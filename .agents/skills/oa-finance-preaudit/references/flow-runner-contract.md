@@ -37,6 +37,8 @@
 
 每轮回执只包含 runner id、workflow_key、候选/成功/失败/unknown 数、实际 Reviewer/Submitter 峰值、四类耗时与 Token 汇总、closure 和 stop reason，不包含 requestId、人员、公司、附件名、附件正文或意见正文。
 
+轮次闭合后的任务归档、日志和材料清理遵循[30 天留存合同](retention-contract.md)。留存动作是后置维护，不得阻断本轮审核或提交。
+
 ## 发布门
 
 本配置只定义五个入口和 dry-run 行为，不自动创建或启用生产 cron。生产启用必须另行人工验收：逐入口验证 0/1/多待办、真实平台槽位、OA 登录、模拟提交回执和回退开关后，才可单独启用该入口。
