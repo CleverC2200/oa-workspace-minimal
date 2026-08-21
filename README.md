@@ -63,6 +63,17 @@ python3 -m apps.oa_finance_preaudit.cli list-handled \
 
 候选标题不能证明流程身份，必须以 `collect-case` 返回的 `workflow_key` 为准。
 
+## 脱敏运行指标
+
+每个 attempt 的 `observability.json` 只保存 attempt 哈希、流程、阶段、耗时、结果和平台精确 usage；没有精确 usage 时固定记为 `unknown`，不做估算。汇总按审核、沟通协调、等待和提交四类拆分：
+
+```bash
+python3 -m apps.oa_finance_preaudit.observability summary \
+  --log /absolute/attempt/observability.json
+```
+
+平台在 Agent 闭合后返回精确 usage 时，使用同一 `item_key + event_id` 的 `usage` 命令补充；重复回放不会重复计数，冲突值会被拒绝。指标缺失只影响监控，不阻断审核或提交。
+
 ## 验证
 
 ```bash

@@ -75,7 +75,8 @@
 - 当天控制台发现租约疑似超时只报告。确认原 Agent 和相关进程均已结束后，由当天控制台凭原 worker_id、lease_token、received_at 和机器可读死亡证明执行一次 `role_cli ops recover-stale`；状态机使用 CAS 复核并令下一次 claim 进入新的 attempt 目录。任一证明或 CAS 不匹配时保持原租约。
 - 所有审核 Agent 共享下载通道：HTTP 直连受全局容量限制，共享浏览器下载目录全局单飞，商旅浏览器按全局容量限制。等待协调槽不是附件缺失，不得绕过槽位另开下载。
 - 原生观察子 Agent 只能由当前单据审核 Agent 创建，并只能在当前 requestId 的材料根目录内工作；返回必须带 resource_id、page 和当前 requestId。汇总者在覆盖门禁闭合后才生成该单意见；观察子 Agent 不得接触其他单据。
-- **单据时效：**审核 Agent 在领取 assignment 后使用单调时钟分别测量单次采集、视觉观察和最终判断，阻断或成功都必须返回一行脱敏 `ITEM_TIMING|request_id=...|workflow_key=...|attempt=...|collection_seconds=...|observation_seconds=...|judgment_seconds=...|preparation_total_seconds=...|prepared_wait_seconds=...|writer_total_seconds=...|attempt_end_to_end_seconds=...|pages_total=...|visual_units=...|observer_agents_peak=...|result=...`。采集包含下载与确定性解析；观察只包含页面覆盖；判断包含证据关系核对、固定项目输出和封套生成。准备结束前未知的 `prepared_wait_seconds、writer_total_seconds、attempt_end_to_end_seconds` 先写 `-`，由当天控制台在提交或阻断闭合后用队列的 `lease_at、prepared_at、submission_at` 及生产回执时间补齐最终同 requestId 时效行。时效记录不得包含人员、公司、金额、附件名、附件正文或意见正文。
+- **单据时效：**审核 Agent 在领取 assignment 后使用单调时钟分别测量单次采集、视觉观察和最终判断，阻断或成功都必须闭合脱敏阶段事件。事件按 `collect、review、coordination、wait、submit、postcheck` 记录 wall time、active time、queue wait、结果和模型；身份只保存 `requestId + received_at + attempt` 的 SHA-256。Token 只接收平台返回的精确 input/output/total usage，缺失固定记为 `unknown`，禁止估算。`item_key + event_id` 相同的重放不得重复计数，冲突值必须拒绝。指标按审核、沟通协调、等待和提交聚合；指标缺失不得阻断审核、提交或状态闭合。记录不得包含人员、公司、金额、附件名、附件正文或意见正文。
+- 兼容批次回执仍可投影 `ITEM_TIMING|collection_seconds=...|observation_seconds=...|judgment_seconds=...|preparation_total_seconds=...|prepared_wait_seconds=...|writer_total_seconds=...|attempt_end_to_end_seconds=...`；这些字段只能从阶段事件或队列时间戳确定性生成，不另建第二份计时事实。
 
 ## 唯一写入器
 
