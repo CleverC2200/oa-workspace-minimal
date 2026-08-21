@@ -1,0 +1,22 @@
+# Changelog
+
+本项目使用语义化版本号。未发布变更记录在 `Unreleased`。
+
+## Unreleased
+
+## 1.1.0 - 2026-08-21
+
+### Added
+
+- 建立 OA 财务预审与包装文字校对的首次 GitHub 私有发布基线。
+- 增加 Issue、Sub-issue、原子 PR、Conventional Commit 和验收闭环规范。
+- 增加安全配置示例、敏感文件忽略规则和安全报告说明。
+
+### Changed
+
+- 数据库地址、账号和 Keychain 服务改为只从本地环境读取，不再提供部署默认值。
+- README 与 AGENTS 只描述当前可验证事实，并把后续架构改造交给 GitHub Issues 追踪。
+
+### Security
+
+- 远程 `main` 从当前已脱敏代码生成新的根提交，不上传包含历史运行材料的本地 Git 历史。

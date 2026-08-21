@@ -1,0 +1,6 @@
+interface:
+  display_name: "同步 OA 状态到飞书"
+  short_description: "将 OA requestId 的审批完成状态安全同步到飞书审批中心"
+  default_prompt: "使用 $lark-sync-oa-approval-status 将指定 OA requestId 的审批完成状态同步到飞书。"
+policy:
+  allow_implicit_invocation: false

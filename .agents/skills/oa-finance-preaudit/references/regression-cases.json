@@ -1,0 +1,225 @@
+{
+  "schema_version": 1,
+  "description": "人工确认的脱敏财务预审错误案例。仅在盲测结果冻结后用于对照和回归，不作为观察子 Agent 的当前答案。",
+  "cases": [
+    {
+      "id": "RC-001-status-marker-position",
+      "scope": "all-workflows",
+      "audit_item": "output-format",
+      "status": "confirmed",
+      "input_facts": [
+        "单项结论已形成明确状态"
+      ],
+      "incorrect_output": "1、审核项：结论 ✅",
+      "expected_output": "✅ 1、审核项：结论",
+      "failure_mode": "状态标识后置，财务无法先扫状态",
+      "rule_ref": "result-contract.md#统一格式"
+    },
+    {
+      "id": "RC-002-travel-period-used-booking-date",
+      "scope": "travel-expense",
+      "audit_item": "1-报销周期",
+      "status": "confirmed",
+      "input_facts": [
+        "消费或下单日期只表示预订时间",
+        "实际乘车或住宿日期位于申报周期内"
+      ],
+      "incorrect_output": "❌ 报销周期：消费日期不在申报周期内",
+      "expected_output": "✅ 报销周期：实际行程日期均位于申报周期内；消费或下单日期不作为行程日期",
+      "failure_mode": "把交易日期误当作实际行程日期",
+      "rule_ref": "result-contract.md#差旅第-1-项判定细则"
+    },
+    {
+      "id": "RC-003-resident-district-reported-cross-region",
+      "scope": "travel-expense",
+      "audit_item": "5-跨区域带车",
+      "status": "confirmed",
+      "input_facts": [
+        "常驻城市为城市A",
+        "完整打卡地址位于城市A所属区县A1",
+        "旧结果把城市A和区县A1列为区域外"
+      ],
+      "incorrect_output": "⚠️ 跨区域带车：待核实地点包括城市A、区县A1",
+      "expected_output": "先把城市A和明确所属区县A1纳入常驻地集合并排除，再核对剩余跨区域候选",
+      "failure_mode": "未识别常驻城市与所属区县的行政关系",
+      "rule_ref": "result-contract.md#差旅第-2456-项判定细则"
+    },
+    {
+      "id": "RC-004-refund-not-netted-from-payment",
+      "scope": "business-entertainment",
+      "audit_item": "4-金额孰低核销",
+      "status": "confirmed",
+      "input_facts": [
+        "原支付481.40元",
+        "同一交易已退款45.00元",
+        "申报金额436.40元"
+      ],
+      "incorrect_output": "按481.40元作为实际支付金额参与孰低比较",
+      "expected_output": "实际支付金额为481.40-45.00=436.40元，再与发票和申报金额取最低值",
+      "failure_mode": "识别到退款但没有抵减实际支付",
+      "rule_ref": "result-contract.md#业务招待费报销申请流程"
+    },
+    {
+      "id": "RC-005-hotel-name-used-as-address",
+      "scope": "travel-expense",
+      "audit_item": "4-住宿与考勤",
+      "status": "confirmed",
+      "input_facts": [
+        "酒店名称中包含区域B字样",
+        "酒店详情完整地址位于区域A",
+        "同日考勤完整地址也位于区域A"
+      ],
+      "incorrect_output": "❌ 住宿与考勤：酒店位于区域B，考勤位于区域A",
+      "expected_output": "✅ 住宿与考勤：按酒店详情完整地址核对，住宿与考勤均位于区域A",
+      "failure_mode": "把酒店名称或预订摘要中的区域字样当作酒店地址",
+      "rule_ref": "result-contract.md#差旅第-2456-项判定细则"
+    },
+    {
+      "id": "RC-006-fully-reversed-hotels-counted-as-stays",
+      "scope": "travel-expense",
+      "audit_item": "2-出差与住宿天数;4-住宿与考勤",
+      "status": "confirmed",
+      "input_facts": [
+        "同一住宿订单存在135.00元和-135.00元",
+        "另一订单存在142.00元和-142.00元",
+        "另一订单存在266.00元和-266.00元",
+        "每组均可唯一配对且净额为0"
+      ],
+      "incorrect_output": "把已全额冲销的酒店订单计入住宿夜数和住宿地点比较",
+      "expected_output": "三组全额冲销订单均排除，不计住宿夜数，也不参与住宿与考勤地点比较",
+      "failure_mode": "未在住宿判断前配对酒店正负明细",
+      "rule_ref": "result-contract.md#差旅第-2456-项判定细则"
+    },
+    {
+      "id": "RC-007-rpa-mileage-used-without-image-review",
+      "scope": "travel-expense",
+      "audit_item": "6-油补",
+      "status": "confirmed",
+      "input_facts": [
+        "旧RPA给出异常里程差值",
+        "原始仪表照片尚未确认起始读数、结束读数、单位和显示区域"
+      ],
+      "incorrect_output": "❌ 油补：直接采用旧RPA差值判定申报里程不一致",
+      "expected_output": "回到当前流程绑定的原始照片读取起止原值并重新计算；无法稳定辨认时输出⚠️，不编造正确里程",
+      "failure_mode": "把旧RPA或OCR差值当作权威事实",
+      "rule_ref": "result-contract.md#差旅第-2456-项判定细则"
+    },
+    {
+      "id": "RC-008-budget-missing-treated-as-unresolved",
+      "scope": "business-entertainment;business-support-fee",
+      "audit_item": "预算",
+      "status": "confirmed",
+      "input_facts": [
+        "当前OA未提供可用预算数据",
+        "人工已确认当前阶段暂不校验预算"
+      ],
+      "incorrect_output": "⚠️ 预算：缺少预算数据，需人工判断",
+      "expected_output": "✅ 预算：当前阶段按既定策略暂不校验，OA 暂未提供预算数据",
+      "failure_mode": "把已确认的阶段性放过口径仍输出为证据不足",
+      "rule_ref": "result-contract.md#业务招待费报销申请流程"
+    },
+    {
+      "id": "RC-009-multiple-payments-not-summed",
+      "scope": "business-entertainment",
+      "audit_item": "4-金额孰低核销",
+      "status": "confirmed",
+      "input_facts": [
+        "一条403.00元明细稳定绑定两张成功支付凭证103.00元和285.00元，实付合计388.00元",
+        "另一条413.00元明细显示立减0.24元，实付412.76元",
+        "全部申报和发票合计2667.00元，全部实付合计2651.76元"
+      ],
+      "incorrect_output": "⚠️ 金额孰低核销：多笔支付凭证无法可靠汇总，需人工核实",
+      "expected_output": "❌ 金额孰低核销：实际支付合计2651.76元，低于申报和发票2667.00元，差额15.24元",
+      "failure_mode": "同一明细存在多张支付凭证时放弃逐张核实和求和",
+      "rule_ref": "result-contract.md#业务招待费报销申请流程"
+    },
+        {
+            "id": "RC-010-flow-number-lookup-removed",
+      "scope": "collector",
+      "audit_item": "流程定位",
+      "status": "confirmed",
+      "input_facts": [
+        "用户只提供业务流程编号",
+        "数据库能够按流程编号精确查询唯一requestId"
+      ],
+      "incorrect_output": "要求用户另行提供requestId，或改用标题和浏览器候选搜索",
+      "expected_output": "使用只读参数化SQL精确解析唯一requestId；零条、多条或查询失败时停止",
+            "failure_mode": "重构时丢失常用的流程编号到requestId定位能力",
+            "rule_ref": "SKILL.md#1-只读取数"
+        },
+        {
+            "id": "RC-011-split-details-double-counted-one-payment",
+            "scope": "business-entertainment",
+            "audit_item": "4-金额孰低核销",
+            "status": "confirmed",
+            "input_facts": [
+                "两条拆分明细分别申报55.40元和3.00元",
+                "两条明细均由OA稳定绑定页级内容完全相同的58.40元支付凭证",
+                "凭证交易身份和业务上下文一致，拆分申报合计等于实付58.40元"
+            ],
+            "incorrect_output": "把两份精确重复凭证表述成两条明细各有一笔独立支付，或在总额中重复计算58.40元",
+            "expected_output": "将两条拆分明细建立为同一支付分组，实付58.40元只计一次，并明确写出55.40+3.00=58.40元",
+            "failure_mode": "没有区分附件资源数量、明细数量和不同支付事实数量",
+            "rule_ref": "result-contract.md#业务招待费报销申请流程"
+        },
+        {
+            "id": "RC-012-packaging-generic-three-item-template",
+            "scope": "packaging-layout-approval",
+            "audit_item": "output-template;image-text-proofreading",
+            "status": "confirmed",
+            "input_facts": [
+                "每一版包装均需审核配料、过敏原、营养成分表和地址四块文字",
+                "异常可能来自图片错别字、漏项、重复、表达不通或与可选Excel不一致"
+            ],
+            "incorrect_output": "使用包装图片文字、重复与版面文字、图片与Excel一致性三个通用项目，未按四块内容分别说明",
+            "expected_output": "固定输出配料信息、过敏原信息、营养成分表信息、地址信息四项，并把图片文字及Excel差异归入对应项目",
+            "failure_mode": "输出模板按异常类型分组，导致业务需要的四块内容覆盖不可见",
+            "rule_ref": "result-contract.md#包装新制更改及包装版面审批流程"
+        },
+        {
+            "id": "RC-013-packaging-no-excel-blanket-warning",
+            "scope": "packaging-layout-approval",
+            "audit_item": "image-only-proofreading;output-status",
+            "status": "confirmed",
+            "input_facts": [
+                "包装图片原始附件完整可读",
+                "当前流程未提供可选Excel对照材料",
+                "四块关键文字仍可通过原图放大、方向辅助视图和按需无损切片校对"
+            ],
+            "incorrect_output": "仅因未提供Excel或字号较小，把配料、过敏原、营养成分表和地址四项统一标为需人工判断",
+            "expected_output": "完整下载并观察每张原图，完成G0-G4后按实际图片异常逐项签字；无Excel只需明确未执行Excel对照，不影响图片自身校对结论",
+            "failure_mode": "把缺少可选对照源误当成图片无法判断，并在实际像素观察前过早收口",
+            "rule_ref": "result-contract.md#包装新制更改及包装版面审批流程"
+        },
+        {
+            "id": "RC-014-packaging-excel-notice-repeated",
+            "scope": "packaging-layout-approval",
+            "audit_item": "output-template;excel-source-notice",
+            "status": "confirmed",
+            "input_facts": [
+                "配料、过敏原、营养成分表和地址通常来自同一Excel文件",
+                "当前流程未提供可选Excel对照材料",
+                "四项图片文字结论已经分别形成"
+            ],
+            "incorrect_output": "在四个固定审核项中重复写本次未提供Excel、未执行Excel对照",
+            "expected_output": "四项只写各自图片结论，在四项之后单独写一次Excel对照：本次未提供Excel，未执行Excel对照",
+            "failure_mode": "把同一Excel来源状态复制到多个审核项，造成意见冗余",
+            "rule_ref": "result-contract.md#包装新制更改及包装版面审批流程"
+        },
+        {
+            "id": "RC-015-packaging-full-text-overcontrol",
+            "scope": "packaging-layout-approval",
+            "audit_item": "key-text-scope;risk-based-review;finite-convergence",
+            "status": "confirmed",
+            "input_facts": [
+                "包装图片大部分内容是装饰性或营销文字",
+                "审批重点是固定四项及影响产品识别或使用的关键文字",
+                "关键文字大多清晰，只有少数区域可能低置信或存在冲突"
+            ],
+            "incorrect_output": "把全部可见文字逐块裁切，并强制每个区域完成覆盖审计和A/B/C三路盲审；覆盖未闭合时持续重切和等待",
+            "expected_output": "先建立关键文字区域清单，简单清晰版面由协调者直接主审；只对低置信、高影响或冲突区域增加一次独立复核，最多一次定向重切后把仍不确定的受影响项目标为人工判断",
+            "failure_mode": "把非关键文案和可选复核升级为全单准确性门禁，导致单据无法有限闭合",
+            "rule_ref": "audit-chinese-image-text/SKILL.md#oa-包装版面流程"
+        }
+  ]
+}

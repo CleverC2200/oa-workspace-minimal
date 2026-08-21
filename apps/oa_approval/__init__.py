@@ -1,0 +1,1 @@
+"""Minimal OA approval automation."""

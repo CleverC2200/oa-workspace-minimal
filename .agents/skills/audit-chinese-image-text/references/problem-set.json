@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "description": "人工确认后的通用中文图片校对问题特征；不得作为自动纠错字典。",
+  "entries": [
+    {
+      "id": "issue-503c55e72d9f",
+      "outcome": "confirmed-error",
+      "category": "latin-digit-confusion",
+      "observed": "Q",
+      "expected": "0",
+      "feature_signature": "latin-letter-resembles-digit-in-numeric-field",
+      "detection_rules": [
+        "inspect-every-character-in-numeric-claims"
+      ],
+      "source_modes": [
+        "image-only"
+      ],
+      "evidence_count": 1,
+      "status": "active"
+    },
+    {
+      "id": "issue-2533781350da",
+      "outcome": "confirmed-error",
+      "category": "glyph-confusion",
+      "observed": "玉",
+      "expected": "于",
+      "feature_signature": "extra-stroke-creates-valid-similar-character",
+      "detection_rules": [
+        "compare-glyph-strokes-before-semantic-normalization"
+      ],
+      "source_modes": [
+        "image-only"
+      ],
+      "evidence_count": 1,
+      "status": "active"
+    },
+    {
+      "id": "issue-87188dbe3cc4",
+      "outcome": "confirmed-error",
+      "category": "semantic-character-substitution",
+      "observed": "亿",
+      "expected": "们",
+      "feature_signature": "valid-character-breaks-common-pronoun-phrase",
+      "detection_rules": [
+        "preserve-raw-character-then-check-short-phrase-semantics"
+      ],
+      "source_modes": [
+        "image-only"
+      ],
+      "evidence_count": 1,
+      "status": "active"
+    },
+    {
+      "id": "issue-be8c53a7c47e",
+      "outcome": "confirmed-error",
+      "category": "term-inconsistency",
+      "observed": "销",
+      "expected": "铛",
+      "feature_signature": "same-radical-different-right-component-across-term-occurrences",
+      "detection_rules": [
+        "compare-every-term-occurrence-independently"
+      ],
+      "source_modes": [
+        "cross-instance"
+      ],
+      "evidence_count": 1,
+      "status": "active"
+    },
+    {
+      "id": "issue-dd81576950dc",
+      "outcome": "confirmed-error",
+      "category": "duplicate-content",
+      "observed": "同一文字块非预期重复印刷",
+      "expected": "同一文字块仅保留预期实例",
+      "feature_signature": "same-text-block-repeated-unintentionally",
+      "detection_rules": [
+        "enumerate-every-visible-block-instance-before-layout-judgment"
+      ],
+      "source_modes": [
+        "human-copy"
+      ],
+      "evidence_count": 1,
+      "status": "active",
+      "created_at": "2026-08-14T10:20:22+00:00",
+      "last_confirmed_at": "2026-08-14T10:20:22+00:00"
+    },
+    {
+      "id": "issue-e75426426e8d",
+      "outcome": "confirmed-error",
+      "category": "reference-mismatch",
+      "observed": "高影响编号与Excel文案不一致",
+      "expected": "高影响编号与Excel逐字符一致",
+      "feature_signature": "high-impact-identifier-differs-from-reference",
+      "detection_rules": [
+        "compare-high-impact-identifiers-character-by-character-when-excel-exists"
+      ],
+      "source_modes": [
+        "human-copy"
+      ],
+      "evidence_count": 1,
+      "status": "active",
+      "created_at": "2026-08-14T10:20:22+00:00",
+      "last_confirmed_at": "2026-08-14T10:20:22+00:00"
+    }
+  ]
+}

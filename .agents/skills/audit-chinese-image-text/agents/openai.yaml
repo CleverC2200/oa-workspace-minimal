@@ -1,0 +1,4 @@
+interface:
+  display_name: "中文图稿视觉交叉校对"
+  short_description: "关键文字优先校对，按风险复核并支持 Excel 对照"
+  default_prompt: "使用 $audit-chinese-image-text 校对中文图稿的关键文字。简单清晰版面由协调者直接完成覆盖自检和主审；只对低置信、高影响或冲突区域增加独立复核。有 Excel 时对能映射到关键文字的内容逐字符对照；保留原文分歧并把用户明确纠正脱敏后沉淀为后续复查特征。"

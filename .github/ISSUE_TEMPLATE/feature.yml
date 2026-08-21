@@ -1,0 +1,51 @@
+name: 功能或改造
+description: 提议一个可独立验收的功能、重构或工程改造
+title: ""
+labels:
+  - needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: 请勿填写真实 requestId、附件正文、账号、内部地址、密钥或未脱敏日志。
+  - type: textarea
+    id: background
+    attributes:
+      label: 背景
+      description: 当前问题及其影响是什么？
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: 范围
+      description: 本票具体负责什么？
+    validations:
+      required: true
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: 非目标
+      description: 明确本票不处理的内容。
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收标准
+      description: 使用可验证的清单描述完成条件。
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: 依赖
+      description: 填写 Blocked by / Blocks；没有则写“无”。
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: 验证方式
+      description: 需要运行哪些测试、回放或人工验收？
+    validations:
+      required: true

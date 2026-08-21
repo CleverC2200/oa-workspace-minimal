@@ -1,0 +1,7 @@
+interface:
+  display_name: "OA 预审"
+  short_description: "读取可信证据，审核财务单据或校对包装版面文字"
+  default_prompt: "使用 $oa-finance-preaudit 按 requestId、业务流程编号或已授权候选批次执行 OA 预审：四类财务流程按固定项目核实证据；包装版面流程校对图片文字，存在 Excel 时逐字符对照。输出前置 ✅/❌/⚠️。自动化每小时创建一个独立可见调度任务并唤醒当天唯一控制台，控制台直接协调 fresh epoch；本小时内每个 requestId 使用全新隔离原生子 Agent，默认 Terra high、疑难单最多升级一次 Sol high；异常只上报用户指定的 Admin，OA 提交始终按持久化 FIFO 由唯一写入器串行完成。"
+
+policy:
+  allow_implicit_invocation: false

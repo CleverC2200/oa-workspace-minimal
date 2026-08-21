@@ -1,0 +1,41 @@
+name: 缺陷
+description: 报告可复现的错误、回归或安全阻断
+title: "fix: "
+labels:
+  - bug
+  - needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: 只提供脱敏复现信息；不要粘贴真实业务材料、凭据或内部地址。
+  - type: textarea
+    id: symptom
+    attributes:
+      label: 现象
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 最小复现
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: 影响与安全边界
+      description: 是否影响只读、材料归属、提交幂等或授权？
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: 修复验收
+    validations:
+      required: true
