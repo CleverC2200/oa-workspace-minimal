@@ -295,7 +295,7 @@ class ElasticQueueTest(unittest.TestCase):
             ],
             0,
         )
-    def test_later_prepared_item_cannot_skip_fifo_head(self) -> None:
+    def test_prepared_item_can_submit_while_an_unrelated_request_is_reviewing(self) -> None:
         self.refresh(
             [
                 production_item("r1", "travel_expense"),
@@ -308,13 +308,30 @@ class ElasticQueueTest(unittest.TestCase):
         )
         first = elastic_queue.claim_next(self.state_path, "worker-1", now=NOW)
         second = elastic_queue.claim_next(self.state_path, "worker-2", now=NOW)
+        material = Path(second["material_file"])
+        remark = Path(second["remark_file"])
+        material.parent.mkdir(parents=True, exist_ok=True)
+        material.write_bytes(b"material-r2")
+        remark.write_text("AI审核结论：可提交 ✅\n", encoding="utf-8")
+        material_fingerprint = f"sha256:{hashlib.sha256(material.read_bytes()).hexdigest()}"
+        remark_fingerprint = f"sha256:{hashlib.sha256(remark.read_bytes()).hexdigest()}"
+        envelope, envelope_fingerprint = self.write_remark_envelope(
+            second,
+            material_fingerprint=material_fingerprint,
+            remark_fingerprint=remark_fingerprint,
+        )
         elastic_queue.complete_preparation(
             self.state_path,
             worker_id="worker-2",
             request_id="r2",
             lease_token=second["lease_token"],
             material_request_id="r2",
-            material_fingerprint="sha256:r2",
+            material_fingerprint=material_fingerprint,
+            material_file=str(material),
+            remark_file=str(remark),
+            remark_fingerprint=remark_fingerprint,
+            remark_envelope_file=str(envelope),
+            remark_envelope_fingerprint=envelope_fingerprint,
             outcome="prepared",
             result_code="preview_ready",
             now=NOW,
@@ -323,28 +340,18 @@ class ElasticQueueTest(unittest.TestCase):
         next_item = elastic_queue.next_submit(self.state_path)
         self.assertEqual(next_item["status"], "waiting")
         self.assertEqual(next_item["request_id"], "r1")
-        with self.assertRaisesRegex(elastic_queue.QueueContractError, "fifo_head_mismatch"):
-            elastic_queue.begin_submit(
-                self.state_path,
-                "r2",
-                current_candidate=self.current_candidate(
-                    "r2", "2026-08-11 08:01:00"
-                ),
-                now=NOW,
-            )
-
-        elastic_queue.complete_preparation(
+        submission = elastic_queue.begin_submit(
             self.state_path,
-            worker_id="worker-1",
-            request_id="r1",
-            lease_token=first["lease_token"],
-            material_request_id="r1",
-            material_fingerprint="sha256:r1",
-            outcome="blocked",
-            result_code="partial_read",
+            request_id="r2",
+            current_candidate=self.current_candidate(
+                "r2", "2026-08-11 08:01:00"
+            ),
             now=NOW,
         )
-        self.assertEqual(elastic_queue.next_submit(self.state_path)["request_id"], "r2")
+        self.assertEqual(submission["request_id"], "r2")
+        stored = json.loads(self.state_path.read_text(encoding="utf-8"))["items"]
+        self.assertEqual(stored[0]["state"], "leased")
+        self.assertEqual(stored[1]["state"], "submitting")
 
     def test_pool_plan_scales_with_backlog_and_is_capped(self) -> None:
         expected = {0: 0, 1: 1, 5: 2, 11: 2, 19: 2, 20: 3, 30: 3, 100: 3}

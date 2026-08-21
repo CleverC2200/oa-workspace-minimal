@@ -74,6 +74,8 @@ python3 -m apps.oa_finance_preaudit.observability summary \
 
 平台在 Agent 闭合后返回精确 usage 时，使用同一 `item_key + event_id` 的 `usage` 命令补充；重复回放不会重复计数，冲突值会被拒绝。指标缺失只影响监控，不阻断审核或提交。
 
+OA 提交只通过冻结写入入口执行。锁、token、冻结指纹和终态回执均绑定单个 `requestId + received_at + attempt`：同一 requestId 单飞并幂等重放，不同 requestId 可由 `submission_pool.run_bounded` 有界并发。生产写入仍需单独授权；本仓库测试只使用模拟接口。
+
 ## 验证
 
 ```bash

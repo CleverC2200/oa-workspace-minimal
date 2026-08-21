@@ -1,8 +1,8 @@
-# 唯一 OA 写入器合同
+# 按请求隔离的 OA 提交合同
 
-本角色是全局唯一写入器，只串行提交已经冻结且位于 FIFO 队首的 attempt；不得执行审核判断、重新下载附件或修改意见。
+Writer 一次只提交一个已经冻结的 `requestId + received_at + attempt`；不得执行审核判断、重新下载附件或修改意见。不同 requestId 没有业务依赖，可以由有界提交池并发；同一 requestId 始终单飞。
 
-启动时只用 canonical 接口核对包含开发合同与生产 writer 代码的复合指纹：
+启动时使用 canonical 接口核对包含开发合同与生产提交代码的复合指纹：
 
 ```bash
 cd /Users/synear/HermesWorkspace/profiles/oa/projects/oa-workspace-minimal
@@ -11,19 +11,18 @@ python3 -m apps.oa_finance_preaudit.role_cli writer release-manifest \
   --writer-root /Users/synear/HermesWorkspace/profiles/oa/projects/oa-workspace-minimal
 ```
 
-不得从生产 cwd 推导项目合同路径，不得对单个文件自行计算哈希。只有返回的 `sha256` 与控制台给定 writer 指纹一致才进入提交门禁。
+不得从生产 cwd 推导项目合同路径，不得对单个文件自行计算哈希。只有返回的 `sha256` 与调度入口给定 writer 指纹一致才进入提交门禁。
 
-## 提交门禁
+## 单据级提交门禁
 
-1. `apps.oa_approval.frozen_writer status` 返回 `active_run=false`，且没有第二个冻结 Writer；
-2. `next-submit` 的 FIFO 队首为 `prepared`；
-3. 材料、意见、封套、assignment 与 current proof 属于同一 `requestId + received_at + isolation_key + attempt`；
-4. 实时生产待办身份源与项目 list-pending 各唯一命中该版本；
-5. 四个冻结文件位于同一 attempt，requestId、received_at、isolation_key、一次性 submission token 与四份 SHA-256 指纹全部匹配。
+1. 材料、意见、封套、assignment 与 current proof 属于同一 `requestId + received_at + isolation_key + attempt`；
+2. 实时生产待办身份源与项目 list-pending 各唯一命中该版本；
+3. 四个冻结文件位于同一 attempt，身份、一次性 submission token 与四份 SHA-256 指纹全部匹配；
+4. requestId 级锁内不存在同 requestId 的活动提交、冲突回执或未知写入结果。
 
-控制台必须在创建 Writer 前通过 `capture-live-inputs` 完成实时双源固定，只把本次 receipt/request 专用的 `live-inputs.json` 绝对路径随任务交付。Writer 不接收或手工拼接两个 source 路径；canonical 单入口会核验 manifest 路径、两个 final schema、计数与 SHA-256，并要求计数为严格整数、采集时间仍在有效期内。manifest 必须在采集后 300 秒内使用，采集时间不得比当前时间超前 30 秒以上。不得接收 stdout、工具 output、旧 epoch 文件、`last_json` 占位路径、半成品目录或临时会话结果。manifest 过期、时间异常、字段类型错误或来源不可信时，在发 submission token 前统一返回 `queue_input_unreadable`，不得启动生产写入。
+Writer 只接收 canonical `live-inputs.json`，并复核 manifest 路径、两个 final schema、计数与 SHA-256；manifest 超时、来源变化或任一来源不是唯一命中时不得生成 submission token。
 
-门禁通过后只调用下面的 canonical 单入口；不得由模型手工拼接 `begin-submit`、`frozen_writer submit`、回执文件或队列闭合命令：
+门禁通过后只调用 canonical 单入口：
 
 ```bash
 cd /Users/synear/HermesWorkspace/profiles/oa/projects/oa-workspace-minimal
@@ -34,12 +33,18 @@ python3 -m apps.oa_finance_preaudit.role_cli writer submit-frozen-once \
   --production-root /Users/synear/HermesWorkspace/profiles/oa/projects/oa-workspace-minimal
 ```
 
-该接口先读取冻结 Writer 状态；只有 inactive 才原子生成 current proof，并连续执行 `begin-submit → frozen_writer submit → 校验 submission_receipt → mark-submitted`。取得 submission token 后不会返回模型控制权或插入查询。窄 Writer 只读取同一 attempt 的 material、remark、remark envelope 和 current proof，逐项复核路径、身份与指纹后提交冻结意见；不得取数、识别流程、读取附件正文、生成判断或修改意见。
+该入口连续执行 current proof、`begin-submit`、冻结提交、回执校验和 `mark-submitted`；取得 submission token 后不会返回模型控制权。调用方不得手工拼接阶段，也不得绕过冻结路径直接提交。
 
-命令返回 `elastic_queue_frozen_submitted`，且回执中的 requestId、submission token 完全匹配，并同时满足 `submit_ok=true、done_hit=true、postcheck_done_hit=true` 才算闭合。命令失败时不得再次运行：队列若仍为 `prepared`，说明尚未发 token；若为 `submitting`，必须按实时 OA 状态与绑定回执对账，禁止猜测未写入。
+## 并发与幂等
 
-## 写后闭合
+- 调度入口使用配置上限与平台实际槽位共同约束的有界提交池；不同 requestId 可并发，不建立跨流程 FIFO。
+- 锁只绑定 requestId。相同 requestId 的并发、重放和超时重试必须等待同一锁，并优先读取 attempt 内的持久成功回执；同一 token 只能产生一次有效 OA 写入。
+- requestId、冻结目录、current proof、submission token 和回执逐单绑定。任何跨单据路径或指纹混用都只阻断受影响单据，并停止该请求的写入。
+- 提交临界区只包含单据级冻结复核、接口调用、写后确认和持久终态；不保留全局 Writer 锁。
 
-- 只有 `submit_ok=true、done_hit=true、postcheck_done_hit=true` 的同一次 final 回执才由 canonical 单入口调用 `mark-submitted`；状态机会更新持久 timing 的 prepared_wait、writer_total 和 attempt_end_to_end。
-- 明确未写入才凭绑定 requestId 的 machine no-write proof 调用 `mark-submit-failed`。实际写入或写入状态不明不得重试、补写或标记 submitted，必须停止 writer 并上报 Admin。
-- 单据成功或已证明未写入的单据级失败闭合后，立即读取下一 FIFO 队首；唯一写入器保持串行，审核槽位可继续并发准备后续单据。
+## 写后闭合与恢复
+
+- 只有 `submit_ok=true、done_hit=true、postcheck_done_hit=true` 的同一次回执才可 `mark-submitted`。
+- 明确未写入的认证或传输前失败可以在同 requestId 门禁下重试；必须保持原冻结指纹并重新验证当前待办身份。
+- 接口已返回成功但已办命中、待办消失或回执状态不能闭合时，原子写入脱敏 `writer_result_unknown` 标记。同 requestId 后续调用只返回 unknown，不得再次提交；其他 requestId 可以继续。
+- 不同 requestId 的失败互不阻断。只有发现共享认证整体失效、跨单据材料串线或多个有效回执冲突时，才暂停提交池并上报 Admin。

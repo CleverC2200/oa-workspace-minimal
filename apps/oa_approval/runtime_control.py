@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import fcntl
+import hashlib
 import os
 from pathlib import Path
-from typing import Iterator, TextIO
+from typing import Iterator
 
 
 STOP_CODE = "oa_run_stopped"
@@ -38,16 +39,16 @@ def writer_lock_file() -> Path:
     )
 
 
-def _try_writer_lock(path: Path) -> TextIO:
-    target = Path(path).expanduser().resolve()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = target.open("a+", encoding="utf-8")
-    try:
-        fcntl.flock(descriptor.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        descriptor.close()
-        raise RuntimeError("writer_already_active")
-    return descriptor
+def request_writer_lock_file(request_id: str, base_path: Path | None = None) -> Path:
+    base = Path(base_path or writer_lock_file()).expanduser().resolve()
+    digest = hashlib.sha256(str(request_id).encode("utf-8")).hexdigest()[:16]
+    return base.with_name(f"{base.stem}-{digest}{base.suffix or '.lock'}")
+
+
+def active_request_writers(base_path: Path | None = None) -> int:
+    base = Path(base_path or writer_lock_file()).expanduser().resolve()
+    pattern = f"{base.stem}-*{base.suffix or '.lock'}"
+    return sum(1 for path in base.parent.glob(pattern) if writer_active(path))
 
 
 def writer_active(path: Path | None = None) -> bool:
@@ -70,9 +71,15 @@ def writer_active(path: Path | None = None) -> bool:
 
 
 @contextmanager
-def writer_lease(path: Path | None = None) -> Iterator[None]:
-    descriptor = _try_writer_lock(path or writer_lock_file())
+def request_writer_lease(
+    request_id: str,
+    path: Path | None = None,
+) -> Iterator[None]:
+    target = request_writer_lock_file(request_id, path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = target.open("a+", encoding="utf-8")
     try:
+        fcntl.flock(descriptor.fileno(), fcntl.LOCK_EX)
         descriptor.seek(0)
         descriptor.truncate()
         descriptor.write(str(os.getpid()))

@@ -1270,14 +1270,7 @@ def begin_submit(
     request = _safe_id(request_id, code="invalid_request_id")
     path = Path(state_path)
     with _locked_state(path) as state:
-        candidate = None
-        for item in state["items"]:
-            if str(item.get("state") or "") in TERMINAL_STATES:
-                continue
-            candidate = item
-            break
-        if candidate is None or candidate.get("request_id") != request:
-            raise QueueContractError("fifo_head_mismatch")
+        candidate = _find_item(state, request)
         if candidate.get("state") != "prepared":
             raise QueueContractError("fifo_head_not_prepared")
         if int(candidate.get("material_contract_version") or 0) != 2:
