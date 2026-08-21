@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "schedule": "0 * * * *",
+  "timezone": "Asia/Shanghai",
+  "defaults": {
+    "reviewer_limit": 3,
+    "submit_limit": 3
+  },
+  "runners": [
+    {"workflow_key": "travel_expense", "runner_id": "oa-travel-expense"},
+    {"workflow_key": "business_entertainment", "runner_id": "oa-business-entertainment"},
+    {"workflow_key": "business_support_fee", "runner_id": "oa-business-support-fee"},
+    {"workflow_key": "small_marketing_fee", "runner_id": "oa-small-marketing-fee"},
+    {"workflow_key": "packaging_layout_approval", "runner_id": "oa-packaging-layout-approval"}
+  ]
+}

@@ -254,14 +254,14 @@ class SkillResultContractTest(unittest.TestCase):
         self.assertIn("升级为原始分辨率", self.observation_contract)
         self.assertIn("不得重复打开", self.observation_contract)
 
-    def test_automation_batch_continues_after_item_level_failures(self):
-        self.assertIn("自动化批次契约", self.skill)
-        self.assertIn("单据级失败不得结束整批", self.automation_batch_contract)
-        self.assertIn("material_collection_failed", self.automation_batch_contract)
-        self.assertIn("remark_template_line_prefix", self.automation_batch_contract)
-        self.assertIn("oa_session_expired", self.automation_batch_contract)
-        self.assertNotIn("attachment_ai_auth_failed", self.automation_batch_contract)
-        self.assertIn("单据级失败不得结束整批", self.automation_batch_contract)
+    def test_single_flow_runner_continues_after_item_level_failures(self):
+        flow_runner_contract = (RESULT_CONTRACT.parent / "flow-runner-contract.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("单流程定时运行合同", self.skill)
+        self.assertIn("只闭合当前 requestId", flow_runner_contract)
+        self.assertIn("同一流程内其他安全单据继续", flow_runner_contract)
+        self.assertIn("不得暂停、重启或改写其他四个入口", flow_runner_contract)
 
     def test_automation_batch_drains_actionable_queue(self):
         self.assertIn("每小时完整拉取一次", self.automation_batch_contract)
@@ -709,13 +709,13 @@ class SkillResultContractTest(unittest.TestCase):
 
     def test_skill_routes_each_runtime_role_to_a_small_contract(self):
         for name in (
-            "dispatcher-contract.md",
-            "controller-contract.md",
+            "flow-runner-contract.md",
             "reviewer-contract.md",
             "writer-contract.md",
         ):
             self.assertIn(name, self.skill)
         self.assertIn("只读取本角色", self.skill)
+        self.assertIn("不进入新自动化上下文", self.skill)
 
     def test_reviewer_contract_excludes_controller_and_writer_operations(self):
         self.assertIn("collect-assignment", self.reviewer_contract)
