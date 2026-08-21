@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "suite_version": "1.0.0",
+  "flows": {
+    "travel_expense": ["报销周期", "出差与住宿天数", "公共交通", "住宿与考勤", "跨区域带车", "油补", "个人垫付车票", "发票购买方"],
+    "business_entertainment": ["附件完整性/支付证据", "发票关联", "预算", "金额孰低核销"],
+    "business_support_fee": ["附件完整性", "业务事项合规性", "预算校验", "金额孰低核销"],
+    "small_marketing_fee": ["预算科目", "附件完整性", "费用承担主体", "SAP 客户编码匹配", "金额孰低核销"],
+    "packaging_layout_approval": ["配料信息", "过敏原信息", "营养成分表信息", "地址信息"]
+  },
+  "cases": [
+    {"case_id":"travel-normal-v1","workflow_key":"travel_expense","scenario":"normal","source":{"kind":"synthetic_baseline","reference":"flow-rule-pack","version":"1.0.0"},"expected":{"outcome":"pass","statuses":["✅","✅","✅","✅","✅","✅","✅","✅"],"stop_code":null},"baseline":{"duration_ms":1200,"tokens":1800}},
+    {"case_id":"travel-warning-v1","workflow_key":"travel_expense","scenario":"business_warning","source":{"kind":"confirmed_feedback","reference":"F-006","version":"1.0.0"},"expected":{"outcome":"business_warning","statuses":["✅","✅","✅","❌","✅","✅","✅","✅"],"stop_code":null},"baseline":{"duration_ms":1400,"tokens":1950}},
+    {"case_id":"travel-insufficient-v1","workflow_key":"travel_expense","scenario":"evidence_insufficient","source":{"kind":"confirmed_feedback","reference":"F-003","version":"1.0.0"},"expected":{"outcome":"evidence_insufficient","statuses":["✅","⚠️","✅","⚠️","✅","✅","✅","✅"],"stop_code":null},"baseline":{"duration_ms":1500,"tokens":2050}},
+    {"case_id":"travel-technical-v1","workflow_key":"travel_expense","scenario":"technical_failure","source":{"kind":"contract_case","reference":"material-ownership","version":"1.0.0"},"expected":{"outcome":"technical_failure","statuses":[],"stop_code":"material_ownership_mismatch"},"baseline":{"duration_ms":300,"tokens":220}},
+
+    {"case_id":"entertainment-normal-v1","workflow_key":"business_entertainment","scenario":"normal","source":{"kind":"synthetic_baseline","reference":"flow-rule-pack","version":"1.0.0"},"expected":{"outcome":"pass","statuses":["✅","✅","✅","✅"],"stop_code":null},"baseline":{"duration_ms":800,"tokens":1050}},
+    {"case_id":"entertainment-warning-v1","workflow_key":"business_entertainment","scenario":"business_warning","source":{"kind":"confirmed_feedback","reference":"F-011","version":"1.0.0"},"expected":{"outcome":"business_warning","statuses":["✅","❌","✅","✅"],"stop_code":null},"baseline":{"duration_ms":900,"tokens":1150}},
+    {"case_id":"entertainment-insufficient-v1","workflow_key":"business_entertainment","scenario":"evidence_insufficient","source":{"kind":"confirmed_feedback","reference":"F-003","version":"1.0.0"},"expected":{"outcome":"evidence_insufficient","statuses":["⚠️","⚠️","✅","✅"],"stop_code":null},"baseline":{"duration_ms":1000,"tokens":1250}},
+    {"case_id":"entertainment-technical-v1","workflow_key":"business_entertainment","scenario":"technical_failure","source":{"kind":"contract_case","reference":"attachment-coverage","version":"1.0.0"},"expected":{"outcome":"technical_failure","statuses":[],"stop_code":"material_collection_failed"},"baseline":{"duration_ms":260,"tokens":180}},
+
+    {"case_id":"support-normal-v1","workflow_key":"business_support_fee","scenario":"normal","source":{"kind":"synthetic_baseline","reference":"flow-rule-pack","version":"1.0.0"},"expected":{"outcome":"pass","statuses":["✅","✅","✅","✅"],"stop_code":null},"baseline":{"duration_ms":850,"tokens":1100}},
+    {"case_id":"support-warning-v1","workflow_key":"business_support_fee","scenario":"business_warning","source":{"kind":"contract_case","reference":"business-support-rule-pack","version":"1.0.0"},"expected":{"outcome":"business_warning","statuses":["✅","❌","✅","✅"],"stop_code":null},"baseline":{"duration_ms":950,"tokens":1200}},
+    {"case_id":"support-insufficient-v1","workflow_key":"business_support_fee","scenario":"evidence_insufficient","source":{"kind":"confirmed_feedback","reference":"F-003","version":"1.0.0"},"expected":{"outcome":"evidence_insufficient","statuses":["⚠️","⚠️","✅","✅"],"stop_code":null},"baseline":{"duration_ms":1050,"tokens":1300}},
+    {"case_id":"support-technical-v1","workflow_key":"business_support_fee","scenario":"technical_failure","source":{"kind":"contract_case","reference":"workflow-identity","version":"1.0.0"},"expected":{"outcome":"technical_failure","statuses":[],"stop_code":"workflow_identity_unknown"},"baseline":{"duration_ms":240,"tokens":160}},
+
+    {"case_id":"marketing-normal-v1","workflow_key":"small_marketing_fee","scenario":"normal","source":{"kind":"synthetic_baseline","reference":"flow-rule-pack","version":"1.0.0"},"expected":{"outcome":"pass","statuses":["✅","✅","✅","✅","✅"],"stop_code":null},"baseline":{"duration_ms":900,"tokens":1200}},
+    {"case_id":"marketing-warning-v1","workflow_key":"small_marketing_fee","scenario":"business_warning","source":{"kind":"contract_case","reference":"small-marketing-rule-pack","version":"1.0.0"},"expected":{"outcome":"business_warning","statuses":["✅","✅","✅","❌","✅"],"stop_code":null},"baseline":{"duration_ms":1000,"tokens":1300}},
+    {"case_id":"marketing-insufficient-v1","workflow_key":"small_marketing_fee","scenario":"evidence_insufficient","source":{"kind":"confirmed_feedback","reference":"F-003","version":"1.0.0"},"expected":{"outcome":"evidence_insufficient","statuses":["✅","⚠️","⚠️","⚠️","✅"],"stop_code":null},"baseline":{"duration_ms":1100,"tokens":1400}},
+    {"case_id":"marketing-technical-v1","workflow_key":"small_marketing_fee","scenario":"technical_failure","source":{"kind":"contract_case","reference":"authority-source","version":"1.0.0"},"expected":{"outcome":"technical_failure","statuses":[],"stop_code":"authority_source_unavailable"},"baseline":{"duration_ms":280,"tokens":200}},
+
+    {"case_id":"packaging-normal-v1","workflow_key":"packaging_layout_approval","scenario":"normal","source":{"kind":"synthetic_baseline","reference":"flow-rule-pack","version":"1.0.0"},"expected":{"outcome":"pass","statuses":["✅","✅","✅","✅"],"stop_code":null},"baseline":{"duration_ms":1300,"tokens":1700}},
+    {"case_id":"packaging-warning-v1","workflow_key":"packaging_layout_approval","scenario":"business_warning","source":{"kind":"confirmed_feedback","reference":"F-015","version":"1.0.0"},"expected":{"outcome":"business_warning","statuses":["❌","✅","✅","✅"],"stop_code":null},"baseline":{"duration_ms":1450,"tokens":1850}},
+    {"case_id":"packaging-insufficient-v1","workflow_key":"packaging_layout_approval","scenario":"evidence_insufficient","source":{"kind":"confirmed_feedback","reference":"F-018","version":"1.0.0"},"expected":{"outcome":"evidence_insufficient","statuses":["⚠️","✅","⚠️","✅"],"stop_code":null},"baseline":{"duration_ms":1550,"tokens":1950}},
+    {"case_id":"packaging-technical-v1","workflow_key":"packaging_layout_approval","scenario":"technical_failure","source":{"kind":"contract_case","reference":"image-readability","version":"1.0.0"},"expected":{"outcome":"technical_failure","statuses":[],"stop_code":"prepared_resource_unreadable"},"baseline":{"duration_ms":320,"tokens":240}}
+  ]
+}
