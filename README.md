@@ -122,6 +122,20 @@ python3 -m unittest discover -s tests/finance_preaudit -p 'test_*.py' -v
 
 团队规范要求 `main` 只接受满足质量门的 PR；但当前 GitHub 方案尚不支持私有仓库服务端分支保护，不能由平台强制禁止直接推送。实际状态和升级后的目标规则见[主分支保护状态](docs/agents/branch-protection.md)。CI 不读取真实 OA 凭据，也不启用生产自动化。
 
+## 并发调参建议
+
+`apps.oa_finance_preaudit.tuning` 按流程读取脱敏闭合指标和 golden replay 报告，只输出并发建议，不修改配置。每类至少 20 张闭合单据且 Token 完整、质量无回归、重复提交为零、错误率不超限后才评估；建议单次最多增加 1，单流程上限为 3，并保留一个共享实际槽位。
+
+```bash
+python3 -m apps.oa_finance_preaudit.tuning \
+  --histories /absolute/path/to/sanitized-histories.json \
+  --quality-report /absolute/path/to/golden-report.json \
+  --shared-reviewer-slots 4 \
+  --shared-submit-slots 4
+```
+
+输出包含样本窗口、P50/P95、等待占比、Token/单、错误率、重复提交率、假设、预期效果和回退条件。任何建议都需要另行小流量人工验收；不会自动启用生产任务。
+
 ## 验证
 
 ```bash
