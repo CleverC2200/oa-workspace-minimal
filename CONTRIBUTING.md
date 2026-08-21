@@ -16,7 +16,7 @@
 
 - 未完成或仍在探索的 PR 保持 Draft；验收标准和必要检查通过后再转 Ready。
 - 标题使用 Conventional Commit 风格。
-- 正文包含 `Closes #<issue>`、改动摘要、验证命令、风险和回退方式。
+- 正文必须且只能包含一个独立行 `Closes #<issue>`，并保留 `## 验证`、`## 风险与回退`、改动摘要和实际结果。
 - 不在 PR、Issue、截图或日志中暴露 requestId、附件正文、账号、内部地址、密钥或 Cookie。
 - 合并后确认关联 Issue 已关闭；若自动关闭失败，补充验收证据后手动关闭。
 
@@ -30,10 +30,14 @@
 常用完整验证：
 
 ```bash
-python3 /Users/synear/.codex/skills/.system/skill-creator/scripts/quick_validate.py \
-  .agents/skills/oa-finance-preaudit
+python3 -m scripts.quality skill
+python3 -m scripts.quality format
+python3 -m scripts.quality hygiene
+python3 -m scripts.quality links
 python3 -m unittest discover -s tests/finance_preaudit -p 'test_*.py' -v
-git diff --check
+python3 -m compileall -q apps scripts tests
 ```
 
-真实 OA 写入、自动化启停、仓库设置和发布均属于独立授权动作，测试通过不等于获得执行授权。
+GitHub `main` 要求通过名为 `quality` 的检查并经 PR 合并，禁止强推和删除；规则同时适用于管理员，不保留静默绕过。紧急变更仍应建立 Issue/PR 并保存验证与回退记录，如确需临时调整保护规则，必须在对应 Issue 留下原因、时间和恢复回执。
+
+真实 OA 写入、自动化启停和发布均属于独立授权动作，测试通过不等于获得执行授权。

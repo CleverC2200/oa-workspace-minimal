@@ -125,16 +125,27 @@ class ReadAdaptersContractTest(unittest.TestCase):
             source = root / "declared-as-jpeg.jpg"
             source.write_bytes(heic_bytes)
 
-            images, manifest, structured = attachment_extractors.prepare_materials(
-                [
-                    {
-                        "resource_id": "misnamed-heic",
-                        "name": "declared-as-jpeg.jpg",
-                        "path": str(source),
-                    }
-                ],
-                out_dir=root / "prepared",
-            )
+            def convert(path: Path, *, out_dir: Path, resource_id: str) -> Path:
+                self.assertEqual(path, source)
+                destination = out_dir / f"{resource_id}.png"
+                destination.write_bytes(b"\x89PNG\r\n\x1a\n")
+                return destination
+
+            with patch.object(
+                attachment_extractors,
+                "_convert_heic_to_png",
+                side_effect=convert,
+            ):
+                images, manifest, structured = attachment_extractors.prepare_materials(
+                    [
+                        {
+                            "resource_id": "misnamed-heic",
+                            "name": "declared-as-jpeg.jpg",
+                            "path": str(source),
+                        }
+                    ],
+                    out_dir=root / "prepared",
+                )
 
             converted = Path(str(images[0]["path"]))
             self.assertEqual(converted.suffix, ".png")
@@ -182,7 +193,11 @@ class ReadAdaptersContractTest(unittest.TestCase):
         self.assertEqual(structured, [])
 
     def test_pending_rows_are_fifo_and_missing_times_do_not_starve(self) -> None:
-        client = api.OaApi("recorded-token", "recorded-user")
+        client = api.OaApi(
+            "recorded-token",
+            "recorded-user",
+            base_url="https://oa.invalid",
+        )
         pages = [
             {
                 "data": [
@@ -220,7 +235,11 @@ class ReadAdaptersContractTest(unittest.TestCase):
         self.assertEqual(cases[1]["received_at"], "2026-08-01 09:01:00")
 
     def test_pending_rows_fail_closed_on_http_or_permission_error(self) -> None:
-        client = api.OaApi("recorded-token", "recorded-user")
+        client = api.OaApi(
+            "recorded-token",
+            "recorded-user",
+            base_url="https://oa.invalid",
+        )
 
         for payload in (
             {"http_status": 500, "error": "recorded"},

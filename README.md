@@ -108,6 +108,20 @@ python3 -m unittest tests.finance_preaudit.test_flow_evals -v
 
 外部离线结果也可通过 `python3 -m apps.oa_finance_preaudit.flow_evals --fixtures ... --actuals ...` 生成逐流程报告。样本不包含原始附件或业务身份，性能改善不得以准确性和格式回归为代价。
 
+## 代码质量门
+
+GitHub PR 的 `quality` 检查在无业务凭据环境运行 Skill 校验、文本格式、敏感文件/密钥扫描、Markdown 链接、PR 单 Issue 合同、Python 语法和完整离线测试。贡献者可在本地运行：
+
+```bash
+python3 -m scripts.quality skill
+python3 -m scripts.quality format
+python3 -m scripts.quality hygiene
+python3 -m scripts.quality links
+python3 -m unittest discover -s tests/finance_preaudit -p 'test_*.py' -v
+```
+
+`main` 只接受满足质量门的 PR，禁止强推和删除；详细规则见 [贡献指南](CONTRIBUTING.md)。CI 不读取真实 OA 凭据，也不启用生产自动化。
+
 ## 验证
 
 ```bash
