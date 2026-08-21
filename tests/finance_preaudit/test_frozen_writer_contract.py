@@ -4,9 +4,11 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 
 from apps.oa_approval import frozen_writer, runtime_control, writer_api
 
@@ -232,15 +234,7 @@ class FrozenWriterContractTests(unittest.TestCase):
 
         self.assertEqual(api.calls, [])
 
-    def test_active_writer_and_failed_postcheck_never_yield_success_receipt(self) -> None:
-        api = _RecordedWriterApi()
-        with runtime_control.writer_lease(self.lock_path):
-            with self.assertRaisesRegex(
-                frozen_writer.FrozenWriterError, "writer_already_active"
-            ):
-                self._submit(api)
-        self.assertEqual(api.calls, [])
-
+    def test_failed_postcheck_never_yields_success_receipt(self) -> None:
         failed_api = _RecordedWriterApi(
             {
                 "submit_ok": True,
@@ -249,7 +243,7 @@ class FrozenWriterContractTests(unittest.TestCase):
             }
         )
         with self.assertRaisesRegex(
-            frozen_writer.FrozenWriterError, "writer_postcheck_failed"
+            frozen_writer.FrozenWriterError, "writer_result_unknown"
         ):
             self._submit(failed_api)
         self.assertEqual(failed_api.calls, [(self.request_id, self.remark_text)])
@@ -257,6 +251,54 @@ class FrozenWriterContractTests(unittest.TestCase):
     def test_inactive_status_does_not_create_a_lock_artifact(self) -> None:
         self.assertFalse(runtime_control.writer_active(self.lock_path))
         self.assertFalse(self.lock_path.exists())
+
+    def test_same_request_concurrent_replay_writes_once(self) -> None:
+        class _SlowApi(_RecordedWriterApi):
+            def submit_and_verify(self, request_id: str, remark: str) -> dict:
+                time.sleep(0.05)
+                return super().submit_and_verify(request_id, remark)
+
+        api = _SlowApi()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            receipts = list(pool.map(lambda _index: self._submit(api), range(2)))
+
+        self.assertEqual(len(api.calls), 1)
+        self.assertEqual(receipts[0], receipts[1])
+
+    def test_unknown_postcheck_blocks_same_request_replay(self) -> None:
+        api = _RecordedWriterApi(
+            {"submit_ok": True, "done_hit": False, "postcheck_done_hit": False}
+        )
+        with self.assertRaisesRegex(
+            frozen_writer.FrozenWriterError, "writer_result_unknown"
+        ):
+            self._submit(api)
+        with self.assertRaisesRegex(
+            frozen_writer.FrozenWriterError, "writer_result_unknown"
+        ):
+            self._submit(api)
+
+        self.assertEqual(len(api.calls), 1)
+
+    def test_confirmed_no_write_failure_can_retry_same_request(self) -> None:
+        api = _RecordedWriterApi(
+            {"submit_ok": False, "done_hit": False, "postcheck_done_hit": False}
+        )
+
+        for _attempt in range(2):
+            with self.assertRaisesRegex(
+                frozen_writer.FrozenWriterError, "writer_submit_failed"
+            ):
+                self._submit(api)
+
+        self.assertEqual(len(api.calls), 2)
+
+    def test_request_lock_paths_are_isolated(self) -> None:
+        first = runtime_control.request_writer_lock_file("2639001", self.lock_path)
+        second = runtime_control.request_writer_lock_file("2639002", self.lock_path)
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(first.parent, second.parent)
 
 
 class FrozenWriterApiTests(unittest.TestCase):

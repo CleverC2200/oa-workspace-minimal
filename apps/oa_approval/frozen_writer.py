@@ -12,6 +12,7 @@ import uuid
 
 from apps.oa_approval import runtime_control
 from apps.oa_approval.writer_api import FrozenWriterApi, build_writer_api
+from apps.oa_finance_preaudit.json_artifact import write_json_atomic
 
 
 _REQUEST_ID = re.compile(r"^[0-9]{1,20}$")
@@ -85,7 +86,7 @@ def _validate_frozen_inputs(
     remark_fingerprint: str,
     remark_envelope_fingerprint: str,
     current_proof_fingerprint: str,
-) -> str:
+) -> tuple[str, Path]:
     if not _REQUEST_ID.fullmatch(request_id):
         raise FrozenWriterError("frozen_identity_mismatch")
     expected_isolation = hashlib.sha256(
@@ -110,7 +111,7 @@ def _validate_frozen_inputs(
     remark_path = _resolved_file(remark_file)
     envelope_path = _resolved_file(remark_envelope_file)
     proof_path = _resolved_file(current_proof_file)
-    _validate_attempt_paths(
+    attempt_root = _validate_attempt_paths(
         request_id=request_id,
         isolation_key=isolation_key,
         paths=(material_path, remark_path, envelope_path, proof_path),
@@ -179,7 +180,25 @@ def _validate_frozen_inputs(
         raise FrozenWriterError("frozen_remark_empty")
     if _UNRESOLVED.search(remark):
         raise FrozenWriterError("frozen_remark_unresolved")
-    return remark
+    return remark, attempt_root
+
+
+def _read_terminal_receipt(path: Path, *, request_id: str, submission_token: str) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    receipt, _raw = _read_json(path, code="writer_receipt_unreadable")
+    if (
+        str(receipt.get("request_id") or "") != request_id
+        or not secrets.compare_digest(
+            str(receipt.get("submission_token") or ""), submission_token
+        )
+        or receipt.get("write") is not True
+        or receipt.get("submit_ok") is not True
+        or receipt.get("done_hit") is not True
+        or receipt.get("postcheck_done_hit") is not True
+    ):
+        raise FrozenWriterError("writer_receipt_mismatch")
+    return receipt
 
 
 def submit_frozen(
@@ -204,9 +223,9 @@ def submit_frozen(
     if runtime_control.stop_requested():
         raise FrozenWriterError(runtime_control.STOP_CODE)
     try:
-        lease = runtime_control.writer_lease(lock_path)
+        lease = runtime_control.request_writer_lease(request_id, lock_path)
         with lease:
-            remark = _validate_frozen_inputs(
+            remark, attempt_root = _validate_frozen_inputs(
                 request_id=request_id,
                 received_at=received_at,
                 isolation_key=isolation_key,
@@ -219,28 +238,74 @@ def submit_frozen(
                 remark_envelope_fingerprint=remark_envelope_fingerprint,
                 current_proof_fingerprint=current_proof_fingerprint,
             )
+            receipt_path = attempt_root / "submission-receipt.json"
+            attempt_state_path = attempt_root / "submission-attempt.json"
+            request_key = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
+            token_key = hashlib.sha256(submission_token.encode("utf-8")).hexdigest()
+            prior_receipt = _read_terminal_receipt(
+                receipt_path,
+                request_id=request_id,
+                submission_token=submission_token,
+            )
+            if prior_receipt is not None:
+                return prior_receipt
+            if attempt_state_path.exists():
+                attempt_state, _raw = _read_json(
+                    attempt_state_path,
+                    code="writer_result_unknown",
+                )
+                if (
+                    attempt_state.get("schema_version") != 1
+                    or attempt_state.get("kind") != "preaudit_submission_attempt"
+                    or attempt_state.get("request_key") != request_key
+                    or attempt_state.get("submission_token_sha256") != token_key
+                    or attempt_state.get("status")
+                    not in {"calling", "unknown", "confirmed_no_write"}
+                ):
+                    raise FrozenWriterError("writer_result_unknown")
+                if attempt_state.get("status") in {"calling", "unknown"}:
+                    raise FrozenWriterError("writer_result_unknown")
+            attempt_state = {
+                "schema_version": 1,
+                "kind": "preaudit_submission_attempt",
+                "request_key": request_key,
+                "submission_token_sha256": token_key,
+                "status": "calling",
+            }
+            write_json_atomic(attempt_state_path, attempt_state)
             result = (api or build_writer_api()).submit_and_verify(request_id, remark)
+            if result.get("submit_ok") is not True:
+                write_json_atomic(
+                    attempt_state_path,
+                    {**attempt_state, "status": "confirmed_no_write"},
+                )
+                raise FrozenWriterError("writer_submit_failed")
+            if (
+                result.get("done_hit") is not True
+                or result.get("postcheck_done_hit") is not True
+            ):
+                write_json_atomic(
+                    attempt_state_path,
+                    {**attempt_state, "status": "unknown"},
+                )
+                raise FrozenWriterError("writer_result_unknown")
+            receipt = {
+                "request_id": request_id,
+                "submission_token": submission_token,
+                "run_id": f"frozen-{uuid.uuid4().hex}",
+                "write": True,
+                "submit_ok": True,
+                "done_hit": True,
+                "postcheck_done_hit": True,
+            }
+            write_json_atomic(receipt_path, receipt)
+            attempt_state_path.unlink(missing_ok=True)
+            return receipt
     except RuntimeError as error:
         code = str(error)
         if code == "writer_already_active":
             raise FrozenWriterError(code) from error
         raise
-    if result.get("submit_ok") is not True:
-        raise FrozenWriterError("writer_submit_failed")
-    if (
-        result.get("done_hit") is not True
-        or result.get("postcheck_done_hit") is not True
-    ):
-        raise FrozenWriterError("writer_postcheck_failed")
-    return {
-        "request_id": request_id,
-        "submission_token": submission_token,
-        "run_id": f"frozen-{uuid.uuid4().hex}",
-        "write": True,
-        "submit_ok": True,
-        "done_hit": True,
-        "postcheck_done_hit": True,
-    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -267,7 +332,17 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "status":
-        print(json.dumps({"ok": True, "active_run": runtime_control.writer_active()}))
+        active_count = runtime_control.active_request_writers()
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "lock_scope": "request_id",
+                    "active_run": active_count > 0,
+                    "active_count": active_count,
+                }
+            )
+        )
         return 0
     try:
         receipt = submit_frozen(

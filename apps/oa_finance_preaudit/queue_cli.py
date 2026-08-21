@@ -102,12 +102,6 @@ def _build_current_proof(
         raise elastic_queue.QueueContractError("current_proof_path_mismatch")
     target.unlink(missing_ok=True)
 
-    next_item = elastic_queue.next_submit(state_path)
-    if str(next_item.get("request_id") or "") != str(request_id):
-        raise elastic_queue.QueueContractError("fifo_head_mismatch")
-    if next_item.get("status") != "ready":
-        raise elastic_queue.QueueContractError("fifo_head_not_prepared")
-
     production_matches = [
         item
         for item in _rows(_read_json(production_list), "items")
@@ -151,33 +145,6 @@ def _decode_writer_output(stdout: str) -> dict:
     return output
 
 
-def _require_writer_inactive(production_root: str) -> None:
-    command = [
-        sys.executable,
-        "-m",
-        "apps.oa_approval.frozen_writer",
-        "status",
-    ]
-    try:
-        completed = subprocess.run(
-            command,
-            cwd=str(Path(production_root).expanduser().resolve()),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError as error:
-        raise elastic_queue.QueueContractError("writer_status_unavailable") from error
-    try:
-        status = json.loads(completed.stdout)
-    except json.JSONDecodeError as error:
-        raise elastic_queue.QueueContractError("writer_status_unavailable") from error
-    if completed.returncode != 0 or not isinstance(status, dict):
-        raise elastic_queue.QueueContractError("writer_status_unavailable")
-    if status.get("active_run") is not False:
-        raise elastic_queue.QueueContractError("writer_already_active")
-
-
 def _submit_frozen_once(
     *,
     state_path: Path,
@@ -186,7 +153,6 @@ def _submit_frozen_once(
     pending_list: str,
     production_root: str,
 ) -> dict:
-    _require_writer_inactive(production_root)
     expected = elastic_queue.request_paths(state_path, request_id)
     proof_path = Path(expected["request_root"]) / "current-proof.json"
     _build_current_proof(

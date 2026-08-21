@@ -413,37 +413,9 @@ class ElasticQueueCliTest(unittest.TestCase):
                 production_root=str(production_root),
             )
 
-        self.assertEqual(events, ["status", "proof", "begin", "frozen-writer", "close"])
+        self.assertEqual(events, ["proof", "begin", "frozen-writer", "close"])
         self.assertEqual(result["state"], "submitted")
         self.assertTrue(result["postcheck_done_hit"])
-
-    def test_submit_frozen_once_checks_inactive_writer_before_issuing_token(self) -> None:
-        with (
-            patch.object(
-                queue_cli.subprocess,
-                "run",
-                return_value=queue_cli.subprocess.CompletedProcess(
-                    [],
-                    0,
-                    stdout=json.dumps({"ok": True, "active_run": True}),
-                    stderr="",
-                ),
-            ),
-            patch.object(queue_cli.elastic_queue, "begin_submit") as begin,
-        ):
-            with self.assertRaisesRegex(
-                queue_cli.elastic_queue.QueueContractError,
-                "writer_already_active",
-            ):
-                queue_cli._submit_frozen_once(
-                    state_path=self.state,
-                    request_id="2625001",
-                    production_list=str(self.root / "production.json"),
-                    pending_list=str(self.root / "pending.json"),
-                    production_root=str(self.root),
-                )
-
-        begin.assert_not_called()
 
     def test_submit_frozen_once_never_closes_unreadable_writer_output(self) -> None:
         request_root = self.root / "requests" / "2625001" / "attempt-1"
@@ -485,16 +457,8 @@ class ElasticQueueCliTest(unittest.TestCase):
             patch.object(
                 queue_cli.subprocess,
                 "run",
-                side_effect=(
-                    queue_cli.subprocess.CompletedProcess(
-                        [],
-                        0,
-                        stdout=json.dumps({"ok": True, "active_run": False}),
-                        stderr="",
-                    ),
-                    queue_cli.subprocess.CompletedProcess(
-                        [], 0, stdout="not-json", stderr=""
-                    ),
+                return_value=queue_cli.subprocess.CompletedProcess(
+                    [], 0, stdout="not-json", stderr=""
                 ),
             ),
             patch.object(queue_cli.elastic_queue, "mark_submitted") as close,
@@ -553,14 +517,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             patch.object(
                 queue_cli.subprocess,
                 "run",
-                side_effect=(
-                    queue_cli.subprocess.CompletedProcess(
-                        [],
-                        0,
-                        stdout=json.dumps({"ok": True, "active_run": False}),
-                        stderr="",
-                    ),
-                    queue_cli.subprocess.CompletedProcess(
+                return_value=queue_cli.subprocess.CompletedProcess(
                         [],
                         0,
                         stdout=json.dumps(
@@ -577,7 +534,6 @@ class ElasticQueueCliTest(unittest.TestCase):
                             }
                         ),
                         stderr="",
-                    ),
                 ),
             ),
             patch.object(queue_cli.elastic_queue, "mark_submitted") as close,

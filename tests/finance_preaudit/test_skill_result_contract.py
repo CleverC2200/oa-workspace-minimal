@@ -276,14 +276,15 @@ class SkillResultContractTest(unittest.TestCase):
         self.assertIn("积压未清空时不得因固定时长停止新增 claim", self.controller_contract)
         self.assertIn("滚动检查点", self.controller_contract)
 
-    def test_backlog_mode_uses_three_reviewers_but_keeps_one_writer(self):
+    def test_backlog_mode_uses_bounded_review_and_submit_pools(self):
         self.assertIn("普通池最多 3 个单据审核 Agent", self.automation_batch_contract)
         self.assertIn("包装准确性协调位独立计算", self.automation_batch_contract)
         self.assertIn("实际可用槽位", self.automation_batch_contract)
         self.assertIn("唯一 OA 写入入口", self.automation_batch_contract)
         self.assertIn("等待下一小时刷新", self.automation_batch_contract)
         self.assertIn("低待办时不启动十分钟心跳", self.automation_batch_contract)
-        self.assertIn("OA 提交必须串行", self.automation_batch_contract)
+        self.assertIn("不同 requestId 可以并发", self.automation_batch_contract)
+        self.assertIn("同一 requestId 使用 requestId 级锁", self.automation_batch_contract)
         self.assertIn("剩余候选", self.automation_batch_contract)
 
     def test_frozen_writer_rechecks_attempt_identity_without_reading_attachments(self):
@@ -292,13 +293,10 @@ class SkillResultContractTest(unittest.TestCase):
         self.assertIn("四份 SHA-256", self.automation_batch_contract)
         self.assertIn("Writer 不读取附件正文", self.automation_batch_contract)
 
-    def test_fifo_head_race_is_rechecked_before_any_submission_token(self):
-        self.assertIn("队列刷新竞争", self.automation_batch_contract)
-        self.assertIn("目标已不再是实时队首", self.automation_batch_contract)
-        self.assertIn("该项没有 submission_token", self.automation_batch_contract)
-        self.assertIn("基于新 generation 和新的双源 JSON", self.automation_batch_contract)
-        self.assertIn("第二次仍不匹配时保持 prepared", self.automation_batch_contract)
-        self.assertIn("禁止把单据转 blocked", self.automation_batch_contract)
+    def test_request_identity_is_rechecked_before_any_submission_token(self):
+        self.assertIn("版本、待办身份或冻结指纹变化", self.automation_batch_contract)
+        self.assertIn("只保持该项 prepared", self.automation_batch_contract)
+        self.assertIn("不影响池内其他 requestId", self.automation_batch_contract)
 
     def test_begin_submit_handoff_cannot_yield_before_writer_launch(self):
         self.assertIn(
@@ -367,7 +365,7 @@ class SkillResultContractTest(unittest.TestCase):
         self.assertIn("发送审核任务后不得结束当前 epoch", self.automation_batch_contract)
         self.assertIn("wait_threads", self.automation_batch_contract)
         self.assertIn("任一审核 Agent 完成", self.automation_batch_contract)
-        self.assertIn("继续补充审核池并推进 FIFO", self.automation_batch_contract)
+        self.assertIn("提交当前全部可执行 prepared 单据", self.automation_batch_contract)
 
     def test_controller_uses_rolling_checkpoints_without_stopping_backlog(self):
         self.assertIn("滚动调度 Goal", self.automation_batch_contract)
@@ -378,13 +376,13 @@ class SkillResultContractTest(unittest.TestCase):
         self.assertIn("update_goal(status=complete)", self.automation_batch_contract)
         self.assertIn("单次不超过 60 秒", self.automation_batch_contract)
 
-    def test_automation_batch_processes_candidates_fifo(self):
+    def test_automation_batch_orders_claims_without_cross_request_submit_dependency(self):
         self.assertIn("list-pending", self.automation_batch_contract)
         self.assertIn("submitted_at 从早到晚", self.automation_batch_contract)
         self.assertIn("received_at", self.automation_batch_contract)
         self.assertIn("requestId 升序", self.automation_batch_contract)
         self.assertIn("缺失提交时间的候选优先", self.automation_batch_contract)
-        self.assertIn("不得跳过队首", self.automation_batch_contract)
+        self.assertIn("跨单据不建立写入依赖", self.automation_batch_contract)
 
     def test_automation_batch_deduplicates_unchanged_blocks_across_goals(self):
         self.assertIn("跨轮阻断索引", self.automation_batch_contract)
@@ -394,7 +392,7 @@ class SkillResultContractTest(unittest.TestCase):
         self.assertIn("不得重新分配", self.automation_batch_contract)
         self.assertIn("received_at 变化", self.automation_batch_contract)
 
-    def test_elastic_preparation_has_isolated_leases_and_one_writer(self):
+    def test_elastic_preparation_and_submission_are_request_isolated(self):
         self.assertIn("不得生成、修正或推断财务结论", self.automation_batch_contract)
         self.assertIn("全新原生审核 Agent 按 Skill 完成", self.automation_batch_contract)
         self.assertIn("当天控制台", self.automation_batch_contract)
@@ -408,7 +406,7 @@ class SkillResultContractTest(unittest.TestCase):
         self.assertIn("差旅保留通道", self.automation_batch_contract)
         self.assertIn("非差旅财务保留通道", self.automation_batch_contract)
         self.assertIn("2–19 条保持 2 个", self.automation_batch_contract)
-        self.assertIn("contiguous_prepared_depth < 2", self.automation_batch_contract)
+        self.assertIn("prepared 缓冲不足", self.automation_batch_contract)
         self.assertIn("第 3 槽", self.automation_batch_contract)
         self.assertIn("实际可用槽位", self.automation_batch_contract)
         self.assertIn("小时调度任务只等待控制台反馈", self.automation_batch_contract)
@@ -416,7 +414,7 @@ class SkillResultContractTest(unittest.TestCase):
         self.assertIn("当天控制台", self.automation_batch_contract)
         self.assertIn("兼任跨线程只读监控", self.automation_batch_contract)
         self.assertIn("不启动十分钟模型心跳或独立常驻监控任务", self.automation_batch_contract)
-        self.assertIn("全局 FIFO", self.automation_batch_contract)
+        self.assertIn("跨单据不建立写入依赖", self.automation_batch_contract)
         self.assertIn("窄 `frozen_writer submit` 是唯一 OA 写入入口", self.automation_batch_contract)
         self.assertIn("mark-submit-failed --confirm-no-write YES", self.automation_batch_contract)
         self.assertIn("active_run=false", self.automation_batch_contract)
@@ -607,8 +605,7 @@ class SkillResultContractTest(unittest.TestCase):
     def test_backlog_reserves_reviewers_before_visual_observers(self):
         self.assertIn("积压达到 20 条", self.automation_batch_contract)
         self.assertIn("差旅和非差旅财务两个保留槽", self.automation_batch_contract)
-        self.assertIn("全局 FIFO 队首所属通道优先", self.automation_batch_contract)
-        self.assertIn("最后才比较通道积压", self.automation_batch_contract)
+        self.assertIn("等待最久且缓冲不足的通道", self.automation_batch_contract)
         self.assertIn("只有命中风险条件的独立复核", self.automation_batch_contract)
         self.assertIn("任一审核或观察 Agent 状态变化", self.automation_batch_contract)
         self.assertIn("重新计算三类通道", self.automation_batch_contract)
@@ -648,7 +645,7 @@ class SkillResultContractTest(unittest.TestCase):
     def test_writer_reconciliation_binds_one_process_and_receipt_to_one_token(self):
         self.assertIn("每个 submission token 只能对应一个", self.automation_batch_contract)
         self.assertIn("一个终态回执", self.automation_batch_contract)
-        self.assertIn("两个终态回执", self.automation_batch_contract)
+        self.assertIn("冲突终态", self.automation_batch_contract)
 
     def test_postcheck_requires_submit_handled_hit_and_pending_absence(self):
         self.assertIn("提交接口成功", self.automation_batch_contract)
@@ -747,7 +744,7 @@ class SkillResultContractTest(unittest.TestCase):
     def test_dispatcher_and_writer_contracts_have_narrow_authority(self):
         self.assertIn("不得 claim", self.dispatcher_contract)
         self.assertIn("不得读取附件", self.dispatcher_contract)
-        self.assertIn("唯一写入器", self.writer_contract)
+        self.assertIn("按请求隔离", self.writer_contract)
         self.assertIn("不得执行审核判断", self.writer_contract)
         self.assertIn("role_cli writer release-manifest", self.writer_contract)
         self.assertIn("--project-root /Users/synear/HermesWorkspace/profiles/oa/projects/oa-workspace-minimal", self.writer_contract)
@@ -786,7 +783,7 @@ class SkillResultContractTest(unittest.TestCase):
     def test_generation_change_after_assignment_is_audit_only_not_a_failure(self):
         self.assertIn("只接收 `reviewer` 角色指纹", self.automation_batch_contract)
         self.assertIn("处理中才发现代际变化", self.automation_batch_contract)
-        self.assertIn("不得重取证或改变 FIFO", self.automation_batch_contract)
+        self.assertIn("不得重取证", self.automation_batch_contract)
         self.assertIn("`generation_transition=natural_close_old`", self.automation_batch_contract)
 
     def test_old_epoch_stops_new_claims_after_a_skill_release(self):
@@ -974,7 +971,7 @@ class SkillResultContractTest(unittest.TestCase):
             "非差旅财务保留通道",
             "不得被差旅积压占用",
             "包装准确性通道",
-            "全局 FIFO 串行提交",
+            "不同 requestId 可由有界提交池并发",
         ):
             self.assertIn(text, self.automation_batch_contract)
         self.assertIn("--lane", self.controller_contract)

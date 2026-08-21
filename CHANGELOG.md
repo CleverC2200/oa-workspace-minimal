@@ -11,6 +11,7 @@
 ### Changed
 
 - 将五类流程拆成独立规则包；Reviewer 在确认 `workflow_key` 后只加载当前流程规则和样本。
+- 将 OA 提交从全局 Writer 锁收紧为 requestId 级单飞和有界并发提交池。
 
 ## 1.1.0 - 2026-08-21
 

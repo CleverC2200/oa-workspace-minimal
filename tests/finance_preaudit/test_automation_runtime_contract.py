@@ -30,7 +30,8 @@ class AutomationRuntimeContractTests(unittest.TestCase):
         self.assertIn("控制与写入分离", contract)
         self.assertIn("窄 `frozen_writer submit` 是唯一 OA 写入入口", contract)
         self.assertIn("审核 Agent 可以并行", contract)
-        self.assertIn("单据级阻断闭合当前队首后继续 FIFO", contract)
+        self.assertIn("不同 requestId 可进入有界提交池", contract)
+        self.assertIn("同一 requestId 始终单飞", contract)
         self.assertIn("不新增逐命令授权", contract)
         self.assertIn("不得反复弹出授权", contract)
         self.assertIn("在领取新租约前报告", contract)
@@ -186,7 +187,7 @@ class AutomationRuntimeContractTests(unittest.TestCase):
         self.assertIn("OPEN_OP|", contract)
         self.assertIn("归档补偿独立于控制台发现", contract)
         self.assertIn("不以 `idle` 或 `notLoaded`", contract)
-        self.assertIn("归档失败不阻断 FIFO", contract)
+        self.assertIn("归档失败不阻断控制台发现", contract)
 
     def test_native_reviewer_agents_are_not_treated_as_archivable_app_threads(self) -> None:
         contract = (
@@ -213,7 +214,7 @@ class AutomationRuntimeContractTests(unittest.TestCase):
             / "controller-contract.md"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("普通财务 Reviewer 和唯一 Writer 都使用原生子 Agent", contract)
+        self.assertIn("普通财务 Reviewer 和 Writer 都使用原生子 Agent", contract)
         self.assertIn("`spawn_agent`", contract)
         self.assertIn("`wait_agent`", contract)
         self.assertIn("包装关键文字通道例外使用独立可见任务", contract)
