@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+### Changed
+
+- 将五类流程拆成独立规则包；Reviewer 在确认 `workflow_key` 后只加载当前流程规则和样本。
+
 ## 1.1.0 - 2026-08-21
 
 ### Added

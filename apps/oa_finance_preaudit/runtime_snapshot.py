@@ -35,6 +35,11 @@ DEFAULT_ROLE_FILES: Mapping[str, tuple[str, ...]] = {
     ),
     "reviewer": (
         ".agents/skills/oa-finance-preaudit/SKILL.md",
+        ".agents/skills/oa-finance-preaudit/references/flows/business-entertainment.md",
+        ".agents/skills/oa-finance-preaudit/references/flows/business-support-fee.md",
+        ".agents/skills/oa-finance-preaudit/references/flows/packaging-layout-approval.md",
+        ".agents/skills/oa-finance-preaudit/references/flows/small-marketing-fee.md",
+        ".agents/skills/oa-finance-preaudit/references/flows/travel-expense.md",
         ".agents/skills/oa-finance-preaudit/references/reviewer-contract.md",
         ".agents/skills/oa-finance-preaudit/references/result-contract.md",
         ".agents/skills/oa-finance-preaudit/references/observation-contract.md",

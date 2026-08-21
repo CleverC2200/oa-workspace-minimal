@@ -27,7 +27,7 @@
       "incorrect_output": "❌ 报销周期：消费日期不在申报周期内",
       "expected_output": "✅ 报销周期：实际行程日期均位于申报周期内；消费或下单日期不作为行程日期",
       "failure_mode": "把交易日期误当作实际行程日期",
-      "rule_ref": "result-contract.md#差旅第-1-项判定细则"
+      "rule_ref": "flows/travel-expense.md#差旅第-1-项判定细则"
     },
     {
       "id": "RC-003-resident-district-reported-cross-region",
@@ -42,7 +42,7 @@
       "incorrect_output": "⚠️ 跨区域带车：待核实地点包括城市A、区县A1",
       "expected_output": "先把城市A和明确所属区县A1纳入常驻地集合并排除，再核对剩余跨区域候选",
       "failure_mode": "未识别常驻城市与所属区县的行政关系",
-      "rule_ref": "result-contract.md#差旅第-2456-项判定细则"
+      "rule_ref": "flows/travel-expense.md#差旅第-2456-项判定细则"
     },
     {
       "id": "RC-004-refund-not-netted-from-payment",
@@ -57,7 +57,7 @@
       "incorrect_output": "按481.40元作为实际支付金额参与孰低比较",
       "expected_output": "实际支付金额为481.40-45.00=436.40元，再与发票和申报金额取最低值",
       "failure_mode": "识别到退款但没有抵减实际支付",
-      "rule_ref": "result-contract.md#业务招待费报销申请流程"
+      "rule_ref": "flows/business-entertainment.md#判定规则"
     },
     {
       "id": "RC-005-hotel-name-used-as-address",
@@ -72,7 +72,7 @@
       "incorrect_output": "❌ 住宿与考勤：酒店位于区域B，考勤位于区域A",
       "expected_output": "✅ 住宿与考勤：按酒店详情完整地址核对，住宿与考勤均位于区域A",
       "failure_mode": "把酒店名称或预订摘要中的区域字样当作酒店地址",
-      "rule_ref": "result-contract.md#差旅第-2456-项判定细则"
+      "rule_ref": "flows/travel-expense.md#差旅第-2456-项判定细则"
     },
     {
       "id": "RC-006-fully-reversed-hotels-counted-as-stays",
@@ -88,7 +88,7 @@
       "incorrect_output": "把已全额冲销的酒店订单计入住宿夜数和住宿地点比较",
       "expected_output": "三组全额冲销订单均排除，不计住宿夜数，也不参与住宿与考勤地点比较",
       "failure_mode": "未在住宿判断前配对酒店正负明细",
-      "rule_ref": "result-contract.md#差旅第-2456-项判定细则"
+      "rule_ref": "flows/travel-expense.md#差旅第-2456-项判定细则"
     },
     {
       "id": "RC-007-rpa-mileage-used-without-image-review",
@@ -102,7 +102,7 @@
       "incorrect_output": "❌ 油补：直接采用旧RPA差值判定申报里程不一致",
       "expected_output": "回到当前流程绑定的原始照片读取起止原值并重新计算；无法稳定辨认时输出⚠️，不编造正确里程",
       "failure_mode": "把旧RPA或OCR差值当作权威事实",
-      "rule_ref": "result-contract.md#差旅第-2456-项判定细则"
+      "rule_ref": "flows/travel-expense.md#差旅第-2456-项判定细则"
     },
     {
       "id": "RC-008-budget-missing-treated-as-unresolved",
@@ -116,7 +116,7 @@
       "incorrect_output": "⚠️ 预算：缺少预算数据，需人工判断",
       "expected_output": "✅ 预算：当前阶段按既定策略暂不校验，OA 暂未提供预算数据",
       "failure_mode": "把已确认的阶段性放过口径仍输出为证据不足",
-      "rule_ref": "result-contract.md#业务招待费报销申请流程"
+      "rule_ref": "flows/business-entertainment.md#判定规则;flows/business-support-fee.md#判定规则"
     },
     {
       "id": "RC-009-multiple-payments-not-summed",
@@ -131,7 +131,7 @@
       "incorrect_output": "⚠️ 金额孰低核销：多笔支付凭证无法可靠汇总，需人工核实",
       "expected_output": "❌ 金额孰低核销：实际支付合计2651.76元，低于申报和发票2667.00元，差额15.24元",
       "failure_mode": "同一明细存在多张支付凭证时放弃逐张核实和求和",
-      "rule_ref": "result-contract.md#业务招待费报销申请流程"
+      "rule_ref": "flows/business-entertainment.md#判定规则"
     },
         {
             "id": "RC-010-flow-number-lookup-removed",
@@ -160,7 +160,7 @@
             "incorrect_output": "把两份精确重复凭证表述成两条明细各有一笔独立支付，或在总额中重复计算58.40元",
             "expected_output": "将两条拆分明细建立为同一支付分组，实付58.40元只计一次，并明确写出55.40+3.00=58.40元",
             "failure_mode": "没有区分附件资源数量、明细数量和不同支付事实数量",
-            "rule_ref": "result-contract.md#业务招待费报销申请流程"
+            "rule_ref": "flows/business-entertainment.md#判定规则"
         },
         {
             "id": "RC-012-packaging-generic-three-item-template",
@@ -174,7 +174,7 @@
             "incorrect_output": "使用包装图片文字、重复与版面文字、图片与Excel一致性三个通用项目，未按四块内容分别说明",
             "expected_output": "固定输出配料信息、过敏原信息、营养成分表信息、地址信息四项，并把图片文字及Excel差异归入对应项目",
             "failure_mode": "输出模板按异常类型分组，导致业务需要的四块内容覆盖不可见",
-            "rule_ref": "result-contract.md#包装新制更改及包装版面审批流程"
+            "rule_ref": "flows/packaging-layout-approval.md#审核范围"
         },
         {
             "id": "RC-013-packaging-no-excel-blanket-warning",
@@ -189,7 +189,7 @@
             "incorrect_output": "仅因未提供Excel或字号较小，把配料、过敏原、营养成分表和地址四项统一标为需人工判断",
             "expected_output": "完整下载并观察每张原图，完成G0-G4后按实际图片异常逐项签字；无Excel只需明确未执行Excel对照，不影响图片自身校对结论",
             "failure_mode": "把缺少可选对照源误当成图片无法判断，并在实际像素观察前过早收口",
-            "rule_ref": "result-contract.md#包装新制更改及包装版面审批流程"
+            "rule_ref": "flows/packaging-layout-approval.md#审核范围"
         },
         {
             "id": "RC-014-packaging-excel-notice-repeated",
@@ -204,7 +204,7 @@
             "incorrect_output": "在四个固定审核项中重复写本次未提供Excel、未执行Excel对照",
             "expected_output": "四项只写各自图片结论，在四项之后单独写一次Excel对照：本次未提供Excel，未执行Excel对照",
             "failure_mode": "把同一Excel来源状态复制到多个审核项，造成意见冗余",
-            "rule_ref": "result-contract.md#包装新制更改及包装版面审批流程"
+            "rule_ref": "flows/packaging-layout-approval.md#审核范围"
         },
         {
             "id": "RC-015-packaging-full-text-overcontrol",

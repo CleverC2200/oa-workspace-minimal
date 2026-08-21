@@ -1,7 +1,10 @@
 import json
 import re
+import tempfile
 import unittest
 from pathlib import Path
+
+from apps.oa_finance_preaudit import elastic_queue
 
 
 RESULT_CONTRACT = (
@@ -30,6 +33,58 @@ PACKAGING_OUTPUT_CONTRACT = (
     / "references"
     / "output-contract.md"
 )
+FLOW_RULE_PACKS = {
+    "travel_expense": RESULT_CONTRACT.parent / "flows" / "travel-expense.md",
+    "business_entertainment": (
+        RESULT_CONTRACT.parent / "flows" / "business-entertainment.md"
+    ),
+    "business_support_fee": (
+        RESULT_CONTRACT.parent / "flows" / "business-support-fee.md"
+    ),
+    "small_marketing_fee": (
+        RESULT_CONTRACT.parent / "flows" / "small-marketing-fee.md"
+    ),
+    "packaging_layout_approval": (
+        RESULT_CONTRACT.parent / "flows" / "packaging-layout-approval.md"
+    ),
+}
+FLOW_ITEM_NAMES = {
+    "travel_expense": (
+        "报销周期",
+        "出差与住宿天数",
+        "公共交通",
+        "住宿与考勤",
+        "跨区域带车",
+        "油补",
+        "个人垫付车票",
+        "发票购买方",
+    ),
+    "business_entertainment": (
+        "附件完整性/支付证据",
+        "发票关联",
+        "预算",
+        "金额孰低核销",
+    ),
+    "business_support_fee": (
+        "附件完整性",
+        "业务事项合规性",
+        "预算校验",
+        "金额孰低核销",
+    ),
+    "small_marketing_fee": (
+        "预算科目",
+        "附件完整性",
+        "费用承担主体",
+        "SAP 客户编码匹配",
+        "金额孰低核销",
+    ),
+    "packaging_layout_approval": (
+        "配料信息",
+        "过敏原信息",
+        "营养成分表信息",
+        "地址信息",
+    ),
+}
 
 
 class SkillResultContractTest(unittest.TestCase):
@@ -51,53 +106,126 @@ class SkillResultContractTest(unittest.TestCase):
         cls.packaging_output_contract = PACKAGING_OUTPUT_CONTRACT.read_text(
             encoding="utf-8"
         )
+        cls.flow_contracts = {
+            workflow_key: path.read_text(encoding="utf-8")
+            for workflow_key, path in FLOW_RULE_PACKS.items()
+        }
+        cls.travel_contract = cls.flow_contracts["travel_expense"]
+        cls.entertainment_contract = cls.flow_contracts["business_entertainment"]
+        cls.small_marketing_contract = cls.flow_contracts["small_marketing_fee"]
+        cls.packaging_contract = cls.flow_contracts["packaging_layout_approval"]
+
+    def test_each_workflow_has_one_isolated_rule_pack(self):
+        self.assertEqual(set(FLOW_RULE_PACKS), set(FLOW_ITEM_NAMES))
+        unique_markers = {
+            "travel_expense": "报销周期",
+            "business_entertainment": "附件完整性/支付证据",
+            "business_support_fee": "业务事项合规性",
+            "small_marketing_fee": "SAP 客户编码匹配",
+            "packaging_layout_approval": "配料信息",
+        }
+        for workflow_key, path in FLOW_RULE_PACKS.items():
+            with self.subTest(workflow_key=workflow_key):
+                self.assertTrue(path.is_file(), path)
+                contract = path.read_text(encoding="utf-8")
+                self.assertIn(f"`workflow_key={workflow_key}`", contract)
+                self.assertIn("## 固定审核项", contract)
+                item_names = tuple(
+                    re.findall(
+                        r"^[1-9][0-9]*\. ([^：；。\n]+)[：；。].*$",
+                        contract,
+                        re.MULTILINE,
+                    )
+                )
+                self.assertEqual(item_names, FLOW_ITEM_NAMES[workflow_key])
+                for other_key, marker in unique_markers.items():
+                    if other_key != workflow_key:
+                        self.assertNotIn(marker, contract)
+
+    def test_shared_result_contract_is_only_the_common_interface_and_router(self):
+        for path in FLOW_RULE_PACKS.values():
+            relative = path.relative_to(RESULT_CONTRACT.parent).as_posix()
+            self.assertIn(f"({relative})", self.contract)
+        for flow_specific_rule in (
+            "差旅第 1 项判定细则",
+            "同一支付事实覆盖多条拆分明细",
+            "SAP 主数据接口未接入",
+            "每一版包装图片都必须输出上述四项",
+        ):
+            self.assertNotIn(flow_specific_rule, self.contract)
+
+    def test_reviewer_loads_only_the_material_workflow_rule_pack(self):
+        self.assertIn("材料中的 `workflow_key`", self.reviewer_contract)
+        self.assertIn("只读取该 `workflow_key` 对应的一个流程规则包", self.reviewer_contract)
+        self.assertIn("不得读取其他流程规则包", self.reviewer_contract)
+
+    def test_each_flow_rule_pack_matches_the_runtime_output_contract(self):
+        for workflow_key, item_names in FLOW_ITEM_NAMES.items():
+            with self.subTest(workflow_key=workflow_key), tempfile.TemporaryDirectory() as temporary:
+                remark = Path(temporary) / "remark.txt"
+                lines = ["AI审核结论：可提交 ✅"]
+                lines.extend(
+                    f"✅ {index}、{item_name}：符合。"
+                    for index, item_name in enumerate(item_names, start=1)
+                )
+                if workflow_key == "packaging_layout_approval":
+                    lines.append("Excel 对照：本次未提供 Excel，未执行 Excel 对照。")
+                remark.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+                result = elastic_queue.validate_remark_file(
+                    remark,
+                    expected_path=remark,
+                    expected_flow_key=workflow_key,
+                )
+
+                self.assertTrue(result["remark_fingerprint"].startswith("sha256:"))
 
     def test_travel_period_uses_actual_travel_date_not_transaction_date(self):
-        self.assertIn("实际行程日期", self.contract)
-        self.assertIn("消费日期、下单日期、支付日期和开票日期", self.contract)
-        self.assertIn("不得仅因缺少结构化“报销期间”降为 `⚠️`", self.contract)
+        self.assertIn("实际行程日期", self.travel_contract)
+        self.assertIn("消费日期、下单日期、支付日期和开票日期", self.travel_contract)
+        self.assertIn("不得仅因缺少结构化“报销期间”降为 `⚠️`", self.travel_contract)
 
     def test_cross_region_candidates_exclude_resident_locations(self):
-        self.assertIn("常驻地集合", self.contract)
-        self.assertIn("跨区域候选集合", self.contract)
-        self.assertIn("不得进入跨区域候选集合", self.contract)
+        self.assertIn("常驻地集合", self.travel_contract)
+        self.assertIn("跨区域候选集合", self.travel_contract)
+        self.assertIn("不得进入跨区域候选集合", self.travel_contract)
 
     def test_fully_reversed_hotel_booking_is_not_stay_evidence(self):
-        self.assertIn("正负金额绝对值相等且净额为 0", self.contract)
-        self.assertIn("不计入住宿夜数", self.contract)
-        self.assertIn("不得参与住宿与考勤地点比较", self.contract)
-        self.assertIn("部分退款", self.contract)
+        self.assertIn("正负金额绝对值相等且净额为 0", self.travel_contract)
+        self.assertIn("不计入住宿夜数", self.travel_contract)
+        self.assertIn("不得参与住宿与考勤地点比较", self.travel_contract)
+        self.assertIn("部分退款", self.travel_contract)
 
     def test_hotel_location_uses_detail_address_not_booking_summary(self):
-        self.assertIn("酒店详情页完整地址", self.contract)
-        self.assertIn("费用说明中的城市、入住区间和夜数只是预订摘要", self.contract)
-        self.assertIn("酒店名称括号内的商圈、门店或区域字样", self.contract)
+        self.assertIn("酒店详情页完整地址", self.travel_contract)
+        self.assertIn("费用说明中的城市、入住区间和夜数只是预订摘要", self.travel_contract)
+        self.assertIn("酒店名称括号内的商圈、门店或区域字样", self.travel_contract)
 
     def test_refund_reduces_actual_payment_only_when_relation_is_stable(self):
-        self.assertIn("已支付金额－已退款金额", self.contract)
-        self.assertIn("稳定订单号、交易号或支付平台关联记录", self.contract)
-        self.assertIn("不得按相似金额或相邻截图强行抵减", self.contract)
+        self.assertIn("已支付金额－已退款金额", self.entertainment_contract)
+        self.assertIn("稳定订单号、交易号或支付平台关联记录", self.entertainment_contract)
+        self.assertIn("不得按相似金额或相邻截图强行抵减", self.entertainment_contract)
 
     def test_multiple_payment_vouchers_are_summed_per_owned_detail(self):
-        self.assertIn("同一费用明细稳定绑定多张支付凭证", self.contract)
-        self.assertIn("逐张读取交易状态和实际支出", self.contract)
-        self.assertIn("不能仅因凭证超过一张就停止在“无法汇总”", self.contract)
-        self.assertIn("不得按文件名、相邻顺序或凑申报金额强行相加", self.contract)
+        self.assertIn("同一费用明细稳定绑定多张支付凭证", self.entertainment_contract)
+        self.assertIn("逐张读取交易状态和实际支出", self.entertainment_contract)
+        self.assertIn("不能仅因凭证超过一张就停止在“无法汇总”", self.entertainment_contract)
+        self.assertIn("不得按文件名、相邻顺序或凑申报金额强行相加", self.entertainment_contract)
 
     def test_one_payment_fact_can_cover_stably_bound_split_details(self):
-        self.assertIn("同一支付事实覆盖多条拆分明细", self.contract)
-        self.assertIn("拆分明细申报金额之和等于凭证实付金额", self.contract)
-        self.assertIn("该支付事实只计一次", self.contract)
-        self.assertIn("不得表述为每条明细各有一笔独立支付", self.contract)
-        self.assertIn("交易号或订单号可见时必须一致", self.contract)
-        self.assertIn("不可见时不能单独作为否定分组的理由", self.contract)
+        self.assertIn("同一支付事实覆盖多条拆分明细", self.entertainment_contract)
+        self.assertIn("拆分明细申报金额之和等于凭证实付金额", self.entertainment_contract)
+        self.assertIn("该支付事实只计一次", self.entertainment_contract)
+        self.assertIn("不得表述为每条明细各有一笔独立支付", self.entertainment_contract)
+        self.assertIn("交易号或订单号可见时必须一致", self.entertainment_contract)
+        self.assertIn("不可见时不能单独作为否定分组的理由", self.entertainment_contract)
 
     def test_payment_status_uses_business_semantics_not_one_literal(self):
-        self.assertIn("有效支付证据不要求画面逐字出现“支付成功”", self.contract)
-        self.assertIn("订单已完成", self.contract)
-        self.assertIn("扫码支付", self.contract)
-        self.assertIn("支付合计", self.contract)
-        self.assertIn("取消、关闭、失败、退款或待支付", self.contract)
+        self.assertIn("有效支付证据不要求画面逐字出现“支付成功”", self.entertainment_contract)
+        self.assertIn("订单已完成", self.entertainment_contract)
+        self.assertIn("扫码支付", self.entertainment_contract)
+        self.assertIn("支付合计", self.entertainment_contract)
+        self.assertIn("取消、关闭、失败、退款或待支付", self.entertainment_contract)
 
     def test_pass_remarks_collapse_amounts_into_final_reconciliation_item(self):
         self.assertIn("可提交金额收敛", self.contract)
@@ -261,7 +389,7 @@ class SkillResultContractTest(unittest.TestCase):
     def test_automation_batch_deduplicates_unchanged_blocks_across_goals(self):
         self.assertIn("跨轮阻断索引", self.automation_batch_contract)
         self.assertIn("requestId + received_at", self.automation_batch_contract)
-        self.assertIn("result-contract.md 的 SHA-256", self.automation_batch_contract)
+        self.assertIn("reviewer release manifest 的 SHA-256", self.automation_batch_contract)
         self.assertIn("24 小时冷却", self.automation_batch_contract)
         self.assertIn("不得重新分配", self.automation_batch_contract)
         self.assertIn("received_at 变化", self.automation_batch_contract)
@@ -712,26 +840,26 @@ class SkillResultContractTest(unittest.TestCase):
         self.assertIn("绝不重新采集", self.reviewer_contract)
 
     def test_small_marketing_remark_uses_the_exact_fixed_item_name(self):
-        self.assertIn("固定项目名必须逐字复制", self.skill)
-        self.assertIn("SAP 客户编码匹配", self.skill)
+        self.assertIn("固定项目名和顺序必须逐字采用", self.contract)
+        self.assertIn("SAP 客户编码匹配", self.small_marketing_contract)
 
     def test_packaging_flow_uses_four_content_sections_without_regulatory_expansion(self):
         self.assertIn("packaging_layout_approval", self.skill)
-        self.assertIn("audit-chinese-image-text", self.skill)
-        self.assertIn("固定四项，顺序不可改变", self.contract)
+        self.assertIn("audit-chinese-image-text", self.packaging_contract)
+        self.assertIn("固定四项，顺序不可改变", self.packaging_contract)
         for item_name in (
             "配料信息",
             "过敏原信息",
             "营养成分表信息",
             "地址信息",
         ):
-            self.assertIn(item_name, self.contract)
-        self.assertIn("每一版包装图片都必须输出上述四项", self.contract)
-        self.assertIn("与 Excel 不一致", self.contract)
-        self.assertIn("关键文字", self.contract)
-        self.assertIn("默认不纳入全面逐字、语病或文风检查", self.contract)
-        self.assertIn("没有 Excel 时", self.contract)
-        self.assertIn("不判断许可证真伪", self.contract)
+            self.assertIn(item_name, self.packaging_contract)
+        self.assertIn("每一版包装图片都必须输出上述四项", self.packaging_contract)
+        self.assertIn("与 Excel 不一致", self.packaging_contract)
+        self.assertIn("关键文字", self.packaging_contract)
+        self.assertIn("默认不纳入全面逐字、语病或文风检查", self.packaging_contract)
+        self.assertIn("没有 Excel 时", self.packaging_contract)
+        self.assertIn("不判断许可证真伪", self.packaging_contract)
         self.assertIn("错别字、漏字、多字", self.packaging_audit_skill)
         self.assertIn("四块内容", self.packaging_audit_skill)
 
@@ -748,15 +876,15 @@ class SkillResultContractTest(unittest.TestCase):
         )
         self.assertIn(
             "不得仅因未提供 Excel 将四项统一标为 `⚠️`",
-            self.contract,
+            self.packaging_contract,
         )
-        self.assertIn("关键文字审核路径已闭合", self.reviewer_contract)
+        self.assertIn("关键文字审核路径已闭合", self.packaging_contract)
 
     def test_packaging_defaults_to_key_text_fast_path(self):
         self.assertIn("关键文字范围", self.packaging_audit_skill)
         self.assertIn("装饰性文字、营销口号", self.packaging_audit_skill)
         self.assertIn("默认快速路径", self.automation_batch_contract)
-        self.assertIn("不要求 A/B/C 三路齐全", self.reviewer_contract)
+        self.assertIn("不要求 A/B/C 三路齐全", self.packaging_contract)
         self.assertNotIn("三路盲审齐全数", self.packaging_output_contract)
 
     def test_packaging_escalates_only_risky_or_uncertain_text(self):
@@ -769,7 +897,7 @@ class SkillResultContractTest(unittest.TestCase):
         self.assertIn("最多执行一次定向重切", self.packaging_audit_skill)
         self.assertIn("受影响的具体审核项标为 `⚠️`", self.packaging_audit_skill)
         self.assertNotIn("不得因固定尝试次数停止", self.packaging_audit_skill)
-        self.assertIn("不得无限重切或无限等待", self.reviewer_contract)
+        self.assertIn("不得无限重切或无限等待", self.packaging_contract)
 
     def test_packaging_g1_technical_block_uses_an_exact_reason_code(self):
         for code in (
@@ -778,10 +906,10 @@ class SkillResultContractTest(unittest.TestCase):
             "packaging_g1_coverage_auditor_unavailable",
         ):
             self.assertIn(code, self.packaging_audit_skill)
-            self.assertIn(code, self.reviewer_contract)
+            self.assertIn(code, self.packaging_contract)
         self.assertIn(
             "泛化的 `packaging_g1_coverage_failed` 不再允许封存新 attempt",
-            self.reviewer_contract,
+            self.packaging_contract,
         )
 
     def test_packaging_output_contract_has_canonical_no_excel_signing_template(self):
@@ -816,16 +944,16 @@ class SkillResultContractTest(unittest.TestCase):
             no_excel_template.index("✅ 4、地址信息"),
             no_excel_template.index("Excel 对照："),
         )
-        self.assertIn("只在四项之后统一说明一次", self.contract)
+        self.assertIn("只在四项之后统一说明一次", self.packaging_contract)
 
         case_ids = {case["id"] for case in self.regression_data["cases"]}
         self.assertIn("RC-014-packaging-excel-notice-repeated", case_ids)
         self.assertIn("F-017", self.feedback)
 
     def test_packaging_non_domain_text_uses_an_unnumbered_supplement(self):
-        self.assertIn("非编号的 `补充校对`", self.contract)
-        self.assertIn("合并到唯一一行非编号的 `补充校对`", self.contract)
-        self.assertIn("全部合并到唯一一行 `补充校对`", self.reviewer_contract)
+        self.assertIn("非编号的 `补充校对`", self.packaging_contract)
+        self.assertIn("合并到唯一一行非编号的 `补充校对`", self.packaging_contract)
+        self.assertIn("全部非四项关键异常合并到唯一一行", self.packaging_contract)
         self.assertIn("多个异常必须合并到这一行", self.packaging_output_contract)
         self.assertIn("不是第五审核项", self.packaging_output_contract)
         self.assertIn("不得漏报或硬塞进错误项目", self.packaging_output_contract)
@@ -906,10 +1034,10 @@ class SkillResultContractTest(unittest.TestCase):
         self.assertIn("用户纠错或明确财务反馈", self.skill)
 
     def test_mileage_result_requires_raw_readings_before_comparison(self):
-        self.assertIn("起始读数、结束读数、单位和计算差值", self.contract)
-        self.assertIn("不得拼接不同显示区域中的数字", self.contract)
-        self.assertIn("不得直接采用旧 RPA 或 OCR 给出的差值", self.contract)
-        self.assertIn("无法稳定辨认时使用 `⚠️`", self.contract)
+        self.assertIn("起始读数、结束读数、单位和计算差值", self.travel_contract)
+        self.assertIn("不得拼接不同显示区域中的数字", self.travel_contract)
+        self.assertIn("不得直接采用旧 RPA 或 OCR 给出的差值", self.travel_contract)
+        self.assertIn("无法稳定辨认时使用 `⚠️`", self.travel_contract)
 
     def test_flow_number_is_a_first_class_collection_entry(self):
         self.assertIn("--flow-number FLOW_NUMBER", self.skill)

@@ -85,6 +85,15 @@ class RuntimeSnapshotTests(unittest.TestCase):
                 "apps/oa_finance_preaudit/role_cli.py",
             }.issubset(reviewer_files)
         )
+        self.assertTrue(
+            {
+                ".agents/skills/oa-finance-preaudit/references/flows/business-entertainment.md",
+                ".agents/skills/oa-finance-preaudit/references/flows/business-support-fee.md",
+                ".agents/skills/oa-finance-preaudit/references/flows/packaging-layout-approval.md",
+                ".agents/skills/oa-finance-preaudit/references/flows/small-marketing-fee.md",
+                ".agents/skills/oa-finance-preaudit/references/flows/travel-expense.md",
+            }.issubset(reviewer_files)
+        )
 
     def test_role_releases_cover_the_shared_json_artifact_runtime(self) -> None:
         artifact = "apps/oa_finance_preaudit/json_artifact.py"

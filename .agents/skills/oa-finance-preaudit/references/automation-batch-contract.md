@@ -43,7 +43,7 @@
 - 按 `submitted_at 从早到晚` 排序；相同提交时间依次按 `received_at`、`requestId 升序`稳定排序。缺失提交时间的候选优先，避免未知老单持续沉底。
 - 清单状态由 `apps.oa_finance_preaudit.queue_cli` 原子更新，不由任务在对话文本或 memory 中自行拼接。状态只保存 requestId、流程类型、时间、准备尝试号、租约、材料/意见封套指纹、结果码和脱敏写入回执，不保存附件正文、人员、公司或审批意见。
 - 后续候选可以在队首取证期间提前准备，但全局 FIFO 写入顺序不能改变，不得跳过队首。队首在得到提交闭环、单据级技术失败或单据级安全阻断前，任何后续候选不得写 OA。
-- 跨轮阻断索引仍按 `requestId + received_at + failure_code + last_attempt_at + result-contract.md 的 SHA-256` 去重。确定性格式阻断在版本和契约均未变化时不得重新分配；材料类阻断采用 24 小时冷却，`received_at 变化`后立即允许新版本重试。
+- 跨轮阻断索引仍按 `requestId + received_at + failure_code + last_attempt_at + reviewer release manifest 的 SHA-256` 去重。该 manifest 同时覆盖共享结果接口与五个流程规则包，任一规则变更都不会沿用旧阻断；确定性格式阻断在版本和 reviewer release 均未变化时不得重新分配。材料类阻断采用 24 小时冷却，`received_at 变化`后立即允许新版本重试。
 
 ## 单据 Agent 与附件硬隔离
 
