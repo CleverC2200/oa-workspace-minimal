@@ -60,6 +60,7 @@ DEFAULT_ROLE_FILES: Mapping[str, tuple[str, ...]] = {
         "apps/oa_finance_preaudit/cli.py",
         "apps/oa_finance_preaudit/elastic_queue.py",
         "apps/oa_finance_preaudit/json_artifact.py",
+        "apps/oa_finance_preaudit/observability.py",
         "apps/oa_finance_preaudit/queue_cli.py",
         "apps/oa_finance_preaudit/review_attempt.py",
         "apps/oa_finance_preaudit/role_cli.py",

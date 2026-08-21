@@ -12,6 +12,7 @@ import time
 
 from . import elastic_queue
 from . import json_artifact
+from . import observability
 
 
 _TIMING_FIELDS = (
@@ -245,24 +246,48 @@ def collect_assignment(assignment_file: Path) -> dict:
                 raise elastic_queue.QueueContractError("collection_material_invalid")
             _write_json(material_file, material, code="collection_material_write_failed")
             prepared = material.get("prepared") if isinstance(material.get("prepared"), dict) else {}
-            return {
+            response = {
                 "request_id": str(assignment["request_id"]),
                 "output": str(material_file),
                 "collection_seconds": max(0, int(time.monotonic() - started)),
                 "resource_count": len(material.get("resources") or []),
                 "image_count": len(prepared.get("images") or []),
             }
+            try:
+                observability.record_attempt_phase(
+                    assignment,
+                    event_id="collect",
+                    phase="collect",
+                    wall_seconds=response["collection_seconds"],
+                    active_seconds=response["collection_seconds"],
+                    result="success",
+                )
+            except (OSError, TypeError, ValueError):
+                pass
+            return response
         except Exception as error:
             from . import cli as collection_cli
 
             failure = collection_cli._failure_payload(error)
             _write_json(failure_file, failure, code="collection_failure_write_failed")
-            return {
+            response = {
                 "request_id": str(assignment["request_id"]),
                 "failure_code": str(failure["failure"]["code"]),
                 "failure_file": str(failure_file),
                 "collection_seconds": max(0, int(time.monotonic() - started)),
             }
+            try:
+                observability.record_attempt_phase(
+                    assignment,
+                    event_id="collect",
+                    phase="collect",
+                    wall_seconds=response["collection_seconds"],
+                    active_seconds=response["collection_seconds"],
+                    result="technical_failure",
+                )
+            except (OSError, TypeError, ValueError):
+                pass
+            return response
 
 
 def seal_review(
@@ -428,6 +453,18 @@ def finish_review(assignment_file: Path, result_bundle_file: Path) -> dict:
         # Timing is diagnostic. The queue already contains the same normalized
         # timing, so a sidecar failure must not reopen or strand the lease.
         timing_persisted = False
+    try:
+        review_seconds = timing["observation_seconds"] + timing["judgment_seconds"]
+        observability.record_attempt_phase(
+            assignment,
+            event_id="review",
+            phase="review",
+            wall_seconds=review_seconds,
+            active_seconds=review_seconds,
+            result="success" if outcome == "prepared" else "technical_failure",
+        )
+    except (OSError, TypeError, ValueError):
+        pass
     return {
         "request_id": item["request_id"],
         "state": item["state"],
