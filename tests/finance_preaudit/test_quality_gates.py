@@ -31,7 +31,11 @@ class QualityGateTests(unittest.TestCase):
     def test_pr_requires_one_issue_validation_and_rollback(self) -> None:
         valid = "## 验证\n全部通过\n\n## 风险与回退\n回退提交\n\nCloses #8\n"
         self.assertEqual(quality.check_pr_body(valid), [])
-        self.assertIn("pr_requires_one_closing_issue", quality.check_pr_body(valid + "Closes #9\n"))
+        self.assertEqual(
+            quality.check_pr_body(valid.replace("Closes #8", "Refs #8")),
+            [],
+        )
+        self.assertIn("pr_requires_one_issue", quality.check_pr_body(valid + "Closes #9\n"))
         self.assertIn("pr_risk_missing", quality.check_pr_body("## 验证\n失败\nCloses #8\n"))
 
     def test_broken_local_link_is_rejected(self) -> None:

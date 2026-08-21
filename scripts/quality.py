@@ -132,10 +132,13 @@ def check_markdown_links(paths: Iterable[Path], root: Path = PROJECT_ROOT) -> li
 def check_pr_body(body: object) -> list[str]:
     if not isinstance(body, str):
         return ["pr_body_missing"]
-    closing = re.findall(r"(?im)^\s*(?:close[sd]?|fixe[sd]?|resolve[sd]?)\s+#\d+\s*$", body)
+    issue_links = re.findall(
+        r"(?im)^\s*(?:refs?|close[sd]?|fixe[sd]?|resolve[sd]?)\s+#\d+\s*$",
+        body,
+    )
     findings = []
-    if len(closing) != 1:
-        findings.append("pr_requires_one_closing_issue")
+    if len(issue_links) != 1:
+        findings.append("pr_requires_one_issue")
     for heading, code in (("## 验证", "pr_validation_missing"), ("## 风险与回退", "pr_risk_missing")):
         if heading not in body:
             findings.append(code)
