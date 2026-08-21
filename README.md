@@ -28,6 +28,7 @@ V1.1 是首次 GitHub 私有发布基线。发布不会启动定时任务，现�
 
 ```text
 .agents/skills/oa-finance-preaudit/  # Skill 入口、流程规则与证据契约
+.agents/skills/oa-finance-preaudit/references/flows/  # 五类隔离规则包
 apps/oa_finance_preaudit/           # 材料收集、冻结结果与角色窄入口
 apps/oa_approval/                   # OA 和外部数据的复用连接能力
 tests/finance_preaudit/             # 聚焦合同测试与回放测试

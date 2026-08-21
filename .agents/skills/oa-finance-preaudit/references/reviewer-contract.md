@@ -6,10 +6,9 @@
 
 1. 主 `SKILL.md`；
 2. [证据阅读规则](observation-contract.md)；
-3. [流程审核项与结果格式](result-contract.md)；
-4. 控制台传入的原样 `assignment.json` 与本角色 release 指纹。
+3. 控制台传入的原样 `assignment.json` 与本角色 release 指纹。
 
-仅当采集材料的 `workflow_key=packaging_layout_approval` 时，再完整读取 `../../audit-chinese-image-text/SKILL.md` 及其按闸门要求引用的 reference；其他四类财务单据不得加载包装问题集或包装视觉提示。包装流程的当前审核 Agent 是该单据的独立包装审核协调者，默认直接完成关键文字覆盖自检和主审；命中风险条件时才增加一次独立复核，只有增强模式才启动 A/B/C 三路盲审。脚本只提供来源字段、同名去重记录、图片页面和 Excel 结构化内容。
+采集成功并精确确认材料中的 `workflow_key` 后，完整读取[共享结果接口与流程路由](result-contract.md)，只读取该 `workflow_key` 对应的一个流程规则包；不得读取其他流程规则包。流程规则包要求附加 Skill 时再按其路由读取；因此只有 `workflow_key=packaging_layout_approval` 才能加载包装问题集或包装视觉提示。
 
 启动时用唯一 canonical 接口计算本角色复合指纹：
 
@@ -45,12 +44,8 @@ python3 -m apps.oa_finance_preaudit.role_cli reviewer collection-status \
 ```
 
 `collection-status` 返回的两种 kind 与原采集命令相同。若原 canonical 采集进程仍持有 attempt 级采集锁，它必须返回 `collection_process_active`；继续等待原进程，不得结束 Reviewer、上报材料不可用或再次调用状态恢复。若进程已退出后返回 `collection_result_unavailable` 或 `collection_result_ambiguous`，保持原租约并上报 Admin；不得补跑采集或自造失败码。
-- 完整观察当前材料，由 Codex 按主 Skill 和结果契约判断，只写 assignment 指定的 `remark_file`。封套、指纹、身份字段和结果 JSON 均由 canonical 闭合命令生成，审核 Agent 不手工计算或填写。
-- 附件下载、结构化解析与视觉观察可以使用项目辅助能力；不得让脚本生成财务判断。四类财务报销仅在模糊且高影响的单页增加一次隔离观察子 Agent；包装流程同样只对低置信、高影响数字或专名、Excel 差异或内部冲突增加一次独立复核，增强模式除外。
-- 包装流程只有在每个 `packaging_image` 原图下载、关键文字区域清单建立且关键文字审核路径已闭合后才能生成四项签字意见；必须保留原图尺寸、方向、关键区域清单、主审状态及实际触发的复核状态，不要求 A/B/C 三路齐全。缺少可选 Excel 不影响该闭合，也不能单独触发四项 `⚠️`。
-- 包装 G1 返回有效 `FAIL` 时，只按可执行问题清单执行一次定向重切。第二次仍不能闭合但原图关键文字可读时，记录缺口并把受影响的具体审核项标为 `⚠️`，继续处理其他区域，不得无限重切或无限等待。只有三类不可恢复条件可以技术阻断，并必须使用对应精确码：原图本身缺失或边界裁断且关键文字不可读使用 `packaging_g1_source_image_incomplete`；已验证的绝对坐标无损裁切无法工作且原图也无法观察关键文字使用 `packaging_g1_lossless_crop_unavailable`；必需覆盖审计 Agent 机器状态确实不可用且有界恢复失败使用 `packaging_g1_coverage_auditor_unavailable`。泛化的 `packaging_g1_coverage_failed` 不再允许封存新 attempt。
-- 只有复杂或模糊版面才启动覆盖审计 Agent；简单清晰版面由协调者直接覆盖自检。必需 Agent 仍为 active/running 且有任务进展时继续有界等待，不得并发启动替代；任务系统明确失败或停止后才按同一 attempt 恢复。可选独立复核不可用时把受影响的低置信关键区域标为 `⚠️`，不得把整单技术阻断。
-- 包装流程发现多个无法归入固定四项的文字异常时，详细复核材料仍逐项保留，但 OA 意见必须把它们全部合并到唯一一行 `补充校对`，逐项写明版本或区域定位，不得输出第二行 `补充校对`；Excel 来源状态仍只在意见末尾统一说明一次。
+- 完整观察当前材料，由 Codex 按主 Skill、共享结果接口和唯一流程规则包判断，只写 assignment 指定的 `remark_file`。封套、指纹、身份字段和结果 JSON 均由 canonical 闭合命令生成，审核 Agent 不手工计算或填写。
+- 附件下载、结构化解析与视觉观察可以使用项目辅助能力；不得让脚本生成业务判断。只有模糊且高影响的事实才增加一次隔离观察，具体升级条件以当前流程规则包为准。
 - 记录 collection、observation、judgment、preparation_total 秒数，以及页数、视觉单元数和观察 Agent 峰值。时间来自本 attempt 的单调时钟，不从聊天估算。
 
 ## 唯一闭合接口
