@@ -1,4 +1,4 @@
 # 本项目的 oa-skill 需要访问独立生产工作树和 OA 网络。
-# 业务写入边界仍由冻结材料、FIFO、生产全局锁和写后回执控制。
+# 业务写入边界由冻结材料、requestId 级单飞锁和写后回执控制。
 default_permissions = ":danger-full-access"
 approval_policy = "never"

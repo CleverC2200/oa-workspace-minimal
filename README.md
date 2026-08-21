@@ -76,6 +76,22 @@ python3 -m apps.oa_finance_preaudit.observability summary \
 
 OA 提交只通过冻结写入入口执行。锁、token、冻结指纹和终态回执均绑定单个 `requestId + received_at + attempt`：同一 requestId 单飞并幂等重放，不同 requestId 可由 `submission_pool.run_bounded` 有界并发。生产写入仍需单独授权；本仓库测试只使用模拟接口。
 
+## 单流程调度 dry-run
+
+五个定时入口的唯一配置位于 `config/flow-runners.json`。每个入口只加载一类流程规则，并使用独立的状态目录和指标目录；旧小时 dispatcher、当天控制台和跨流程 FIFO 不进入新热路径。
+
+候选文件只接受当前流程的 queued、prepared 或 submitting 单据。以下命令只计算本轮容量和闭合状态，不读取附件、不形成意见、不调用 OA：
+
+```bash
+python3 -m apps.oa_finance_preaudit.flow_runner \
+  --workflow-key travel_expense \
+  --candidates-file /absolute/path/to/candidates.json \
+  --available-reviewer-slots 3 \
+  --available-submit-slots 3
+```
+
+空队列立即闭合；积压按配置和实际槽位的较小值并发。配置不会创建或启用生产 cron，生产入口仍保持暂停，需另行完成人工验收后逐个启用。
+
 ## 验证
 
 ```bash
@@ -85,4 +101,4 @@ python3 -m unittest discover -s tests/finance_preaudit -p 'test_*.py' -v
 git diff --check
 ```
 
-贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。V1.2 的流程拆分、并发提交、监控、留存与代码质量工程在 GitHub Issues 中分票推进；Issue 中的方案是目标状态，不代表当前已经上线。
+贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。V1.2 的流程拆分、并发提交、监控、留存与代码质量工程在 GitHub Issues 中分票推进；已合并能力只代表代码和测试完成，不代表生产已经启用。
