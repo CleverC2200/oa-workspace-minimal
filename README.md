@@ -98,6 +98,16 @@ python3 -m apps.oa_finance_preaudit.flow_runner \
 
 清理能力位于 `apps.oa_finance_preaudit.retention`，执行前要求运行根存在专用标记并一次性校验全部目标不能越界。仓库不会自动标记或清理现有生产目录，也不连接真实任务系统；生产启用需要另行验收。
 
+## 离线质量回放
+
+五类流程各有正常、业务异常、证据不足和技术失败四个脱敏样本。回放比较固定审核项、状态/停止码、格式、耗时和精确 Token，不需要 OA 登录：
+
+```bash
+python3 -m unittest tests.finance_preaudit.test_flow_evals -v
+```
+
+外部离线结果也可通过 `python3 -m apps.oa_finance_preaudit.flow_evals --fixtures ... --actuals ...` 生成逐流程报告。样本不包含原始附件或业务身份，性能改善不得以准确性和格式回归为代价。
+
 ## 验证
 
 ```bash
