@@ -14,3 +14,5 @@
 - 回退：回退本 PR 的 squash commit。
 
 Closes #
+
+<!-- 完成票据保留 Closes；不应关闭未完成票据时改为 Refs。只保留一行 Issue 关联。 -->

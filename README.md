@@ -120,7 +120,7 @@ python3 -m scripts.quality links
 python3 -m unittest discover -s tests/finance_preaudit -p 'test_*.py' -v
 ```
 
-`main` 只接受满足质量门的 PR，禁止强推和删除；详细规则见 [贡献指南](CONTRIBUTING.md)。CI 不读取真实 OA 凭据，也不启用生产自动化。
+团队规范要求 `main` 只接受满足质量门的 PR；但当前 GitHub 方案尚不支持私有仓库服务端分支保护，不能由平台强制禁止直接推送。实际状态和升级后的目标规则见[主分支保护状态](docs/agents/branch-protection.md)。CI 不读取真实 OA 凭据，也不启用生产自动化。
 
 ## 验证
 

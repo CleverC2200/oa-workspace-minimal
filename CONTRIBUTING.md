@@ -16,7 +16,7 @@
 
 - 未完成或仍在探索的 PR 保持 Draft；验收标准和必要检查通过后再转 Ready。
 - 标题使用 Conventional Commit 风格。
-- 正文必须且只能包含一个独立行 `Closes #<issue>`，并保留 `## 验证`、`## 风险与回退`、改动摘要和实际结果。
+- 正文必须且只能包含一个独立 Issue 关联行，并保留 `## 验证`、`## 风险与回退`、改动摘要和实际结果。完成票据使用 `Closes #<issue>`；不应关闭尚未完成票据的跟进修正使用 `Refs #<issue>`。
 - 不在 PR、Issue、截图或日志中暴露 requestId、附件正文、账号、内部地址、密钥或 Cookie。
 - 合并后确认关联 Issue 已关闭；若自动关闭失败，补充验收证据后手动关闭。
 
@@ -38,6 +38,6 @@ python3 -m unittest discover -s tests/finance_preaudit -p 'test_*.py' -v
 python3 -m compileall -q apps scripts tests
 ```
 
-GitHub `main` 要求通过名为 `quality` 的检查并经 PR 合并，禁止强推和删除；规则同时适用于管理员，不保留静默绕过。紧急变更仍应建立 Issue/PR 并保存验证与回退记录，如确需临时调整保护规则，必须在对应 Issue 留下原因、时间和恢复回执。
+GitHub `main` 的目标规则是通过名为 `quality` 的检查并经 PR 合并，禁止强推和删除，且同样约束管理员。当前私有仓库方案尚不支持服务端分支保护，实际状态和升级后配置见[主分支保护状态](docs/agents/branch-protection.md)；在规则生效前不得把人工规范表述为平台强制。
 
 真实 OA 写入、自动化启停和发布均属于独立授权动作，测试通过不等于获得执行授权。
