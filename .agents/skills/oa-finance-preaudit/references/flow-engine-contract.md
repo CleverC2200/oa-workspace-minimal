@@ -58,6 +58,10 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
 - 任一项目为 `fail` 或 `uncertain` 时，`overall` 必须为 `needs_human`；全部为 `pass` 时必须为 `pass`。
 - 不增加 requestId、人员、公司、写入模式、意见文本或其他字段。
 
+包装流程的决定还必须增加一个 `excel_comparison`：未提供 Excel 时固定为 `{"status":"not_provided","resource_id":null}`；存在 Excel 时，只有已经读取同一份结构化 Excel、完成四项严格字符对照，并在每项 `evidence_refs` 中引用对应 `material:prepared.structured_contents.<resource_id>.<item_key>` 后，才能使用 `{"status":"completed","resource_id":"<resource_id>"}`。脚本只在验证这些显式证据后渲染 Excel 对照尾行，不根据附件存在自行推断完成。
+
+包装决定还必须用 `material:prepared.images.<resource_id>.page-<number>` 在 `evidence_refs` 或 `missing_evidence` 中覆盖审核包引用材料的每一页。脚本会先验证图片可读、manifest 页数与准备页一致，再验证决定的全页覆盖；采集脚本不得生成图片观察或校对结论。
+
 将决定写入新的本地文件后执行：
 
 ```bash

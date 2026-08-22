@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from apps import json_artifact
 from apps.oa_finance_preaudit import cli, flow_engine, flow_evals
 
@@ -27,8 +29,12 @@ def _material(
 ) -> dict:
     attachment = attempt_root / "attachments" / "page-1.png"
     prepared_image = attempt_root / "prepared" / "page-1.png"
-    attachment.write_bytes(b"sanitized-packaging-source")
-    prepared_image.write_bytes(b"sanitized-packaging-page")
+    png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
+        "0000000c4944415408d763f8ffff3f0005fe02fe0dcae9400000000049454e44ae426082"
+    )
+    attachment.write_bytes(png)
+    prepared_image.write_bytes(png)
     resources = [{
         "request_id": request_id,
         "resource_id": "page-1",
@@ -37,11 +43,16 @@ def _material(
         "review_role": "packaging_image",
         "local_readonly_path": str(attachment),
     }]
-    manifest = [{"resource_id": "page-1", "status": "prepared"}]
+    manifest = [{"resource_id": "page-1", "status": "image", "image_count": 1}]
     structured = []
     if excel:
+        from openpyxl import Workbook
+
         excel_file = attempt_root / "attachments" / "reference.xlsx"
-        excel_file.write_bytes(b"sanitized-excel-reference")
+        workbook = Workbook()
+        workbook.active.append(["配料", "过敏原", "营养成分", "地址"])
+        workbook.save(excel_file)
+        workbook.close()
         resources.append({
             "request_id": request_id,
             "resource_id": "excel-1",
@@ -51,7 +62,12 @@ def _material(
             "local_readonly_path": str(excel_file),
         })
         manifest.append({"resource_id": "excel-1", "status": "prepared"})
-        structured.append({"resource_id": "excel-1", "kind": "spreadsheet"})
+        structured.append({
+            "resource_id": "excel-1",
+            "document_type": "spreadsheet",
+            "summary": "脱敏 Excel 文案基准。",
+            "key_text": ["Sheet!R1: 配料 | 过敏原 | 营养成分 | 地址"],
+        })
     return {
         "schema_version": 1,
         "kind": "preaudit_material",
@@ -65,7 +81,6 @@ def _material(
                 "resource_id": "page-1",
                 "path": str(prepared_image),
                 "kind": "image",
-                "observed_regions": dict(regions),
             }],
             "structured_contents": structured,
             "manifest": manifest,
@@ -133,7 +148,12 @@ def _engine(
     )
 
 
-def _decision(action: dict, reviewed_items: list[dict]) -> dict:
+def _decision(
+    action: dict,
+    reviewed_items: list[dict],
+    *,
+    excel: bool = False,
+) -> dict:
     packet = json.loads(Path(action["review_packet_file"]).read_text(encoding="utf-8"))
     return {
         "schema_version": 1,
@@ -146,8 +166,26 @@ def _decision(action: dict, reviewed_items: list[dict]) -> dict:
             if all(item["status"] == "pass" for item in reviewed_items)
             else "needs_human"
         ),
+        "excel_comparison": {
+            "status": "completed" if excel else "not_provided",
+            "resource_id": "excel-1" if excel else None,
+        },
         "items": [
-            {"item_key": item["item_key"], **reviewed}
+            {
+                "item_key": item["item_key"],
+                **reviewed,
+                **(
+                    {
+                        "evidence_refs": [
+                            *reviewed["evidence_refs"],
+                            "material:prepared.structured_contents."
+                            f"excel-1.{item['item_key']}",
+                        ]
+                    }
+                    if excel
+                    else {}
+                ),
+            }
             for item, reviewed in zip(packet["items"], reviewed_items, strict=True)
         ],
     }
@@ -158,7 +196,7 @@ def _passing_items() -> list[dict]:
         {
             "status": "pass",
             "conclusion": "当前关键文字区域未见异常。",
-            "evidence_refs": [f"material:prepared.images.page-1.{region}"],
+            "evidence_refs": ["material:prepared.images.page-1.page-1"],
             "missing_evidence": [],
         }
         for region in REGION_KEYS
@@ -217,12 +255,77 @@ def test_packaging_without_packaging_image_stops_current_case(tmp_path: Path) ->
     assert action["reason"] == "material_collection_failed"
 
 
+@pytest.mark.parametrize("failure", ["invalid_image", "page_count_mismatch"])
+def test_packaging_rejects_invalid_or_incomplete_pages(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    def collect(request_id: str, attempt_root: Path) -> dict:
+        material = _material(
+            request_id,
+            attempt_root,
+            workflow_key=WORKFLOW_KEY,
+            regions={},
+            excel=False,
+        )
+        if failure == "invalid_image":
+            Path(material["prepared"]["images"][0]["path"]).write_bytes(
+                b"not-an-image"
+            )
+        else:
+            material["prepared"]["manifest"][0]["image_count"] = 2
+        return material
+
+    engine = flow_engine.FlowEngine(
+        root=tmp_path,
+        discover_candidates=lambda workflow_key: [{
+            "request_id": "packaging-request",
+            "received_at": "2026-08-22T09:00:00+08:00",
+            "workflow_key": workflow_key,
+        }],
+        collect_material=collect,
+    )
+
+    action = engine.next_action(WORKFLOW_KEY)
+
+    assert action["action"] == "needs_admin"
+    assert action["reason"] == "material_collection_failed"
+
+
+def test_packaging_decision_must_cover_every_page(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    action = engine.next_action(WORKFLOW_KEY)
+    reviewed = _passing_items()
+    for item in reviewed:
+        item["evidence_refs"] = ["material:unrelated"]
+    decision_file = tmp_path / "uncovered-page.json"
+    json_artifact.write_json_atomic(decision_file, _decision(action, reviewed))
+
+    with pytest.raises(ValueError, match="review_decision_invalid"):
+        engine.complete_review(Path(action["action_file"]), decision_file)
+
+
+def test_packaging_excel_requires_explicit_per_item_comparison_evidence(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path, excel=True)
+    action = engine.next_action(WORKFLOW_KEY)
+    decision_file = tmp_path / "excel-without-comparison.json"
+    json_artifact.write_json_atomic(decision_file, _decision(action, _passing_items()))
+
+    with pytest.raises(ValueError, match="review_decision_invalid"):
+        engine.complete_review(Path(action["action_file"]), decision_file)
+
+
 def test_packaging_excel_notice_and_controlled_substitute_are_bound(tmp_path: Path) -> None:
     calls: list[dict] = []
     engine = _engine(tmp_path, excel=True, calls=calls)
     action = engine.next_action(WORKFLOW_KEY)
     decision_file = tmp_path / "controlled.json"
-    json_artifact.write_json_atomic(decision_file, _decision(action, _passing_items()))
+    json_artifact.write_json_atomic(
+        decision_file,
+        _decision(action, _passing_items(), excel=True),
+    )
     closed = engine.complete_review(Path(action["action_file"]), decision_file)
     remark = Path(closed["remark_file"]).read_text(encoding="utf-8")
     assert len(calls) == 1
@@ -254,10 +357,16 @@ def test_packaging_independent_reviewer_replay_scores_100_percent(tmp_path: Path
         closed = engine.complete_review(Path(action["action_file"]), decision_file)
         packet = json.loads(Path(action["review_packet_file"]).read_text(encoding="utf-8"))
         material = json.loads(Path(packet["material_file"]).read_text(encoding="utf-8"))
-        observed = material["prepared"]["images"][0]["observed_regions"]
+        page_refs = {"material:prepared.images.page-1.page-1"}
         for item in case["items"]:
-            for ref in item["evidence_refs"]:
-                assert ref.removeprefix("material:prepared.images.page-1.") in observed
+            assert not any("observed_regions" in image for image in material["prepared"]["images"])
+        covered_refs = {
+            ref
+            for item in case["items"]
+            for field in ("evidence_refs", "missing_evidence")
+            for ref in item[field]
+        }
+        assert page_refs.issubset(covered_refs)
         statuses = [marks[item["status"]] for item in case["items"]]
         actuals[case["case_id"]] = {
             "outcome": (

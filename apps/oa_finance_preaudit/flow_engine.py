@@ -11,6 +11,8 @@ import secrets
 import time
 from typing import Callable, Iterable
 
+import fitz
+
 from apps import json_artifact
 
 from . import elastic_queue, observability, submission
@@ -188,6 +190,21 @@ def _flow_items(workflow_key: str) -> list[dict]:
     ]
 
 
+def _is_readable_single_page_image(path: object) -> bool:
+    try:
+        document = fitz.open(str(path or ""))
+        try:
+            return (
+                document.page_count == 1
+                and document[0].rect.width > 0
+                and document[0].rect.height > 0
+            )
+        finally:
+            document.close()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def _validate_flow_material(workflow_key: str, material: dict) -> None:
     if workflow_key != "packaging_layout_approval":
         return
@@ -202,13 +219,82 @@ def _validate_flow_material(workflow_key: str, material: dict) -> None:
         if isinstance(resource, dict)
         and resource.get("review_role") == "packaging_image"
     }
-    covered_ids = {
-        str(image.get("parent_resource_id") or image.get("resource_id") or "")
-        for image in images
-        if isinstance(image, dict)
-    }
-    if not required_ids or not required_ids.issubset(covered_ids):
+    manifest = prepared.get("manifest")
+    if not required_ids or not isinstance(manifest, list):
         raise ValueError("packaging_material_incomplete")
+    image_counts = {resource_id: 0 for resource_id in required_ids}
+    for image in images:
+        if not isinstance(image, dict):
+            raise ValueError("packaging_material_incomplete")
+        resource_id = str(
+            image.get("parent_resource_id") or image.get("resource_id") or ""
+        )
+        if resource_id not in image_counts:
+            continue
+        if not _is_readable_single_page_image(image.get("path")):
+            raise ValueError("packaging_material_incomplete")
+        image_counts[resource_id] += 1
+    manifest_counts = {
+        str(item.get("resource_id") or ""): item.get("image_count")
+        for item in manifest
+        if isinstance(item, dict)
+        and str(item.get("resource_id") or "") in required_ids
+    }
+    if any(
+        image_counts[resource_id] <= 0
+        or manifest_counts.get(resource_id) != image_counts[resource_id]
+        for resource_id in required_ids
+    ):
+        raise ValueError("packaging_material_incomplete")
+
+
+def _packaging_page_refs(material: dict) -> tuple[str, ...]:
+    resources = material.get("resources")
+    prepared = material.get("prepared")
+    images = prepared.get("images") if isinstance(prepared, dict) else []
+    resource_items = resources if isinstance(resources, list) else []
+    required_ids = [
+        str(resource.get("resource_id") or "")
+        for resource in resource_items
+        if isinstance(resource, dict)
+        and resource.get("review_role") == "packaging_image"
+    ]
+    refs = []
+    for resource_id in required_ids:
+        resource_images = [
+            image
+            for image in images
+            if isinstance(image, dict)
+            and str(image.get("parent_resource_id") or image.get("resource_id") or "")
+            == resource_id
+        ]
+        refs.extend(
+            f"material:prepared.images.{resource_id}.page-{number}"
+            for number, _image in enumerate(resource_images, start=1)
+        )
+    return tuple(refs)
+
+
+def _packaging_excel_ids(material: dict) -> tuple[set[str], set[str]]:
+    resources = material.get("resources")
+    prepared = material.get("prepared")
+    structured = prepared.get("structured_contents") if isinstance(prepared, dict) else []
+    resource_items = resources if isinstance(resources, list) else []
+    excel_ids = {
+        str(resource.get("resource_id") or "")
+        for resource in resource_items
+        if isinstance(resource, dict)
+        and resource.get("review_role") == "excel_reference"
+    }
+    readable_ids = {
+        str(item.get("resource_id") or "")
+        for item in structured
+        if isinstance(item, dict)
+        and item.get("document_type") == "spreadsheet"
+        and isinstance(item.get("key_text"), list)
+        and bool(item["key_text"])
+    }
+    return excel_ids, excel_ids & readable_ids
 
 
 def _attempt_number(path: Path) -> int | None:
@@ -1533,6 +1619,8 @@ class FlowEngine:
             "overall",
             "items",
         }
+        if action["workflow_key"] == "packaging_layout_approval":
+            expected_fields.add("excel_comparison")
         if (
             set(decision) != expected_fields
             or decision.get("schema_version") != SCHEMA_VERSION
@@ -1582,6 +1670,54 @@ class FlowEngine:
                 raise ValueError("review_decision_invalid")
             normalized_items.append(dict(item))
 
+        packaging_material: dict | None = None
+        packaging_excel_notice: str | None = None
+        if action["workflow_key"] == "packaging_layout_approval":
+            packaging_material = _read_object(
+                Path(state["material_file"]),
+                code="frozen_material_changed",
+            )
+            page_refs = set(_packaging_page_refs(packaging_material))
+            covered_refs = {
+                value
+                for item in normalized_items
+                for field in ("evidence_refs", "missing_evidence")
+                for value in item[field]
+            }
+            if not page_refs or not page_refs.issubset(covered_refs):
+                raise ValueError("review_decision_invalid")
+            comparison = decision.get("excel_comparison")
+            if not isinstance(comparison, dict) or set(comparison) != {
+                "status",
+                "resource_id",
+            }:
+                raise ValueError("review_decision_invalid")
+            excel_ids, readable_excel_ids = _packaging_excel_ids(packaging_material)
+            comparison_status = comparison.get("status")
+            excel_resource_id = comparison.get("resource_id")
+            if comparison_status == "not_provided":
+                if excel_ids or excel_resource_id is not None:
+                    raise ValueError("review_decision_invalid")
+                packaging_excel_notice = (
+                    "Excel 对照：本次未提供 Excel，未执行 Excel 对照。"
+                )
+            elif comparison_status == "completed":
+                if excel_resource_id not in readable_excel_ids:
+                    raise ValueError("review_decision_invalid")
+                for expected, item in zip(packet_items, normalized_items, strict=True):
+                    excel_ref = (
+                        "material:prepared.structured_contents."
+                        f"{excel_resource_id}.{expected['item_key']}"
+                    )
+                    if excel_ref not in item["evidence_refs"]:
+                        raise ValueError("review_decision_invalid")
+                packaging_excel_notice = (
+                    "Excel 对照：上述四项已与同一 Excel 逐字符对照；"
+                    "具体差异已写入对应项目。"
+                )
+            else:
+                raise ValueError("review_decision_invalid")
+
         needs_human = any(item["status"] != "pass" for item in normalized_items)
         expected_overall = "needs_human" if needs_human else "pass"
         if decision["overall"] != expected_overall:
@@ -1608,22 +1744,8 @@ class FlowEngine:
                 f"{status_mark[item['status']]} {number}、{expected['name']}："
                 f"{item['conclusion'].strip()}"
             )
-        if action["workflow_key"] == "packaging_layout_approval":
-            material = _read_object(
-                Path(state["material_file"]),
-                code="frozen_material_changed",
-            )
-            excel_present = any(
-                isinstance(resource, dict)
-                and resource.get("review_role") == "excel_reference"
-                for resource in material.get("resources", [])
-            )
-            lines.append(
-                "Excel 对照：上述四项已与同一 Excel 逐字符对照；"
-                "具体差异已写入对应项目。"
-                if excel_present
-                else "Excel 对照：本次未提供 Excel，未执行 Excel 对照。"
-            )
+        if packaging_excel_notice is not None:
+            lines.append(packaging_excel_notice)
         remark_file = action_path.with_name("remark.txt")
         remark_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
