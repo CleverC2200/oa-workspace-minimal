@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 
 import pytest
 
@@ -26,15 +27,13 @@ def _material(
     workflow_key: str,
     regions: dict,
     excel: bool,
+    image_fixture: str,
 ) -> dict:
     attachment = attempt_root / "attachments" / "page-1.png"
     prepared_image = attempt_root / "prepared" / "page-1.png"
-    png = bytes.fromhex(
-        "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
-        "0000000c4944415408d763f8ffff3f0005fe02fe0dcae9400000000049454e44ae426082"
-    )
-    attachment.write_bytes(png)
-    prepared_image.write_bytes(png)
+    source_image = FIXTURE_ROOT / image_fixture
+    shutil.copyfile(source_image, attachment)
+    shutil.copyfile(source_image, prepared_image)
     resources = [{
         "request_id": request_id,
         "resource_id": "page-1",
@@ -50,7 +49,10 @@ def _material(
 
         excel_file = attempt_root / "attachments" / "reference.xlsx"
         workbook = Workbook()
-        workbook.active.append(["配料", "过敏原", "营养成分", "地址"])
+        workbook.active.append(["配料：小麦粉、白砂糖、植物油、食用盐"])
+        workbook.active.append(["过敏原：本产品含有小麦制品"])
+        workbook.active.append(["营养成分：能量1680千焦；蛋白质8.0克"])
+        workbook.active.append(["地址：示例市示例区测试路100号"])
         workbook.save(excel_file)
         workbook.close()
         resources.append({
@@ -66,7 +68,12 @@ def _material(
             "resource_id": "excel-1",
             "document_type": "spreadsheet",
             "summary": "脱敏 Excel 文案基准。",
-            "key_text": ["Sheet!R1: 配料 | 过敏原 | 营养成分 | 地址"],
+            "key_text": [
+                "Sheet!R1: 配料：小麦粉、白砂糖、植物油、食用盐",
+                "Sheet!R2: 过敏原：本产品含有小麦制品",
+                "Sheet!R3: 营养成分：能量1680千焦；蛋白质8.0克",
+                "Sheet!R4: 地址：示例市示例区测试路100号",
+            ],
         })
     return {
         "schema_version": 1,
@@ -109,6 +116,7 @@ def _engine(
     regions: dict | None = None,
     excel: bool = False,
     calls: list[dict] | None = None,
+    image_fixture: str = "packaging_sample.png",
 ) -> flow_engine.FlowEngine:
     current_regions = regions if regions is not None else dict.fromkeys(REGION_KEYS, "clear")
 
@@ -139,6 +147,7 @@ def _engine(
             workflow_key=material_workflow,
             regions=current_regions,
             excel=excel,
+            image_fixture=image_fixture,
         ),
         authorization_source=_grant if controlled else None,
         authorization_verifier=(
@@ -169,6 +178,21 @@ def _decision(
         "excel_comparison": {
             "status": "completed" if excel else "not_provided",
             "resource_id": "excel-1" if excel else None,
+            "mappings": (
+                [
+                    {
+                        "item_key": item["item_key"],
+                        "cell_refs": [
+                            "material:prepared.structured_contents."
+                            f"excel-1.key_text.{index}"
+                        ],
+                        "result": "match",
+                    }
+                    for index, item in enumerate(packet["items"])
+                ]
+                if excel
+                else []
+            ),
         },
         "items": [
             {
@@ -179,14 +203,16 @@ def _decision(
                         "evidence_refs": [
                             *reviewed["evidence_refs"],
                             "material:prepared.structured_contents."
-                            f"excel-1.{item['item_key']}",
+                            f"excel-1.key_text.{index}",
                         ]
                     }
                     if excel
                     else {}
                 ),
             }
-            for item, reviewed in zip(packet["items"], reviewed_items, strict=True)
+            for index, (item, reviewed) in enumerate(
+                zip(packet["items"], reviewed_items, strict=True)
+            )
         ],
     }
 
@@ -267,6 +293,7 @@ def test_packaging_rejects_invalid_or_incomplete_pages(
             workflow_key=WORKFLOW_KEY,
             regions={},
             excel=False,
+            image_fixture="packaging_sample.png",
         )
         if failure == "invalid_image":
             Path(material["prepared"]["images"][0]["path"]).write_bytes(
@@ -345,6 +372,7 @@ def test_packaging_independent_reviewer_replay_scores_100_percent(tmp_path: Path
             tmp_path / case["case_id"],
             material_workflow=case["material_workflow"],
             regions=case["regions"],
+            image_fixture=case["image_fixture"],
         )
         action = engine.next_action(WORKFLOW_KEY)
         if action["action"] == "needs_admin":
@@ -360,6 +388,8 @@ def test_packaging_independent_reviewer_replay_scores_100_percent(tmp_path: Path
         page_refs = {"material:prepared.images.page-1.page-1"}
         for item in case["items"]:
             assert not any("observed_regions" in image for image in material["prepared"]["images"])
+        for region, item in zip(REGION_KEYS, case["items"], strict=True):
+            assert (region in case["observations"]) == (item["status"] != "uncertain")
         covered_refs = {
             ref
             for item in case["items"]

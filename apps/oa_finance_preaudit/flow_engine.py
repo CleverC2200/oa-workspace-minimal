@@ -275,7 +275,7 @@ def _packaging_page_refs(material: dict) -> tuple[str, ...]:
     return tuple(refs)
 
 
-def _packaging_excel_ids(material: dict) -> tuple[set[str], set[str]]:
+def _packaging_excel_contents(material: dict) -> tuple[set[str], dict[str, list[str]]]:
     resources = material.get("resources")
     prepared = material.get("prepared")
     structured = prepared.get("structured_contents") if isinstance(prepared, dict) else []
@@ -286,15 +286,19 @@ def _packaging_excel_ids(material: dict) -> tuple[set[str], set[str]]:
         if isinstance(resource, dict)
         and resource.get("review_role") == "excel_reference"
     }
-    readable_ids = {
-        str(item.get("resource_id") or "")
+    readable = {
+        str(item.get("resource_id") or ""): list(item["key_text"])
         for item in structured
         if isinstance(item, dict)
         and item.get("document_type") == "spreadsheet"
         and isinstance(item.get("key_text"), list)
         and bool(item["key_text"])
     }
-    return excel_ids, excel_ids & readable_ids
+    return excel_ids, {
+        resource_id: key_text
+        for resource_id, key_text in readable.items()
+        if resource_id in excel_ids
+    }
 
 
 def _attempt_number(path: Path) -> int | None:
@@ -1690,26 +1694,70 @@ class FlowEngine:
             if not isinstance(comparison, dict) or set(comparison) != {
                 "status",
                 "resource_id",
+                "mappings",
             }:
                 raise ValueError("review_decision_invalid")
-            excel_ids, readable_excel_ids = _packaging_excel_ids(packaging_material)
+            excel_ids, readable_excel = _packaging_excel_contents(packaging_material)
             comparison_status = comparison.get("status")
             excel_resource_id = comparison.get("resource_id")
+            mappings = comparison.get("mappings")
             if comparison_status == "not_provided":
-                if excel_ids or excel_resource_id is not None:
+                if excel_ids or excel_resource_id is not None or mappings != []:
                     raise ValueError("review_decision_invalid")
                 packaging_excel_notice = (
                     "Excel 对照：本次未提供 Excel，未执行 Excel 对照。"
                 )
             elif comparison_status == "completed":
-                if excel_resource_id not in readable_excel_ids:
+                if (
+                    excel_resource_id not in readable_excel
+                    or not isinstance(mappings, list)
+                    or len(mappings) != len(packet_items)
+                ):
                     raise ValueError("review_decision_invalid")
-                for expected, item in zip(packet_items, normalized_items, strict=True):
-                    excel_ref = (
-                        "material:prepared.structured_contents."
-                        f"{excel_resource_id}.{expected['item_key']}"
-                    )
-                    if excel_ref not in item["evidence_refs"]:
+                key_text = readable_excel[excel_resource_id]
+                ref_prefix = (
+                    "material:prepared.structured_contents."
+                    f"{excel_resource_id}.key_text."
+                )
+                for expected, item, mapping in zip(
+                    packet_items,
+                    normalized_items,
+                    mappings,
+                    strict=True,
+                ):
+                    if not isinstance(mapping, dict) or set(mapping) != {
+                        "item_key",
+                        "cell_refs",
+                        "result",
+                    }:
+                        raise ValueError("review_decision_invalid")
+                    cell_refs = mapping.get("cell_refs")
+                    result = mapping.get("result")
+                    if (
+                        mapping.get("item_key") != expected.get("item_key")
+                        or not isinstance(cell_refs, list)
+                        or not cell_refs
+                        or result not in {"match", "different", "uncertain"}
+                        or (result == "different" and item["status"] == "pass")
+                        or (result == "uncertain" and item["status"] != "uncertain")
+                    ):
+                        raise ValueError("review_decision_invalid")
+                    for cell_ref in cell_refs:
+                        if (
+                            not isinstance(cell_ref, str)
+                            or not cell_ref.startswith(ref_prefix)
+                            or cell_ref not in item["evidence_refs"]
+                        ):
+                            raise ValueError("review_decision_invalid")
+                        try:
+                            index = int(cell_ref.removeprefix(ref_prefix))
+                        except ValueError as error:
+                            raise ValueError("review_decision_invalid") from error
+                        if index < 0 or index >= len(key_text):
+                            raise ValueError("review_decision_invalid")
+                    if not all(key_text[index].strip() for index in [
+                        int(cell_ref.removeprefix(ref_prefix)) for cell_ref in cell_refs
+                    ]):
                         raise ValueError("review_decision_invalid")
                 packaging_excel_notice = (
                     "Excel 对照：上述四项已与同一 Excel 逐字符对照；"

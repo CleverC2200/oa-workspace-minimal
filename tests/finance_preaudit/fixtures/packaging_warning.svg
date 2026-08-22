@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="900" viewBox="0 0 1200 900">
+  <rect width="1200" height="900" fill="#fffdf8"/>
+  <g font-family="PingFang SC, sans-serif" fill="#111">
+    <text x="70" y="90" font-size="38" font-weight="700">配料信息</text>
+    <text x="70" y="150" font-size="30">小麦粉、白砂糖、植物油、食用监</text>
+    <text x="70" y="280" font-size="38" font-weight="700">过敏原信息</text>
+    <text x="70" y="340" font-size="30">本产品含有小麦制品</text>
+    <text x="70" y="470" font-size="38" font-weight="700">营养成分表信息</text>
+    <text x="70" y="530" font-size="30">每100克：能量 1680 千焦；蛋白质 8.0 克</text>
+    <text x="70" y="660" font-size="38" font-weight="700">地址信息</text>
+    <text x="70" y="720" font-size="30">生产者：脱敏食品示例厂</text>
+    <text x="70" y="775" font-size="30">地址：示例市示例区测试路 100 号</text>
+  </g>
+</svg>
