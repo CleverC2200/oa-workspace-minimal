@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import fcntl
+import os
 from pathlib import Path
 import shutil
 from typing import Callable, Iterable
@@ -127,6 +130,8 @@ def _validated_root(root: Path) -> Path:
         raise ValueError("retention_root_invalid")
     resolved = raw.resolve(strict=True)
     marker = resolved / MARKER_NAME
+    if marker.is_symlink():
+        raise ValueError("retention_root_unmarked")
     try:
         marker_value = marker.read_text(encoding="utf-8")
     except OSError as error:
@@ -137,9 +142,21 @@ def _validated_root(root: Path) -> Path:
 
 
 def _validated_target(root: Path, relative_path: str | None) -> Path:
-    if not relative_path or Path(relative_path).is_absolute():
+    relative = Path(str(relative_path or ""))
+    if (
+        not relative_path
+        or relative.is_absolute()
+        or ".." in relative.parts
+        or "." in relative.parts
+    ):
         raise ValueError("retention_path_outside_root")
-    target = (root / relative_path).resolve(strict=False)
+    raw_target = root / relative
+    current = raw_target
+    while current != root:
+        if current.is_symlink():
+            raise ValueError("retention_path_outside_root")
+        current = current.parent
+    target = raw_target.resolve(strict=False)
     if target == root or root not in target.parents:
         raise ValueError("retention_path_outside_root")
     return target
@@ -159,34 +176,119 @@ def _receipt(*, now: datetime, archived: int = 0, deleted: int = 0,
     }
 
 
+def validate_file_actions(
+    root: Path,
+    actions: Iterable[RetentionAction],
+) -> None:
+    resolved_root = _validated_root(root)
+    for action in actions:
+        if action.action not in {"archive_path", "delete_path", "keep"}:
+            raise ValueError("retention_action_invalid")
+        _validated_target(resolved_root, action.relative_path)
+        if action.action == "archive_path":
+            source = _validated_target(resolved_root, action.relative_path)
+            destination = _validated_target(
+                resolved_root,
+                str(Path(".archive") / str(action.relative_path)),
+            )
+            if source.exists() and destination.exists():
+                raise ValueError("retention_archive_conflict")
+
+
+@contextmanager
+def maintenance_lock(root: Path):
+    resolved_root = _validated_root(root)
+    lock_path = resolved_root / ".retention.lock"
+    if lock_path.is_symlink():
+        raise ValueError("retention_root_invalid")
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as error:
+        raise ValueError("retention_root_invalid") from error
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield resolved_root
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 def apply_file_actions(
     root: Path,
     actions: Iterable[RetentionAction],
     *,
     now: datetime,
 ) -> dict:
+    items = list(actions)
+    with maintenance_lock(root) as resolved_root:
+        return apply_file_actions_locked(
+            resolved_root,
+            items,
+            now=now,
+        )
+
+
+def apply_file_actions_locked(
+    root: Path,
+    actions: Iterable[RetentionAction],
+    *,
+    now: datetime,
+) -> dict:
+    items = list(actions)
+    validate_file_actions(root, items)
     resolved_root = _validated_root(root)
     targets = [
         (action, _validated_target(resolved_root, action.relative_path))
-        for action in actions
-        if action.action == "delete_path"
+        for action in items
+        if action.action in {"archive_path", "delete_path"}
     ]
+    archive_targets = {
+        action.key: _validated_target(
+            resolved_root,
+            str(Path(".archive") / str(action.relative_path)),
+        )
+        for action, _target in targets
+        if action.action == "archive_path"
+    }
+    archived = 0
     deleted = 0
     missing = 0
     failed = 0
-    for _action, target in targets:
+    for _action, planned_target in targets:
+        target = _validated_target(resolved_root, _action.relative_path)
+        if target != planned_target:
+            raise ValueError("retention_path_outside_root")
         if not target.exists():
             missing += 1
             continue
         try:
-            if target.is_dir():
+            if _action.action == "archive_path":
+                destination = archive_targets[_action.key]
+                if destination.exists():
+                    raise ValueError("retention_archive_conflict")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination = _validated_target(
+                    resolved_root,
+                    str(destination.relative_to(resolved_root)),
+                )
+                target.rename(destination)
+                archived += 1
+            elif target.is_dir():
                 shutil.rmtree(target)
             else:
                 target.unlink()
-            deleted += 1
+            if _action.action == "delete_path":
+                deleted += 1
         except OSError:
             failed += 1
-    return _receipt(now=now, deleted=deleted, missing=missing, failed=failed)
+    return _receipt(
+        now=now,
+        archived=archived,
+        deleted=deleted,
+        missing=missing,
+        failed=failed,
+    )
 
 
 def apply_task_actions(

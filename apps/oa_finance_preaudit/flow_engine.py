@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
@@ -608,6 +609,7 @@ class FlowEngine:
             )
             state = {
                 **action,
+                "created_at": claim["created_at"],
                 "request_id": claim["request_id"],
                 "received_at": claim["received_at"],
                 "material_file": str(material_file),
@@ -824,6 +826,7 @@ class FlowEngine:
                     attempt=attempt,
                     request_id=selected["request_id"],
                     received_at=selected["received_at"],
+                    created_at=datetime.now(timezone.utc).isoformat(),
                     discovery_seconds=discovery_seconds,
                 )
                 prepare_root.mkdir(parents=True, exist_ok=True)
@@ -1133,6 +1136,7 @@ class FlowEngine:
             Path(action["state_file"]),
             {
                 **closed,
+                "created_at": state["created_at"],
                 "request_id": state["request_id"],
                 "received_at": state["received_at"],
                 "material_file": state["material_file"],

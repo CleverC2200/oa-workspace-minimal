@@ -13,7 +13,11 @@
 
 清理固定执行 `列举 → 计算计划 → 全量校验范围 → 删除`。调用方必须显式提供一个已由 `.oa-retention-root` 标记的运行根；根目录符号链接、未标记根、绝对目标、`..` 越界和解析后逃逸都必须在任何删除前失败。
 
-`apps.oa_finance_preaudit.retention` 只提供计划器、受限文件执行器和任务回调接口，不内置真实任务系统凭据。重复执行时，已不存在的目标计为 `missing`，不得扩展目标范围或报为成功删除。
+`python3 -m apps.oa_finance_preaudit.cli status --root <path>` 从 FlowEngine 的 attempt 状态生成版本化脱敏 JSON，只含流程、哈希、计数、年龄、执行/业务/写入状态和失败码。不得读取或输出材料、意见、requestId、人员、公司、附件名或绝对路径。status 是运维入口，不加入审核 Agent 的正常上下文。
+
+`python3 -m apps.oa_finance_preaudit.cli prune --root <path>` 调用 `runtime_maintenance` 完成列举、完整计划、全量范围校验和执行。策略固定为 30 天，计划不得来自未来且生成后 5 分钟失效。30 天内的旧已闭合 attempt 移入根内 `.archive/`；严格超期的旧 attempt 删除；最新、未闭合、状态无效或 `write_state=unknown` 的 attempt 保留。重复执行时，已不存在的目标计为 `missing`，不得扩展目标范围或报为成功删除。
+
+`apps.oa_finance_preaudit.retention` 保留纯计划器、受限文件执行器和任务回调接口，不内置真实任务系统凭据。
 
 ## 脱敏回执
 

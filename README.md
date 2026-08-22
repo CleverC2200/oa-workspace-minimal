@@ -113,7 +113,21 @@ python3 -m apps.oa_finance_preaudit.flow_runner \
 
 结构化日志、脱敏指标、冻结材料和临时附件保留 30 天；每类流程只保留最新一轮可见任务，旧的已闭合任务先归档，严格超过 30 天后才删除。未闭合任务或写入结果 `unknown` 的单据始终保留。
 
-清理能力位于 `apps.oa_finance_preaudit.retention`，执行前要求运行根存在专用标记并一次性校验全部目标不能越界。仓库不会自动标记或清理现有生产目录，也不连接真实任务系统；生产启用需要另行验收。
+人工、Codex 和后续定时任务使用同一个只读状态入口；输出只有脱敏哈希、计数、年龄、三维状态和失败码：
+
+```bash
+python3 -m apps.oa_finance_preaudit.cli status \
+  --root /absolute/path/to/finance_preaudit_flows
+```
+
+受控清理使用同一 JSON CLI。它先列举全部 attempt、生成带指纹的完整计划并校验所有目标，全部通过后才归档或删除：
+
+```bash
+python3 -m apps.oa_finance_preaudit.cli prune \
+  --root /absolute/path/to/finance_preaudit_flows
+```
+
+`prune` 要求运行根已存在专用 `.oa-retention-root` 标记，不会自动标记目录。未标记根、符号链接、绝对目标或越界目标会在任何变更前整体失败。仓库不会自动清理现有生产目录，也不连接真实任务系统；生产启用需要另行验收。
 
 ## 离线质量回放
 
