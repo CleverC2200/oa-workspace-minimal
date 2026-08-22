@@ -22,7 +22,7 @@ ITEM_NAMES = (
     "SAP 客户编码匹配",
     "金额孰低核销",
 )
-FACT_KEYS = ("budget_account", "attachment", "cost_bearer", "sap_customer", "amount")
+FACT_KEYS = ("budget_account", "attachment", "cost_bearer", None, "amount")
 FIXTURE_ROOT = Path(__file__).parent / "fixtures"
 REPLAY = json.loads(
     (FIXTURE_ROOT / "small_marketing_reviewer_replay.json").read_text(
@@ -65,7 +65,9 @@ def _engine(
     facts: dict | None = None,
     calls: list[dict] | None = None,
 ) -> flow_engine.FlowEngine:
-    current_facts = facts if facts is not None else dict.fromkeys(FACT_KEYS, "matched")
+    current_facts = facts if facts is not None else {
+        key: "matched" for key in FACT_KEYS if key is not None
+    }
 
     def submit(job: dict) -> dict:
         if calls is not None:
@@ -103,11 +105,21 @@ def _reviewed_items(statuses: list[str]) -> list[dict]:
     return [
         {
             "status": status,
-            "conclusion": "当前审核项已按脱敏冻结事实判断。",
-            "evidence_refs": (
-                [] if status == "uncertain" else [f"material:declared_fields.{fact_key}"]
+            "conclusion": (
+                "SAP 主数据接口未接入，无法核验。"
+                if fact_key is None
+                else "当前审核项已按脱敏冻结事实判断。"
             ),
-            "missing_evidence": ["当前审核项证据不足"] if status == "uncertain" else [],
+            "evidence_refs": (
+                []
+                if status == "uncertain"
+                else [f"material:declared_fields.{fact_key}"]
+            ),
+            "missing_evidence": (
+                ["SAP 主数据"]
+                if fact_key is None
+                else ["当前审核项证据不足"] if status == "uncertain" else []
+            ),
         }
         for fact_key, status in zip(FACT_KEYS, statuses, strict=True)
     ]
@@ -152,11 +164,12 @@ def test_marketing_preview_cli_and_items_are_isolated(tmp_path: Path, capsys) ->
 
     decision_file = tmp_path / "decision.json"
     json_artifact.write_json_atomic(
-        decision_file, _decision(action, _reviewed_items(["pass"] * 5))
+        decision_file,
+        _decision(action, _reviewed_items(["pass", "pass", "pass", "uncertain", "pass"])),
     )
     closed = engine.complete_review(Path(action["action_file"]), decision_file)
     assert (closed["business_state"], closed["write_state"]) == (
-        "pass", "not_requested"
+        "needs_human", "not_requested"
     )
 
 
@@ -166,7 +179,8 @@ def test_marketing_controlled_substitute_is_bound_and_idempotent(tmp_path: Path)
     action = engine.next_action(WORKFLOW_KEY)
     decision_file = tmp_path / "controlled.json"
     json_artifact.write_json_atomic(
-        decision_file, _decision(action, _reviewed_items(["pass"] * 5))
+        decision_file,
+        _decision(action, _reviewed_items(["pass", "pass", "pass", "uncertain", "pass"])),
     )
     closed = engine.complete_review(Path(action["action_file"]), decision_file)
     replayed = engine.complete_review(Path(action["action_file"]), decision_file)
@@ -204,8 +218,8 @@ def test_marketing_independent_reviewer_replay_scores_100_percent(tmp_path: Path
                 assert ref.removeprefix("material:declared_fields.") in material["declared_fields"]
         actuals[case["case_id"]] = {
             "outcome": (
-                "evidence_insufficient" if "⚠️" in statuses
-                else "business_warning" if "❌" in statuses else "pass"
+                "business_warning" if "❌" in statuses
+                else "evidence_insufficient" if "⚠️" in statuses else "pass"
             ),
             "items": [
                 {"name": item["name"], "status": status}
