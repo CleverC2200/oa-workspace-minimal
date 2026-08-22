@@ -11,7 +11,13 @@ from datetime import datetime, timezone
 from apps.oa_approval import api as legacy_api
 from apps.oa_approval import flow as legacy_flow
 from .case_bundle import collect_case
-from . import flow_engine, observability, production_pending, runtime_maintenance
+from . import (
+    flow_engine,
+    observability,
+    production_pending,
+    production_write,
+    runtime_maintenance,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -38,6 +44,7 @@ _FLOW_FAILURE_CODES = {
     "review_decision_invalid",
     "review_decision_unreadable",
     "run_mode_unauthorized",
+    "write_authorization_invalid",
     "workflow_not_implemented",
 }
 
@@ -64,10 +71,16 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     next_action = subparsers.add_parser("next-action")
     next_action.add_argument("--workflow", required=True)
-    next_action.add_argument("--mode", choices=("preview",), default="preview")
+    next_action.add_argument(
+        "--mode",
+        choices=("preview", "controlled-write"),
+        default="preview",
+    )
+    next_action.add_argument("--confirm-write", choices=("YES",), default=None)
     complete_review = subparsers.add_parser("complete-review")
     complete_review.add_argument("--action-file", type=Path, required=True)
     complete_review.add_argument("--decision-file", type=Path, required=True)
+    complete_review.add_argument("--confirm-write", choices=("YES",), default=None)
     status = subparsers.add_parser("status")
     status.add_argument("--root", type=Path, default=None)
     prune = subparsers.add_parser("prune")
@@ -83,7 +96,7 @@ def _runtime_root(value: Path | None) -> Path:
     )
 
 
-def _live_flow_engine() -> flow_engine.FlowEngine:
+def _live_flow_engine(*, controlled: bool = False) -> flow_engine.FlowEngine:
     configs = legacy_flow.load_all_configs()
     oa_uid = legacy_flow.common_oa_uid(configs)
     oa_api = legacy_api.build_api(configs[0], oa_uid_override=oa_uid)
@@ -117,11 +130,21 @@ def _live_flow_engine() -> flow_engine.FlowEngine:
         os.environ.get("OA_FINANCE_PREAUDIT_FLOW_ROOT")
         or PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
     )
+    ports = production_write.build_ports(root=root) if controlled else {}
     return flow_engine.FlowEngine(
         root=root,
         discover_candidates=discover,
         collect_material=collect,
+        **ports,
     )
+
+
+def _persisted_mode(action_file: Path) -> str | None:
+    try:
+        payload = json.loads(action_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return str(payload.get("mode") or "") if isinstance(payload, dict) else None
 
 
 def _failure_payload(error: Exception, *, command: str = "next-action") -> dict:
@@ -248,10 +271,29 @@ def main(
             operation = runtime_prune or runtime_maintenance.prune
             payload = operation(_runtime_root(args.root))
         else:
-            engine = (flow_engine_factory or _live_flow_engine)()
             if args.command == "next-action":
-                payload = engine.next_action(args.workflow, mode=args.mode)
+                controlled = args.mode == "controlled-write"
+                if controlled != (args.confirm_write == "YES"):
+                    raise ValueError("run_mode_unauthorized")
+                engine = (
+                    flow_engine_factory()
+                    if flow_engine_factory is not None
+                    else _live_flow_engine(controlled=controlled)
+                )
+                payload = engine.next_action(
+                    args.workflow,
+                    mode="controlled_write" if controlled else "preview",
+                )
             else:
+                persisted_mode = _persisted_mode(args.action_file)
+                controlled = persisted_mode == "controlled_write"
+                if controlled != (args.confirm_write == "YES"):
+                    raise ValueError("run_mode_unauthorized")
+                engine = (
+                    flow_engine_factory()
+                    if flow_engine_factory is not None
+                    else _live_flow_engine(controlled=controlled)
+                )
                 payload = engine.complete_review(
                     args.action_file,
                     args.decision_file,

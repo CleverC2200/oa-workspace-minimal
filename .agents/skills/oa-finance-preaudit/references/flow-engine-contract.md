@@ -17,7 +17,9 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
 - `action=review_required`：只读取 `review_packet_file` 及审核包引用的 `material_file`，按审核包顺序完成当前流程的固定审核项。
 - `action=needs_admin`：本地冻结材料、审核包或持久状态不再可信；这是退出码为 0 的正常动作结果，并同步写入当前动作和对应 attempt 状态。停止当前单据并报告 `reason`，不得自行修复、重取或改写为业务 `⚠️`。
 
-公开 CLI 返回的 preview 动作都固化 `mode=preview`、`write_authorized=false` 和 `write_state=not_requested`。审核决定不包含运行模式或授权，不能在第二步切换写入。
+默认命令返回的 preview 动作固化 `mode=preview`、`write_authorized=false` 和 `write_state=not_requested`。审核决定不包含运行模式或授权，不能在第二步切换写入。
+
+受控生产任务仍使用相同的 `next-action` 和 `complete-review`，但必须由已经单独授权的流程定时入口在两个动作上都显式传入 `--confirm-write YES`，并由运行环境提供只包含该流程的本地授权清单。手工 Skill 任务固定使用默认 preview，不得把已有 preview attempt 提升为写入。
 
 每个 attempt 只有一个当前动作；同一候选重复调用时返回原动作和 token，不重复取数。积压中还存在未打开候选时，后续 `next-action` 可以打开另一单据，供独立审核调用处理。`current-action.json` 只是最近一次返回动作的投影，不是全局锁或事实源。
 
@@ -72,6 +74,6 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
 
 只有返回 `action=closed` 才算当前 preview 闭合。`execution_state`、`business_state` 和 `write_state` 分别表示技术执行、业务结论和 OA 写入；公开 CLI 的本合同下 `write_state` 必须始终为 `not_requested`。业务 `needs_human` 是正常闭合，不重试、不改成技术失败。脚本在闭合前重新验证流程身份、动作、状态、审核包、材料路径和冻结指纹；任一变化返回 `needs_admin`，不生成意见。
 
-受控写入不是审核者可选择的模式。只有宿主同时注入绑定当前 `requestId + received_at + case_key + attempt + material_fingerprint + evidence_fingerprint` 的一次性授权、外部 verifier 和提交适配器时，FlowEngine 才生成写入 token；`complete-review` 提交前会再次调用 verifier。审核决定不能创建、修改或提升授权。
+受控写入不是审核者可选择的模式。只有宿主同时注入绑定当前 `requestId + received_at + case_key + attempt + material_fingerprint + evidence_fingerprint` 的一小时授权、外部 verifier 和提交适配器时，FlowEngine 才生成写入 token；`complete-review` 提交前会再次验签并复核本地流程授权清单。提交适配器还要重新确认当前 OA 待办中的 `requestId + received_at` 完全一致。审核决定不能创建、修改或提升授权。
 
 每个 attempt 至少记录 discover、collect、review、close；受控写入还记录 submit、postcheck。FlowEngine 不把“审核包已生成到结果写回”的墙钟时间直接当成等待或 Agent 活动；只有宿主提供绑定当前 item 的 exact timing receipt 时，验收报告才覆盖 `active_seconds` 与 `waiting_seconds`，否则两者保持 unknown 并阻止等待比例调优。coordination 秒数和 Token 固定为 0。当前运行的 Token 状态固定写 `unknown`。终态回执只保存审核项、资源、页面的 covered/total/applicable 计数和格式是否合规，不保存证据正文；资源 covered 必须来自决定中的具体资源引用，不能按材料存在自动填满。提交前事件不能保存时停止；已确认提交后才发生观测异常时，回执必须写 `observability_state=unknown`，禁止为了补日志重复提交。

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -300,6 +301,132 @@ class TestFrozenWriterContract:
 
         assert first != second
         assert first.parent == second.parent
+
+    def test_request_writer_lease_rejects_symlink_without_touching_target(
+        self,
+    ) -> None:
+        outside = self.root / "outside.txt"
+        outside.write_text("KEEP", encoding="utf-8")
+        target = runtime_control.request_writer_lock_file(
+            self.request_id,
+            self.lock_path,
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.symlink_to(outside)
+
+        with pytest.raises(RuntimeError, match="writer_lock_unsafe"):
+            with runtime_control.request_writer_lease(
+                self.request_id,
+                self.lock_path,
+            ):
+                pytest.fail("unsafe lock unexpectedly acquired")
+
+        assert outside.read_text(encoding="utf-8") == "KEEP"
+
+    def test_request_writer_lease_rejects_symlink_parent(self) -> None:
+        outside = self.root / "outside-locks"
+        outside.mkdir()
+        linked_parent = self.root / "linked-locks"
+        linked_parent.symlink_to(outside, target_is_directory=True)
+        lock_path = linked_parent / "writer.lock"
+
+        with pytest.raises(RuntimeError, match="writer_lock_unsafe"):
+            with runtime_control.request_writer_lease(
+                self.request_id,
+                lock_path,
+            ):
+                pytest.fail("unsafe parent unexpectedly accepted")
+
+        assert list(outside.iterdir()) == []
+
+    def test_request_writer_lease_pins_parent_during_open(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        safe_parent = self.root / "safe-locks"
+        safe_parent.mkdir()
+        backup_parent = self.root / "safe-locks-original"
+        outside = self.root / "outside-locks"
+        outside.mkdir()
+        lock_path = safe_parent / "writer.lock"
+        target = runtime_control.request_writer_lock_file(
+            self.request_id,
+            lock_path,
+        )
+        outside_target = outside / target.name
+        outside_target.write_text("KEEP", encoding="utf-8")
+        original_open = os.open
+        swapped = False
+
+        def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal swapped
+            is_target = (
+                dir_fd is None and Path(path) == target
+            ) or (
+                dir_fd is not None and str(path) == target.name
+            )
+            if is_target and not swapped:
+                safe_parent.rename(backup_parent)
+                safe_parent.symlink_to(outside, target_is_directory=True)
+                swapped = True
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(runtime_control.os, "open", racing_open)
+
+        with pytest.raises(RuntimeError, match="writer_lock_unsafe"):
+            with runtime_control.request_writer_lease(
+                self.request_id,
+                lock_path,
+            ):
+                pytest.fail("raced parent unexpectedly accepted")
+
+        assert swapped is True
+        assert outside_target.read_text(encoding="utf-8") == "KEEP"
+
+    def test_request_writer_lease_rejects_ancestor_swap(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ancestor = self.root / "managed-locks"
+        parent = ancestor / "control"
+        parent.mkdir(parents=True)
+        backup = self.root / "managed-locks-original"
+        outside = self.root / "outside-tree"
+        outside_parent = outside / "control"
+        outside_parent.mkdir(parents=True)
+        lock_path = parent / "writer.lock"
+        target = runtime_control.request_writer_lock_file(
+            self.request_id,
+            lock_path,
+        )
+        outside_target = outside_parent / target.name
+        outside_target.write_text("KEEP", encoding="utf-8")
+        original_open = os.open
+        swapped = False
+
+        def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal swapped
+            opens_full_parent = dir_fd is None and Path(path) == parent
+            opens_ancestor_component = (
+                dir_fd is not None and str(path) == ancestor.name
+            )
+            if not swapped and (opens_full_parent or opens_ancestor_component):
+                ancestor.rename(backup)
+                ancestor.symlink_to(outside, target_is_directory=True)
+                swapped = True
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(runtime_control.os, "open", racing_open)
+
+        with pytest.raises(RuntimeError, match="writer_lock_unsafe"):
+            with runtime_control.request_writer_lease(
+                self.request_id,
+                lock_path,
+            ):
+                pytest.fail("raced ancestor unexpectedly accepted")
+
+        assert swapped is True
+        assert outside_target.read_text(encoding="utf-8") == "KEEP"
 
 
 class TestFrozenWriterApi:

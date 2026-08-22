@@ -60,7 +60,7 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
   --decision-file /absolute/path/to/review-decision.json
 ```
 
-两条公开命令默认且当前只支持 preview，动作固定 `write_authorized=false`，写入状态固定为 `not_requested`；不会调用 OA 提交。模块和 CLI 共用同一业务实现，大对象通过本地文件传递，stdout 只输出一个版本化 JSON。冻结材料、流程身份或持久状态不一致时返回正常的 `needs_admin` 动作并停止当前单据，不生成意见。五类流程的目录、锁和当前动作投影相互独立；积压中已有单据等待审核时，后续调用可取得另一单据，每个 attempt 使用自己的完成锁，互不等待。
+两条命令默认都是 preview，动作固定 `write_authorized=false`，写入状态固定为 `not_requested`；不会调用 OA 提交。模块和 CLI 共用同一业务实现，大对象通过本地文件传递，stdout 只输出一个版本化 JSON。冻结材料、流程身份或持久状态不一致时返回正常的 `needs_admin` 动作并停止当前单据，不生成意见。五类流程的目录、锁和当前动作投影相互独立；积压中已有单据等待审核时，后续调用可取得另一单据，每个 attempt 使用自己的完成锁，互不等待。
 
 正常运行只使用 `next-action`、`complete-review`、`status` 和 `prune` 四个命令。候选发现、材料收集、冻结校验、单据锁、提交安全门和回执均隐藏在深模块内；没有角色 CLI、底层队列命令或跨任务消息协议。
 
@@ -70,11 +70,25 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
 
 内部离线验收报告固定检查审核项/资源/页面/格式/golden replay 100%、重复提交/跨单据混用/unknown 自动重试/Agent 消息 0，以及 P95 小于 900 秒、等待比例小于 20%、技术错误率不高于 2%。每流程不足 20 个闭合脱敏样本时不建议调参；缺少平台精确 usage 时只停止 Token 调优。真实 `python -m` 入口会把四命令的成功、参数、JSON 合同和文件传递结果写入本地 30 天脱敏 CLI 日志；进程尚未启动时的失败和人工复现由本地 launcher/harness 补充。日志不含 argv、stderr 或路径；status/prune 每次只记一条 global 调用，按流程展示时投影影响范围，但 overall 不重复计数。未知值不能推断为 0。只有 CLI 故障严格多于其他技术故障且证据完整时，报告才允许提出独立 stdio MCP 后续 Issue；本项目当前不实现或安装 MCP。
 
-OA 提交只通过冻结写入入口执行。授权证明、锁、token、冻结指纹和终态回执均绑定单个 `requestId + received_at + attempt` 及其材料版本：同一 attempt 单飞并幂等重放，不同单据可以并发。受控写入还必须由运行环境注入授权源、外部 verifier 和提交适配器，并在提交前复核；公开 CLI 未接入这些端口。本仓库测试只使用模拟接口，不会写真实 OA。
+OA 提交只通过冻结写入入口执行。授权证明、锁、token、冻结指纹和终态回执均绑定单个 `requestId + received_at + attempt` 及其材料版本：同一 attempt 单飞并幂等重放，不同单据可以并发。受控写入由同一个 CLI 向 FlowEngine 注入授权源、外部 verifier 和提交适配器；必须同时满足本地流程授权清单和两步命令各自的显式 `--confirm-write YES`，缺一不可：
+
+```bash
+python3 -m apps.oa_finance_preaudit.cli next-action \
+  --workflow WORKFLOW_KEY \
+  --mode controlled-write \
+  --confirm-write YES
+
+python3 -m apps.oa_finance_preaudit.cli complete-review \
+  --action-file /absolute/path/to/action.json \
+  --decision-file /absolute/path/to/review-decision.json \
+  --confirm-write YES
+```
+
+流程授权清单只保存在被 Git 忽略的 `runtime/control/write-policy.json`。授权源用本地 OA 应用密钥对单据版本、attempt 和材料指纹生成一小时有效的绑定证明；提交前 verifier 再验签、复核流程授权清单、冻结文件和当前 OA 待办版本。测试只使用模拟接口，不会写真实 OA。
 
 ## 单流程运行
 
-每次 `next-action` 只处理参数指定的一类流程，规则包、状态目录和当前单据相互隔离。空队列立即闭合；积压并发由调用方对不同单据重复使用同一双动作接口实现，不在审核上下文建立角色或消息协调。项目不会创建或启用生产 cron，生产入口仍保持暂停，需另行完成人工验收后逐个启用。
+每次 `next-action` 只处理参数指定的一类流程，规则包、状态目录和当前单据相互隔离。空队列立即闭合；积压并发由调用方对不同单据重复使用同一双动作接口实现，不在审核上下文建立角色或消息协调。仓库合并不会创建或启用生产 cron；每类流程仍需单独完成真实环境验收和当前授权后，才能建立并启用自己的定时入口。
 
 ## 留存与清理
 
