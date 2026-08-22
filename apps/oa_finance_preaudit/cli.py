@@ -14,7 +14,7 @@ from apps.oa_approval import official_sql
 
 from apps import json_artifact
 from .case_bundle import CollectionFailure, collect_case
-from . import flow_engine, production_pending
+from . import flow_engine, production_pending, runtime_maintenance
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -23,7 +23,20 @@ ListHandledFunction = Callable[..., list[dict]]
 ListPendingFunction = Callable[..., list[dict]]
 ResolveRequestIdFunction = Callable[[str], str]
 FlowEngineFactory = Callable[[], flow_engine.FlowEngine]
+RuntimeOperation = Callable[[Path], dict]
 _SAFE_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{2,80}$")
+_RUNTIME_FAILURE_CODES = {
+    "retention_action_invalid",
+    "retention_archive_conflict",
+    "retention_path_outside_root",
+    "retention_plan_invalid",
+    "retention_root_invalid",
+    "retention_root_unmarked",
+    "runtime_now_invalid",
+    "runtime_path_symlink",
+    "runtime_root_invalid",
+    "runtime_state_invalid",
+}
 
 
 def _json_default(value: object) -> str:
@@ -72,7 +85,19 @@ def build_parser() -> argparse.ArgumentParser:
     complete_review = subparsers.add_parser("complete-review")
     complete_review.add_argument("--action-file", type=Path, required=True)
     complete_review.add_argument("--decision-file", type=Path, required=True)
+    status = subparsers.add_parser("status")
+    status.add_argument("--root", type=Path, default=None)
+    prune = subparsers.add_parser("prune")
+    prune.add_argument("--root", type=Path, default=None)
     return parser
+
+
+def _runtime_root(value: Path | None) -> Path:
+    return Path(
+        value
+        or os.environ.get("OA_FINANCE_PREAUDIT_FLOW_ROOT")
+        or PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
+    )
 
 
 def _live_collect(args: argparse.Namespace, request_id: str) -> dict:
@@ -161,6 +186,14 @@ def _live_flow_engine() -> flow_engine.FlowEngine:
 
 
 def _failure_payload(error: Exception, *, command: str = "collect-case") -> dict:
+    if command in {"status", "prune"}:
+        raw_code = str(error).strip()
+        code = raw_code if raw_code in _RUNTIME_FAILURE_CODES else "runtime_failed"
+        return {
+            "schema_version": 1,
+            "kind": "preaudit_runtime_failed",
+            "failure": {"code": code, "stage": command},
+        }
     if command in {"next-action", "complete-review"}:
         return {
             "schema_version": 1,
@@ -204,6 +237,8 @@ def _fail(args: argparse.Namespace, error: Exception) -> int:
         except OSError:
             pass
     _print_payload(failure)
+    if args.command in {"status", "prune"}:
+        print(failure["failure"]["code"], file=sys.stderr)
     return 1
 
 
@@ -215,10 +250,18 @@ def main(
     list_pending: ListPendingFunction | None = None,
     resolve_request_id: ResolveRequestIdFunction | None = None,
     flow_engine_factory: FlowEngineFactory | None = None,
+    runtime_status: RuntimeOperation | None = None,
+    runtime_prune: RuntimeOperation | None = None,
 ) -> int:
     args = build_parser().parse_args(argv)
     try:
-        if args.command in {"next-action", "complete-review"}:
+        if args.command == "status":
+            operation = runtime_status or runtime_maintenance.status
+            payload = operation(_runtime_root(args.root))
+        elif args.command == "prune":
+            operation = runtime_prune or runtime_maintenance.prune
+            payload = operation(_runtime_root(args.root))
+        elif args.command in {"next-action", "complete-review"}:
             engine = (flow_engine_factory or _live_flow_engine)()
             if args.command == "next-action":
                 payload = engine.next_action(args.workflow, mode=args.mode)
