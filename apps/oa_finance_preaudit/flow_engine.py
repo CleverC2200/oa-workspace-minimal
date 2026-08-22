@@ -11,6 +11,8 @@ import secrets
 import time
 from typing import Callable, Iterable
 
+import fitz
+
 from apps import json_artifact
 
 from . import elastic_queue, observability, submission
@@ -57,6 +59,15 @@ _FLOW_SPECS = {
             "cost_bearer",
             "sap_customer_code_match",
             "reimbursable_minimum",
+        ),
+    },
+    "packaging_layout_approval": {
+        "rule_version": "packaging_layout_approval:1",
+        "item_keys": (
+            "ingredients",
+            "allergens",
+            "nutrition_facts",
+            "address_information",
         ),
     },
 }
@@ -177,6 +188,117 @@ def _flow_items(workflow_key: str) -> list[dict]:
             start=1,
         )
     ]
+
+
+def _is_readable_single_page_image(path: object) -> bool:
+    try:
+        document = fitz.open(str(path or ""))
+        try:
+            return (
+                document.page_count == 1
+                and document[0].rect.width > 0
+                and document[0].rect.height > 0
+            )
+        finally:
+            document.close()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _validate_flow_material(workflow_key: str, material: dict) -> None:
+    if workflow_key != "packaging_layout_approval":
+        return
+    resources = material.get("resources")
+    prepared = material.get("prepared")
+    images = prepared.get("images") if isinstance(prepared, dict) else None
+    if not isinstance(resources, list) or not isinstance(images, list):
+        raise ValueError("packaging_material_incomplete")
+    required_ids = {
+        str(resource.get("resource_id") or "")
+        for resource in resources
+        if isinstance(resource, dict)
+        and resource.get("review_role") == "packaging_image"
+    }
+    manifest = prepared.get("manifest")
+    if not required_ids or not isinstance(manifest, list):
+        raise ValueError("packaging_material_incomplete")
+    image_counts = {resource_id: 0 for resource_id in required_ids}
+    for image in images:
+        if not isinstance(image, dict):
+            raise ValueError("packaging_material_incomplete")
+        resource_id = str(
+            image.get("parent_resource_id") or image.get("resource_id") or ""
+        )
+        if resource_id not in image_counts:
+            continue
+        if not _is_readable_single_page_image(image.get("path")):
+            raise ValueError("packaging_material_incomplete")
+        image_counts[resource_id] += 1
+    manifest_counts = {
+        str(item.get("resource_id") or ""): item.get("image_count")
+        for item in manifest
+        if isinstance(item, dict)
+        and str(item.get("resource_id") or "") in required_ids
+    }
+    if any(
+        image_counts[resource_id] <= 0
+        or manifest_counts.get(resource_id) != image_counts[resource_id]
+        for resource_id in required_ids
+    ):
+        raise ValueError("packaging_material_incomplete")
+
+
+def _packaging_page_refs(material: dict) -> tuple[str, ...]:
+    resources = material.get("resources")
+    prepared = material.get("prepared")
+    images = prepared.get("images") if isinstance(prepared, dict) else []
+    resource_items = resources if isinstance(resources, list) else []
+    required_ids = [
+        str(resource.get("resource_id") or "")
+        for resource in resource_items
+        if isinstance(resource, dict)
+        and resource.get("review_role") == "packaging_image"
+    ]
+    refs = []
+    for resource_id in required_ids:
+        resource_images = [
+            image
+            for image in images
+            if isinstance(image, dict)
+            and str(image.get("parent_resource_id") or image.get("resource_id") or "")
+            == resource_id
+        ]
+        refs.extend(
+            f"material:prepared.images.{resource_id}.page-{number}"
+            for number, _image in enumerate(resource_images, start=1)
+        )
+    return tuple(refs)
+
+
+def _packaging_excel_contents(material: dict) -> tuple[set[str], dict[str, list[str]]]:
+    resources = material.get("resources")
+    prepared = material.get("prepared")
+    structured = prepared.get("structured_contents") if isinstance(prepared, dict) else []
+    resource_items = resources if isinstance(resources, list) else []
+    excel_ids = {
+        str(resource.get("resource_id") or "")
+        for resource in resource_items
+        if isinstance(resource, dict)
+        and resource.get("review_role") == "excel_reference"
+    }
+    readable = {
+        str(item.get("resource_id") or ""): list(item["key_text"])
+        for item in structured
+        if isinstance(item, dict)
+        and item.get("document_type") == "spreadsheet"
+        and isinstance(item.get("key_text"), list)
+        and bool(item["key_text"])
+    }
+    return excel_ids, {
+        resource_id: key_text
+        for resource_id, key_text in readable.items()
+        if resource_id in excel_ids
+    }
 
 
 def _attempt_number(path: Path) -> int | None:
@@ -944,6 +1066,7 @@ class FlowEngine:
             or _evidence_fingerprint(material) != state.get("evidence_fingerprint")
         ):
             raise ValueError("frozen_material_changed")
+        _validate_flow_material(workflow_key, material)
         return action, state, packet
 
     def _prepare_attempt(self, attempt_root: Path) -> dict:
@@ -1004,6 +1127,7 @@ class FlowEngine:
                     or material.get("workflow_key") != workflow_key
                 ):
                     raise ValueError("material_workflow_mismatch")
+                _validate_flow_material(workflow_key, material)
                 material_file = attempt_root / "material.json"
                 json_artifact.write_json_atomic(material_file, material, indent=2)
                 verified = elastic_queue.validate_material_bundle(
@@ -1499,6 +1623,8 @@ class FlowEngine:
             "overall",
             "items",
         }
+        if action["workflow_key"] == "packaging_layout_approval":
+            expected_fields.add("excel_comparison")
         if (
             set(decision) != expected_fields
             or decision.get("schema_version") != SCHEMA_VERSION
@@ -1548,6 +1674,98 @@ class FlowEngine:
                 raise ValueError("review_decision_invalid")
             normalized_items.append(dict(item))
 
+        packaging_material: dict | None = None
+        packaging_excel_notice: str | None = None
+        if action["workflow_key"] == "packaging_layout_approval":
+            packaging_material = _read_object(
+                Path(state["material_file"]),
+                code="frozen_material_changed",
+            )
+            page_refs = set(_packaging_page_refs(packaging_material))
+            covered_refs = {
+                value
+                for item in normalized_items
+                for field in ("evidence_refs", "missing_evidence")
+                for value in item[field]
+            }
+            if not page_refs or not page_refs.issubset(covered_refs):
+                raise ValueError("review_decision_invalid")
+            comparison = decision.get("excel_comparison")
+            if not isinstance(comparison, dict) or set(comparison) != {
+                "status",
+                "resource_id",
+                "mappings",
+            }:
+                raise ValueError("review_decision_invalid")
+            excel_ids, readable_excel = _packaging_excel_contents(packaging_material)
+            comparison_status = comparison.get("status")
+            excel_resource_id = comparison.get("resource_id")
+            mappings = comparison.get("mappings")
+            if comparison_status == "not_provided":
+                if excel_ids or excel_resource_id is not None or mappings != []:
+                    raise ValueError("review_decision_invalid")
+                packaging_excel_notice = (
+                    "Excel 对照：本次未提供 Excel，未执行 Excel 对照。"
+                )
+            elif comparison_status == "completed":
+                if (
+                    excel_resource_id not in readable_excel
+                    or not isinstance(mappings, list)
+                    or len(mappings) != len(packet_items)
+                ):
+                    raise ValueError("review_decision_invalid")
+                key_text = readable_excel[excel_resource_id]
+                ref_prefix = (
+                    "material:prepared.structured_contents."
+                    f"{excel_resource_id}.key_text."
+                )
+                for expected, item, mapping in zip(
+                    packet_items,
+                    normalized_items,
+                    mappings,
+                    strict=True,
+                ):
+                    if not isinstance(mapping, dict) or set(mapping) != {
+                        "item_key",
+                        "cell_refs",
+                        "result",
+                    }:
+                        raise ValueError("review_decision_invalid")
+                    cell_refs = mapping.get("cell_refs")
+                    result = mapping.get("result")
+                    if (
+                        mapping.get("item_key") != expected.get("item_key")
+                        or not isinstance(cell_refs, list)
+                        or not cell_refs
+                        or result not in {"match", "different", "uncertain"}
+                        or (result == "different" and item["status"] == "pass")
+                        or (result == "uncertain" and item["status"] != "uncertain")
+                    ):
+                        raise ValueError("review_decision_invalid")
+                    for cell_ref in cell_refs:
+                        if (
+                            not isinstance(cell_ref, str)
+                            or not cell_ref.startswith(ref_prefix)
+                            or cell_ref not in item["evidence_refs"]
+                        ):
+                            raise ValueError("review_decision_invalid")
+                        try:
+                            index = int(cell_ref.removeprefix(ref_prefix))
+                        except ValueError as error:
+                            raise ValueError("review_decision_invalid") from error
+                        if index < 0 or index >= len(key_text):
+                            raise ValueError("review_decision_invalid")
+                    if not all(key_text[index].strip() for index in [
+                        int(cell_ref.removeprefix(ref_prefix)) for cell_ref in cell_refs
+                    ]):
+                        raise ValueError("review_decision_invalid")
+                packaging_excel_notice = (
+                    "Excel 对照：上述四项已与同一 Excel 逐字符对照；"
+                    "具体差异已写入对应项目。"
+                )
+            else:
+                raise ValueError("review_decision_invalid")
+
         needs_human = any(item["status"] != "pass" for item in normalized_items)
         expected_overall = "needs_human" if needs_human else "pass"
         if decision["overall"] != expected_overall:
@@ -1574,6 +1792,8 @@ class FlowEngine:
                 f"{status_mark[item['status']]} {number}、{expected['name']}："
                 f"{item['conclusion'].strip()}"
             )
+        if packaging_excel_notice is not None:
+            lines.append(packaging_excel_notice)
         remark_file = action_path.with_name("remark.txt")
         remark_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

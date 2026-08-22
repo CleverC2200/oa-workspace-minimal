@@ -1,6 +1,6 @@
 # 本地 FlowEngine 合同
 
-当前合同覆盖 `travel_expense`、`business_entertainment`、`business_support_fee` 和 `small_marketing_fee` 的 preview。四类财务流程使用同一接口、独立运行目录和各自规则包；旧角色入口暂时只用于回退，不得与本路径混用。
+当前合同覆盖全部五类流程。它们使用同一接口、独立运行目录和各自规则包；包装流程另按规则包直接观察原图，禁止 OCR。旧角色入口暂时只用于回退，不得与本路径混用。
 
 ## 两动作循环
 
@@ -57,6 +57,10 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
 - `uncertain` 至少有一个 `missing_evidence`。
 - 任一项目为 `fail` 或 `uncertain` 时，`overall` 必须为 `needs_human`；全部为 `pass` 时必须为 `pass`。
 - 不增加 requestId、人员、公司、写入模式、意见文本或其他字段。
+
+包装流程的决定还必须增加一个 `excel_comparison`。未提供 Excel 时固定为 `{"status":"not_provided","resource_id":null,"mappings":[]}`。存在 Excel 时，`mappings` 必须按四项顺序逐项给出 `item_key`、可解析到同一结构化 Excel `key_text` 索引的 `cell_refs`，以及 `match`、`different` 或 `uncertain` 比较结果；相同 cell ref 还要进入对应项目的 `evidence_refs`。脚本逐条验证资源、索引、项目状态和四项映射后才渲染 Excel 对照尾行，不根据附件存在自行推断完成。
+
+包装决定还必须用 `material:prepared.images.<resource_id>.page-<number>` 在 `evidence_refs` 或 `missing_evidence` 中覆盖审核包引用材料的每一页。脚本会先验证图片可读、manifest 页数与准备页一致，再验证决定的全页覆盖；采集脚本不得生成图片观察或校对结论。
 
 将决定写入新的本地文件后执行：
 

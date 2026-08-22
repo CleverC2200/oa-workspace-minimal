@@ -18,7 +18,7 @@ description: 使用 Codex 对 Weaver E9 四类财务报销和包装版面流程�
 - 仅当用户已明确授权的生产自动化调用本 Skill 时，才可把冻结意见交给项目既有的安全写入器；不得由本 Skill 绕过安全门、直接批准、退回或继续流程。
 - 不读取、输出或复制凭据、Cookie、token、密码和无关附件正文。
 
-四类财务流程 preview 优先使用[本地 FlowEngine 合同](references/flow-engine-contract.md)：只执行 `next-action`，读取返回的审核包及其冻结材料，写出结构化审核决定，再执行 `complete-review`。不得为该路径创建 Reviewer、Writer、Observer、控制台或 Agent-to-Agent 消息；不得自行处理 requestId、目录、哈希、状态或意见渲染。
+五类流程 preview 统一使用[本地 FlowEngine 合同](references/flow-engine-contract.md)：只执行 `next-action`，读取返回的审核包及其冻结材料，写出结构化审核决定，再执行 `complete-review`。不得为该路径创建 Reviewer、Writer、Observer、控制台或 Agent-to-Agent 消息；不得自行处理 requestId、目录、哈希、状态或意见渲染。包装流程仍须按其规则包调用中文图片文字校对 Skill，禁止 OCR。
 
 自动化运行先读取[单流程定时运行合同](references/flow-runner-contract.md)。五个入口各自只加载当前流程的规则包和当前单据；每个角色只读取本角色合同，不得加载旧小时 dispatcher、当天控制台或其他流程上下文。单据审核 Agent 再读取[单据审核 Agent 合同](references/reviewer-contract.md)，Writer 读取[按请求隔离的 OA 提交合同](references/writer-contract.md)。
 

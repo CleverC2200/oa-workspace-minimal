@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="900" viewBox="0 0 1200 900">
+  <rect width="1200" height="900" fill="#fffdf8"/>
+  <rect x="40" y="40" width="1120" height="170" fill="#f8f2e8" stroke="#222" stroke-width="3"/>
+  <text x="75" y="95" font-family="PingFang SC, sans-serif" font-size="38" font-weight="700">配料信息</text>
+  <text x="75" y="155" font-family="PingFang SC, sans-serif" font-size="30">小麦粉、白砂糖、植物油、食用盐</text>
+  <rect x="40" y="240" width="1120" height="150" fill="#eef7f2" stroke="#222" stroke-width="3"/>
+  <text x="75" y="295" font-family="PingFang SC, sans-serif" font-size="38" font-weight="700">过敏原信息</text>
+  <text x="75" y="355" font-family="PingFang SC, sans-serif" font-size="30">本产品含有小麦制品</text>
+  <rect x="40" y="420" width="1120" height="200" fill="#eef4fb" stroke="#222" stroke-width="3"/>
+  <text x="75" y="475" font-family="PingFang SC, sans-serif" font-size="38" font-weight="700">营养成分表信息</text>
+  <text x="75" y="535" font-family="PingFang SC, sans-serif" font-size="30">每100克：能量 1680 千焦；蛋白质 8.0 克</text>
+  <text x="75" y="585" font-family="PingFang SC, sans-serif" font-size="30">脂肪 12.0 克；碳水化合物 68.0 克</text>
+  <rect x="40" y="650" width="1120" height="200" fill="#f7eef8" stroke="#222" stroke-width="3"/>
+  <text x="75" y="705" font-family="PingFang SC, sans-serif" font-size="38" font-weight="700">地址信息</text>
+  <text x="75" y="765" font-family="PingFang SC, sans-serif" font-size="30">生产者：脱敏食品示例厂</text>
+  <text x="75" y="815" font-family="PingFang SC, sans-serif" font-size="30">地址：示例市示例区测试路 100 号</text>
+</svg>
