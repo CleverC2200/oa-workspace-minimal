@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import argparse
 import json
 from pathlib import Path
 from statistics import mean
 from typing import Mapping
 
-from .flow_runner import WORKFLOW_KEYS
+from .flow_engine import WORKFLOW_KEYS
 
 
 SCENARIOS = (
@@ -266,23 +265,3 @@ def run_replay(suite: dict, actuals: Mapping[str, dict]) -> dict:
         },
         "differences": differences,
     }
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="oa-finance-flow-evals")
-    parser.add_argument("--fixtures", type=Path, required=True)
-    parser.add_argument("--actuals", type=Path, required=True)
-    args = parser.parse_args(argv)
-    suite = load_suite(args.fixtures)
-    try:
-        actuals = json.loads(args.actuals.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise SystemExit("eval_actuals_unreadable") from error
-    if not isinstance(actuals, dict):
-        raise SystemExit("eval_actuals_invalid")
-    print(json.dumps(run_replay(suite, actuals), ensure_ascii=False, sort_keys=True))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

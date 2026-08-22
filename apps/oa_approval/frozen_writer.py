@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 from pathlib import Path
 import re
 import secrets
-import sys
 from typing import Any, Sequence
 import uuid
 
@@ -306,68 +304,3 @@ def submit_frozen(
         if code == "writer_already_active":
             raise FrozenWriterError(code) from error
         raise
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Submit one frozen preaudit remark")
-    commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("status")
-    submit = commands.add_parser("submit")
-    submit.add_argument("--request-id", required=True)
-    submit.add_argument("--received-at", required=True)
-    submit.add_argument("--isolation-key", required=True)
-    submit.add_argument("--submission-token", required=True)
-    submit.add_argument("--material-file", required=True)
-    submit.add_argument("--remark-file", required=True)
-    submit.add_argument("--remark-envelope-file", required=True)
-    submit.add_argument("--current-proof-file", required=True)
-    submit.add_argument("--material-fingerprint", required=True)
-    submit.add_argument("--remark-fingerprint", required=True)
-    submit.add_argument("--remark-envelope-fingerprint", required=True)
-    submit.add_argument("--current-proof-fingerprint", required=True)
-    submit.add_argument("--confirm-write", choices=("YES",), required=True)
-    return parser
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    if args.command == "status":
-        active_count = runtime_control.active_request_writers()
-        print(
-            json.dumps(
-                {
-                    "ok": True,
-                    "lock_scope": "request_id",
-                    "active_run": active_count > 0,
-                    "active_count": active_count,
-                }
-            )
-        )
-        return 0
-    try:
-        receipt = submit_frozen(
-            request_id=args.request_id,
-            received_at=args.received_at,
-            isolation_key=args.isolation_key,
-            submission_token=args.submission_token,
-            material_file=args.material_file,
-            remark_file=args.remark_file,
-            remark_envelope_file=args.remark_envelope_file,
-            current_proof_file=args.current_proof_file,
-            material_fingerprint=args.material_fingerprint,
-            remark_fingerprint=args.remark_fingerprint,
-            remark_envelope_fingerprint=args.remark_envelope_fingerprint,
-            current_proof_fingerprint=args.current_proof_fingerprint,
-        )
-    except FrozenWriterError as error:
-        print(json.dumps({"ok": False, "fail_code": str(error)}, ensure_ascii=False))
-        return 1
-    except (OSError, ValueError, RuntimeError):
-        print(json.dumps({"ok": False, "fail_code": "writer_runtime_failed"}))
-        return 1
-    print(json.dumps({"ok": True, "submission_receipt": receipt}, ensure_ascii=False))
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

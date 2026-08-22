@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
-import argparse
 import fcntl
 import hashlib
 import json
@@ -220,45 +219,6 @@ def attempt_has_phases(
     return required.issubset(present)
 
 
-def attach_exact_usage(
-    path: Path,
-    *,
-    item_key: str,
-    event_id: str,
-    model: str,
-    input_tokens: int,
-    output_tokens: int,
-    total_tokens: int,
-) -> dict:
-    target = Path(path).expanduser().resolve()
-    usage = _validated_usage(
-        {
-            "status": "exact",
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": total_tokens,
-        }
-    )
-    if not _SHA256.fullmatch(item_key) or not _SAFE_TEXT.fullmatch(event_id):
-        raise ValueError("observability_event_invalid")
-    if not _SAFE_TEXT.fullmatch(model):
-        raise ValueError("observability_event_invalid")
-    with _exclusive_lock(target):
-        payload = _read_log(target)
-        for event in payload["events"]:
-            if event["item_key"] != item_key or event["event_id"] != event_id:
-                continue
-            if event["token_usage"] == usage and event["model"] == model:
-                return {"event_count": len(payload["events"]), "replayed": True}
-            if event["token_usage"] != {"status": "unknown"}:
-                raise ValueError("observability_usage_conflict")
-            event["token_usage"] = usage
-            event["model"] = model
-            write_json_atomic(target, payload)
-            return {"event_count": len(payload["events"]), "replayed": False}
-    raise ValueError("observability_event_not_found")
-
-
 def _empty_metrics() -> dict:
     return {
         "event_count": 0,
@@ -320,54 +280,3 @@ def summarize_logs(paths: Iterable[Path]) -> dict:
         "by_hour": dict(sorted(by_hour.items())),
         "results": results,
     }
-
-
-def _read_event_file(path: Path) -> dict:
-    try:
-        payload = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValueError("observability_event_file_unreadable") from error
-    return validate_event(payload)
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="oa-finance-preaudit-observability")
-    commands = parser.add_subparsers(dest="command", required=True)
-    record = commands.add_parser("record")
-    record.add_argument("--log", type=Path, required=True)
-    record.add_argument("--event-file", type=Path, required=True)
-    usage = commands.add_parser("usage")
-    usage.add_argument("--log", type=Path, required=True)
-    usage.add_argument("--item-key", required=True)
-    usage.add_argument("--event-id", required=True)
-    usage.add_argument("--model", required=True)
-    usage.add_argument("--input-tokens", type=int, required=True)
-    usage.add_argument("--output-tokens", type=int, required=True)
-    usage.add_argument("--total-tokens", type=int, required=True)
-    summary = commands.add_parser("summary")
-    summary.add_argument("--log", type=Path, action="append", required=True)
-    return parser
-
-
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    if args.command == "record":
-        result = record_event(args.log, _read_event_file(args.event_file))
-    elif args.command == "usage":
-        result = attach_exact_usage(
-            args.log,
-            item_key=args.item_key,
-            event_id=args.event_id,
-            model=args.model,
-            input_tokens=args.input_tokens,
-            output_tokens=args.output_tokens,
-            total_tokens=args.total_tokens,
-        )
-    else:
-        result = summarize_logs(args.log)
-    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

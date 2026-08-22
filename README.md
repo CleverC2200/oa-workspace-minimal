@@ -29,7 +29,7 @@ V1.1 是首次 GitHub 私有发布基线。发布不会启动定时任务，现�
 ```text
 .agents/skills/oa-finance-preaudit/  # Skill 入口、流程规则与证据契约
 .agents/skills/oa-finance-preaudit/references/flows/  # 五类隔离规则包
-apps/oa_finance_preaudit/           # 材料收集、冻结结果与角色窄入口
+apps/oa_finance_preaudit/           # 单一深模块、JSON CLI、状态与观测
 apps/oa_approval/                   # OA 和外部数据的复用连接能力
 tests/finance_preaudit/             # 聚焦合同测试与回放测试
 docs/agents/                        # Issue、标签和领域文档约定
@@ -62,52 +62,17 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
 
 两条公开命令默认且当前只支持 preview，动作固定 `write_authorized=false`，写入状态固定为 `not_requested`；不会调用 OA 提交。模块和 CLI 共用同一业务实现，大对象通过本地文件传递，stdout 只输出一个版本化 JSON。冻结材料、流程身份或持久状态不一致时返回正常的 `needs_admin` 动作并停止当前单据，不生成意见。五类流程的目录、锁和当前动作投影相互独立；积压中已有单据等待审核时，后续调用可取得另一单据，每个 attempt 使用自己的完成锁，互不等待。
 
-旧的按 requestId 材料收集入口暂时作为回退能力保留：
-
-```bash
-python3 -m apps.oa_finance_preaudit.cli collect-case \
-  --request-id REQUEST_ID \
-  --allow-browser-download
-```
-
-需要从已办流程选择测试样本时，可先读取候选索引：
-
-```bash
-python3 -m apps.oa_finance_preaudit.cli list-handled \
-  --page-size 200 \
-  --max-pages 5
-```
-
-候选标题不能证明流程身份，必须以 `collect-case` 返回的 `workflow_key` 为准。
+正常运行只使用 `next-action`、`complete-review`、`status` 和 `prune` 四个命令。候选发现、材料收集、冻结校验、单据锁、提交安全门和回执均隐藏在深模块内；没有角色 CLI、底层队列命令或跨任务消息协议。
 
 ## 脱敏运行指标
 
-每个 attempt 的 `observability.json` 只保存 attempt 哈希、流程、阶段、耗时、结果和平台精确 usage；没有精确 usage 时固定记为 `unknown`，不做估算。汇总按审核、沟通协调、等待和提交四类拆分：
-
-```bash
-python3 -m apps.oa_finance_preaudit.observability summary \
-  --log /absolute/attempt/observability.json
-```
-
-平台在 Agent 闭合后返回精确 usage 时，使用同一 `item_key + event_id` 的 `usage` 命令补充；重复回放不会重复计数，冲突值会被拒绝。提交前的必要事件无法保存时停止当前单据；提交后才发生的指标异常不会重放 OA，而是在回执中明确记录 `observability_state=unknown`。
+每个 attempt 的 `observability.json` 只保存 attempt 哈希、流程、阶段、耗时、结果和 Token 状态。当前运行固定记录 `token_usage=unknown`，不做估算；`status` 同时汇总当前与归档 attempt。重复事件不会重复计数，冲突值会被拒绝；提交前的必要事件无法保存时停止当前单据，提交后的指标异常不会触发 OA 重放。
 
 OA 提交只通过冻结写入入口执行。授权证明、锁、token、冻结指纹和终态回执均绑定单个 `requestId + received_at + attempt` 及其材料版本：同一 attempt 单飞并幂等重放，不同单据可以并发。受控写入还必须由运行环境注入授权源、外部 verifier 和提交适配器，并在提交前复核；公开 CLI 未接入这些端口。本仓库测试只使用模拟接口，不会写真实 OA。
 
-## 单流程调度 dry-run
+## 单流程运行
 
-五个定时入口的唯一配置位于 `config/flow-runners.json`。每个入口只加载一类流程规则，并使用独立的状态目录和指标目录；旧小时 dispatcher、当天控制台和跨流程 FIFO 不进入新热路径。
-
-候选文件只接受当前流程的 queued、prepared 或 submitting 单据。以下命令只计算本轮容量和闭合状态，不读取附件、不形成意见、不调用 OA：
-
-```bash
-python3 -m apps.oa_finance_preaudit.flow_runner \
-  --workflow-key travel_expense \
-  --candidates-file /absolute/path/to/candidates.json \
-  --available-reviewer-slots 3 \
-  --available-submit-slots 3
-```
-
-空队列立即闭合；积压按配置和实际槽位的较小值并发。配置不会创建或启用生产 cron，生产入口仍保持暂停，需另行完成人工验收后逐个启用。
+每次 `next-action` 只处理参数指定的一类流程，规则包、状态目录和当前单据相互隔离。空队列立即闭合；积压并发由调用方对不同单据重复使用同一双动作接口实现，不在审核上下文建立角色或消息协调。项目不会创建或启用生产 cron，生产入口仍保持暂停，需另行完成人工验收后逐个启用。
 
 ## 留存与清理
 
@@ -137,7 +102,7 @@ python3 -m apps.oa_finance_preaudit.cli prune \
 python3 -m pytest tests/finance_preaudit/test_flow_evals.py -v
 ```
 
-外部离线结果也可通过 `python3 -m apps.oa_finance_preaudit.flow_evals --fixtures ... --actuals ...` 生成逐流程报告。样本不包含原始附件或业务身份，性能改善不得以准确性和格式回归为代价。
+离线样本不包含原始附件或业务身份，性能改善不得以准确性和格式回归为代价。回放实现属于开发质量模块，不是正常运行入口。
 
 ## 代码质量门
 
@@ -152,20 +117,6 @@ python3 -m pytest -v
 ```
 
 仓库继续保持私有，不配置 GitHub 服务端分支保护。`main` 的普通变更仍按本地维护规则通过质量门和 PR 合并，但这不是平台强制；具体见[main 本地管理规则](docs/agents/branch-protection.md)。CI 不读取真实 OA 凭据，也不启用生产自动化。
-
-## 并发调参建议
-
-`apps.oa_finance_preaudit.tuning` 按流程读取脱敏闭合指标和 golden replay 报告，只输出并发建议，不修改配置。每类至少 20 张闭合单据且 Token 完整、质量无回归、重复提交为零、错误率不超限后才评估；建议单次最多增加 1，单流程上限为 3，并保留一个共享实际槽位。
-
-```bash
-python3 -m apps.oa_finance_preaudit.tuning \
-  --histories /absolute/path/to/sanitized-histories.json \
-  --quality-report /absolute/path/to/golden-report.json \
-  --shared-reviewer-slots 4 \
-  --shared-submit-slots 4
-```
-
-输出包含样本窗口、P50/P95、等待占比、Token/单、错误率、重复提交率、假设、预期效果和回退条件。任何建议都需要另行小流量人工验收；不会自动启用生产任务。
 
 ## 验证
 

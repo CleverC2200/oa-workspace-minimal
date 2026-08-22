@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import re
 
-from . import retention
+from . import observability, retention
 
 
 SCHEMA_VERSION = 1
@@ -132,7 +132,22 @@ def status(root: Path, *, now: datetime | None = None) -> dict:
         raise ValueError("runtime_root_invalid")
 
     by_workflow: dict[str, list[dict]] = {}
-    for attempt_root in _attempt_roots(runtime_root):
+    attempt_roots = _attempt_roots(runtime_root)
+    metric_cutoff = current_time - timedelta(days=retention.RETENTION_DAYS)
+    archived_metric_roots: list[Path] = []
+    for attempt_root in _attempt_roots(runtime_root, archived=True):
+        try:
+            state = _read_state(attempt_root / "state.json")
+            created_at = _timestamp(state["created_at"])
+        except ValueError:
+            continue
+        if created_at >= metric_cutoff:
+            archived_metric_roots.append(attempt_root)
+    metric_roots = [
+        *attempt_roots,
+        *archived_metric_roots,
+    ]
+    for attempt_root in attempt_roots:
         try:
             state = _read_state(attempt_root / "state.json")
         except ValueError:
@@ -231,6 +246,14 @@ def status(root: Path, *, now: datetime | None = None) -> dict:
         "kind": "preaudit_runtime_status",
         "generated_at": current_time.isoformat(),
         "workflows": workflows,
+        "observability": observability.summarize_logs(
+            path
+            for path in (
+                attempt_root / "observability.json"
+                for attempt_root in metric_roots
+            )
+            if path.is_file()
+        ),
     }
 
 

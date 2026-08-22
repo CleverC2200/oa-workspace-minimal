@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import time
 from typing import Callable, Iterable
@@ -15,7 +16,7 @@ import fitz
 
 from apps import json_artifact
 
-from . import elastic_queue, observability, submission
+from . import observability, submission
 
 
 SCHEMA_VERSION = 1
@@ -32,6 +33,16 @@ _FLOW_SPECS = {
             "personal_advance_tickets",
             "invoice_buyer",
         ),
+        "item_names": (
+            "报销周期",
+            "出差与住宿天数",
+            "公共交通",
+            "住宿与考勤",
+            "跨区域带车",
+            "油补",
+            "个人垫付车票",
+            "发票购买方",
+        ),
     },
     "business_entertainment": {
         "rule_version": "business_entertainment:1",
@@ -41,6 +52,12 @@ _FLOW_SPECS = {
             "budget",
             "reimbursable_minimum",
         ),
+        "item_names": (
+            "附件完整性/支付证据",
+            "发票关联",
+            "预算",
+            "金额孰低核销",
+        ),
     },
     "business_support_fee": {
         "rule_version": "business_support_fee:1",
@@ -49,6 +66,12 @@ _FLOW_SPECS = {
             "business_compliance",
             "budget_check",
             "reimbursable_minimum",
+        ),
+        "item_names": (
+            "附件完整性",
+            "业务事项合规性",
+            "预算校验",
+            "金额孰低核销",
         ),
     },
     "small_marketing_fee": {
@@ -60,6 +83,13 @@ _FLOW_SPECS = {
             "sap_customer_code_match",
             "reimbursable_minimum",
         ),
+        "item_names": (
+            "预算科目",
+            "附件完整性",
+            "费用承担主体",
+            "SAP 客户编码匹配",
+            "金额孰低核销",
+        ),
     },
     "packaging_layout_approval": {
         "rule_version": "packaging_layout_approval:1",
@@ -69,8 +99,16 @@ _FLOW_SPECS = {
             "nutrition_facts",
             "address_information",
         ),
+        "item_names": (
+            "配料信息",
+            "过敏原信息",
+            "营养成分表信息",
+            "地址信息",
+        ),
     },
 }
+WORKFLOW_KEYS = tuple(_FLOW_SPECS)
+_SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 SHARED_FAILURE_CODES = {
     "submission_adapter_unavailable",
     "write_authorization_invalid",
@@ -180,14 +218,131 @@ def _flow_items(workflow_key: str) -> list[dict]:
     spec = _FLOW_SPECS.get(workflow_key)
     if spec is None:
         raise ValueError("workflow_not_implemented")
-    names = elastic_queue.flow_item_names(workflow_key)
     return [
         {"item_key": item_key, "number": number, "name": name}
         for number, (item_key, name) in enumerate(
-            zip(spec["item_keys"], names, strict=True),
+            zip(spec["item_keys"], spec["item_names"], strict=True),
             start=1,
         )
     ]
+
+
+def _path_within(value: object, root: Path, *, code: str) -> Path:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError(code)
+    path = Path(raw).expanduser().resolve()
+    expected_root = Path(root).expanduser().resolve()
+    if not path.is_file() or not path.is_relative_to(expected_root):
+        raise ValueError(code)
+    return path
+
+
+def _validate_material_bundle(
+    material_file: Path,
+    *,
+    expected_request_id: str,
+    attachment_root: Path,
+    prepared_root: Path,
+) -> dict:
+    request_id = str(expected_request_id or "").strip()
+    if not _SAFE_REQUEST_ID.fullmatch(request_id):
+        raise ValueError("invalid_request_id")
+    try:
+        raw = Path(material_file).read_bytes()
+        material = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("material_bundle_unreadable") from error
+    if (
+        not isinstance(material, dict)
+        or material.get("schema_version") != 1
+        or material.get("kind") != "preaudit_material"
+    ):
+        raise ValueError("material_bundle_schema_invalid")
+    if str(material.get("request_id") or "") != request_id:
+        raise ValueError("material_request_mismatch")
+
+    resources = material.get("resources")
+    prepared = material.get("prepared")
+    if not isinstance(resources, list) or not isinstance(prepared, dict):
+        raise ValueError("material_bundle_schema_invalid")
+    resource_ids: set[str] = set()
+    resource_paths: dict[str, Path] = {}
+    for resource in resources:
+        if not isinstance(resource, dict):
+            raise ValueError("material_bundle_schema_invalid")
+        if str(resource.get("request_id") or "") != request_id:
+            raise ValueError("resource_request_mismatch")
+        resource_id = str(resource.get("resource_id") or "").strip()
+        source_resource_id = str(resource.get("source_resource_id") or "").strip()
+        if not resource_id or resource_id in resource_ids:
+            raise ValueError("resource_identity_invalid")
+        if not source_resource_id:
+            raise ValueError("resource_source_identity_missing")
+        if (
+            str(resource.get("source_system") or "") == "travel_platform"
+            and str(resource.get("source_request_id") or "") != request_id
+        ):
+            raise ValueError("resource_request_mismatch")
+        resource_ids.add(resource_id)
+        resource_paths[resource_id] = _path_within(
+            resource.get("local_readonly_path"),
+            attachment_root,
+            code="attachment_path_outside_request_root",
+        )
+
+    images = prepared.get("images")
+    manifest = prepared.get("manifest")
+    structured = prepared.get("structured_contents")
+    if not all(isinstance(value, list) for value in (images, manifest, structured)):
+        raise ValueError("material_bundle_schema_invalid")
+    prepared_path = Path(prepared_root).expanduser().resolve()
+    for image in images:
+        if not isinstance(image, dict):
+            raise ValueError("material_bundle_schema_invalid")
+        resource_id = str(image.get("resource_id") or "").strip()
+        parent_resource_id = str(image.get("parent_resource_id") or "").strip()
+        if resource_id in resource_paths:
+            bound_resource_id = resource_id
+        elif parent_resource_id in resource_paths:
+            bound_resource_id = parent_resource_id
+        else:
+            raise ValueError("prepared_resource_unbound")
+        image_path = Path(str(image.get("path") or "")).expanduser().resolve()
+        if not image_path.is_file():
+            raise ValueError("prepared_path_outside_request_root")
+        if image_path.is_relative_to(prepared_path):
+            continue
+        if resource_id != bound_resource_id or image_path != resource_paths[resource_id]:
+            raise ValueError("prepared_resource_path_mismatch")
+    for item in structured:
+        if not isinstance(item, dict):
+            raise ValueError("prepared_resource_unbound")
+        resource_id = str(item.get("resource_id") or "").strip()
+        parent_resource_id = str(item.get("parent_resource_id") or "").strip()
+        if resource_id not in resource_ids and parent_resource_id not in resource_ids:
+            raise ValueError("prepared_resource_unbound")
+    manifest_resource_ids: set[str] = set()
+    for item in manifest:
+        if not isinstance(item, dict):
+            raise ValueError("manifest_resource_unbound")
+        resource_id = str(item.get("resource_id") or "")
+        if resource_id not in resource_ids:
+            raise ValueError("manifest_resource_unbound")
+        manifest_resource_ids.add(resource_id)
+    if manifest_resource_ids != resource_ids:
+        raise ValueError("manifest_resource_coverage_incomplete")
+
+    return {
+        "request_id": request_id,
+        "material_fingerprint": f"sha256:{hashlib.sha256(raw).hexdigest()}",
+        "resource_count": len(resources),
+        "image_count": len(images),
+        "excel_reference_present": any(
+            str(resource.get("review_role") or "") == "excel_reference"
+            for resource in resources
+        ),
+    }
 
 
 def _is_readable_single_page_image(path: object) -> bool:
@@ -1050,13 +1205,13 @@ class FlowEngine:
         if packet != expected_packet:
             raise ValueError("frozen_packet_changed")
         try:
-            verified = elastic_queue.validate_material_bundle(
+            verified = _validate_material_bundle(
                 material_path,
                 expected_request_id=str(state.get("request_id") or ""),
                 attachment_root=action_path.parent / "attachments",
                 prepared_root=action_path.parent / "prepared",
             )
-        except (OSError, ValueError, elastic_queue.QueueContractError) as error:
+        except (OSError, ValueError) as error:
             raise ValueError("frozen_material_changed") from error
         if verified["material_fingerprint"] != state.get("material_fingerprint"):
             raise ValueError("frozen_material_changed")
@@ -1130,7 +1285,7 @@ class FlowEngine:
                 _validate_flow_material(workflow_key, material)
                 material_file = attempt_root / "material.json"
                 json_artifact.write_json_atomic(material_file, material, indent=2)
-                verified = elastic_queue.validate_material_bundle(
+                verified = _validate_material_bundle(
                     material_file,
                     expected_request_id=claim["request_id"],
                     attachment_root=attachment_root,
