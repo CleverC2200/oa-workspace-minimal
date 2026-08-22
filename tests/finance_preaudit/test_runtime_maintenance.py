@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import fcntl
 import hashlib
 import io
 import json
+import os
+import threading
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
@@ -56,6 +59,14 @@ def _attempt(
         encoding="utf-8",
     )
     return attempt_root
+
+
+def _empty_daily_rollup() -> dict:
+    outcomes = runtime_maintenance._empty_outcome_metrics()
+    return {
+        "observability": observability.empty_daily_metrics(),
+        "outcomes": {"overall": outcomes, "by_flow": {}},
+    }
 
 
 def test_status_is_versioned_and_sanitized(tmp_path: Path) -> None:
@@ -126,23 +137,29 @@ def test_status_is_versioned_and_sanitized(tmp_path: Path) -> None:
         active_seconds=2,
         result="success",
     )
-    for attempt_root, request_id, wall_seconds in (
-        (boundary_attempt, "boundary-request", 3),
-        (expired_attempt, "expired-request", 100),
+    for attempt_root, request_id, occurred_at, wall_seconds in (
+        (boundary_attempt, "boundary-request", "2026-07-23T12:00:00Z", 3),
+        (expired_attempt, "expired-request", "2026-07-22T12:00:00Z", 100),
     ):
-        observability.record_attempt_phase(
+        observability.record_event(
+            attempt_root / "observability.json",
             {
-                "request_root": str(attempt_root),
-                "request_id": request_id,
-                "received_at": "2026-07-23T20:00:00+08:00",
-                "attempt": 1,
-                "flow_key": "travel_expense",
+                "event_id": "close",
+                "item_key": observability.attempt_key(
+                    request_id,
+                    "2026-07-23T20:00:00+08:00",
+                    1,
+                ),
+                "workflow_key": "travel_expense",
+                "occurred_at": occurred_at,
+                "phase": "close",
+                "wall_seconds": wall_seconds,
+                "active_seconds": wall_seconds,
+                "queue_wait_seconds": 0,
+                "result": "success",
+                "model": None,
+                "token_usage": {"status": "unknown"},
             },
-            event_id="close",
-            phase="close",
-            wall_seconds=wall_seconds,
-            active_seconds=wall_seconds,
-            result="success",
         )
 
     status = runtime_maintenance.status(root, now=NOW)
@@ -248,6 +265,231 @@ def test_prune_archives_deletes_and_preserves_protected_attempts(
     assert open_attempt.is_dir()
     assert unknown.is_dir()
     assert "targets" not in first
+
+
+def test_prune_compacts_raw_metrics_before_delete_and_keeps_daily_180_days(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    expired = _attempt(root, case_key="a" * 64, attempt=1, age_days=31)
+    _attempt(root, case_key="b" * 64, attempt=1, age_days=1)
+    item_key = observability.attempt_key(
+        "expired-request",
+        "2026-07-22T09:00:00+08:00",
+        1,
+    )
+    observability.record_event(
+        expired / "observability.json",
+        {
+            "event_id": "close",
+            "item_key": item_key,
+            "workflow_key": "travel_expense",
+            "occurred_at": "2026-07-22T04:00:00Z",
+            "phase": "close",
+            "wall_seconds": 1,
+            "active_seconds": 1,
+            "queue_wait_seconds": 0,
+            "result": "success",
+            "model": None,
+            "token_usage": {"status": "unknown"},
+        },
+    )
+    metrics_root = root / ".metrics" / "daily"
+    metrics_root.mkdir(parents=True)
+    for age_days in (180, 181):
+        day = (NOW - timedelta(days=age_days)).date().isoformat()
+        json_artifact.write_json_atomic(
+            metrics_root / f"{day}.json",
+            {
+                "schema_version": 1,
+                "kind": "preaudit_daily_metric",
+                "day": day,
+                "generated_at": NOW.isoformat(),
+                    "metrics": _empty_daily_rollup(),
+            },
+        )
+
+    receipt = runtime_maintenance.prune(root, now=NOW)
+    status = runtime_maintenance.status(root, now=NOW)
+
+    compacted = metrics_root / "2026-07-22.json"
+    boundary = metrics_root / f"{(NOW - timedelta(days=180)).date()}.json"
+    expired_daily = metrics_root / f"{(NOW - timedelta(days=181)).date()}.json"
+    assert receipt["deleted"] == 2
+    assert not expired.exists()
+    assert compacted.is_file()
+    assert boundary.is_file()
+    assert not expired_daily.exists()
+    assert item_key not in compacted.read_text(encoding="utf-8")
+    assert {item["day"] for item in status["daily_history"]} == {
+        "2026-07-22",
+        boundary.stem,
+    }
+    compacted_payload = json.loads(compacted.read_text(encoding="utf-8"))
+    assert set(compacted_payload["metrics"]) == {"observability", "outcomes"}
+    assert compacted_payload["metrics"]["outcomes"]["overall"][
+        "evidence_status"
+    ] in {"exact", "unknown"}
+
+
+def test_daily_metric_rejects_nested_unapproved_fields(tmp_path: Path) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    metrics = _empty_daily_rollup()
+    metrics["outcomes"]["overall"]["request_id"] = "must-not-appear"
+    daily = root / ".metrics" / "daily" / "2026-08-22.json"
+    daily.parent.mkdir(parents=True)
+    json_artifact.write_json_atomic(
+        daily,
+        {
+            "schema_version": 1,
+            "kind": "preaudit_daily_metric",
+            "day": "2026-08-22",
+            "generated_at": NOW.isoformat(),
+            "metrics": metrics,
+        },
+    )
+
+    with pytest.raises(ValueError, match="runtime_state_invalid"):
+        runtime_maintenance.status(root, now=NOW)
+
+
+def test_daily_metric_rejects_impossible_outcome_totals(tmp_path: Path) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    metrics = _empty_daily_rollup()
+    metrics["outcomes"]["overall"]["quality"]["item_covered"] = 1
+    daily = root / ".metrics" / "daily" / "2026-08-22.json"
+    daily.parent.mkdir(parents=True)
+    json_artifact.write_json_atomic(
+        daily,
+        {
+            "schema_version": 1,
+            "kind": "preaudit_daily_metric",
+            "day": "2026-08-22",
+            "generated_at": NOW.isoformat(),
+            "metrics": metrics,
+        },
+    )
+
+    with pytest.raises(ValueError, match="runtime_state_invalid"):
+        runtime_maintenance.status(root, now=NOW)
+
+
+def test_daily_metric_rejects_flow_overall_mismatch() -> None:
+    metrics = _empty_daily_rollup()
+    flow = runtime_maintenance._empty_outcome_metrics()
+    flow["attempt_count"] = 1
+    flow["closed_count"] = 1
+    flow["business_results"]["pass"] = 1
+    flow["quality"]["format_total"] = 1
+    metrics["outcomes"]["by_flow"]["travel_expense"] = flow
+
+    with pytest.raises(ValueError, match="runtime_state_invalid"):
+        runtime_maintenance._validate_daily_rollup(metrics)
+
+
+def test_prune_never_follows_daily_target_symlink(tmp_path: Path) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    expired = _attempt(root, case_key="a" * 64, attempt=1, age_days=31)
+    _attempt(root, case_key="b" * 64, attempt=1, age_days=1)
+    observability.record_event(
+        expired / "observability.json",
+        {
+            "event_id": "close",
+            "item_key": observability.attempt_key("request", "received", 1),
+            "workflow_key": "travel_expense",
+            "occurred_at": "2026-07-22T04:00:00Z",
+            "phase": "close",
+            "wall_seconds": 1,
+            "active_seconds": 1,
+            "queue_wait_seconds": 0,
+            "result": "success",
+            "model": None,
+            "token_usage": {"status": "unknown"},
+        },
+    )
+    outside = tmp_path / "outside.json"
+    outside.write_text("unchanged", encoding="utf-8")
+    target = root / ".metrics" / "daily" / "2026-07-22.json"
+    target.parent.mkdir(parents=True)
+    target.symlink_to(outside)
+
+    with pytest.raises(ValueError):
+        runtime_maintenance.prune(root, now=NOW)
+
+    assert outside.read_text(encoding="utf-8") == "unchanged"
+    assert expired.is_dir()
+
+
+def test_recent_close_prevents_old_attempt_from_immediate_deletion(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    old = _attempt(root, case_key="a" * 64, attempt=1, age_days=31)
+    _attempt(root, case_key="b" * 64, attempt=1, age_days=1)
+    observability.record_attempt_phase(
+        {
+            "request_root": str(old),
+            "request_id": "long-running-request",
+            "received_at": "2026-07-22T09:00:00+08:00",
+            "attempt": 1,
+            "flow_key": "travel_expense",
+        },
+        event_id="close",
+        phase="close",
+        wall_seconds=1,
+        active_seconds=1,
+        result="success",
+    )
+
+    plan = runtime_maintenance.build_prune_plan(root, now=NOW)
+    by_path = {item["relative_path"]: item for item in plan["actions"]}
+
+    assert by_path[str(old.relative_to(root))]["action"] == "archive_path"
+
+
+def test_prune_waits_for_flow_state_transition_lock(tmp_path: Path) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    attempt_root = _attempt(
+        root,
+        case_key="a" * 64,
+        attempt=1,
+        age_days=1,
+    )
+    descriptor = os.open(attempt_root / "complete.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    results: list[object] = []
+
+    def run_prune() -> None:
+        try:
+            results.append(runtime_maintenance.prune(root, now=NOW))
+        except Exception as error:
+            results.append(error)
+
+    worker = threading.Thread(target=run_prune)
+    worker.start()
+    try:
+        worker.join(timeout=0.1)
+        assert worker.is_alive()
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert len(results) == 1
+    assert isinstance(results[0], dict)
 
 
 def test_prune_rejects_entire_plan_before_mutation(tmp_path: Path) -> None:

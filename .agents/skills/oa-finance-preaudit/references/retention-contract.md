@@ -1,11 +1,11 @@
 # 30 天留存合同
 
-运行证据只为追溯、时效和 Token 优化服务，不建立长期业务索引。结构化日志、脱敏事件、指标、冻结材料和临时附件保留 30 天；年龄等于 30 天时仍保留，严格超过 30 天才进入删除计划。
+运行证据只为追溯、时效和 Token 优化服务，不建立长期业务索引。结构化日志、脱敏事件、单据指标、CLI 调用回执、冻结材料和临时附件保留 30 天；不含 item_key 的日/流程聚合保留 180 天。年龄等于边界时仍保留，严格超过边界才进入删除计划。日界固定为 Asia/Shanghai。
 
 ## 任务生命周期
 
 - 每个 `workflow_key` 只保留创建时间最新的一轮可见任务；之前已闭合且仍在 30 天内的任务归档。
-- 严格超过 30 天的非最新已闭合任务删除。
+- 严格超过 30 天的非最新已闭合任务删除；年龄使用创建时间和最后有效事件时间中的较晚者。
 - 正在处理、未闭合或 `write_state=unknown` 的任务与材料始终保留，不受年龄影响。
 - 归档和删除只接收任务标识，不读取或复制任务正文。
 
@@ -13,9 +13,9 @@
 
 清理固定执行 `列举 → 计算计划 → 全量校验范围 → 删除`。调用方必须显式提供一个已由 `.oa-retention-root` 标记的运行根；根目录符号链接、未标记根、绝对目标、`..` 越界和解析后逃逸都必须在任何删除前失败。
 
-`python3 -m apps.oa_finance_preaudit.cli status --root <path>` 从 FlowEngine 的 attempt 状态生成版本化脱敏 JSON，只含流程、哈希、计数、年龄、执行/业务/写入状态和失败码。不得读取或输出材料、意见、requestId、人员、公司、附件名或绝对路径。status 是运维入口，不加入审核 Agent 的正常上下文。
+`python3 -m apps.oa_finance_preaudit.cli status --root <path>` 从 FlowEngine 的 attempt 状态、终态质量回执和脱敏事件生成版本化 JSON，只含流程、哈希、计数、年龄、三维状态、失败码、阶段 P50/P95、Token 完整性及 180 天日聚合。日聚合同时保存业务结果、技术失败、写入 unknown、质量覆盖和提交安全计数，不保存单据哈希。不得读取或输出材料、意见、requestId、人员、公司、附件名或绝对路径。status 是运维入口，不加入审核 Agent 的正常上下文。
 
-`python3 -m apps.oa_finance_preaudit.cli prune --root <path>` 调用 `runtime_maintenance` 完成列举、完整计划、全量范围校验和执行。策略固定为 30 天，计划不得来自未来且生成后 5 分钟失效。30 天内的旧已闭合 attempt 移入根内 `.archive/`；严格超期的旧 attempt 删除；最新、未闭合、状态无效或 `write_state=unknown` 的 attempt 保留。重复执行时，已不存在的目标计为 `missing`，不得扩展目标范围或报为成功删除。
+`python3 -m apps.oa_finance_preaudit.cli prune --root <path>` 调用 `runtime_maintenance`，在同一维护锁和源事件锁内计算日聚合、校验完整预期计划及全部路径，随后以不跟随符号链接的原子写入保存 `.metrics/daily/`，最后才执行归档和删除。计划不得来自未来且生成后 5 分钟失效。30 天内的旧已闭合 attempt 移入根内 `.archive/`；严格超期的旧 attempt 删除；最新、未闭合、状态无效或 `write_state=unknown` 的恢复证据保留。严格超过 180 天的合法日聚合由同一计划删除。重复执行时，已不存在的目标计为 `missing`，不得扩展目标范围或报为成功删除。
 
 `apps.oa_finance_preaudit.retention` 保留纯计划器、受限文件执行器和任务回调接口，不内置真实任务系统凭据。
 

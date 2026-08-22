@@ -6,16 +6,18 @@ import os
 from pathlib import Path
 import sys
 from typing import Callable, Sequence
+from datetime import datetime, timezone
 
 from apps.oa_approval import api as legacy_api
 from apps.oa_approval import flow as legacy_flow
 from .case_bundle import collect_case
-from . import flow_engine, production_pending, runtime_maintenance
+from . import flow_engine, observability, production_pending, runtime_maintenance
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FlowEngineFactory = Callable[[], flow_engine.FlowEngine]
 RuntimeOperation = Callable[[Path], dict]
+InvocationSink = Callable[[dict], None]
 _RUNTIME_FAILURE_CODES = {
     "retention_action_invalid",
     "retention_archive_conflict",
@@ -160,14 +162,84 @@ def _fail(args: argparse.Namespace, error: Exception) -> int:
     return 1
 
 
+def _invocation_outcome(error: Exception) -> str:
+    code = str(error).strip()
+    if "unreadable" in code or "path" in code or "file" in code:
+        return "file_transfer_error"
+    if "invalid" in code or "conflict" in code or "contract" in code:
+        return "json_contract_error"
+    return "other"
+
+
+def _emit_invocation(
+    sink: InvocationSink | None,
+    *,
+    command: str,
+    workflow_key: str | None,
+    outcome: str,
+) -> None:
+    if sink is None:
+        return
+    workflow_keys = (
+        [workflow_key]
+        if workflow_key in flow_engine.WORKFLOW_KEYS
+        else ["global"]
+        if command in {"status", "prune"}
+        else []
+    )
+    for current_workflow in workflow_keys:
+        try:
+            sink(
+                {
+                    "workflow_key": current_workflow,
+                    "command": command,
+                    "occurred_at": datetime.now(timezone.utc).isoformat(),
+                    "outcome": outcome,
+                    "human_reproduction": "not_attempted",
+                }
+            )
+        except Exception:
+            continue
+
+
+def _invocation_workflow(
+    args: argparse.Namespace,
+    payload: object = None,
+) -> str | None:
+    if (
+        isinstance(payload, dict)
+        and payload.get("workflow_key") in flow_engine.WORKFLOW_KEYS
+    ):
+        return str(payload["workflow_key"])
+    workflow_key = getattr(args, "workflow", None)
+    if workflow_key in flow_engine.WORKFLOW_KEYS:
+        return str(workflow_key)
+    action_file = getattr(args, "action_file", None)
+    if isinstance(action_file, Path) and len(action_file.parents) >= 4:
+        inferred = action_file.parents[3].name
+        if inferred in flow_engine.WORKFLOW_KEYS:
+            return inferred
+    return None
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
     flow_engine_factory: FlowEngineFactory | None = None,
     runtime_status: RuntimeOperation | None = None,
     runtime_prune: RuntimeOperation | None = None,
+    invocation_sink: InvocationSink | None = None,
+    persist_invocations: bool = False,
 ) -> int:
     args = build_parser().parse_args(argv)
+    sink = invocation_sink
+    if sink is None and persist_invocations:
+        cli_log = (
+            _runtime_root(getattr(args, "root", None))
+            / ".metrics"
+            / "cli-invocations.json"
+        )
+        sink = lambda receipt: observability.record_cli_invocation(cli_log, receipt)
     try:
         if args.command == "status":
             operation = runtime_status or runtime_maintenance.status
@@ -185,10 +257,69 @@ def main(
                     args.decision_file,
                 )
     except Exception as error:
+        _emit_invocation(
+            sink,
+            command=args.command,
+            workflow_key=_invocation_workflow(args),
+            outcome=_invocation_outcome(error),
+        )
         return _fail(args, error)
+    _emit_invocation(
+        sink,
+        command=args.command,
+        workflow_key=_invocation_workflow(args, payload),
+        outcome="success",
+    )
     _print_payload(payload)
     return 0
 
 
+def entrypoint(argv: Sequence[str] | None = None) -> int:
+    raw = list(argv if argv is not None else sys.argv[1:])
+    try:
+        return main(raw, persist_invocations=True)
+    except SystemExit as error:
+        code = int(error.code or 0)
+        if code == 0 or not raw or raw[0] not in {
+            "next-action",
+            "complete-review",
+            "status",
+            "prune",
+        }:
+            return code
+        command = raw[0]
+        root_value: Path | None = None
+        workflow_key: str | None = None
+        for option, assign in (
+            ("--root", "root"),
+            ("--workflow", "workflow"),
+            ("--action-file", "action"),
+        ):
+            if option not in raw:
+                continue
+            index = raw.index(option)
+            if index + 1 >= len(raw):
+                continue
+            value = raw[index + 1]
+            if assign == "root":
+                root_value = Path(value)
+            elif assign == "workflow" and value in flow_engine.WORKFLOW_KEYS:
+                workflow_key = value
+            elif assign == "action":
+                action_path = Path(value)
+                if len(action_path.parents) >= 4:
+                    inferred = action_path.parents[3].name
+                    if inferred in flow_engine.WORKFLOW_KEYS:
+                        workflow_key = inferred
+        cli_log = _runtime_root(root_value) / ".metrics" / "cli-invocations.json"
+        _emit_invocation(
+            lambda receipt: observability.record_cli_invocation(cli_log, receipt),
+            command=command,
+            workflow_key=workflow_key,
+            outcome="argument_error",
+        )
+        return code
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(entrypoint())

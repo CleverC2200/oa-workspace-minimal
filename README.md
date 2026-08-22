@@ -66,7 +66,9 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
 
 ## 脱敏运行指标
 
-每个 attempt 的 `observability.json` 只保存 attempt 哈希、流程、阶段、耗时、结果和 Token 状态。当前运行固定记录 `token_usage=unknown`，不做估算；`status` 同时汇总当前与归档 attempt。重复事件不会重复计数，冲突值会被拒绝；提交前的必要事件无法保存时停止当前单据，提交后的指标异常不会触发 OA 重放。
+每个 attempt 的 `observability.json` 只保存 attempt 哈希、流程、阶段、耗时、结果和 Token 状态。阶段拆为机械取数、审核脚本、可选 exact 等待、提交和协调；协调秒数与 Token 必须为 0。FlowEngine 不猜测 Agent 活动或等待，宿主没有提供绑定当前 item 的 exact timing receipt 时，两者保持 unknown 并停止等待比例调优。当前运行固定记录 `token_usage=unknown`，不做估算；`status` 按单据哈希、流程和 Asia/Shanghai 日期给出 P50/P95 与 Token 完整性。重复事件不会重复计数，冲突值会被拒绝；提交前的必要事件无法保存时停止当前单据，提交后的指标异常不会触发 OA 重放。
+
+内部离线验收报告固定检查审核项/资源/页面/格式/golden replay 100%、重复提交/跨单据混用/unknown 自动重试/Agent 消息 0，以及 P95 小于 900 秒、等待比例小于 20%、技术错误率不高于 2%。每流程不足 20 个闭合脱敏样本时不建议调参；缺少平台精确 usage 时只停止 Token 调优。真实 `python -m` 入口会把四命令的成功、参数、JSON 合同和文件传递结果写入本地 30 天脱敏 CLI 日志；进程尚未启动时的失败和人工复现由本地 launcher/harness 补充。日志不含 argv、stderr 或路径；status/prune 每次只记一条 global 调用，按流程展示时投影影响范围，但 overall 不重复计数。未知值不能推断为 0。只有 CLI 故障严格多于其他技术故障且证据完整时，报告才允许提出独立 stdio MCP 后续 Issue；本项目当前不实现或安装 MCP。
 
 OA 提交只通过冻结写入入口执行。授权证明、锁、token、冻结指纹和终态回执均绑定单个 `requestId + received_at + attempt` 及其材料版本：同一 attempt 单飞并幂等重放，不同单据可以并发。受控写入还必须由运行环境注入授权源、外部 verifier 和提交适配器，并在提交前复核；公开 CLI 未接入这些端口。本仓库测试只使用模拟接口，不会写真实 OA。
 
@@ -76,7 +78,7 @@ OA 提交只通过冻结写入入口执行。授权证明、锁、token、冻结
 
 ## 留存与清理
 
-结构化日志、脱敏指标、冻结材料和临时附件保留 30 天；每类流程只保留最新一轮可见任务，旧的已闭合任务先归档，严格超过 30 天后才删除。未闭合任务或写入结果 `unknown` 的单据始终保留。
+结构化日志、单据级脱敏指标、冻结材料和临时附件保留 30 天；不含单据哈希的日/流程聚合保留 180 天。每类流程只保留最新一轮可见任务，旧的已闭合任务先归档，严格超过 30 天后才删除。未闭合任务或写入结果 `unknown` 的恢复证据始终保留，但超过 30 天不进入原始分析窗口。清理以创建时间和最后事件时间中较晚者计算年龄，避免老任务刚闭合就被删除。
 
 人工、Codex 和后续定时任务使用同一个只读状态入口；输出只有脱敏哈希、计数、年龄、三维状态和失败码：
 
@@ -85,7 +87,7 @@ python3 -m apps.oa_finance_preaudit.cli status \
   --root /absolute/path/to/finance_preaudit_flows
 ```
 
-受控清理使用同一 JSON CLI。它先列举全部 attempt、生成带指纹的完整计划并校验所有目标，全部通过后才归档或删除：
+受控清理使用同一 JSON CLI。它在同一维护锁和事件锁内先计算脱敏日聚合，完整校验计划与所有目标，再以不跟随符号链接的原子写入落盘，最后才归档或删除原始 attempt：
 
 ```bash
 python3 -m apps.oa_finance_preaudit.cli prune \
