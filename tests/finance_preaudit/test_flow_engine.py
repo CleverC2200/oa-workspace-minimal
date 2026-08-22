@@ -459,7 +459,7 @@ def test_closed_preview_creates_a_fresh_attempt_without_overwriting_history(
     )["execution_state"] == "closed"
 
 
-def test_open_attempt_stays_the_unique_action_when_candidates_change(
+def test_new_candidate_can_open_while_another_case_waits_for_review(
     tmp_path: Path,
 ) -> None:
     candidates = [
@@ -491,8 +491,14 @@ def test_open_attempt_stays_the_unique_action_when_candidates_change(
 
     second = engine.next_action("travel_expense")
 
-    assert second == first
-    assert collected == ["request-a"]
+    assert second != first
+    assert second["case_key"] != first["case_key"]
+    assert collected == ["request-a", "request-b"]
+    assert json.loads(
+        (tmp_path / "travel_expense" / "current-action.json").read_text(
+            encoding="utf-8"
+        )
+    ) == second
 
 
 def test_concurrent_review_completion_cannot_overwrite_the_first_result(
