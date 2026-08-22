@@ -85,7 +85,7 @@ class CliReadonlyContractTest(unittest.TestCase):
 
         def recorded_resolve(flow_number: str) -> str:
             resolved.append(flow_number)
-            return "2625001"
+            return "1002"
 
         def recorded_collect(request_id: str, *, allow_browser_download: bool) -> dict:
             collected.append(request_id)
@@ -111,8 +111,8 @@ class CliReadonlyContractTest(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(resolved, ["CLBX20260802011"])
-        self.assertEqual(collected, ["2625001"])
-        self.assertEqual(json.loads(output.getvalue())["request_id"], "2625001")
+        self.assertEqual(collected, ["1002"])
+        self.assertEqual(json.loads(output.getvalue())["request_id"], "1002")
 
     def test_collect_case_can_atomically_write_one_material_file(self) -> None:
         def recorded_collect(request_id: str, *, allow_browser_download: bool) -> dict:
@@ -137,7 +137,7 @@ class CliReadonlyContractTest(unittest.TestCase):
                     [
                         "collect-case",
                         "--request-id",
-                        "2625001",
+                        "1002",
                         "--output",
                         str(path),
                     ],
@@ -147,9 +147,9 @@ class CliReadonlyContractTest(unittest.TestCase):
             receipt = json.loads(output.getvalue())
             self.assertEqual(exit_code, 0)
             self.assertEqual(receipt["kind"], "preaudit_material_written")
-            self.assertEqual(receipt["request_id"], "2625001")
+            self.assertEqual(receipt["request_id"], "1002")
             material = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(material["request_id"], "2625001")
+            self.assertEqual(material["request_id"], "1002")
             self.assertEqual(
                 material["prepared"]["images"][0]["path"],
                 "/readonly/prepared/page.png",
@@ -173,7 +173,7 @@ class CliReadonlyContractTest(unittest.TestCase):
                     [
                         "collect-case",
                         "--request-id",
-                        "2625001",
+                        "1002",
                         "--output",
                         str(parent_file / "material.json"),
                     ],
@@ -226,7 +226,7 @@ class CliReadonlyContractTest(unittest.TestCase):
             calls.append((page_size, max_pages))
             return [
                 {
-                    "request_id": "2625001",
+                    "request_id": "1002",
                     "workflow_id": "138023",
                     "workflow_name": "差旅费报销流程",
                     "submitted_at": "2026-08-01 08:00:00",
@@ -257,7 +257,7 @@ class CliReadonlyContractTest(unittest.TestCase):
     def test_list_pending_can_atomically_write_fresh_input_file(self) -> None:
         rows = [
             {
-                "request_id": "2625001",
+                "request_id": "1002",
                 "submitted_at": "2026-08-01 08:00:00",
                 "received_at": "2026-08-01 08:01:00",
             }

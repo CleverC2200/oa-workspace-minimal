@@ -35,7 +35,7 @@ class FrozenWriterContractTests(unittest.TestCase):
         self.project_root_patch = patch.object(frozen_writer, "PROJECT_ROOT", self.root)
         self.project_root_patch.start()
         self.addCleanup(self.project_root_patch.stop)
-        self.request_id = "2639001"
+        self.request_id = "1004"
         self.received_at = "2026-08-21 09:30:00"
         self.isolation_key = hashlib.sha256(
             f"{self.request_id}\0{self.received_at}".encode("utf-8")
@@ -294,7 +294,7 @@ class FrozenWriterContractTests(unittest.TestCase):
         self.assertEqual(len(api.calls), 2)
 
     def test_request_lock_paths_are_isolated(self) -> None:
-        first = runtime_control.request_writer_lock_file("2639001", self.lock_path)
+        first = runtime_control.request_writer_lock_file("1004", self.lock_path)
         second = runtime_control.request_writer_lock_file("2639002", self.lock_path)
 
         self.assertNotEqual(first, second)
@@ -324,12 +324,12 @@ class FrozenWriterApiTests(unittest.TestCase):
             "urlopen",
             return_value=_Response(),
         ) as urlopen:
-            response = api._post_submit("2639001", "第一行\n<a>")
+            response = api._post_submit("1004", "第一行\n<a>")
 
         request = urlopen.call_args.args[0]
         body = urllib.parse.parse_qs(request.data.decode("utf-8"))
         self.assertEqual(request.full_url, "https://oa.invalid" + writer_api.SUBMIT_ENDPOINT)
-        self.assertEqual(body, {"requestId": ["2639001"], "remark": ["第一行<br/>&lt;a&gt;"]})
+        self.assertEqual(body, {"requestId": ["1004"], "remark": ["第一行<br/>&lt;a&gt;"]})
         self.assertEqual(response, {"code": "SUCCESS"})
 
     def test_submit_requires_success_handled_hit_and_pending_absence(self) -> None:
@@ -344,13 +344,13 @@ class FrozenWriterApiTests(unittest.TestCase):
             patch.object(
                 api,
                 "handled_rows",
-                return_value=[{"request_id": "2639001"}],
+                return_value=[{"request_id": "1004"}],
             ),
             patch.object(api, "pending_rows", return_value=[]),
         ):
-            result = api.submit_and_verify("2639001", "第一行\n第二行")
+            result = api.submit_and_verify("1004", "第一行\n第二行")
 
-        submit.assert_called_once_with("2639001", "第一行\n第二行")
+        submit.assert_called_once_with("1004", "第一行\n第二行")
         self.assertEqual(
             result,
             {
@@ -376,7 +376,7 @@ class FrozenWriterApiTests(unittest.TestCase):
             patch.object(api, "handled_rows") as handled,
             patch.object(api, "pending_rows") as pending,
         ):
-            result = api.submit_and_verify("2639001", "冻结意见")
+            result = api.submit_and_verify("1004", "冻结意见")
 
         self.assertEqual(
             result,
