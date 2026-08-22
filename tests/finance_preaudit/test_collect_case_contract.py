@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import unittest
-from pathlib import Path
 import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 import fitz
+import pytest
 
 from apps.oa_approval import (
     attachments,
@@ -16,7 +16,6 @@ from apps.oa_approval import (
 )
 from apps.oa_finance_preaudit import case_bundle
 from apps.oa_finance_preaudit.case_bundle import collect_case
-
 
 FLOW_CONFIGS = (
     {
@@ -92,22 +91,25 @@ class RecordedOaApi:
         )
 
 
-class CollectCaseContractTest(unittest.TestCase):
-    def setUp(self) -> None:
-        for patcher in (
-            patch.object(attachments, "OA_HOST", "https://oa.example.com"),
-            patch.object(attachments, "EXTRA_DOWNLOAD_HOSTS", {"travel.example.com"}),
-            patch.object(evidence_packet, "FIELD_ATTACHMENT_HOSTS", {"travel.example.com"}),
-            patch.object(travel_orders, "TRIP_BASE_URL", "https://travel.example.com"),
-            patch.object(travel_orders, "OA_BASE_URL", "https://oa.example.com"),
-        ):
-            patcher.start()
-            self.addCleanup(patcher.stop)
+class TestCollectCaseContract:
+    @pytest.fixture(autouse=True)
+    def _configure_hosts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(attachments, "OA_HOST", "https://oa.example.com")
+        monkeypatch.setattr(attachments, "EXTRA_DOWNLOAD_HOSTS", {"travel.example.com"})
+        monkeypatch.setattr(
+            evidence_packet, "FIELD_ATTACHMENT_HOSTS", {"travel.example.com"}
+        )
+        monkeypatch.setattr(
+            travel_orders, "TRIP_BASE_URL", "https://travel.example.com"
+        )
+        monkeypatch.setattr(travel_orders, "OA_BASE_URL", "https://oa.example.com")
 
     def test_relative_collection_roots_are_frozen_as_absolute_paths(self) -> None:
         captured: dict[str, Path] = {}
 
-        def recorded_download(resources: list[dict], *, dest_dir: Path, **_kwargs: object):
+        def recorded_download(
+            resources: list[dict], *, dest_dir: Path, **_kwargs: object
+        ):
             captured["attachment_dir"] = dest_dir
             return (
                 [
@@ -162,11 +164,9 @@ class CollectCaseContractTest(unittest.TestCase):
                 prepared_root=Path("relative-attempt/prepared"),
             )
 
-        self.assertTrue(captured["attachment_dir"].is_absolute())
-        self.assertTrue(captured["prepared_dir"].is_absolute())
-        self.assertTrue(
-            Path(material["resources"][0]["local_readonly_path"]).is_absolute()
-        )
+        assert captured["attachment_dir"].is_absolute()
+        assert captured["prepared_dir"].is_absolute()
+        assert Path(material["resources"][0]["local_readonly_path"]).is_absolute()
 
     def test_resource_merge_only_deduplicates_exact_same_owner_identity(self) -> None:
         duplicate = {
@@ -175,11 +175,10 @@ class CollectCaseContractTest(unittest.TestCase):
             "downloadUrl": "https://oa.example.com/download/001",
             "_trusted_owner_detail_id": "detail[0].row[0]",
         }
-        self.assertEqual(
-            case_bundle._merge_resources([duplicate, dict(duplicate)], []),
-            [duplicate],
-        )
-        with self.assertRaisesRegex(RuntimeError, "^resource_ownership_untrusted$"):
+        assert case_bundle._merge_resources([duplicate, dict(duplicate)], []) == [
+            duplicate
+        ]
+        with pytest.raises(RuntimeError, match="^resource_ownership_untrusted$"):
             case_bundle._merge_resources(
                 [
                     duplicate,
@@ -190,9 +189,8 @@ class CollectCaseContractTest(unittest.TestCase):
                 ],
                 [],
             )
-        with self.assertRaisesRegex(
-            RuntimeError,
-            f"^{attachments.ATTACHMENT_IDENTITY_CONFLICT_CODE}$",
+        with pytest.raises(
+            RuntimeError, match=f"^{attachments.ATTACHMENT_IDENTITY_CONFLICT_CODE}$"
         ):
             case_bundle._merge_resources(
                 [duplicate, {**duplicate, "downloadUrl": "https://oa.example.com/b"}],
@@ -220,7 +218,7 @@ class CollectCaseContractTest(unittest.TestCase):
                 allow_browser_download=False,
             )
 
-        self.assertEqual(material["workflow_key"], "business_support_fee")
+        assert material["workflow_key"] == "business_support_fee"
 
     def test_travel_collection_enables_readonly_authority_lookup_without_mutating_config(
         self,
@@ -259,11 +257,12 @@ class CollectCaseContractTest(unittest.TestCase):
                 allow_browser_download=False,
             )
 
-        self.assertEqual(
-            [item["name"] for item in material["authority_facts"]],
-            ["职务类别", "职务名称", "负责区域"],
-        )
-        self.assertNotIn("official_sql", travel_config)
+        assert [item["name"] for item in material["authority_facts"]] == [
+            "职务类别",
+            "职务名称",
+            "负责区域",
+        ]
+        assert "official_sql" not in travel_config
 
     def test_same_named_request_resources_are_not_discarded(self) -> None:
         workflow = {
@@ -293,18 +292,17 @@ class CollectCaseContractTest(unittest.TestCase):
             },
         ]
 
-        self.assertEqual(
-            [
-                item["id"]
-                for item in evidence_packet.logical_attachment_resources(
-                    workflow,
-                    resources,
-                )
-            ],
-            ["receipt-a", "receipt-b"],
-        )
+        assert [
+            item["id"]
+            for item in evidence_packet.logical_attachment_resources(
+                workflow,
+                resources,
+            )
+        ] == ["receipt-a", "receipt-b"]
 
-    def test_form_attachment_counts_exclude_stale_duplicate_request_resources(self) -> None:
+    def test_form_attachment_counts_exclude_stale_duplicate_request_resources(
+        self,
+    ) -> None:
         workflow = {
             "workflowDetailTableInfos": [
                 {
@@ -326,25 +324,35 @@ class CollectCaseContractTest(unittest.TestCase):
             ]
         }
         resources = [
-            {"id": f"current-{name.removesuffix('.jpg')}", "name": name, "downloadUrl": f"/download/current-{name}"}
+            {
+                "id": f"current-{name.removesuffix('.jpg')}",
+                "name": name,
+                "downloadUrl": f"/download/current-{name}",
+            }
             for name in ("a.jpg", "b.jpg", "c.jpg")
         ] + [
-            {"id": f"stale-{name}", "name": name, "downloadUrl": f"/download/stale-{name}"}
+            {
+                "id": f"stale-{name}",
+                "name": name,
+                "downloadUrl": f"/download/stale-{name}",
+            }
             for name in ("a.jpg", "b.jpg", "c.jpg")
         ]
 
-        self.assertEqual(
-            [item["id"] for item in evidence_packet.logical_attachment_resources(workflow, resources)],
-            ["current-a", "current-b", "current-c"],
-        )
+        assert [
+            item["id"]
+            for item in evidence_packet.logical_attachment_resources(
+                workflow, resources
+            )
+        ] == ["current-a", "current-b", "current-c"]
 
     def test_oa_attachment_html_binds_download_resources_to_detail_row(self) -> None:
         class DetailAttachmentOaApi(RecordedOaApi):
             def request_context(self, request_id: str) -> tuple[dict, list[dict]]:
                 workflow, _resources = super().request_context(request_id)
-                workflow["workflowDetailTableInfos"][0][
-                    "workflowRequestTableRecords"
-                ][0]["workflowRequestTableFields"].append(
+                workflow["workflowDetailTableInfos"][0]["workflowRequestTableRecords"][
+                    0
+                ]["workflowRequestTableFields"].append(
                     {
                         "fieldName": "scfj",
                         "fieldShowName": "上传附件",
@@ -418,16 +426,13 @@ class CollectCaseContractTest(unittest.TestCase):
                     prepared_root=root / "prepared",
                 )
 
-        self.assertEqual(
-            [
-                (item["resource_id"], item["owner_detail_id"])
-                for item in material["resources"]
-            ],
-            [
-                ("4080101", "detail[0].row[0]"),
-                ("4080103", "detail[0].row[0]"),
-            ],
-        )
+        assert [
+            (item["resource_id"], item["owner_detail_id"])
+            for item in material["resources"]
+        ] == [
+            ("4080101", "detail[0].row[0]"),
+            ("4080103", "detail[0].row[0]"),
+        ]
 
     def test_attachment_resources_preserve_unique_source_field_provenance(self) -> None:
         workflow = {
@@ -471,26 +476,23 @@ class CollectCaseContractTest(unittest.TestCase):
 
         logical = evidence_packet.logical_attachment_resources(workflow, resources)
 
-        self.assertEqual(
-            [
-                (
-                    item["id"],
-                    item.get("_trusted_source_field_path"),
-                    item.get("_trusted_source_field_name"),
-                    item.get("_trusted_owner_detail_id"),
-                )
-                for item in logical
-            ],
-            [
-                ("excel-1", "main[0].field[0]", "产品信息表", None),
-                (
-                    "image-1",
-                    "detail[0].row[0].field[0]",
-                    "宣传附件（此处请上传卖点证明材料）",
-                    "detail[0].row[0]",
-                ),
-            ],
-        )
+        assert [
+            (
+                item["id"],
+                item.get("_trusted_source_field_path"),
+                item.get("_trusted_source_field_name"),
+                item.get("_trusted_owner_detail_id"),
+            )
+            for item in logical
+        ] == [
+            ("excel-1", "main[0].field[0]", "产品信息表", None),
+            (
+                "image-1",
+                "detail[0].row[0].field[0]",
+                "宣传附件（此处请上传卖点证明材料）",
+                "detail[0].row[0]",
+            ),
+        ]
 
     def test_packaging_resources_dedupe_only_cross_field_same_filename(self) -> None:
         resources = [
@@ -528,54 +530,41 @@ class CollectCaseContractTest(unittest.TestCase):
 
         kept, deduplicated = case_bundle._prepare_packaging_resources(resources)
 
-        self.assertEqual(
-            [item["id"] for item in kept],
-            [
-                "top-original",
-                "top-repeat-a",
-                "top-repeat-b",
-                "bottom-unique-image",
-                "excel-reference",
-            ],
-        )
-        self.assertEqual(
-            [item["_trusted_review_role"] for item in kept],
-            [
-                "packaging_image",
-                "packaging_image",
-                "packaging_image",
-                "packaging_image",
-                "excel_reference",
-            ],
-        )
+        assert [item["id"] for item in kept] == [
+            "top-original",
+            "top-repeat-a",
+            "top-repeat-b",
+            "bottom-unique-image",
+            "excel-reference",
+        ]
+        assert [item["_trusted_review_role"] for item in kept] == [
+            "packaging_image",
+            "packaging_image",
+            "packaging_image",
+            "packaging_image",
+            "excel_reference",
+        ]
         descriptors = [
             case_bundle._resource_descriptor(item, request_id="packaging-request")
             for item in kept
         ]
-        self.assertEqual(
-            [
-                (item["source_field_name"], item["review_role"])
-                for item in descriptors
-            ],
-            [
-                ("宣传附件（此处请上传卖点证明材料）", "packaging_image"),
-                ("宣传附件（此处请上传卖点证明材料）", "packaging_image"),
-                ("宣传附件（此处请上传卖点证明材料）", "packaging_image"),
-                ("产品信息表", "packaging_image"),
-                ("产品信息表", "excel_reference"),
-            ],
-        )
-        self.assertEqual(
-            deduplicated,
-            [
-                {
-                    "reason": "cross_field_duplicate_filename",
-                    "name": "包装A.JPG",
-                    "kept_source_resource_id": "top-original",
-                    "dropped_source_resource_id": "bottom-copy",
-                }
-            ],
-        )
+        assert [
+            (item["source_field_name"], item["review_role"]) for item in descriptors
+        ] == [
+            ("宣传附件（此处请上传卖点证明材料）", "packaging_image"),
+            ("宣传附件（此处请上传卖点证明材料）", "packaging_image"),
+            ("宣传附件（此处请上传卖点证明材料）", "packaging_image"),
+            ("产品信息表", "packaging_image"),
+            ("产品信息表", "excel_reference"),
+        ]
+        assert deduplicated == [
+            {
+                "reason": "cross_field_duplicate_filename",
+                "name": "包装A.JPG",
+                "kept_source_resource_id": "top-original",
+                "dropped_source_resource_id": "bottom-copy",
+            }
+        ]
 
     def test_invoice_buyers_are_read_even_when_form_companies_differ(self) -> None:
         class InvoiceOaApi:
@@ -624,16 +613,13 @@ class CollectCaseContractTest(unittest.TestCase):
             invoice_client=InvoiceClient(),
         )
 
-        self.assertEqual(result["read_status"], "content_read")
-        self.assertEqual(
-            result["invoices"],
-            [
-                {
-                    "invoice_no": "12345678901234567890",
-                    "buyer": "发票购买方公司",
-                }
-            ],
-        )
+        assert result["read_status"] == "content_read"
+        assert result["invoices"] == [
+            {
+                "invoice_no": "12345678901234567890",
+                "buyer": "发票购买方公司",
+            }
+        ]
 
     def test_travel_order_text_is_not_truncated_before_agent_review(self) -> None:
         flow_mark = "CLBXLONG"
@@ -674,12 +660,12 @@ class CollectCaseContractTest(unittest.TestCase):
                 allow_browser_download=True,
             )
 
-        self.assertEqual(result["fields"][0]["value"], body)
+        assert result["fields"][0]["value"] == body
 
     def test_unknown_workflow_fails_with_stable_code_before_evidence_reads(
         self,
     ) -> None:
-        with self.assertRaisesRegex(RuntimeError, "^workflow_ambiguous$"):
+        with pytest.raises(RuntimeError, match="^workflow_ambiguous$"):
             collect_case(
                 "recorded-unknown",
                 oa_api=RecordedOaApi("999999", "未知流程"),
@@ -715,34 +701,31 @@ class CollectCaseContractTest(unittest.TestCase):
                 for config in FLOW_CONFIGS
             )
 
-        self.assertEqual(
-            tuple(material["workflow_key"] for material in materials),
-            tuple(str(config["flow_key"]) for config in FLOW_CONFIGS),
+        assert tuple(material["workflow_key"] for material in materials) == tuple(
+            str(config["flow_key"]) for config in FLOW_CONFIGS
         )
-        self.assertEqual(
-            materials[0]["declared_fields"],
-            [
-                {
-                    "path": "main[0].field[0]",
-                    "name": "报销金额",
-                    "code": "amount",
-                    "value": "100.00",
-                },
-                {
-                    "path": "detail[0].row[0].field[0]",
-                    "name": "费用类型",
-                    "code": "expense_type",
-                    "value": "酒店",
-                },
-            ],
-        )
-        self.assertEqual(materials[0]["resources"], [])
-        self.assertEqual(
-            materials[0]["prepared"],
-            {"images": [], "structured_contents": [], "manifest": []},
-        )
-        self.assertEqual(materials[0]["authority_facts"], [])
-        self.assertEqual(materials[0]["warnings"], [])
+        assert materials[0]["declared_fields"] == [
+            {
+                "path": "main[0].field[0]",
+                "name": "报销金额",
+                "code": "amount",
+                "value": "100.00",
+            },
+            {
+                "path": "detail[0].row[0].field[0]",
+                "name": "费用类型",
+                "code": "expense_type",
+                "value": "酒店",
+            },
+        ]
+        assert materials[0]["resources"] == []
+        assert materials[0]["prepared"] == {
+            "images": [],
+            "structured_contents": [],
+            "manifest": [],
+        }
+        assert materials[0]["authority_facts"] == []
+        assert materials[0]["warnings"] == []
 
     def test_authoritative_fields_and_invoice_buyers_are_exposed_as_material(
         self,
@@ -776,23 +759,20 @@ class CollectCaseContractTest(unittest.TestCase):
                 allow_browser_download=False,
             )
 
-        self.assertEqual(
-            material["authority_facts"],
-            [
-                {
-                    "source": "official_sql",
-                    "name": "负责区域",
-                    "value": "重庆",
-                    "subject_ref": "负责区域",
-                },
-                {
-                    "source": "invoice_cloud",
-                    "name": "发票购买方",
-                    "value": "四川思念食品销售有限公司",
-                    "subject_ref": "001",
-                },
-            ],
-        )
+        assert material["authority_facts"] == [
+            {
+                "source": "official_sql",
+                "name": "负责区域",
+                "value": "重庆",
+                "subject_ref": "负责区域",
+            },
+            {
+                "source": "invoice_cloud",
+                "name": "发票购买方",
+                "value": "四川思念食品销售有限公司",
+                "subject_ref": "001",
+            },
+        ]
 
     def test_travel_hotel_address_is_bound_to_detail_subject(self) -> None:
         with (
@@ -811,8 +791,7 @@ class CollectCaseContractTest(unittest.TestCase):
                         {
                             "name": "酒店地址",
                             "value": (
-                                "广东省珠海市香洲区唐家湾镇科技一路"
-                                "高新宝龙城B2栋公寓"
+                                "广东省珠海市香洲区唐家湾镇科技一路高新宝龙城B2栋公寓"
                             ),
                             "subject_ref": "detail[5].row[0]",
                         }
@@ -829,18 +808,12 @@ class CollectCaseContractTest(unittest.TestCase):
                 allow_browser_download=True,
             )
 
-        self.assertIn(
-            {
-                "source": "travel_platform",
-                "name": "酒店地址",
-                "value": (
-                    "广东省珠海市香洲区唐家湾镇科技一路"
-                    "高新宝龙城B2栋公寓"
-                ),
-                "subject_ref": "detail[5].row[0]",
-            },
-            material["authority_facts"],
-        )
+        assert {
+            "source": "travel_platform",
+            "name": "酒店地址",
+            "value": ("广东省珠海市香洲区唐家湾镇科技一路高新宝龙城B2栋公寓"),
+            "subject_ref": "detail[5].row[0]",
+        } in material["authority_facts"]
 
     def test_pdf_resource_exposes_every_page_without_requiring_write_methods(
         self,
@@ -900,25 +873,19 @@ class CollectCaseContractTest(unittest.TestCase):
                     prepared_root=root / "prepared",
                 )
 
-        self.assertEqual(len(material["prepared"]["images"]), 5)
-        self.assertTrue(
-            all(
-                item["resource_id"] == "pdf-001"
-                for item in material["prepared"]["images"]
-            )
+        assert len(material["prepared"]["images"]) == 5
+        assert all(
+            item["resource_id"] == "pdf-001" for item in material["prepared"]["images"]
         )
-        self.assertEqual(
-            material["prepared"]["manifest"],
-            [
-                {
-                    "resource_id": "pdf-001",
-                    "name": "evidence.pdf",
-                    "status": "pdf_rendered",
-                    "image_count": 5,
-                    "page_count": 5,
-                }
-            ],
-        )
+        assert material["prepared"]["manifest"] == [
+            {
+                "resource_id": "pdf-001",
+                "name": "evidence.pdf",
+                "status": "pdf_rendered",
+                "image_count": 5,
+                "page_count": 5,
+            }
+        ]
 
     def test_resource_id_variant_is_canonicalized_before_download(self) -> None:
         class ResourceIdOaApi(RecordedOaApi):
@@ -943,7 +910,7 @@ class CollectCaseContractTest(unittest.TestCase):
             )
 
             def recorded_download(resources: list[dict], **_kwargs: object):
-                self.assertEqual(resources[0]["id"], "resource-variant-001")
+                assert resources[0]["id"] == "resource-variant-001"
                 return (
                     [
                         {
@@ -982,10 +949,7 @@ class CollectCaseContractTest(unittest.TestCase):
                     prepared_root=root / "prepared",
                 )
 
-        self.assertEqual(
-            material["resources"][0]["resource_id"],
-            "resource-variant-001",
-        )
+        assert material["resources"][0]["resource_id"] == "resource-variant-001"
 
     def test_unprepared_related_resource_stops_instead_of_returning_preview_material(
         self,
@@ -1029,9 +993,8 @@ class CollectCaseContractTest(unittest.TestCase):
                     return_value={"read_status": "not_applicable", "invoices": []},
                 ),
             ):
-                with self.assertRaisesRegex(
-                    RuntimeError,
-                    "^attachment_content_incomplete$",
+                with pytest.raises(
+                    RuntimeError, match="^attachment_content_incomplete$"
                 ):
                     collect_case(
                         "recorded-request",
@@ -1099,9 +1062,9 @@ class CollectCaseContractTest(unittest.TestCase):
                 return_value={"read_status": "not_applicable", "invoices": []},
             ),
         ):
-            with self.assertRaisesRegex(
+            with pytest.raises(
                 case_bundle.CollectionFailure,
-                "^travel_attachment_resources_incomplete$",
+                match="^travel_attachment_resources_incomplete$",
             ) as failure:
                 collect_case(
                     "recorded-request",
@@ -1112,16 +1075,13 @@ class CollectCaseContractTest(unittest.TestCase):
                     configs=FLOW_CONFIGS,
                     allow_browser_download=True,
                 )
-        self.assertEqual(
-            failure.exception.counts,
-            {
-                "declared_attachment_count": 5,
-                "discovered_resource_count": 4,
-                "form_resource_count": 0,
-                "travel_resource_count": 4,
-                "trusted_source_sighting_count": 4,
-            },
-        )
+        assert failure.value.counts == {
+            "declared_attachment_count": 5,
+            "discovered_resource_count": 4,
+            "form_resource_count": 0,
+            "travel_resource_count": 4,
+            "trusted_source_sighting_count": 4,
+        }
 
     def test_declared_attachment_count_uses_trusted_source_sightings_before_dedup(
         self,
@@ -1187,7 +1147,11 @@ class CollectCaseContractTest(unittest.TestCase):
             ),
             patch(
                 "apps.oa_finance_preaudit.case_bundle.travel_orders.collect_evidence",
-                return_value={"fields": [], "resources": travel_resources, "errors": []},
+                return_value={
+                    "fields": [],
+                    "resources": travel_resources,
+                    "errors": [],
+                },
             ),
             patch(
                 "apps.oa_finance_preaudit.case_bundle.attachments.download_resources",
@@ -1213,8 +1177,8 @@ class CollectCaseContractTest(unittest.TestCase):
                 allow_browser_download=True,
             )
 
-        self.assertEqual(len(material["resources"]), 4)
-        self.assertEqual(len(downloaded_targets), 4)
+        assert len(material["resources"]) == 4
+        assert len(downloaded_targets) == 4
 
     def test_travel_resources_are_request_bound_deduplicated_and_prepared(
         self,
@@ -1321,30 +1285,24 @@ class CollectCaseContractTest(unittest.TestCase):
                     prepared_root=root / "prepared",
                 )
 
-        self.assertEqual(
-            [
-                (item["resource_id"], item["owner_detail_id"])
-                for item in material["resources"]
-            ],
-            [
-                ("trip_file:12345", "detail[0].row[0]"),
-                ("travel_platform:67890", None),
-            ],
+        assert [
+            (item["resource_id"], item["owner_detail_id"])
+            for item in material["resources"]
+        ] == [
+            ("trip_file:12345", "detail[0].row[0]"),
+            ("travel_platform:67890", None),
+        ]
+        assert all(
+            item["request_id"] == "recorded-request" for item in material["resources"]
         )
-        self.assertTrue(
-            all(
-                item["request_id"] == "recorded-request"
-                for item in material["resources"]
-            )
-        )
-        self.assertEqual(
-            [item["resource_id"] for item in material["prepared"]["images"]],
-            ["trip_file:12345", "travel_platform:67890"],
-        )
-        self.assertEqual(
-            [item["status"] for item in material["prepared"]["manifest"]],
-            ["image", "image"],
-        )
+        assert [item["resource_id"] for item in material["prepared"]["images"]] == [
+            "trip_file:12345",
+            "travel_platform:67890",
+        ]
+        assert [item["status"] for item in material["prepared"]["manifest"]] == [
+            "image",
+            "image",
+        ]
 
     def test_main_table_trip_attachment_binds_to_request_without_detail_owner(
         self,
@@ -1373,7 +1331,7 @@ class CollectCaseContractTest(unittest.TestCase):
             )
 
             def recorded_download(resources: list[dict], **_kwargs: object):
-                self.assertEqual(resources[0]["id"], "field_main_0_1")
+                assert resources[0]["id"] == "field_main_0_1"
                 return (
                     [
                         {
@@ -1413,18 +1371,12 @@ class CollectCaseContractTest(unittest.TestCase):
                     prepared_root=root / "prepared",
                 )
 
-        self.assertEqual(
-            (
-                material["resources"][0]["resource_id"],
-                material["resources"][0]["request_id"],
-                material["resources"][0]["owner_detail_id"],
-            ),
-            ("trip_file:12345", "recorded-request", None),
-        )
-        self.assertEqual(
-            material["prepared"]["images"][0]["resource_id"],
-            "trip_file:12345",
-        )
+        assert (
+            material["resources"][0]["resource_id"],
+            material["resources"][0]["request_id"],
+            material["resources"][0]["owner_detail_id"],
+        ) == ("trip_file:12345", "recorded-request", None)
+        assert material["prepared"]["images"][0]["resource_id"] == "trip_file:12345"
 
     def test_travel_discovery_rejects_resource_from_another_request(self) -> None:
         with (
@@ -1456,17 +1408,10 @@ class CollectCaseContractTest(unittest.TestCase):
                 return_value={"read_status": "not_applicable", "invoices": []},
             ),
         ):
-            with self.assertRaisesRegex(
-                RuntimeError,
-                "^resource_ownership_untrusted$",
-            ):
+            with pytest.raises(RuntimeError, match="^resource_ownership_untrusted$"):
                 collect_case(
                     "recorded-request",
                     oa_api=RecordedOaApi("138023", "差旅费报销流程"),
                     configs=FLOW_CONFIGS,
                     allow_browser_download=False,
                 )
-
-
-if __name__ == "__main__":
-    unittest.main()

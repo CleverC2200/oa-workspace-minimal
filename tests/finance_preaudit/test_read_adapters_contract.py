@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 import base64
-from contextlib import contextmanager
 import io
 import tempfile
 import threading
 import time
-import unittest
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
-import openpyxl
 import fitz
+import openpyxl
+import pytest
 
 from apps.oa_approval import (
     api,
@@ -24,17 +24,18 @@ from apps.oa_approval import (
 )
 
 
-class ReadAdaptersContractTest(unittest.TestCase):
-    def setUp(self) -> None:
-        for patcher in (
-            patch.object(attachments, "OA_HOST", "https://oa.example.com"),
-            patch.object(attachments, "EXTRA_DOWNLOAD_HOSTS", {"travel.example.com"}),
-            patch.object(evidence_packet, "FIELD_ATTACHMENT_HOSTS", {"travel.example.com"}),
-            patch.object(travel_orders, "TRIP_BASE_URL", "https://travel.example.com"),
-            patch.object(travel_orders, "OA_BASE_URL", "https://oa.example.com"),
-        ):
-            patcher.start()
-            self.addCleanup(patcher.stop)
+class TestReadAdaptersContract:
+    @pytest.fixture(autouse=True)
+    def _configure_hosts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(attachments, "OA_HOST", "https://oa.example.com")
+        monkeypatch.setattr(attachments, "EXTRA_DOWNLOAD_HOSTS", {"travel.example.com"})
+        monkeypatch.setattr(
+            evidence_packet, "FIELD_ATTACHMENT_HOSTS", {"travel.example.com"}
+        )
+        monkeypatch.setattr(
+            travel_orders, "TRIP_BASE_URL", "https://travel.example.com"
+        )
+        monkeypatch.setattr(travel_orders, "OA_BASE_URL", "https://oa.example.com")
 
     def test_archive_children_are_frozen_under_prepared_root_and_manifest_is_parent_bound(
         self,
@@ -73,48 +74,35 @@ class ReadAdaptersContractTest(unittest.TestCase):
                                 "parent_resource_id": "archive-1",
                                 "name": "evidence.pdf",
                                 "path": str(pdf),
-                            }
+                            },
                         ],
                     }
                 ],
                 out_dir=prepared_root,
             )
 
-            self.assertEqual(len(images), 2)
-            self.assertTrue(
-                all(
-                    Path(str(item["path"])).resolve().is_relative_to(
-                        prepared_root.resolve()
-                    )
-                    for item in images
-                )
+            assert len(images) == 2
+            assert all(
+                Path(str(item["path"]))
+                .resolve()
+                .is_relative_to(prepared_root.resolve())
+                for item in images
             )
-            self.assertEqual(
-                Path(str(images[0]["path"])).read_bytes(),
-                image.read_bytes(),
-            )
-            self.assertTrue(
-                all(item.get("parent_resource_id") == "archive-1" for item in images)
-            )
-            self.assertEqual(
-                [
-                    {
-                        key: item.get(key)
-                        for key in ("resource_id", "status", "image_count")
-                    }
-                    for item in manifest
-                ],
-                [
-                    {
-                        "resource_id": "archive-1",
-                        "status": "archive_extracted",
-                        "image_count": 2,
-                    }
-                ],
-            )
-            self.assertEqual(len(structured), 1)
-            self.assertEqual(structured[0]["resource_id"], "archive-1::2")
-            self.assertEqual(structured[0]["parent_resource_id"], "archive-1")
+            assert Path(str(images[0]["path"])).read_bytes() == image.read_bytes()
+            assert all(item.get("parent_resource_id") == "archive-1" for item in images)
+            assert [
+                {key: item.get(key) for key in ("resource_id", "status", "image_count")}
+                for item in manifest
+            ] == [
+                {
+                    "resource_id": "archive-1",
+                    "status": "archive_extracted",
+                    "image_count": 2,
+                }
+            ]
+            assert len(structured) == 1
+            assert structured[0]["resource_id"] == "archive-1::2"
+            assert structured[0]["parent_resource_id"] == "archive-1"
 
     def test_misnamed_heic_image_is_converted_before_visual_observation(self) -> None:
         heic_bytes = base64.b64decode(
@@ -126,7 +114,7 @@ class ReadAdaptersContractTest(unittest.TestCase):
             source.write_bytes(heic_bytes)
 
             def convert(path: Path, *, out_dir: Path, resource_id: str) -> Path:
-                self.assertEqual(path, source)
+                assert path == source
                 destination = out_dir / f"{resource_id}.png"
                 destination.write_bytes(b"\x89PNG\r\n\x1a\n")
                 return destination
@@ -148,11 +136,11 @@ class ReadAdaptersContractTest(unittest.TestCase):
                 )
 
             converted = Path(str(images[0]["path"]))
-            self.assertEqual(converted.suffix, ".png")
-            self.assertEqual(converted.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+            assert converted.suffix == ".png"
+            assert converted.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
 
-        self.assertEqual(manifest[0]["status"], "image_converted")
-        self.assertEqual(structured, [])
+        assert manifest[0]["status"] == "image_converted"
+        assert structured == []
 
     def test_declared_heic_image_is_prepared_for_visual_observation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -161,36 +149,37 @@ class ReadAdaptersContractTest(unittest.TestCase):
             source.write_bytes(b"recorded-heic")
 
             def convert(path: Path, *, out_dir: Path, resource_id: str) -> Path:
-                self.assertEqual(path, source)
+                assert path == source
                 destination = out_dir / f"{resource_id}.png"
                 destination.write_bytes(b"\x89PNG\r\n\x1a\n")
                 return destination
 
-            with patch.object(
-                attachment_extractors,
-                "_is_heic_content",
-                return_value=True,
-            ), patch.object(
-                attachment_extractors,
-                "_convert_heic_to_png",
-                side_effect=convert,
+            with (
+                patch.object(
+                    attachment_extractors,
+                    "_is_heic_content",
+                    return_value=True,
+                ),
+                patch.object(
+                    attachment_extractors,
+                    "_convert_heic_to_png",
+                    side_effect=convert,
+                ),
             ):
-                images, manifest, structured = (
-                    attachment_extractors.prepare_materials(
-                        [
-                            {
-                                "resource_id": "declared-heic",
-                                "name": "packaging.heic",
-                                "path": str(source),
-                            }
-                        ],
-                        out_dir=root / "prepared",
-                    )
+                images, manifest, structured = attachment_extractors.prepare_materials(
+                    [
+                        {
+                            "resource_id": "declared-heic",
+                            "name": "packaging.heic",
+                            "path": str(source),
+                        }
+                    ],
+                    out_dir=root / "prepared",
                 )
 
-        self.assertEqual(Path(str(images[0]["path"])).suffix, ".png")
-        self.assertEqual(manifest[0]["status"], "image_converted")
-        self.assertEqual(structured, [])
+        assert Path(str(images[0]["path"])).suffix == ".png"
+        assert manifest[0]["status"] == "image_converted"
+        assert structured == []
 
     def test_pending_rows_are_fifo_and_missing_times_do_not_starve(self) -> None:
         client = api.OaApi(
@@ -227,28 +216,29 @@ class ReadAdaptersContractTest(unittest.TestCase):
         with patch.object(client, "_post_readonly", side_effect=pages):
             cases = client.pending_rows(page_size=3, max_pages=2)
 
-        self.assertEqual(
-            [item["request_id"] for item in cases],
-            ["100", "200", "300"],
-        )
-        self.assertEqual(cases[1]["submitted_at"], "2026-08-01 09:00:00")
-        self.assertEqual(cases[1]["received_at"], "2026-08-01 09:01:00")
+        assert [item["request_id"] for item in cases] == ["100", "200", "300"]
+        assert cases[1]["submitted_at"] == "2026-08-01 09:00:00"
+        assert cases[1]["received_at"] == "2026-08-01 09:01:00"
 
-    def test_pending_rows_fail_closed_on_http_or_permission_error(self) -> None:
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"http_status": 500, "error": "recorded"},
+            {"code": "NO_PERMISSION", "message": "recorded"},
+        ],
+        ids=["row_0", "row_1"],
+    )
+    def test_pending_rows_fail_closed_on_http_or_permission_error(
+        self, payload: dict[str, object]
+    ) -> None:
         client = api.OaApi(
             "recorded-token",
             "recorded-user",
             base_url="https://oa.invalid",
         )
-
-        for payload in (
-            {"http_status": 500, "error": "recorded"},
-            {"code": "NO_PERMISSION", "message": "recorded"},
-        ):
-            with self.subTest(payload=payload):
-                with patch.object(client, "_post_readonly", return_value=payload):
-                    with self.assertRaisesRegex(RuntimeError, "pending_queue_fetch_failed"):
-                        client.pending_rows(page_size=3, max_pages=2)
+        with patch.object(client, "_post_readonly", return_value=payload):
+            with pytest.raises(RuntimeError, match="pending_queue_fetch_failed"):
+                client.pending_rows(page_size=3, max_pages=2)
 
     def test_pdf_material_exposes_page_text_and_duplicate_hash_without_merging(
         self,
@@ -284,22 +274,22 @@ class ReadAdaptersContractTest(unittest.TestCase):
                 out_dir=root / "prepared",
             )
 
-        self.assertEqual([item["resource_id"] for item in images], [
+        assert [item["resource_id"] for item in images] == [
             "pdf-a",
             "pdf-a",
             "pdf-b",
             "pdf-b",
-        ])
-        self.assertEqual(len({item["source_content_sha256"] for item in images}), 1)
-        self.assertEqual(images[0]["content_sha256"], images[2]["content_sha256"])
-        self.assertEqual(images[1]["content_sha256"], images[3]["content_sha256"])
-        self.assertEqual(len(manifest), 2)
-        self.assertEqual(
-            [item["document_type"] for item in structured],
-            ["pdf_text", "pdf_text"],
-        )
-        self.assertIn("P1: Travel date 2026-07-21", structured[0]["key_text"])
-        self.assertIn("P2: Refund 45.00", structured[0]["key_text"])
+        ]
+        assert len({item["source_content_sha256"] for item in images}) == 1
+        assert images[0]["content_sha256"] == images[2]["content_sha256"]
+        assert images[1]["content_sha256"] == images[3]["content_sha256"]
+        assert len(manifest) == 2
+        assert [item["document_type"] for item in structured] == [
+            "pdf_text",
+            "pdf_text",
+        ]
+        assert "P1: Travel date 2026-07-21" in structured[0]["key_text"]
+        assert "P2: Refund 45.00" in structured[0]["key_text"]
 
     def test_attachment_downloads_run_concurrently_and_keep_resource_order(
         self,
@@ -363,31 +353,28 @@ class ReadAdaptersContractTest(unittest.TestCase):
                 )
 
             paths = [Path(str(item["path"])) for item in downloaded]
-            self.assertEqual(errors, [])
-            self.assertEqual(
-                [item["resource_id"] for item in downloaded],
-                ["resource-b", "resource-a"],
-            )
-            self.assertEqual(max_active, 2)
-            self.assertEqual(len({path.name for path in paths}), 2)
-            self.assertEqual(
-                [path.read_text() for path in paths],
-                [
-                    "https://oa.example.com/download/b",
-                    "https://oa.example.com/download/a",
-                ],
-            )
+            assert errors == []
+            assert [item["resource_id"] for item in downloaded] == [
+                "resource-b",
+                "resource-a",
+            ]
+            assert max_active == 2
+            assert len({path.name for path in paths}) == 2
+            assert [path.read_text() for path in paths] == [
+                "https://oa.example.com/download/b",
+                "https://oa.example.com/download/a",
+            ]
 
     def test_attachment_download_concurrency_has_a_hard_upper_bound(self) -> None:
-        self.assertEqual(attachments._download_worker_count(0, "999"), 0)
-        self.assertEqual(attachments._download_worker_count(3, "999"), 3)
-        self.assertEqual(
-            attachments._download_worker_count(20, "999"),
-            attachments.MAX_DOWNLOAD_CONCURRENCY,
+        assert attachments._download_worker_count(0, "999") == 0
+        assert attachments._download_worker_count(3, "999") == 3
+        assert (
+            attachments._download_worker_count(20, "999")
+            == attachments.MAX_DOWNLOAD_CONCURRENCY
         )
-        self.assertEqual(
-            attachments._download_worker_count(20, "invalid"),
-            attachments.DEFAULT_DOWNLOAD_CONCURRENCY,
+        assert (
+            attachments._download_worker_count(20, "invalid")
+            == attachments.DEFAULT_DOWNLOAD_CONCURRENCY
         )
 
     def test_attachment_download_paths_use_global_resource_slots(self) -> None:
@@ -400,7 +387,7 @@ class ReadAdaptersContractTest(unittest.TestCase):
             capacity: int,
             timeout_sec: float,
         ) -> object:
-            self.assertGreater(timeout_sec, 0)
+            assert timeout_sec > 0
             calls.append((name, capacity))
             yield Path("recorded-slot")
 
@@ -424,30 +411,21 @@ class ReadAdaptersContractTest(unittest.TestCase):
                     return_value=(expected, ""),
                 ),
             ):
-                self.assertEqual(
-                    attachments._download_resource_direct(
-                        resource,
-                        dest_dir=Path(tmp),
-                        timeout_sec=5,
-                    ),
-                    (expected, ""),
-                )
-                self.assertEqual(
-                    attachments._download_resource_with_browser(
-                        resource,
-                        dest_dir=Path(tmp),
-                        timeout_sec=5,
-                    ),
-                    (expected, ""),
-                )
+                assert attachments._download_resource_direct(
+                    resource,
+                    dest_dir=Path(tmp),
+                    timeout_sec=5,
+                ) == (expected, "")
+                assert attachments._download_resource_with_browser(
+                    resource,
+                    dest_dir=Path(tmp),
+                    timeout_sec=5,
+                ) == (expected, "")
 
-        self.assertEqual(
-            calls,
-            [
-                ("attachment-direct", attachments.DEFAULT_GLOBAL_DOWNLOAD_CAPACITY),
-                ("visible-browser", 1),
-            ],
-        )
+        assert calls == [
+            ("attachment-direct", attachments.DEFAULT_GLOBAL_DOWNLOAD_CAPACITY),
+            ("visible-browser", 1),
+        ]
 
     def test_travel_browser_paths_use_separate_global_resource_slots(self) -> None:
         calls: list[tuple[str, int]] = []
@@ -459,7 +437,7 @@ class ReadAdaptersContractTest(unittest.TestCase):
             capacity: int,
             timeout_sec: float,
         ) -> object:
-            self.assertGreater(timeout_sec, 0)
+            assert timeout_sec > 0
             calls.append((name, capacity))
             yield Path("recorded-slot")
 
@@ -488,13 +466,10 @@ class ReadAdaptersContractTest(unittest.TestCase):
                 headless=False,
             )
 
-        self.assertEqual(
-            calls,
-            [
-                ("travel-browser", travel_orders.DEFAULT_TRAVEL_BROWSER_CAPACITY),
-                ("visible-browser", 1),
-            ],
-        )
+        assert calls == [
+            ("travel-browser", travel_orders.DEFAULT_TRAVEL_BROWSER_CAPACITY),
+            ("visible-browser", 1),
+        ]
 
     def test_identical_attachment_resource_is_downloaded_once(self) -> None:
         class RecordedResponse(io.BytesIO):
@@ -539,12 +514,9 @@ class ReadAdaptersContractTest(unittest.TestCase):
                     flow_key="travel_expense",
                 )
 
-        self.assertEqual(errors, [])
-        self.assertEqual(calls, 1)
-        self.assertEqual(
-            [item["resource_id"] for item in downloaded],
-            ["same-resource"],
-        )
+        assert errors == []
+        assert calls == 1
+        assert [item["resource_id"] for item in downloaded] == ["same-resource"]
 
     def test_same_resource_id_with_different_urls_stops_before_download(self) -> None:
         resources = [
@@ -570,11 +542,10 @@ class ReadAdaptersContractTest(unittest.TestCase):
                     flow_key="travel_expense",
                 )
 
-        self.assertEqual(downloaded, [])
-        self.assertEqual(
-            [item["code"] for item in errors],
-            [attachments.ATTACHMENT_IDENTITY_CONFLICT_CODE],
-        )
+        assert downloaded == []
+        assert [item["code"] for item in errors] == [
+            attachments.ATTACHMENT_IDENTITY_CONFLICT_CODE
+        ]
         urlopen.assert_not_called()
 
     def test_distinct_resource_ids_with_same_url_are_not_merged(self) -> None:
@@ -625,16 +596,13 @@ class ReadAdaptersContractTest(unittest.TestCase):
                     flow_key="travel_expense",
                 )
 
-        self.assertEqual(errors, [])
-        self.assertEqual(calls, 2)
-        self.assertEqual(
-            [item["resource_id"] for item in downloaded],
-            ["resource-a", "resource-b"],
-        )
-        self.assertEqual(
-            len({Path(str(item["path"])).name for item in downloaded}),
-            2,
-        )
+        assert errors == []
+        assert calls == 2
+        assert [item["resource_id"] for item in downloaded] == [
+            "resource-a",
+            "resource-b",
+        ]
+        assert len({Path(str(item["path"])).name for item in downloaded}) == 2
 
     def test_attachment_cache_is_scoped_by_request_and_flow(self) -> None:
         class RecordedResponse(io.BytesIO):
@@ -707,15 +675,12 @@ class ReadAdaptersContractTest(unittest.TestCase):
                     flow_key="business_entertainment",
                 )
 
-        self.assertEqual(
-            first_errors + reused_errors + request_errors + flow_errors,
-            [],
-        )
-        self.assertEqual(calls, 3)
-        self.assertFalse(first[0]["reused"])
-        self.assertTrue(reused[0]["reused"])
-        self.assertFalse(other_request[0]["reused"])
-        self.assertFalse(other_flow[0]["reused"])
+        assert first_errors + reused_errors + request_errors + flow_errors == []
+        assert calls == 3
+        assert not first[0]["reused"]
+        assert reused[0]["reused"]
+        assert not other_request[0]["reused"]
+        assert not other_flow[0]["reused"]
 
     def test_direct_download_stops_on_oa_permission_redirect(self) -> None:
         class RedirectedResponse(io.BytesIO):
@@ -749,8 +714,8 @@ class ReadAdaptersContractTest(unittest.TestCase):
                     timeout_sec=5,
                 )
 
-        self.assertIsNone(path)
-        self.assertTrue(error.startswith("oa_session_expired:"), error)
+        assert path is None
+        assert error.startswith("oa_session_expired:")
 
     def test_handled_rows_use_readonly_endpoints_and_normalize_case_index(self) -> None:
         client = api.OaApi("token", "user", app_id="app", base_url="https://oa.example")
@@ -776,31 +741,25 @@ class ReadAdaptersContractTest(unittest.TestCase):
         with patch.object(client, "_post_readonly", side_effect=recorded_post):
             rows = client.handled_rows(page_size=50, max_pages=2)
 
-        self.assertEqual(
-            calls,
-            [
-                (
-                    "/api/workflow/paService/getHandledWorkflowRequestList4Ofs",
-                    {"pageNo": "1", "pageSize": "50", "isNeedOs": True},
-                ),
-                (
-                    "/api/workflow/paService/getHandledWorkflowRequestList",
-                    {"pageNo": "1", "pageSize": "50", "isNeedOs": True},
-                ),
-            ],
-        )
-        self.assertEqual(
-            rows,
-            [
-                {
-                    "request_id": "1001",
-                    "workflow_id": "138023",
-                    "workflow_name": "差旅费报销流程",
-                    "request_name": "差旅费报销流程-归档 CLBX20260624025",
-                    "handled_at": "2026-07-01 09:30:00",
-                }
-            ],
-        )
+        assert calls == [
+            (
+                "/api/workflow/paService/getHandledWorkflowRequestList4Ofs",
+                {"pageNo": "1", "pageSize": "50", "isNeedOs": True},
+            ),
+            (
+                "/api/workflow/paService/getHandledWorkflowRequestList",
+                {"pageNo": "1", "pageSize": "50", "isNeedOs": True},
+            ),
+        ]
+        assert rows == [
+            {
+                "request_id": "1001",
+                "workflow_id": "138023",
+                "workflow_name": "差旅费报销流程",
+                "request_name": "差旅费报销流程-归档 CLBX20260624025",
+                "handled_at": "2026-07-01 09:30:00",
+            }
+        ]
 
     def test_unconfigured_authority_query_returns_no_facts(self) -> None:
         with patch.object(official_sql, "_connect", return_value=None):
@@ -809,7 +768,7 @@ class ReadAdaptersContractTest(unittest.TestCase):
                 {"job_level_id": 7},
             )
 
-        self.assertEqual(rows, [])
+        assert rows == []
 
     def test_flow_number_resolves_one_exact_request_id(self) -> None:
         calls: list[tuple[str, dict]] = []
@@ -826,38 +785,36 @@ class ReadAdaptersContractTest(unittest.TestCase):
         with patch.object(official_sql, "_query_rows", side_effect=recorded_query):
             request_id = official_sql.resolve_request_id(" CLBX20260802011 ")
 
-        self.assertEqual(request_id, "1002")
-        self.assertEqual(
-            calls,
-            [
-                (
-                    "workflow_request_by_mark",
-                    {"request_mark": "CLBX20260802011"},
-                    True,
-                )
-            ],
-        )
-
-    def test_flow_number_stops_when_request_id_is_missing_or_ambiguous(self) -> None:
-        cases = (
-            ([], "flow_number_not_found"),
+        assert request_id == "1002"
+        assert calls == [
             (
-                [{"requestid": 1002}, {"requestid": 1003}],
-                "flow_number_not_unique",
-            ),
-        )
-        for rows, error_code in cases:
-            with self.subTest(error_code=error_code):
-                with (
-                    patch.object(official_sql, "_query_rows", return_value=rows),
-                    self.assertRaisesRegex(RuntimeError, f"^{error_code}$"),
-                ):
-                    official_sql.resolve_request_id("CLBX20260802011")
+                "workflow_request_by_mark",
+                {"request_mark": "CLBX20260802011"},
+                True,
+            )
+        ]
+
+    @pytest.mark.parametrize(
+        "rows,error_code",
+        [
+            ([], "flow_number_not_found"),
+            ([{"requestid": 1002}, {"requestid": 1003}], "flow_number_not_unique"),
+        ],
+        ids=["row_0", "row_1"],
+    )
+    def test_flow_number_stops_when_request_id_is_missing_or_ambiguous(
+        self, rows, error_code: str
+    ) -> None:
+        with (
+            patch.object(official_sql, "_query_rows", return_value=rows),
+            pytest.raises(RuntimeError, match=f"^{error_code}$"),
+        ):
+            official_sql.resolve_request_id("CLBX20260802011")
 
     def test_flow_number_stops_when_official_database_is_unavailable(self) -> None:
         with (
             patch.object(official_sql, "_connect", return_value=None),
-            self.assertRaisesRegex(RuntimeError, "^official_sql_unavailable$"),
+            pytest.raises(RuntimeError, match="^official_sql_unavailable$"),
         ):
             official_sql.resolve_request_id("CLBX20260802011")
 
@@ -868,7 +825,7 @@ class ReadAdaptersContractTest(unittest.TestCase):
                 "_connect",
                 side_effect=ConnectionError("recorded connection failure"),
             ),
-            self.assertRaisesRegex(RuntimeError, "^official_sql_read_failed$"),
+            pytest.raises(RuntimeError, match="^official_sql_read_failed$"),
         ):
             official_sql._query_rows(
                 "travel_job_level",
@@ -927,8 +884,8 @@ class ReadAdaptersContractTest(unittest.TestCase):
                 allow_browser_download=True,
             )
 
-        self.assertEqual(result["errors"], [])
-        self.assertEqual(result["resources"], [])
+        assert result["errors"] == []
+        assert result["resources"] == []
 
     def test_trip_candidate_only_short_circuits_on_exact_complete_snapshot(
         self,
@@ -938,35 +895,30 @@ class ReadAdaptersContractTest(unittest.TestCase):
             "resources": [{"id": "a"}, {"id": "b"}],
             "attachment_scan_status": "resources_found",
         }
-        self.assertTrue(
-            travel_orders._trip_candidate_complete(
-                complete,
-                expected_marker="CLBX-RECORDED",
-                expected_resource_count=2,
-            )
+        assert travel_orders._trip_candidate_complete(
+            complete,
+            expected_marker="CLBX-RECORDED",
+            expected_resource_count=2,
         )
-        self.assertFalse(
-            travel_orders._trip_candidate_complete(
-                complete,
-                expected_marker="CLBX-RECORDED",
-                expected_resource_count=1,
-            )
+        assert not travel_orders._trip_candidate_complete(
+            complete,
+            expected_marker="CLBX-RECORDED",
+            expected_resource_count=1,
         )
-        self.assertFalse(
-            travel_orders._trip_candidate_complete(
-                {**complete, "text": "另一个流程"},
-                expected_marker="CLBX-RECORDED",
-                expected_resource_count=2,
-            )
+        assert not travel_orders._trip_candidate_complete(
+            {**complete, "text": "另一个流程"},
+            expected_marker="CLBX-RECORDED",
+            expected_resource_count=2,
         )
-        self.assertFalse(
-            travel_orders._trip_candidate_complete(
-                {**complete, "attachment_scan_status": "read_failed"},
-                expected_marker="CLBX-RECORDED",
-                expected_resource_count=2,
-            )
+        assert not travel_orders._trip_candidate_complete(
+            {**complete, "attachment_scan_status": "read_failed"},
+            expected_marker="CLBX-RECORDED",
+            expected_resource_count=2,
         )
-    def test_travel_scan_does_not_treat_global_attachment_count_as_trip_subtotal(self) -> None:
+
+    def test_travel_scan_does_not_treat_global_attachment_count_as_trip_subtotal(
+        self,
+    ) -> None:
         flow_mark = "CLBX-PARTIAL"
         workflow = {
             "workflowMainTableInfo": {
@@ -1019,13 +971,14 @@ class ReadAdaptersContractTest(unittest.TestCase):
                 allow_browser_download=True,
             )
 
-        self.assertEqual(result["errors"], [])
-        self.assertEqual(
-            [item["id"] for item in result["resources"]],
-            [f"travel_platform:{index}" for index in range(1, 5)],
-        )
+        assert result["errors"] == []
+        assert [item["id"] for item in result["resources"]] == [
+            f"travel_platform:{index}" for index in range(1, 5)
+        ]
 
-    def test_travel_scan_deduplicates_same_attachment_id_with_different_urls(self) -> None:
+    def test_travel_scan_deduplicates_same_attachment_id_with_different_urls(
+        self,
+    ) -> None:
         flow_mark = "CLBX-DUPLICATE"
         workflow = {
             "workflowMainTableInfo": {
@@ -1084,11 +1037,11 @@ class ReadAdaptersContractTest(unittest.TestCase):
                 allow_browser_download=True,
             )
 
-        self.assertEqual(result["errors"], [])
-        self.assertEqual(
-            [item["id"] for item in result["resources"]],
-            ["travel_platform:1001", "travel_platform:1002"],
-        )
+        assert result["errors"] == []
+        assert [item["id"] for item in result["resources"]] == [
+            "travel_platform:1001",
+            "travel_platform:1002",
+        ]
 
     def test_travel_attachment_snapshot_waits_for_declared_count(self) -> None:
         class RecordedPage:
@@ -1135,9 +1088,9 @@ class ReadAdaptersContractTest(unittest.TestCase):
                 expected_resource_count=5,
             )
 
-        self.assertTrue(result["resource_scan_stable"])
-        self.assertEqual(len(result["resources"]), 5)
-        self.assertEqual(browser_snapshot.call_count, 6)
+        assert result["resource_scan_stable"]
+        assert len(result["resources"]) == 5
+        assert browser_snapshot.call_count == 6
 
     def test_travel_attachment_response_exposes_nested_attachment_lists(self) -> None:
         payload = {
@@ -1170,20 +1123,14 @@ class ReadAdaptersContractTest(unittest.TestCase):
 
         resources = travel_orders._attachment_resources_from_api_payload(payload)
 
-        self.assertEqual(
-            [item["id"] for item in resources],
-            [
-                "2084972582555074560",
-                "2084972582576046080",
-                "2084973571320299520",
-            ],
-        )
-        self.assertEqual(
-            resources[0]["downloadUrl"],
-            (
-                "https://travel.example.com/fcfile/fcc/opera/getFile/"
-                "2084972582555074560/mileage-start.jpg"
-            ),
+        assert [item["id"] for item in resources] == [
+            "2084972582555074560",
+            "2084972582576046080",
+            "2084973571320299520",
+        ]
+        assert resources[0]["downloadUrl"] == (
+            "https://travel.example.com/fcfile/fcc/opera/getFile/"
+            "2084972582555074560/mileage-start.jpg"
         )
 
     def test_travel_expense_response_exposes_hotel_order_for_detail_lookup(
@@ -1213,26 +1160,22 @@ class ReadAdaptersContractTest(unittest.TestCase):
 
         orders = travel_orders._hotel_orders_from_api_payload(payload)
 
-        self.assertEqual(
-            orders,
-            [
-                {
-                    "order_no": "HT260702000024LX9U",
-                    "expense_description": (
-                        "方文辉 2026-07-02 至 2026-07-04 "
-                        "入住满房宝国际公寓（高新区宝龙广场店）"
-                    ),
-                }
-            ],
-        )
+        assert orders == [
+            {
+                "order_no": "HT260702000024LX9U",
+                "expense_description": (
+                    "方文辉 2026-07-02 至 2026-07-04 "
+                    "入住满房宝国际公寓（高新区宝龙广场店）"
+                ),
+            }
+        ]
 
     def test_hotel_detail_address_is_bound_by_exact_expense_description(
         self,
     ) -> None:
         flow_mark = "CLBX-HOTEL"
         expense_description = (
-            "方文辉 2026-07-02 至 2026-07-04 "
-            "入住满房宝国际公寓（高新区宝龙广场店）"
+            "方文辉 2026-07-02 至 2026-07-04 入住满房宝国际公寓（高新区宝龙广场店）"
         )
         workflow = {
             "workflowMainTableInfo": {
@@ -1278,8 +1221,7 @@ class ReadAdaptersContractTest(unittest.TestCase):
                                 "expense_description": expense_description,
                                 "hotel_name": "满房宝国际公寓（高新区宝龙广场店）",
                                 "hotel_address": (
-                                    "珠海市香洲区唐家湾镇科技一路"
-                                    "高新宝龙城B2栋公寓"
+                                    "珠海市香洲区唐家湾镇科技一路高新宝龙城B2栋公寓"
                                 ),
                                 "city": "珠海",
                                 "district": "香洲区",
@@ -1298,17 +1240,14 @@ class ReadAdaptersContractTest(unittest.TestCase):
                 allow_browser_download=True,
             )
 
-        self.assertIn(
-            {
-                "name": "酒店地址",
-                "value": "珠海市香洲区唐家湾镇科技一路高新宝龙城B2栋公寓",
-                "raw_value": "珠海市香洲区唐家湾镇科技一路高新宝龙城B2栋公寓",
-                "table": "travel_order",
-                "row": 0,
-                "subject_ref": "detail[0].row[0]",
-            },
-            result["fields"],
-        )
+        assert {
+            "name": "酒店地址",
+            "value": "珠海市香洲区唐家湾镇科技一路高新宝龙城B2栋公寓",
+            "raw_value": "珠海市香洲区唐家湾镇科技一路高新宝龙城B2栋公寓",
+            "table": "travel_order",
+            "row": 0,
+            "subject_ref": "detail[0].row[0]",
+        } in result["fields"]
 
     def test_travel_attachment_snapshot_merges_api_response_resources(self) -> None:
         class RecordedPage:
@@ -1344,8 +1283,8 @@ class ReadAdaptersContractTest(unittest.TestCase):
                 response_resources=api_resources,
             )
 
-        self.assertTrue(result["resource_scan_stable"])
-        self.assertEqual(len(result["resources"]), 5)
+        assert result["resource_scan_stable"]
+        assert len(result["resources"]) == 5
 
     def test_spreadsheet_reader_exposes_all_rows_and_columns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1366,9 +1305,9 @@ class ReadAdaptersContractTest(unittest.TestCase):
                 name=path.name,
             )
 
-        self.assertIn("明细!R85:", fact["key_text"][-1])
-        self.assertIn("R85C31", fact["key_text"][-1])
-        self.assertEqual(len(fact["key_text"]), 85)
+        assert "明细!R85:" in fact["key_text"][-1]
+        assert "R85C31" in fact["key_text"][-1]
+        assert len(fact["key_text"]) == 85
 
     def test_docx_reader_exposes_all_paragraphs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1393,9 +1332,9 @@ class ReadAdaptersContractTest(unittest.TestCase):
                 out_dir=root,
             )
 
-        self.assertEqual(len(fact["key_text"]), 205)
-        self.assertEqual(fact["key_text"][-1], "第205条证据")
-        self.assertEqual(images, [])
+        assert len(fact["key_text"]) == 205
+        assert fact["key_text"][-1] == "第205条证据"
+        assert images == []
 
     def test_ofd_reader_stops_instead_of_silently_skipping_xml_members(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1405,7 +1344,7 @@ class ReadAdaptersContractTest(unittest.TestCase):
                 for index in range(31):
                     archive.writestr(f"Doc_{index}/Content.xml", content_xml)
 
-            with self.assertRaisesRegex(ValueError, "OFD内部XML文件数量超过读取上限"):
+            with pytest.raises(ValueError, match="OFD内部XML文件数量超过读取上限"):
                 attachment_extractors.ofd_invoice_fact(
                     path,
                     resource_id="ofd-001",
@@ -1448,20 +1387,13 @@ class ReadAdaptersContractTest(unittest.TestCase):
         with patch.object(official_sql, "_query_rows", side_effect=recorded_query):
             facts = official_sql.travel_extra_fields(workflow)
 
-        self.assertEqual(
-            [(item["name"], item["value"]) for item in facts],
-            [
-                ("职务类别", "销售人员分类"),
-                ("职务名称", "销售代表"),
-                ("职务类别", "营销职能人员分类"),
-                ("职务名称", "营销专员"),
-                ("负责区域", "佛山"),
-                ("负责区域", "广州"),
-            ],
-        )
-        self.assertEqual(facts[-2]["subject_ref"], "11")
-        self.assertEqual(facts[-2]["observed_at"], "2026-08-01")
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert [(item["name"], item["value"]) for item in facts] == [
+            ("职务类别", "销售人员分类"),
+            ("职务名称", "销售代表"),
+            ("职务类别", "营销职能人员分类"),
+            ("职务名称", "营销专员"),
+            ("负责区域", "佛山"),
+            ("负责区域", "广州"),
+        ]
+        assert facts[-2]["subject_ref"] == "11"
+        assert facts[-2]["observed_at"] == "2026-08-01"

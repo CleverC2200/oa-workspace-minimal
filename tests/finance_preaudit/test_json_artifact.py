@@ -1,16 +1,23 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import tempfile
-import unittest
+from pathlib import Path
 from unittest import mock
 
-from apps.oa_finance_preaudit import json_artifact
+import pytest
+
+from apps import json_artifact
+from apps.oa_finance_preaudit import json_artifact as legacy_json_artifact
 
 
-class JsonArtifactTest(unittest.TestCase):
-    def test_atomic_write_publishes_normalized_json_and_leaves_no_temporary_file(self) -> None:
+class TestJsonArtifact:
+    def test_legacy_import_path_uses_shared_writer(self) -> None:
+        assert legacy_json_artifact.write_json_atomic is json_artifact.write_json_atomic
+
+    def test_atomic_write_publishes_normalized_json_and_leaves_no_temporary_file(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             target = root / "artifact.json"
@@ -24,35 +31,30 @@ class JsonArtifactTest(unittest.TestCase):
                 indent=2,
             )
 
-            self.assertEqual(written, target.resolve())
-            self.assertEqual(
-                json.loads(target.read_text(encoding="utf-8")),
-                {
-                    "schema_version": 1,
-                    "path": str((root / "bound-file.json")),
-                },
-            )
-            self.assertEqual(list(root.glob(".*.tmp")), [])
+            assert written == target.resolve()
+            assert json.loads(target.read_text(encoding="utf-8")) == {
+                "schema_version": 1,
+                "path": str((root / "bound-file.json")),
+            }
+            assert list(root.glob(".*.tmp")) == []
 
-    def test_replace_failure_preserves_the_existing_artifact_and_cleans_up(self) -> None:
+    def test_replace_failure_preserves_the_existing_artifact_and_cleans_up(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             target = root / "artifact.json"
             target.write_text('{"version": 1}\n', encoding="utf-8")
 
-            with mock.patch.object(
-                json_artifact.os,
-                "replace",
-                side_effect=OSError("replace failed"),
-            ), self.assertRaises(OSError):
+            with (
+                mock.patch.object(
+                    json_artifact.os,
+                    "replace",
+                    side_effect=OSError("replace failed"),
+                ),
+                pytest.raises(OSError),
+            ):
                 json_artifact.write_json_atomic(target, {"version": 2})
 
-            self.assertEqual(
-                json.loads(target.read_text(encoding="utf-8")),
-                {"version": 1},
-            )
-            self.assertEqual(list(root.glob(".*.tmp")), [])
-
-
-if __name__ == "__main__":
-    unittest.main()
+            assert json.loads(target.read_text(encoding="utf-8")) == {"version": 1}
+            assert list(root.glob(".*.tmp")) == []

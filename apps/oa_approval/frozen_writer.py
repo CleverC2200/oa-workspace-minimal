@@ -12,7 +12,7 @@ import uuid
 
 from apps.oa_approval import runtime_control
 from apps.oa_approval.writer_api import FrozenWriterApi, build_writer_api
-from apps.oa_finance_preaudit.json_artifact import write_json_atomic
+from apps.json_artifact import write_json_atomic
 
 
 _REQUEST_ID = re.compile(r"^[0-9]{1,20}$")

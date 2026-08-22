@@ -9,7 +9,7 @@ import sys
 from typing import Callable
 
 from . import elastic_queue
-from . import json_artifact
+from apps import json_artifact
 
 
 RunFunction = Callable[..., subprocess.CompletedProcess]

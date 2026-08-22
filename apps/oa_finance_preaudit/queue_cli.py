@@ -11,7 +11,7 @@ import sys
 from typing import Sequence
 
 from . import elastic_queue
-from . import json_artifact
+from apps import json_artifact
 from . import live_inputs
 from . import review_attempt
 from . import runtime_snapshot

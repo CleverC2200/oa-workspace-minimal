@@ -34,7 +34,7 @@ python3 -m scripts.quality skill
 python3 -m scripts.quality format
 python3 -m scripts.quality hygiene
 python3 -m scripts.quality links
-python3 -m unittest discover -s tests/finance_preaudit -p 'test_*.py' -v
+python3 -m pytest -v
 python3 -m compileall -q apps scripts tests
 ```
 

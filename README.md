@@ -103,7 +103,7 @@ python3 -m apps.oa_finance_preaudit.flow_runner \
 五类流程各有正常、业务异常、证据不足和技术失败四个脱敏样本。回放比较固定审核项、状态/停止码、格式、耗时和精确 Token，不需要 OA 登录：
 
 ```bash
-python3 -m unittest tests.finance_preaudit.test_flow_evals -v
+python3 -m pytest tests/finance_preaudit/test_flow_evals.py -v
 ```
 
 外部离线结果也可通过 `python3 -m apps.oa_finance_preaudit.flow_evals --fixtures ... --actuals ...` 生成逐流程报告。样本不包含原始附件或业务身份，性能改善不得以准确性和格式回归为代价。
@@ -117,7 +117,7 @@ python3 -m scripts.quality skill
 python3 -m scripts.quality format
 python3 -m scripts.quality hygiene
 python3 -m scripts.quality links
-python3 -m unittest discover -s tests/finance_preaudit -p 'test_*.py' -v
+python3 -m pytest -v
 ```
 
 仓库继续保持私有，不配置 GitHub 服务端分支保护。`main` 的普通变更仍按本地维护规则通过质量门和 PR 合并，但这不是平台强制；具体见[main 本地管理规则](docs/agents/branch-protection.md)。CI 不读取真实 OA 凭据，也不启用生产自动化。
@@ -140,7 +140,7 @@ python3 -m apps.oa_finance_preaudit.tuning \
 
 ```bash
 python3 -m scripts.quality skill
-python3 -m unittest discover -s tests/finance_preaudit -p 'test_*.py' -v
+python3 -m pytest -v
 git diff --check
 ```
 

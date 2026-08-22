@@ -74,8 +74,8 @@ dry-run 回执必须令 `postcheck.done=false`、`postcheck.current=null`。检�
 需要改变固定契约或修复错误时，先增加聚焦案例/测试，再最小修改 `apps/oa_approval/feishu_external_instance.py`，运行：
 
 ```bash
-python3 -m unittest tests.test_feishu_external_instance -v
-python3 -m unittest discover -s tests -p 'test_*.py' -v
+python3 -m pytest tests/test_feishu_external_instance.py -v
+python3 -m pytest -v
 git diff --check
 ```
 

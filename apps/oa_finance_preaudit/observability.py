@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 from typing import Iterable
 
-from .json_artifact import write_json_atomic
+from apps.json_artifact import write_json_atomic
 
 
 _PHASE_CATEGORY = {

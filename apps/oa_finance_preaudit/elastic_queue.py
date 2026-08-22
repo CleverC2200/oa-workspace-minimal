@@ -12,7 +12,7 @@ import secrets
 from typing import Iterator, Optional
 from zoneinfo import ZoneInfo
 
-from . import json_artifact
+from apps import json_artifact
 
 
 SCHEMA_VERSION = 1

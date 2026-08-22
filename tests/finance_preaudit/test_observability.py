@@ -2,17 +2,16 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-import tempfile
-import unittest
+
+import pytest
 
 from apps.oa_finance_preaudit import observability
 
 
-class ObservabilityTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp_dir.cleanup)
-        self.log = Path(self.temp_dir.name) / "observability.json"
+class TestObservability:
+    @pytest.fixture(autouse=True)
+    def _workspace(self, tmp_path: Path) -> None:
+        self.log = tmp_path / "observability.json"
         self.item_key = observability.attempt_key("REQ-1", "2026-08-22T01:00:00Z", 1)
 
     def event(self, **overrides: object) -> dict:
@@ -41,9 +40,9 @@ class ObservabilityTests(unittest.TestCase):
         first = observability.record_event(self.log, self.event())
         replay = observability.record_event(self.log, self.event())
 
-        self.assertEqual(first["event_count"], 1)
-        self.assertEqual(replay["event_count"], 1)
-        with self.assertRaisesRegex(ValueError, "observability_event_conflict"):
+        assert first["event_count"] == 1
+        assert replay["event_count"] == 1
+        with pytest.raises(ValueError, match="observability_event_conflict"):
             observability.record_event(self.log, self.event(wall_seconds=21))
 
     def test_summary_splits_approval_coordination_waiting_and_submission(self) -> None:
@@ -91,14 +90,14 @@ class ObservabilityTests(unittest.TestCase):
 
         summary = observability.summarize_logs([self.log])
 
-        self.assertEqual(summary["totals"]["approval"]["total_tokens"], 120)
-        self.assertEqual(summary["totals"]["coordination"]["total_tokens"], 40)
-        self.assertEqual(summary["totals"]["waiting"]["wall_seconds"], 60)
-        self.assertEqual(summary["totals"]["waiting"]["usage_unknown_events"], 1)
-        self.assertEqual(summary["totals"]["submission"]["wall_seconds"], 3)
-        self.assertEqual(summary["by_flow"]["travel_expense"]["event_count"], 4)
-        self.assertEqual(summary["by_date"]["2026-08-22"]["event_count"], 4)
-        self.assertEqual(summary["by_hour"]["2026-08-22T01:00:00Z"]["event_count"], 4)
+        assert summary["totals"]["approval"]["total_tokens"] == 120
+        assert summary["totals"]["coordination"]["total_tokens"] == 40
+        assert summary["totals"]["waiting"]["wall_seconds"] == 60
+        assert summary["totals"]["waiting"]["usage_unknown_events"] == 1
+        assert summary["totals"]["submission"]["wall_seconds"] == 3
+        assert summary["by_flow"]["travel_expense"]["event_count"] == 4
+        assert summary["by_date"]["2026-08-22"]["event_count"] == 4
+        assert summary["by_hour"]["2026-08-22T01:00:00Z"]["event_count"] == 4
 
     def test_business_warning_and_technical_failure_are_closed_results(self) -> None:
         observability.record_event(
@@ -118,24 +117,24 @@ class ObservabilityTests(unittest.TestCase):
 
         summary = observability.summarize_logs([self.log])
 
-        self.assertEqual(summary["results"]["business_warning"], 1)
-        self.assertEqual(summary["results"]["technical_failure"], 1)
+        assert summary["results"]["business_warning"] == 1
+        assert summary["results"]["technical_failure"] == 1
 
     def test_rejects_estimated_usage_and_raw_identity(self) -> None:
         invalid = self.event(
             request_id="REQ-1",
             token_usage={"status": "estimated", "total_tokens": 120},
         )
-        with self.assertRaisesRegex(ValueError, "observability_event_invalid"):
+        with pytest.raises(ValueError, match="observability_event_invalid"):
             observability.record_event(self.log, invalid)
-        self.assertFalse(self.log.exists())
+        assert not self.log.exists()
 
     def test_written_log_contains_only_sanitized_identity(self) -> None:
         observability.record_event(self.log, self.event())
         payload = json.loads(self.log.read_text(encoding="utf-8"))
 
-        self.assertNotIn("REQ-1", self.log.read_text(encoding="utf-8"))
-        self.assertEqual(payload["kind"], "preaudit_observability")
+        assert "REQ-1" not in self.log.read_text(encoding="utf-8")
+        assert payload["kind"] == "preaudit_observability"
 
     def test_exact_usage_can_enrich_unknown_once(self) -> None:
         observability.record_event(
@@ -162,13 +161,11 @@ class ObservabilityTests(unittest.TestCase):
             total_tokens=15,
         )
 
-        self.assertFalse(first["replayed"])
-        self.assertTrue(replay["replayed"])
-        self.assertEqual(
-            observability.summarize_logs([self.log])["totals"]["approval"]["total_tokens"],
-            15,
+        assert not first["replayed"]
+        assert replay["replayed"]
+        assert (
+            observability.summarize_logs([self.log])["totals"]["approval"][
+                "total_tokens"
+            ]
+            == 15
         )
-
-
-if __name__ == "__main__":
-    unittest.main()
