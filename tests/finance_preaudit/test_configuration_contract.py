@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import re
 import sys
 import types
 import unittest
 from unittest.mock import patch
 
 from apps.oa_approval import auth, official_sql
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class ConfigurationContractTest(unittest.TestCase):
@@ -30,6 +35,20 @@ class ConfigurationContractTest(unittest.TestCase):
             patch.dict(sys.modules, {"oracledb": fake_oracledb}),
         ):
             self.assertIsNone(official_sql._connect())
+
+    def test_env_template_contains_only_implemented_settings(self) -> None:
+        template = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
+        names = set(re.findall(r"^([A-Z][A-Z0-9_]*)=", template, re.MULTILINE))
+        implementation = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (PROJECT_ROOT / "apps").rglob("*")
+            if path.suffix in {".py", ".js"}
+        )
+
+        self.assertEqual(
+            sorted(name for name in names if name not in implementation),
+            [],
+        )
 
 
 if __name__ == "__main__":

@@ -16,12 +16,6 @@ from . import live_inputs
 from . import review_attempt
 from . import runtime_snapshot
 
-
-_BLOCK_LINE = re.compile(
-    r"(?:^|\|)(?:request_id|requestId)=([A-Za-z0-9][A-Za-z0-9_-]{0,127})(?:\||$)"
-)
-
-
 def _print(payload: dict) -> None:
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
