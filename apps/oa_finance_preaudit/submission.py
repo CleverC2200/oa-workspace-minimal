@@ -281,5 +281,8 @@ def build_receipt(
         "envelope_fingerprint": envelope_fingerprint,
         "submission_token_sha256": submission_token_sha256,
         "observability_state": observability_state,
+        "no_write_evidence": (
+            "confirmed_no_write" if write_state == "not_requested" else None
+        ),
         **submission_result,
     }

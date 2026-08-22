@@ -549,11 +549,15 @@ def test_concurrent_review_completion_cannot_overwrite_the_first_result(
 
     engine._open_attempt = controlled_open  # type: ignore[method-assign]
     results: list[dict] = []
+    conflicts: list[str] = []
 
     def complete(decision_file: Path, *, finished: threading.Event | None = None) -> None:
-        results.append(
-            engine.complete_review(Path(action["action_file"]), decision_file)
-        )
+        try:
+            results.append(
+                engine.complete_review(Path(action["action_file"]), decision_file)
+            )
+        except ValueError as error:
+            conflicts.append(str(error))
         if finished is not None:
             finished.set()
 
@@ -573,10 +577,10 @@ def test_concurrent_review_completion_cannot_overwrite_the_first_result(
 
     assert not first_thread.is_alive()
     assert not second_thread.is_alive()
-    first, second = results
-
+    assert len(results) == 1
+    first = results[0]
     assert first["business_state"] == "pass"
-    assert second == first
+    assert conflicts == ["review_decision_conflict"]
     assert json.loads(
         Path(action["state_file"]).read_text(encoding="utf-8")
     )["business_state"] == "pass"
