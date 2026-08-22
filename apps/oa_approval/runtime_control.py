@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import os
 from pathlib import Path
+import stat
 from typing import Iterator
 
 
@@ -40,9 +41,41 @@ def writer_lock_file() -> Path:
 
 
 def request_writer_lock_file(request_id: str, base_path: Path | None = None) -> Path:
-    base = Path(base_path or writer_lock_file()).expanduser().resolve()
+    base = Path(os.path.abspath(Path(base_path or writer_lock_file()).expanduser()))
     digest = hashlib.sha256(str(request_id).encode("utf-8")).hexdigest()[:16]
     return base.with_name(f"{base.stem}-{digest}{base.suffix or '.lock'}")
+
+
+def _open_directory_nofollow(path: Path) -> int:
+    target = Path(path)
+    if not target.is_absolute() or not target.parts:
+        raise RuntimeError("writer_lock_unsafe")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(target.parts[0], flags)
+        for component in target.parts[1:]:
+            if component in {"", ".", ".."}:
+                raise RuntimeError("writer_lock_unsafe")
+            try:
+                child = os.open(component, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, 0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except (OSError, RuntimeError) as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise RuntimeError("writer_lock_unsafe") from error
 
 
 def active_request_writers(base_path: Path | None = None) -> int:
@@ -76,8 +109,47 @@ def request_writer_lease(
     path: Path | None = None,
 ) -> Iterator[None]:
     target = request_writer_lock_file(request_id, path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = target.open("a+", encoding="utf-8")
+    parent_descriptor = _open_directory_nofollow(target.parent)
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    file_descriptor: int | None = None
+    try:
+        parent_stat = os.fstat(parent_descriptor)
+        for _attempt in range(8):
+            try:
+                file_descriptor = os.open(
+                    target.name,
+                    flags,
+                    0o600,
+                    dir_fd=parent_descriptor,
+                )
+                break
+            except FileNotFoundError:
+                continue
+        if file_descriptor is None:
+            raise RuntimeError("writer_lock_unsafe")
+        current_parent = os.stat(target.parent, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(current_parent.st_mode)
+            or (current_parent.st_dev, current_parent.st_ino)
+            != (parent_stat.st_dev, parent_stat.st_ino)
+        ):
+            raise RuntimeError("writer_lock_unsafe")
+    except (OSError, RuntimeError) as error:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+            file_descriptor = None
+        raise RuntimeError("writer_lock_unsafe") from error
+    finally:
+        os.close(parent_descriptor)
+    if file_descriptor is None:
+        raise RuntimeError("writer_lock_unsafe")
+    try:
+        descriptor = os.fdopen(file_descriptor, "r+", encoding="utf-8")
+    except Exception:
+        os.close(file_descriptor)
+        raise
     try:
         fcntl.flock(descriptor.fileno(), fcntl.LOCK_EX)
         descriptor.seek(0)

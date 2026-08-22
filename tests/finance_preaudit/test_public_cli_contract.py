@@ -81,6 +81,55 @@ def test_next_action_uses_the_deep_module_and_prints_one_json() -> None:
     }
 
 
+def test_controlled_next_action_requires_explicit_confirmation() -> None:
+    calls: list[tuple[str, str]] = []
+
+    class Engine:
+        def next_action(self, workflow: str, *, mode: str) -> dict:
+            calls.append((workflow, mode))
+            return {
+                "schema_version": 1,
+                "kind": "preaudit_action",
+                "action": "closed",
+                "workflow_key": workflow,
+                "mode": mode,
+            }
+
+    denied = io.StringIO()
+    with redirect_stdout(denied):
+        denied_code = cli.main(
+            [
+                "next-action",
+                "--workflow",
+                "travel_expense",
+                "--mode",
+                "controlled-write",
+            ],
+            flow_engine_factory=Engine,
+        )
+
+    allowed = io.StringIO()
+    with redirect_stdout(allowed):
+        allowed_code = cli.main(
+            [
+                "next-action",
+                "--workflow",
+                "travel_expense",
+                "--mode",
+                "controlled-write",
+                "--confirm-write",
+                "YES",
+            ],
+            flow_engine_factory=Engine,
+        )
+
+    assert denied_code == 1
+    assert json.loads(denied.getvalue())["failure"]["code"] == "run_mode_unauthorized"
+    assert allowed_code == 0
+    assert calls == [("travel_expense", "controlled_write")]
+    assert json.loads(allowed.getvalue())["mode"] == "controlled_write"
+
+
 def test_cli_failure_emits_sanitized_classification() -> None:
     receipts: list[dict] = []
 
@@ -204,3 +253,51 @@ def test_complete_review_uses_the_same_deep_module(tmp_path) -> None:
     assert exit_code == 0
     assert calls == [(action_file, decision_file)]
     assert json.loads(output.getvalue())["action"] == "closed"
+
+
+def test_controlled_complete_review_requires_confirmation(tmp_path: Path) -> None:
+    action_file = tmp_path / "action.json"
+    decision_file = tmp_path / "decision.json"
+    action_file.write_text(
+        json.dumps({"mode": "controlled_write"}),
+        encoding="utf-8",
+    )
+    calls: list[tuple[object, object]] = []
+
+    class Engine:
+        def complete_review(self, action: object, decision: object) -> dict:
+            calls.append((action, decision))
+            return {"schema_version": 1, "kind": "preaudit_action", "action": "closed"}
+
+    denied = io.StringIO()
+    with redirect_stdout(denied):
+        denied_code = cli.main(
+            [
+                "complete-review",
+                "--action-file",
+                str(action_file),
+                "--decision-file",
+                str(decision_file),
+            ],
+            flow_engine_factory=Engine,
+        )
+
+    allowed = io.StringIO()
+    with redirect_stdout(allowed):
+        allowed_code = cli.main(
+            [
+                "complete-review",
+                "--action-file",
+                str(action_file),
+                "--decision-file",
+                str(decision_file),
+                "--confirm-write",
+                "YES",
+            ],
+            flow_engine_factory=Engine,
+        )
+
+    assert denied_code == 1
+    assert json.loads(denied.getvalue())["failure"]["code"] == "run_mode_unauthorized"
+    assert allowed_code == 0
+    assert calls == [(action_file, decision_file)]

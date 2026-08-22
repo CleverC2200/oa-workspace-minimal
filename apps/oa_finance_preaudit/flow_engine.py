@@ -523,6 +523,36 @@ def _validate_flow_material(workflow_key: str, material: dict) -> None:
         raise ValueError("packaging_material_incomplete")
 
 
+def validate_frozen_evidence(
+    *,
+    material_file: Path,
+    request_id: str,
+    workflow_key: str,
+    attachment_root: Path,
+    prepared_root: Path,
+    material_fingerprint: str,
+    evidence_fingerprint: str,
+) -> dict:
+    try:
+        verified = _validate_material_bundle(
+            material_file,
+            expected_request_id=request_id,
+            attachment_root=attachment_root,
+            prepared_root=prepared_root,
+        )
+        material = _read_object(material_file, code="frozen_material_changed")
+        if (
+            verified["material_fingerprint"] != material_fingerprint
+            or material.get("workflow_key") != workflow_key
+            or _evidence_fingerprint(material) != evidence_fingerprint
+        ):
+            raise ValueError("frozen_material_changed")
+        _validate_flow_material(workflow_key, material)
+    except (OSError, ValueError) as error:
+        raise ValueError("frozen_material_changed") from error
+    return material
+
+
 def _packaging_page_refs(material: dict) -> tuple[str, ...]:
     resources = material.get("resources")
     prepared = material.get("prepared")
@@ -1330,24 +1360,15 @@ class FlowEngine:
         }
         if packet != expected_packet:
             raise ValueError("frozen_packet_changed")
-        try:
-            verified = _validate_material_bundle(
-                material_path,
-                expected_request_id=str(state.get("request_id") or ""),
-                attachment_root=action_path.parent / "attachments",
-                prepared_root=action_path.parent / "prepared",
-            )
-        except (OSError, ValueError) as error:
-            raise ValueError("frozen_material_changed") from error
-        if verified["material_fingerprint"] != state.get("material_fingerprint"):
-            raise ValueError("frozen_material_changed")
-        material = _read_object(material_path, code="frozen_material_changed")
-        if (
-            material.get("workflow_key") != workflow_key
-            or _evidence_fingerprint(material) != state.get("evidence_fingerprint")
-        ):
-            raise ValueError("frozen_material_changed")
-        _validate_flow_material(workflow_key, material)
+        validate_frozen_evidence(
+            material_file=material_path,
+            request_id=str(state.get("request_id") or ""),
+            workflow_key=workflow_key,
+            attachment_root=action_path.parent / "attachments",
+            prepared_root=action_path.parent / "prepared",
+            material_fingerprint=str(state.get("material_fingerprint") or ""),
+            evidence_fingerprint=str(state.get("evidence_fingerprint") or ""),
+        )
         return action, state, packet
 
     def _prepare_attempt(self, attempt_root: Path) -> dict:
@@ -1532,7 +1553,13 @@ class FlowEngine:
     def next_action(self, workflow_key: str, *, mode: str = "preview") -> dict:
         if workflow_key not in _FLOW_SPECS:
             raise ValueError("workflow_not_implemented")
-        if mode != "preview":
+        if mode not in {"preview", "controlled_write"}:
+            raise ValueError("run_mode_unauthorized")
+        if mode == "controlled_write" and (
+            self._authorization_source is None
+            or self._authorization_verifier is None
+            or self._submit_frozen is None
+        ):
             raise ValueError("run_mode_unauthorized")
 
         workflow_root = self._root / workflow_key
