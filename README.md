@@ -45,7 +45,7 @@ cp .env.example .env
 
 ## 只读 preview
 
-差旅费已经提供本地深模块的两动作接口。先取得当前唯一动作：
+差旅费已经提供本地深模块的两动作接口。先取得下一个动作：
 
 ```bash
 python3 -m apps.oa_finance_preaudit.cli next-action \
@@ -60,7 +60,7 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
   --decision-file /absolute/path/to/review-decision.json
 ```
 
-两条命令默认且当前只支持 preview，动作固定 `write_authorized=false`，写入状态固定为 `not_requested`；不会调用 OA 提交。模块和 CLI 共用同一业务实现，大对象通过本地文件传递，stdout 只输出一个版本化 JSON。冻结材料或持久状态不一致时返回正常的 `needs_admin` 动作并停止当前单据，不生成意见。
+两条公开命令默认且当前只支持 preview，动作固定 `write_authorized=false`，写入状态固定为 `not_requested`；不会调用 OA 提交。模块和 CLI 共用同一业务实现，大对象通过本地文件传递，stdout 只输出一个版本化 JSON。冻结材料或持久状态不一致时返回正常的 `needs_admin` 动作并停止当前单据，不生成意见。积压中已有单据等待审核时，后续调用可取得另一单据；每个 attempt 使用自己的完成锁，互不等待。
 
 旧的按 requestId 材料收集入口暂时作为回退能力保留：
 
@@ -89,9 +89,9 @@ python3 -m apps.oa_finance_preaudit.observability summary \
   --log /absolute/attempt/observability.json
 ```
 
-平台在 Agent 闭合后返回精确 usage 时，使用同一 `item_key + event_id` 的 `usage` 命令补充；重复回放不会重复计数，冲突值会被拒绝。指标缺失只影响监控，不阻断审核或提交。
+平台在 Agent 闭合后返回精确 usage 时，使用同一 `item_key + event_id` 的 `usage` 命令补充；重复回放不会重复计数，冲突值会被拒绝。提交前的必要事件无法保存时停止当前单据；提交后才发生的指标异常不会重放 OA，而是在回执中明确记录 `observability_state=unknown`。
 
-OA 提交只通过冻结写入入口执行。锁、token、冻结指纹和终态回执均绑定单个 `requestId + received_at + attempt`：同一 requestId 单飞并幂等重放，不同 requestId 可由 `submission_pool.run_bounded` 有界并发。生产写入仍需单独授权；本仓库测试只使用模拟接口。
+OA 提交只通过冻结写入入口执行。授权证明、锁、token、冻结指纹和终态回执均绑定单个 `requestId + received_at + attempt` 及其材料版本：同一 attempt 单飞并幂等重放，不同单据可以并发。受控写入还必须由运行环境注入授权源、外部 verifier 和提交适配器，并在提交前复核；公开 CLI 未接入这些端口。本仓库测试只使用模拟接口，不会写真实 OA。
 
 ## 单流程调度 dry-run
 

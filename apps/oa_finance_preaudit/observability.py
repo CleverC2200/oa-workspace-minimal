@@ -14,12 +14,14 @@ from apps.json_artifact import write_json_atomic
 
 
 _PHASE_CATEGORY = {
+    "discover": "approval",
     "collect": "approval",
     "review": "approval",
     "coordination": "coordination",
     "wait": "waiting",
     "submit": "submission",
     "postcheck": "submission",
+    "close": "approval",
 }
 _WORKFLOW_KEYS = {
     "travel_expense",
@@ -195,6 +197,27 @@ def record_attempt_phase(
             "token_usage": token_usage or {"status": "unknown"},
         },
     )
+
+
+def attempt_has_phases(
+    path: Path,
+    *,
+    request_id: str,
+    received_at: str,
+    attempt: int,
+    phases: Iterable[str],
+) -> bool:
+    payload = _read_log(Path(path).expanduser().resolve())
+    item_key = attempt_key(request_id, received_at, attempt)
+    present = {
+        event["phase"]
+        for event in payload["events"]
+        if event["item_key"] == item_key
+    }
+    required = set(phases)
+    if not required.issubset(_PHASE_CATEGORY):
+        raise ValueError("observability_event_invalid")
+    return required.issubset(present)
 
 
 def attach_exact_usage(
