@@ -1056,23 +1056,6 @@ def _download_resource_with_browser(
         )
 
 
-def download_resource(
-    resource: Dict[str, Any], *, dest_dir: Path, timeout_sec: int
-) -> Tuple[Path | None, str]:
-    path, error = _download_resource_direct(
-        resource,
-        dest_dir=dest_dir,
-        timeout_sec=timeout_sec,
-    )
-    if path is not None or error:
-        return path, error
-    return _download_resource_with_browser(
-        resource,
-        dest_dir=dest_dir,
-        timeout_sec=timeout_sec,
-    )
-
-
 def _is_zip_symlink(info: zipfile.ZipInfo) -> bool:
     mode = (info.external_attr >> 16) & 0o170000
     return stat.S_ISLNK(mode)

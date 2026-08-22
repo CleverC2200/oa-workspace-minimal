@@ -9,11 +9,10 @@
 | OA 地址、应用标识和应用密钥 | `.env` 或 `.env.oa-auth` | 已忽略 |
 | 数据库地址、服务名、账号 | `.env` | 已忽略 |
 | 数据库密码 | `.env`，或由 `OA_DB_KEYCHAIN_SERVICE` 指向 macOS Keychain | 已忽略或不在项目目录 |
-| 附件模型 API 地址、密钥和模型名 | `.env` | 已忽略 |
 | 下载附件、冻结材料、队列状态、SQLite 状态和脱敏指标 | `runtime/` | 已忽略 |
 | 临时分析和发布审计材料 | `.scratch/` | 已忽略 |
 
-`.env.example` 只列出变量名、空值和无效示例域名，不得填入可用凭据后提交。模型接入使用 `OA_ATTACHMENT_API_*`、`OA_ATTACHMENT_CODEX_*` 或 `OA_ATTACHMENT_AI_COMMAND`；这些配置没有仓库内真实默认值。
+`.env.example` 只列出当前代码实际读取的变量名、空值和无效示例域名，不得填入可用凭据后提交。附件观察与模型路由由 Skill 和 Agent 运行时负责，项目代码不接收或保存模型服务密钥。
 
 ## 发布门禁
 

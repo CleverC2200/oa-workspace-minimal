@@ -306,7 +306,7 @@ class ElasticQueueTest(unittest.TestCase):
                 pending_case("r2", "2026-08-11 08:01:00"),
             ],
         )
-        first = elastic_queue.claim_next(self.state_path, "worker-1", now=NOW)
+        elastic_queue.claim_next(self.state_path, "worker-1", now=NOW)
         second = elastic_queue.claim_next(self.state_path, "worker-2", now=NOW)
         material = Path(second["material_file"])
         remark = Path(second["remark_file"])
@@ -541,7 +541,7 @@ class ElasticQueueTest(unittest.TestCase):
             [production_item("r1", "travel_expense")],
             [pending_case("r1", "2026-08-11 08:00:00")],
         )
-        claim = elastic_queue.claim_next(self.state_path, "worker-1", now=NOW)
+        elastic_queue.claim_next(self.state_path, "worker-1", now=NOW)
 
         stale = elastic_queue.stale_assignments(
             self.state_path,
