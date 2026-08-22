@@ -3,9 +3,39 @@
   "workflow_key": "business_support_fee",
   "rule_version": "business_support_fee:1",
   "cases": [
-    {"case_id":"support-normal-v1","material_workflow":"business_support_fee","statuses":["pass","pass","pass","pass"]},
-    {"case_id":"support-warning-v1","material_workflow":"business_support_fee","statuses":["pass","fail","pass","pass"]},
-    {"case_id":"support-insufficient-v1","material_workflow":"business_support_fee","statuses":["uncertain","uncertain","pass","pass"]},
-    {"case_id":"support-technical-v1","material_workflow":"travel_expense","statuses":[]}
+    {
+      "case_id": "support-normal-v1",
+      "material_workflow": "business_support_fee",
+      "facts": {"attachment": "complete", "business": "supported", "budget": "available", "amount": "within_limit"},
+      "items": [
+        {"status":"pass","conclusion":"附件证据完整。","evidence_refs":["material:declared_fields.attachment"],"missing_evidence":[]},
+        {"status":"pass","conclusion":"业务事项证据闭合。","evidence_refs":["material:declared_fields.business"],"missing_evidence":[]},
+        {"status":"pass","conclusion":"预算证据完整。","evidence_refs":["material:declared_fields.budget"],"missing_evidence":[]},
+        {"status":"pass","conclusion":"核销金额在上限内。","evidence_refs":["material:declared_fields.amount"],"missing_evidence":[]}
+      ]
+    },
+    {
+      "case_id": "support-warning-v1",
+      "material_workflow": "business_support_fee",
+      "facts": {"attachment": "complete", "business": "unsupported", "budget": "available", "amount": "within_limit"},
+      "items": [
+        {"status":"pass","conclusion":"附件证据完整。","evidence_refs":["material:declared_fields.attachment"],"missing_evidence":[]},
+        {"status":"fail","conclusion":"业务事项证据不支持。","evidence_refs":["material:declared_fields.business"],"missing_evidence":[]},
+        {"status":"pass","conclusion":"预算证据完整。","evidence_refs":["material:declared_fields.budget"],"missing_evidence":[]},
+        {"status":"pass","conclusion":"核销金额在上限内。","evidence_refs":["material:declared_fields.amount"],"missing_evidence":[]}
+      ]
+    },
+    {
+      "case_id": "support-insufficient-v1",
+      "material_workflow": "business_support_fee",
+      "facts": {"budget": "available", "amount": "within_limit"},
+      "items": [
+        {"status":"uncertain","conclusion":"附件完整性证据不足。","evidence_refs":[],"missing_evidence":["附件覆盖"]},
+        {"status":"uncertain","conclusion":"业务事项证据不足。","evidence_refs":[],"missing_evidence":["业务事项依据"]},
+        {"status":"pass","conclusion":"预算证据完整。","evidence_refs":["material:declared_fields.budget"],"missing_evidence":[]},
+        {"status":"pass","conclusion":"核销金额在上限内。","evidence_refs":["material:declared_fields.amount"],"missing_evidence":[]}
+      ]
+    },
+    {"case_id":"support-technical-v1","material_workflow":"travel_expense","facts":{},"items":[]}
   ]
 }
