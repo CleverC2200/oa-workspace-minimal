@@ -24,12 +24,17 @@ LINK_PATTERN = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 
 def tracked_files(root: Path = PROJECT_ROOT) -> list[Path]:
     result = subprocess.run(
-        ["git", "ls-files", "-z"],
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
         cwd=root,
         check=True,
         capture_output=True,
     )
-    return [root / item.decode("utf-8") for item in result.stdout.split(b"\0") if item]
+    paths = [
+        root / item.decode("utf-8")
+        for item in result.stdout.split(b"\0")
+        if item
+    ]
+    return [path for path in paths if path.is_file()]
 
 
 def check_skill(path: Path = SKILL_PATH) -> list[str]:

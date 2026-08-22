@@ -11,7 +11,7 @@ import secrets
 import time
 
 from . import elastic_queue
-from . import json_artifact
+from apps import json_artifact
 from . import observability
 
 

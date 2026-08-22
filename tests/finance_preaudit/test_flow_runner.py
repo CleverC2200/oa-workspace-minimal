@@ -1,26 +1,27 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import tempfile
-import unittest
+from pathlib import Path
+
+import pytest
 
 from apps.oa_finance_preaudit import flow_runner
 
 
-class FlowRunnerTests(unittest.TestCase):
+class TestFlowRunner:
     def test_five_runners_have_isolated_config_context_state_and_metrics(self) -> None:
         configs = flow_runner.load_configs()
 
-        self.assertEqual(set(configs), set(flow_runner.WORKFLOW_KEYS))
-        self.assertEqual(len({item.runner_id for item in configs.values()}), 5)
-        self.assertEqual(len({item.state_root for item in configs.values()}), 5)
-        self.assertEqual(len({item.metrics_root for item in configs.values()}), 5)
+        assert set(configs) == set(flow_runner.WORKFLOW_KEYS)
+        assert len({item.runner_id for item in configs.values()}) == 5
+        assert len({item.state_root for item in configs.values()}) == 5
+        assert len({item.metrics_root for item in configs.values()}) == 5
         for workflow_key, config in configs.items():
-            self.assertEqual(config.workflow_key, workflow_key)
+            assert config.workflow_key == workflow_key
             flow_contexts = [path for path in config.context_files if "/flows/" in path]
-            self.assertEqual(flow_contexts, [config.rule_pack])
-            self.assertIn(workflow_key.replace("_", "-") + ".md", config.rule_pack)
+            assert flow_contexts == [config.rule_pack]
+            assert workflow_key.replace("_", "-") + ".md" in config.rule_pack
 
     def test_config_rejects_duplicate_runner_identity(self) -> None:
         payload = json.loads(flow_runner.CONFIG_FILE.read_text(encoding="utf-8"))
@@ -28,7 +29,7 @@ class FlowRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "flow-runners.json"
             path.write_text(json.dumps(payload), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "flow_runner_config_invalid"):
+            with pytest.raises(ValueError, match="flow_runner_config_invalid"):
                 flow_runner.load_configs(path)
 
     def test_zero_one_and_backlog_close_without_idle_controller(self) -> None:
@@ -49,18 +50,22 @@ class FlowRunnerTests(unittest.TestCase):
         backlog = flow_runner.plan_run(
             config,
             [
-                {"request_id": f"r{index}", "workflow_key": "travel_expense", "state": "queued"}
+                {
+                    "request_id": f"r{index}",
+                    "workflow_key": "travel_expense",
+                    "state": "queued",
+                }
                 for index in range(8)
             ],
             available_reviewer_slots=2,
             available_submit_slots=4,
         )
 
-        self.assertEqual(empty["closure"], "closed")
-        self.assertEqual(empty["reviewers"], 0)
-        self.assertEqual(single["reviewers"], 1)
-        self.assertEqual(backlog["reviewers"], 2)
-        self.assertFalse(backlog["persistent_controller"])
+        assert empty["closure"] == "closed"
+        assert empty["reviewers"] == 0
+        assert single["reviewers"] == 1
+        assert backlog["reviewers"] == 2
+        assert not backlog["persistent_controller"]
 
     def test_prepared_submissions_use_independent_bounded_capacity(self) -> None:
         config = flow_runner.load_configs()["business_entertainment"]
@@ -80,28 +85,36 @@ class FlowRunnerTests(unittest.TestCase):
             available_submit_slots=2,
         )
 
-        self.assertEqual(plan["reviewers"], 0)
-        self.assertEqual(plan["submitters"], 2)
-        self.assertEqual(plan["closure"], "run_to_completion")
+        assert plan["reviewers"] == 0
+        assert plan["submitters"] == 2
+        assert plan["closure"] == "run_to_completion"
 
     def test_cross_flow_input_fails_only_that_runner(self) -> None:
         configs = flow_runner.load_configs()
-        with self.assertRaisesRegex(ValueError, "flow_candidate_mismatch"):
+        with pytest.raises(ValueError, match="flow_candidate_mismatch"):
             flow_runner.plan_run(
                 configs["travel_expense"],
-                [{"request_id": "bad", "workflow_key": "business_support_fee", "state": "queued"}],
+                [
+                    {
+                        "request_id": "bad",
+                        "workflow_key": "business_support_fee",
+                        "state": "queued",
+                    }
+                ],
                 available_reviewer_slots=1,
                 available_submit_slots=1,
             )
 
         healthy = flow_runner.plan_run(
             configs["business_support_fee"],
-            [{"request_id": "ok", "workflow_key": "business_support_fee", "state": "queued"}],
+            [
+                {
+                    "request_id": "ok",
+                    "workflow_key": "business_support_fee",
+                    "state": "queued",
+                }
+            ],
             available_reviewer_slots=1,
             available_submit_slots=1,
         )
-        self.assertEqual(healthy["reviewers"], 1)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert healthy["reviewers"] == 1

@@ -1,21 +1,20 @@
 from __future__ import annotations
 
-from contextlib import redirect_stderr
-from contextlib import redirect_stdout
-from datetime import datetime, timezone
 import hashlib
 import io
 import json
-from pathlib import Path
 import tempfile
-import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
+from pathlib import Path
 from unittest import mock
 
-from apps.oa_finance_preaudit import role_cli
-from apps.oa_finance_preaudit import elastic_queue
+import pytest
+
+from apps.oa_finance_preaudit import elastic_queue, role_cli
 
 
-class RoleCliTest(unittest.TestCase):
+class TestRoleCli:
     def test_controller_lists_only_readonly_production_pending_identities(self) -> None:
         class RecordedApi:
             def pending_rows(self, *, page_size: int, max_pages: int) -> list[dict]:
@@ -41,10 +40,13 @@ class RoleCliTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             output_path = Path(temporary) / "production-list.json"
             output = io.StringIO()
-            with mock.patch(
-                "apps.oa_approval.api.build_api",
-                return_value=recorded_api,
-            ), redirect_stdout(output):
+            with (
+                mock.patch(
+                    "apps.oa_approval.api.build_api",
+                    return_value=recorded_api,
+                ),
+                redirect_stdout(output),
+            ):
                 result = role_cli.main(
                     [
                         "controller",
@@ -61,41 +63,40 @@ class RoleCliTest(unittest.TestCase):
             receipt = json.loads(output.getvalue())
             payload = json.loads(output_path.read_text(encoding="utf-8"))
 
-        self.assertEqual(result, 0)
-        self.assertEqual(recorded_api.arguments, (50, 2))
-        self.assertEqual(receipt["kind"], "preaudit_production_identities_written")
-        self.assertEqual(receipt["count"], 2)
-        self.assertEqual(
-            payload,
-            {
-                "schema_version": 1,
-                "kind": "preaudit_production_pending_identities",
-                "total": 2,
-                "returned": 2,
-                "items": [
-                    {
-                        "requestId": "recorded-supported",
-                        "received_at": "2026-08-21 10:00:00",
-                        "workflow_id": "138023",
-                        "workflow_name": "差旅费报销流程",
-                        "flow_key": "travel_expense",
-                        "support_status": "supported",
-                        "can_submit": True,
-                    },
-                    {
-                        "requestId": "recorded-unsupported",
-                        "received_at": "2026-08-21 10:01:00",
-                        "workflow_id": "unsupported-id",
-                        "workflow_name": "unsupported-workflow",
-                        "flow_key": "",
-                        "support_status": "unsupported_workflow",
-                        "can_submit": False,
-                    },
-                ],
-            },
-        )
+        assert result == 0
+        assert recorded_api.arguments == (50, 2)
+        assert receipt["kind"] == "preaudit_production_identities_written"
+        assert receipt["count"] == 2
+        assert payload == {
+            "schema_version": 1,
+            "kind": "preaudit_production_pending_identities",
+            "total": 2,
+            "returned": 2,
+            "items": [
+                {
+                    "requestId": "recorded-supported",
+                    "received_at": "2026-08-21 10:00:00",
+                    "workflow_id": "138023",
+                    "workflow_name": "差旅费报销流程",
+                    "flow_key": "travel_expense",
+                    "support_status": "supported",
+                    "can_submit": True,
+                },
+                {
+                    "requestId": "recorded-unsupported",
+                    "received_at": "2026-08-21 10:01:00",
+                    "workflow_id": "unsupported-id",
+                    "workflow_name": "unsupported-workflow",
+                    "flow_key": "",
+                    "support_status": "unsupported_workflow",
+                    "can_submit": False,
+                },
+            ],
+        }
 
-    def test_controller_claim_requires_and_freezes_reviewer_release_sha256(self) -> None:
+    def test_controller_claim_requires_and_freezes_reviewer_release_sha256(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             state_path = root / "queue" / "state.json"
@@ -117,7 +118,7 @@ class RoleCliTest(unittest.TestCase):
                 blocked_requests={},
             )
 
-            with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            with redirect_stderr(io.StringIO()), pytest.raises(SystemExit):
                 role_cli.main(
                     [
                         "controller",
@@ -149,9 +150,9 @@ class RoleCliTest(unittest.TestCase):
             assignment = json.loads(
                 Path(receipt["assignment_file"]).read_text(encoding="utf-8")
             )
-            self.assertEqual(result, 0)
-            self.assertEqual(receipt["reviewer_release_sha256"], reviewer_sha256)
-            self.assertEqual(assignment["reviewer_release_sha256"], reviewer_sha256)
+            assert result == 0
+            assert receipt["reviewer_release_sha256"] == reviewer_sha256
+            assert assignment["reviewer_release_sha256"] == reviewer_sha256
 
     def test_reviewer_only_routes_reviewer_actions(self) -> None:
         with mock.patch.object(role_cli.queue_cli, "main", return_value=0) as delegated:
@@ -159,15 +160,17 @@ class RoleCliTest(unittest.TestCase):
                 ["reviewer", "collect-assignment", "--assignment-file", "/tmp/a.json"]
             )
 
-        self.assertEqual(result, 0)
+        assert result == 0
         delegated.assert_called_once_with(
             ["collect-assignment", "--assignment-file", "/tmp/a.json"]
         )
 
-        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+        with redirect_stderr(io.StringIO()), pytest.raises(SystemExit):
             role_cli.main(["reviewer", "submit-frozen-once"])
 
-    def test_reviewer_rejects_missing_or_malformed_frozen_release_fingerprint(self) -> None:
+    def test_reviewer_rejects_missing_or_malformed_frozen_release_fingerprint(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             assignment_path = Path(temporary) / "assignment.json"
             for fingerprint, expected_code in (
@@ -179,10 +182,13 @@ class RoleCliTest(unittest.TestCase):
                     assignment["reviewer_release_sha256"] = fingerprint
                 assignment_path.write_text(json.dumps(assignment), encoding="utf-8")
                 output = io.StringIO()
-                with redirect_stdout(output), mock.patch.object(
-                    role_cli.queue_cli,
-                    "main",
-                ) as delegated:
+                with (
+                    redirect_stdout(output),
+                    mock.patch.object(
+                        role_cli.queue_cli,
+                        "main",
+                    ) as delegated,
+                ):
                     result = role_cli.main(
                         [
                             "reviewer",
@@ -192,35 +198,34 @@ class RoleCliTest(unittest.TestCase):
                         ]
                     )
 
-                self.assertEqual(result, 1)
-                self.assertEqual(
-                    json.loads(output.getvalue())["failure"]["code"],
-                    expected_code,
-                )
+                assert result == 1
+                assert json.loads(output.getvalue())["failure"]["code"] == expected_code
                 delegated.assert_not_called()
 
     def test_writer_surface_contains_only_manifest_and_canonical_submit(self) -> None:
-        self.assertEqual(
-            set(role_cli.allowed_actions("writer")),
-            {"release-manifest", "submit-frozen-once"},
-        )
-        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+        assert set(role_cli.allowed_actions("writer")) == {
+            "release-manifest",
+            "submit-frozen-once",
+        }
+        with redirect_stderr(io.StringIO()), pytest.raises(SystemExit):
             role_cli.main(["writer", "begin-submit"])
-        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+        with redirect_stderr(io.StringIO()), pytest.raises(SystemExit):
             role_cli.main(["writer", "mark-submitted"])
 
-    def test_release_manifest_injects_role_and_rejects_manual_role_override(self) -> None:
+    def test_release_manifest_injects_role_and_rejects_manual_role_override(
+        self,
+    ) -> None:
         with mock.patch.object(role_cli.queue_cli, "main", return_value=0) as delegated:
             result = role_cli.main(
                 ["controller", "release-manifest", "--project-root", "/project"]
             )
 
-        self.assertEqual(result, 0)
+        assert result == 0
         delegated.assert_called_once_with(
             ["release-manifest", "--project-root", "/project", "--role", "controller"]
         )
 
-        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+        with redirect_stderr(io.StringIO()), pytest.raises(SystemExit):
             role_cli.main(
                 [
                     "reviewer",
@@ -233,10 +238,10 @@ class RoleCliTest(unittest.TestCase):
             )
 
     def test_controller_and_ops_surfaces_do_not_overlap_writer_submit(self) -> None:
-        self.assertNotIn("submit-frozen-once", role_cli.allowed_actions("controller"))
-        self.assertNotIn("submit-frozen-once", role_cli.allowed_actions("ops"))
-        self.assertIn("recover-stale", role_cli.allowed_actions("ops"))
-        self.assertNotIn("recover-stale", role_cli.allowed_actions("controller"))
+        assert "submit-frozen-once" not in role_cli.allowed_actions("controller")
+        assert "submit-frozen-once" not in role_cli.allowed_actions("ops")
+        assert "recover-stale" in role_cli.allowed_actions("ops")
+        assert "recover-stale" not in role_cli.allowed_actions("controller")
 
     def test_controller_refresh_scenario_runs_through_the_role_interface(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -324,11 +329,13 @@ class RoleCliTest(unittest.TestCase):
                 )
 
         receipt = json.loads(output.getvalue())
-        self.assertEqual(result, 0)
-        self.assertEqual(receipt["kind"], "elastic_queue_refreshed")
-        self.assertEqual(receipt["summary"]["actionable"], 1)
+        assert result == 0
+        assert receipt["kind"] == "elastic_queue_refreshed"
+        assert receipt["summary"]["actionable"] == 1
 
-    def test_writer_scenario_rejects_an_untrusted_manifest_before_queue_write(self) -> None:
+    def test_writer_scenario_rejects_an_untrusted_manifest_before_queue_write(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             manifest_path = root / "live-inputs.json"
@@ -356,10 +363,6 @@ class RoleCliTest(unittest.TestCase):
                 )
 
         receipt = json.loads(output.getvalue())
-        self.assertEqual(result, 1)
-        self.assertEqual(receipt["failure"]["code"], "queue_input_unreadable")
-        self.assertFalse(state_path.exists())
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert result == 1
+        assert receipt["failure"]["code"] == "queue_input_unreadable"
+        assert not state_path.exists()

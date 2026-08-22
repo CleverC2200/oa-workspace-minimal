@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import multiprocessing
-from pathlib import Path
 import tempfile
-import unittest
+from pathlib import Path
+
+import pytest
 
 from apps.oa_approval import resource_slots
 
@@ -19,7 +20,7 @@ def _hold_slot(root: str, ready: object, release: object) -> None:
         release.wait(5)
 
 
-class ResourceSlotsTest(unittest.TestCase):
+class TestResourceSlots:
     def test_slot_capacity_is_shared_across_processes(self) -> None:
         context = multiprocessing.get_context("fork")
         ready = context.Event()
@@ -31,8 +32,8 @@ class ResourceSlotsTest(unittest.TestCase):
             )
             process.start()
             try:
-                self.assertTrue(ready.wait(2))
-                with self.assertRaises(resource_slots.ResourceSlotTimeout):
+                assert ready.wait(2)
+                with pytest.raises(resource_slots.ResourceSlotTimeout):
                     with resource_slots.acquire(
                         "recorded-download",
                         capacity=1,
@@ -47,7 +48,7 @@ class ResourceSlotsTest(unittest.TestCase):
                     process.terminate()
                     process.join(2)
 
-            self.assertEqual(process.exitcode, 0)
+            assert process.exitcode == 0
             with resource_slots.acquire(
                 "recorded-download",
                 capacity=1,
@@ -72,7 +73,3 @@ class ResourceSlotsTest(unittest.TestCase):
                     root=root,
                 ):
                     pass
-
-
-if __name__ == "__main__":
-    unittest.main()

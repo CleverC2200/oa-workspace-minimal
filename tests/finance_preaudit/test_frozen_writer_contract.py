@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
-import tempfile
 import time
-import unittest
-from unittest.mock import patch
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 from apps.oa_approval import frozen_writer, runtime_control, writer_api
 
@@ -27,14 +27,11 @@ class _RecordedWriterApi:
         return dict(self.result)
 
 
-class FrozenWriterContractTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        self.project_root_patch = patch.object(frozen_writer, "PROJECT_ROOT", self.root)
-        self.project_root_patch.start()
-        self.addCleanup(self.project_root_patch.stop)
+class TestFrozenWriterContract:
+    @pytest.fixture(autouse=True)
+    def _workspace(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.root = tmp_path
+        monkeypatch.setattr(frozen_writer, "PROJECT_ROOT", self.root)
         self.request_id = "1004"
         self.received_at = "2026-08-21 09:30:00"
         self.isolation_key = hashlib.sha256(
@@ -133,19 +130,21 @@ class FrozenWriterContractTests(unittest.TestCase):
 
         receipt = self._submit(api)
 
-        self.assertEqual(api.calls, [(self.request_id, self.remark_text)])
-        self.assertEqual(receipt["request_id"], self.request_id)
-        self.assertEqual(receipt["submission_token"], "1" * 32)
-        self.assertTrue(receipt["submit_ok"])
-        self.assertTrue(receipt["done_hit"])
-        self.assertTrue(receipt["postcheck_done_hit"])
+        assert api.calls == [(self.request_id, self.remark_text)]
+        assert receipt["request_id"] == self.request_id
+        assert receipt["submission_token"] == "1" * 32
+        assert receipt["submit_ok"]
+        assert receipt["done_hit"]
+        assert receipt["postcheck_done_hit"]
 
     def test_path_or_frozen_identity_mismatch_blocks_before_submit(self) -> None:
         api = _RecordedWriterApi()
         outside_proof = self.root / "current-proof.json"
         outside_proof.write_bytes(self.proof.read_bytes())
 
-        with self.assertRaisesRegex(frozen_writer.FrozenWriterError, "frozen_path_mismatch"):
+        with pytest.raises(
+            frozen_writer.FrozenWriterError, match="frozen_path_mismatch"
+        ):
             frozen_writer.submit_frozen(
                 request_id=self.request_id,
                 received_at=self.received_at,
@@ -163,12 +162,14 @@ class FrozenWriterContractTests(unittest.TestCase):
                 lock_path=self.lock_path,
             )
 
-        self.assertEqual(api.calls, [])
+        assert api.calls == []
 
-    def test_changed_fingerprint_or_unresolved_placeholder_blocks_before_submit(self) -> None:
+    def test_changed_fingerprint_or_unresolved_placeholder_blocks_before_submit(
+        self,
+    ) -> None:
         api = _RecordedWriterApi()
-        with self.assertRaisesRegex(
-            frozen_writer.FrozenWriterError, "frozen_fingerprint_mismatch"
+        with pytest.raises(
+            frozen_writer.FrozenWriterError, match="frozen_fingerprint_mismatch"
         ):
             frozen_writer.submit_frozen(
                 request_id=self.request_id,
@@ -187,8 +188,8 @@ class FrozenWriterContractTests(unittest.TestCase):
                 lock_path=self.lock_path,
             )
 
-        with self.assertRaisesRegex(
-            frozen_writer.FrozenWriterError, "frozen_fingerprint_mismatch"
+        with pytest.raises(
+            frozen_writer.FrozenWriterError, match="frozen_fingerprint_mismatch"
         ):
             frozen_writer.submit_frozen(
                 request_id=self.request_id,
@@ -212,8 +213,8 @@ class FrozenWriterContractTests(unittest.TestCase):
         envelope = json.loads(self.envelope.read_text(encoding="utf-8"))
         envelope["remark_fingerprint"] = changed_remark
         self.envelope.write_text(json.dumps(envelope), encoding="utf-8")
-        with self.assertRaisesRegex(
-            frozen_writer.FrozenWriterError, "frozen_remark_unresolved"
+        with pytest.raises(
+            frozen_writer.FrozenWriterError, match="frozen_remark_unresolved"
         ):
             frozen_writer.submit_frozen(
                 request_id=self.request_id,
@@ -232,7 +233,7 @@ class FrozenWriterContractTests(unittest.TestCase):
                 lock_path=self.lock_path,
             )
 
-        self.assertEqual(api.calls, [])
+        assert api.calls == []
 
     def test_failed_postcheck_never_yields_success_receipt(self) -> None:
         failed_api = _RecordedWriterApi(
@@ -242,15 +243,15 @@ class FrozenWriterContractTests(unittest.TestCase):
                 "postcheck_done_hit": False,
             }
         )
-        with self.assertRaisesRegex(
-            frozen_writer.FrozenWriterError, "writer_result_unknown"
+        with pytest.raises(
+            frozen_writer.FrozenWriterError, match="writer_result_unknown"
         ):
             self._submit(failed_api)
-        self.assertEqual(failed_api.calls, [(self.request_id, self.remark_text)])
+        assert failed_api.calls == [(self.request_id, self.remark_text)]
 
     def test_inactive_status_does_not_create_a_lock_artifact(self) -> None:
-        self.assertFalse(runtime_control.writer_active(self.lock_path))
-        self.assertFalse(self.lock_path.exists())
+        assert not runtime_control.writer_active(self.lock_path)
+        assert not self.lock_path.exists()
 
     def test_same_request_concurrent_replay_writes_once(self) -> None:
         class _SlowApi(_RecordedWriterApi):
@@ -262,23 +263,23 @@ class FrozenWriterContractTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=2) as pool:
             receipts = list(pool.map(lambda _index: self._submit(api), range(2)))
 
-        self.assertEqual(len(api.calls), 1)
-        self.assertEqual(receipts[0], receipts[1])
+        assert len(api.calls) == 1
+        assert receipts[0] == receipts[1]
 
     def test_unknown_postcheck_blocks_same_request_replay(self) -> None:
         api = _RecordedWriterApi(
             {"submit_ok": True, "done_hit": False, "postcheck_done_hit": False}
         )
-        with self.assertRaisesRegex(
-            frozen_writer.FrozenWriterError, "writer_result_unknown"
+        with pytest.raises(
+            frozen_writer.FrozenWriterError, match="writer_result_unknown"
         ):
             self._submit(api)
-        with self.assertRaisesRegex(
-            frozen_writer.FrozenWriterError, "writer_result_unknown"
+        with pytest.raises(
+            frozen_writer.FrozenWriterError, match="writer_result_unknown"
         ):
             self._submit(api)
 
-        self.assertEqual(len(api.calls), 1)
+        assert len(api.calls) == 1
 
     def test_confirmed_no_write_failure_can_retry_same_request(self) -> None:
         api = _RecordedWriterApi(
@@ -286,22 +287,22 @@ class FrozenWriterContractTests(unittest.TestCase):
         )
 
         for _attempt in range(2):
-            with self.assertRaisesRegex(
-                frozen_writer.FrozenWriterError, "writer_submit_failed"
+            with pytest.raises(
+                frozen_writer.FrozenWriterError, match="writer_submit_failed"
             ):
                 self._submit(api)
 
-        self.assertEqual(len(api.calls), 2)
+        assert len(api.calls) == 2
 
     def test_request_lock_paths_are_isolated(self) -> None:
         first = runtime_control.request_writer_lock_file("1004", self.lock_path)
         second = runtime_control.request_writer_lock_file("2639002", self.lock_path)
 
-        self.assertNotEqual(first, second)
-        self.assertEqual(first.parent, second.parent)
+        assert first != second
+        assert first.parent == second.parent
 
 
-class FrozenWriterApiTests(unittest.TestCase):
+class TestFrozenWriterApi:
     def test_submit_transport_posts_only_request_id_and_frozen_remark(self) -> None:
         class _Response:
             def __enter__(self):
@@ -328,9 +329,9 @@ class FrozenWriterApiTests(unittest.TestCase):
 
         request = urlopen.call_args.args[0]
         body = urllib.parse.parse_qs(request.data.decode("utf-8"))
-        self.assertEqual(request.full_url, "https://oa.invalid" + writer_api.SUBMIT_ENDPOINT)
-        self.assertEqual(body, {"requestId": ["1004"], "remark": ["第一行<br/>&lt;a&gt;"]})
-        self.assertEqual(response, {"code": "SUCCESS"})
+        assert request.full_url == "https://oa.invalid" + writer_api.SUBMIT_ENDPOINT
+        assert body == {"requestId": ["1004"], "remark": ["第一行<br/>&lt;a&gt;"]}
+        assert response == {"code": "SUCCESS"}
 
     def test_submit_requires_success_handled_hit_and_pending_absence(self) -> None:
         api = writer_api.FrozenWriterApi(
@@ -340,7 +341,9 @@ class FrozenWriterApiTests(unittest.TestCase):
             base_url="https://oa.invalid",
         )
         with (
-            patch.object(api, "_post_submit", return_value={"code": "SUCCESS"}) as submit,
+            patch.object(
+                api, "_post_submit", return_value={"code": "SUCCESS"}
+            ) as submit,
             patch.object(
                 api,
                 "handled_rows",
@@ -351,18 +354,12 @@ class FrozenWriterApiTests(unittest.TestCase):
             result = api.submit_and_verify("1004", "第一行\n第二行")
 
         submit.assert_called_once_with("1004", "第一行\n第二行")
-        self.assertEqual(
-            result,
-            {
-                "submit_ok": True,
-                "done_hit": True,
-                "postcheck_done_hit": True,
-            },
-        )
-        self.assertEqual(
-            writer_api._format_remark("第一行\n<a>"),
-            "第一行<br/>&lt;a&gt;",
-        )
+        assert result == {
+            "submit_ok": True,
+            "done_hit": True,
+            "postcheck_done_hit": True,
+        }
+        assert writer_api._format_remark("第一行\n<a>") == "第一行<br/>&lt;a&gt;"
 
     def test_failed_submit_does_not_run_postcheck(self) -> None:
         api = writer_api.FrozenWriterApi(
@@ -378,13 +375,10 @@ class FrozenWriterApiTests(unittest.TestCase):
         ):
             result = api.submit_and_verify("1004", "冻结意见")
 
-        self.assertEqual(
-            result,
-            {
-                "submit_ok": False,
-                "done_hit": False,
-                "postcheck_done_hit": False,
-            },
-        )
+        assert result == {
+            "submit_ok": False,
+            "done_hit": False,
+            "postcheck_done_hit": False,
+        }
         handled.assert_not_called()
         pending.assert_not_called()

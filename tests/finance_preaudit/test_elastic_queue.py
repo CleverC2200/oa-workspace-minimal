@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import hashlib
 import json
-import os
-import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import unittest
+
+import pytest
 
 from apps.oa_finance_preaudit import elastic_queue
-
 
 NOW = datetime(2026, 8, 11, 6, 0, tzinfo=timezone.utc)
 
@@ -35,11 +33,11 @@ def pending_case(
     }
 
 
-class ElasticQueueTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.state_path = Path(self.temp.name) / "queue" / "state.json"
+class TestElasticQueue:
+    @pytest.fixture(autouse=True)
+    def _workspace(self, tmp_path: Path) -> None:
+        self.root = tmp_path
+        self.state_path = tmp_path / "queue" / "state.json"
 
     def refresh(self, production: list[dict], pending: list[dict], **kwargs) -> dict:
         return elastic_queue.refresh_state(
@@ -83,8 +81,8 @@ class ElasticQueueTest(unittest.TestCase):
             "pending": True,
         }
 
-    def assert_fresh_attempt(self, item: dict) -> None:
-        self.assertEqual(item["state"], "queued")
+    def _assert_fresh_attempt(self, item: dict) -> None:
+        assert item["state"] == "queued"
         for field in (
             "worker_id",
             "lease_token",
@@ -102,8 +100,8 @@ class ElasticQueueTest(unittest.TestCase):
             "assignment_file",
             "timing_file",
         ):
-            self.assertEqual(item.get(field), "", field)
-        self.assertEqual(item.get("material_contract_version"), 0)
+            assert item.get(field) == "", field
+        assert item.get("material_contract_version") == 0
         for field in (
             "submission_receipt",
             "actual_write_proof",
@@ -111,7 +109,7 @@ class ElasticQueueTest(unittest.TestCase):
             "no_write_proof",
             "timing",
         ):
-            self.assertEqual(item.get(field), {}, field)
+            assert item.get(field) == {}, field
 
     def test_refresh_builds_stable_fifo_from_safe_intersection(self) -> None:
         state = self.refresh(
@@ -123,15 +121,17 @@ class ElasticQueueTest(unittest.TestCase):
             ],
             [
                 pending_case("r3", "2026-08-11 08:00:00"),
-                pending_case("r2", "2026-08-11 08:00:00", received_at="2026-08-11 08:00:01"),
+                pending_case(
+                    "r2", "2026-08-11 08:00:00", received_at="2026-08-11 08:00:01"
+                ),
                 pending_case("r1", ""),
                 pending_case("pending-only", "2026-08-10 08:00:00"),
             ],
         )
 
-        self.assertEqual([item["request_id"] for item in state["items"]], ["r1", "r3", "r2"])
-        self.assertEqual(state["summary"]["actionable"], 3)
-        self.assertEqual(state["summary"]["travel"], 2)
+        assert [item["request_id"] for item in state["items"]] == ["r1", "r3", "r2"]
+        assert state["summary"]["actionable"] == 3
+        assert state["summary"]["travel"] == 2
 
     def test_external_block_applies_only_to_matching_received_version(self) -> None:
         production = [production_item("r1", "travel_expense")]
@@ -151,8 +151,8 @@ class ElasticQueueTest(unittest.TestCase):
             blocked_requests=block,
             now=NOW,
         )
-        self.assertEqual(old["items"][0]["state"], "blocked_external")
-        self.assertEqual(old["items"][0]["blocked_record"]["failure_code"], "partial_read")
+        assert old["items"][0]["state"] == "blocked_external"
+        assert old["items"][0]["blocked_record"]["failure_code"] == "partial_read"
 
         new = elastic_queue.refresh_state(
             self.state_path,
@@ -167,8 +167,8 @@ class ElasticQueueTest(unittest.TestCase):
             blocked_requests=block,
             now=NOW,
         )
-        self.assertEqual(new["items"][0]["state"], "queued")
-        self.assertEqual(new["items"][0]["blocked_record"], {})
+        assert new["items"][0]["state"] == "queued"
+        assert new["items"][0]["blocked_record"] == {}
 
     def test_claim_is_unique_and_uses_received_version_isolation_root(self) -> None:
         self.refresh(
@@ -177,15 +177,15 @@ class ElasticQueueTest(unittest.TestCase):
         )
 
         claim = elastic_queue.claim_next(self.state_path, "worker-1", now=NOW)
-        self.assertEqual(claim["request_id"], "r1")
-        self.assertIn("/requests/r1/", claim["request_root"])
-        self.assertTrue(claim["lease_token"])
-        self.assertIsNone(elastic_queue.claim_next(self.state_path, "worker-2", now=NOW))
+        assert claim["request_id"] == "r1"
+        assert "/requests/r1/" in claim["request_root"]
+        assert claim["lease_token"]
+        assert elastic_queue.claim_next(self.state_path, "worker-2", now=NOW) is None
 
-    def test_claim_returns_absolute_assignment_paths_for_relative_state(self) -> None:
-        original_cwd = Path.cwd()
-        os.chdir(self.temp.name)
-        self.addCleanup(os.chdir, original_cwd)
+    def test_claim_returns_absolute_assignment_paths_for_relative_state(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(self.root)
         relative_state = Path("queue/state.json")
         elastic_queue.refresh_state(
             relative_state,
@@ -205,9 +205,9 @@ class ElasticQueueTest(unittest.TestCase):
             "remark_file",
             "remark_envelope_file",
         ):
-            self.assertTrue(Path(claim[key]).is_absolute(), key)
+            assert Path(claim[key]).is_absolute(), key
         for key in ("request_root", "attachment_root", "prepared_root"):
-            self.assertTrue(Path(claim[key]).is_dir(), key)
+            assert Path(claim[key]).is_dir(), key
 
     def test_claim_never_reuses_an_existing_attempt_directory(self) -> None:
         self.refresh(
@@ -228,9 +228,9 @@ class ElasticQueueTest(unittest.TestCase):
 
         claim = elastic_queue.claim_next(self.state_path, "worker-1", now=NOW)
 
-        self.assertTrue(claim["request_root"].endswith("/attempt-2"))
+        assert claim["request_root"].endswith("/attempt-2")
         persisted = json.loads(self.state_path.read_text(encoding="utf-8"))
-        self.assertEqual(persisted["items"][0]["preparation_epoch"], 2)
+        assert persisted["items"][0]["preparation_epoch"] == 2
 
     def test_completion_rejects_cross_request_or_wrong_lease(self) -> None:
         self.refresh(
@@ -239,7 +239,9 @@ class ElasticQueueTest(unittest.TestCase):
         )
         claim = elastic_queue.claim_next(self.state_path, "worker-1", now=NOW)
 
-        with self.assertRaisesRegex(elastic_queue.QueueContractError, "material_request_mismatch"):
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="material_request_mismatch"
+        ):
             elastic_queue.complete_preparation(
                 self.state_path,
                 worker_id="worker-1",
@@ -251,7 +253,7 @@ class ElasticQueueTest(unittest.TestCase):
                 result_code="preview_ready",
                 now=NOW,
             )
-        with self.assertRaisesRegex(elastic_queue.QueueContractError, "lease_mismatch"):
+        with pytest.raises(elastic_queue.QueueContractError, match="lease_mismatch"):
             elastic_queue.complete_preparation(
                 self.state_path,
                 worker_id="worker-1",
@@ -282,20 +284,19 @@ class ElasticQueueTest(unittest.TestCase):
             now=NOW,
         )
 
-        self.assertEqual(
-            elastic_queue.queue_status(self.state_path)[
-                "attempts_closed_since_refresh"
-            ],
-            1,
+        assert (
+            elastic_queue.queue_status(self.state_path)["attempts_closed_since_refresh"]
+            == 1
         )
         self.refresh(production, pending)
-        self.assertEqual(
-            elastic_queue.queue_status(self.state_path)[
-                "attempts_closed_since_refresh"
-            ],
-            0,
+        assert (
+            elastic_queue.queue_status(self.state_path)["attempts_closed_since_refresh"]
+            == 0
         )
-    def test_prepared_item_can_submit_while_an_unrelated_request_is_reviewing(self) -> None:
+
+    def test_prepared_item_can_submit_while_an_unrelated_request_is_reviewing(
+        self,
+    ) -> None:
         self.refresh(
             [
                 production_item("r1", "travel_expense"),
@@ -313,7 +314,9 @@ class ElasticQueueTest(unittest.TestCase):
         material.parent.mkdir(parents=True, exist_ok=True)
         material.write_bytes(b"material-r2")
         remark.write_text("AI审核结论：可提交 ✅\n", encoding="utf-8")
-        material_fingerprint = f"sha256:{hashlib.sha256(material.read_bytes()).hexdigest()}"
+        material_fingerprint = (
+            f"sha256:{hashlib.sha256(material.read_bytes()).hexdigest()}"
+        )
         remark_fingerprint = f"sha256:{hashlib.sha256(remark.read_bytes()).hexdigest()}"
         envelope, envelope_fingerprint = self.write_remark_envelope(
             second,
@@ -338,31 +341,34 @@ class ElasticQueueTest(unittest.TestCase):
         )
 
         next_item = elastic_queue.next_submit(self.state_path)
-        self.assertEqual(next_item["status"], "waiting")
-        self.assertEqual(next_item["request_id"], "r1")
+        assert next_item["status"] == "waiting"
+        assert next_item["request_id"] == "r1"
         submission = elastic_queue.begin_submit(
             self.state_path,
             request_id="r2",
-            current_candidate=self.current_candidate(
-                "r2", "2026-08-11 08:01:00"
-            ),
+            current_candidate=self.current_candidate("r2", "2026-08-11 08:01:00"),
             now=NOW,
         )
-        self.assertEqual(submission["request_id"], "r2")
+        assert submission["request_id"] == "r2"
         stored = json.loads(self.state_path.read_text(encoding="utf-8"))["items"]
-        self.assertEqual(stored[0]["state"], "leased")
-        self.assertEqual(stored[1]["state"], "submitting")
+        assert stored[0]["state"] == "leased"
+        assert stored[1]["state"] == "submitting"
 
-    def test_pool_plan_scales_with_backlog_and_is_capped(self) -> None:
-        expected = {0: 0, 1: 1, 5: 2, 11: 2, 19: 2, 20: 3, 30: 3, 100: 3}
-        for backlog, workers in expected.items():
-            with self.subTest(backlog=backlog):
-                plan = elastic_queue.pool_plan(backlog)
-                self.assertEqual(plan["desired_workers"], workers)
-                self.assertEqual(plan["monitor_required"], workers > 1)
-                self.assertEqual(plan["max_workers"], 3)
+    @pytest.mark.parametrize(
+        "backlog,workers",
+        [(0, 0), (1, 1), (5, 2), (11, 2), (19, 2), (20, 3), (30, 3), (100, 3)],
+    )
+    def test_pool_plan_scales_with_backlog_and_is_capped(
+        self, backlog: int, workers: int
+    ) -> None:
+        plan = elastic_queue.pool_plan(backlog)
+        assert plan["desired_workers"] == workers
+        assert plan["monitor_required"] == (workers > 1)
+        assert plan["max_workers"] == 3
 
-    def test_queue_status_reports_age_and_lane_pressure_without_business_data(self) -> None:
+    def test_queue_status_reports_age_and_lane_pressure_without_business_data(
+        self,
+    ) -> None:
         self.refresh(
             [
                 production_item("travel-oldest", "travel_expense"),
@@ -378,21 +384,18 @@ class ElasticQueueTest(unittest.TestCase):
 
         summary = elastic_queue.queue_status(self.state_path, now=NOW)["summary"]
 
-        self.assertEqual(summary["oldest_actionable_age_seconds"], 6 * 60 * 60)
-        self.assertEqual(summary["queue_age_p50_seconds"], 5 * 60 * 60)
-        self.assertEqual(summary["queue_age_p95_seconds"], 6 * 60 * 60)
-        self.assertEqual(summary["fifo_head_age_seconds"], 6 * 60 * 60)
-        self.assertEqual(summary["fifo_head_lane"], "travel")
-        self.assertEqual(
-            summary["lane_oldest_preparation_age_seconds"],
-            {
-                "travel": 6 * 60 * 60,
-                "finance_nontravel": 5 * 60 * 60,
-                "packaging_accuracy": 4 * 60 * 60,
-            },
-        )
-        self.assertEqual(summary["prepared_total"], 0)
-        self.assertEqual(summary["contiguous_prepared_depth"], 0)
+        assert summary["oldest_actionable_age_seconds"] == 6 * 60 * 60
+        assert summary["queue_age_p50_seconds"] == 5 * 60 * 60
+        assert summary["queue_age_p95_seconds"] == 6 * 60 * 60
+        assert summary["fifo_head_age_seconds"] == 6 * 60 * 60
+        assert summary["fifo_head_lane"] == "travel"
+        assert summary["lane_oldest_preparation_age_seconds"] == {
+            "travel": 6 * 60 * 60,
+            "finance_nontravel": 5 * 60 * 60,
+            "packaging_accuracy": 4 * 60 * 60,
+        }
+        assert summary["prepared_total"] == 0
+        assert summary["contiguous_prepared_depth"] == 0
 
     def test_queue_status_counts_only_the_contiguous_fifo_prepared_prefix(self) -> None:
         self.refresh(
@@ -434,8 +437,8 @@ class ElasticQueueTest(unittest.TestCase):
 
         summary = elastic_queue.queue_status(self.state_path, now=NOW)["summary"]
 
-        self.assertEqual(summary["prepared_total"], 2)
-        self.assertEqual(summary["contiguous_prepared_depth"], 2)
+        assert summary["prepared_total"] == 2
+        assert summary["contiguous_prepared_depth"] == 2
 
     def test_lane_pool_plan_reserves_nontravel_when_travel_dominates(self) -> None:
         plan = elastic_queue.pool_plan(
@@ -445,11 +448,11 @@ class ElasticQueueTest(unittest.TestCase):
             packaging_backlog=0,
         )
 
-        self.assertEqual(plan["ordinary_desired_workers"], 3)
-        self.assertGreaterEqual(plan["lanes"]["travel"], 1)
-        self.assertEqual(plan["lanes"]["finance_nontravel"], 1)
-        self.assertEqual(plan["lanes"]["packaging_accuracy"], 0)
-        self.assertEqual(plan["desired_workers"], 3)
+        assert plan["ordinary_desired_workers"] == 3
+        assert plan["lanes"]["travel"] >= 1
+        assert plan["lanes"]["finance_nontravel"] == 1
+        assert plan["lanes"]["packaging_accuracy"] == 0
+        assert plan["desired_workers"] == 3
 
     def test_pool_plan_uses_the_third_reviewer_only_to_refill_fifo_buffer(self) -> None:
         catching_up = elastic_queue.pool_plan(
@@ -467,12 +470,12 @@ class ElasticQueueTest(unittest.TestCase):
             contiguous_prepared_depth=2,
         )
 
-        self.assertEqual(catching_up["ordinary_desired_workers"], 3)
-        self.assertTrue(catching_up["boost_eligible"])
-        self.assertIn("catchup_backlog", catching_up["reason_codes"])
-        self.assertEqual(buffered["ordinary_desired_workers"], 2)
-        self.assertFalse(buffered["boost_eligible"])
-        self.assertIn("prepared_buffer_sufficient", buffered["reason_codes"])
+        assert catching_up["ordinary_desired_workers"] == 3
+        assert catching_up["boost_eligible"]
+        assert "catchup_backlog" in catching_up["reason_codes"]
+        assert buffered["ordinary_desired_workers"] == 2
+        assert not buffered["boost_eligible"]
+        assert "prepared_buffer_sufficient" in buffered["reason_codes"]
 
     def test_pool_plan_prioritizes_the_fifo_head_lane_before_backlog_size(self) -> None:
         plan = elastic_queue.pool_plan(
@@ -488,11 +491,13 @@ class ElasticQueueTest(unittest.TestCase):
             },
         )
 
-        self.assertEqual(plan["lane_priority"][:2], ["finance_nontravel", "travel"])
-        self.assertEqual(plan["lanes"]["finance_nontravel"], 2)
-        self.assertEqual(plan["lanes"]["travel"], 1)
+        assert plan["lane_priority"][:2] == ["finance_nontravel", "travel"]
+        assert plan["lanes"]["finance_nontravel"] == 2
+        assert plan["lanes"]["travel"] == 1
 
-    def test_packaging_accuracy_coordinator_is_outside_ordinary_pool_limit(self) -> None:
+    def test_packaging_accuracy_coordinator_is_outside_ordinary_pool_limit(
+        self,
+    ) -> None:
         plan = elastic_queue.pool_plan(
             52,
             travel_backlog=50,
@@ -500,10 +505,10 @@ class ElasticQueueTest(unittest.TestCase):
             packaging_backlog=1,
         )
 
-        self.assertEqual(plan["ordinary_desired_workers"], 3)
-        self.assertEqual(plan["lanes"]["packaging_accuracy"], 1)
-        self.assertEqual(plan["desired_workers"], 4)
-        self.assertTrue(plan["packaging_cross_review_required"])
+        assert plan["ordinary_desired_workers"] == 3
+        assert plan["lanes"]["packaging_accuracy"] == 1
+        assert plan["desired_workers"] == 4
+        assert plan["packaging_cross_review_required"]
 
     def test_claim_can_select_reserved_lanes_without_changing_global_fifo(self) -> None:
         self.refresh(
@@ -531,10 +536,12 @@ class ElasticQueueTest(unittest.TestCase):
             self.state_path, "travel-worker", lane="travel", now=NOW
         )
 
-        self.assertEqual(nontravel["request_id"], "nontravel")
-        self.assertEqual(packaging["request_id"], "packaging")
-        self.assertEqual(travel["request_id"], "travel-oldest")
-        self.assertEqual(elastic_queue.next_submit(self.state_path)["request_id"], "travel-oldest")
+        assert nontravel["request_id"] == "nontravel"
+        assert packaging["request_id"] == "packaging"
+        assert travel["request_id"] == "travel-oldest"
+        assert (
+            elastic_queue.next_submit(self.state_path)["request_id"] == "travel-oldest"
+        )
 
     def test_stale_lease_is_reported_but_not_released(self) -> None:
         self.refresh(
@@ -548,10 +555,12 @@ class ElasticQueueTest(unittest.TestCase):
             now=datetime(2026, 8, 11, 6, 31, tzinfo=timezone.utc),
             timeout_seconds=30 * 60,
         )
-        self.assertEqual(stale, [{"request_id": "r1", "worker_id": "worker-1", "state": "leased"}])
+        assert stale == [
+            {"request_id": "r1", "worker_id": "worker-1", "state": "leased"}
+        ]
         status = elastic_queue.queue_status(self.state_path)
-        self.assertEqual(status["states"]["leased"], 1)
-        self.assertEqual(status["active_workers"], ["worker-1"])
+        assert status["states"]["leased"] == 1
+        assert status["active_workers"] == ["worker-1"]
 
     def test_refresh_invalidates_old_lease_when_received_version_changes(self) -> None:
         self.refresh(
@@ -575,11 +584,30 @@ class ElasticQueueTest(unittest.TestCase):
         )
 
         item = state["items"][0]
-        self.assertEqual(item["state"], "queued")
-        self.assertNotEqual(item["isolation_key"], old_claim["isolation_key"])
-        self.assertEqual(item["worker_id"], "")
+        assert item["state"] == "queued"
+        assert item["isolation_key"] != old_claim["isolation_key"]
+        assert item["worker_id"] == ""
 
-    def test_refresh_never_replaces_or_removes_submitting_item(self) -> None:
+    @pytest.mark.parametrize(
+        "production,pending,code",
+        [
+            ([], [], "submitting_candidate_missing"),
+            (
+                [production_item("r1", "travel_expense")],
+                [
+                    pending_case(
+                        "r1",
+                        "2026-08-11 08:00:00",
+                        received_at="2026-08-11 08:05:00",
+                    )
+                ],
+                "submitting_version_changed",
+            ),
+        ],
+    )
+    def test_refresh_never_replaces_or_removes_submitting_item(
+        self, production: list[dict], pending: list[dict], code: str
+    ) -> None:
         self.refresh(
             [production_item("r1", "travel_expense")],
             [pending_case("r1", "2026-08-11 08:00:00")],
@@ -590,7 +618,9 @@ class ElasticQueueTest(unittest.TestCase):
         material.parent.mkdir(parents=True, exist_ok=True)
         material.write_bytes(b"material")
         remark.write_text("AI审核结论：需人工判断 ⚠️\n", encoding="utf-8")
-        material_fingerprint = f"sha256:{hashlib.sha256(material.read_bytes()).hexdigest()}"
+        material_fingerprint = (
+            f"sha256:{hashlib.sha256(material.read_bytes()).hexdigest()}"
+        )
         remark_fingerprint = f"sha256:{hashlib.sha256(remark.read_bytes()).hexdigest()}"
         envelope, envelope_fingerprint = self.write_remark_envelope(
             claim,
@@ -616,41 +646,26 @@ class ElasticQueueTest(unittest.TestCase):
         submission = elastic_queue.begin_submit(
             self.state_path,
             "r1",
-            current_candidate=self.current_candidate(
-                "r1", "2026-08-11 08:00:00"
-            ),
+            current_candidate=self.current_candidate("r1", "2026-08-11 08:00:00"),
             now=NOW,
         )
 
-        for production, pending, code in (
-            ([], [], "submitting_candidate_missing"),
-            (
-                [production_item("r1", "travel_expense")],
-                [
-                    pending_case(
-                        "r1",
-                        "2026-08-11 08:00:00",
-                        received_at="2026-08-11 08:05:00",
-                    )
-                ],
-                "submitting_version_changed",
-            ),
-        ):
-            with self.subTest(code=code):
-                with self.assertRaisesRegex(elastic_queue.QueueContractError, code):
-                    elastic_queue.refresh_state(
-                        self.state_path,
-                        production_items=production,
-                        pending_cases=pending,
-                        blocked_requests=set(),
-                        now=datetime(2026, 8, 11, 6, 5, tzinfo=timezone.utc),
-                    )
-                state = elastic_queue.queue_status(self.state_path)
-                self.assertEqual(state["next_submit"]["state"], "submitting")
-                stored = json.loads(self.state_path.read_text(encoding="utf-8"))["items"][0]
-                self.assertEqual(stored["submission_token"], submission["submission_token"])
+        with pytest.raises(elastic_queue.QueueContractError, match=code):
+            elastic_queue.refresh_state(
+                self.state_path,
+                production_items=production,
+                pending_cases=pending,
+                blocked_requests=set(),
+                now=datetime(2026, 8, 11, 6, 5, tzinfo=timezone.utc),
+            )
+        state = elastic_queue.queue_status(self.state_path)
+        assert state["next_submit"]["state"] == "submitting"
+        stored = json.loads(self.state_path.read_text(encoding="utf-8"))["items"][0]
+        assert stored["submission_token"] == submission["submission_token"]
 
-    def test_refresh_requeues_legacy_prepared_material_without_reusing_attempt(self) -> None:
+    def test_refresh_requeues_legacy_prepared_material_without_reusing_attempt(
+        self,
+    ) -> None:
         state = self.refresh(
             [production_item("r1", "travel_expense")],
             [pending_case("r1", "2026-08-11 08:00:00")],
@@ -673,13 +688,13 @@ class ElasticQueueTest(unittest.TestCase):
         )
 
         item = refreshed["items"][0]
-        self.assertEqual(item["state"], "queued")
-        self.assertEqual(item["preparation_epoch"], 3)
-        self.assertEqual(item["material_file"], "")
-        self.assertEqual(item["remark_envelope_file"], "")
+        assert item["state"] == "queued"
+        assert item["preparation_epoch"] == 3
+        assert item["material_file"] == ""
+        assert item["remark_envelope_file"] == ""
 
     def test_material_bundle_rejects_cross_request_resource_and_path(self) -> None:
-        request_root = Path(self.temp.name) / "request"
+        request_root = self.root / "request"
         attachments = request_root / "attachments"
         prepared = request_root / "prepared"
         attachments.mkdir(parents=True)
@@ -714,7 +729,9 @@ class ElasticQueueTest(unittest.TestCase):
         }
         material_file.write_text(json.dumps(material), encoding="utf-8")
 
-        with self.assertRaisesRegex(elastic_queue.QueueContractError, "resource_request_mismatch"):
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="resource_request_mismatch"
+        ):
             elastic_queue.validate_material_bundle(
                 material_file,
                 expected_request_id="r1",
@@ -722,8 +739,10 @@ class ElasticQueueTest(unittest.TestCase):
                 prepared_root=prepared,
             )
 
-    def test_material_bundle_accepts_native_image_only_for_its_bound_resource(self) -> None:
-        request_root = Path(self.temp.name) / "request"
+    def test_material_bundle_accepts_native_image_only_for_its_bound_resource(
+        self,
+    ) -> None:
+        request_root = self.root / "request"
         attachments = request_root / "attachments"
         prepared = request_root / "prepared"
         attachments.mkdir(parents=True)
@@ -768,13 +787,12 @@ class ElasticQueueTest(unittest.TestCase):
             attachment_root=attachments,
             prepared_root=prepared,
         )
-        self.assertEqual(result["image_count"], 1)
+        assert result["image_count"] == 1
 
         material["prepared"]["images"][0]["path"] = str(second)
         material_file.write_text(json.dumps(material), encoding="utf-8")
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "prepared_resource_path_mismatch",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="prepared_resource_path_mismatch"
         ):
             elastic_queue.validate_material_bundle(
                 material_file,
@@ -783,8 +801,10 @@ class ElasticQueueTest(unittest.TestCase):
                 prepared_root=prepared,
             )
 
-    def test_material_bundle_accepts_prepared_child_only_for_its_bound_parent(self) -> None:
-        request_root = Path(self.temp.name) / "request"
+    def test_material_bundle_accepts_prepared_child_only_for_its_bound_parent(
+        self,
+    ) -> None:
+        request_root = self.root / "request"
         attachments = request_root / "attachments"
         prepared = request_root / "prepared"
         attachments.mkdir(parents=True)
@@ -831,13 +851,12 @@ class ElasticQueueTest(unittest.TestCase):
             attachment_root=attachments,
             prepared_root=prepared,
         )
-        self.assertEqual(result["image_count"], 1)
+        assert result["image_count"] == 1
 
         material["prepared"]["images"][0]["parent_resource_id"] = "resource-2"
         material_file.write_text(json.dumps(material), encoding="utf-8")
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "prepared_resource_unbound",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="prepared_resource_unbound"
         ):
             elastic_queue.validate_material_bundle(
                 material_file,
@@ -851,9 +870,8 @@ class ElasticQueueTest(unittest.TestCase):
             "resource-2"
         )
         material_file.write_text(json.dumps(material), encoding="utf-8")
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "prepared_resource_unbound",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="prepared_resource_unbound"
         ):
             elastic_queue.validate_material_bundle(
                 material_file,
@@ -863,7 +881,7 @@ class ElasticQueueTest(unittest.TestCase):
             )
 
     def test_material_bundle_requires_archive_child_under_prepared_root(self) -> None:
-        request_root = Path(self.temp.name) / "request"
+        request_root = self.root / "request"
         attachments = request_root / "attachments"
         prepared = request_root / "prepared"
         extracted = attachments / "flow" / "r1" / "extracted" / "resource-1" / "folder"
@@ -902,9 +920,8 @@ class ElasticQueueTest(unittest.TestCase):
         }
         material_file.write_text(json.dumps(material), encoding="utf-8")
 
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "prepared_resource_path_mismatch",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="prepared_resource_path_mismatch"
         ):
             elastic_queue.validate_material_bundle(
                 material_file,
@@ -923,15 +940,14 @@ class ElasticQueueTest(unittest.TestCase):
             attachment_root=attachments,
             prepared_root=prepared,
         )
-        self.assertEqual(result["image_count"], 1)
+        assert result["image_count"] == 1
 
         material["prepared"]["manifest"].append(
             {"resource_id": "resource-1::1", "status": "image"}
         )
         material_file.write_text(json.dumps(material), encoding="utf-8")
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "manifest_resource_unbound",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="manifest_resource_unbound"
         ):
             elastic_queue.validate_material_bundle(
                 material_file,
@@ -941,12 +957,14 @@ class ElasticQueueTest(unittest.TestCase):
             )
 
         material["resources"][0]["request_id"] = "r1"
-        material["resources"][0]["local_readonly_path"] = str(request_root / "other.jpg")
+        material["resources"][0]["local_readonly_path"] = str(
+            request_root / "other.jpg"
+        )
         (request_root / "other.jpg").write_bytes(b"other")
         material_file.write_text(json.dumps(material), encoding="utf-8")
-        with self.assertRaisesRegex(
+        with pytest.raises(
             elastic_queue.QueueContractError,
-            "attachment_path_outside_request_root",
+            match="attachment_path_outside_request_root",
         ):
             elastic_queue.validate_material_bundle(
                 material_file,
@@ -955,8 +973,10 @@ class ElasticQueueTest(unittest.TestCase):
                 prepared_root=prepared,
             )
 
-    def test_material_bundle_requires_manifest_coverage_for_every_resource(self) -> None:
-        request_root = Path(self.temp.name) / "request"
+    def test_material_bundle_requires_manifest_coverage_for_every_resource(
+        self,
+    ) -> None:
+        request_root = self.root / "request"
         attachments = request_root / "attachments"
         prepared = request_root / "prepared"
         attachments.mkdir(parents=True)
@@ -988,9 +1008,9 @@ class ElasticQueueTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-        with self.assertRaisesRegex(
+        with pytest.raises(
             elastic_queue.QueueContractError,
-            "manifest_resource_coverage_incomplete",
+            match="manifest_resource_coverage_incomplete",
         ):
             elastic_queue.validate_material_bundle(
                 material_file,
@@ -1000,7 +1020,7 @@ class ElasticQueueTest(unittest.TestCase):
             )
 
     def test_remark_envelope_binds_request_version_and_material(self) -> None:
-        request_root = Path(self.temp.name) / "request"
+        request_root = self.root / "request"
         request_root.mkdir()
         remark = request_root / "remark.txt"
         envelope = request_root / "remark-envelope.json"
@@ -1038,14 +1058,13 @@ class ElasticQueueTest(unittest.TestCase):
             ),
             expected_material_fingerprint=material_fingerprint,
         )
-        self.assertEqual(verified["remark_fingerprint"], remark_fingerprint)
+        assert verified["remark_fingerprint"] == remark_fingerprint
 
         payload = json.loads(envelope.read_text(encoding="utf-8"))
         payload["request_id"] = "r2"
         envelope.write_text(json.dumps(payload), encoding="utf-8")
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "remark_envelope_identity_mismatch",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="remark_envelope_identity_mismatch"
         ):
             elastic_queue.validate_remark_envelope(
                 envelope,
@@ -1060,16 +1079,15 @@ class ElasticQueueTest(unittest.TestCase):
             )
 
     def test_remark_format_enforces_flow_item_count_and_conclusion(self) -> None:
-        request_root = Path(self.temp.name) / "request"
+        request_root = self.root / "request"
         request_root.mkdir()
         remark = request_root / "remark.txt"
         remark.write_text(
             "AI审核结论：可提交 ✅\n✅ 1、报销周期：符合。\n",
             encoding="utf-8",
         )
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "remark_item_count_invalid",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="remark_item_count_invalid"
         ):
             elastic_queue.validate_remark_file(
                 remark,
@@ -1099,10 +1117,10 @@ class ElasticQueueTest(unittest.TestCase):
             expected_path=remark,
             expected_flow_key="travel_expense",
         )
-        self.assertTrue(result["remark_fingerprint"].startswith("sha256:"))
+        assert result["remark_fingerprint"].startswith("sha256:")
 
     def test_packaging_remark_uses_four_content_sections(self) -> None:
-        request_root = Path(self.temp.name) / "packaging-request"
+        request_root = self.root / "packaging-request"
         request_root.mkdir()
         remark = request_root / "remark.txt"
         remark.write_text(
@@ -1121,10 +1139,10 @@ class ElasticQueueTest(unittest.TestCase):
             expected_flow_key="packaging_layout_approval",
         )
 
-        self.assertTrue(result["remark_fingerprint"].startswith("sha256:"))
+        assert result["remark_fingerprint"].startswith("sha256:")
 
     def test_packaging_remark_requires_exactly_one_trailing_excel_notice(self) -> None:
-        request_root = Path(self.temp.name) / "packaging-missing-excel-notice"
+        request_root = self.root / "packaging-missing-excel-notice"
         request_root.mkdir()
         remark = request_root / "remark.txt"
         remark.write_text(
@@ -1136,9 +1154,8 @@ class ElasticQueueTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "remark_excel_notice_invalid",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="remark_excel_notice_invalid"
         ):
             elastic_queue.validate_remark_file(
                 remark,
@@ -1147,7 +1164,7 @@ class ElasticQueueTest(unittest.TestCase):
             )
 
     def test_packaging_remark_accepts_one_trailing_excel_notice(self) -> None:
-        request_root = Path(self.temp.name) / "packaging-no-excel"
+        request_root = self.root / "packaging-no-excel"
         request_root.mkdir()
         remark = request_root / "remark.txt"
         remark.write_text(
@@ -1166,16 +1183,15 @@ class ElasticQueueTest(unittest.TestCase):
             expected_flow_key="packaging_layout_approval",
         )
 
-        self.assertTrue(result["remark_fingerprint"].startswith("sha256:"))
+        assert result["remark_fingerprint"].startswith("sha256:")
 
         remark.write_text(
             remark.read_text(encoding="utf-8")
             + "Excel 对照：本次未提供 Excel，未执行 Excel 对照。\n",
             encoding="utf-8",
         )
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "remark_excel_notice_invalid",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="remark_excel_notice_invalid"
         ):
             elastic_queue.validate_remark_file(
                 remark,
@@ -1184,7 +1200,7 @@ class ElasticQueueTest(unittest.TestCase):
             )
 
     def test_packaging_excel_notice_must_match_the_frozen_material_role(self) -> None:
-        request_root = Path(self.temp.name) / "packaging-excel-role"
+        request_root = self.root / "packaging-excel-role"
         request_root.mkdir()
         remark = request_root / "remark.txt"
         remark.write_text(
@@ -1214,9 +1230,8 @@ class ElasticQueueTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "remark_excel_notice_mismatch",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="remark_excel_notice_mismatch"
         ):
             elastic_queue.validate_remark_envelope(
                 envelope,
@@ -1231,7 +1246,7 @@ class ElasticQueueTest(unittest.TestCase):
             )
 
     def test_packaging_remark_consolidates_multiple_supplement_findings(self) -> None:
-        request_root = Path(self.temp.name) / "packaging-supplement"
+        request_root = self.root / "packaging-supplement"
         request_root.mkdir()
         remark = request_root / "remark.txt"
         base = (
@@ -1253,7 +1268,7 @@ class ElasticQueueTest(unittest.TestCase):
             expected_path=remark,
             expected_flow_key="packaging_layout_approval",
         )
-        self.assertTrue(result["remark_fingerprint"].startswith("sha256:"))
+        assert result["remark_fingerprint"].startswith("sha256:")
 
         remark.write_text(
             base
@@ -1262,9 +1277,8 @@ class ElasticQueueTest(unittest.TestCase):
             + "Excel 对照：本次未提供 Excel，未执行 Excel 对照。\n",
             encoding="utf-8",
         )
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "remark_supplement_invalid",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="remark_supplement_invalid"
         ):
             elastic_queue.validate_remark_file(
                 remark,
@@ -1273,7 +1287,7 @@ class ElasticQueueTest(unittest.TestCase):
             )
 
     def test_packaging_remark_rejects_old_generic_three_item_template(self) -> None:
-        request_root = Path(self.temp.name) / "packaging-old-template"
+        request_root = self.root / "packaging-old-template"
         request_root.mkdir()
         remark = request_root / "remark.txt"
         remark.write_text(
@@ -1284,8 +1298,8 @@ class ElasticQueueTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError, "remark_item_count_invalid"
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="remark_item_count_invalid"
         ):
             elastic_queue.validate_remark_file(
                 remark,
@@ -1294,7 +1308,7 @@ class ElasticQueueTest(unittest.TestCase):
             )
 
     def test_remark_format_rejects_synonym_item_names(self) -> None:
-        request_root = Path(self.temp.name) / "request"
+        request_root = self.root / "request"
         request_root.mkdir()
         remark = request_root / "remark.txt"
         remark.write_text(
@@ -1315,9 +1329,8 @@ class ElasticQueueTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "remark_template_line_prefix",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="remark_template_line_prefix"
         ):
             elastic_queue.validate_remark_file(
                 remark,
@@ -1336,7 +1349,9 @@ class ElasticQueueTest(unittest.TestCase):
         material.parent.mkdir(parents=True, exist_ok=True)
         material.write_bytes(b"material")
         remark.write_text("AI审核结论：需人工判断 ⚠️\n", encoding="utf-8")
-        material_fingerprint = f"sha256:{hashlib.sha256(material.read_bytes()).hexdigest()}"
+        material_fingerprint = (
+            f"sha256:{hashlib.sha256(material.read_bytes()).hexdigest()}"
+        )
         remark_fingerprint = f"sha256:{hashlib.sha256(remark.read_bytes()).hexdigest()}"
         envelope, envelope_fingerprint = self.write_remark_envelope(
             claim,
@@ -1362,9 +1377,7 @@ class ElasticQueueTest(unittest.TestCase):
         submission = elastic_queue.begin_submit(
             self.state_path,
             "r1",
-            current_candidate=self.current_candidate(
-                "r1", "2026-08-11 08:00:00"
-            ),
+            current_candidate=self.current_candidate("r1", "2026-08-11 08:00:00"),
             now=NOW,
         )
 
@@ -1382,11 +1395,13 @@ class ElasticQueueTest(unittest.TestCase):
             now=NOW,
         )
 
-        self.assertEqual(item["state"], "blocked")
-        self.assertEqual(item["result_code"], "runner_item_timeout")
-        self.assertEqual(elastic_queue.next_submit(self.state_path)["status"], "empty")
+        assert item["state"] == "blocked"
+        assert item["result_code"] == "runner_item_timeout"
+        assert elastic_queue.next_submit(self.state_path)["status"] == "empty"
 
-    def test_confirmed_actual_write_closes_submitting_as_persistent_external_block(self) -> None:
+    def test_confirmed_actual_write_closes_submitting_as_persistent_external_block(
+        self,
+    ) -> None:
         self.refresh(
             [
                 production_item("r1", "travel_expense"),
@@ -1403,7 +1418,9 @@ class ElasticQueueTest(unittest.TestCase):
         material.parent.mkdir(parents=True, exist_ok=True)
         material.write_bytes(b"material")
         remark.write_text("AI审核结论：需人工判断 ⚠️\n", encoding="utf-8")
-        material_fingerprint = f"sha256:{hashlib.sha256(material.read_bytes()).hexdigest()}"
+        material_fingerprint = (
+            f"sha256:{hashlib.sha256(material.read_bytes()).hexdigest()}"
+        )
         remark_fingerprint = f"sha256:{hashlib.sha256(remark.read_bytes()).hexdigest()}"
         envelope, envelope_fingerprint = self.write_remark_envelope(
             claim,
@@ -1456,10 +1473,10 @@ class ElasticQueueTest(unittest.TestCase):
             now=NOW,
         )
 
-        self.assertEqual(item["state"], "blocked_external")
-        self.assertEqual(item["submission_token"], "")
-        self.assertEqual(item["blocked_record"]["source"], "write_reconciliation")
-        self.assertEqual(elastic_queue.next_submit(self.state_path)["request_id"], "r2")
+        assert item["state"] == "blocked_external"
+        assert item["submission_token"] == ""
+        assert item["blocked_record"]["source"] == "write_reconciliation"
+        assert elastic_queue.next_submit(self.state_path)["request_id"] == "r2"
         refreshed = self.refresh(
             [
                 production_item("r1", "travel_expense"),
@@ -1470,7 +1487,7 @@ class ElasticQueueTest(unittest.TestCase):
                 pending_case("r2", "2026-08-11 08:01:00"),
             ],
         )
-        self.assertEqual(refreshed["items"][0]["state"], "blocked_external")
+        assert refreshed["items"][0]["state"] == "blocked_external"
 
     def test_mark_submitted_requires_complete_bound_receipt(self) -> None:
         self.refresh(
@@ -1483,7 +1500,9 @@ class ElasticQueueTest(unittest.TestCase):
         material.parent.mkdir(parents=True, exist_ok=True)
         material.write_bytes(b"material")
         remark.write_text("AI审核结论：需人工判断 ⚠️\n", encoding="utf-8")
-        material_fingerprint = f"sha256:{hashlib.sha256(material.read_bytes()).hexdigest()}"
+        material_fingerprint = (
+            f"sha256:{hashlib.sha256(material.read_bytes()).hexdigest()}"
+        )
         remark_fingerprint = f"sha256:{hashlib.sha256(remark.read_bytes()).hexdigest()}"
         envelope, envelope_fingerprint = self.write_remark_envelope(
             claim,
@@ -1509,15 +1528,12 @@ class ElasticQueueTest(unittest.TestCase):
         submission = elastic_queue.begin_submit(
             self.state_path,
             "r1",
-            current_candidate=self.current_candidate(
-                "r1", "2026-08-11 08:00:00"
-            ),
+            current_candidate=self.current_candidate("r1", "2026-08-11 08:00:00"),
             now=NOW,
         )
 
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "submission_receipt_incomplete",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="submission_receipt_incomplete"
         ):
             elastic_queue.mark_submitted(
                 self.state_path,
@@ -1549,7 +1565,7 @@ class ElasticQueueTest(unittest.TestCase):
             },
             now=NOW,
         )
-        self.assertEqual(item["submission_receipt"]["run_id"], "run-recorded")
+        assert item["submission_receipt"]["run_id"] == "run-recorded"
 
     def test_mark_submitted_finalizes_attempt_timing_sidecar(self) -> None:
         self.refresh(
@@ -1580,7 +1596,9 @@ class ElasticQueueTest(unittest.TestCase):
         remark = Path(claim["remark_file"])
         material.write_bytes(b"material")
         remark.write_text("AI审核结论：需人工判断 ⚠️\n", encoding="utf-8")
-        material_fingerprint = f"sha256:{hashlib.sha256(material.read_bytes()).hexdigest()}"
+        material_fingerprint = (
+            f"sha256:{hashlib.sha256(material.read_bytes()).hexdigest()}"
+        )
         remark_fingerprint = f"sha256:{hashlib.sha256(remark.read_bytes()).hexdigest()}"
         envelope, envelope_fingerprint = self.write_remark_envelope(
             claim,
@@ -1629,11 +1647,11 @@ class ElasticQueueTest(unittest.TestCase):
         )
 
         persisted = json.loads(timing_file.read_text(encoding="utf-8"))
-        self.assertEqual(persisted["prepared_wait_seconds"], 10)
-        self.assertEqual(persisted["writer_total_seconds"], 5)
-        self.assertEqual(persisted["attempt_end_to_end_seconds"], 25)
-        self.assertEqual(persisted["result"], "submitted")
-        self.assertEqual(item["timing"], persisted)
+        assert persisted["prepared_wait_seconds"] == 10
+        assert persisted["writer_total_seconds"] == 5
+        assert persisted["attempt_end_to_end_seconds"] == 25
+        assert persisted["result"] == "submitted"
+        assert item["timing"] == persisted
 
     def test_begin_submit_rejects_stale_current_candidate_proof(self) -> None:
         self.refresh(
@@ -1646,7 +1664,9 @@ class ElasticQueueTest(unittest.TestCase):
         material.parent.mkdir(parents=True, exist_ok=True)
         material.write_bytes(b"material")
         remark.write_text("AI审核结论：需人工判断 ⚠️\n", encoding="utf-8")
-        material_fingerprint = f"sha256:{hashlib.sha256(material.read_bytes()).hexdigest()}"
+        material_fingerprint = (
+            f"sha256:{hashlib.sha256(material.read_bytes()).hexdigest()}"
+        )
         remark_fingerprint = f"sha256:{hashlib.sha256(remark.read_bytes()).hexdigest()}"
         envelope, envelope_fingerprint = self.write_remark_envelope(
             claim,
@@ -1671,9 +1691,8 @@ class ElasticQueueTest(unittest.TestCase):
         )
 
         stale = self.current_candidate("r1", "2026-08-11 08:05:00")
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "current_candidate_mismatch",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="current_candidate_mismatch"
         ):
             elastic_queue.begin_submit(
                 self.state_path,
@@ -1683,9 +1702,8 @@ class ElasticQueueTest(unittest.TestCase):
             )
 
     def test_submission_failure_requires_machine_readable_no_write_proof(self) -> None:
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "no_write_proof_incomplete",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="no_write_proof_incomplete"
         ):
             elastic_queue.validate_no_write_proof(
                 {
@@ -1713,11 +1731,11 @@ class ElasticQueueTest(unittest.TestCase):
             worker_inactive=True,
             related_process_inactive=True,
         )
-        self.assertEqual(recovered["state"], "queued")
+        assert recovered["state"] == "queued"
 
         second = elastic_queue.claim_next(self.state_path, "worker-2", now=NOW)
-        self.assertNotEqual(second["request_root"], first["request_root"])
-        with self.assertRaisesRegex(elastic_queue.QueueContractError, "lease_mismatch"):
+        assert second["request_root"] != first["request_root"]
+        with pytest.raises(elastic_queue.QueueContractError, match="lease_mismatch"):
             elastic_queue.complete_preparation(
                 self.state_path,
                 worker_id="worker-1",
@@ -1730,7 +1748,9 @@ class ElasticQueueTest(unittest.TestCase):
                 now=NOW,
             )
 
-    def test_false_material_block_can_be_requeued_only_for_same_version_and_code(self) -> None:
+    def test_false_material_block_can_be_requeued_only_for_same_version_and_code(
+        self,
+    ) -> None:
         self.refresh(
             [production_item("r1", "travel_expense")],
             [pending_case("r1", "2026-08-11 08:00:00")],
@@ -1755,10 +1775,15 @@ class ElasticQueueTest(unittest.TestCase):
             expected_result_code="material_collection_failed",
         )
 
-        self.assertEqual(item["state"], "queued")
-        self.assertEqual(item["result_code"], "")
+        assert item["state"] == "queued"
+        assert item["result_code"] == ""
 
-    def test_fresh_attempt_transitions_clear_all_attempt_residue(self) -> None:
+    @pytest.mark.parametrize(
+        "transition", ["recover-stale", "requeue-blocked", "manual-external-requeue"]
+    )
+    def test_fresh_attempt_transitions_clear_all_attempt_residue(
+        self, transition: str
+    ) -> None:
         residue = {
             "submission_receipt": {"run_id": "stale-run"},
             "actual_write_proof": {"run_id": "stale-run"},
@@ -1766,7 +1791,7 @@ class ElasticQueueTest(unittest.TestCase):
             "no_write_proof": {"request_id": "r1"},
         }
 
-        with self.subTest(transition="recover-stale"):
+        if transition == "recover-stale":
             self.refresh(
                 [production_item("r1", "travel_expense")],
                 [pending_case("r1", "2026-08-11 08:00:00")],
@@ -1785,10 +1810,7 @@ class ElasticQueueTest(unittest.TestCase):
                 worker_inactive=True,
                 related_process_inactive=True,
             )
-            self.assert_fresh_attempt(item)
-
-        with self.subTest(transition="requeue-blocked"):
-            self.state_path.unlink()
+        elif transition == "requeue-blocked":
             self.refresh(
                 [production_item("r1", "travel_expense")],
                 [pending_case("r1", "2026-08-11 08:00:00")],
@@ -1815,10 +1837,7 @@ class ElasticQueueTest(unittest.TestCase):
                 expected_received_at="2026-08-11 08:00:00",
                 expected_result_code="material_collection_failed",
             )
-            self.assert_fresh_attempt(item)
-
-        with self.subTest(transition="manual-external-requeue"):
-            self.state_path.unlink()
+        else:
             blocked = {
                 "r1": {
                     "request_id": "r1",
@@ -1849,13 +1868,16 @@ class ElasticQueueTest(unittest.TestCase):
                 expected_result_code="travel_attachment_resources_incomplete",
                 expected_contract_sha256="a" * 64,
             )
-            self.assert_fresh_attempt(item)
-            self.assertEqual(
-                item["manual_review_release"]["source"],
-                "user_authorized_historical_review",
+        self._assert_fresh_attempt(item)
+        if transition == "manual-external-requeue":
+            assert (
+                item["manual_review_release"]["source"]
+                == "user_authorized_historical_review"
             )
 
-    def test_user_authorized_external_historical_block_requeues_as_fresh_attempt(self) -> None:
+    def test_user_authorized_external_historical_block_requeues_as_fresh_attempt(
+        self,
+    ) -> None:
         blocked = {
             "r1": {
                 "request_id": "r1",
@@ -1878,10 +1900,10 @@ class ElasticQueueTest(unittest.TestCase):
             expected_contract_sha256="a" * 64,
         )
 
-        self.assertEqual(item["state"], "queued")
-        self.assertEqual(item["blocked_record"], {})
+        assert item["state"] == "queued"
+        assert item["blocked_record"] == {}
         claimed = elastic_queue.claim_next(self.state_path, "worker-1", now=NOW)
-        self.assertEqual(claimed["request_root"].rsplit("/", 1)[-1], "attempt-1")
+        assert claimed["request_root"].rsplit("/", 1)[-1] == "attempt-1"
         elastic_queue.recover_stale_lease(
             self.state_path,
             "r1",
@@ -1896,11 +1918,13 @@ class ElasticQueueTest(unittest.TestCase):
             [pending_case("r1", "2026-08-11 08:00:00")],
             blocked_requests=blocked,
         )
-        self.assertEqual(refreshed["items"][0]["state"], "queued")
+        assert refreshed["items"][0]["state"] == "queued"
         fresh = elastic_queue.claim_next(self.state_path, "worker-2", now=NOW)
-        self.assertEqual(fresh["request_root"].rsplit("/", 1)[-1], "attempt-2")
+        assert fresh["request_root"].rsplit("/", 1)[-1] == "attempt-2"
 
-    def test_user_authorized_external_requeue_rejects_write_reconciliation(self) -> None:
+    def test_user_authorized_external_requeue_rejects_write_reconciliation(
+        self,
+    ) -> None:
         self.refresh(
             [production_item("r1", "travel_expense")],
             [pending_case("r1", "2026-08-11 08:00:00")],
@@ -1920,9 +1944,9 @@ class ElasticQueueTest(unittest.TestCase):
         )
         self.state_path.write_text(json.dumps(state), encoding="utf-8")
 
-        with self.assertRaisesRegex(
+        with pytest.raises(
             elastic_queue.QueueContractError,
-            "external_block_manual_review_forbidden",
+            match="external_block_manual_review_forbidden",
         ):
             elastic_queue.requeue_blocked_external_for_manual_review(
                 self.state_path,
@@ -1932,7 +1956,9 @@ class ElasticQueueTest(unittest.TestCase):
                 expected_contract_sha256="a" * 64,
             )
 
-    def test_refresh_preserves_unreleased_external_block_when_old_index_is_missing(self) -> None:
+    def test_refresh_preserves_unreleased_external_block_when_old_index_is_missing(
+        self,
+    ) -> None:
         self.refresh(
             [production_item("r1", "travel_expense")],
             [pending_case("r1", "2026-08-11 08:00:00")],
@@ -1951,13 +1977,15 @@ class ElasticQueueTest(unittest.TestCase):
             [pending_case("r1", "2026-08-11 08:00:00")],
         )
 
-        self.assertEqual(refreshed["items"][0]["state"], "blocked_external")
-        self.assertEqual(
-            refreshed["items"][0]["blocked_record"]["failure_code"],
-            "assignment_hash_mismatch",
+        assert refreshed["items"][0]["state"] == "blocked_external"
+        assert (
+            refreshed["items"][0]["blocked_record"]["failure_code"]
+            == "assignment_hash_mismatch"
         )
 
-    def test_prepared_preflight_failure_uses_frozen_fingerprints_not_worker_lease(self) -> None:
+    def test_prepared_preflight_failure_uses_frozen_fingerprints_not_worker_lease(
+        self,
+    ) -> None:
         material_fingerprint = "sha256:" + "a" * 64
         remark_fingerprint = "sha256:" + "b" * 64
         envelope_fingerprint = "sha256:" + "c" * 64
@@ -2001,8 +2029,8 @@ class ElasticQueueTest(unittest.TestCase):
             now=NOW,
         )
 
-        self.assertEqual(blocked["state"], "blocked")
-        self.assertEqual(blocked["result_code"], "remark_amount_repeated")
+        assert blocked["state"] == "blocked"
+        assert blocked["result_code"] == "remark_amount_repeated"
 
     def test_prepared_preflight_failure_rejects_stale_fingerprint(self) -> None:
         material_fingerprint = "sha256:" + "a" * 64
@@ -2030,9 +2058,8 @@ class ElasticQueueTest(unittest.TestCase):
             now=NOW,
         )
 
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "prepared_version_mismatch",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="prepared_version_mismatch"
         ):
             elastic_queue.block_prepared_preflight(
                 self.state_path,
@@ -2044,7 +2071,3 @@ class ElasticQueueTest(unittest.TestCase):
                 result_code="remark_amount_repeated",
                 now=NOW,
             )
-
-
-if __name__ == "__main__":
-    unittest.main()

@@ -7,7 +7,7 @@ from apps.oa_approval import api
 from apps.oa_approval import flow
 
 from . import elastic_queue
-from . import json_artifact
+from apps import json_artifact
 
 
 def _support_identity(

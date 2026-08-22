@@ -1,27 +1,28 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-import subprocess
-import tempfile
-import unittest
+
+import pytest
 
 from apps.oa_finance_preaudit import elastic_queue, live_inputs
 
 
-class LiveInputsTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+class TestLiveInputs:
+    @pytest.fixture(autouse=True)
+    def _workspace(self, tmp_path: Path) -> None:
+        self.root = tmp_path
         self.project_root = self.root / "project"
         self.production_root = self.root / "production"
         self.project_root.mkdir()
         self.production_root.mkdir()
 
-    def successful_run(self, command: list[str], **kwargs) -> subprocess.CompletedProcess:
+    def successful_run(
+        self, command: list[str], **kwargs
+    ) -> subprocess.CompletedProcess:
         output_path = Path(command[command.index("--output") + 1])
         if Path(kwargs["cwd"]).resolve() == self.production_root.resolve():
             payload = {
@@ -39,7 +40,7 @@ class LiveInputsTest(unittest.TestCase):
                         "support_status": "supported",
                         "can_submit": True,
                     }
-                ]
+                ],
             }
             receipt = {
                 "ok": True,
@@ -68,7 +69,9 @@ class LiveInputsTest(unittest.TestCase):
         output_path.write_text(json.dumps(payload), encoding="utf-8")
         return subprocess.CompletedProcess(command, 0, json.dumps(receipt), "")
 
-    def test_capture_publishes_one_bound_manifest_after_both_sources_validate(self) -> None:
+    def test_capture_publishes_one_bound_manifest_after_both_sources_validate(
+        self,
+    ) -> None:
         snapshot_dir = self.root / "snapshots" / "receipt-request"
 
         manifest = live_inputs.capture_live_inputs(
@@ -79,20 +82,17 @@ class LiveInputsTest(unittest.TestCase):
         )
 
         manifest_path = snapshot_dir / "live-inputs.json"
-        self.assertEqual(manifest["kind"], "preaudit_live_inputs")
-        self.assertEqual(manifest["production_count"], 1)
-        self.assertEqual(manifest["pending_count"], 1)
-        self.assertEqual(
-            live_inputs.read_live_inputs_manifest(manifest_path),
-            manifest,
+        assert manifest["kind"] == "preaudit_live_inputs"
+        assert manifest["production_count"] == 1
+        assert manifest["pending_count"] == 1
+        assert live_inputs.read_live_inputs_manifest(manifest_path) == manifest
+        assert (
+            Path(manifest["production_list"])
+            == (snapshot_dir / "production-list.json").resolve()
         )
-        self.assertEqual(
-            Path(manifest["production_list"]),
-            (snapshot_dir / "production-list.json").resolve(),
-        )
-        self.assertEqual(
-            Path(manifest["pending_list"]),
-            (snapshot_dir / "pending-list.json").resolve(),
+        assert (
+            Path(manifest["pending_list"])
+            == (snapshot_dir / "pending-list.json").resolve()
         )
 
     def test_capture_uses_role_scoped_readonly_production_identity_entry(self) -> None:
@@ -109,19 +109,18 @@ class LiveInputsTest(unittest.TestCase):
             run=recording_run,
         )
 
-        self.assertEqual(
-            commands[0][1:6],
-            [
-                "-m",
-                "apps.oa_finance_preaudit.role_cli",
-                "controller",
-                "list-production-pending",
-                "--output",
-            ],
-        )
-        self.assertNotIn("apps.oa_approval.cli", commands[0])
+        assert commands[0][1:6] == [
+            "-m",
+            "apps.oa_finance_preaudit.role_cli",
+            "controller",
+            "list-production-pending",
+            "--output",
+        ]
+        assert "apps.oa_approval.cli" not in commands[0]
 
-    def test_capture_does_not_publish_manifest_when_a_written_receipt_is_invalid(self) -> None:
+    def test_capture_does_not_publish_manifest_when_a_written_receipt_is_invalid(
+        self,
+    ) -> None:
         snapshot_dir = self.root / "snapshots" / "invalid-receipt"
 
         def invalid_pending_receipt(command: list[str], **kwargs):
@@ -135,9 +134,8 @@ class LiveInputsTest(unittest.TestCase):
                 )
             return result
 
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "live_inputs_receipt_invalid",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="live_inputs_receipt_invalid"
         ):
             live_inputs.capture_live_inputs(
                 snapshot_dir,
@@ -146,40 +144,38 @@ class LiveInputsTest(unittest.TestCase):
                 run=invalid_pending_receipt,
             )
 
-        self.assertFalse((snapshot_dir / "live-inputs.json").exists())
+        assert not (snapshot_dir / "live-inputs.json").exists()
 
-    def test_capture_rejects_non_integer_written_receipt_counts(self) -> None:
-        for invalid_count in (True, "1"):
-            with self.subTest(invalid_count=invalid_count):
-                snapshot_dir = (
-                    self.root
-                    / "snapshots"
-                    / f"invalid-count-{type(invalid_count).__name__}"
-                )
+    @pytest.mark.parametrize("invalid_count", [True, "1"])
+    def test_capture_rejects_non_integer_written_receipt_counts(
+        self, invalid_count: object
+    ) -> None:
+        snapshot_dir = (
+            self.root / "snapshots" / f"invalid-count-{type(invalid_count).__name__}"
+        )
 
-                def invalid_count_run(command: list[str], **kwargs):
-                    result = self.successful_run(command, **kwargs)
-                    receipt = json.loads(result.stdout)
-                    receipt["count"] = invalid_count
-                    return subprocess.CompletedProcess(
-                        command,
-                        result.returncode,
-                        json.dumps(receipt),
-                        result.stderr,
-                    )
+        def invalid_count_run(command: list[str], **kwargs):
+            result = self.successful_run(command, **kwargs)
+            receipt = json.loads(result.stdout)
+            receipt["count"] = invalid_count
+            return subprocess.CompletedProcess(
+                command,
+                result.returncode,
+                json.dumps(receipt),
+                result.stderr,
+            )
 
-                with self.assertRaisesRegex(
-                    elastic_queue.QueueContractError,
-                    "live_inputs_receipt_invalid",
-                ):
-                    live_inputs.capture_live_inputs(
-                        snapshot_dir,
-                        project_root=self.project_root,
-                        production_root=self.production_root,
-                        run=invalid_count_run,
-                    )
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="live_inputs_receipt_invalid"
+        ):
+            live_inputs.capture_live_inputs(
+                snapshot_dir,
+                project_root=self.project_root,
+                production_root=self.production_root,
+                run=invalid_count_run,
+            )
 
-                self.assertFalse((snapshot_dir / "live-inputs.json").exists())
+        assert not (snapshot_dir / "live-inputs.json").exists()
 
     def test_manifest_rejects_a_source_changed_after_capture(self) -> None:
         snapshot_dir = self.root / "snapshots" / "changed-source"
@@ -194,9 +190,8 @@ class LiveInputsTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "live_inputs_source_changed",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="live_inputs_source_changed"
         ):
             live_inputs.read_live_inputs_manifest(snapshot_dir / "live-inputs.json")
 
@@ -204,9 +199,8 @@ class LiveInputsTest(unittest.TestCase):
         snapshot_dir = self.root / "snapshots" / "existing"
         snapshot_dir.mkdir(parents=True)
 
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "live_inputs_directory_exists",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="live_inputs_directory_exists"
         ):
             live_inputs.capture_live_inputs(
                 snapshot_dir,
@@ -247,9 +241,8 @@ class LiveInputsTest(unittest.TestCase):
                 )
             return result
 
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "live_inputs_schema_invalid",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="live_inputs_schema_invalid"
         ):
             live_inputs.capture_live_inputs(
                 snapshot_dir,
@@ -258,7 +251,7 @@ class LiveInputsTest(unittest.TestCase):
                 run=wrong_pending_schema,
             )
 
-        self.assertFalse((snapshot_dir / "live-inputs.json").exists())
+        assert not (snapshot_dir / "live-inputs.json").exists()
 
     def test_capture_rejects_a_production_source_with_inconsistent_counts(self) -> None:
         snapshot_dir = self.root / "snapshots" / "wrong-production-schema"
@@ -294,9 +287,8 @@ class LiveInputsTest(unittest.TestCase):
                 )
             return result
 
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "live_inputs_schema_invalid",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="live_inputs_schema_invalid"
         ):
             live_inputs.capture_live_inputs(
                 snapshot_dir,
@@ -305,9 +297,11 @@ class LiveInputsTest(unittest.TestCase):
                 run=wrong_production_schema,
             )
 
-        self.assertFalse((snapshot_dir / "live-inputs.json").exists())
+        assert not (snapshot_dir / "live-inputs.json").exists()
 
-    def test_manifest_reread_rejects_a_hash_bound_source_with_wrong_schema(self) -> None:
+    def test_manifest_reread_rejects_a_hash_bound_source_with_wrong_schema(
+        self,
+    ) -> None:
         snapshot_dir = self.root / "snapshots" / "wrong-bound-schema"
         live_inputs.capture_live_inputs(
             snapshot_dir,
@@ -338,9 +332,8 @@ class LiveInputsTest(unittest.TestCase):
         )
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "live_inputs_schema_invalid",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="live_inputs_schema_invalid"
         ):
             live_inputs.read_live_inputs_manifest(manifest_path)
 
@@ -369,9 +362,8 @@ class LiveInputsTest(unittest.TestCase):
         )
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "live_inputs_schema_invalid",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="live_inputs_schema_invalid"
         ):
             live_inputs.read_live_inputs_manifest(manifest_path)
 
@@ -388,10 +380,7 @@ class LiveInputsTest(unittest.TestCase):
         manifest["captured_at"] = "2026-08-17T08:00:00Z"
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "live_inputs_stale",
-        ):
+        with pytest.raises(elastic_queue.QueueContractError, match="live_inputs_stale"):
             live_inputs.read_live_inputs_manifest(
                 manifest_path,
                 now=datetime(2026, 8, 17, 8, 10, tzinfo=timezone.utc),
@@ -411,12 +400,7 @@ class LiveInputsTest(unittest.TestCase):
         manifest["pending_count"] = True
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-        with self.assertRaisesRegex(
-            elastic_queue.QueueContractError,
-            "live_inputs_schema_invalid",
+        with pytest.raises(
+            elastic_queue.QueueContractError, match="live_inputs_schema_invalid"
         ):
             live_inputs.read_live_inputs_manifest(manifest_path)
-
-
-if __name__ == "__main__":
-    unittest.main()

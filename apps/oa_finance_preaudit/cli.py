@@ -12,7 +12,7 @@ from apps.oa_approval import api as legacy_api
 from apps.oa_approval import flow as legacy_flow
 from apps.oa_approval import official_sql
 
-from . import json_artifact
+from apps import json_artifact
 from .case_bundle import CollectionFailure, collect_case
 
 

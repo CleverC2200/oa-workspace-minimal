@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import tempfile
-import unittest
+
+import pytest
 
 from apps.oa_finance_preaudit import retention
-
 
 NOW = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
 
@@ -32,7 +32,7 @@ def record(
     )
 
 
-class RetentionTests(unittest.TestCase):
+class TestRetention:
     def test_29_30_31_day_boundary_deletes_only_older_than_30_days(self) -> None:
         actions = retention.plan_retention(
             [
@@ -43,10 +43,11 @@ class RetentionTests(unittest.TestCase):
             now=NOW,
         )
 
-        self.assertEqual(
-            [(action.key, action.action) for action in actions],
-            [("d29", "keep"), ("d30", "keep"), ("d31", "delete_path")],
-        )
+        assert [(action.key, action.action) for action in actions] == [
+            ("d29", "keep"),
+            ("d30", "keep"),
+            ("d31", "delete_path"),
+        ]
 
     def test_latest_task_unclosed_and_unknown_write_are_always_retained(self) -> None:
         actions = retention.plan_retention(
@@ -54,16 +55,18 @@ class RetentionTests(unittest.TestCase):
                 record("old", age_days=40, kind="task"),
                 record("latest", age_days=35, kind="task"),
                 record("open", age_days=90, kind="task", closed=False),
-                record("unknown", age_days=90, write_state="unknown", relative_path="x"),
+                record(
+                    "unknown", age_days=90, write_state="unknown", relative_path="x"
+                ),
             ],
             now=NOW,
         )
         by_key = {action.key: action for action in actions}
 
-        self.assertEqual(by_key["old"].action, "delete_task")
-        self.assertEqual(by_key["latest"].reason, "latest_task")
-        self.assertEqual(by_key["open"].reason, "not_closed")
-        self.assertEqual(by_key["unknown"].reason, "write_state_unknown")
+        assert by_key["old"].action == "delete_task"
+        assert by_key["latest"].reason == "latest_task"
+        assert by_key["open"].reason == "not_closed"
+        assert by_key["unknown"].reason == "write_state_unknown"
 
     def test_closed_previous_task_is_archived_before_expiry(self) -> None:
         actions = retention.plan_retention(
@@ -73,8 +76,8 @@ class RetentionTests(unittest.TestCase):
             ],
             now=NOW,
         )
-        self.assertEqual(actions[0].action, "archive_task")
-        self.assertEqual(actions[1].reason, "latest_task")
+        assert actions[0].action == "archive_task"
+        assert actions[1].reason == "latest_task"
 
     def test_file_cleanup_is_idempotent_and_cannot_escape_marked_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -94,16 +97,16 @@ class RetentionTests(unittest.TestCase):
             first = retention.apply_file_actions(root, [action], now=NOW)
             second = retention.apply_file_actions(root, [action], now=NOW)
 
-            self.assertEqual(first["deleted"], 1)
-            self.assertEqual(second["missing"], 1)
-            self.assertNotIn(str(root), str(first))
+            assert first["deleted"] == 1
+            assert second["missing"] == 1
+            assert str(root) not in str(first)
             outside = retention.RetentionAction(
                 key="bad",
                 action="delete_path",
                 reason="expired",
                 relative_path="../outside.json",
             )
-            with self.assertRaisesRegex(ValueError, "retention_path_outside_root"):
+            with pytest.raises(ValueError, match="retention_path_outside_root"):
                 retention.apply_file_actions(root, [outside], now=NOW)
 
     def test_task_callbacks_receive_only_planned_archive_and_delete(self) -> None:
@@ -121,12 +124,8 @@ class RetentionTests(unittest.TestCase):
             now=NOW,
         )
 
-        self.assertEqual(calls, [("archive", "a"), ("delete", "d")])
-        self.assertEqual(receipt["archived"], 1)
-        self.assertEqual(receipt["deleted"], 1)
-        self.assertNotIn("targets", receipt)
-        self.assertNotIn("task_ids", receipt)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert calls == [("archive", "a"), ("delete", "d")]
+        assert receipt["archived"] == 1
+        assert receipt["deleted"] == 1
+        assert "targets" not in receipt
+        assert "task_ids" not in receipt
