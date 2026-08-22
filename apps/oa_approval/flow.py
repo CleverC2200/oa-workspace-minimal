@@ -29,6 +29,12 @@ def load_config(path: str | None) -> dict[str, Any]:
         raise SystemExit(
             f"流程配置缺少必要字段: {', '.join(missing)} ({resolved})"
         )
+    forbidden_identity_fields = sorted({"oa_uid", "oa_uid_env"} & data.keys())
+    if forbidden_identity_fields:
+        raise SystemExit(
+            "流程配置不得保存或重定向 OA_UID，请改用本地环境变量 "
+            f"({resolved})"
+        )
     data["_config_path"] = str(resolved)
     return data
 
@@ -40,21 +46,6 @@ def load_all_configs() -> list[dict[str, Any]]:
     if not configs:
         raise SystemExit(f"未找到流程配置: {CONFIG_DIR}")
     return configs
-
-
-def common_oa_uid(configs: list[dict[str, Any]]) -> str:
-    values = sorted(
-        {
-            str(config.get("oa_uid") or "").strip()
-            for config in configs
-            if str(config.get("oa_uid") or "").strip()
-        }
-    )
-    if len(values) == 1:
-        return values[0]
-    if not values:
-        return ""
-    raise SystemExit("多个流程配置 oa_uid 不一致，请指定 --oa-uid")
 
 
 def workflow_identity(row: dict[str, Any]) -> dict[str, str]:

@@ -41,7 +41,7 @@ docs/agents/                        # Issue、标签和领域文档约定
 cp .env.example .env
 ```
 
-只在本地填写真实配置。数据库连接没有仓库内默认账号或地址；如需从 macOS Keychain 读取密码，需同时配置 `OA_DB_USER` 和 `OA_DB_KEYCHAIN_SERVICE`。完整的数据与凭据边界见[安全说明](SECURITY.md)。
+只在本地填写真实配置。OA 执行人标识只允许通过本地 `OA_UID` 提供，流程 JSON 明确拒绝内嵌账号。数据库连接没有仓库内默认账号或地址；如需从 macOS Keychain 读取密码，需同时配置 `OA_DB_USER` 和 `OA_DB_KEYCHAIN_SERVICE`。完整的数据与凭据边界见[安全说明](SECURITY.md)。
 
 ## 只读 preview
 

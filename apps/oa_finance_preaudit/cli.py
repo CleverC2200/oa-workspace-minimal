@@ -98,8 +98,7 @@ def _runtime_root(value: Path | None) -> Path:
 
 def _live_flow_engine(*, controlled: bool = False) -> flow_engine.FlowEngine:
     configs = legacy_flow.load_all_configs()
-    oa_uid = legacy_flow.common_oa_uid(configs)
-    oa_api = legacy_api.build_api(configs[0], oa_uid_override=oa_uid)
+    oa_api = legacy_api.build_api(configs[0])
 
     def discover(workflow_key: str) -> list[dict]:
         rows = oa_api.pending_rows(page_size=200, max_pages=100)
