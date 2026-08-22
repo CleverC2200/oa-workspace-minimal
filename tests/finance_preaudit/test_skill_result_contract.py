@@ -740,6 +740,8 @@ class SkillResultContractTest(unittest.TestCase):
         self.assertNotIn("create_thread", self.reviewer_contract)
         self.assertNotIn("set_thread_archived", self.reviewer_contract)
         self.assertNotIn("run-once", self.reviewer_contract)
+        self.assertIn("export PROJECT_ROOT=/absolute/path/to/oa-workspace-minimal", self.reviewer_contract)
+        self.assertIn('--project-root "$PROJECT_ROOT"', self.reviewer_contract)
 
     def test_dispatcher_and_writer_contracts_have_narrow_authority(self):
         self.assertIn("不得 claim", self.dispatcher_contract)
@@ -747,10 +749,10 @@ class SkillResultContractTest(unittest.TestCase):
         self.assertIn("按请求隔离", self.writer_contract)
         self.assertIn("不得执行审核判断", self.writer_contract)
         self.assertIn("role_cli writer release-manifest", self.writer_contract)
-        self.assertIn("--project-root /Users/synear/HermesWorkspace/profiles/oa/projects/oa-workspace-minimal", self.writer_contract)
-        self.assertIn("--writer-root /Users/synear/HermesWorkspace/profiles/oa/projects/oa-workspace-minimal", self.writer_contract)
-        self.assertIn("--production-root /Users/synear/HermesWorkspace/profiles/oa/projects/oa-workspace-minimal", self.writer_contract)
-        self.assertNotIn("/Users/synear/.codex/worktrees/c8c1", self.writer_contract)
+        self.assertIn("export PROJECT_ROOT=/absolute/path/to/oa-workspace-minimal", self.writer_contract)
+        self.assertIn('--project-root "$PROJECT_ROOT"', self.writer_contract)
+        self.assertIn('--writer-root "$PROJECT_ROOT"', self.writer_contract)
+        self.assertIn('--production-root "$PROJECT_ROOT"', self.writer_contract)
         self.assertIn("不得从生产 cwd 推导", self.writer_contract)
         self.assertIn("role_cli writer submit-frozen-once", self.writer_contract)
         self.assertNotIn("begin-submit", self.writer_contract.split("canonical 单入口")[0])

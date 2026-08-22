@@ -244,7 +244,7 @@ class RuntimeSnapshotTests(unittest.TestCase):
                     },
                 },
                 "active_workers": ["reviewer-1"],
-                "next_submit": {"request_id": "2630000", "state": "leased"},
+                "next_submit": {"request_id": "test-request-001", "state": "leased"},
             },
             production_status={
                 "ok": True,

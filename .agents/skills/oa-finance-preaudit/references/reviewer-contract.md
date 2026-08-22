@@ -13,8 +13,9 @@
 启动时用唯一 canonical 接口计算本角色复合指纹：
 
 ```bash
+export PROJECT_ROOT=/absolute/path/to/oa-workspace-minimal
 python3 -m apps.oa_finance_preaudit.role_cli reviewer release-manifest \
-  --project-root /Users/synear/HermesWorkspace/profiles/oa/projects/oa-workspace-minimal
+  --project-root "$PROJECT_ROOT"
 ```
 
 只比较返回的 `sha256` 与 canonical `assignment.json` 顶层 `reviewer_release_sha256`。该字段由 `role_cli controller claim --reviewer-release-sha256` 在原子领取时冻结；canonical `role_cli reviewer` 会在采集或封存前机械拒绝缺失或格式异常的冻结指纹，Reviewer 仍须比较值是否与启动时加载的 release manifest 一致。缺失或不一致时不得采集或封存，直接上报 `reviewer_release_fingerprint_missing` 或 `reviewer_release_fingerprint_mismatch`。不得拿当前新 generation 的 manifest 否定已经按旧 generation 启动的 Reviewer；旧代际须按其冻结指纹自然闭合。不得对单个文件运行 `shasum`，也不得自行选择文件或重建哈希算法。
@@ -29,7 +30,7 @@ python3 -m apps.oa_finance_preaudit.role_cli reviewer release-manifest \
 - 从项目根只调用一次 canonical 采集命令；它从 assignment 读取 requestId、附件目录、准备目录和材料路径，不得自行拼接 `collect-case`、切换到 request_root 作为模块 cwd、增加整进程 180 秒终止器或复制 stdout：
 
 ```bash
-cd /Users/synear/HermesWorkspace/profiles/oa/projects/oa-workspace-minimal && \
+cd "$PROJECT_ROOT" && \
 python3 -m apps.oa_finance_preaudit.role_cli reviewer collect-assignment \
   --assignment-file ABSOLUTE_ASSIGNMENT_JSON
 ```
@@ -38,7 +39,7 @@ python3 -m apps.oa_finance_preaudit.role_cli reviewer collect-assignment \
 - 若已确认原 canonical 采集进程结束，但任务传输层没有返回 stdout，只允许执行一次只读状态恢复命令；该命令只读取同一 attempt 的 `material_file` 或脱敏 `collection-failure.json`，绝不重新采集：
 
 ```bash
-cd /Users/synear/HermesWorkspace/profiles/oa/projects/oa-workspace-minimal && \
+cd "$PROJECT_ROOT" && \
 python3 -m apps.oa_finance_preaudit.role_cli reviewer collection-status \
   --assignment-file ABSOLUTE_ASSIGNMENT_JSON
 ```
@@ -53,7 +54,7 @@ python3 -m apps.oa_finance_preaudit.role_cli reviewer collection-status \
 意见完成后只调用 `seal-review`。`prepared` 时该命令校验材料和固定意见格式，自动生成带 `sha256:` 前缀的封套与结果，并用原租约原子闭合；技术失败时将 `--outcome` 改为 `blocked`、`--result-code` 改为 canonical 采集返回的脱敏码。七个计时参数均为非负整数，`preparation-total-seconds` 不小于三个阶段中的任一值：
 
 ```bash
-cd /Users/synear/HermesWorkspace/profiles/oa/projects/oa-workspace-minimal && \
+cd "$PROJECT_ROOT" && \
 python3 -m apps.oa_finance_preaudit.role_cli reviewer seal-review \
   --assignment-file ABSOLUTE_ASSIGNMENT_JSON \
   --outcome prepared --result-code prepared \
