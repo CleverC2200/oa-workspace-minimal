@@ -37,6 +37,16 @@ _RUNTIME_FAILURE_CODES = {
     "runtime_root_invalid",
     "runtime_state_invalid",
 }
+_FLOW_FAILURE_CODES = {
+    "flow_candidate_invalid",
+    "observability_write_failed",
+    "persistent_state_invalid",
+    "review_decision_conflict",
+    "review_decision_invalid",
+    "review_decision_unreadable",
+    "run_mode_unauthorized",
+    "workflow_not_implemented",
+}
 
 
 def _json_default(value: object) -> str:
@@ -195,6 +205,7 @@ def _failure_payload(error: Exception, *, command: str = "collect-case") -> dict
             "failure": {"code": code, "stage": command},
         }
     if command in {"next-action", "complete-review"}:
+        raw_code = str(error).strip()
         return {
             "schema_version": 1,
             "kind": "preaudit_action_failed",
@@ -202,7 +213,11 @@ def _failure_payload(error: Exception, *, command: str = "collect-case") -> dict
             "business_state": "not_available",
             "write_state": "not_requested",
             "failure": {
-                "code": "flow_action_failed",
+                "code": (
+                    raw_code
+                    if raw_code in _FLOW_FAILURE_CODES
+                    else "flow_action_failed"
+                ),
                 "stage": command.replace("-", "_"),
                 "message": "本地预审动作失败",
             },

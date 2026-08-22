@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "suite_version": "1.0.0",
+  "workflow_key": "travel_expense",
+  "cases": [
+    {
+      "boundary": "submit_begin",
+      "expected": {
+        "action": "needs_admin",
+        "write_state": "unknown",
+        "submission_calls": 0
+      }
+    },
+    {
+      "boundary": "submit_return",
+      "expected": {
+        "action": "needs_admin",
+        "write_state": "unknown",
+        "submission_calls": 1
+      }
+    },
+    {
+      "boundary": "receipt_persisted",
+      "expected": {
+        "action": "closed",
+        "write_state": "submitted",
+        "submission_calls": 1
+      }
+    },
+    {
+      "boundary": "closed_action_persisted",
+      "expected": {
+        "action": "closed",
+        "write_state": "submitted",
+        "submission_calls": 1
+      }
+    }
+  ]
+}
