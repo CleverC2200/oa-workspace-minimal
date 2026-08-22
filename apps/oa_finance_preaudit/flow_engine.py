@@ -59,6 +59,15 @@ _FLOW_SPECS = {
             "reimbursable_minimum",
         ),
     },
+    "packaging_layout_approval": {
+        "rule_version": "packaging_layout_approval:1",
+        "item_keys": (
+            "ingredients",
+            "allergens",
+            "nutrition_facts",
+            "address_information",
+        ),
+    },
 }
 SHARED_FAILURE_CODES = {
     "submission_adapter_unavailable",
@@ -177,6 +186,29 @@ def _flow_items(workflow_key: str) -> list[dict]:
             start=1,
         )
     ]
+
+
+def _validate_flow_material(workflow_key: str, material: dict) -> None:
+    if workflow_key != "packaging_layout_approval":
+        return
+    resources = material.get("resources")
+    prepared = material.get("prepared")
+    images = prepared.get("images") if isinstance(prepared, dict) else None
+    if not isinstance(resources, list) or not isinstance(images, list):
+        raise ValueError("packaging_material_incomplete")
+    required_ids = {
+        str(resource.get("resource_id") or "")
+        for resource in resources
+        if isinstance(resource, dict)
+        and resource.get("review_role") == "packaging_image"
+    }
+    covered_ids = {
+        str(image.get("parent_resource_id") or image.get("resource_id") or "")
+        for image in images
+        if isinstance(image, dict)
+    }
+    if not required_ids or not required_ids.issubset(covered_ids):
+        raise ValueError("packaging_material_incomplete")
 
 
 def _attempt_number(path: Path) -> int | None:
@@ -944,6 +976,7 @@ class FlowEngine:
             or _evidence_fingerprint(material) != state.get("evidence_fingerprint")
         ):
             raise ValueError("frozen_material_changed")
+        _validate_flow_material(workflow_key, material)
         return action, state, packet
 
     def _prepare_attempt(self, attempt_root: Path) -> dict:
@@ -1004,6 +1037,7 @@ class FlowEngine:
                     or material.get("workflow_key") != workflow_key
                 ):
                     raise ValueError("material_workflow_mismatch")
+                _validate_flow_material(workflow_key, material)
                 material_file = attempt_root / "material.json"
                 json_artifact.write_json_atomic(material_file, material, indent=2)
                 verified = elastic_queue.validate_material_bundle(
@@ -1573,6 +1607,22 @@ class FlowEngine:
             lines.append(
                 f"{status_mark[item['status']]} {number}、{expected['name']}："
                 f"{item['conclusion'].strip()}"
+            )
+        if action["workflow_key"] == "packaging_layout_approval":
+            material = _read_object(
+                Path(state["material_file"]),
+                code="frozen_material_changed",
+            )
+            excel_present = any(
+                isinstance(resource, dict)
+                and resource.get("review_role") == "excel_reference"
+                for resource in material.get("resources", [])
+            )
+            lines.append(
+                "Excel 对照：上述四项已与同一 Excel 逐字符对照；"
+                "具体差异已写入对应项目。"
+                if excel_present
+                else "Excel 对照：本次未提供 Excel，未执行 Excel 对照。"
             )
         remark_file = action_path.with_name("remark.txt")
         remark_file.write_text("\n".join(lines) + "\n", encoding="utf-8")

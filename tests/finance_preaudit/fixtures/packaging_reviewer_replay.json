@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "workflow_key": "packaging_layout_approval",
+  "rule_version": "packaging_layout_approval:1",
+  "cases": [
+    {"case_id":"packaging-normal-v1","material_workflow":"packaging_layout_approval","regions":{"ingredients":"clear","allergens":"clear","nutrition":"clear","address":"clear"},"items":[
+      {"status":"pass","conclusion":"配料关键文字未见异常。","evidence_refs":["material:prepared.images.page-1.ingredients"],"missing_evidence":[]},
+      {"status":"pass","conclusion":"过敏原关键文字未见异常。","evidence_refs":["material:prepared.images.page-1.allergens"],"missing_evidence":[]},
+      {"status":"pass","conclusion":"营养成分表关键文字未见异常。","evidence_refs":["material:prepared.images.page-1.nutrition"],"missing_evidence":[]},
+      {"status":"pass","conclusion":"地址关键文字未见异常。","evidence_refs":["material:prepared.images.page-1.address"],"missing_evidence":[]}
+    ]},
+    {"case_id":"packaging-warning-v1","material_workflow":"packaging_layout_approval","regions":{"ingredients":"character_mismatch","allergens":"clear","nutrition":"clear","address":"clear"},"items":[
+      {"status":"fail","conclusion":"配料区域存在明确字符差异。","evidence_refs":["material:prepared.images.page-1.ingredients"],"missing_evidence":[]},
+      {"status":"pass","conclusion":"过敏原关键文字未见异常。","evidence_refs":["material:prepared.images.page-1.allergens"],"missing_evidence":[]},
+      {"status":"pass","conclusion":"营养成分表关键文字未见异常。","evidence_refs":["material:prepared.images.page-1.nutrition"],"missing_evidence":[]},
+      {"status":"pass","conclusion":"地址关键文字未见异常。","evidence_refs":["material:prepared.images.page-1.address"],"missing_evidence":[]}
+    ]},
+    {"case_id":"packaging-insufficient-v1","material_workflow":"packaging_layout_approval","regions":{"allergens":"clear","address":"clear"},"items":[
+      {"status":"uncertain","conclusion":"配料区域低置信。","evidence_refs":[],"missing_evidence":["配料区域清晰像素"]},
+      {"status":"pass","conclusion":"过敏原关键文字未见异常。","evidence_refs":["material:prepared.images.page-1.allergens"],"missing_evidence":[]},
+      {"status":"uncertain","conclusion":"营养成分表区域低置信。","evidence_refs":[],"missing_evidence":["营养成分表清晰像素"]},
+      {"status":"pass","conclusion":"地址关键文字未见异常。","evidence_refs":["material:prepared.images.page-1.address"],"missing_evidence":[]}
+    ]},
+    {"case_id":"packaging-technical-v1","material_workflow":"travel_expense","regions":{},"items":[]}
+  ]
+}
