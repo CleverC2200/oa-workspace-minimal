@@ -65,7 +65,6 @@ def _engine(
     material_facts = facts if facts is not None else {
         "attachment": "complete",
         "business": "supported",
-        "budget": "available",
         "amount": "within_limit",
     }
 
@@ -103,13 +102,23 @@ def _engine(
 
 
 def _reviewed_items(statuses: list[str]) -> list[dict]:
-    fact_keys = ("attachment", "business", "budget", "amount")
+    fact_keys = ("attachment", "business", None, "amount")
     return [
         {
             "status": status,
-            "conclusion": "当前审核项已按冻结证据判断。",
+            "conclusion": (
+                "当前阶段按既定策略暂不校验，OA 暂未提供预算数据。"
+                if key is None
+                else "当前审核项已按冻结证据判断。"
+            ),
             "evidence_refs": (
-                [] if status == "uncertain" else [f"material:declared_fields.{key}"]
+                []
+                if status == "uncertain"
+                else [
+                    "rule:business-support-budget-not-checked"
+                    if key is None
+                    else f"material:declared_fields.{key}"
+                ]
             ),
             "missing_evidence": ["当前审核项证据不足"] if status == "uncertain" else [],
         }
@@ -219,9 +228,14 @@ def test_support_independent_reviewer_replay_scores_100_percent(tmp_path: Path) 
         )
         for reviewed in case["items"]:
             for evidence_ref in reviewed["evidence_refs"]:
-                fact_key = evidence_ref.removeprefix("material:declared_fields.")
-                assert evidence_ref.startswith("material:declared_fields.")
-                assert fact_key in material["declared_fields"]
+                if evidence_ref.startswith("material:declared_fields."):
+                    fact_key = evidence_ref.removeprefix("material:declared_fields.")
+                    assert fact_key in material["declared_fields"]
+                else:
+                    assert evidence_ref == "rule:business-support-budget-not-checked"
+        assert case["items"][2]["conclusion"] == (
+            "当前阶段按既定策略暂不校验，OA 暂未提供预算数据。"
+        )
         statuses = [marks[item["status"]] for item in case["items"]]
         actuals[case["case_id"]] = {
             "outcome": (
