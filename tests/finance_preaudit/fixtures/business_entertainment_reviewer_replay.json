@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "workflow_key": "business_entertainment",
+  "rule_version": "business_entertainment:1",
+  "cases": [
+    {
+      "case_id": "entertainment-normal-v1",
+      "material_workflow": "business_entertainment",
+      "items": [
+        {"status": "pass", "conclusion": "支付证据完整。", "evidence_refs": ["material:payment"], "missing_evidence": []},
+        {"status": "pass", "conclusion": "发票与当前事项关联。", "evidence_refs": ["material:invoice"], "missing_evidence": []},
+        {"status": "pass", "conclusion": "预算证据完整。", "evidence_refs": ["material:budget"], "missing_evidence": []},
+        {"status": "pass", "conclusion": "核销金额不高于可核销上限。", "evidence_refs": ["material:amounts"], "missing_evidence": []}
+      ]
+    },
+    {
+      "case_id": "entertainment-warning-v1",
+      "material_workflow": "business_entertainment",
+      "items": [
+        {"status": "pass", "conclusion": "支付证据完整。", "evidence_refs": ["material:payment"], "missing_evidence": []},
+        {"status": "fail", "conclusion": "发票不能关联当前事项。", "evidence_refs": ["material:invoice"], "missing_evidence": []},
+        {"status": "pass", "conclusion": "预算证据完整。", "evidence_refs": ["material:budget"], "missing_evidence": []},
+        {"status": "pass", "conclusion": "核销金额不高于可核销上限。", "evidence_refs": ["material:amounts"], "missing_evidence": []}
+      ]
+    },
+    {
+      "case_id": "entertainment-insufficient-v1",
+      "material_workflow": "business_entertainment",
+      "items": [
+        {"status": "uncertain", "conclusion": "支付证据归属不足。", "evidence_refs": [], "missing_evidence": ["支付证据归属"]},
+        {"status": "uncertain", "conclusion": "发票关联证据不足。", "evidence_refs": [], "missing_evidence": ["发票关联"]},
+        {"status": "pass", "conclusion": "预算证据完整。", "evidence_refs": ["material:budget"], "missing_evidence": []},
+        {"status": "pass", "conclusion": "核销金额不高于可核销上限。", "evidence_refs": ["material:amounts"], "missing_evidence": []}
+      ]
+    },
+    {
+      "case_id": "entertainment-technical-v1",
+      "material_workflow": "travel_expense",
+      "items": []
+    }
+  ]
+}

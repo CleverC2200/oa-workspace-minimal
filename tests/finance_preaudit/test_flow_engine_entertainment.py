@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from apps import json_artifact
-from apps.oa_finance_preaudit import cli, flow_engine
+from apps.oa_finance_preaudit import cli, flow_engine, flow_evals
 
 
 WORKFLOW_KEY = "business_entertainment"
@@ -16,6 +16,12 @@ GOLDEN_REPLAY = json.loads(
     (Path(__file__).parent / "fixtures/golden_replay.json").read_text(
         encoding="utf-8"
     )
+)
+REVIEWER_REPLAY = json.loads(
+    (
+        Path(__file__).parent
+        / "fixtures/business_entertainment_reviewer_replay.json"
+    ).read_text(encoding="utf-8")
 )
 
 
@@ -254,64 +260,99 @@ def test_unsupported_flow_does_not_create_runtime_directory(tmp_path: Path) -> N
     assert not (tmp_path / "business_support_fee").exists()
 
 
-@pytest.mark.parametrize(
-    "case",
-    [
-        case
-        for case in GOLDEN_REPLAY["cases"]
-        if case["workflow_key"] == WORKFLOW_KEY
-    ],
-    ids=lambda case: case["case_id"],
-)
-def test_entertainment_golden_replay_drives_flow_engine(
+def test_entertainment_independent_reviewer_replay_scores_100_percent(
     tmp_path: Path,
-    case: dict,
 ) -> None:
-    technical_failure = case["expected"]["outcome"] == "technical_failure"
-    engine = _engine(
-        tmp_path,
-        material_workflow="travel_expense" if technical_failure else WORKFLOW_KEY,
+    suite = flow_evals.load_suite(
+        Path(__file__).parent / "fixtures/golden_replay.json"
     )
+    actuals = flow_evals.expected_actuals(suite)
+    entertainment_actuals = {}
 
-    action = engine.next_action(WORKFLOW_KEY)
+    for replay_case in REVIEWER_REPLAY["cases"]:
+        case_root = tmp_path / replay_case["case_id"]
+        engine = _engine(
+            case_root,
+            material_workflow=replay_case["material_workflow"],
+        )
+        action = engine.next_action(WORKFLOW_KEY)
+        if action["action"] == "needs_admin":
+            entertainment_actuals[replay_case["case_id"]] = {
+                "outcome": "technical_failure",
+                "items": [],
+                "stop_code": action["reason"],
+            }
+            continue
 
-    if technical_failure:
-        assert action["action"] == "needs_admin"
-        assert action["reason"] == case["expected"]["stop_code"]
-        return
-
-    status_by_mark = {"✅": "pass", "❌": "fail", "⚠️": "uncertain"}
-    decision = _decision(action)
-    decision["items"] = [
-        {
-            **item,
-            "status": status_by_mark[mark],
-            "evidence_refs": [] if mark == "⚠️" else item["evidence_refs"],
-            "missing_evidence": ["当前审核项证据不足"] if mark == "⚠️" else [],
+        packet = json.loads(
+            Path(action["review_packet_file"]).read_text(encoding="utf-8")
+        )
+        assert packet["rule_version"] == REVIEWER_REPLAY["rule_version"]
+        decision = {
+            "schema_version": 1,
+            "kind": "preaudit_review_decision",
+            "action_token": action["action_token"],
+            "workflow_key": REVIEWER_REPLAY["workflow_key"],
+            "rule_version": REVIEWER_REPLAY["rule_version"],
+            "overall": (
+                "pass"
+                if all(item["status"] == "pass" for item in replay_case["items"])
+                else "needs_human"
+            ),
+            "items": [
+                {"item_key": expected["item_key"], **reviewed}
+                for expected, reviewed in zip(
+                    packet["items"],
+                    replay_case["items"],
+                    strict=True,
+                )
+            ],
         }
-        for item, mark in zip(
-            decision["items"],
-            case["expected"]["statuses"],
-            strict=True,
+        decision_file = case_root / "reviewer-decision.json"
+        json_artifact.write_json_atomic(decision_file, decision)
+        closed = engine.complete_review(Path(action["action_file"]), decision_file)
+        remark_lines = Path(closed["remark_file"]).read_text(
+            encoding="utf-8"
+        ).splitlines()[1:]
+        status_marks = [
+            next(mark for mark in ("✅", "❌", "⚠️") if line.startswith(mark))
+            for line in remark_lines
+        ]
+        outcome = (
+            "evidence_insufficient"
+            if "⚠️" in status_marks
+            else "business_warning" if "❌" in status_marks else "pass"
         )
+        receipt = json.loads(
+            Path(closed["receipt_file"]).read_text(encoding="utf-8")
+        )
+        events = json.loads(
+            Path(closed["events_file"]).read_text(encoding="utf-8")
+        )["events"]
+        assert receipt["workflow_key"] == WORKFLOW_KEY
+        assert [event["phase"] for event in events] == [
+            "discover",
+            "collect",
+            "review",
+            "close",
+        ]
+        entertainment_actuals[replay_case["case_id"]] = {
+            "outcome": outcome,
+            "items": [
+                {"name": expected["name"], "status": mark}
+                for expected, mark in zip(packet["items"], status_marks, strict=True)
+            ],
+            "stop_code": None,
+        }
+
+    actuals.update(entertainment_actuals)
+    report = flow_evals.run_replay(suite, actuals)
+
+    assert len(entertainment_actuals) == 4
+    assert report["accuracy"] == 1.0
+    assert report["format_compliance"] == 1.0
+    assert not [
+        difference
+        for difference in report["differences"]
+        if difference["workflow_key"] == WORKFLOW_KEY
     ]
-    if any(mark != "✅" for mark in case["expected"]["statuses"]):
-        decision["overall"] = "needs_human"
-    decision_file = tmp_path / f"{case['case_id']}.json"
-    json_artifact.write_json_atomic(decision_file, decision)
-
-    closed = engine.complete_review(Path(action["action_file"]), decision_file)
-    remark = Path(closed["remark_file"]).read_text(encoding="utf-8")
-
-    assert closed["action"] == "closed"
-    assert closed["business_state"] == (
-        "pass" if case["expected"]["outcome"] == "pass" else "needs_human"
-    )
-    assert all(
-        line.startswith(mark)
-        for line, mark in zip(
-            remark.splitlines()[1:],
-            case["expected"]["statuses"],
-            strict=True,
-        )
-    )
