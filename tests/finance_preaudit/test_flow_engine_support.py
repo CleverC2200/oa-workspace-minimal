@@ -9,6 +9,12 @@ from apps.oa_finance_preaudit import cli, flow_engine, flow_evals
 
 WORKFLOW_KEY = "business_support_fee"
 ITEM_NAMES = ("附件完整性", "业务事项合规性", "预算校验", "金额孰低核销")
+ITEM_KEYS = (
+    "attachment_completeness",
+    "business_compliance",
+    "budget_check",
+    "reimbursable_minimum",
+)
 FIXTURE_ROOT = Path(__file__).parent / "fixtures"
 REPLAY = json.loads(
     (FIXTURE_ROOT / "business_support_reviewer_replay.json").read_text(
@@ -119,6 +125,7 @@ def test_support_preview_and_cli_use_isolated_four_item_contract(
     packet = json.loads(Path(action["review_packet_file"]).read_text(encoding="utf-8"))
     assert action["coordination_seconds"] == action["coordination_tokens"] == 0
     assert packet["rule_version"] == "business_support_fee:1"
+    assert tuple(item["item_key"] for item in packet["items"]) == ITEM_KEYS
     assert tuple(item["name"] for item in packet["items"]) == ITEM_NAMES
     assert "附件完整性/支付证据" not in str(packet)
 
