@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import pytest
 
-from apps.oa_approval import auth, official_sql
+from apps.oa_approval import api, auth, flow, official_sql
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -58,6 +58,53 @@ class TestConfigurationContract:
         ):
             with pytest.raises(RuntimeError, match="OA_BASE_URL"):
                 auth.host()
+
+    def test_oa_user_identity_is_never_stored_in_flow_configs(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        configs = flow.load_all_configs()
+
+        assert all("oa_uid" not in config for config in configs)
+        assert "OA_UID=" in (PROJECT_ROOT / ".env.example").read_text(
+            encoding="utf-8"
+        )
+        for forbidden_field in ("oa_uid", "oa_uid_env"):
+            invalid = tmp_path / f"{forbidden_field}.json"
+            invalid.write_text(
+                '{"flow_key":"test","workflow_id":"1",'
+                f'"workflow_name":"test","{forbidden_field}":"forbidden"}}',
+                encoding="utf-8",
+            )
+            with pytest.raises(SystemExit, match="OA_UID"):
+                flow.load_config(str(invalid))
+
+    def test_oa_api_uses_only_override_or_fixed_local_uid(self) -> None:
+        def fake_env(name: str) -> str:
+            return {"OA_UID": "local-user", "OTHER_UID": "wrong-user"}[name]
+
+        with (
+            patch.object(api.auth, "get_token", return_value="token"),
+            patch.object(api.auth, "env", side_effect=fake_env),
+            patch.object(
+                api.auth,
+                "encrypt_user_id",
+                side_effect=lambda value: f"encrypted:{value}",
+            ),
+            patch.object(
+                api,
+                "OaApi",
+                side_effect=lambda token, uid: (token, uid),
+            ),
+        ):
+            assert api.build_api({"oa_uid_env": "OTHER_UID"}) == (
+                "token",
+                "encrypted:local-user",
+            )
+            assert api.build_api({}, oa_uid_override="override-user") == (
+                "token",
+                "encrypted:override-user",
+            )
 
     def test_official_sql_has_no_implicit_database_identity(self) -> None:
         fake_oracledb = types.SimpleNamespace(

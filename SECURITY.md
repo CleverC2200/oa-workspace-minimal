@@ -6,7 +6,7 @@
 
 | 内容 | 本地位置 | Git 状态 |
 | --- | --- | --- |
-| OA 地址、应用标识和应用密钥 | `.env` 或 `.env.oa-auth` | 已忽略 |
+| OA 地址、应用标识、应用密钥和执行人 `OA_UID` | `.env` 或 `.env.oa-auth` | 已忽略 |
 | 数据库地址、服务名、账号 | `.env` | 已忽略 |
 | 数据库密码 | `.env`，或由 `OA_DB_KEYCHAIN_SERVICE` 指向 macOS Keychain | 已忽略或不在项目目录 |
 | 已获授权的生产流程清单 | `runtime/control/write-policy.json` | 已忽略 |
