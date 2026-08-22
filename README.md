@@ -120,7 +120,7 @@ python3 -m scripts.quality links
 python3 -m unittest discover -s tests/finance_preaudit -p 'test_*.py' -v
 ```
 
-团队规范要求 `main` 只接受满足质量门的 PR；但当前 GitHub 方案尚不支持私有仓库服务端分支保护，不能由平台强制禁止直接推送。实际状态和升级后的目标规则见[主分支保护状态](docs/agents/branch-protection.md)。CI 不读取真实 OA 凭据，也不启用生产自动化。
+仓库继续保持私有，不配置 GitHub 服务端分支保护。`main` 的普通变更仍按本地维护规则通过质量门和 PR 合并，但这不是平台强制；具体见[main 本地管理规则](docs/agents/branch-protection.md)。CI 不读取真实 OA 凭据，也不启用生产自动化。
 
 ## 并发调参建议
 

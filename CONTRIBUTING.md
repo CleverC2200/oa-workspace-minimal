@@ -38,6 +38,6 @@ python3 -m unittest discover -s tests/finance_preaudit -p 'test_*.py' -v
 python3 -m compileall -q apps scripts tests
 ```
 
-GitHub `main` 的目标规则是通过名为 `quality` 的检查并经 PR 合并，禁止强推和删除，且同样约束管理员。当前私有仓库方案尚不支持服务端分支保护，实际状态和升级后配置见[主分支保护状态](docs/agents/branch-protection.md)；在规则生效前不得把人工规范表述为平台强制。
+仓库继续保持私有，不配置 GitHub 服务端分支保护。`main` 的分支、验证、PR、合并和清理规则由仓库所有者本地维护，具体见[main 本地管理规则](docs/agents/branch-protection.md)；不得把人工规范表述为平台强制。
 
 真实 OA 写入、自动化启停和发布均属于独立授权动作，测试通过不等于获得执行授权。
