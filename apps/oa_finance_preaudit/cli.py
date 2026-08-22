@@ -14,6 +14,7 @@ from apps.oa_approval import official_sql
 
 from apps import json_artifact
 from .case_bundle import CollectionFailure, collect_case
+from . import flow_engine, production_pending
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -21,6 +22,7 @@ CollectFunction = Callable[..., dict]
 ListHandledFunction = Callable[..., list[dict]]
 ListPendingFunction = Callable[..., list[dict]]
 ResolveRequestIdFunction = Callable[[str], str]
+FlowEngineFactory = Callable[[], flow_engine.FlowEngine]
 _SAFE_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{2,80}$")
 
 
@@ -64,6 +66,12 @@ def build_parser() -> argparse.ArgumentParser:
     pending.add_argument("--page-size", type=int, default=200)
     pending.add_argument("--max-pages", type=int, default=100)
     pending.add_argument("--output", default="")
+    next_action = subparsers.add_parser("next-action")
+    next_action.add_argument("--workflow", required=True)
+    next_action.add_argument("--mode", choices=("preview",), default="preview")
+    complete_review = subparsers.add_parser("complete-review")
+    complete_review.add_argument("--action-file", type=Path, required=True)
+    complete_review.add_argument("--decision-file", type=Path, required=True)
     return parser
 
 
@@ -111,7 +119,61 @@ def _live_list_pending(args: argparse.Namespace) -> list[dict]:
     )
 
 
-def _failure_payload(error: Exception) -> dict:
+def _live_flow_engine() -> flow_engine.FlowEngine:
+    configs = legacy_flow.load_all_configs()
+    oa_uid = legacy_flow.common_oa_uid(configs)
+    oa_api = legacy_api.build_api(configs[0], oa_uid_override=oa_uid)
+
+    def discover(workflow_key: str) -> list[dict]:
+        rows = oa_api.pending_rows(page_size=200, max_pages=100)
+        identities = production_pending.identify_pending_rows(rows, configs)
+        return [
+            {
+                "request_id": item["requestId"],
+                "received_at": item["received_at"],
+                "workflow_key": item["flow_key"],
+            }
+            for item in identities
+            if item["support_status"] == "supported"
+            and item["flow_key"] == workflow_key
+        ]
+
+    def collect(request_id: str, attempt_root: Path) -> dict:
+        return collect_case(
+            request_id,
+            oa_api=oa_api,
+            configs=configs,
+            allow_browser_download=True,
+            attachment_root=attempt_root / "attachments",
+            prepared_root=attempt_root / "prepared",
+            attachment_timeout_sec=180,
+        )
+
+    root = Path(
+        os.environ.get("OA_FINANCE_PREAUDIT_FLOW_ROOT")
+        or PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
+    )
+    return flow_engine.FlowEngine(
+        root=root,
+        discover_candidates=discover,
+        collect_material=collect,
+    )
+
+
+def _failure_payload(error: Exception, *, command: str = "collect-case") -> dict:
+    if command in {"next-action", "complete-review"}:
+        return {
+            "schema_version": 1,
+            "kind": "preaudit_action_failed",
+            "execution_state": "failed",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "failure": {
+                "code": "flow_action_failed",
+                "stage": command.replace("-", "_"),
+                "message": "本地预审动作失败",
+            },
+        }
     raw_code = str(error).strip()
     code = raw_code if _SAFE_ERROR_CODE.fullmatch(raw_code) else "material_collection_failed"
     payload = {
@@ -135,7 +197,7 @@ def _write_payload(path: Path, payload: dict) -> None:
 
 
 def _fail(args: argparse.Namespace, error: Exception) -> int:
-    failure = _failure_payload(error)
+    failure = _failure_payload(error, command=args.command)
     if args.command == "collect-case" and str(args.failure_output or "").strip():
         try:
             _write_payload(Path(str(args.failure_output)), failure)
@@ -152,10 +214,20 @@ def main(
     list_handled: ListHandledFunction | None = None,
     list_pending: ListPendingFunction | None = None,
     resolve_request_id: ResolveRequestIdFunction | None = None,
+    flow_engine_factory: FlowEngineFactory | None = None,
 ) -> int:
     args = build_parser().parse_args(argv)
     try:
-        if args.command == "list-handled":
+        if args.command in {"next-action", "complete-review"}:
+            engine = (flow_engine_factory or _live_flow_engine)()
+            if args.command == "next-action":
+                payload = engine.next_action(args.workflow, mode=args.mode)
+            else:
+                payload = engine.complete_review(
+                    args.action_file,
+                    args.decision_file,
+                )
+        elif args.command == "list-handled":
             rows = (
                 _live_list_handled(args)
                 if list_handled is None

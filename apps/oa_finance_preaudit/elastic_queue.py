@@ -104,6 +104,13 @@ _FLOW_ITEM_NAMES = {
 }
 
 
+def flow_item_names(flow_key: str) -> tuple[str, ...]:
+    names = _FLOW_ITEM_NAMES.get(flow_key)
+    if names is None:
+        raise QueueContractError("unsupported_flow")
+    return names
+
+
 class QueueContractError(RuntimeError):
     pass
 

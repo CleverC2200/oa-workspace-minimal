@@ -22,7 +22,7 @@ def _support_identity(
     return "", "unsupported_workflow"
 
 
-def _identity_items(
+def identify_pending_rows(
     rows: list[dict[str, Any]],
     configs: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -75,7 +75,7 @@ def capture_production_pending(
         raise elastic_queue.QueueContractError(
             "production_pending_fetch_failed"
         ) from error
-    items = _identity_items(rows, configs)
+    items = identify_pending_rows(rows, configs)
     payload = {
         "schema_version": 1,
         "kind": "preaudit_production_pending_identities",
