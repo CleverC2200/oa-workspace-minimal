@@ -255,9 +255,9 @@ def test_unsupported_flow_does_not_create_runtime_directory(tmp_path: Path) -> N
     engine = _engine(tmp_path)
 
     with pytest.raises(ValueError, match="workflow_not_implemented"):
-        engine.next_action("small_marketing_fee")
+        engine.next_action("packaging_layout_approval")
 
-    assert not (tmp_path / "small_marketing_fee").exists()
+    assert not (tmp_path / "packaging_layout_approval").exists()
 
 
 def test_entertainment_independent_reviewer_replay_scores_100_percent(

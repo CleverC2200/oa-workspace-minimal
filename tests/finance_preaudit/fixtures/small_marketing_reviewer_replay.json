@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "workflow_key": "small_marketing_fee",
+  "rule_version": "small_marketing_fee:1",
+  "cases": [
+    {"case_id":"marketing-normal-v1","material_workflow":"small_marketing_fee","facts":{"budget_account":"matched","attachment":"complete","cost_bearer":"matched","sap_customer":"matched","amount":"within_limit"},"items":[
+      {"status":"pass","conclusion":"预算科目匹配。","evidence_refs":["material:declared_fields.budget_account"],"missing_evidence":[]},
+      {"status":"pass","conclusion":"附件完整。","evidence_refs":["material:declared_fields.attachment"],"missing_evidence":[]},
+      {"status":"pass","conclusion":"费用承担主体匹配。","evidence_refs":["material:declared_fields.cost_bearer"],"missing_evidence":[]},
+      {"status":"pass","conclusion":"SAP 客户编码匹配。","evidence_refs":["material:declared_fields.sap_customer"],"missing_evidence":[]},
+      {"status":"pass","conclusion":"核销金额在上限内。","evidence_refs":["material:declared_fields.amount"],"missing_evidence":[]}
+    ]},
+    {"case_id":"marketing-warning-v1","material_workflow":"small_marketing_fee","facts":{"budget_account":"matched","attachment":"complete","cost_bearer":"matched","sap_customer":"mismatched","amount":"within_limit"},"items":[
+      {"status":"pass","conclusion":"预算科目匹配。","evidence_refs":["material:declared_fields.budget_account"],"missing_evidence":[]},
+      {"status":"pass","conclusion":"附件完整。","evidence_refs":["material:declared_fields.attachment"],"missing_evidence":[]},
+      {"status":"pass","conclusion":"费用承担主体匹配。","evidence_refs":["material:declared_fields.cost_bearer"],"missing_evidence":[]},
+      {"status":"fail","conclusion":"SAP 客户编码不匹配。","evidence_refs":["material:declared_fields.sap_customer"],"missing_evidence":[]},
+      {"status":"pass","conclusion":"核销金额在上限内。","evidence_refs":["material:declared_fields.amount"],"missing_evidence":[]}
+    ]},
+    {"case_id":"marketing-insufficient-v1","material_workflow":"small_marketing_fee","facts":{"budget_account":"matched","amount":"within_limit"},"items":[
+      {"status":"pass","conclusion":"预算科目匹配。","evidence_refs":["material:declared_fields.budget_account"],"missing_evidence":[]},
+      {"status":"uncertain","conclusion":"附件完整性证据不足。","evidence_refs":[],"missing_evidence":["附件覆盖"]},
+      {"status":"uncertain","conclusion":"费用承担主体证据不足。","evidence_refs":[],"missing_evidence":["承担主体"]},
+      {"status":"uncertain","conclusion":"SAP 主数据接口未接入，无法核验。","evidence_refs":[],"missing_evidence":["SAP 主数据"]},
+      {"status":"pass","conclusion":"核销金额在上限内。","evidence_refs":["material:declared_fields.amount"],"missing_evidence":[]}
+    ]},
+    {"case_id":"marketing-technical-v1","material_workflow":"travel_expense","facts":{},"items":[]}
+  ]
+}

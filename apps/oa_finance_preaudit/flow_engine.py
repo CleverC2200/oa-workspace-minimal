@@ -49,6 +49,16 @@ _FLOW_SPECS = {
             "reimbursable_minimum",
         ),
     },
+    "small_marketing_fee": {
+        "rule_version": "small_marketing_fee:1",
+        "item_keys": (
+            "budget_account",
+            "attachment_completeness",
+            "cost_bearer",
+            "sap_customer_code_match",
+            "reimbursable_minimum",
+        ),
+    },
 }
 SHARED_FAILURE_CODES = {
     "submission_adapter_unavailable",
