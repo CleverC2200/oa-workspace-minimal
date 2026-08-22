@@ -131,7 +131,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             {
                 "items": [
                     {
-                        "requestId": "2625001",
+                        "requestId": "1002",
                         "flow_key": "travel_expense",
                         "can_submit": True,
                     }
@@ -140,7 +140,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             {
                 "cases": [
                     {
-                        "request_id": "2625001",
+                        "request_id": "1002",
                         "submitted_at": "2026-08-11 08:00:00",
                         "received_at": "2026-08-11 08:01:00",
                     }
@@ -170,7 +170,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             queue_cli,
             "_submit_frozen_once",
             return_value={
-                "request_id": "2625001",
+                "request_id": "1002",
                 "state": "submitted",
                 "run_id": "recorded-run",
                 "submit_ok": True,
@@ -183,7 +183,7 @@ class ElasticQueueCliTest(unittest.TestCase):
                 "--state",
                 str(self.state),
                 "--request-id",
-                "2625001",
+                "1002",
                 "--live-inputs-manifest",
                 str(manifest),
                 "--production-root",
@@ -207,7 +207,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             {
                 "items": [
                     {
-                        "requestId": "2625001",
+                        "requestId": "1002",
                         "flow_key": "travel_expense",
                         "can_submit": True,
                         "payload_json": "must-not-leak",
@@ -220,7 +220,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             {
                 "cases": [
                     {
-                        "request_id": "2625001",
+                        "request_id": "1002",
                         "submitted_at": "2026-08-11 08:00:00",
                         "received_at": "2026-08-11 08:01:00",
                         "request_name": "must-not-leak",
@@ -324,19 +324,19 @@ class ElasticQueueCliTest(unittest.TestCase):
         self.assertIn("packaging_layout_approval.json", " ".join(payload["files"]))
 
     def test_submit_frozen_once_keeps_begin_run_and_receipt_close_in_one_call(self) -> None:
-        request_root = self.root / "requests" / "2625001" / "attempt-1"
+        request_root = self.root / "requests" / "1002" / "attempt-1"
         request_root.mkdir(parents=True)
         production_root = self.root / "production"
         production_root.mkdir()
         proof = {
-            "request_id": "2625001",
+            "request_id": "1002",
             "received_at": "2026-08-11 08:01:00",
             "isolation_key": "isolation",
             "can_submit": True,
             "pending": True,
         }
         receipt = {
-            "request_id": "2625001",
+            "request_id": "1002",
             "submission_token": "token-1",
             "run_id": "run-1",
             "write": True,
@@ -407,7 +407,7 @@ class ElasticQueueCliTest(unittest.TestCase):
         ):
             result = queue_cli._submit_frozen_once(
                 state_path=self.state,
-                request_id="2625001",
+                request_id="1002",
                 production_list=str(self.root / "production.json"),
                 pending_list=str(self.root / "pending.json"),
                 production_root=str(production_root),
@@ -418,10 +418,10 @@ class ElasticQueueCliTest(unittest.TestCase):
         self.assertTrue(result["postcheck_done_hit"])
 
     def test_submit_frozen_once_never_closes_unreadable_writer_output(self) -> None:
-        request_root = self.root / "requests" / "2625001" / "attempt-1"
+        request_root = self.root / "requests" / "1002" / "attempt-1"
         request_root.mkdir(parents=True)
         proof = {
-            "request_id": "2625001",
+            "request_id": "1002",
             "received_at": "2026-08-11 08:01:00",
             "isolation_key": "isolation",
             "can_submit": True,
@@ -469,7 +469,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             ):
                 queue_cli._submit_frozen_once(
                     state_path=self.state,
-                    request_id="2625001",
+                    request_id="1002",
                     production_list=str(self.root / "production.json"),
                     pending_list=str(self.root / "pending.json"),
                     production_root=str(self.root),
@@ -478,10 +478,10 @@ class ElasticQueueCliTest(unittest.TestCase):
         close.assert_not_called()
 
     def test_submit_frozen_once_never_closes_a_receipt_bound_to_another_token(self) -> None:
-        request_root = self.root / "requests" / "2625001" / "attempt-1"
+        request_root = self.root / "requests" / "1002" / "attempt-1"
         request_root.mkdir(parents=True)
         proof = {
-            "request_id": "2625001",
+            "request_id": "1002",
             "received_at": "2026-08-11 08:01:00",
             "isolation_key": "isolation",
             "can_submit": True,
@@ -523,7 +523,7 @@ class ElasticQueueCliTest(unittest.TestCase):
                         stdout=json.dumps(
                             {
                                 "submission_receipt": {
-                                    "request_id": "2625001",
+                                    "request_id": "1002",
                                     "submission_token": "another-token",
                                     "run_id": "run-1",
                                     "write": True,
@@ -544,7 +544,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             ):
                 queue_cli._submit_frozen_once(
                     state_path=self.state,
-                    request_id="2625001",
+                    request_id="1002",
                     production_list=str(self.root / "production.json"),
                     pending_list=str(self.root / "pending.json"),
                     production_root=str(self.root),
@@ -575,7 +575,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             {
                 "items": [
                     {
-                        "requestId": "2625001",
+                        "requestId": "1002",
                         "flow_key": "travel_expense",
                         "can_submit": True,
                     }
@@ -587,7 +587,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             {
                 "cases": [
                     {
-                        "request_id": "2625001",
+                        "request_id": "1002",
                         "submitted_at": "2026-08-11 08:00:00",
                         "received_at": "2026-08-11 08:01:00",
                     }
@@ -611,7 +611,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             {
                 "schema_version": 1,
                 "kind": "preaudit_material",
-                "request_id": "2625001",
+                "request_id": "1002",
                 "workflow_key": "travel_expense",
                 "resources": [],
                 "prepared": {"images": [], "manifest": [], "structured_contents": []},
@@ -640,7 +640,7 @@ class ElasticQueueCliTest(unittest.TestCase):
                 {
                     "schema_version": 1,
                     "kind": "preaudit_remark_envelope",
-                    "request_id": "2625001",
+                    "request_id": "1002",
                     "received_at": claim["received_at"],
                     "isolation_key": claim["isolation_key"],
                     "workflow_key": "travel_expense",
@@ -657,7 +657,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             "--worker-id",
             "travel-1",
             "--request-id",
-            "2625001",
+            "1002",
             "--lease-token",
             claim["lease_token"],
             "--material-file",
@@ -680,7 +680,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             "--state",
             str(self.state),
             "--request-id",
-            "2625001",
+            "1002",
             "--production-list",
             str(production),
             "--pending-list",
@@ -696,7 +696,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             {
                 "schema_version": 1,
                 "kind": "preaudit_current_proof",
-                "request_id": "2625001",
+                "request_id": "1002",
                 "received_at": claim["received_at"],
                 "isolation_key": claim["isolation_key"],
                 "can_submit": True,
@@ -711,7 +711,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             {
                 "cases": [
                     {
-                        "request_id": "2625001",
+                        "request_id": "1002",
                         "submitted_at": "2026-08-11 08:00:00",
                         "received_at": "2026-08-11 08:01:00",
                     }
@@ -728,7 +728,7 @@ class ElasticQueueCliTest(unittest.TestCase):
                 {
                     "items": [
                         {
-                            "requestId": "2625001",
+                            "requestId": "1002",
                             "flow_key": "travel_expense",
                             "can_submit": True,
                         }
@@ -753,7 +753,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             "--state",
             str(self.state),
             "--request-id",
-            "2625001",
+            "1002",
             "--production-list",
             str(production),
             "--pending-list",
@@ -772,7 +772,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             {
                 "items": [
                     {
-                        "requestId": "2625001",
+                        "requestId": "1002",
                         "flow_key": "travel_expense",
                         "can_submit": True,
                     }
@@ -784,7 +784,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             {
                 "cases": [
                     {
-                        "request_id": "2625001",
+                        "request_id": "1002",
                         "submitted_at": "2026-08-11 08:00:00",
                         "received_at": "2026-08-11 08:01:00",
                     }
@@ -805,8 +805,8 @@ class ElasticQueueCliTest(unittest.TestCase):
             "claim", "--state", str(self.state), "--worker-id", "travel-1"
         )
         self.assertEqual(code, 0)
-        self.assertEqual(claim["request_id"], "2625001")
-        self.assertIn("/requests/2625001/", claim["attachment_root"])
+        self.assertEqual(claim["request_id"], "1002")
+        self.assertIn("/requests/1002/", claim["attachment_root"])
         self.assertTrue(Path(claim["request_root"]).is_dir())
         self.assertTrue(Path(claim["attachment_root"]).is_dir())
         self.assertTrue(Path(claim["prepared_root"]).is_dir())
@@ -844,7 +844,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             {
                 "items": [
                     {
-                        "requestId": "2625001",
+                        "requestId": "1002",
                         "flow_key": "travel_expense",
                         "can_submit": True,
                     }
@@ -856,7 +856,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             {
                 "cases": [
                     {
-                        "request_id": "2625001",
+                        "request_id": "1002",
                         "submitted_at": "2026-08-11 08:00:00",
                         "received_at": "2026-08-11 08:01:00",
                     }
@@ -881,7 +881,7 @@ class ElasticQueueCliTest(unittest.TestCase):
                 {
                     "schema_version": 1,
                     "kind": "preaudit_material",
-                    "request_id": "2625001",
+                    "request_id": "1002",
                     "workflow_key": "travel_expense",
                     "resources": [],
                     "prepared": {
@@ -918,7 +918,7 @@ class ElasticQueueCliTest(unittest.TestCase):
                 {
                     "schema_version": 1,
                     "kind": "preaudit_remark_envelope",
-                    "request_id": "2625001",
+                    "request_id": "1002",
                     "received_at": claim["received_at"],
                     "isolation_key": claim["isolation_key"],
                     "workflow_key": "travel_expense",
@@ -971,12 +971,12 @@ class ElasticQueueCliTest(unittest.TestCase):
     def test_collect_assignment_uses_only_assignment_paths_and_writes_material(self) -> None:
         production = self.write_json(
             "production-collect.json",
-            {"items": [{"requestId": "2625001", "flow_key": "travel_expense", "can_submit": True}]},
+            {"items": [{"requestId": "1002", "flow_key": "travel_expense", "can_submit": True}]},
         )
         pending = self.write_json(
             "pending-collect.json",
             {"cases": [{
-                "request_id": "2625001",
+                "request_id": "1002",
                 "submitted_at": "2026-08-11 08:00:00",
                 "received_at": "2026-08-11 08:01:00",
             }]},
@@ -991,7 +991,7 @@ class ElasticQueueCliTest(unittest.TestCase):
         material_payload = {
             "schema_version": 1,
             "kind": "preaudit_material",
-            "request_id": "2625001",
+            "request_id": "1002",
             "workflow_key": "travel_expense",
             "resources": [{"local_readonly_path": Path(claim["attachment_root"]) / "proof.jpg"}],
             "prepared": {"images": [], "manifest": [], "structured_contents": []},
@@ -1008,7 +1008,7 @@ class ElasticQueueCliTest(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(payload["kind"], "preaudit_assignment_material_written")
-        self.assertEqual(payload["request_id"], "2625001")
+        self.assertEqual(payload["request_id"], "1002")
         written = json.loads(Path(claim["material_file"]).read_text(encoding="utf-8"))
         self.assertEqual(
             written["resources"][0]["local_readonly_path"],
@@ -1016,7 +1016,7 @@ class ElasticQueueCliTest(unittest.TestCase):
         )
         collect.assert_called_once()
         call = collect.call_args.kwargs
-        self.assertEqual(call["request_id"], "2625001")
+        self.assertEqual(call["request_id"], "1002")
         self.assertEqual(call["attachment_root"], Path(claim["attachment_root"]))
         self.assertEqual(call["prepared_root"], Path(claim["prepared_root"]))
         self.assertEqual(
@@ -1027,12 +1027,12 @@ class ElasticQueueCliTest(unittest.TestCase):
     def test_collect_assignment_rejects_an_archived_claim_copy(self) -> None:
         production = self.write_json(
             "production-archive-copy.json",
-            {"items": [{"requestId": "2625001", "flow_key": "travel_expense", "can_submit": True}]},
+            {"items": [{"requestId": "1002", "flow_key": "travel_expense", "can_submit": True}]},
         )
         pending = self.write_json(
             "pending-archive-copy.json",
             {"cases": [{
-                "request_id": "2625001",
+                "request_id": "1002",
                 "submitted_at": "2026-08-11 08:00:00",
                 "received_at": "2026-08-11 08:01:00",
             }]},
@@ -1059,12 +1059,12 @@ class ElasticQueueCliTest(unittest.TestCase):
     def test_collect_assignment_preserves_safe_failure_without_material_or_retry(self) -> None:
         production = self.write_json(
             "production-collect-failure.json",
-            {"items": [{"requestId": "2625001", "flow_key": "travel_expense", "can_submit": True}]},
+            {"items": [{"requestId": "1002", "flow_key": "travel_expense", "can_submit": True}]},
         )
         pending = self.write_json(
             "pending-collect-failure.json",
             {"cases": [{
-                "request_id": "2625001",
+                "request_id": "1002",
                 "submitted_at": "2026-08-11 08:00:00",
                 "received_at": "2026-08-11 08:01:00",
             }]},
@@ -1113,12 +1113,12 @@ class ElasticQueueCliTest(unittest.TestCase):
     def test_collection_status_reports_unavailable_without_restarting_collection(self) -> None:
         production = self.write_json(
             "production-status-unavailable.json",
-            {"items": [{"requestId": "2625001", "flow_key": "travel_expense", "can_submit": True}]},
+            {"items": [{"requestId": "1002", "flow_key": "travel_expense", "can_submit": True}]},
         )
         pending = self.write_json(
             "pending-status-unavailable.json",
             {"cases": [{
-                "request_id": "2625001",
+                "request_id": "1002",
                 "submitted_at": "2026-08-11 08:00:00",
                 "received_at": "2026-08-11 08:01:00",
             }]},
@@ -1144,12 +1144,12 @@ class ElasticQueueCliTest(unittest.TestCase):
     def test_collection_status_rejects_an_active_canonical_collection(self) -> None:
         production = self.write_json(
             "production-status-active.json",
-            {"items": [{"requestId": "2625001", "flow_key": "travel_expense", "can_submit": True}]},
+            {"items": [{"requestId": "1002", "flow_key": "travel_expense", "can_submit": True}]},
         )
         pending = self.write_json(
             "pending-status-active.json",
             {"cases": [{
-                "request_id": "2625001",
+                "request_id": "1002",
                 "submitted_at": "2026-08-11 08:00:00",
                 "received_at": "2026-08-11 08:01:00",
             }]},
@@ -1177,12 +1177,12 @@ class ElasticQueueCliTest(unittest.TestCase):
     def test_collect_assignment_refuses_a_second_collection_for_the_same_attempt(self) -> None:
         production = self.write_json(
             "production-collect-started.json",
-            {"items": [{"requestId": "2625001", "flow_key": "travel_expense", "can_submit": True}]},
+            {"items": [{"requestId": "1002", "flow_key": "travel_expense", "can_submit": True}]},
         )
         pending = self.write_json(
             "pending-collect-started.json",
             {"cases": [{
-                "request_id": "2625001",
+                "request_id": "1002",
                 "submitted_at": "2026-08-11 08:00:00",
                 "received_at": "2026-08-11 08:01:00",
             }]},
@@ -1217,12 +1217,12 @@ class ElasticQueueCliTest(unittest.TestCase):
     def test_seal_review_builds_prefixed_envelope_and_closes_prepared(self) -> None:
         production = self.write_json(
             "production-seal.json",
-            {"items": [{"requestId": "2625001", "flow_key": "travel_expense", "can_submit": True}]},
+            {"items": [{"requestId": "1002", "flow_key": "travel_expense", "can_submit": True}]},
         )
         pending = self.write_json(
             "pending-seal.json",
             {"cases": [{
-                "request_id": "2625001",
+                "request_id": "1002",
                 "submitted_at": "2026-08-11 08:00:00",
                 "received_at": "2026-08-11 08:01:00",
             }]},
@@ -1238,7 +1238,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             json.dumps({
                 "schema_version": 1,
                 "kind": "preaudit_material",
-                "request_id": "2625001",
+                "request_id": "1002",
                 "workflow_key": "travel_expense",
                 "resources": [],
                 "prepared": {"images": [], "manifest": [], "structured_contents": []},
@@ -1380,16 +1380,16 @@ class ElasticQueueCliTest(unittest.TestCase):
     def test_manual_external_requeue_requires_exact_historical_signature(self) -> None:
         production = self.write_json(
             "production.json",
-            {"items": [{"requestId": "2625001", "flow_key": "travel_expense", "can_submit": True}]},
+            {"items": [{"requestId": "1002", "flow_key": "travel_expense", "can_submit": True}]},
         )
         pending = self.write_json(
             "pending.json",
-            {"cases": [{"request_id": "2625001", "submitted_at": "2026-08-11 08:00:00", "received_at": "2026-08-11 08:00:00"}]},
+            {"cases": [{"request_id": "1002", "submitted_at": "2026-08-11 08:00:00", "received_at": "2026-08-11 08:00:00"}]},
         )
         blocked = self.write_json(
             "blocked.json",
             {"blocked_requests": [{
-                "request_id": "2625001",
+                "request_id": "1002",
                 "received_at": "2026-08-11 08:00:00",
                 "failure_code": "travel_attachment_resources_incomplete",
                 "contract_sha256": "a" * 64,
@@ -1402,7 +1402,7 @@ class ElasticQueueCliTest(unittest.TestCase):
 
         code, payload = self.invoke(
             "requeue-blocked-external-manual", "--state", str(self.state),
-            "--request-id", "2625001", "--expected-received-at", "2026-08-11 08:00:00",
+            "--request-id", "1002", "--expected-received-at", "2026-08-11 08:00:00",
             "--expected-result-code", "travel_attachment_resources_incomplete",
             "--expected-contract-sha256", "a" * 64, "--confirm-manual-review", "YES",
         )
@@ -1414,7 +1414,7 @@ class ElasticQueueCliTest(unittest.TestCase):
     def test_block_index_accepts_structured_memory_request_id_field(self) -> None:
         blocked = self.root / "memory.md"
         blocked.write_text(
-            "BLOCK|request_id=2625001|received_at=2026-08-11 08:01:00|"
+            "BLOCK|request_id=1002|received_at=2026-08-11 08:01:00|"
             "failure_code=partial_read|last_attempt_at=2026-08-11T08:30:00+08:00|"
             "contract_sha256=" + "a" * 64 + "\n",
             encoding="utf-8",
@@ -1423,8 +1423,8 @@ class ElasticQueueCliTest(unittest.TestCase):
         self.assertEqual(
             queue_cli._blocked_requests(str(blocked)),
             {
-                "2625001": {
-                    "request_id": "2625001",
+                "1002": {
+                    "request_id": "1002",
                     "received_at": "2026-08-11 08:01:00",
                     "failure_code": "partial_read",
                     "last_attempt_at": "2026-08-11T08:30:00+08:00",
@@ -1439,7 +1439,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             {
                 "items": [
                     {
-                        "requestId": "2625001",
+                        "requestId": "1002",
                         "flow_key": "business_entertainment",
                         "can_submit": True,
                     }
@@ -1451,7 +1451,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             {
                 "cases": [
                     {
-                        "request_id": "2625001",
+                        "request_id": "1002",
                         "submitted_at": "2026-08-11 08:00:00",
                         "received_at": "2026-08-11 08:01:00",
                     }
@@ -1477,7 +1477,7 @@ class ElasticQueueCliTest(unittest.TestCase):
                 {
                     "schema_version": 1,
                     "kind": "preaudit_material",
-                    "request_id": "2625001",
+                    "request_id": "1002",
                     "resources": [],
                     "prepared": {
                         "images": [],
@@ -1507,7 +1507,7 @@ class ElasticQueueCliTest(unittest.TestCase):
                 {
                     "schema_version": 1,
                     "kind": "preaudit_remark_envelope",
-                    "request_id": "2625001",
+                    "request_id": "1002",
                     "received_at": claim["received_at"],
                     "isolation_key": claim["isolation_key"],
                     "material_fingerprint": material_fingerprint,
@@ -1530,7 +1530,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             "--worker-id",
             "general-1",
             "--request-id",
-            "2625001",
+            "1002",
             "--lease-token",
             claim["lease_token"],
             "--material-file",
@@ -1556,7 +1556,7 @@ class ElasticQueueCliTest(unittest.TestCase):
         current_proof = self.write_json(
             "current-proof.json",
             {
-                "request_id": "2625001",
+                "request_id": "1002",
                 "received_at": claim["received_at"],
                 "isolation_key": claim["isolation_key"],
                 "can_submit": True,
@@ -1568,7 +1568,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             "--state",
             str(self.state),
             "--request-id",
-            "2625001",
+            "1002",
             "--current-proof-file",
             str(current_proof),
         )
@@ -1580,7 +1580,7 @@ class ElasticQueueCliTest(unittest.TestCase):
             "--state",
             str(self.state),
             "--request-id",
-            "2625001",
+            "1002",
             "--expected-received-at",
             claim["received_at"],
             "--expected-material-fingerprint",

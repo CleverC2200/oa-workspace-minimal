@@ -762,7 +762,7 @@ class ReadAdaptersContractTest(unittest.TestCase):
                 "data": {
                     "list": [
                         {
-                            "requestId": "2588333",
+                            "requestId": "1001",
                             "workflowId": "138023",
                             "workflowName": "差旅费报销流程",
                             "requestName": "差旅费报销流程-归档 CLBX20260624025",
@@ -793,7 +793,7 @@ class ReadAdaptersContractTest(unittest.TestCase):
             rows,
             [
                 {
-                    "request_id": "2588333",
+                    "request_id": "1001",
                     "workflow_id": "138023",
                     "workflow_name": "差旅费报销流程",
                     "request_name": "差旅费报销流程-归档 CLBX20260624025",
@@ -821,12 +821,12 @@ class ReadAdaptersContractTest(unittest.TestCase):
             require_connection: bool = False,
         ) -> list[dict]:
             calls.append((name, params, require_connection))
-            return [{"requestid": 2625001, "requestmark": "CLBX20260802011"}]
+            return [{"requestid": 1002, "requestmark": "CLBX20260802011"}]
 
         with patch.object(official_sql, "_query_rows", side_effect=recorded_query):
             request_id = official_sql.resolve_request_id(" CLBX20260802011 ")
 
-        self.assertEqual(request_id, "2625001")
+        self.assertEqual(request_id, "1002")
         self.assertEqual(
             calls,
             [
@@ -842,7 +842,7 @@ class ReadAdaptersContractTest(unittest.TestCase):
         cases = (
             ([], "flow_number_not_found"),
             (
-                [{"requestid": 2625001}, {"requestid": 2625002}],
+                [{"requestid": 1002}, {"requestid": 1003}],
                 "flow_number_not_unique",
             ),
         )
