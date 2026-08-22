@@ -97,8 +97,13 @@ def _validate_suite(payload: object) -> dict:
             or expected.get("stop_code") is not None
         ):
             raise ValueError("eval_case_invalid")
-        if scenario == "normal" and (
-            expected["outcome"] != "pass" or set(statuses) != {"✅"}
+        if scenario == "normal" and not (
+            (expected["outcome"] == "pass" and set(statuses) == {"✅"})
+            or (
+                expected["outcome"] == "evidence_insufficient"
+                and "⚠️" in statuses
+                and "❌" not in statuses
+            )
         ):
             raise ValueError("eval_case_invalid")
         if scenario == "business_warning" and (

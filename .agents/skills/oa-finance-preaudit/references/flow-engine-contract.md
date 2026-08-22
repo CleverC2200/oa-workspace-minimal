@@ -1,6 +1,6 @@
 # 本地 FlowEngine 合同
 
-当前合同覆盖 `travel_expense`、`business_entertainment` 和 `business_support_fee` 的 preview。三类流程使用同一接口、独立运行目录和各自规则包；旧角色入口暂时只用于回退，不得与本路径混用。
+当前合同覆盖 `travel_expense`、`business_entertainment`、`business_support_fee` 和 `small_marketing_fee` 的 preview。四类财务流程使用同一接口、独立运行目录和各自规则包；旧角色入口暂时只用于回退，不得与本路径混用。
 
 ## 两动作循环
 
