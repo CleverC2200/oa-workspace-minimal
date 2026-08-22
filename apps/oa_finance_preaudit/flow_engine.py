@@ -40,6 +40,15 @@ _FLOW_SPECS = {
             "reimbursable_minimum",
         ),
     },
+    "business_support_fee": {
+        "rule_version": "business_support_fee:1",
+        "item_keys": (
+            "attachment_completeness",
+            "business_compliance",
+            "budget_check",
+            "reimbursable_minimum",
+        ),
+    },
 }
 SHARED_FAILURE_CODES = {
     "submission_adapter_unavailable",

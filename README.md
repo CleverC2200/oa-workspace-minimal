@@ -45,7 +45,7 @@ cp .env.example .env
 
 ## 只读 preview
 
-差旅费和业务招待费已经提供同一个本地深模块两动作接口。先取得指定流程的下一个动作：
+差旅费、业务招待费和业务支持费已经提供同一个本地深模块两动作接口。先取得指定流程的下一个动作：
 
 ```bash
 python3 -m apps.oa_finance_preaudit.cli next-action \
@@ -60,7 +60,7 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
   --decision-file /absolute/path/to/review-decision.json
 ```
 
-两条公开命令默认且当前只支持 preview，动作固定 `write_authorized=false`，写入状态固定为 `not_requested`；不会调用 OA 提交。模块和 CLI 共用同一业务实现，大对象通过本地文件传递，stdout 只输出一个版本化 JSON。冻结材料、流程身份或持久状态不一致时返回正常的 `needs_admin` 动作并停止当前单据，不生成意见。两类流程的目录、锁和当前动作投影相互独立；积压中已有单据等待审核时，后续调用可取得另一单据，每个 attempt 使用自己的完成锁，互不等待。
+两条公开命令默认且当前只支持 preview，动作固定 `write_authorized=false`，写入状态固定为 `not_requested`；不会调用 OA 提交。模块和 CLI 共用同一业务实现，大对象通过本地文件传递，stdout 只输出一个版本化 JSON。冻结材料、流程身份或持久状态不一致时返回正常的 `needs_admin` 动作并停止当前单据，不生成意见。三类流程的目录、锁和当前动作投影相互独立；积压中已有单据等待审核时，后续调用可取得另一单据，每个 attempt 使用自己的完成锁，互不等待。
 
 旧的按 requestId 材料收集入口暂时作为回退能力保留：
 
