@@ -5,10 +5,11 @@ Writer 一次只提交一个已经冻结的 `requestId + received_at + attempt`�
 启动时使用 canonical 接口核对包含开发合同与生产提交代码的复合指纹：
 
 ```bash
-cd /Users/synear/HermesWorkspace/profiles/oa/projects/oa-workspace-minimal
+export PROJECT_ROOT=/absolute/path/to/oa-workspace-minimal
+cd "$PROJECT_ROOT"
 python3 -m apps.oa_finance_preaudit.role_cli writer release-manifest \
-  --project-root /Users/synear/HermesWorkspace/profiles/oa/projects/oa-workspace-minimal \
-  --writer-root /Users/synear/HermesWorkspace/profiles/oa/projects/oa-workspace-minimal
+  --project-root "$PROJECT_ROOT" \
+  --writer-root "$PROJECT_ROOT"
 ```
 
 不得从生产 cwd 推导项目合同路径，不得对单个文件自行计算哈希。只有返回的 `sha256` 与调度入口给定 writer 指纹一致才进入提交门禁。
@@ -25,12 +26,12 @@ Writer 只接收 canonical `live-inputs.json`，并复核 manifest 路径、两�
 门禁通过后只调用 canonical 单入口：
 
 ```bash
-cd /Users/synear/HermesWorkspace/profiles/oa/projects/oa-workspace-minimal
+cd "$PROJECT_ROOT"
 python3 -m apps.oa_finance_preaudit.role_cli writer submit-frozen-once \
-  --state /Users/synear/HermesWorkspace/profiles/oa/projects/oa-workspace-minimal/runtime/finance_preaudit_queue/state.json \
+  --state "$PROJECT_ROOT/runtime/finance_preaudit_queue/state.json" \
   --request-id REQUEST_ID \
   --live-inputs-manifest LIVE_INPUTS_JSON \
-  --production-root /Users/synear/HermesWorkspace/profiles/oa/projects/oa-workspace-minimal
+  --production-root "$PROJECT_ROOT"
 ```
 
 该入口连续执行 current proof、`begin-submit`、冻结提交、回执校验和 `mark-submitted`；取得 submission token 后不会返回模型控制权。调用方不得手工拼接阶段，也不得绕过冻结路径直接提交。

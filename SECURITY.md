@@ -1,16 +1,37 @@
-# 安全说明
+# 安全与本地数据边界
 
-## 禁止提交的内容
+仓库只保存代码、空值配置模板和脱敏测试样本。真实 OA 数据、附件、数据库、账号、密钥、Cookie、内部地址和模型服务凭据不得进入 Git、Issue、PR、Actions 日志或发布包。
 
-- 密钥、token、Cookie、账号密码和认证文件
-- 内部域名、IP、数据库连接信息和真实 Keychain 服务名
-- OA requestId、表单或附件正文、人员身份信息
-- SQLite、运行目录、浏览器 profile、未脱敏日志和调试快照
+## 本地存储位置
 
-本地配置从 `.env.example` 复制到被忽略的 `.env`。发现疑似泄露时，先停止发布和写入，轮换受影响凭据，再通过 GitHub 私有安全报告或直接联系仓库所有者；不要建立包含敏感值的公开或普通 Issue。
+| 内容 | 本地位置 | Git 状态 |
+| --- | --- | --- |
+| OA 地址、应用标识和应用密钥 | `.env` 或 `.env.oa-auth` | 已忽略 |
+| 数据库地址、服务名、账号 | `.env` | 已忽略 |
+| 数据库密码 | `.env`，或由 `OA_DB_KEYCHAIN_SERVICE` 指向 macOS Keychain | 已忽略或不在项目目录 |
+| 附件模型 API 地址、密钥和模型名 | `.env` | 已忽略 |
+| 下载附件、冻结材料、队列状态、SQLite 状态和脱敏指标 | `runtime/` | 已忽略 |
+| 临时分析和发布审计材料 | `.scratch/` | 已忽略 |
 
-CI 使用 `scripts.quality hygiene` 检查被跟踪的数据库文件、常见密钥格式、私钥头和带密码连接 URI。该扫描是提交前兜底，不替代凭据轮换；任何真实密钥一旦进入 Git 历史都按已泄露处理。
+`.env.example` 只列出变量名、空值和无效示例域名，不得填入可用凭据后提交。模型接入使用 `OA_ATTACHMENT_API_*`、`OA_ATTACHMENT_CODEX_*` 或 `OA_ATTACHMENT_AI_COMMAND`；这些配置没有仓库内真实默认值。
+
+## 发布门禁
+
+公开发布前至少执行：
+
+```bash
+python3 -m scripts.quality hygiene
+python3 -m scripts.quality links
+python3 -m unittest discover -s tests/finance_preaudit -p 'test_*.py' -v
+git diff --check
+```
+
+还必须扫描待发布的完整 Git 历史，而不只扫描工作树，并确认发布引用不包含数据库文件、真实业务标识、个人环境路径或凭据。若历史引用无法可靠清除，应从已验证的当前源码创建单提交公开快照，不得直接切换原仓库可见性。
 
 ## 自动化安全边界
 
 仓库发布、测试或合并不会自动授权 OA 写入。任何真实提交和定时任务启停都必须经过当前明确授权，并保留脱敏、可追溯的执行证据。
+
+## 泄露处置
+
+发现疑似泄露时立即停止发布，撤销并轮换对应凭据，再清理所有可达 Git 和托管平台引用。仅删除当前文件或新增一次覆盖提交不能清除历史内容。

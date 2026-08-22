@@ -41,7 +41,7 @@ docs/agents/                        # Issue、标签和领域文档约定
 cp .env.example .env
 ```
 
-只在本地填写真实配置。数据库连接没有仓库内默认账号或地址；如需从 macOS Keychain 读取密码，需同时配置 `OA_DB_USER` 和 `OA_DB_KEYCHAIN_SERVICE`。
+只在本地填写真实配置。数据库连接没有仓库内默认账号或地址；如需从 macOS Keychain 读取密码，需同时配置 `OA_DB_USER` 和 `OA_DB_KEYCHAIN_SERVICE`。完整的数据与凭据边界见[安全说明](SECURITY.md)。
 
 ## 只读 preview
 
@@ -139,8 +139,7 @@ python3 -m apps.oa_finance_preaudit.tuning \
 ## 验证
 
 ```bash
-python3 /Users/synear/.codex/skills/.system/skill-creator/scripts/quick_validate.py \
-  .agents/skills/oa-finance-preaudit
+python3 -m scripts.quality skill
 python3 -m unittest discover -s tests/finance_preaudit -p 'test_*.py' -v
 git diff --check
 ```
