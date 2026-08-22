@@ -264,6 +264,7 @@ def build_receipt(
     submission_token_sha256: str | None,
     observability_state: str,
     submission_result: dict,
+    quality: dict,
 ) -> dict:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -285,5 +286,6 @@ def build_receipt(
         "no_write_evidence": (
             "confirmed_no_write" if write_state == "not_requested" else None
         ),
+        "quality": quality,
         **submission_result,
     }

@@ -74,4 +74,4 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
 
 受控写入不是审核者可选择的模式。只有宿主同时注入绑定当前 `requestId + received_at + case_key + attempt + material_fingerprint + evidence_fingerprint` 的一次性授权、外部 verifier 和提交适配器时，FlowEngine 才生成写入 token；`complete-review` 提交前会再次调用 verifier。审核决定不能创建、修改或提升授权。
 
-每个 attempt 至少记录 discover、collect、review、close；受控写入还记录 submit、postcheck。当前运行的 Token 状态固定写 `unknown`。提交前事件不能保存时停止；已确认提交后才发生观测异常时，回执必须写 `observability_state=unknown`，禁止为了补日志重复提交。
+每个 attempt 至少记录 discover、collect、review、close；受控写入还记录 submit、postcheck。FlowEngine 不把“审核包已生成到结果写回”的墙钟时间直接当成等待或 Agent 活动；只有宿主提供绑定当前 item 的 exact timing receipt 时，验收报告才覆盖 `active_seconds` 与 `waiting_seconds`，否则两者保持 unknown 并阻止等待比例调优。coordination 秒数和 Token 固定为 0。当前运行的 Token 状态固定写 `unknown`。终态回执只保存审核项、资源、页面的 covered/total/applicable 计数和格式是否合规，不保存证据正文；资源 covered 必须来自决定中的具体资源引用，不能按材料存在自动填满。提交前事件不能保存时停止；已确认提交后才发生观测异常时，回执必须写 `observability_state=unknown`，禁止为了补日志重复提交。

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
 import threading
 
 from apps import json_artifact
-from apps.oa_finance_preaudit import flow_engine, submission
+from apps.oa_finance_preaudit import (
+    flow_engine,
+    flow_evals,
+    runtime_maintenance,
+    submission,
+)
 
 
 def _material(request_id: str) -> dict:
@@ -98,6 +104,31 @@ def _success(job: dict) -> dict:
     }
 
 
+def test_resource_coverage_comes_from_decision_references() -> None:
+    material = {
+        "resources": [
+            {"resource_id": "invoice-1"},
+            {"resource_id": "payment-1"},
+        ]
+    }
+
+    quality = flow_engine._quality_projection(
+        workflow_key="travel_expense",
+        material=material,
+        item_count=8,
+        evidence_refs={
+            "material:prepared.images.invoice-1.page-1",
+            "not-a-material-reference.payment-1.fake",
+        },
+    )
+
+    assert quality["resource_coverage"] == {
+        "applicable": True,
+        "covered": 1,
+        "total": 2,
+    }
+
+
 def _engine(
     root: Path,
     request_id: str,
@@ -164,6 +195,12 @@ def test_controlled_write_is_bound_to_action_and_closes_with_one_receipt(
     assert receipt["submit_ok"] is True
     assert receipt["done_hit"] is True
     assert receipt["postcheck_done_hit"] is True
+    assert receipt["quality"] == {
+        "item_coverage": {"applicable": True, "covered": 8, "total": 8},
+        "resource_coverage": {"applicable": False, "covered": 0, "total": 0},
+        "page_coverage": {"applicable": False, "covered": 0, "total": 0},
+        "format_ok": True,
+    }
     assert receipt["submission_token_sha256"] == hashlib.sha256(
         calls[0]["submission_token"].encode("utf-8")
     ).hexdigest()
@@ -179,7 +216,65 @@ def test_controlled_write_is_bound_to_action_and_closes_with_one_receipt(
         "postcheck",
         "close",
     ]
+    assert all(event["phase"] != "wait" for event in events)
+    assert all(event["phase"] != "coordination" for event in events)
     assert all(event["token_usage"] == {"status": "unknown"} for event in events)
+
+    runtime_status = runtime_maintenance.status(
+        tmp_path,
+        now=datetime.now(timezone.utc),
+    )
+    case_metric = runtime_status["case_metrics"][0]
+    state = json.loads(Path(action["state_file"]).read_text(encoding="utf-8"))
+    expected_backlog = max(
+        0,
+        int(
+            (
+                datetime.fromisoformat(state["created_at"])
+                - datetime.fromisoformat(state["received_at"])
+            ).total_seconds()
+        ),
+    )
+    acceptance = flow_evals.build_acceptance_report(
+        [case_metric],
+        replay_report={
+            "accuracy": 1.0,
+            "format_compliance": 1.0,
+            "differences": [],
+        },
+        cli_samples=[],
+        review_timing_receipts=[
+            {
+                "item_key": case_metric["item_key"],
+                "workflow_key": "travel_expense",
+                "active_seconds": case_metric["active_seconds"],
+                "waiting_seconds": 0,
+                "source": "host_exact",
+            }
+        ],
+        runtime_evidence={
+            "schema_version": 1,
+            "kind": "preaudit_runtime_evidence",
+            "window_start": case_metric["closed_at"],
+            "window_end": case_metric["closed_at"],
+            "by_flow": {
+                workflow_key: {
+                    "duplicate_submissions": 0,
+                    "cross_case_mix": 0,
+                    "unknown_auto_retries": 0,
+                    "agent_messages": 0,
+                }
+                for workflow_key in flow_engine.WORKFLOW_KEYS
+            },
+        },
+    )
+    assert acceptance["cases"][0]["timing_status"] == "exact"
+    assert acceptance["overall"]["closed_samples"] == 1
+    assert acceptance["sample_eligible"] is False
+    assert case_metric["backlog_age_seconds"] == expected_backlog
+    assert case_metric["unknown_auto_retries"] == "unknown"
+    assert case_metric["agent_messages"] == "unknown"
+    assert acceptance["quality_gate"]["agent_messages_0"] is True
 
 
 def test_preview_never_calls_submitter_and_cannot_be_promoted_by_decision(

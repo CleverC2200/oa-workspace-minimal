@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import io
 import json
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 
 import pytest
 
@@ -44,6 +45,8 @@ def test_removed_mechanical_commands_are_not_parseable(removed_command: str) -> 
 
 
 def test_next_action_uses_the_deep_module_and_prints_one_json() -> None:
+    receipts: list[dict] = []
+
     class Engine:
         def next_action(self, workflow: str, *, mode: str) -> dict:
             return {
@@ -59,11 +62,116 @@ def test_next_action_uses_the_deep_module_and_prints_one_json() -> None:
         exit_code = cli.main(
             ["next-action", "--workflow", "travel_expense"],
             flow_engine_factory=Engine,
+            invocation_sink=receipts.append,
         )
 
     assert exit_code == 0
     assert json.loads(output.getvalue())["action"] == "closed"
     assert output.getvalue().count("\n") == 1
+    assert receipts[0]["workflow_key"] == "travel_expense"
+    assert receipts[0]["command"] == "next-action"
+    assert receipts[0]["outcome"] == "success"
+    assert receipts[0]["human_reproduction"] == "not_attempted"
+    assert set(receipts[0]) == {
+        "workflow_key",
+        "command",
+        "occurred_at",
+        "outcome",
+        "human_reproduction",
+    }
+
+
+def test_cli_failure_emits_sanitized_classification() -> None:
+    receipts: list[dict] = []
+
+    class Engine:
+        def next_action(self, workflow: str, *, mode: str) -> dict:
+            raise ValueError("review_decision_invalid")
+
+    output = io.StringIO()
+    with redirect_stdout(output):
+        exit_code = cli.main(
+            ["next-action", "--workflow", "travel_expense"],
+            flow_engine_factory=Engine,
+            invocation_sink=receipts.append,
+        )
+
+    assert exit_code == 1
+    assert receipts == [
+        {
+            "workflow_key": "travel_expense",
+            "command": "next-action",
+            "occurred_at": receipts[0]["occurred_at"],
+            "outcome": "json_contract_error",
+            "human_reproduction": "not_attempted",
+        }
+    ]
+    assert "review_decision_invalid" not in json.dumps(receipts)
+
+
+def test_metrics_sink_failure_never_changes_command_result() -> None:
+    class Engine:
+        def next_action(self, workflow: str, *, mode: str) -> dict:
+            return {"workflow_key": workflow, "action": "closed"}
+
+    output = io.StringIO()
+    with redirect_stdout(output):
+        exit_code = cli.main(
+            ["next-action", "--workflow", "travel_expense"],
+            flow_engine_factory=Engine,
+            invocation_sink=lambda _receipt: (_ for _ in ()).throw(
+                OSError("metrics unavailable")
+            ),
+        )
+
+    assert exit_code == 0
+    assert json.loads(output.getvalue())["action"] == "closed"
+
+
+def test_module_entry_persists_global_command_once(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    output = io.StringIO()
+    with redirect_stdout(output):
+        exit_code = cli.main(
+            ["status", "--root", str(root)],
+            runtime_status=lambda _root: {"kind": "preaudit_runtime_status"},
+            persist_invocations=True,
+        )
+
+    assert exit_code == 0
+    payload = json.loads(
+        (root / ".metrics" / "cli-invocations.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert len(payload["events"]) == 1
+    assert payload["events"][0]["workflow_key"] == "global"
+    assert all(event["command"] == "status" for event in payload["events"])
+
+
+def test_module_entry_records_argument_error_without_argv(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    stderr = io.StringIO()
+    with redirect_stderr(stderr):
+        exit_code = cli.entrypoint(
+            ["status", "--root", str(root), "--unexpected"]
+        )
+
+    assert exit_code == 2
+    text = (root / ".metrics" / "cli-invocations.json").read_text(
+        encoding="utf-8"
+    )
+    payload = json.loads(text)
+    assert len(payload["events"]) == 1
+    assert all(event["outcome"] == "argument_error" for event in payload["events"])
+    assert str(root) not in text
+    assert "--unexpected" not in text
 
 
 def test_complete_review_uses_the_same_deep_module(tmp_path) -> None:

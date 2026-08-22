@@ -227,6 +227,126 @@ def _flow_items(workflow_key: str) -> list[dict]:
     ]
 
 
+def _coverage(*, covered: int, total: int, applicable: bool) -> dict:
+    return {
+        "applicable": applicable,
+        "covered": covered,
+        "total": total,
+    }
+
+
+def _quality_projection(
+    *,
+    workflow_key: str,
+    material: dict,
+    item_count: int,
+    evidence_refs: set[str],
+    covered_page_count: int = 0,
+) -> dict:
+    resources = material.get("resources")
+    resource_ids = {
+        str(resource.get("resource_id") or "")
+        for resource in resources
+        if isinstance(resource, dict) and resource.get("resource_id")
+    } if isinstance(resources, list) else set()
+    reference_prefixes = {
+        resource_id: {
+            f"material:resources.{resource_id}.",
+            f"material:prepared.images.{resource_id}.",
+            f"material:prepared.structured_contents.{resource_id}.",
+        }
+        for resource_id in resource_ids
+    }
+    prepared = material.get("prepared")
+    if isinstance(prepared, dict):
+        for collection in ("images", "structured_contents"):
+            entries = prepared.get(collection)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                bound_id = str(
+                    entry.get("parent_resource_id")
+                    or entry.get("resource_id")
+                    or ""
+                )
+                entry_id = str(entry.get("resource_id") or "")
+                if bound_id in reference_prefixes and entry_id:
+                    reference_prefixes[bound_id].add(
+                        f"material:prepared.{collection}.{entry_id}."
+                    )
+    covered_resources = {
+        resource_id
+        for resource_id, prefixes in reference_prefixes.items()
+        if f"material:resources.{resource_id}" in evidence_refs
+        or any(
+            reference.startswith(prefix)
+            for reference in evidence_refs
+            for prefix in prefixes
+        )
+    }
+    page_applicable = workflow_key == "packaging_layout_approval"
+    return {
+        "item_coverage": _coverage(
+            covered=item_count,
+            total=item_count,
+            applicable=True,
+        ),
+        "resource_coverage": _coverage(
+            covered=len(covered_resources),
+            total=len(resource_ids),
+            applicable=bool(resource_ids),
+        ),
+        "page_coverage": _coverage(
+            covered=covered_page_count,
+            total=covered_page_count,
+            applicable=page_applicable,
+        ),
+        "format_ok": True,
+    }
+
+
+def _valid_quality_projection(value: object, workflow_key: str) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "item_coverage",
+        "resource_coverage",
+        "page_coverage",
+        "format_ok",
+    }:
+        return False
+    for name in ("item_coverage", "resource_coverage", "page_coverage"):
+        coverage = value.get(name)
+        if not isinstance(coverage, dict) or set(coverage) != {
+            "applicable",
+            "covered",
+            "total",
+        }:
+            return False
+        applicable = coverage["applicable"]
+        covered = coverage["covered"]
+        total = coverage["total"]
+        if (
+            not isinstance(applicable, bool)
+            or isinstance(covered, bool)
+            or not isinstance(covered, int)
+            or isinstance(total, bool)
+            or not isinstance(total, int)
+            or covered < 0
+            or total < 0
+            or covered > total
+            or (applicable and total < 1)
+            or (not applicable and (covered != 0 or total != 0))
+        ):
+            return False
+    return (
+        value["item_coverage"]["applicable"] is True
+        and value["page_coverage"]["applicable"]
+        is (workflow_key == "packaging_layout_approval")
+        and value.get("format_ok") is True
+    )
+
+
 def _path_within(value: object, root: Path, *, code: str) -> Path:
     raw = str(value or "").strip()
     if not raw:
@@ -584,6 +704,7 @@ class FlowEngine:
             "postcheck": 5,
             "close": 6,
         }
+        duration = max(0, int(wall_seconds))
         try:
             observability.record_attempt_phase(
                 {
@@ -595,8 +716,8 @@ class FlowEngine:
                 },
                 event_id=f"{order[phase]:02d}-{phase}",
                 phase=phase,
-                wall_seconds=max(0, int(wall_seconds)),
-                active_seconds=max(0, int(wall_seconds)),
+                wall_seconds=duration,
+                active_seconds=duration,
                 result=result,
                 token_usage={"status": "unknown"},
             )
@@ -756,6 +877,7 @@ class FlowEngine:
             "submit_ok",
             "done_hit",
             "postcheck_done_hit",
+            "quality",
         }
         identity = {
             "schema_version": SCHEMA_VERSION,
@@ -778,6 +900,10 @@ class FlowEngine:
             or any(receipt.get(key) != value for key, value in identity.items())
             or receipt.get("business_state") not in {"pass", "needs_human"}
             or receipt.get("observability_state") not in {"complete", "unknown"}
+            or not _valid_quality_projection(
+                receipt.get("quality"),
+                workflow_key,
+            )
         ):
             raise ValueError("execution_receipt_invalid")
         files = {
@@ -2038,6 +2164,25 @@ class FlowEngine:
         )
 
         observability_state = "complete" if observability_complete else "unknown"
+        quality_material = packaging_material or _read_object(
+            Path(state["material_file"]),
+            code="frozen_material_changed",
+        )
+        quality = _quality_projection(
+            workflow_key=action["workflow_key"],
+            material=quality_material,
+            item_count=len(normalized_items),
+            evidence_refs={
+                reference
+                for item in normalized_items
+                for reference in item["evidence_refs"]
+            },
+            covered_page_count=(
+                len(_packaging_page_refs(quality_material))
+                if action["workflow_key"] == "packaging_layout_approval"
+                else 0
+            ),
+        )
         receipt = submission.build_receipt(
             action=action,
             state=state,
@@ -2049,6 +2194,7 @@ class FlowEngine:
             submission_token_sha256=submission_token_sha256,
             observability_state=observability_state,
             submission_result=submission_result,
+            quality=quality,
         )
         receipt_file = action_path.with_name("execution-receipt.json")
         json_artifact.write_json_atomic(receipt_file, receipt, indent=2)
