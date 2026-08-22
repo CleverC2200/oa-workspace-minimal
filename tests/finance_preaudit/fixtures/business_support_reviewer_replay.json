@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "workflow_key": "business_support_fee",
+  "rule_version": "business_support_fee:1",
+  "cases": [
+    {"case_id":"support-normal-v1","material_workflow":"business_support_fee","statuses":["pass","pass","pass","pass"]},
+    {"case_id":"support-warning-v1","material_workflow":"business_support_fee","statuses":["pass","fail","pass","pass"]},
+    {"case_id":"support-insufficient-v1","material_workflow":"business_support_fee","statuses":["uncertain","uncertain","pass","pass"]},
+    {"case_id":"support-technical-v1","material_workflow":"travel_expense","statuses":[]}
+  ]
+}
