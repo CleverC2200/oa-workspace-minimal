@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from apps import json_artifact
-from apps.oa_finance_preaudit import cli, retention, runtime_maintenance
+from apps.oa_finance_preaudit import cli, observability, retention, runtime_maintenance
 
 
 NOW = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
@@ -60,7 +60,7 @@ def _attempt(
 
 def test_status_is_versioned_and_sanitized(tmp_path: Path) -> None:
     root = tmp_path / "runtime"
-    _attempt(
+    first_attempt = _attempt(
         root,
         case_key="a" * 64,
         attempt=1,
@@ -77,6 +77,73 @@ def test_status_is_versioned_and_sanitized(tmp_path: Path) -> None:
         execution_state="review_required",
         business_state="not_available",
     )
+    archived_attempt = _attempt(
+        root,
+        case_key="c" * 64,
+        attempt=1,
+        age_days=10,
+        archived=True,
+    )
+    boundary_attempt = _attempt(
+        root,
+        case_key="d" * 64,
+        attempt=1,
+        age_days=30,
+        archived=True,
+    )
+    expired_attempt = _attempt(
+        root,
+        case_key="e" * 64,
+        attempt=1,
+        age_days=31,
+        archived=True,
+    )
+    observability.record_attempt_phase(
+        {
+            "request_root": str(first_attempt),
+            "request_id": "recorded-request",
+            "received_at": "2026-08-22T09:00:00+08:00",
+            "attempt": 1,
+            "flow_key": "travel_expense",
+        },
+        event_id="review",
+        phase="review",
+        wall_seconds=5,
+        active_seconds=5,
+        result="success",
+    )
+    observability.record_attempt_phase(
+        {
+            "request_root": str(archived_attempt),
+            "request_id": "archived-request",
+            "received_at": "2026-08-12T09:00:00+08:00",
+            "attempt": 1,
+            "flow_key": "travel_expense",
+        },
+        event_id="close",
+        phase="close",
+        wall_seconds=2,
+        active_seconds=2,
+        result="success",
+    )
+    for attempt_root, request_id, wall_seconds in (
+        (boundary_attempt, "boundary-request", 3),
+        (expired_attempt, "expired-request", 100),
+    ):
+        observability.record_attempt_phase(
+            {
+                "request_root": str(attempt_root),
+                "request_id": request_id,
+                "received_at": "2026-07-23T20:00:00+08:00",
+                "attempt": 1,
+                "flow_key": "travel_expense",
+            },
+            event_id="close",
+            phase="close",
+            wall_seconds=wall_seconds,
+            active_seconds=wall_seconds,
+            result="success",
+        )
 
     status = runtime_maintenance.status(root, now=NOW)
     encoded = json.dumps(status, ensure_ascii=False)
@@ -94,6 +161,9 @@ def test_status_is_versioned_and_sanitized(tmp_path: Path) -> None:
         "review_required": 1,
     }
     assert flow["failure_counts"] == {"observability_incomplete": 1}
+    assert status["observability"]["event_count"] == 3
+    assert status["observability"]["totals"]["approval"]["wall_seconds"] == 10
+    assert status["observability"]["totals"]["approval"]["usage_unknown_events"] == 3
     assert "sensitive" not in encoded
     assert str(root) not in encoded
     assert "request_id" not in encoded

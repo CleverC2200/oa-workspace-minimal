@@ -1,13 +1,13 @@
-"""OA finance preaudit orchestration."""
+"""OA finance preaudit deep module."""
 
-__all__ = ["collect_case"]
+__all__ = ["FlowEngine"]
 
 
 def __getattr__(name: str) -> object:
-    if name != "collect_case":
+    if name != "FlowEngine":
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
-    from .case_bundle import collect_case
+    from .flow_engine import FlowEngine
 
-    globals()[name] = collect_case
-    return collect_case
+    globals()[name] = FlowEngine
+    return FlowEngine

@@ -135,37 +135,3 @@ class TestObservability:
 
         assert "REQ-1" not in self.log.read_text(encoding="utf-8")
         assert payload["kind"] == "preaudit_observability"
-
-    def test_exact_usage_can_enrich_unknown_once(self) -> None:
-        observability.record_event(
-            self.log,
-            self.event(model=None, token_usage={"status": "unknown"}),
-        )
-
-        first = observability.attach_exact_usage(
-            self.log,
-            item_key=self.item_key,
-            event_id="event-1",
-            model="gpt-5.6-terra",
-            input_tokens=12,
-            output_tokens=3,
-            total_tokens=15,
-        )
-        replay = observability.attach_exact_usage(
-            self.log,
-            item_key=self.item_key,
-            event_id="event-1",
-            model="gpt-5.6-terra",
-            input_tokens=12,
-            output_tokens=3,
-            total_tokens=15,
-        )
-
-        assert not first["replayed"]
-        assert replay["replayed"]
-        assert (
-            observability.summarize_logs([self.log])["totals"]["approval"][
-                "total_tokens"
-            ]
-            == 15
-        )

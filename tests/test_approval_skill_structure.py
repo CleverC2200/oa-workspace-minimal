@@ -5,17 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from apps.oa_finance_preaudit import collect_case as public_collect_case
-from apps.oa_finance_preaudit.case_bundle import collect_case
+from apps.oa_finance_preaudit import FlowEngine
+from apps.oa_finance_preaudit.flow_engine import FlowEngine as DefinedFlowEngine
 
 ROOT = Path(__file__).resolve().parents[1]
-APPROVAL_SKILLS = {
-    "oa-finance-preaudit": ROOT / ".agents" / "skills" / "oa-finance-preaudit",
-    "lark-sync-oa-approval-status": ROOT
-    / ".agents"
-    / "skills"
-    / "lark-sync-oa-approval-status",
-}
+FINANCE_SKILL = ROOT / ".agents" / "skills" / "oa-finance-preaudit"
+SYNC_SKILL = ROOT / ".agents" / "skills" / "lark-sync-oa-approval-status"
+APPROVAL_SKILLS = {"oa-finance-preaudit": FINANCE_SKILL, "lark-sync": SYNC_SKILL}
 PHASES = [
     "## 0. 目标门禁",
     "## 1. 输入与证据",
@@ -35,16 +31,24 @@ REFERENCE_FILES = {
 
 
 class TestApprovalSkillStructure:
-    def test_finance_preaudit_keeps_public_collect_case_import(self) -> None:
-        assert public_collect_case is collect_case
+    def test_finance_preaudit_exports_only_the_deep_module(self) -> None:
+        assert FlowEngine is DefinedFlowEngine
 
-    @pytest.mark.parametrize("name,skill_dir", APPROVAL_SKILLS.items())
-    def test_all_approval_skills_share_closed_loop_phases(
-        self, name: str, skill_dir: Path
-    ) -> None:
-        content = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+    def test_sync_skill_keeps_the_generic_closed_loop_phases(self) -> None:
+        content = (SYNC_SKILL / "SKILL.md").read_text(encoding="utf-8")
         positions = [content.index(phase) for phase in PHASES]
-        assert positions == sorted(positions), name
+        assert positions == sorted(positions)
+
+    def test_finance_skill_keeps_only_the_four_step_deep_module_loop(self) -> None:
+        content = (FINANCE_SKILL / "SKILL.md").read_text(encoding="utf-8")
+        phases = (
+            "## 1. 取得当前动作",
+            "## 2. 读取证据",
+            "## 3. 形成结构化决定",
+            "## 4. 完成审核",
+        )
+        positions = [content.index(phase) for phase in phases]
+        assert positions == sorted(positions)
 
     @pytest.mark.parametrize("name,skill_dir", APPROVAL_SKILLS.items())
     def test_all_approval_skills_have_closed_loop_references(
@@ -61,12 +65,8 @@ class TestApprovalSkillStructure:
         assert isinstance(cases["cases"], list)
 
     def test_effect_and_postcheck_are_distinct(self) -> None:
-        finance = (APPROVAL_SKILLS["oa-finance-preaudit"] / "SKILL.md").read_text(
-            encoding="utf-8"
-        )
-        sync = (APPROVAL_SKILLS["lark-sync-oa-approval-status"] / "SKILL.md").read_text(
-            encoding="utf-8"
-        )
+        finance = (FINANCE_SKILL / "SKILL.md").read_text(encoding="utf-8")
+        sync = (SYNC_SKILL / "SKILL.md").read_text(encoding="utf-8")
         assert "preview-only" in finance
         assert "external-write" in sync
         assert "external_instances/check" in sync

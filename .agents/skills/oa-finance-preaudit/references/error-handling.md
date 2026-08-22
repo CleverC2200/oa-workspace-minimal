@@ -8,7 +8,7 @@
 - 资源无法证明属于当前流程；
 - OA 已声明或返回的相关附件资源缺失、损坏、未完整读取或 PDF 页面覆盖不全；
 - 权威接口失败且该数据是当前审核项的必要依据；
-- `collect-case` 未返回唯一的 `schema_version=1`、`kind=preaudit_material` JSON；
+- FlowEngine 未生成唯一的 `schema_version=1`、`kind=preaudit_material` 冻结材料；
 - 只读测试过程中出现任何写入、流转或 automation 变更请求。
 
 业务上的 `❌/⚠️` 不是技术失败。附件内容确实可读，但某项事实没有出现或关系不足时，在对应审核项标为 `⚠️`；不得伪造证据，也不得换旧 runner 手工提交。

@@ -421,6 +421,119 @@ def test_changed_evidence_bytes_return_needs_admin_without_closing(
     assert not Path(action["action_file"]).with_name("remark.txt").exists()
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "resource_request_mismatch",
+        "source_identity_missing",
+        "attachment_outside_attempt",
+        "prepared_resource_unbound",
+        "manifest_coverage_incomplete",
+        "native_image_uses_other_resource",
+        "archive_child_outside_prepared",
+        "unknown_manifest_resource",
+    ),
+)
+def test_material_safety_failures_stop_at_the_deep_module_interface(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    def collect(request_id: str, attempt_root: Path) -> dict:
+        material = _travel_material_with_attachment(request_id, attempt_root)
+        if mutation == "resource_request_mismatch":
+            material["resources"][0]["request_id"] = "different-request"
+        elif mutation == "source_identity_missing":
+            material["resources"][0]["source_resource_id"] = ""
+        elif mutation == "attachment_outside_attempt":
+            outside = tmp_path / "outside.bin"
+            outside.write_bytes(b"outside")
+            material["resources"][0]["local_readonly_path"] = str(outside)
+        elif mutation == "prepared_resource_unbound":
+            material["prepared"]["images"][0]["resource_id"] = "different-resource"
+        elif mutation == "native_image_uses_other_resource":
+            second = attempt_root / "attachments" / "second.bin"
+            second.write_bytes(b"second")
+            material["resources"].append(
+                {
+                    "request_id": request_id,
+                    "resource_id": "evidence-2",
+                    "source_resource_id": "source-2",
+                    "source_system": "oa",
+                    "local_readonly_path": str(second),
+                }
+            )
+            material["prepared"]["manifest"].append(
+                {"resource_id": "evidence-2", "status": "image"}
+            )
+            material["prepared"]["images"][0]["path"] = str(second)
+        elif mutation == "archive_child_outside_prepared":
+            child = attempt_root / "attachments" / "archive-child.png"
+            child.write_bytes(b"archive-child")
+            material["prepared"]["images"][0] = {
+                "resource_id": "evidence-1::archive::1",
+                "parent_resource_id": "evidence-1",
+                "path": str(child),
+            }
+        elif mutation == "unknown_manifest_resource":
+            material["prepared"]["manifest"].append(
+                {"resource_id": "unknown-resource", "status": "image"}
+            )
+        else:
+            material["prepared"]["manifest"] = []
+        return material
+
+    engine = flow_engine.FlowEngine(
+        root=tmp_path / "runtime",
+        discover_candidates=lambda workflow_key: [
+            {
+                "request_id": "recorded-request",
+                "received_at": "2026-08-22T09:00:00+08:00",
+                "workflow_key": workflow_key,
+            }
+        ],
+        collect_material=collect,
+    )
+
+    result = engine.next_action("travel_expense")
+
+    assert result["action"] == "needs_admin"
+    assert result["reason"] == "material_collection_failed"
+    assert result["write_state"] == "not_requested"
+
+
+def test_prepared_archive_child_bound_to_parent_is_accepted(
+    tmp_path: Path,
+) -> None:
+    def collect(request_id: str, attempt_root: Path) -> dict:
+        material = _travel_material_with_attachment(request_id, attempt_root)
+        material["prepared"]["images"][0] = {
+            "resource_id": "evidence-1::archive::1",
+            "parent_resource_id": "evidence-1",
+            "path": str(attempt_root / "prepared" / "evidence.png"),
+        }
+        material["prepared"]["structured_contents"] = [
+            {
+                "resource_id": "evidence-1::document-text",
+                "parent_resource_id": "evidence-1",
+            }
+        ]
+        return material
+
+    engine = flow_engine.FlowEngine(
+        root=tmp_path / "runtime",
+        discover_candidates=lambda workflow_key: [
+            {
+                "request_id": "recorded-request",
+                "received_at": "2026-08-22T09:00:00+08:00",
+                "workflow_key": workflow_key,
+            }
+        ],
+        collect_material=collect,
+    )
+
+    assert engine.next_action("travel_expense")["action"] == "review_required"
+
+
 def test_closed_preview_creates_a_fresh_attempt_without_overwriting_history(
     tmp_path: Path,
 ) -> None:

@@ -1,162 +1,68 @@
 ---
 name: oa-finance-preaudit
-description: 使用 Codex 对 Weaver E9 四类财务报销和包装版面流程执行只读预审：接受 requestId、业务流程编号或已授权单流程候选，复用项目脚本读取表单与附件；财务流程按固定项目核实证据，包装流程校对图片文字并在存在 Excel 时逐字符对照。输出结论先行、状态标识前置的 ✅/❌/⚠️ 意见；不批准、不退回、不拦截，本 Skill 自身不写 OA。
+description: 使用 Codex 对 Weaver E9 四类财务报销和包装版面流程执行预审：读取 FlowEngine 冻结证据，按当前流程固定审核项形成结构化决定；财务只给意见，包装只校对文字。
 ---
 
 # OA 财务预审
 
-让 Codex 承担证据阅读、关系判断和对应流程的固定项目预审；只调用项目已有的稳定取数与附件工具。不要把本 Skill 扩展成新的通用审批引擎。
+目标是用最短路径完成一张单据的一类流程审核：FlowEngine 负责发现、取数、冻结和状态；Codex 只读取证据并形成业务决定。
 
-首要运行目标是快速、准确、持续排空已授权报销待办。准确性由单据身份、附件归属与覆盖、证据关系和固定审核项保证；吞吐由五个互不依赖的单流程入口、单据隔离审核和 requestId 级提交池保证。安全门禁只保护事实可信与写入确定性，不能把控制面动作变成审批路障；每轮排空后立即闭合，不保留永久控制台。
+手工任务固定为 `preview-only`；本 Skill 不批准、不退回，也不改变 OA 状态。
 
-## 0. 目标门禁
+## 1. 取得当前动作
 
-- 当前目标流程为：`travel_expense`、`business_entertainment`、`business_support_fee`、`small_marketing_fee`、`packaging_layout_approval`。必须先精确识别流程，再选择对应审核项，不能把差旅八项或财务金额规则套给包装流程。
-- 只有 requestId 或业务流程编号能够唯一定位单据时继续；无法唯一定位时停止，不猜测。
-- 本 Skill 只给财务预审意见，不退回、不拦截，也不替代后续财务审批。
-- 本 Skill 自身只生成冻结后的财务预审意见，不直接写 OA。手工任务固定为 `preview-only`。
-- 仅当用户已明确授权的生产自动化调用本 Skill 时，才可把冻结意见交给项目既有的安全写入器；不得由本 Skill 绕过安全门、直接批准、退回或继续流程。
-- 不读取、输出或复制凭据、Cookie、token、密码和无关附件正文。
-
-五类流程 preview 统一使用[本地 FlowEngine 合同](references/flow-engine-contract.md)：只执行 `next-action`，读取返回的审核包及其冻结材料，写出结构化审核决定，再执行 `complete-review`。不得为该路径创建 Reviewer、Writer、Observer、控制台或 Agent-to-Agent 消息；不得自行处理 requestId、目录、哈希、状态或意见渲染。包装流程仍须按其规则包调用中文图片文字校对 Skill，禁止 OCR。
-
-自动化运行先读取[单流程定时运行合同](references/flow-runner-contract.md)。五个入口各自只加载当前流程的规则包和当前单据；每个角色只读取本角色合同，不得加载旧小时 dispatcher、当天控制台或其他流程上下文。单据审核 Agent 再读取[单据审核 Agent 合同](references/reviewer-contract.md)，Writer 读取[按请求隔离的 OA 提交合同](references/writer-contract.md)。
-
-运行角色只从项目的窄入口执行机械动作；底层 `queue_cli` 只作为实现和回滚兼容面。旧[自动化批次总契约](references/automation-batch-contract.md)、[每日控制台合同](references/controller-contract.md)和[小时调度合同](references/dispatcher-contract.md)只用于尚未启用新入口前的诊断与回滚，不进入新自动化上下文。
-
-每个审核 Agent 只处理一个 `requestId + received_at + attempt`，材料、附件、意见和封套使用唯一独立目录。身份、租约、路径、manifest 覆盖、封套或指纹不一致都属于当前单据的技术安全阻断，禁止进入 OA 写入，但不得阻断其他流程。
-
-自动化 reviewer 不手工拼接采集、整进程超时、结果 JSON、封套或哈希；统一使用 reviewer 合同中的 `collect-assignment` 与 `seal-review`。脚本只固定身份、路径、失败码和指纹，材料观察与财务判断仍由 Codex 完成。
-
-## 1. 输入与证据
-
-优先复用 `apps/oa_approval/` 已验证的 OA、数据库、附件、商旅和发票能力。按唯一标识执行。
-
-已知业务流程编号时，直接执行：
+从项目根执行：
 
 ```bash
-python3 -m apps.oa_finance_preaudit.cli collect-case \
-  --flow-number FLOW_NUMBER \
-  --allow-browser-download
+python3 -m apps.oa_finance_preaudit.cli next-action \
+  --workflow WORKFLOW_KEY
 ```
 
-该入口使用只读参数化 SQL 按业务流程编号精确查询唯一 requestId，再执行同一份 `collect-case`。零条、多条或数据库查询失败都属于技术失败，必须停止；不得改用标题、浏览器搜索或候选遍历猜测。
+按返回动作处理：
 
-已知 requestId 时，直接执行：
+- `closed`：本轮完成。
+- `needs_admin`：报告脱敏 `reason` 后停止当前单据。
+- `review_required`：继续下一步；只读取 `review_packet_file` 及其引用的 `material_file`。
 
-仅在人工对照测试需要从已办流程抽样时，可以先执行：
+动作、材料和审核包均为只读。完整的动作字段、技术失败和闭合语义见[本地 FlowEngine 合同](references/flow-engine-contract.md)。
+
+## 2. 读取证据
+
+先确认审核包的 `workflow_key`，再从[共享结果接口与流程路由](references/result-contract.md)只加载对应的一个流程规则包。完整读取[证据阅读规则](references/observation-contract.md)，并满足以下完成条件：
+
+- 表单明细、相关资源和准备页全部覆盖；
+- 每条采用的证据同时证明资源归属和审核项关系；
+- 权威字段优先，图片不可见或关系不明的事实保持未知；
+- 流程身份、附件归属、读取完整性不可信时停止当前单据。
+
+包装流程同时调用项目的中文图片文字校对 Skill，直接观察原图；存在 Excel 时逐字符对照。包装只校对关键文字，不扩展为法规审核。
+
+## 3. 形成结构化决定
+
+决定必须遵守[本地 FlowEngine 合同](references/flow-engine-contract.md)中的 `preaudit_review_decision` 结构：
+
+- `items` 与审核包的固定项目数量、顺序和 `item_key` 完全一致；
+- 每项包含 `status`、简明 `conclusion`、`evidence_refs` 和 `missing_evidence`；
+- `pass`、`fail` 必须有可回查证据，`uncertain` 必须写明缺口；
+- 任一项目为 `fail` 或 `uncertain` 时，`overall=needs_human`；全部为 `pass` 时，`overall=pass`；
+- 包装决定增加合同规定的 `excel_comparison`，并覆盖每个冻结图片页。
+
+业务 `fail` 和 `uncertain` 是正常预审结果，不代表批准、退回或技术失败。
+
+## 4. 完成审核
+
+把决定写入新的本地 JSON 文件，然后执行：
 
 ```bash
-python3 -m apps.oa_finance_preaudit.cli list-handled \
-  --page-size 200 \
-  --max-pages 5
+python3 -m apps.oa_finance_preaudit.cli complete-review \
+  --action-file /absolute/path/to/action.json \
+  --decision-file /absolute/path/to/review-decision.json
 ```
 
-该输出只是不含审批意见的候选索引，标题不能作为流程身份或业务证据。选中候选后，必须继续用其 requestId 执行 `collect-case`，并以材料中的 `workflow_key` 精确确认流程。用户已经提供业务流程编号时不得先扫描已办。
+只有返回 `action=closed` 才完成当前单据。返回 `needs_admin` 时报告脱敏原因并停止；不得修改冻结文件后重试。
 
-```bash
-python3 -m apps.oa_finance_preaudit.cli collect-case \
-  --request-id REQUEST_ID \
-  --allow-browser-download
-```
+## 5. 输出与反馈
 
-只接受 `schema_version=1`、`kind=preaudit_material` 的唯一 JSON 输出。该命令只负责收集材料，不接收 observation、remark、effect、写入确认或 automation 参数；最终审核判断由 Codex 根据材料形成。
+向用户展示的意见遵守[共享结果接口](references/result-contract.md)：整体结论先行，状态前置，固定项目完整且不增加第二套摘要。
 
-检查以下覆盖范围：
-
-- 表单主字段和全部费用明细；
-- 当前 request 直接附件及能够证明属于当前 request 的商旅关联附件；
-- PDF 全部页面、图片原图和确定性结构化提取内容；
-- 发票购买方、岗位、负责区域等可用权威来源。
-
-材料较长时，按审核项分段读取同一次 `collect-case` 返回结构；不得依赖终端中被截断的片段直接下结论。先为当前流程的每个固定审核项完整枚举相关明细和唯一值，再进行比较，不能看到首批匹配项后提前停止。
-
-逐一检查：
-
-- `workflow_key` 必须是五个目标流程之一；
-- `resources[*].request_id` 必须等于当前 requestId；
-- 可确认明细归属时必须有 `owner_detail_id`；无法确认时保持空值，不能按附件顺序补猜；
-- `prepared.manifest` 必须覆盖所有资源，PDF 的 `image_count` 必须等于实际页面数；
-- 为每个 `prepared.images` 页面建立覆盖记录：必须已经直接观察、已由原生观察子 agent 返回带资源定位的观察，或已有同页确定性文本足以回答当前审核项；不得因页面多、终端截断或已有部分结论跳过剩余页面；
-- 任一相关资源缺失、损坏、不支持或未完整准备时，按技术失败停止，不生成貌似完整的 preview。
-
-### 建立证据关系
-
-执行审核前完整读取 [证据阅读规则](references/observation-contract.md)。
-
-- 先证明资源属于当前流程，再说明资源支持哪个审核项；“附件存在”本身不是证据。
-- 表单结构化字段和权威接口优先于图片推测。
-- 同一明细表必须遍历全部行；地点类事实同时检查城市/县、行政区和完整地址，去重归一后再与负责区域比较。
-- 文件名、排列顺序、相似金额或相似日期不能单独证明附件属于某条明细。
-- 附件中不可见的内容保持未知；不得为了凑齐八项而补猜。
-- 直接由当前 Codex 阅读准备好的页面；按证据阅读规则依据页面数量分组，材料较多时使用原生观察子 agent 并行读取。不得从本 Skill 启动嵌套 `codex exec`、模型 API 或其他兼容 worker。
-- 高影响且图像模糊的事实才执行一次隔离复核，并保留不一致；不默认对每个事实运行两套模型。
-
-### 模型路由
-
-- 单流程运行器和普通单据审核默认使用 `gpt-5.6-terra`、`reasoning_effort=high`。不得仅因上下文较长或附件较多默认升级模型；应先依靠流程隔离、单据隔离、页面分组和覆盖记录控制上下文。
-- 只有权威证据互相冲突，或金额、退款、里程、地址、附件归属等高影响事实在一次隔离复核后仍不明确时，当前单据才可升级一次 `gpt-5.6-sol`、`reasoning_effort=high`。升级复核必须读取同一份冻结材料和覆盖记录，不得重新下载、重新采集或换一套证据范围。
-- Sol 复核仍不能闭合时输出 `⚠️` 并说明证据缺口，不继续叠加模型或创建无上限复核线程。
-
-## 2. 计划或判断
-
-完整读取[共享结果接口与流程路由](references/result-contract.md)。材料中的 `workflow_key` 精确确认后，只读取路由表对应的一个流程规则包；不得读取其他流程规则包，也不得把其他流程的固定审核项、示例或视觉提示带入当前审核上下文。
-
-每项必须同时具备状态、简明结论和可回查依据。固定项目名、顺序和业务判断只以当前流程规则包为准；共享结果接口只约束结论行、状态前置和公共表达。业务 `❌/⚠️` 不代表技术失败或退回指令。
-
-## 3. 执行效果
-
-先输出整体结论，再输出当前流程的全部固定审核项，不增加过程说明或第二套摘要：
-
-```text
-AI审核结论：可提交 ✅
-```
-
-或：
-
-```text
-AI审核结论：需人工判断 ⚠️
-```
-
-整体结论行维持 `AI审核结论：…… {状态}`；其后的每个编号审核项必须以前置状态开头。手工任务只在本次回复中展示 preview，不写 OA。已明确授权的单流程自动化可以把冻结意见交给安全写入器，并按 requestId 逐条验证回执。若使用财务确认样本做校准，必须先盲审生成结果，再查看财务答案并逐项比较，避免把答案反写成观察。
-
-## 4. 后置验证与回执
-
-输出前完成闭环检查：
-
-- 流程类型与结果模板唯一对应，固定审核项数量完整；
-- 每项均以前置 `✅`、`❌` 或 `⚠️` 开头，整体结论与逐项结果相容；
-- 所有相关明细和资源页面已覆盖，未知事实仍明确保持未知；
-- 手工任务没有写 OA、继续流程、创建 automation 或修改生产配置；授权单流程自动化则逐条取得绑定当前 requestId 的 `run_id`、`submit_ok`、`done_hit`、`postcheck_done_hit` 回执，并由状态机验证后保存。
-
-手工任务以当前回复中的完整 preview 作为回执；授权单流程自动化以逐条提交结果和本流程汇总作为回执。任一检查不满足时，不得声称预审闭环完成。
-
-## 5. 反馈沉淀
-
-[已确认反馈清单](references/confirmed-feedback.md)记录通用规则及落点，不替代[结果契约](references/result-contract.md)，实际审核始终以后者为准。
-
-用户在对话中明确指出预审误报、漏报、证据字段错误或应采用的财务口径时，已经构成人工反馈，不得要求重复确认。先把反馈映射到具体流程和审核项，移除流程编号、requestId、人员、公司、附件正文等业务上下文；再把可复现的通用纠正记录到已确认反馈清单，尚不能形成稳定规则时标为“待样本”。
-
-未来语义保持：后续财务节点未反馈问题、意见为空或只有“同意”，视为整体认同；只有明确问题才映射具体审核项。当前 Skill 不调用 OA 财务反馈接口，也不因技术故障自动修改财务规则。授权自动化发现运行问题时只发送脱敏结构化事件给调度任务；只有用户纠错或明确财务反馈才能进入错误回归闭环。
-
-## 6. 错误回归
-
-[错误回归案例](references/regression-cases.json)记录脱敏后的输入事实、旧错误输出和正确输出。它不是理由清单；每个案例必须包含能够重放的最小输入事实、实际错误、期望结果、失败模式和规则落点。
-
-发布前的离线质量门读取 [Golden Replay 合同](references/eval-contract.md)；该回放只验证脱敏固定样本，不进入当前单据观察上下文。
-
-正常 preview 不读取错误回归案例。只有盲测结果已经冻结、正在与财务答案对照，或用户明确反馈错误时，才完整读取案例集，避免历史答案泄漏到当前观察。
-
-收到明确错误反馈后，同一轮执行：
-
-1. 先把反馈映射到具体流程和审核项，移除流程编号、requestId、人员、公司、附件正文等业务上下文；
-2. 在错误回归案例中记录最小输入事实、旧错误输出、正确输出、失败模式和规则落点。无法确认正确事实时保留明确的证据边界，不编造数值；
-3. 再按“反馈沉淀”阶段更新已确认反馈清单；
-4. 已有明确规则时标出结果契约和聚焦测试的落点；需要新增判断时只做当前缺口所需的最小规则；
-5. 回复中分别说明“案例已记录”和“规则是否已应用”。记录或验证失败时必须明确报告。
-
-盲测必须先冻结预审结果，再读取样本答案或用户反馈，防止答案泄漏进证据观察。
-
-## 7. 技术失败
-
-遇到流程身份、资源归属、附件读取或权威来源不可信时，读取 [停止规则](references/error-handling.md)，停止当前单据并明确缺口；不得绕过取证路径或改写为业务 `⚠️`。自动化失败范围按单流程定时运行合同判断。
+用户明确指出误报、漏报或财务口径时，把脱敏后的可复现纠正写入[已确认反馈清单](references/confirmed-feedback.md)；可重放错误写入[错误回归案例](references/regression-cases.json)。正常审核不读取回归答案，保持盲审。
