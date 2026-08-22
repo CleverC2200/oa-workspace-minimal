@@ -28,6 +28,7 @@ def _material(
     regions: dict,
     excel: bool,
     image_fixture: str,
+    excel_mismatch: bool,
 ) -> dict:
     attachment = attempt_root / "attachments" / "page-1.png"
     prepared_image = attempt_root / "prepared" / "page-1.png"
@@ -51,8 +52,16 @@ def _material(
         workbook = Workbook()
         workbook.active.append(["配料：小麦粉、白砂糖、植物油、食用盐"])
         workbook.active.append(["过敏原：本产品含有小麦制品"])
-        workbook.active.append(["营养成分：能量1680千焦；蛋白质8.0克"])
-        workbook.active.append(["地址：示例市示例区测试路100号"])
+        workbook.active.append([
+            "营养成分：每100克：能量1680千焦；蛋白质8.0克"
+            if excel_mismatch
+            else "营养成分：每100克：能量 1680 千焦；蛋白质 8.0 克"
+        ])
+        workbook.active.append([
+            "地址：示例市示例区测试路100号"
+            if excel_mismatch
+            else "地址：示例市示例区测试路 100 号"
+        ])
         workbook.save(excel_file)
         workbook.close()
         resources.append({
@@ -71,8 +80,16 @@ def _material(
             "key_text": [
                 "Sheet!R1: 配料：小麦粉、白砂糖、植物油、食用盐",
                 "Sheet!R2: 过敏原：本产品含有小麦制品",
-                "Sheet!R3: 营养成分：能量1680千焦；蛋白质8.0克",
-                "Sheet!R4: 地址：示例市示例区测试路100号",
+                (
+                    "Sheet!R3: 营养成分：每100克：能量1680千焦；蛋白质8.0克"
+                    if excel_mismatch
+                    else "Sheet!R3: 营养成分：每100克：能量 1680 千焦；蛋白质 8.0 克"
+                ),
+                (
+                    "Sheet!R4: 地址：示例市示例区测试路100号"
+                    if excel_mismatch
+                    else "Sheet!R4: 地址：示例市示例区测试路 100 号"
+                ),
             ],
         })
     return {
@@ -117,6 +134,7 @@ def _engine(
     excel: bool = False,
     calls: list[dict] | None = None,
     image_fixture: str = "packaging_sample.png",
+    excel_mismatch: bool = False,
 ) -> flow_engine.FlowEngine:
     current_regions = regions if regions is not None else dict.fromkeys(REGION_KEYS, "clear")
 
@@ -148,6 +166,7 @@ def _engine(
             regions=current_regions,
             excel=excel,
             image_fixture=image_fixture,
+            excel_mismatch=excel_mismatch,
         ),
         authorization_source=_grant if controlled else None,
         authorization_verifier=(
@@ -162,6 +181,7 @@ def _decision(
     reviewed_items: list[dict],
     *,
     excel: bool = False,
+    excel_results: tuple[str, ...] = ("match", "match", "match", "match"),
 ) -> dict:
     packet = json.loads(Path(action["review_packet_file"]).read_text(encoding="utf-8"))
     return {
@@ -186,7 +206,7 @@ def _decision(
                             "material:prepared.structured_contents."
                             f"excel-1.key_text.{index}"
                         ],
-                        "result": "match",
+                        "result": excel_results[index],
                     }
                     for index, item in enumerate(packet["items"])
                 ]
@@ -294,6 +314,7 @@ def test_packaging_rejects_invalid_or_incomplete_pages(
             regions={},
             excel=False,
             image_fixture="packaging_sample.png",
+            excel_mismatch=False,
         )
         if failure == "invalid_image":
             Path(material["prepared"]["images"][0]["path"]).write_bytes(
@@ -361,6 +382,41 @@ def test_packaging_excel_notice_and_controlled_substitute_are_bound(tmp_path: Pa
     assert remark.endswith(
         "Excel 对照：上述四项已与同一 Excel 逐字符对照；具体差异已写入对应项目。\n"
     )
+
+
+def test_packaging_excel_character_differences_are_not_marked_as_match(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path, excel=True, excel_mismatch=True)
+    action = engine.next_action(WORKFLOW_KEY)
+    reviewed = _passing_items()
+    reviewed[2] = {
+        **reviewed[2],
+        "status": "fail",
+        "conclusion": "营养成分表与 Excel 存在空格字符差异。",
+    }
+    reviewed[3] = {
+        **reviewed[3],
+        "status": "fail",
+        "conclusion": "地址与 Excel 存在空格字符差异。",
+    }
+    decision_file = tmp_path / "excel-differences.json"
+    json_artifact.write_json_atomic(
+        decision_file,
+        _decision(
+            action,
+            reviewed,
+            excel=True,
+            excel_results=("match", "match", "different", "different"),
+        ),
+    )
+
+    closed = engine.complete_review(Path(action["action_file"]), decision_file)
+    remark = Path(closed["remark_file"]).read_text(encoding="utf-8")
+
+    assert closed["business_state"] == "needs_human"
+    assert "❌ 3、营养成分表信息：营养成分表与 Excel 存在空格字符差异。" in remark
+    assert "❌ 4、地址信息：地址与 Excel 存在空格字符差异。" in remark
 
 
 def test_packaging_independent_reviewer_replay_scores_100_percent(tmp_path: Path) -> None:
