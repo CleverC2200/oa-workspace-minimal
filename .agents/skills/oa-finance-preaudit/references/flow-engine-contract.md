@@ -1,6 +1,6 @@
 # 本地 FlowEngine 合同
 
-当前合同只覆盖 `travel_expense` 的 preview。它是差旅费新路径；旧角色入口暂时只用于回退，不得与本路径混用。
+当前合同覆盖 `travel_expense` 和 `business_entertainment` 的 preview。两类流程使用同一接口、独立运行目录和各自规则包；旧角色入口暂时只用于回退，不得与本路径混用。
 
 ## 两动作循环
 
@@ -8,13 +8,13 @@
 
 ```bash
 python3 -m apps.oa_finance_preaudit.cli next-action \
-  --workflow travel_expense
+  --workflow WORKFLOW_KEY
 ```
 
 stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSON：
 
 - `action=closed`：本轮结束，不取数、不等待、不创建其他 Agent。
-- `action=review_required`：只读取 `review_packet_file` 及审核包引用的 `material_file`，完成当前八个固定审核项。
+- `action=review_required`：只读取 `review_packet_file` 及审核包引用的 `material_file`，按审核包顺序完成当前流程的固定审核项。
 - `action=needs_admin`：本地冻结材料、审核包或持久状态不再可信；这是退出码为 0 的正常动作结果，并同步写入当前动作和对应 attempt 状态。停止当前单据并报告 `reason`，不得自行修复、重取或改写为业务 `⚠️`。
 
 公开 CLI 返回的 preview 动作都固化 `mode=preview`、`write_authorized=false` 和 `write_state=not_requested`。审核决定不包含运行模式或授权，不能在第二步切换写入。
@@ -34,7 +34,7 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
   "schema_version": 1,
   "kind": "preaudit_review_decision",
   "action_token": "原样复制 action.action_token",
-  "workflow_key": "travel_expense",
+  "workflow_key": "原样复制 action.workflow_key",
   "rule_version": "原样复制 review_packet.rule_version",
   "overall": "pass 或 needs_human",
   "items": []
@@ -66,7 +66,7 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
   --decision-file /absolute/path/to/review-decision.json
 ```
 
-只有返回 `action=closed` 才算当前 preview 闭合。`execution_state`、`business_state` 和 `write_state` 分别表示技术执行、业务结论和 OA 写入；本合同下 `write_state` 必须始终为 `not_requested`。业务 `needs_human` 是正常闭合，不重试、不改成技术失败。脚本在闭合前重新验证动作、状态、审核包、材料路径和冻结指纹；任一变化返回 `needs_admin`，不生成意见。
+只有返回 `action=closed` 才算当前 preview 闭合。`execution_state`、`business_state` 和 `write_state` 分别表示技术执行、业务结论和 OA 写入；公开 CLI 的本合同下 `write_state` 必须始终为 `not_requested`。业务 `needs_human` 是正常闭合，不重试、不改成技术失败。脚本在闭合前重新验证流程身份、动作、状态、审核包、材料路径和冻结指纹；任一变化返回 `needs_admin`，不生成意见。
 
 受控写入不是审核者可选择的模式。只有宿主同时注入绑定当前 `requestId + received_at + case_key + attempt + material_fingerprint + evidence_fingerprint` 的一次性授权、外部 verifier 和提交适配器时，FlowEngine 才生成写入 token；`complete-review` 提交前会再次调用 verifier。审核决定不能创建、修改或提升授权。
 

@@ -224,6 +224,7 @@ def build_job(
     envelope_fingerprint: str,
 ) -> dict:
     return {
+        "workflow_key": action["workflow_key"],
         "request_id": state["request_id"],
         "received_at": state["received_at"],
         "case_key": action["case_key"],

@@ -17,17 +17,30 @@ from . import elastic_queue, observability, submission
 
 
 SCHEMA_VERSION = 1
-TRAVEL_RULE_VERSION = "travel_expense:1"
-TRAVEL_ITEM_KEYS = (
-    "reimbursement_period",
-    "travel_and_lodging_days",
-    "public_transport",
-    "lodging_and_attendance",
-    "cross_region_vehicle",
-    "fuel_subsidy",
-    "personal_advance_tickets",
-    "invoice_buyer",
-)
+_FLOW_SPECS = {
+    "travel_expense": {
+        "rule_version": "travel_expense:1",
+        "item_keys": (
+            "reimbursement_period",
+            "travel_and_lodging_days",
+            "public_transport",
+            "lodging_and_attendance",
+            "cross_region_vehicle",
+            "fuel_subsidy",
+            "personal_advance_tickets",
+            "invoice_buyer",
+        ),
+    },
+    "business_entertainment": {
+        "rule_version": "business_entertainment:1",
+        "item_keys": (
+            "attachment_payment_evidence",
+            "invoice_linkage",
+            "budget",
+            "reimbursable_minimum",
+        ),
+    },
+}
 SHARED_FAILURE_CODES = {
     "submission_adapter_unavailable",
     "write_authorization_invalid",
@@ -133,12 +146,15 @@ def _action_payload(
     }
 
 
-def _travel_items() -> list[dict]:
-    names = elastic_queue.flow_item_names("travel_expense")
+def _flow_items(workflow_key: str) -> list[dict]:
+    spec = _FLOW_SPECS.get(workflow_key)
+    if spec is None:
+        raise ValueError("workflow_not_implemented")
+    names = elastic_queue.flow_item_names(workflow_key)
     return [
         {"item_key": item_key, "number": number, "name": name}
         for number, (item_key, name) in enumerate(
-            zip(TRAVEL_ITEM_KEYS, names, strict=True),
+            zip(spec["item_keys"], names, strict=True),
             start=1,
         )
     ]
@@ -156,11 +172,22 @@ def _attempt_number(path: Path) -> int | None:
 
 
 def _is_attempt_action_path(path: Path, root: Path) -> bool:
+    cases_root = path.parent.parent.parent
+    workflow_root = cases_root.parent
     return (
         path.name == "action.json"
         and _attempt_number(path.parent) is not None
-        and path.parent.parent.parent == root / "travel_expense" / "cases"
+        and workflow_root.parent == root
+        and workflow_root.name in _FLOW_SPECS
+        and cases_root == workflow_root / "cases"
     )
+
+
+def _attempt_workflow_key(attempt_root: Path, root: Path) -> str:
+    action_path = attempt_root / "action.json"
+    if not _is_attempt_action_path(action_path, root):
+        raise ValueError("persistent_state_invalid")
+    return attempt_root.parent.parent.parent.name
 
 
 def _managed_existing_path(path: Path, root: Path) -> bool:
@@ -326,11 +353,13 @@ class FlowEngine:
         reason: str,
     ) -> dict:
         attempt_root = action_path.parent
+        workflow_key = _attempt_workflow_key(attempt_root, self._root)
+        workflow_root = self._root / workflow_key
         state_path = attempt_root / "state.json"
         if action_path.is_symlink() or state_path.is_symlink():
             return self._persist_current_action(
-                self._root / "travel_expense",
-                _needs_admin("travel_expense", "persistent_state_invalid"),
+                workflow_root,
+                _needs_admin(workflow_key, "persistent_state_invalid"),
             )
         try:
             state = _read_object(state_path, code="persistent_state_invalid")
@@ -342,7 +371,7 @@ class FlowEngine:
             else "not_requested"
         )
         action = _needs_admin(
-            "travel_expense",
+            workflow_key,
             reason,
             write_state=write_state,
             action_file=str(action_path),
@@ -357,7 +386,7 @@ class FlowEngine:
             indent=2,
         )
         return self._persist_current_action(
-            self._root / "travel_expense",
+            workflow_root,
             action,
             expected_action_file=str(action_path),
         )
@@ -370,6 +399,7 @@ class FlowEngine:
         require_material: bool,
     ) -> bool:
         action_path = attempt_root / "action.json"
+        workflow_key = _attempt_workflow_key(attempt_root, self._root)
         request_id = state.get("request_id")
         received_at = state.get("received_at")
         return (
@@ -378,7 +408,7 @@ class FlowEngine:
             and _managed_existing_path(attempt_root, self._root)
             and _managed_existing_path(action_path, self._root)
             and _managed_existing_path(attempt_root / "state.json", self._root)
-            and state.get("workflow_key") == "travel_expense"
+            and state.get("workflow_key") == workflow_key
             and state.get("case_key") == attempt_root.parent.name
             and state.get("attempt") == _attempt_number(attempt_root)
             and state.get("action_file") == str(action_path)
@@ -395,6 +425,7 @@ class FlowEngine:
         )
 
     def _completion_receipt(self, attempt_root: Path, state: dict) -> dict:
+        workflow_key = _attempt_workflow_key(attempt_root, self._root)
         if (
             not self._attempt_identity_matches(
                 attempt_root,
@@ -433,7 +464,7 @@ class FlowEngine:
         identity = {
             "schema_version": SCHEMA_VERSION,
             "kind": "preaudit_execution_receipt",
-            "workflow_key": "travel_expense",
+            "workflow_key": workflow_key,
             "case_key": attempt_root.parent.name,
             "attempt": _attempt_number(attempt_root),
             "mode": state.get("mode"),
@@ -548,13 +579,14 @@ class FlowEngine:
         receipt: dict,
     ) -> dict:
         attempt_root = action_path.parent
+        workflow_key = _attempt_workflow_key(attempt_root, self._root)
         receipt_file = attempt_root / "execution-receipt.json"
         closed = _action_payload(
             action="closed",
             execution_state="closed",
             business_state=receipt["business_state"],
             write_state=receipt["write_state"],
-            workflow_key="travel_expense",
+            workflow_key=workflow_key,
             mode=state["mode"],
             write_authorized=state["write_authorized"],
             observability_state=receipt["observability_state"],
@@ -591,7 +623,7 @@ class FlowEngine:
             indent=2,
         )
         return self._persist_current_action(
-            self._root / "travel_expense",
+            self._root / workflow_key,
             closed,
             expected_action_file=str(action_path),
         )
@@ -722,7 +754,7 @@ class FlowEngine:
             raise ValueError("persistent_state_invalid")
         return self._persist_current_action(
             workflow_root,
-            _needs_admin("travel_expense", "persistent_state_invalid"),
+            _needs_admin(workflow_root.name, "persistent_state_invalid"),
         )
 
     def _resume_active_action(
@@ -799,6 +831,8 @@ class FlowEngine:
         state_path = action_path.with_name("state.json")
         packet_path = action_path.with_name("review-packet.json")
         material_path = action_path.with_name("material.json")
+        workflow_key = _attempt_workflow_key(action_path.parent, self._root)
+        spec = _FLOW_SPECS[workflow_key]
         action = _read_object(action_path, code="persistent_state_invalid")
         state = _read_object(state_path, code="persistent_state_invalid")
         packet = _read_object(packet_path, code="frozen_packet_changed")
@@ -842,7 +876,7 @@ class FlowEngine:
             "execution_state": "review_required",
             "business_state": "not_available",
             "write_state": write_state,
-            "workflow_key": "travel_expense",
+            "workflow_key": workflow_key,
             "mode": mode,
             "write_authorized": write_authorized,
             "authorization_fingerprint": state["authorization_fingerprint"],
@@ -866,11 +900,11 @@ class FlowEngine:
         expected_packet = {
             "schema_version": SCHEMA_VERSION,
             "kind": "preaudit_review_packet",
-            "workflow_key": "travel_expense",
-            "rule_version": TRAVEL_RULE_VERSION,
+            "workflow_key": workflow_key,
+            "rule_version": spec["rule_version"],
             "material_file": str(material_path),
             "material_fingerprint": state.get("material_fingerprint"),
-            "items": _travel_items(),
+            "items": _flow_items(workflow_key),
         }
         if packet != expected_packet:
             raise ValueError("frozen_packet_changed")
@@ -886,12 +920,17 @@ class FlowEngine:
         if verified["material_fingerprint"] != state.get("material_fingerprint"):
             raise ValueError("frozen_material_changed")
         material = _read_object(material_path, code="frozen_material_changed")
-        if _evidence_fingerprint(material) != state.get("evidence_fingerprint"):
+        if (
+            material.get("workflow_key") != workflow_key
+            or _evidence_fingerprint(material) != state.get("evidence_fingerprint")
+        ):
             raise ValueError("frozen_material_changed")
         return action, state, packet
 
     def _prepare_attempt(self, attempt_root: Path) -> dict:
-        workflow_root = self._root / "travel_expense"
+        workflow_key = _attempt_workflow_key(attempt_root, self._root)
+        workflow_root = self._root / workflow_key
+        spec = _FLOW_SPECS[workflow_key]
         with _exclusive_lock(attempt_root / "prepare.lock"):
             state_path = attempt_root / "state.json"
             try:
@@ -943,7 +982,7 @@ class FlowEngine:
                 material = self._collect_material(claim["request_id"], attempt_root)
                 if (
                     not isinstance(material, dict)
-                    or material.get("workflow_key") != "travel_expense"
+                    or material.get("workflow_key") != workflow_key
                 ):
                     raise ValueError("material_workflow_mismatch")
                 material_file = attempt_root / "material.json"
@@ -962,11 +1001,11 @@ class FlowEngine:
                 packet = {
                     "schema_version": SCHEMA_VERSION,
                     "kind": "preaudit_review_packet",
-                    "workflow_key": "travel_expense",
-                    "rule_version": TRAVEL_RULE_VERSION,
+                    "workflow_key": workflow_key,
+                    "rule_version": spec["rule_version"],
                     "material_file": str(material_file),
                     "material_fingerprint": verified["material_fingerprint"],
-                    "items": _travel_items(),
+                    "items": _flow_items(workflow_key),
                 }
                 packet_file = attempt_root / "review-packet.json"
                 json_artifact.write_json_atomic(packet_file, packet, indent=2)
@@ -978,7 +1017,7 @@ class FlowEngine:
             try:
                 authorization = submission.resolve_authorization(
                     submission.authorization_context(
-                        workflow_key="travel_expense",
+                        workflow_key=workflow_key,
                         request_id=claim["request_id"],
                         received_at=claim["received_at"],
                         case_key=claim["case_key"],
@@ -1013,7 +1052,7 @@ class FlowEngine:
                     if authorization["write_authorized"]
                     else "not_requested"
                 ),
-                workflow_key="travel_expense",
+                workflow_key=workflow_key,
                 mode=authorization["mode"],
                 write_authorized=authorization["write_authorized"],
                 authorization_fingerprint=authorization[
@@ -1067,7 +1106,7 @@ class FlowEngine:
             return self._persist_current_action(workflow_root, action)
 
     def next_action(self, workflow_key: str, *, mode: str = "preview") -> dict:
-        if workflow_key != "travel_expense":
+        if workflow_key not in _FLOW_SPECS:
             raise ValueError("workflow_not_implemented")
         if mode != "preview":
             raise ValueError("run_mode_unauthorized")
@@ -1320,7 +1359,7 @@ class FlowEngine:
             action_path.parent / "complete.lock"
             if action_path.is_relative_to(self._root)
             and _is_attempt_action_path(action_path, self._root)
-            else self._root / "travel_expense" / "invalid-action.lock"
+            else self._root / "invalid-action.lock"
         )
         with _exclusive_lock(lock_path):
             return self._complete_review_locked(action_path, Path(decision_file))
@@ -1396,10 +1435,16 @@ class FlowEngine:
                         return existing
                 if existing.get("action") == "review_required":
                     return self._persist_attempt_needs_admin(action_path, reason)
-            return self._persist_current_action(
-                self._root / "travel_expense",
-                _needs_admin("travel_expense", reason),
-            )
+            if (
+                action_path.is_relative_to(self._root)
+                and _is_attempt_action_path(action_path, self._root)
+            ):
+                workflow_key = _attempt_workflow_key(action_path.parent, self._root)
+                return self._persist_current_action(
+                    self._root / workflow_key,
+                    _needs_admin(workflow_key, reason),
+                )
+            return _needs_admin("unknown", reason)
         try:
             submission.verify_persisted_authorization(
                 state,
@@ -1657,7 +1702,7 @@ class FlowEngine:
             indent=2,
         )
         return self._persist_current_action(
-            self._root / "travel_expense",
+            self._root / action["workflow_key"],
             closed,
             expected_action_file=str(action_path),
         )
