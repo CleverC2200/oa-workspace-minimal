@@ -278,6 +278,19 @@ class TestConfigurationContract:
         ):
             assert official_sql._connect() is None
 
+    def test_declared_environment_can_install_the_official_sql_adapter(
+        self,
+    ) -> None:
+        dependencies = {
+            line.strip()
+            for line in (PROJECT_ROOT / "requirements-dev.txt")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+
+        assert "oracledb==4.0.1" in dependencies
+
     def test_env_template_contains_only_implemented_settings(self) -> None:
         template = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
         names = set(re.findall(r"^([A-Z][A-Z0-9_]*)=", template, re.MULTILINE))
