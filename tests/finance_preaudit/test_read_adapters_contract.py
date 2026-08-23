@@ -220,6 +220,63 @@ class TestReadAdaptersContract:
         assert cases[1]["submitted_at"] == "2026-08-01 09:00:00"
         assert cases[1]["received_at"] == "2026-08-01 09:01:00"
 
+    def test_pending_rows_normalize_nested_workflow_identity(self) -> None:
+        client = api.OaApi(
+            "recorded-token",
+            "recorded-user",
+            base_url="https://oa.invalid",
+        )
+        pages = [
+            {
+                "data": [
+                    {
+                        "requestId": "recorded-request",
+                        "requestName": "recorded-name",
+                        "workflowBaseInfo": {
+                            "workflowId": "138023",
+                            "workflowName": "差旅费报销流程",
+                        },
+                    }
+                ]
+            },
+            {"data": []},
+        ]
+
+        with patch.object(client, "_post_readonly", side_effect=pages):
+            cases = client.pending_rows(page_size=1, max_pages=2)
+
+        assert cases[0]["workflow_id"] == "138023"
+        assert cases[0]["workflow_name"] == "差旅费报销流程"
+
+    def test_pending_rows_reject_conflicting_workflow_identity(self) -> None:
+        client = api.OaApi(
+            "recorded-token",
+            "recorded-user",
+            base_url="https://oa.invalid",
+        )
+        pages = [
+            {
+                "data": [
+                    {
+                        "requestId": "recorded-request",
+                        "workflowId": "138023",
+                        "workflowName": "差旅费报销流程",
+                        "workflowBaseInfo": {
+                            "workflowId": "recorded-conflict",
+                            "workflowName": "差旅费报销流程",
+                        },
+                    }
+                ]
+            },
+            {"data": []},
+        ]
+
+        with patch.object(client, "_post_readonly", side_effect=pages):
+            cases = client.pending_rows(page_size=1, max_pages=2)
+
+        assert cases[0]["workflow_id"] == ""
+        assert cases[0]["workflow_name"] == ""
+
     @pytest.mark.parametrize(
         "payload",
         [
