@@ -578,6 +578,12 @@ def _read_attachment_snapshot(
                 if not snapshot.get("content_scan_failed")
                 else 0
             )
+            if (
+                expected_resource_count == 0
+                and stable_empty_rounds >= 3
+                and activated_roots
+            ):
+                break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
@@ -909,6 +915,16 @@ def collect_evidence(
     for url in (_oa_jump_url(fields), _trip_url(flow_mark)):
         if url and url not in candidates:
             candidates.append(url)
+    declared_attachment_match = re.search(
+        r"\d+",
+        _field_value(fields, ("附件数量",)),
+    )
+    expected_resource_count = (
+        0
+        if declared_attachment_match is not None
+        and int(declared_attachment_match.group()) == 0
+        else None
+    )
     try:
         candidate_results = _read_trip_candidate_results(
             candidates,
@@ -917,8 +933,8 @@ def collect_evidence(
             allow_visible_fallback=True,
             # “附件数量”是流程表单的总数；商旅页面只是其中一个来源。
             # 完整性只可在 case_bundle 合并两类资源后校验，不能要求商旅
-            # 子集单独等于这个总数。
-            expected_resource_count=None,
+            # 子集单独等于这个总数。只有总数明确为零时可以安全快速判空。
+            expected_resource_count=expected_resource_count,
         )
     except Exception:
         candidate_results = []
