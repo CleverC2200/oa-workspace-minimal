@@ -233,9 +233,10 @@ def test_support_independent_reviewer_replay_scores_100_percent(tmp_path: Path) 
                     assert fact_key in material["declared_fields"]
                 else:
                     assert evidence_ref == "rule:business-support-budget-not-checked"
-        assert case["items"][2]["conclusion"] == (
-            "当前阶段按既定策略暂不校验，OA 暂未提供预算数据。"
-        )
+        if packet["material_state"] == "complete":
+            assert case["items"][2]["conclusion"] == (
+                "当前阶段按既定策略暂不校验，OA 暂未提供预算数据。"
+            )
         statuses = [marks[item["status"]] for item in case["items"]]
         actuals[case["case_id"]] = {
             "outcome": (

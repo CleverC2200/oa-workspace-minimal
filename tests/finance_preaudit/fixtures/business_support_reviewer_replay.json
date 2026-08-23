@@ -36,6 +36,11 @@
         {"status":"pass","conclusion":"核销金额在上限内。","evidence_refs":["material:declared_fields.amount"],"missing_evidence":[]}
       ]
     },
-    {"case_id":"support-technical-v1","material_workflow":"travel_expense","facts":{},"items":[]}
+    {"case_id":"support-collection-gap-v1","material_workflow":"travel_expense","facts":{},"items":[
+      {"status":"uncertain","conclusion":"附件材料未能可信取得，请财务结合原始单据判断。","evidence_refs":[],"missing_evidence":["可信附件材料"]},
+      {"status":"uncertain","conclusion":"业务事项材料未能可信取得，请财务结合原始单据判断。","evidence_refs":[],"missing_evidence":["可信业务事项材料"]},
+      {"status":"uncertain","conclusion":"预算材料未能可信取得，请财务结合原始单据判断。","evidence_refs":[],"missing_evidence":["可信预算材料"]},
+      {"status":"uncertain","conclusion":"核销金额材料未能可信取得，请财务结合原始单据判断。","evidence_refs":[],"missing_evidence":["可信核销金额材料"]}
+    ]}
   ]
 }
