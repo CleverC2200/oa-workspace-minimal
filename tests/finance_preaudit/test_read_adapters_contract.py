@@ -946,6 +946,52 @@ class TestReadAdaptersContract:
         assert result["errors"] == []
         assert result["resources"] == []
 
+    def test_zero_declared_attachments_use_exact_empty_scan(self) -> None:
+        flow_mark = "CLBX-ZERO"
+        workflow = {
+            "workflowMainTableInfo": {
+                "requestRecords": [
+                    {
+                        "workflowRequestTableFields": [
+                            {
+                                "fieldShowName": "流程编号",
+                                "fieldShowValue": flow_mark,
+                            },
+                            {
+                                "fieldShowName": "附件数量",
+                                "fieldShowValue": "0",
+                            },
+                        ]
+                    }
+                ]
+            }
+        }
+
+        with (
+            patch.object(travel_orders, "_ensure_cdp_available", return_value=True),
+            patch.object(
+                travel_orders,
+                "_read_trip_candidate_results",
+                return_value=[
+                    {
+                        "text": f"{flow_mark}\n商旅页面已稳定读取",
+                        "resources": [],
+                        "attachment_scan_status": "empty",
+                    }
+                ],
+            ) as read_candidates,
+        ):
+            result = travel_orders.collect_evidence(
+                {"flow_key": "travel_expense"},
+                workflow,
+                "recorded-request",
+                allow_browser_download=True,
+            )
+
+        assert result["errors"] == []
+        assert result["resources"] == []
+        assert read_candidates.call_args.kwargs["expected_resource_count"] == 0
+
     def test_trip_candidate_only_short_circuits_on_exact_complete_snapshot(
         self,
     ) -> None:
@@ -1150,6 +1196,44 @@ class TestReadAdaptersContract:
         assert result["resource_scan_stable"]
         assert len(result["resources"]) == 5
         assert browser_snapshot.call_count == 6
+
+    def test_travel_attachment_snapshot_stops_after_stable_exact_empty(
+        self,
+    ) -> None:
+        class RecordedPage:
+            waits = 0
+
+            @classmethod
+            def wait_for_timeout(cls, _timeout_ms: int) -> None:
+                cls.waits += 1
+                if cls.waits >= 3:
+                    raise AssertionError("exact empty scan did not stop")
+
+        empty_snapshot = {
+            "text": "CLBX-ZERO",
+            "resources": [],
+            "content_scan_failed": False,
+        }
+        with (
+            patch.object(travel_orders, "_browser_roots", return_value=[object()]),
+            patch.object(travel_orders, "_activate_attachment_tab", return_value=True),
+            patch.object(
+                travel_orders,
+                "_browser_snapshot",
+                return_value=empty_snapshot,
+            ) as browser_snapshot,
+        ):
+            result = travel_orders._read_attachment_snapshot(
+                RecordedPage(),
+                url="https://travel.example.com/recorded",
+                timeout_sec=10,
+                expected_resource_count=0,
+            )
+
+        assert result["empty_scan_stable"]
+        assert result["attachment_tab_activated"]
+        assert result["resources"] == []
+        assert browser_snapshot.call_count == 3
 
     def test_travel_attachment_response_exposes_nested_attachment_lists(self) -> None:
         payload = {
