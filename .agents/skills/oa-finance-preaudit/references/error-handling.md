@@ -11,6 +11,15 @@
 
 四类财务流程中，登录或权限导致材料读取失败、资源归属无法确认、附件缺失/损坏/未完整读取、页面覆盖不足或必要权威接口失败，均属于材料缺口。FlowEngine 丢弃不可信候选材料并生成降级审核包；Agent 对 `required_uncertain_items` 生成动态 `⚠️` 说明，交财务结合 OA 原始单据判断，不阻断预审意见生成。
 
+把脱敏缺口码转换成业务语言时按实际影响表达，不逐字翻译或套用固定句：
+
+- `resource_ownership_untrusted`、`attachment_resource_identity_conflict`：说明材料与当前单据或明细的归属无法确认；
+- `travel_attachment_resources_incomplete`：结合审核包中的脱敏计数说明声明材料与可信取得材料不一致；
+- 下载、登录态或读取失败：说明本次未能取得或读取相应材料；
+- `invoice_buyer_read_failed`：说明发票购买方权威信息本次未能核验；
+- `material_workflow_mismatch`、`workflow_ambiguous`：说明取得的材料无法确认适用于当前流程；
+- `material_collection_failed`：只说明本次材料采集未完成以及受影响的审核项，不猜测具体技术原因。
+
 业务上的 `❌/⚠️` 不是技术失败。完整可信材料明确显示业务支持费流程完全没有附件时，“附件完整性”使用 `❌`；OA 声明或返回附件但实际无法可信取得时使用降级包和 `⚠️`，不得伪造证据或改走旧 runner。
 
 包装图片校对必须有可直接观察的可信页面；图片材料不可读仍属于技术失败，不生成貌似完成的文字校对意见。
