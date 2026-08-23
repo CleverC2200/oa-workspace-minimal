@@ -54,13 +54,28 @@ def workflow_identity(row: dict[str, Any]) -> dict[str, str]:
         if isinstance(row.get("workflowBaseInfo"), dict)
         else {}
     )
+
+    def resolve(nested: object, top_level: object) -> tuple[str, bool]:
+        nested_value = str(nested or "").strip()
+        top_level_value = str(top_level or "").strip()
+        if nested_value and top_level_value and nested_value != top_level_value:
+            return "", True
+        return nested_value or top_level_value, False
+
+    workflow_id, id_conflict = resolve(
+        base.get("workflowId"),
+        row.get("workflowId") or row.get("workflowid"),
+    )
+    workflow_name, name_conflict = resolve(
+        base.get("workflowName"),
+        row.get("workflowName") or row.get("workflowname"),
+    )
+    if id_conflict or name_conflict:
+        return {"workflow_id": "", "workflow_name": ""}
+
     return {
-        "workflow_id": str(
-            base.get("workflowId") or row.get("workflowId") or ""
-        ).strip(),
-        "workflow_name": str(
-            base.get("workflowName") or row.get("workflowName") or ""
-        ).strip(),
+        "workflow_id": workflow_id,
+        "workflow_name": workflow_name,
     }
 
 

@@ -6,7 +6,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-from apps.oa_approval import auth
+from apps.oa_approval import auth, flow
 
 
 TIMEOUT = 30
@@ -87,12 +87,11 @@ def _handled_case(row: dict[str, Any]) -> dict[str, str]:
 
 
 def _pending_case(row: dict[str, Any]) -> dict[str, str]:
+    workflow = flow.workflow_identity(row)
     return {
         "request_id": str(row.get("requestId") or row.get("requestid") or "").strip(),
-        "workflow_id": str(row.get("workflowId") or row.get("workflowid") or "").strip(),
-        "workflow_name": str(
-            row.get("workflowName") or row.get("workflowname") or ""
-        ).strip(),
+        "workflow_id": workflow["workflow_id"],
+        "workflow_name": workflow["workflow_name"],
         "request_name": str(
             row.get("requestName") or row.get("requestname") or ""
         ).strip(),
