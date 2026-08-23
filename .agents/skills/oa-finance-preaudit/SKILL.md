@@ -33,7 +33,7 @@ python3 -m apps.oa_finance_preaudit.cli next-action \
 - 表单明细、相关资源和准备页全部覆盖；
 - 每条采用的证据同时证明资源归属和审核项关系；
 - 权威字段优先，图片不可见或关系不明的事实保持未知；
-- 流程身份、附件归属、读取完整性不可信时停止当前单据。
+- 审核包为 `material_state=degraded` 时，不使用任何候选材料；按 `required_uncertain_items` 将缺口写成财务可理解的动态 `uncertain` 结论，继续完成预审。
 
 包装流程同时调用项目的中文图片文字校对 Skill，直接观察原图；存在 Excel 时逐字符对照。包装只校对关键文字，不扩展为法规审核。
 
@@ -44,6 +44,7 @@ python3 -m apps.oa_finance_preaudit.cli next-action \
 - `items` 与审核包的固定项目数量、顺序和 `item_key` 完全一致；
 - 每项包含 `status`、简明 `conclusion`、`evidence_refs` 和 `missing_evidence`；
 - `pass`、`fail` 必须有可回查证据，`uncertain` 必须写明缺口；
+- `required_uncertain_items` 中的项目只能是 `uncertain`，结论要用财务可理解的语言说明具体缺口和需其判断的事项，不得只复制错误码或套用单一固定句；
 - 任一项目为 `fail` 或 `uncertain` 时，`overall=needs_human`；全部为 `pass` 时，`overall=pass`；
 - 包装决定增加合同规定的 `excel_comparison`，并覆盖每个冻结图片页。
 

@@ -63,7 +63,7 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
   --decision-file /absolute/path/to/review-decision.json
 ```
 
-两条命令默认都是 preview，动作固定 `write_authorized=false`，写入状态固定为 `not_requested`；不会调用 OA 提交。模块和 CLI 共用同一业务实现，大对象通过本地文件传递，stdout 只输出一个版本化 JSON。冻结材料、流程身份或持久状态不一致时返回正常的 `needs_admin` 动作并停止当前单据，不生成意见。五类流程的目录、锁和当前动作投影相互独立；积压中已有单据等待审核时，后续调用可取得另一单据，每个 attempt 使用自己的完成锁，互不等待。
+两条命令默认都是 preview，动作固定 `write_authorized=false`，写入状态固定为 `not_requested`；不会调用 OA 提交。模块和 CLI 共用同一业务实现，大对象通过本地文件传递，stdout 只输出一个版本化 JSON。四类财务流程无法可信取得材料时生成不含可疑证据的降级审核包，由 Agent 输出 `⚠️` 意见交财务判断；流程身份、冻结 attempt、写入授权或目标不一致时才返回 `needs_admin`。包装图片不可读仍停止，避免生成貌似完成的校对意见。五类流程的目录、锁和当前动作投影相互独立；积压中已有单据等待审核时，后续调用可取得另一单据，每个 attempt 使用自己的完成锁，互不等待。
 
 正常运行只使用 `next-action`、`complete-review`、`status` 和 `prune` 四个命令。候选发现、材料收集、冻结校验、单据锁、提交安全门和回执均隐藏在深模块内；没有角色 CLI、底层队列命令或跨任务消息协议。
 
@@ -121,7 +121,7 @@ python3 -m apps.oa_finance_preaudit.cli prune \
 
 ## 离线质量回放
 
-五类流程各有正常、业务异常、证据不足和技术失败四个脱敏样本。回放比较固定审核项、状态/停止码、格式、耗时和精确 Token，不需要 OA 登录：
+离线基线包含五类流程的正常、业务异常、证据不足和技术失败场景，并为四类财务流程增加材料采集降级场景，共 24 个脱敏样本。回放比较固定审核项、状态/停止码、格式、耗时和精确 Token，不需要 OA 登录：
 
 ```bash
 python3 -m pytest tests/finance_preaudit/test_flow_evals.py -v

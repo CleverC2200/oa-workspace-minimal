@@ -14,8 +14,8 @@ python3 -m apps.oa_finance_preaudit.cli next-action \
 stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSON：
 
 - `action=closed`：本轮结束，不取数、不等待。
-- `action=review_required`：只读取 `review_packet_file` 及审核包引用的 `material_file`，按审核包顺序完成当前流程的固定审核项。
-- `action=needs_admin`：本地冻结材料、审核包或持久状态不再可信；这是退出码为 0 的正常动作结果，并同步写入当前动作和对应 attempt 状态。停止当前单据并报告 `reason`，不得自行修复、重取或改写为业务 `⚠️`。
+- `action=review_required`：只读取 `review_packet_file` 及审核包引用的 `material_file`，按审核包顺序完成当前流程的固定审核项。四类财务流程的材料采集不可信时仍返回该动作，但审核包标为 `material_state=degraded`，且 `required_uncertain_items` 列出必须交财务判断的项目。
+- `action=needs_admin`：当前单据身份、冻结 attempt、动作/状态、审核包完整性、写入授权或目标不再可信；这是退出码为 0 的正常动作结果。停止当前执行并报告 `reason`，不得自行修复或重取。
 
 默认命令返回的 preview 动作固化 `mode=preview`、`write_authorized=false` 和 `write_state=not_requested`。审核决定不包含运行模式或授权，不能在第二步切换写入。
 
@@ -26,6 +26,8 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
 同一 attempt 的完成转换使用 attempt 锁单飞，后到的重复决定不能覆盖已闭合结果；不同 case 不共享提交锁。完成旧动作时，若投影已指向另一单据，不得回写覆盖该投影。
 
 审核者不得修改 `action_file`、审核包或材料，不得读取其他 attempt，不得自行组织路径、计算指纹、选择 requestId 或调用 OA 写入。
+
+降级审核包的 `material_file` 不引用采集失败前的任何候选字段或资源，只保留脱敏 `collection_gaps`。审核者必须根据缺口和当前流程审核项生成可读的自然语言结论；脚本验证所有 `required_uncertain_items` 均为 `uncertain` 后，仍可正常闭合为 `business_state=needs_human`。包装图片材料不可读时继续返回 `needs_admin`，不使用降级包。
 
 ## 结构化审核决定
 

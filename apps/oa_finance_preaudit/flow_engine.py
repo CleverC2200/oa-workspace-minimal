@@ -108,7 +108,34 @@ _FLOW_SPECS = {
     },
 }
 WORKFLOW_KEYS = tuple(_FLOW_SPECS)
+_FINANCE_WORKFLOW_KEYS = frozenset(WORKFLOW_KEYS) - {"packaging_layout_approval"}
 _SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_SAFE_MATERIAL_GAP_CODES = {
+    "attachment_download_capacity_timeout",
+    "attachment_download_failed",
+    "attachment_download_incomplete",
+    "attachment_download_launch_timeout",
+    "attachment_download_timeout",
+    "attachment_resource_identity_conflict",
+    "invoice_buyer_read_failed",
+    "material_collection_failed",
+    "material_workflow_mismatch",
+    "oa_session_expired",
+    "packaging_material_incomplete",
+    "resource_ownership_untrusted",
+    "travel_attachment_discovery_failed",
+    "travel_attachment_failed",
+    "travel_attachment_resources_incomplete",
+    "workflow_ambiguous",
+}
+_SAFE_COLLECTION_COUNT_KEYS = {
+    "declared_attachment_count",
+    "discovered_resource_count",
+    "form_resource_count",
+    "travel_resource_count",
+    "trusted_source_sighting_count",
+}
+_HARD_COLLECTION_FAILURE_CODES = {"oa_run_stopped"}
 SHARED_FAILURE_CODES = {
     "submission_adapter_unavailable",
     "write_authorization_invalid",
@@ -225,6 +252,91 @@ def _flow_items(workflow_key: str) -> list[dict]:
             start=1,
         )
     ]
+
+
+def _material_gap(error: Exception) -> dict:
+    raw_code = str(error).strip()
+    gap = {
+        "code": (
+            raw_code
+            if raw_code in _SAFE_MATERIAL_GAP_CODES
+            else "material_collection_failed"
+        )
+    }
+    raw_counts = getattr(error, "counts", None)
+    counts = {
+        key: value
+        for key, value in (raw_counts.items() if isinstance(raw_counts, dict) else [])
+        if key in _SAFE_COLLECTION_COUNT_KEYS
+        and isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= 100_000
+    }
+    if counts:
+        gap["counts"] = counts
+    return gap
+
+
+def _degraded_material(request_id: str, workflow_key: str, error: Exception) -> dict:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "preaudit_material",
+        "request_id": request_id,
+        "workflow_key": workflow_key,
+        "workflow_name": workflow_key,
+        "declared_fields": {},
+        "resources": [],
+        "prepared": {"images": [], "structured_contents": [], "manifest": []},
+        "authority_facts": [],
+        "warnings": [],
+        "collection_gaps": [_material_gap(error)],
+    }
+
+
+def _review_packet_constraints(workflow_key: str, material: dict) -> dict:
+    raw_gaps = material.get("collection_gaps", [])
+    if not isinstance(raw_gaps, list):
+        raise ValueError("material_bundle_schema_invalid")
+    for gap in raw_gaps:
+        if (
+            not isinstance(gap, dict)
+            or set(gap) not in ({"code"}, {"code", "counts"})
+            or gap.get("code") not in _SAFE_MATERIAL_GAP_CODES
+        ):
+            raise ValueError("material_bundle_schema_invalid")
+        counts = gap.get("counts")
+        if counts is not None and (
+            not isinstance(counts, dict)
+            or not counts
+            or any(
+                key not in _SAFE_COLLECTION_COUNT_KEYS
+                or not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+                or value > 100_000
+                for key, value in counts.items()
+            )
+        ):
+            raise ValueError("material_bundle_schema_invalid")
+    if not raw_gaps:
+        return {"material_state": "complete", "required_uncertain_items": []}
+    if workflow_key not in _FINANCE_WORKFLOW_KEYS:
+        raise ValueError("material_bundle_schema_invalid")
+    prepared = material.get("prepared")
+    if (
+        material.get("declared_fields") != {}
+        or material.get("authority_facts") != []
+        or material.get("resources") != []
+        or not isinstance(prepared, dict)
+        or prepared.get("images") != []
+        or prepared.get("structured_contents") != []
+        or prepared.get("manifest") != []
+    ):
+        raise ValueError("material_bundle_schema_invalid")
+    return {
+        "material_state": "degraded",
+        "required_uncertain_items": list(_FLOW_SPECS[workflow_key]["item_keys"]),
+    }
 
 
 def _coverage(*, covered: int, total: int, applicable: bool) -> dict:
@@ -416,6 +528,7 @@ def _validate_material_bundle(
     structured = prepared.get("structured_contents")
     if not all(isinstance(value, list) for value in (images, manifest, structured)):
         raise ValueError("material_bundle_schema_invalid")
+    _review_packet_constraints(str(material.get("workflow_key") or ""), material)
     prepared_path = Path(prepared_root).expanduser().resolve()
     for image in images:
         if not isinstance(image, dict):
@@ -1349,18 +1462,7 @@ class FlowEngine:
             or state.get("material_file") != str(material_path)
         ):
             raise ValueError("persistent_state_invalid")
-        expected_packet = {
-            "schema_version": SCHEMA_VERSION,
-            "kind": "preaudit_review_packet",
-            "workflow_key": workflow_key,
-            "rule_version": spec["rule_version"],
-            "material_file": str(material_path),
-            "material_fingerprint": state.get("material_fingerprint"),
-            "items": _flow_items(workflow_key),
-        }
-        if packet != expected_packet:
-            raise ValueError("frozen_packet_changed")
-        validate_frozen_evidence(
+        material = validate_frozen_evidence(
             material_file=material_path,
             request_id=str(state.get("request_id") or ""),
             workflow_key=workflow_key,
@@ -1369,6 +1471,18 @@ class FlowEngine:
             material_fingerprint=str(state.get("material_fingerprint") or ""),
             evidence_fingerprint=str(state.get("evidence_fingerprint") or ""),
         )
+        expected_packet = {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "preaudit_review_packet",
+            "workflow_key": workflow_key,
+            "rule_version": spec["rule_version"],
+            "material_file": str(material_path),
+            "material_fingerprint": state.get("material_fingerprint"),
+            "items": _flow_items(workflow_key),
+            **_review_packet_constraints(workflow_key, material),
+        }
+        if packet != expected_packet:
+            raise ValueError("frozen_packet_changed")
         return action, state, packet
 
     def _prepare_attempt(self, attempt_root: Path) -> dict:
@@ -1430,6 +1544,21 @@ class FlowEngine:
                 ):
                     raise ValueError("material_workflow_mismatch")
                 _validate_flow_material(workflow_key, material)
+            except Exception as error:
+                if (
+                    workflow_key not in _FINANCE_WORKFLOW_KEYS
+                    or str(error).strip() in _HARD_COLLECTION_FAILURE_CODES
+                ):
+                    return self._persist_attempt_needs_admin(
+                        attempt_root / "action.json",
+                        "material_collection_failed",
+                    )
+                material = _degraded_material(
+                    claim["request_id"],
+                    workflow_key,
+                    error,
+                )
+            try:
                 material_file = attempt_root / "material.json"
                 json_artifact.write_json_atomic(material_file, material, indent=2)
                 verified = _validate_material_bundle(
@@ -1451,6 +1580,7 @@ class FlowEngine:
                     "material_file": str(material_file),
                     "material_fingerprint": verified["material_fingerprint"],
                     "items": _flow_items(workflow_key),
+                    **_review_packet_constraints(workflow_key, material),
                 }
                 packet_file = attempt_root / "review-packet.json"
                 json_artifact.write_json_atomic(packet_file, packet, indent=2)
@@ -1981,6 +2111,14 @@ class FlowEngine:
             ):
                 raise ValueError("review_decision_invalid")
             normalized_items.append(dict(item))
+
+        required_uncertain_items = set(packet["required_uncertain_items"])
+        if any(
+            item["item_key"] in required_uncertain_items
+            and item["status"] != "uncertain"
+            for item in normalized_items
+        ):
+            raise ValueError("review_decision_invalid")
 
         packaging_material: dict | None = None
         packaging_excel_notice: str | None = None

@@ -117,6 +117,21 @@ def _decision(action: dict, *, conclusion: str = "证据符合当前审核项。
     }
 
 
+def _uncertain_decision(action: dict) -> dict:
+    decision = _decision(
+        action,
+        conclusion="当前审核项所需材料未能可信取得，请财务结合原始单据判断。",
+    )
+    decision["overall"] = "needs_human"
+    for item in decision["items"]:
+        item.update(
+            status="uncertain",
+            evidence_refs=[],
+            missing_evidence=["当前审核项所需的可信材料"],
+        )
+    return decision
+
+
 def _prepare_controlled(root: Path, calls: list[dict]) -> tuple[flow_engine.FlowEngine, dict, Path]:
     def submit(job: dict) -> dict:
         calls.append(dict(job))
@@ -327,12 +342,17 @@ def test_shared_authorization_failure_stops_flow_but_item_failure_does_not(
         candidates=rows,
         collect_material=fail_one,
     )
-    failed = item.next_action("travel_expense")
+    degraded = item.next_action("travel_expense")
+    decision_file = tmp_path / "material-gap.json"
+    json_artifact.write_json_atomic(decision_file, _uncertain_decision(degraded))
+    closed = item.complete_review(Path(degraded["action_file"]), decision_file)
     continued = item.next_action("travel_expense")
 
-    assert failed["reason"] == "material_collection_failed"
+    assert degraded["action"] == "review_required"
+    assert closed["business_state"] == "needs_human"
     assert continued["action"] == "review_required"
-    assert collected == ["request-a", "request-b"]
+    assert continued["case_key"] == degraded["case_key"]
+    assert collected == ["request-a", "request-a"]
 
 
 def test_unknown_write_stops_only_its_item(tmp_path: Path) -> None:

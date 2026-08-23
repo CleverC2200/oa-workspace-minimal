@@ -20,7 +20,7 @@ class TestFlowEval:
         scenarios = {}
         for case in suite["cases"]:
             scenarios.setdefault(case["workflow_key"], set()).add(case["scenario"])
-        assert len(suite["cases"]) == 20
+        assert len(suite["cases"]) == 24
         assert all(values == set(flow_evals.SCENARIOS) for values in scenarios.values())
         serialized = str(suite).lower()
         for forbidden in (
@@ -37,8 +37,8 @@ class TestFlowEval:
 
         report = flow_evals.run_replay(suite, actuals)
 
-        assert report["case_count"] == 20
-        assert report["matched"] == 20
+        assert report["case_count"] == 24
+        assert report["matched"] == 24
         assert report["accuracy"] == 1.0
         assert report["format_compliance"] == 1.0
         assert set(report["by_flow"]) == set(suite["flows"])
@@ -53,7 +53,7 @@ class TestFlowEval:
 
         report = flow_evals.run_replay(suite, actuals)
 
-        assert report["matched"] == 19
+        assert report["matched"] == 23
         assert report["differences"][0]["case_id"] == "travel-normal-v1"
         assert report["differences"][0]["workflow_key"] == "travel_expense"
         assert report["differences"][0]["item"] == "公共交通"
