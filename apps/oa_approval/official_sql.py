@@ -109,15 +109,7 @@ def _keychain_password(user: str, service: str) -> str:
 
 
 def _connect():
-    import oracledb
-
     auth.load_local_env()
-    global _ORACLE_CLIENT_INITIALIZED
-    lib_dir = _detected_oracle_client_lib_dir()
-    if lib_dir and not _ORACLE_CLIENT_INITIALIZED:
-        oracledb.init_oracle_client(lib_dir=lib_dir)
-        _ORACLE_CLIENT_INITIALIZED = True
-
     host = str(os.environ.get("OA_DB_HOST") or "").strip()
     port = str(os.environ.get("OA_DB_PORT") or DEFAULT_DB_PORT).strip()
     service = str(os.environ.get("OA_DB_SERVICE") or "").strip()
@@ -129,6 +121,14 @@ def _connect():
     )
     if not all((host, port, service, user, password)):
         return None
+
+    import oracledb
+
+    global _ORACLE_CLIENT_INITIALIZED
+    lib_dir = _detected_oracle_client_lib_dir()
+    if lib_dir and not _ORACLE_CLIENT_INITIALIZED:
+        oracledb.init_oracle_client(lib_dir=lib_dir)
+        _ORACLE_CLIENT_INITIALIZED = True
     dsn = oracledb.makedsn(host, int(port), service_name=service)
     return oracledb.connect(user=user, password=password, dsn=dsn)
 
