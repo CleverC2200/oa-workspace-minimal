@@ -268,6 +268,16 @@ class TestConfigurationContract:
         ):
             assert official_sql._connect() is None
 
+    def test_unconfigured_official_sql_does_not_require_oracle_driver(
+        self,
+    ) -> None:
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(auth, "load_local_env"),
+            patch.dict(sys.modules, {"oracledb": None}),
+        ):
+            assert official_sql._connect() is None
+
     def test_env_template_contains_only_implemented_settings(self) -> None:
         template = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
         names = set(re.findall(r"^([A-Z][A-Z0-9_]*)=", template, re.MULTILINE))
