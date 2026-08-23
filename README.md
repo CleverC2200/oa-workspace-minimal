@@ -38,10 +38,13 @@ docs/agents/                        # Issue、标签和领域文档约定
 ## 本地配置
 
 ```bash
-cp .env.example .env
+mkdir -p ~/.config/oa-workspace-minimal
+chmod 700 ~/.config/oa-workspace-minimal
+cp -n .env.example ~/.config/oa-workspace-minimal/oa-auth.env
+chmod 600 ~/.config/oa-workspace-minimal/oa-auth.env
 ```
 
-只在本地填写真实配置。OA 执行人标识只允许通过本地 `OA_UID` 提供，流程 JSON 明确拒绝内嵌账号。数据库连接没有仓库内默认账号或地址；如需从 macOS Keychain 读取密码，需同时配置 `OA_DB_USER` 和 `OA_DB_KEYCHAIN_SERVICE`。完整的数据与凭据边界见[安全说明](SECURITY.md)。
+只在工作树外的 `~/.config/oa-workspace-minimal/oa-auth.env` 填写真实 OA 配置；可用进程环境变量 `OA_AUTH_ENV_FILE` 指向另一个绝对位置。运行时优先使用进程环境和稳定配置文件，仓库内被忽略的 `.env`、`.env.oa-auth` 仅作兼容回退。所有配置文件必须是普通文件且禁止组或其他用户访问，否则安全失败。OA 执行人标识只允许通过本地 `OA_UID` 提供，流程 JSON 明确拒绝内嵌账号。数据库连接没有仓库内默认账号或地址；如需从 macOS Keychain 读取密码，需同时配置 `OA_DB_USER` 和 `OA_DB_KEYCHAIN_SERVICE`。完整的数据与凭据边界见[安全说明](SECURITY.md)。
 
 ## 只读 preview
 
@@ -99,6 +102,12 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
 ```bash
 python3 -m apps.oa_finance_preaudit.cli status \
   --root /absolute/path/to/finance_preaudit_flows
+```
+
+需要同时核验稳定凭据、OA 认证、执行身份绑定和实时待办映射时，在同一命令增加 `--check-live`。它只返回配置来源、健康状态和按流程聚合的数量，不输出配置值、账号、单号或附件内容，也不领取、冻结或提交单据：
+
+```bash
+python3 -m apps.oa_finance_preaudit.cli status --check-live
 ```
 
 受控清理使用同一 JSON CLI。它在同一维护锁和事件锁内先计算脱敏日聚合，完整校验计划与所有目标，再以不跟随符号链接的原子写入落盘，最后才归档或删除原始 attempt：

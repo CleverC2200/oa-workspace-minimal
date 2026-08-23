@@ -22,6 +22,62 @@ def test_public_cli_exposes_exactly_four_commands() -> None:
     assert set(subparsers.choices) == PUBLIC_COMMANDS
 
 
+def test_status_live_check_stays_inside_existing_public_command(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    output = io.StringIO()
+
+    with redirect_stdout(output):
+        exit_code = cli.main(
+            ["status", "--root", str(root), "--check-live"],
+            runtime_status=lambda _root: {
+                "schema_version": 1,
+                "kind": "preaudit_runtime_status",
+            },
+            live_status=lambda: {
+                "status": "ok",
+                "write_state": "not_requested",
+            },
+        )
+
+    assert exit_code == 0
+    payload = json.loads(output.getvalue())
+    assert payload["live_check"] == {
+        "status": "ok",
+        "write_state": "not_requested",
+    }
+
+
+def test_status_live_check_fails_closed_without_configuration(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    output = io.StringIO()
+    stderr = io.StringIO()
+
+    with redirect_stdout(output), redirect_stderr(stderr):
+        exit_code = cli.main(
+            ["status", "--root", str(root), "--check-live"],
+            runtime_status=lambda _root: {
+                "schema_version": 1,
+                "kind": "preaudit_runtime_status",
+            },
+            live_status=lambda: (_ for _ in ()).throw(
+                RuntimeError("runtime_live_configuration_missing")
+            ),
+        )
+
+    assert exit_code == 1
+    assert json.loads(output.getvalue())["failure"] == {
+        "code": "runtime_live_configuration_missing",
+        "stage": "status",
+    }
+    assert stderr.getvalue().strip() == "runtime_live_configuration_missing"
+
+
 def test_frozen_writer_is_an_internal_adapter_without_a_cli() -> None:
     assert not hasattr(frozen_writer, "build_parser")
     assert not hasattr(frozen_writer, "main")

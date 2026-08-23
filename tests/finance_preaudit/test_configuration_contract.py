@@ -15,6 +15,32 @@ from apps.oa_approval import api, auth, flow, official_sql
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _auth_environment(**updates: str) -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("OA_")
+    }
+    environment.update(updates)
+    return environment
+
+
+def _run_auth(code: str, environment: dict[str, str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-B", "-c", code],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _write_auth(path: Path, content: str, *, mode: int = 0o600) -> None:
+    path.write_text(content, encoding="utf-8")
+    path.chmod(mode)
+
+
 class TestConfigurationContract:
     def test_finance_package_import_does_not_load_case_collection(self) -> None:
         result = subprocess.run(
@@ -58,6 +84,129 @@ class TestConfigurationContract:
         ):
             with pytest.raises(RuntimeError, match="OA_BASE_URL"):
                 auth.host()
+
+    def test_worktree_external_auth_file_precedes_local_fallback(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        stable_auth = tmp_path / "oa-auth.env"
+        _write_auth(stable_auth, "OA_BASE_URL=https://stable.invalid\n")
+        result = _run_auth(
+            "from apps.oa_approval import auth; "
+            "print(auth.env('OA_BASE_URL') == 'https://stable.invalid')",
+            _auth_environment(OA_AUTH_ENV_FILE=str(stable_auth)),
+        )
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == "True"
+
+    def test_auth_file_with_group_or_world_access_is_rejected(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        stable_auth = tmp_path / "oa-auth.env"
+        _write_auth(
+            stable_auth,
+            "OA_BASE_URL=https://stable.invalid\n",
+            mode=0o644,
+        )
+        result = _run_auth(
+            "from apps.oa_approval import auth; "
+            "\ntry: auth.env('OA_BASE_URL'); print('not-rejected')"
+            "\nexcept RuntimeError as error: print(str(error))",
+            _auth_environment(OA_AUTH_ENV_FILE=str(stable_auth)),
+        )
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == "oa_auth_file_permissions_invalid"
+
+    def test_symlink_auth_file_is_rejected(self, tmp_path: Path) -> None:
+        target = tmp_path / "target.env"
+        _write_auth(target, "OA_BASE_URL=https://stable.invalid\n")
+        stable_auth = tmp_path / "oa-auth.env"
+        stable_auth.symlink_to(target)
+        result = _run_auth(
+            "from apps.oa_approval import auth; "
+            "\ntry: auth.env('OA_BASE_URL'); print('not-rejected')"
+            "\nexcept RuntimeError as error: print(str(error))",
+            _auth_environment(OA_AUTH_ENV_FILE=str(stable_auth)),
+        )
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == "oa_auth_file_permissions_invalid"
+
+    def test_configuration_status_reports_source_without_values(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        stable_auth = tmp_path / "oa-auth.env"
+        _write_auth(
+            stable_auth,
+            "OA_BASE_URL=https://stable.invalid\n"
+            "OA_APP_ID=recorded-app\n"
+            "OA_APP_SECRET=recorded-secret\n"
+            "OA_UID=recorded-user\n",
+        )
+        result = _run_auth(
+            "import json; from apps.oa_approval import auth; "
+            "print(json.dumps(auth.configuration_status(), sort_keys=True))",
+            _auth_environment(OA_AUTH_ENV_FILE=str(stable_auth)),
+        )
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == (
+            '{"configured": 4, "required": 4, '
+            '"source": "stable", "status": "ok"}'
+        )
+        assert "recorded" not in result.stdout
+
+    def test_empty_stable_value_does_not_block_worktree_fallback(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        stable_auth = tmp_path / "stable.env"
+        _write_auth(stable_auth, "OA_UID=\n")
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        fallback = worktree / ".env.oa-auth"
+        _write_auth(fallback, "OA_UID=fallback-user\n")
+        result = _run_auth(
+            "import os; from pathlib import Path; "
+            "from apps.oa_approval import auth; "
+            "auth.PROJECT_ROOT=Path(os.environ['TEST_PROJECT_ROOT']); "
+            "print(auth.env('OA_UID') == 'fallback-user')",
+            _auth_environment(
+                OA_AUTH_ENV_FILE=str(stable_auth),
+                TEST_PROJECT_ROOT=str(worktree),
+            ),
+        )
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == "True"
+
+    @pytest.mark.parametrize(
+        "configured_path",
+        (
+            "relative-auth.env",
+            str(PROJECT_ROOT / "runtime" / "oa-auth.env"),
+        ),
+        ids=("relative", "inside-worktree"),
+    )
+    def test_stable_auth_path_must_be_absolute_and_outside_worktree(
+        self,
+        configured_path: str,
+    ) -> None:
+        result = _run_auth(
+            "from apps.oa_approval import auth; "
+            "\ntry: auth.stable_env_file(); print('not-rejected')"
+            "\nexcept RuntimeError as error: print(str(error))",
+            _auth_environment(OA_AUTH_ENV_FILE=configured_path),
+        )
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == (
+            "oa_auth_file_outside_worktree_required"
+        )
 
     def test_oa_user_identity_is_never_stored_in_flow_configs(
         self,
