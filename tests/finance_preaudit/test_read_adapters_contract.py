@@ -232,6 +232,7 @@ class TestReadAdaptersContract:
                     {
                         "requestId": "recorded-request",
                         "requestName": "recorded-name",
+                        "userid": "recorded-user",
                         "workflowBaseInfo": {
                             "workflowId": "138023",
                             "workflowName": "差旅费报销流程",
@@ -247,6 +248,7 @@ class TestReadAdaptersContract:
 
         assert cases[0]["workflow_id"] == "138023"
         assert cases[0]["workflow_name"] == "差旅费报销流程"
+        assert cases[0]["operator_id"] == "recorded-user"
 
     def test_pending_rows_reject_conflicting_workflow_identity(self) -> None:
         client = api.OaApi(

@@ -92,6 +92,7 @@ def _pending_case(row: dict[str, Any]) -> dict[str, str]:
         "request_id": str(row.get("requestId") or row.get("requestid") or "").strip(),
         "workflow_id": workflow["workflow_id"],
         "workflow_name": workflow["workflow_name"],
+        "operator_id": str(row.get("userid") or row.get("userId") or "").strip(),
         "request_name": str(
             row.get("requestName") or row.get("requestname") or ""
         ).strip(),

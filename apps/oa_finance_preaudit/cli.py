@@ -23,6 +23,7 @@ from . import (
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FlowEngineFactory = Callable[[], flow_engine.FlowEngine]
 RuntimeOperation = Callable[[Path], dict]
+LiveStatusOperation = Callable[[], dict]
 InvocationSink = Callable[[dict], None]
 _RUNTIME_FAILURE_CODES = {
     "retention_action_invalid",
@@ -35,6 +36,10 @@ _RUNTIME_FAILURE_CODES = {
     "runtime_path_symlink",
     "runtime_root_invalid",
     "runtime_state_invalid",
+    "runtime_live_configuration_missing",
+    "runtime_live_check_failed",
+    "oa_auth_file_permissions_invalid",
+    "oa_auth_file_outside_worktree_required",
 }
 _FLOW_FAILURE_CODES = {
     "flow_candidate_invalid",
@@ -83,6 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
     complete_review.add_argument("--confirm-write", choices=("YES",), default=None)
     status = subparsers.add_parser("status")
     status.add_argument("--root", type=Path, default=None)
+    status.add_argument("--check-live", action="store_true")
     prune = subparsers.add_parser("prune")
     prune.add_argument("--root", type=Path, default=None)
     return parser
@@ -250,6 +256,7 @@ def main(
     flow_engine_factory: FlowEngineFactory | None = None,
     runtime_status: RuntimeOperation | None = None,
     runtime_prune: RuntimeOperation | None = None,
+    live_status: LiveStatusOperation | None = None,
     invocation_sink: InvocationSink | None = None,
     persist_invocations: bool = False,
 ) -> int:
@@ -265,7 +272,13 @@ def main(
     try:
         if args.command == "status":
             operation = runtime_status or runtime_maintenance.status
-            payload = operation(_runtime_root(args.root))
+            payload = dict(operation(_runtime_root(args.root)))
+            if args.check_live:
+                if live_status is None:
+                    from .runtime_doctor import status as live_status_operation
+                else:
+                    live_status_operation = live_status
+                payload["live_check"] = live_status_operation()
         elif args.command == "prune":
             operation = runtime_prune or runtime_maintenance.prune
             payload = operation(_runtime_root(args.root))
