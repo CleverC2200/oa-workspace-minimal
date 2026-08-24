@@ -589,6 +589,40 @@ def test_parent_completion_persists_timing_and_bound_receipt(
     assert timing["wall_seconds"] == 12
 
 
+def test_parent_completion_can_defer_first_invalid_decision_stop(
+    tmp_path: Path,
+) -> None:
+    _task_value, action_file = _task(tmp_path)
+    stopped: list[bool] = []
+
+    result = codex_review_worker.complete_review_result(
+        action_file,
+        {
+            "status": "reviewed",
+            "process_attempts": 1,
+            "agent_wall_seconds": 12,
+            "token_usage": {"status": "unknown"},
+            "codex_events": {
+                "status": "recorded",
+                "attempts": 1,
+                "recorded_attempts": 1,
+                "unknown_attempts": 0,
+                "counts": {"turn.completed": 1},
+            },
+            "decision": {"kind": "preaudit_review_decision", "items": []},
+        },
+        completer=lambda _action, _decision: "codex_decision_invalid",
+        request_stop=lambda: stopped.append(True),
+        defer_invalid_stop=True,
+    )
+
+    assert result["status"] == "retry_required"
+    assert result["error_code"] == "codex_decision_invalid"
+    assert result["write_state"] == "not_requested"
+    assert stopped == []
+    assert not action_file.with_name("execution-receipt.json").exists()
+
+
 def test_usage_parser_reads_only_turn_completed_usage() -> None:
     stream = io.StringIO(
         '\n'.join(

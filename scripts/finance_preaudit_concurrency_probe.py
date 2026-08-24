@@ -620,6 +620,78 @@ def _preparation_executor() -> ProcessPoolExecutor:
     )
 
 
+def _merge_review_attempts(attempts: list[dict]) -> dict:
+    current = dict(attempts[-1])
+    process_attempts = sum(int(item.get("process_attempts") or 0) for item in attempts)
+    usages = [
+        item.get("token_usage")
+        for item in attempts
+        if isinstance(item.get("token_usage"), dict)
+    ]
+    recorded_usages = [
+        usage for usage in usages if usage.get("status") in {"recorded", "partial"}
+    ]
+    token_usage = {
+        "status": (
+            "recorded"
+            if len(usages) == len(attempts)
+            and usages
+            and all(usage.get("status") == "recorded" for usage in usages)
+            else "partial"
+            if recorded_usages
+            else "unknown"
+        ),
+        **{
+            field: sum(int(usage.get(field) or 0) for usage in recorded_usages)
+            for field in (
+                "input_tokens",
+                "cached_input_tokens",
+                "output_tokens",
+                "total_tokens",
+            )
+        },
+    }
+    event_values = [
+        item.get("codex_events")
+        for item in attempts
+        if isinstance(item.get("codex_events"), dict)
+    ]
+    event_counts: Counter[str] = Counter()
+    recorded_events = 0
+    for events in event_values:
+        recorded_events += int(events.get("recorded_attempts") or 0)
+        counts = events.get("counts")
+        if isinstance(counts, dict):
+            event_counts.update(
+                {
+                    str(key): int(value)
+                    for key, value in counts.items()
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                }
+            )
+    codex_events = {
+        "status": (
+            "recorded"
+            if process_attempts > 0 and recorded_events == process_attempts
+            else "unknown"
+        ),
+        "attempts": process_attempts,
+        "recorded_attempts": recorded_events,
+        "unknown_attempts": max(0, process_attempts - recorded_events),
+        "counts": dict(sorted(event_counts.items())),
+    }
+    return {
+        **current,
+        "process_attempts": process_attempts,
+        "process_retries": max(0, process_attempts - 1),
+        "token_usage": token_usage,
+        "codex_events": codex_events,
+        "agent_wall_seconds": sum(
+            int(item.get("agent_wall_seconds") or 0) for item in attempts
+        ),
+    }
+
+
 def _terminate_executor(
     executor: object,
     *,
@@ -666,7 +738,7 @@ def _run_dispatched_tasks(
     renew_actions: RenewActions = _renew_actions,
     prepare_action: PrepareAction | None = None,
     review_worker: ReviewWorker = _review_only,
-    complete_review: ReviewCompleter = codex_review_worker.complete_review_result,
+    complete_review: ReviewCompleter = codex_review_worker.complete_review_attempt,
     executor_factory: ExecutorFactory = _process_executor,
     task_timeout_sec: float = 960,
     prepare_timeout_sec: float = 300,
@@ -684,6 +756,8 @@ def _run_dispatched_tasks(
     outcomes: list[process_pool.TaskOutcome[dict] | None] = [None] * count
     assigned: set[Path] = set()
     futures: dict[object, tuple[int, float, float, Path]] = {}
+    review_histories: dict[int, list[dict]] = {}
+    decision_retries: set[int] = set()
     next_index = 0
     started = 0
     peak_active = 0
@@ -1033,15 +1107,44 @@ def _run_dispatched_tasks(
                 stop_reviews()
                 break
             for index, prepare_elapsed, action_file, reviewed in reviewed_now:
+                merged_review = _merge_review_attempts(
+                    [*review_histories.get(index, []), reviewed]
+                )
                 value = {
-                    **complete_review(action_file, reviewed),
+                    **complete_review(action_file, merged_review),
                     "prepare_elapsed_seconds": prepare_elapsed,
                 }
+                if (
+                    value.get("status") == "retry_required"
+                    and value.get("error_code") == "codex_decision_invalid"
+                    and index not in decision_retries
+                ):
+                    decision_retries.add(index)
+                    review_histories[index] = [merged_review]
+                    future = executor.submit(
+                        review_worker,
+                        {
+                            "project_root": str(root),
+                            "action_file": str(action_file),
+                            "timeout_seconds": 900,
+                        },
+                    )
+                    futures[future] = (
+                        index,
+                        prepare_elapsed,
+                        time.monotonic(),
+                        action_file,
+                    )
+                    peak_active = max(peak_active, len(futures))
+                    continue
+                if value.get("status") == "retry_required":
+                    value = {**value, "status": "failed"}
                 outcomes[index] = process_pool.TaskOutcome(
                     index=index,
                     status="completed",
                     value=value,
                 )
+                review_histories.pop(index, None)
                 if value.get("status") != "completed":
                     halted = True
                     failed_now = True

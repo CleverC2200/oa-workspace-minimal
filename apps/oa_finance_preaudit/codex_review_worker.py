@@ -845,6 +845,7 @@ def complete_review_result(
     *,
     completer: Completer = _complete_decision,
     request_stop: StopRequester = runtime_control.request_stop,
+    defer_invalid_stop: bool = False,
 ) -> dict:
     """Complete one reviewed action in the non-killable parent writer path."""
     decision = reviewed.get("decision") if isinstance(reviewed, dict) else None
@@ -933,7 +934,24 @@ def complete_review_result(
             "write_state": "submitted",
             "error_code": None,
         }
+    if completion_error == "codex_decision_invalid" and defer_invalid_stop:
+        return {
+            **base,
+            "status": "retry_required",
+            "execution_state": "review_required",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "error_code": completion_error,
+        }
     return failed(completion_error or "codex_decision_submit_incomplete")
+
+
+def complete_review_attempt(action_file: Path, reviewed: dict) -> dict:
+    return complete_review_result(
+        action_file,
+        reviewed,
+        defer_invalid_stop=True,
+    )
 
 
 def run_read_only(
