@@ -3,7 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
+import os
 from pathlib import Path
+import subprocess
+import sys
 import threading
 import time
 
@@ -12,6 +15,50 @@ import pytest
 from apps import json_artifact
 from apps.oa_finance_preaudit import concurrency_control, process_pool
 from scripts import finance_preaudit_concurrency_probe
+
+
+def _slow_failed_prepare(_workflow: str) -> dict:
+    time.sleep(0.05)
+    return {"action": "failed", "error_code": "late_prepare_result"}
+
+
+def _successful_prepare(_workflow: str) -> dict:
+    return {
+        "action": "review_required",
+        "action_file": os.environ["OA_TEST_PREPARED_ACTION_FILE"],
+    }
+
+
+def _spawn_ignoring_term_child() -> subprocess.Popen:
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os,pathlib,signal,time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "pathlib.Path(os.environ['OA_TEST_PREPARE_CHILD_PID_FILE'])"
+                ".write_text(str(os.getpid()), encoding='utf-8'); "
+                "time.sleep(30)"
+            ),
+        ],
+    )
+    marker = Path(os.environ["OA_TEST_PREPARE_CHILD_PID_FILE"])
+    deadline = time.monotonic() + 2
+    while not marker.is_file() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return child
+
+
+def _prepare_with_owned_child(_workflow: str) -> dict:
+    _spawn_ignoring_term_child()
+    time.sleep(30)
+    return {"action": "failed", "error_code": "late_prepare_result"}
+
+
+def _failed_prepare_with_owned_child(_workflow: str) -> dict:
+    _spawn_ignoring_term_child()
+    return {"action": "failed", "error_code": "material_collection_failed"}
 
 
 def _open_action(root: Path, *, case_key: str, created_at: str) -> Path:
@@ -948,6 +995,259 @@ def test_dispatcher_times_out_stuck_task_and_stops_new_work(
     assert result.timed_out == 1
     assert result.outcomes[0].error_code == "worker_task_timeout"
     assert result.runtime_samples
+    assert stop_requests == [True]
+
+
+def test_dispatcher_times_out_stuck_preparation_before_review(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stop_requests: list[bool] = []
+    reviews: list[dict] = []
+    completions: list[Path] = []
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda: stop_requests.append(True),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_prepare_one",
+        _slow_failed_prepare,
+    )
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        1,
+        1,
+        project_root=tmp_path,
+        review_worker=lambda task: reviews.append(task) or {"status": "reviewed"},
+        complete_review=lambda action, _reviewed: completions.append(action)
+        or {"status": "completed"},
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        prepare_timeout_sec=0.01,
+        heartbeat_interval_sec=0.005,
+        runtime_status=lambda: {"status": "healthy"},
+    )
+
+    assert result.timed_out == 1
+    assert result.outcomes[0].error_code == "production_probe_prepare_timeout"
+    assert reviews == []
+    assert completions == []
+    assert result.runtime_samples
+    assert result.max_task_elapsed_seconds >= 0.01
+    assert stop_requests == [True]
+
+
+def test_dispatcher_dispatches_successful_preparation_once(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    prepared_action = (
+        tmp_path
+        / "runtime"
+        / "finance_preaudit_flows"
+        / "travel_expense"
+        / "cases"
+        / "prepared"
+        / "attempt-1"
+        / "action.json"
+    )
+    prepared_action.parent.mkdir(parents=True)
+    prepared_action.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("OA_TEST_PREPARED_ACTION_FILE", str(prepared_action))
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    reviews: list[dict] = []
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        1,
+        1,
+        project_root=tmp_path,
+        prepare_action=_successful_prepare,
+        review_worker=lambda task: reviews.append(task)
+        or {
+            "status": "reviewed",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "process_attempts": 1,
+            "process_retries": 0,
+            "token_usage": {"status": "unknown"},
+            "agent_wall_seconds": 1,
+            "decision": {"overall": "needs_human"},
+        },
+        complete_review=lambda _action, _reviewed: {
+            "status": "completed",
+            "business_state": "needs_human",
+            "write_state": "submitted",
+            "process_attempts": 1,
+            "process_retries": 0,
+            "token_usage": {"status": "unknown"},
+            "error_code": None,
+        },
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        runtime_status=lambda: {"status": "healthy"},
+    )
+
+    assert result.completed == 1
+    assert result.timed_out == 0
+    assert [task["action_file"] for task in reviews] == [str(prepared_action)]
+
+
+def test_dispatcher_harvests_review_while_preparation_is_running(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stop_requests: list[bool] = []
+    completions: list[Path] = []
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda: stop_requests.append(True),
+    )
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    action_file = _open_action(
+        flow_root,
+        case_key="f" * 64,
+        created_at="2026-08-24T08:00:00+00:00",
+    )
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        2,
+        2,
+        project_root=tmp_path,
+        renew_actions=lambda paths: paths,
+        prepare_action=_slow_failed_prepare,
+        review_worker=lambda _task: {
+            "status": "reviewed",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "process_attempts": 1,
+            "process_retries": 0,
+            "token_usage": {"status": "unknown"},
+        },
+        complete_review=lambda action, _reviewed: completions.append(action)
+        or {
+            "status": "completed",
+            "business_state": "needs_human",
+            "write_state": "submitted",
+        },
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        prepare_timeout_sec=0.02,
+        heartbeat_interval_sec=0.005,
+        runtime_status=lambda: {"status": "healthy"},
+    )
+
+    assert result.completed == 1
+    assert result.timed_out == 1
+    assert completions == [action_file]
+    assert result.outcomes[1].error_code == "production_probe_prepare_timeout"
+    assert stop_requests == [True]
+
+
+def test_dispatcher_stops_after_preparation_technical_error_without_review(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stop_requests: list[bool] = []
+    reviews: list[dict] = []
+    completions: list[Path] = []
+    marker = tmp_path / "child.pid"
+    monkeypatch.setenv("OA_TEST_PREPARE_CHILD_PID_FILE", str(marker))
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda: stop_requests.append(True),
+    )
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        1,
+        1,
+        project_root=tmp_path,
+        prepare_action=_failed_prepare_with_owned_child,
+        review_worker=lambda task: reviews.append(task) or {"status": "reviewed"},
+        complete_review=lambda action, _reviewed: completions.append(action)
+        or {"status": "completed"},
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        runtime_status=lambda: {"status": "healthy"},
+    )
+
+    assert result.completed == 1
+    assert result.outcomes[0].value["status"] == "failed"
+    assert result.outcomes[0].value["error_code"] == "material_collection_failed"
+    assert reviews == []
+    assert completions == []
+    assert stop_requests == [True]
+    child_pid = int(marker.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        raise AssertionError("preparation child process was not reclaimed")
+
+
+def test_dispatcher_prepare_timeout_reclaims_owned_child_process_group(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    marker = tmp_path / "child.pid"
+    stop_requests: list[bool] = []
+    monkeypatch.setenv("OA_TEST_PREPARE_CHILD_PID_FILE", str(marker))
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda: stop_requests.append(True),
+    )
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        1,
+        1,
+        project_root=tmp_path,
+        prepare_action=_prepare_with_owned_child,
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        prepare_timeout_sec=1,
+        heartbeat_interval_sec=0.01,
+        runtime_status=lambda: {"status": "healthy"},
+    )
+
+    assert result.timed_out == 1
+    assert marker.is_file()
+    child_pid = int(marker.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        raise AssertionError("preparation child process was not reclaimed")
     assert stop_requests == [True]
 
 
