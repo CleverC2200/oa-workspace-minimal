@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+import fcntl
 import hashlib
 import json
+import multiprocessing
+import os
 from pathlib import Path
 
 import pytest
@@ -13,6 +16,14 @@ from apps.oa_finance_preaudit import flow_engine, production_write, submission
 
 
 NOW = datetime(2026, 8, 23, 1, 0, tzinfo=timezone.utc)
+
+
+def _hold_attempt_lock(lock_path: str, ready, release) -> None:
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(descriptor, "a+", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        ready.set()
+        assert release.wait(timeout=10)
 
 
 def _material(request_id: str) -> dict:
@@ -219,6 +230,86 @@ def test_authorized_travel_sample_uses_one_bound_submit_and_receipt(
         ports["recover_frozen"](changed_job)
 
     assert len(api.calls) == 1
+
+
+def test_next_action_defers_later_candidate_during_inflight_completion(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "flows"
+    policy_file = tmp_path / "write-policy.json"
+    json_artifact.write_json_atomic(
+        policy_file,
+        {
+            "schema_version": 1,
+            "kind": "preaudit_write_policy",
+            "authorized_workflows": ["travel_expense"],
+        },
+    )
+    api = FakeWriterApi()
+    ports = production_write.build_ports(
+        root=root,
+        policy_file=policy_file,
+        signing_secret="local-test-secret",
+        api_factory=lambda: api,
+        now=lambda: NOW,
+    )
+    collected: list[str] = []
+
+    def collect(request_id: str, _root: Path) -> dict:
+        collected.append(request_id)
+        return _material(request_id)
+
+    engine = flow_engine.FlowEngine(
+        root=root,
+        discover_candidates=lambda workflow_key: [
+            {
+                "request_id": "live-request",
+                "received_at": "2026-08-23T08:30:00+08:00",
+                "workflow_key": workflow_key,
+            },
+            {
+                "request_id": "later-request",
+                "received_at": "2026-08-23T08:31:00+08:00",
+                "workflow_key": workflow_key,
+            },
+        ],
+        collect_material=collect,
+        **ports,
+    )
+    action = engine.next_action("travel_expense", mode="controlled_write")
+    context = multiprocessing.get_context("spawn")
+    lock_ready = context.Event()
+    release_lock = context.Event()
+    lock_holder = context.Process(
+        target=_hold_attempt_lock,
+        args=(
+            str(Path(action["action_file"]).with_name("complete.lock")),
+            lock_ready,
+            release_lock,
+        ),
+    )
+    lock_holder.start()
+    try:
+        assert lock_ready.wait(timeout=2)
+        assert flow_engine._exclusive_lock_active(
+            Path(action["action_file"]).with_name("complete.lock")
+        )
+        with pytest.raises(ValueError, match="^completion_in_progress$"):
+            engine.next_action("travel_expense", mode="controlled_write")
+        assert collected == ["live-request"]
+        inflight_state = json.loads(
+            Path(action["state_file"]).read_text(encoding="utf-8")
+        )
+        assert inflight_state["execution_state"] == "review_required"
+        assert "reason" not in inflight_state
+    finally:
+        release_lock.set()
+        lock_holder.join(timeout=2)
+        if lock_holder.is_alive():
+            lock_holder.terminate()
+            lock_holder.join(timeout=2)
+    assert lock_holder.exitcode == 0
+    assert len(api.calls) == 0
 
 
 @pytest.mark.parametrize(

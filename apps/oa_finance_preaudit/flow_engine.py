@@ -227,6 +227,21 @@ def _exclusive_lock(path: Path):
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
+def _exclusive_lock_active(path: Path) -> bool:
+    descriptor = os.open(
+        path,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    with os.fdopen(descriptor, "a+", encoding="utf-8") as stream:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        return False
+
+
 def _action_payload(
     *,
     action: str,
@@ -1467,6 +1482,11 @@ class FlowEngine:
                     "persistent_state_invalid",
                 )
             if (
+                state.get("execution_state") != "closed"
+                and _exclusive_lock_active(attempt_root / "complete.lock")
+            ):
+                raise ValueError("completion_in_progress")
+            if (
                 state.get("write_state") == "submitting"
                 or (
                     include_open
@@ -1638,6 +1658,11 @@ class FlowEngine:
                     attempt_root / "action.json",
                     "persistent_state_invalid",
                 )
+            if (
+                state.get("execution_state") != "closed"
+                and _exclusive_lock_active(attempt_root / "complete.lock")
+            ):
+                raise ValueError("completion_in_progress")
             if state.get("write_state") in {"submitting", "unknown"}:
                 return self._recover_completion(attempt_root, state)
             if state.get("execution_state") in {"review_required", "needs_admin"}:
@@ -2096,7 +2121,9 @@ class FlowEngine:
                         skipped_write_authorization_failures
                     ),
                 )
-        except ValueError:
+        except ValueError as error:
+            if str(error) == "completion_in_progress":
+                raise
             return self._persist_tree_invalid(workflow_root)
         if recovered is not None:
             return recovered
@@ -2114,7 +2141,9 @@ class FlowEngine:
                             skipped_write_authorization_failures
                         ),
                     )
-            except ValueError:
+            except ValueError as error:
+                if str(error) == "completion_in_progress":
+                    raise
                 return self._persist_tree_invalid(workflow_root)
             if recovered is not None:
                 return recovered
@@ -2171,6 +2200,11 @@ class FlowEngine:
                             latest / "action.json",
                             "persistent_state_invalid",
                         )
+                    if (
+                        state.get("execution_state") != "closed"
+                        and _exclusive_lock_active(latest / "complete.lock")
+                    ):
+                        raise ValueError("completion_in_progress")
                     if (
                         state.get("write_state") == "submitting"
                         or (

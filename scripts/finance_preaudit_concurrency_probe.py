@@ -164,20 +164,36 @@ def _prepare_one(_workflow_key: str) -> dict:
                 "action": "failed",
                 "error_code": "production_probe_stopped",
             }
-        try:
-            action = engine.next_action(
-                "travel_expense",
-                mode="controlled_write",
-                skip_write_authorization_failures=(
-                    historical_authorization_failures
-                ),
-            )
-        except Exception:
-            runtime_control.request_stop("production_probe_prepare_failed")
-            return {
-                "action": "failed",
-                "error_code": "production_probe_prepare_failed",
-            }
+        while True:
+            try:
+                action = engine.next_action(
+                    "travel_expense",
+                    mode="controlled_write",
+                    skip_write_authorization_failures=(
+                        historical_authorization_failures
+                    ),
+                )
+            except ValueError as error:
+                if str(error) == "completion_in_progress":
+                    if runtime_control.stop_requested():
+                        return {
+                            "action": "failed",
+                            "error_code": "production_probe_stopped",
+                        }
+                    time.sleep(0.05)
+                    continue
+                runtime_control.request_stop("production_probe_prepare_failed")
+                return {
+                    "action": "failed",
+                    "error_code": "production_probe_prepare_failed",
+                }
+            except Exception:
+                runtime_control.request_stop("production_probe_prepare_failed")
+                return {
+                    "action": "failed",
+                    "error_code": "production_probe_prepare_failed",
+                }
+            break
         if action.get("action") == "review_required":
             return {
                 "action": "review_required",
