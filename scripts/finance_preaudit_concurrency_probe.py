@@ -939,7 +939,21 @@ def _run_dispatched_tasks(
                 if host.get("status") == "critical":
                     halted = True
                     runtime_control.request_stop()
-            if halted and preparation is not None:
+            if (
+                halted
+                and preparation is not None
+                and not preparation[0].done()
+            ):
+                wait(
+                    (preparation[0],),
+                    timeout=min(0.25, prepare_timeout_sec),
+                    return_when=FIRST_COMPLETED,
+                )
+            if (
+                halted
+                and preparation is not None
+                and not preparation[0].done()
+            ):
                 _prepare_future, prepare_index, _prepare_started_at = preparation
                 outcomes[prepare_index] = process_pool.TaskOutcome(
                     index=prepare_index,

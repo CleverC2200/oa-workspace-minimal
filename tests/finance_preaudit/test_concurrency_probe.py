@@ -1780,6 +1780,141 @@ def test_dispatcher_stops_after_preparation_technical_error_without_review(
         raise AssertionError("preparation child process was not reclaimed")
 
 
+def test_dispatcher_harvests_prepare_error_that_requested_global_stop(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stopped = False
+    reviews: list[dict] = []
+
+    class CompletedExecutor:
+        _processes: dict = {}
+
+        def submit(self, action, *args) -> Future:
+            future = Future()
+            future.set_result(action(*args))
+            return future
+
+        def shutdown(self, **_kwargs) -> None:
+            return None
+
+    def prepare(_workflow: str) -> dict:
+        nonlocal stopped
+        stopped = True
+        return {
+            "action": "failed",
+            "error_code": "production_probe_prepare_failed",
+        }
+
+    def request_stop() -> None:
+        nonlocal stopped
+        stopped = True
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_preparation_executor",
+        CompletedExecutor,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: stopped,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        request_stop,
+    )
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        1,
+        1,
+        project_root=tmp_path,
+        prepare_action=prepare,
+        review_worker=lambda task: reviews.append(task) or {"status": "reviewed"},
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        runtime_status=lambda: {"status": "healthy"},
+    )
+
+    assert result.completed == 1
+    assert result.stopped == 0
+    assert result.outcomes[0].value["status"] == "failed"
+    assert (
+        result.outcomes[0].value["error_code"]
+        == "production_probe_prepare_failed"
+    )
+    assert reviews == []
+
+
+def test_dispatcher_bounded_drains_prepare_error_after_stop_signal(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stopped = False
+    reviews: list[dict] = []
+
+    class DelayedExecutor:
+        _processes: dict = {}
+
+        def __init__(self) -> None:
+            self._executor = ThreadPoolExecutor(max_workers=1)
+
+        def submit(self, action, *args) -> Future:
+            return self._executor.submit(action, *args)
+
+        def shutdown(self, **kwargs) -> None:
+            self._executor.shutdown(**kwargs)
+
+    def prepare(_workflow: str) -> dict:
+        nonlocal stopped
+        stopped = True
+        time.sleep(0.05)
+        return {
+            "action": "failed",
+            "error_code": "production_probe_prepare_failed",
+        }
+
+    def request_stop() -> None:
+        nonlocal stopped
+        stopped = True
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_preparation_executor",
+        DelayedExecutor,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: stopped,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        request_stop,
+    )
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        1,
+        1,
+        project_root=tmp_path,
+        prepare_action=prepare,
+        review_worker=lambda task: reviews.append(task) or {"status": "reviewed"},
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        heartbeat_interval_sec=0.005,
+        runtime_status=lambda: {"status": "healthy"},
+    )
+
+    assert result.completed == 1
+    assert result.stopped == 0
+    assert result.outcomes[0].value["status"] == "failed"
+    assert (
+        result.outcomes[0].value["error_code"]
+        == "production_probe_prepare_failed"
+    )
+    assert reviews == []
+
+
 def test_dispatcher_prepare_timeout_reclaims_owned_child_process_group(
     tmp_path: Path,
     monkeypatch,
