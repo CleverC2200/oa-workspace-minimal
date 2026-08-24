@@ -7,6 +7,7 @@ from pathlib import Path
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Callable, TextIO
 
@@ -303,6 +304,44 @@ def _valid_events(value: object, *, attempts: int) -> bool:
     return value.get("status") == expected_status
 
 
+def _terminate_process_group(
+    process: subprocess.Popen,
+    *,
+    grace_seconds: float,
+) -> None:
+    process_group = process.pid
+
+    def group_exists() -> bool:
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    try:
+        os.killpg(process_group, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        process.poll()
+        if not group_exists():
+            return
+        time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+    try:
+        os.killpg(process_group, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    kill_deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < kill_deadline:
+        process.poll()
+        if not group_exists():
+            return
+        time.sleep(min(0.02, max(0.0, kill_deadline - time.monotonic())))
+
+
 def _execute_codex(
     project_root: Path,
     action_file: Path,
@@ -317,6 +356,42 @@ def _execute_codex(
         decision_file = temporary_root / "decision.json"
         json_artifact.write_json_atomic(schema_file, _decision_schema())
         command = _codex_command(project_root, schema_file, decision_file)
+        process: subprocess.Popen | None = None
+        previous_sigterm: object | None = None
+        previous_sigterm_mask: set[signal.Signals] | None = None
+
+        def restore_sigterm() -> None:
+            if previous_sigterm is None:
+                return
+            try:
+                signal.signal(signal.SIGTERM, previous_sigterm)
+            except ValueError:
+                pass
+
+        def terminate_owned_group(signum: int, _frame: object) -> None:
+            if process is not None:
+                _terminate_process_group(process, grace_seconds=0.2)
+            restore_sigterm()
+            raise SystemExit(128 + signum)
+
+        def restore_sigterm_mask() -> None:
+            if previous_sigterm_mask is not None:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_sigterm_mask)
+
+        if threading.current_thread() is threading.main_thread():
+            previous_sigterm_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK,
+                {signal.SIGTERM},
+            )
+            try:
+                previous_sigterm = signal.signal(
+                    signal.SIGTERM,
+                    terminate_owned_group,
+                )
+            except ValueError:
+                restore_sigterm_mask()
+                previous_sigterm_mask = None
+
         try:
             process = subprocess.Popen(
                 command,
@@ -328,6 +403,7 @@ def _execute_codex(
                 start_new_session=True,
             )
         except OSError:
+            restore_sigterm()
             output.close()
             return CodexExecution(
                 "codex_process_start_failed",
@@ -336,21 +412,15 @@ def _execute_codex(
                 decision_state="not_attempted",
                 event_status="unknown",
             )
+        finally:
+            restore_sigterm_mask()
         try:
             process.communicate(
                 input=prompt_builder(action_file),
                 timeout=timeout_seconds,
             )
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-                process.wait(timeout=5)
-            except (OSError, subprocess.TimeoutExpired):
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except OSError:
-                    pass
-                process.wait(timeout=5)
+            _terminate_process_group(process, grace_seconds=5)
             usage = _parse_token_usage(output)
             event_counts = _parse_event_counts(output)
             event_status = _event_status(output, event_counts)
@@ -364,6 +434,8 @@ def _execute_codex(
                 event_status=event_status,
                 exit_code=process.returncode,
             )
+        finally:
+            restore_sigterm()
         usage = _parse_token_usage(output)
         event_counts = _parse_event_counts(output)
         event_status = _event_status(output, event_counts)

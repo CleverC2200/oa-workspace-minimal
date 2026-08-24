@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import signal
+import subprocess
 import time
 
 import pytest
 
-from apps.oa_finance_preaudit import flow_engine, process_pool
+from apps import json_artifact
+from apps.oa_finance_preaudit import codex_review_worker, flow_engine, process_pool
 from apps.oa_approval import resource_slots
 
 
@@ -32,6 +35,117 @@ def _sometimes_fails(name: str) -> str:
 def _sleep_worker(delay: float) -> float:
     time.sleep(delay)
     return delay
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _codex_task(tmp_path: Path) -> tuple[dict, Path]:
+    project_root = tmp_path / "project"
+    action_file = (
+        project_root
+        / "runtime"
+        / "finance_preaudit_flows"
+        / "travel_expense"
+        / "cases"
+        / ("a" * 64)
+        / "attempt-1"
+        / "action.json"
+    )
+    action_file.parent.mkdir(parents=True)
+    json_artifact.write_json_atomic(
+        action_file,
+        {
+            "action": "review_required",
+            "workflow_key": "travel_expense",
+            "action_token": "test-action-token",
+        },
+    )
+    return {
+        "project_root": str(project_root),
+        "action_file": str(action_file),
+        "timeout_seconds": 900,
+    }, action_file
+
+
+def _install_fake_codex_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    ignore_child_sigterm: bool,
+) -> tuple[Path, Path, str]:
+    pid_file = tmp_path / "codex-tree-pids.txt"
+    marker = f"oa-test-process-tree-{time.monotonic_ns()}"
+    bin_root = tmp_path / "bin"
+    bin_root.mkdir()
+    fake_codex = bin_root / "codex"
+    child_program = (
+        "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(15)"
+        if ignore_child_sigterm
+        else "import time; time.sleep(15)"
+    )
+    fake_codex.write_text(
+        f"""#!/usr/bin/env python3
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+child = subprocess.Popen([sys.executable, "-c", {child_program!r}, {marker!r}])
+Path(os.environ["OA_TEST_CODEX_PID_FILE"]).write_text(
+    f"{{os.getpid()}}\\n{{child.pid}}\\n", encoding="utf-8"
+)
+sys.stdin.read()
+time.sleep(15)
+""",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_root}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("OA_TEST_CODEX_PID_FILE", str(pid_file))
+    return pid_file, fake_codex, marker
+
+
+def _process_command(pid: int) -> str:
+    result = subprocess.run(
+        ["ps", "-o", "command=", "-p", str(pid)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def _assert_fake_codex_tree_reaped(
+    pid_file: Path,
+    fake_codex: Path,
+    marker: str,
+) -> None:
+    pids = [int(value) for value in pid_file.read_text(encoding="utf-8").split()]
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and any(_pid_exists(pid) for pid in pids):
+        time.sleep(0.02)
+    remaining = [pid for pid in pids if _pid_exists(pid)]
+    if remaining:
+        ownership_verified = all(
+            (
+                str(fake_codex) in _process_command(pid)
+                if pid == pids[0]
+                else marker in _process_command(pid)
+            )
+            and os.getpgid(pid) == pids[0]
+            for pid in remaining
+        )
+        if ownership_verified:
+            os.killpg(pids[0], signal.SIGKILL)
+    assert remaining == []
 
 
 def _must_not_run(_value: str) -> str:
@@ -238,6 +352,68 @@ def test_task_timeout_terminates_stuck_worker_and_emits_runtime_heartbeat() -> N
     assert recovered.completed == 1
 
 
+@pytest.mark.parametrize(
+    ("stop_mode", "expected_status", "expected_error"),
+    [
+        ("task_timeout", "timed_out", "worker_task_timeout"),
+        ("batch_timeout", "timed_out", "worker_timeout"),
+        ("manual_stop", "stopped", "stop_requested"),
+    ],
+)
+def test_outer_stop_reaps_codex_process_group_and_grandchild(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stop_mode: str,
+    expected_status: str,
+    expected_error: str,
+) -> None:
+    task, _action_file = _codex_task(tmp_path)
+    pid_file, fake_codex, marker = _install_fake_codex_tree(
+        tmp_path,
+        monkeypatch,
+        ignore_child_sigterm=True,
+    )
+    options: dict[str, object] = {"batch_timeout_sec": 8}
+    if stop_mode == "task_timeout":
+        options["task_timeout_sec"] = 3
+    elif stop_mode == "batch_timeout":
+        options["batch_timeout_sec"] = 3
+    else:
+        options["stop_requested"] = pid_file.exists
+
+    result = process_pool.run(
+        [task],
+        codex_review_worker.review,
+        max_workers=1,
+        **options,
+    )
+
+    assert result.outcomes[0].status == expected_status
+    assert result.outcomes[0].error_code == expected_error
+    _assert_fake_codex_tree_reaped(pid_file, fake_codex, marker)
+
+
+def test_inner_codex_timeout_reaps_process_group_and_grandchild(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task, action_file = _codex_task(tmp_path)
+    pid_file, fake_codex, marker = _install_fake_codex_tree(
+        tmp_path,
+        monkeypatch,
+        ignore_child_sigterm=False,
+    )
+
+    result = codex_review_worker._execute_codex(
+        Path(task["project_root"]),
+        action_file,
+        1,
+    )
+
+    assert result.error_code == "codex_process_timeout"
+    _assert_fake_codex_tree_reaped(pid_file, fake_codex, marker)
+
+
 def test_crashed_process_is_classified_and_other_tasks_continue() -> None:
     result = process_pool.run(
         ["first", "crash", "third"],
@@ -284,6 +460,9 @@ def test_stop_request_terminates_unfinished_workers_and_pool_can_restart() -> No
     assert stopped.completed == 0
     assert stopped.stopped == 2
     assert all(outcome.status == "stopped" for outcome in stopped.outcomes)
+    assert all(
+        outcome.error_code == "stop_requested" for outcome in stopped.outcomes
+    )
 
     recovered = process_pool.run(
         [0.01],
