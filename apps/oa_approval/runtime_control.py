@@ -10,6 +10,7 @@ from typing import Iterator
 
 
 STOP_CODE = "oa_run_stopped"
+GLOBAL_WRITER_KEY = "finance-preaudit-global-writer"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -160,3 +161,10 @@ def request_writer_lease(
     finally:
         fcntl.flock(descriptor.fileno(), fcntl.LOCK_UN)
         descriptor.close()
+
+
+@contextmanager
+def global_writer_lease() -> Iterator[None]:
+    """Acquire the one canonical lock shared by every OA write entrypoint."""
+    with request_writer_lease(GLOBAL_WRITER_KEY, writer_lock_file()):
+        yield

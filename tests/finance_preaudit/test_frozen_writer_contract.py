@@ -6,6 +6,7 @@ import os
 import time
 import urllib.error
 import urllib.parse
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
@@ -50,6 +51,7 @@ class TestFrozenWriterContract:
         )
         self.attempt_root.mkdir(parents=True)
         self.lock_path = self.root / "runtime" / "frozen-writer.lock"
+        monkeypatch.setenv("OA_FROZEN_WRITER_LOCK_FILE", str(self.lock_path))
         self.material = self.attempt_root / "material.json"
         self.remark = self.attempt_root / "remark.txt"
         self.envelope = self.attempt_root / "remark-envelope.json"
@@ -124,7 +126,6 @@ class TestFrozenWriterContract:
             remark_envelope_fingerprint=self.envelope_fingerprint,
             current_proof_fingerprint=self.proof_fingerprint,
             api=api,
-            lock_path=self.lock_path,
         )
 
     def test_valid_four_artifact_attempt_submits_only_the_frozen_remark(self) -> None:
@@ -138,6 +139,31 @@ class TestFrozenWriterContract:
         assert receipt["submit_ok"]
         assert receipt["done_hit"]
         assert receipt["postcheck_done_hit"]
+
+    def test_stop_requested_while_waiting_for_global_writer_blocks_submit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        api = _RecordedWriterApi()
+
+        @contextmanager
+        def stop_while_waiting():
+            monkeypatch.setenv("OA_FINANCE_PREAUDIT_STOP_REQUESTED", "1")
+            yield
+
+        monkeypatch.setattr(
+            runtime_control,
+            "global_writer_lease",
+            stop_while_waiting,
+        )
+
+        with pytest.raises(
+            frozen_writer.FrozenWriterError,
+            match=runtime_control.STOP_CODE,
+        ):
+            self._submit(api)
+
+        assert api.calls == []
 
     def test_path_or_frozen_identity_mismatch_blocks_before_submit(self) -> None:
         api = _RecordedWriterApi()
@@ -161,7 +187,6 @@ class TestFrozenWriterContract:
                 remark_envelope_fingerprint=self.envelope_fingerprint,
                 current_proof_fingerprint=self.proof_fingerprint,
                 api=api,
-                lock_path=self.lock_path,
             )
 
         assert api.calls == []
@@ -187,7 +212,6 @@ class TestFrozenWriterContract:
                 remark_envelope_fingerprint=self.envelope_fingerprint,
                 current_proof_fingerprint=self.proof_fingerprint,
                 api=api,
-                lock_path=self.lock_path,
             )
 
         with pytest.raises(
@@ -207,7 +231,6 @@ class TestFrozenWriterContract:
                 remark_envelope_fingerprint=self.envelope_fingerprint,
                 current_proof_fingerprint="sha256:" + "0" * 64,
                 api=api,
-                lock_path=self.lock_path,
             )
 
         self.remark.write_text("AI审核结论：{待生成}\n", encoding="utf-8")
@@ -232,7 +255,6 @@ class TestFrozenWriterContract:
                 remark_envelope_fingerprint=self._fingerprint(self.envelope),
                 current_proof_fingerprint=self.proof_fingerprint,
                 api=api,
-                lock_path=self.lock_path,
             )
 
         assert api.calls == []
@@ -307,6 +329,31 @@ class TestFrozenWriterContract:
 
         assert first != second
         assert first.parent == second.parent
+
+    def test_global_writer_lease_uses_canonical_writer_path(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        calls: list[tuple[str, Path | None]] = []
+
+        @contextmanager
+        def record_lease(request_id: str, lock_path: Path | None = None):
+            calls.append((request_id, lock_path))
+            yield
+
+        monkeypatch.setattr(runtime_control, "request_writer_lease", record_lease)
+        monkeypatch.setattr(
+            runtime_control,
+            "writer_lock_file",
+            lambda: self.lock_path,
+        )
+
+        with runtime_control.global_writer_lease():
+            pass
+
+        assert calls == [
+            (runtime_control.GLOBAL_WRITER_KEY, self.lock_path),
+        ]
 
     def test_request_writer_lease_rejects_symlink_without_touching_target(
         self,

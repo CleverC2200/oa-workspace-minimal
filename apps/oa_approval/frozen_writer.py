@@ -214,15 +214,15 @@ def submit_frozen(
     remark_envelope_fingerprint: str,
     current_proof_fingerprint: str,
     api: FrozenWriterApi | None = None,
-    lock_path: Path | None = None,
 ) -> dict[str, Any]:
     if not _SUBMISSION_TOKEN.fullmatch(submission_token):
         raise FrozenWriterError("submission_token_invalid")
     if runtime_control.stop_requested():
         raise FrozenWriterError(runtime_control.STOP_CODE)
     try:
-        lease = runtime_control.request_writer_lease(request_id, lock_path)
-        with lease:
+        with runtime_control.global_writer_lease():
+            if runtime_control.stop_requested():
+                raise FrozenWriterError(runtime_control.STOP_CODE)
             remark, attempt_root = _validate_frozen_inputs(
                 request_id=request_id,
                 received_at=received_at,
