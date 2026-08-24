@@ -30,7 +30,14 @@ def _attempt(
     write_state: str = "not_requested",
     reason: str | None = None,
     archived: bool = False,
+    received_at: str | None = None,
 ) -> Path:
+    created_at = (NOW - timedelta(days=age_days)).isoformat()
+    request_id = f"request-{case_key}"
+    received_at = received_at or created_at
+    case_key = hashlib.sha256(
+        f"{request_id}\x1f{received_at}".encode("utf-8")
+    ).hexdigest()
     prefix = root / ".archive" if archived else root
     attempt_root = (
         prefix
@@ -46,7 +53,9 @@ def _attempt(
         "workflow_key": "travel_expense",
         "case_key": case_key,
         "attempt": attempt,
-        "created_at": (NOW - timedelta(days=age_days)).isoformat(),
+        "request_id": request_id,
+        "received_at": received_at,
+        "created_at": created_at,
         "execution_state": execution_state,
         "business_state": business_state,
         "write_state": write_state,
@@ -227,6 +236,7 @@ def test_status_counts_only_the_latest_attempt_per_case(tmp_path: Path) -> None:
         execution_state="needs_admin",
         business_state="not_available",
         reason="writer_submit_rejected",
+        received_at="2026-08-20T12:00:00+00:00",
     )
     _attempt(
         root,
@@ -236,6 +246,7 @@ def test_status_counts_only_the_latest_attempt_per_case(tmp_path: Path) -> None:
         execution_state="review_required",
         business_state="not_available",
         write_state="authorized",
+        received_at="2026-08-20T12:00:00+00:00",
     )
 
     flow = runtime_maintenance.status(root, now=NOW)["workflows"][0]
@@ -246,6 +257,25 @@ def test_status_counts_only_the_latest_attempt_per_case(tmp_path: Path) -> None:
     assert flow["execution_states"] == {"review_required": 1}
     assert flow["write_states"] == {"authorized": 1}
     assert flow["failure_counts"] == {}
+
+
+def test_status_fails_closed_when_state_identity_does_not_match_case(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    attempt_root = _attempt(
+        root,
+        case_key="identity-source",
+        attempt=1,
+        age_days=1,
+    )
+    state_file = attempt_root / "state.json"
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    state["request_id"] = "different-request"
+    json_artifact.write_json_atomic(state_file, state)
+
+    with pytest.raises(ValueError, match="runtime_state_invalid"):
+        runtime_maintenance.status(root, now=NOW)
 
 
 def test_prune_archives_deletes_and_preserves_protected_attempts(
@@ -356,6 +386,7 @@ def test_prune_compacts_raw_metrics_before_delete_and_keeps_daily_180_days(
     assert item_key not in compacted.read_text(encoding="utf-8")
     assert {item["day"] for item in status["daily_history"]} == {
         "2026-07-22",
+        "2026-08-21",
         boundary.stem,
     }
     compacted_payload = json.loads(compacted.read_text(encoding="utf-8"))

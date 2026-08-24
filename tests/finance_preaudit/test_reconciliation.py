@@ -181,6 +181,36 @@ def test_invalid_highest_attempt_never_falls_back_to_old_state(tmp_path: Path) -
         reconciliation.latest_states(root)
 
 
+@pytest.mark.parametrize("missing_field", ("request_id", "received_at"))
+def test_latest_state_requires_identity_bound_to_case_hash(
+    tmp_path: Path,
+    missing_field: str,
+) -> None:
+    root = tmp_path / "flows"
+    _state(root, "4002", "2026-08-24 12:01:00")
+    state_file = next(root.glob("*/cases/*/attempt-1/state.json"))
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    state.pop(missing_field)
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="runtime_reconciliation_invalid"):
+        reconciliation.latest_states(root)
+
+
+def test_latest_state_rejects_identity_that_does_not_match_case_hash(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "flows"
+    _state(root, "4003", "2026-08-24 12:02:00")
+    state_file = next(root.glob("*/cases/*/attempt-1/state.json"))
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    state["request_id"] = "different-request"
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="runtime_reconciliation_invalid"):
+        reconciliation.latest_states(root)
+
+
 @pytest.mark.parametrize("linked_level", ("workflow", "case", "attempt"))
 def test_reconciliation_rejects_managed_symlink_components(
     tmp_path: Path,

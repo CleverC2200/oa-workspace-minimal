@@ -81,6 +81,9 @@ def latest_states(root: Path) -> list[dict]:
                     or state.get("workflow_key") != workflow_root.name
                     or state.get("attempt") != attempt
                     or state.get("case_key") != case_root.name
+                    or not _identity(state)[0]
+                    or not _identity(state)[1]
+                    or _item_key(*_identity(state)) != case_root.name
                 ):
                     raise ValueError("runtime_reconciliation_invalid")
                 latest.append(state)

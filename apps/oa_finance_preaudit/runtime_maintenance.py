@@ -95,6 +95,19 @@ def _read_state(path: Path) -> dict:
         or not re.fullmatch(r"[0-9a-f]{64}", expected_case)
     ):
         raise ValueError("runtime_state_invalid")
+    request_id = state.get("request_id")
+    received_at = state.get("received_at")
+    if (
+        not isinstance(request_id, str)
+        or not request_id.strip()
+        or not isinstance(received_at, str)
+        or not received_at.strip()
+        or hashlib.sha256(
+            f"{request_id}\x1f{received_at}".encode("utf-8")
+        ).hexdigest()
+        != expected_case
+    ):
+        raise ValueError("runtime_state_identity_invalid")
     _timestamp(state.get("created_at"))
     return state
 
@@ -671,7 +684,9 @@ def status(root: Path, *, now: datetime | None = None) -> dict:
     for attempt_root in attempt_roots:
         try:
             state = _read_state(attempt_root / "state.json")
-        except ValueError:
+        except ValueError as error:
+            if str(error) == "runtime_state_identity_invalid":
+                raise ValueError("runtime_state_invalid") from error
             state_path = attempt_root / "state.json"
             created_at = datetime.fromtimestamp(
                 state_path.stat().st_mtime if state_path.exists() else 0,
