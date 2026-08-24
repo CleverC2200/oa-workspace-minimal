@@ -713,6 +713,81 @@ def test_elastic_rolling_requires_two_healthy_waves_before_upgrade() -> None:
     assert result["elastic"] is True
     assert result["recommended_capacity"] == 8
     assert result["status"] == "completed"
+    assert [health["status"] for health in result["wave_runtime_health"]] == [
+        "healthy",
+        "healthy",
+        "healthy",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("host_status", "expected_reason"),
+    (("critical", "host_critical"), ("healthy", "technical_failure")),
+)
+def test_rolling_failure_retains_health_and_stable_reason(
+    host_status: str,
+    expected_reason: str,
+) -> None:
+    result = finance_preaudit_concurrency_probe.run_rolling_drain(
+        capacity=6,
+        adaptive=True,
+        live_status=lambda: {
+            "credentials": {"status": "ok"},
+            "oa": {
+                "execution_identity": "verified",
+                "by_workflow": {"travel_expense": 12},
+            },
+        },
+        reconcile_status=lambda: _reconciliation_snapshot(12),
+        pipeline_runner=lambda count, capacity: process_pool.PoolResult(
+            requested=count,
+            started=1,
+            completed=0,
+            failed=0,
+            timed_out=0,
+            stopped=count,
+            peak_active=capacity,
+            elapsed_seconds=10,
+            outcomes=tuple(
+                process_pool.TaskOutcome(
+                    index=index,
+                    status="stopped",
+                    value=None,
+                    error_code="stop_requested",
+                )
+                for index in range(count)
+            ),
+            runtime_samples=(
+                {
+                    "active_workers": 6,
+                    "oldest_task_seconds": 8,
+                    "host": {
+                        "status": host_status,
+                        "memory_free_percent": 11,
+                        "load_per_cpu": 0.5,
+                        "active_threads": 1,
+                        "cpu_count": 10,
+                    },
+                },
+            ),
+            max_task_elapsed_seconds=8,
+        ),
+    )
+
+    assert result["status"] == "failed"
+    assert result["stop_reason"] == expected_reason
+    assert result["last_capacity_decision"]["reason"] == expected_reason
+    assert result["wave_runtime_health"] == [
+        {
+            "status": host_status,
+            "sample_count": 1,
+            "minimum_memory_free_percent": 11,
+            "maximum_load_per_cpu": 0.5,
+            "maximum_active_threads": 1,
+            "maximum_active_workers": 6,
+            "maximum_oldest_task_seconds": 8.0,
+        }
+    ]
 
 
 def test_rolling_wave_preserves_transient_codex_error_counts() -> None:
