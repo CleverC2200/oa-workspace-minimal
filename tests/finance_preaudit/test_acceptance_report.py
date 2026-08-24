@@ -289,6 +289,48 @@ def test_single_variable_trial_can_be_kept_without_applying_changes() -> None:
     assert result["decision"] == "keep"
     assert result["applied"] is False
     assert result["token_tuning"]["eligible"] is True
+    assert result["performance"] == {
+        "before": {
+            "end_to_end_seconds": {"p50": 1000, "p95": 1000},
+            "token_usage": {
+                "status": "exact",
+                "exact_samples": 100,
+                "unknown_samples": 0,
+                "input_tokens": 10000,
+                "output_tokens": 2000,
+                "total_tokens": 12000,
+            },
+        },
+        "after": {
+            "end_to_end_seconds": {"p50": 700, "p95": 700},
+            "token_usage": {
+                "status": "exact",
+                "exact_samples": 100,
+                "unknown_samples": 0,
+                "input_tokens": 10000,
+                "output_tokens": 2000,
+                "total_tokens": 12000,
+            },
+        },
+    }
+
+
+def test_experiment_does_not_estimate_incomplete_token_usage() -> None:
+    before = _report(_samples())
+    after = _report(_samples(exact_tokens=False))
+
+    result = flow_evals.evaluate_experiment(
+        before,
+        after,
+        before_settings=SETTINGS,
+        after_settings={**SETTINGS, "review_packet_profile_sha256": "b" * 64},
+    )
+
+    assert result["performance"]["after"]["token_usage"] == {
+        "status": "unknown",
+        "exact_samples": 0,
+        "unknown_samples": 100,
+    }
 
 
 @pytest.mark.parametrize(

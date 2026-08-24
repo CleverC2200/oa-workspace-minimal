@@ -65,7 +65,7 @@ def _material_with_files(request_id: str, attempt_root: Path) -> dict:
 
 def _decision(action: dict) -> dict:
     packet = json.loads(Path(action["review_packet_file"]).read_text(encoding="utf-8"))
-    return {
+    decision = {
         "schema_version": 1,
         "kind": "preaudit_review_decision",
         "action_token": action["action_token"],
@@ -83,6 +83,11 @@ def _decision(action: dict) -> dict:
             for item in packet["items"]
         ],
     }
+    for item in decision["items"]:
+        item["evidence_refs"].extend(
+            packet.get("page_routing", {}).get("review_page_refs", [])
+        )
+    return decision
 
 
 class FakeWriterApi:

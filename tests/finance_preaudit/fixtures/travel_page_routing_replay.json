@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "case_id": "travel-cross-page-routing-v1",
+  "pages": [
+    {"resource_id": "trip", "content": "trip-facts-v1", "facts": ["reimbursement_period", "public_transport"]},
+    {"resource_id": "attendance", "content": "attendance-facts-v1", "facts": ["travel_and_lodging_days", "public_transport", "lodging_and_attendance", "cross_region_vehicle"]},
+    {"resource_id": "lodging", "content": "lodging-facts-v1", "facts": ["travel_and_lodging_days", "lodging_and_attendance"]},
+    {"resource_id": "mileage", "content": "mileage-facts-v1", "facts": ["cross_region_vehicle", "fuel_subsidy"]},
+    {"resource_id": "invoice", "content": "invoice-facts-v1", "facts": ["personal_advance_tickets", "invoice_buyer"]},
+    {"resource_id": "attendance-copy", "content": "attendance-facts-v1", "facts": ["travel_and_lodging_days", "public_transport", "lodging_and_attendance", "cross_region_vehicle"]}
+  ],
+  "expected": {
+    "review_page_count": 5,
+    "reused_resource_ids": ["attendance-copy"],
+    "statuses": ["✅", "✅", "✅", "✅", "✅", "✅", "✅", "✅"]
+  }
+}

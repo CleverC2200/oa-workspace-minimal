@@ -111,6 +111,7 @@ _FLOW_SPECS = {
 WORKFLOW_KEYS = tuple(_FLOW_SPECS)
 _FINANCE_WORKFLOW_KEYS = frozenset(WORKFLOW_KEYS) - {"packaging_layout_approval"}
 _SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_MATERIAL_GAP_CODES = {
     "attachment_download_capacity_timeout",
     "attachment_download_failed",
@@ -343,6 +344,96 @@ def _review_packet_constraints(workflow_key: str, material: dict) -> dict:
     }
 
 
+def _travel_pages(material: dict) -> tuple[tuple[str, dict], ...]:
+    prepared = material.get("prepared")
+    raw_images = prepared.get("images") if isinstance(prepared, dict) else []
+    images = raw_images if isinstance(raw_images, list) else []
+    page_numbers: dict[str, int] = {}
+    pages: list[tuple[str, dict]] = []
+    for global_index, image in enumerate(images, start=1):
+        if not isinstance(image, dict):
+            continue
+        resource_id = str(
+            image.get("parent_resource_id") or image.get("resource_id") or ""
+        ).strip()
+        page_numbers[resource_id] = page_numbers.get(resource_id, 0) + 1
+        page_ref = (
+            f"material:prepared.images.{resource_id}."
+            f"{page_numbers[resource_id]}"
+            if resource_id
+            else f"material:prepared.images.unbound.{global_index}"
+        )
+        pages.append((page_ref, image))
+    return tuple(pages)
+
+
+def _verified_page_sha256(image: dict) -> str:
+    claimed = str(image.get("content_sha256") or "").strip()
+    if not _SHA256.fullmatch(claimed):
+        return ""
+    try:
+        actual = _file_fingerprint(Path(str(image.get("path") or "")))
+    except ValueError:
+        return ""
+    actual_sha256 = actual.removeprefix("sha256:")
+    return claimed if secrets.compare_digest(claimed, actual_sha256) else ""
+
+
+def _full_travel_page_routing(material: dict) -> dict:
+    page_refs = [page_ref for page_ref, _image in _travel_pages(material)]
+    return {
+        "strategy": "full_page_fallback",
+        "applicability": {
+            "item_keys": list(_FLOW_SPECS["travel_expense"]["item_keys"]),
+            "basis": "page_relation_unavailable",
+        },
+        "before_page_count": len(page_refs),
+        "review_page_count": len(page_refs),
+        "review_page_refs": page_refs,
+        "reused_pages": [],
+    }
+
+
+def _review_packet_routing(workflow_key: str, material: dict) -> dict:
+    if workflow_key != "travel_expense":
+        return {}
+    pages = _travel_pages(material)
+    representatives: dict[str, str] = {}
+    reused_pages: list[dict[str, str]] = []
+    for page_ref, image in pages:
+        resource_id = str(
+            image.get("parent_resource_id") or image.get("resource_id") or ""
+        ).strip()
+        content_sha256 = _verified_page_sha256(image)
+        if not resource_id or not content_sha256:
+            continue
+        representative = representatives.setdefault(content_sha256, page_ref)
+        if representative == page_ref:
+            continue
+        reused_pages.append(
+            {
+                "page_ref": page_ref,
+                "resource_id": resource_id,
+                "content_sha256": content_sha256,
+                "representative_page_ref": representative,
+            }
+        )
+    reused_refs = {item["page_ref"] for item in reused_pages}
+    return {
+        "strategy": "exact_page_duplicate_only",
+        "applicability": {
+            "item_keys": list(_FLOW_SPECS[workflow_key]["item_keys"]),
+            "basis": "full_coverage_without_trusted_item_relation",
+        },
+        "before_page_count": len(pages),
+        "review_page_count": len(pages) - len(reused_pages),
+        "review_page_refs": [
+            page_ref for page_ref, _image in pages if page_ref not in reused_refs
+        ],
+        "reused_pages": reused_pages,
+    }
+
+
 def _coverage(*, covered: int, total: int, applicable: bool) -> dict:
     return {
         "applicable": applicable,
@@ -358,6 +449,7 @@ def _quality_projection(
     item_count: int,
     evidence_refs: set[str],
     covered_page_count: int = 0,
+    total_page_count: int = 0,
 ) -> dict:
     resources = material.get("resources")
     resource_ids = {
@@ -402,7 +494,9 @@ def _quality_projection(
             for prefix in prefixes
         )
     }
-    page_applicable = workflow_key == "packaging_layout_approval"
+    page_applicable = (
+        workflow_key == "packaging_layout_approval" or total_page_count > 0
+    )
     return {
         "item_coverage": _coverage(
             covered=item_count,
@@ -416,7 +510,7 @@ def _quality_projection(
         ),
         "page_coverage": _coverage(
             covered=covered_page_count,
-            total=covered_page_count,
+            total=total_page_count,
             applicable=page_applicable,
         ),
         "format_ok": True,
@@ -455,10 +549,18 @@ def _valid_quality_projection(value: object, workflow_key: str) -> bool:
             or (not applicable and (covered != 0 or total != 0))
         ):
             return False
+    page_coverage = value["page_coverage"]
+    if workflow_key == "packaging_layout_approval":
+        page_contract_valid = page_coverage["applicable"] is True
+    elif workflow_key == "travel_expense":
+        page_contract_valid = page_coverage["applicable"] is (
+            page_coverage["total"] > 0
+        )
+    else:
+        page_contract_valid = page_coverage["applicable"] is False
     return (
         value["item_coverage"]["applicable"] is True
-        and value["page_coverage"]["applicable"]
-        is (workflow_key == "packaging_layout_approval")
+        and page_contract_valid
         and value.get("format_ok") is True
     )
 
@@ -1608,7 +1710,15 @@ class FlowEngine:
             "items": _flow_items(workflow_key),
             **_review_packet_constraints(workflow_key, material),
         }
-        if packet != expected_packet:
+        accepted_packets = [expected_packet]
+        if workflow_key == "travel_expense":
+            accepted_packets.append(
+                {
+                    **expected_packet,
+                    "page_routing": _review_packet_routing(workflow_key, material),
+                }
+            )
+        if packet not in accepted_packets:
             raise ValueError("frozen_packet_changed")
         return action, state, packet
 
@@ -1708,6 +1818,16 @@ class FlowEngine:
                     "material_fingerprint": verified["material_fingerprint"],
                     "items": _flow_items(workflow_key),
                     **_review_packet_constraints(workflow_key, material),
+                    **(
+                        {
+                            "page_routing": _review_packet_routing(
+                                workflow_key,
+                                material,
+                            )
+                        }
+                        if workflow_key == "travel_expense"
+                        else {}
+                    ),
                 }
                 packet_file = attempt_root / "review-packet.json"
                 json_artifact.write_json_atomic(packet_file, packet, indent=2)
@@ -2381,22 +2501,26 @@ class FlowEngine:
         ):
             raise ValueError("review_decision_invalid")
 
-        packaging_material: dict | None = None
+        quality_material = _read_object(
+            Path(state["material_file"]),
+            code="frozen_material_changed",
+        )
+        covered_page_refs = {
+            value
+            for item in normalized_items
+            for field in ("evidence_refs", "missing_evidence")
+            for value in item[field]
+        }
+        covered_page_count = 0
+        total_page_count = 0
+        routed_resource_refs: set[str] = set()
         packaging_excel_notice: str | None = None
         if action["workflow_key"] == "packaging_layout_approval":
-            packaging_material = _read_object(
-                Path(state["material_file"]),
-                code="frozen_material_changed",
-            )
-            page_refs = set(_packaging_page_refs(packaging_material))
-            covered_refs = {
-                value
-                for item in normalized_items
-                for field in ("evidence_refs", "missing_evidence")
-                for value in item[field]
-            }
-            if not page_refs or not page_refs.issubset(covered_refs):
+            page_refs = set(_packaging_page_refs(quality_material))
+            if not page_refs or not page_refs.issubset(covered_page_refs):
                 raise ValueError("review_decision_invalid")
+            covered_page_count = len(page_refs)
+            total_page_count = len(page_refs)
             comparison = decision.get("excel_comparison")
             if not isinstance(comparison, dict) or set(comparison) != {
                 "status",
@@ -2404,7 +2528,7 @@ class FlowEngine:
                 "mappings",
             }:
                 raise ValueError("review_decision_invalid")
-            excel_ids, readable_excel = _packaging_excel_contents(packaging_material)
+            excel_ids, readable_excel = _packaging_excel_contents(quality_material)
             comparison_status = comparison.get("status")
             excel_resource_id = comparison.get("resource_id")
             mappings = comparison.get("mappings")
@@ -2472,6 +2596,33 @@ class FlowEngine:
                 )
             else:
                 raise ValueError("review_decision_invalid")
+        elif action["workflow_key"] == "travel_expense":
+            routing = packet.get("page_routing")
+            if not isinstance(routing, dict):
+                routing = _full_travel_page_routing(quality_material)
+            review_page_refs = set(routing["review_page_refs"])
+            applicable_item_keys = set(routing["applicability"]["item_keys"])
+            if any(
+                item["item_key"] in applicable_item_keys
+                and not review_page_refs.issubset(
+                    set(item["evidence_refs"]).union(item["missing_evidence"])
+                )
+                for item in normalized_items
+            ):
+                raise ValueError("review_decision_invalid")
+            covered_pages = review_page_refs.intersection(covered_page_refs)
+            covered_pages.update(
+                str(reused["page_ref"])
+                for reused in routing["reused_pages"]
+                if reused["representative_page_ref"] in covered_page_refs
+            )
+            routed_resource_refs.update(
+                f"material:resources.{reused['resource_id']}"
+                for reused in routing["reused_pages"]
+                if reused["representative_page_ref"] in covered_page_refs
+            )
+            covered_page_count = len(covered_pages)
+            total_page_count = int(routing["before_page_count"])
 
         needs_human = any(item["status"] != "pass" for item in normalized_items)
         expected_overall = "needs_human" if needs_human else "pass"
@@ -2605,10 +2756,6 @@ class FlowEngine:
         )
 
         observability_state = "complete" if observability_complete else "unknown"
-        quality_material = packaging_material or _read_object(
-            Path(state["material_file"]),
-            code="frozen_material_changed",
-        )
         quality = _quality_projection(
             workflow_key=action["workflow_key"],
             material=quality_material,
@@ -2617,12 +2764,9 @@ class FlowEngine:
                 reference
                 for item in normalized_items
                 for reference in item["evidence_refs"]
-            },
-            covered_page_count=(
-                len(_packaging_page_refs(quality_material))
-                if action["workflow_key"] == "packaging_layout_approval"
-                else 0
-            ),
+            }.union(routed_resource_refs),
+            covered_page_count=covered_page_count,
+            total_page_count=total_page_count,
         )
         receipt = submission.build_receipt(
             action=action,
