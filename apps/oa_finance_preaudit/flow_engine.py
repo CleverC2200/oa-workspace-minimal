@@ -15,6 +15,7 @@ from typing import Callable, Iterable
 import fitz
 
 from apps import json_artifact
+from apps.oa_approval import writer_outcomes
 
 from . import observability, submission
 
@@ -140,6 +141,7 @@ SHARED_FAILURE_CODES = {
     "submission_adapter_unavailable",
     "write_authorization_invalid",
 }
+_WRITER_FAILURE_CODES = writer_outcomes.FAILURE_CODES
 
 
 CandidateSource = Callable[[str], Iterable[dict]]
@@ -925,11 +927,14 @@ class FlowEngine:
             state = _read_object(state_path, code="persistent_state_invalid")
         except ValueError:
             state = {}
-        write_state = (
-            "unknown"
-            if state.get("write_state") in {"submitting", "submitted", "unknown"}
-            else "not_requested"
-        )
+        if reason == writer_outcomes.SUBMIT_REJECTED:
+            write_state = "not_requested"
+        else:
+            write_state = (
+                "unknown"
+                if state.get("write_state") in {"submitting", "submitted", "unknown"}
+                else "not_requested"
+            )
         action = _needs_admin(
             workflow_key,
             reason,
@@ -2295,17 +2300,24 @@ class FlowEngine:
                     result,
                     str(submission_token or ""),
                 )
-            except Exception:
+            except Exception as error:
+                reason = str(error).strip()
+                if reason not in _WRITER_FAILURE_CODES:
+                    reason = "writer_result_unknown"
                 self._record_phase(
                     submitting_state,
                     "submit",
-                    "unknown",
+                    (
+                        "technical_failure"
+                        if reason == writer_outcomes.SUBMIT_REJECTED
+                        else "unknown"
+                    ),
                     wall_seconds=max(0, int(time.monotonic() - submit_started)),
                     required=False,
                 )
                 return self._persist_attempt_needs_admin(
                     action_path,
-                    "writer_result_unknown",
+                    reason,
                 )
             write_state = "submitted"
             observability_complete = self._record_phase(

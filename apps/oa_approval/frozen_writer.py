@@ -8,7 +8,7 @@ import secrets
 from typing import Any, Sequence
 import uuid
 
-from apps.oa_approval import runtime_control
+from apps.oa_approval import runtime_control, writer_outcomes
 from apps.oa_approval.writer_api import FrozenWriterApi, build_writer_api
 from apps.json_artifact import write_json_atomic
 
@@ -263,6 +263,8 @@ def submit_frozen(
                     raise FrozenWriterError("writer_result_unknown")
                 if attempt_state.get("status") in {"calling", "unknown"}:
                     raise FrozenWriterError("writer_result_unknown")
+                if attempt_state.get("status") == "confirmed_no_write":
+                    raise FrozenWriterError(writer_outcomes.SUBMIT_REJECTED)
             attempt_state = {
                 "schema_version": 1,
                 "kind": "preaudit_submission_attempt",
@@ -272,12 +274,23 @@ def submit_frozen(
             }
             write_json_atomic(attempt_state_path, attempt_state)
             result = (api or build_writer_api()).submit_and_verify(request_id, remark)
+            failure_code = str(result.get("failure_code") or "")
             if result.get("submit_ok") is not True:
+                if failure_code != writer_outcomes.SUBMIT_REJECTED:
+                    write_json_atomic(
+                        attempt_state_path,
+                        {**attempt_state, "status": "unknown"},
+                    )
+                    raise FrozenWriterError(
+                        failure_code
+                        if failure_code == writer_outcomes.TRANSPORT_UNKNOWN
+                        else "writer_result_unknown"
+                    )
                 write_json_atomic(
                     attempt_state_path,
                     {**attempt_state, "status": "confirmed_no_write"},
                 )
-                raise FrozenWriterError("writer_submit_failed")
+                raise FrozenWriterError(writer_outcomes.SUBMIT_REJECTED)
             if (
                 result.get("done_hit") is not True
                 or result.get("postcheck_done_hit") is not True
@@ -286,7 +299,12 @@ def submit_frozen(
                     attempt_state_path,
                     {**attempt_state, "status": "unknown"},
                 )
-                raise FrozenWriterError("writer_result_unknown")
+                if failure_code not in {
+                    writer_outcomes.POSTCHECK_TIMEOUT,
+                    writer_outcomes.PENDING_CONFLICT,
+                }:
+                    failure_code = "writer_result_unknown"
+                raise FrozenWriterError(failure_code)
             receipt = {
                 "request_id": request_id,
                 "submission_token": submission_token,
