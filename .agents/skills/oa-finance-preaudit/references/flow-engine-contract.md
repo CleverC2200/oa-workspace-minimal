@@ -19,7 +19,7 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
 
 默认命令返回的 preview 动作固化 `mode=preview`、`write_authorized=false` 和 `write_state=not_requested`。审核决定不包含运行模式或授权，不能在第二步切换写入。
 
-手工 Skill 任务固定使用默认 preview，不得把已有 preview attempt 提升为写入。差旅费受控写入只允许从滚动生产控制器进入；该入口校验当前显式确认、本地流程授权清单、停止状态、OA 身份和只读对账后，才串行准备单据。准备动作生成绑定当前单据和冻结证据的一小时 capability，完成动作再次验签并复核实时待办；任一边界验证失败均不写 OA。手工 `next-action --mode controlled-write` 和受控差旅 `complete-review` 明确拒绝，不能绕过控制器。
+手工 Skill 任务固定使用默认 preview，不得把已有 preview attempt 提升为写入。差旅费受控写入只允许从滚动生产控制器进入；该入口校验当前显式确认、本地流程授权清单、停止状态、OA 身份和只读对账后，才串行准备单据。准备动作生成绑定当前单据和冻结证据的一小时 capability，完成动作再次验签并复核实时待办；任一边界验证失败均不写 OA。手工 `next-action --mode controlled-write` 和受控差旅 `complete-review` 明确拒绝，不能绕过控制器。唯一例外是人工已在 OA 核实未写入的 `writer_result_unknown`：独立确认必须绑定精确 requestId，action/state 均为 `needs_admin + write_state=unknown`，且控制器和所有 Writer 均不活动；入口重新核验实时待办、已办、最新 attempt、身份和执行回执后，仅创建新的受控冻结 attempt，不直接提交 OA，后续仍由滚动控制器和唯一 Writer 处理。
 
 每个 attempt 只有一个当前动作；同一候选重复调用时返回原动作和 token，不重复取数。积压中还存在未打开候选时，后续 `next-action` 可以打开另一单据，供独立审核调用处理。`current-action.json` 只是最近一次返回动作的投影，不是全局锁或事实源。
 

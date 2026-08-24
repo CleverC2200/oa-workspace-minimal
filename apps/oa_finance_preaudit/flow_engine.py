@@ -1865,6 +1865,15 @@ class FlowEngine:
 
             action_file = attempt_root / "action.json"
             events_file = attempt_root / "observability.json"
+            recovery_metadata = {
+                key: claim[key]
+                for key in (
+                    "recovered_from_attempt",
+                    "recovery_reason",
+                    "recovery_no_write_evidence",
+                )
+                if key in claim
+            }
             action = _action_payload(
                 action="review_required",
                 execution_state="review_required",
@@ -1887,6 +1896,7 @@ class FlowEngine:
                 events_file=str(events_file),
                 case_key=claim["case_key"],
                 attempt=claim["attempt"],
+                **recovery_metadata,
             )
             state = {
                 **action,
@@ -2187,6 +2197,8 @@ class FlowEngine:
         *,
         mode: str = "preview",
         confirmed: bool = False,
+        confirmed_unknown_no_write: bool = False,
+        confirmed_request_id: str | None = None,
     ) -> dict:
         if confirmed is not True:
             raise ValueError("recovery_confirmation_required")
@@ -2216,16 +2228,30 @@ class FlowEngine:
         except ValueError as error:
             raise ValueError("recovery_not_safe") from error
         reason = str(state.get("reason") or "")
-        if (
-            action.get("execution_state") != "needs_admin"
-            or state.get("execution_state") != "needs_admin"
-            or action.get("reason") != reason
-            or reason not in {
+        human_confirmed_unknown = (
+            confirmed_unknown_no_write is True
+            and mode == "controlled_write"
+            and reason == "writer_result_unknown"
+            and str(state.get("request_id") or "") == confirmed_request_id
+            and action.get("write_state") == "unknown"
+            and state.get("write_state") == "unknown"
+        )
+        recoverable_without_write = (
+            reason
+            in {
                 "material_collection_failed",
                 "writer_submit_rejected",
             }
-            or action.get("write_state") != "not_requested"
-            or state.get("write_state") != "not_requested"
+            and action.get("write_state") == "not_requested"
+            and state.get("write_state") == "not_requested"
+        )
+        if (
+            action.get("action") != "needs_admin"
+            or state.get("action") != "needs_admin"
+            or action.get("execution_state") != "needs_admin"
+            or state.get("execution_state") != "needs_admin"
+            or action.get("reason") != reason
+            or not (recoverable_without_write or human_confirmed_unknown)
             or not self._attempt_identity_matches(
                 attempt_root,
                 state,
@@ -2302,6 +2328,15 @@ class FlowEngine:
                 discovery_seconds=discovery_seconds,
                 recovered_from_attempt=state["attempt"],
                 recovery_reason=reason,
+                **(
+                    {
+                        "recovery_no_write_evidence": (
+                            "human_confirmed_no_write"
+                        )
+                    }
+                    if human_confirmed_unknown
+                    else {}
+                ),
             )
             prepare_root.mkdir(parents=True)
             json_artifact.write_json_atomic(action_file_next, claim, indent=2)

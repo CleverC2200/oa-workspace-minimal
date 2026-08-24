@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 
 from apps.oa_approval import api as legacy_api
 from apps.oa_approval import flow as legacy_flow
+from apps.oa_approval import runtime_control
 from .case_bundle import collect_case
 from . import (
     flow_engine,
@@ -55,6 +56,7 @@ _FLOW_FAILURE_CODES = {
     "recovery_live_state_conflict",
     "recovery_live_state_unavailable",
     "recovery_not_safe",
+    "recovery_runtime_active",
     "run_mode_unauthorized",
     "production_rolling_controller_required",
     "write_authorization_invalid",
@@ -92,6 +94,12 @@ def build_parser() -> argparse.ArgumentParser:
     next_action.add_argument("--confirm-write", choices=("YES",), default=None)
     next_action.add_argument("--recover-action-file", type=Path, default=None)
     next_action.add_argument("--confirm-recovery", choices=("YES",), default=None)
+    next_action.add_argument(
+        "--confirm-unknown-no-write",
+        choices=("YES",),
+        default=None,
+    )
+    next_action.add_argument("--confirm-unknown-request-id", default=None)
     complete_review = subparsers.add_parser("complete-review")
     complete_review.add_argument("--action-file", type=Path, required=True)
     complete_review.add_argument("--decision-file", type=Path, required=True)
@@ -203,6 +211,34 @@ def _persisted_workflow(action_file: Path) -> str | None:
         return None
     workflow_key = str(payload.get("workflow_key") or "")
     return workflow_key if workflow_key in flow_engine.WORKFLOW_KEYS else None
+
+
+def _matches_confirmed_unknown_recovery(
+    action_file: Path,
+    confirmed_request_id: str | None,
+) -> bool:
+    if not confirmed_request_id:
+        return False
+    try:
+        action = json.loads(action_file.read_text(encoding="utf-8"))
+        state = json.loads(
+            action_file.with_name("state.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(action, dict) or not isinstance(state, dict):
+        return False
+    return (
+        str(state.get("request_id") or "") == confirmed_request_id
+        and action.get("action") == "needs_admin"
+        and state.get("action") == "needs_admin"
+        and action.get("execution_state") == "needs_admin"
+        and state.get("execution_state") == "needs_admin"
+        and action.get("write_state") == "unknown"
+        and state.get("write_state") == "unknown"
+        and action.get("reason") == "writer_result_unknown"
+        and state.get("reason") == "writer_result_unknown"
+    )
 
 
 def _failure_payload(error: Exception, *, command: str = "next-action") -> dict:
@@ -345,8 +381,27 @@ def main(
                 controlled = args.mode == "controlled-write"
                 if controlled != (args.confirm_write == "YES"):
                     raise ValueError("run_mode_unauthorized")
-                if controlled and args.workflow == "travel_expense":
+                confirmed_unknown_recovery = (
+                    args.recover_action_file is not None
+                    and args.confirm_recovery == "YES"
+                    and args.confirm_unknown_no_write == "YES"
+                    and _matches_confirmed_unknown_recovery(
+                        args.recover_action_file,
+                        args.confirm_unknown_request_id,
+                    )
+                )
+                if (
+                    controlled
+                    and args.workflow == "travel_expense"
+                    and not confirmed_unknown_recovery
+                ):
                     raise ValueError("production_rolling_controller_required")
+                if confirmed_unknown_recovery and (
+                    runtime_control.controller_active()
+                    or runtime_control.writer_active()
+                    or runtime_control.active_request_writers() != 0
+                ):
+                    raise ValueError("recovery_runtime_active")
                 engine = (
                     flow_engine_factory()
                     if flow_engine_factory is not None
@@ -358,11 +413,32 @@ def main(
                         raise ValueError("recovery_confirmation_required")
                     if _persisted_workflow(args.recover_action_file) != args.workflow:
                         raise ValueError("recovery_not_safe")
-                    payload = engine.recover_confirmed_no_write(
-                        args.recover_action_file,
-                        mode=mode,
-                        confirmed=True,
-                    )
+                    def recover() -> dict:
+                        return engine.recover_confirmed_no_write(
+                            args.recover_action_file,
+                            mode=mode,
+                            confirmed=True,
+                            confirmed_unknown_no_write=(
+                                args.confirm_unknown_no_write == "YES"
+                            ),
+                            confirmed_request_id=args.confirm_unknown_request_id,
+                        )
+
+                    if confirmed_unknown_recovery:
+                        try:
+                            with runtime_control.global_controller_lease():
+                                if (
+                                    runtime_control.writer_active()
+                                    or runtime_control.active_request_writers() != 0
+                                ):
+                                    raise ValueError("recovery_runtime_active")
+                                payload = recover()
+                        except RuntimeError as error:
+                            if str(error) != "controller_already_active":
+                                raise
+                            raise ValueError("recovery_runtime_active") from error
+                    else:
+                        payload = recover()
                 else:
                     payload = engine.next_action(args.workflow, mode=mode)
             else:

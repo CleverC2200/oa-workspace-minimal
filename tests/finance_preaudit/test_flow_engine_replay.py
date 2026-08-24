@@ -144,6 +144,12 @@ def test_unknown_or_handled_case_cannot_enter_recovery(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="recovery_not_safe"):
         engine.recover_confirmed_no_write(action_path, confirmed=True)
+    with pytest.raises(ValueError, match="recovery_not_safe"):
+        engine.recover_confirmed_no_write(
+            action_path,
+            confirmed=True,
+            confirmed_unknown_no_write=True,
+        )
 
     handled_engine = _engine(
         tmp_path / "handled",
@@ -156,6 +162,142 @@ def test_unknown_or_handled_case_cannot_enter_recovery(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="recovery_live_state_conflict"):
         handled_engine.recover_confirmed_no_write(
             Path(handled_failure["action_file"]), confirmed=True
+        )
+
+
+def test_human_confirmed_unknown_creates_fresh_controlled_attempt(
+    tmp_path: Path,
+) -> None:
+    submit_calls: list[dict] = []
+    engine = _engine(
+        tmp_path,
+        authorization_source=_grant,
+        submit_frozen=lambda job: submit_calls.append(dict(job)) or _success(job),
+    )
+    failed = engine.next_action("travel_expense")
+    action_path = Path(failed["action_file"])
+    state_path = Path(failed["state_file"])
+    for path in (action_path, state_path):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.update(
+            {
+                "action": "needs_admin",
+                "execution_state": "needs_admin",
+                "write_state": "unknown",
+                "reason": "writer_result_unknown",
+            }
+        )
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    old_action = action_path.read_bytes()
+    old_state = state_path.read_bytes()
+
+    recovered = engine.recover_confirmed_no_write(
+        action_path,
+        mode="controlled_write",
+        confirmed=True,
+        confirmed_unknown_no_write=True,
+        confirmed_request_id="recorded-request",
+    )
+
+    assert recovered["action"] == "review_required"
+    assert recovered["attempt"] == 2
+    assert recovered["mode"] == "controlled_write"
+    assert recovered["write_state"] == "authorized"
+    assert recovered["recovery_no_write_evidence"] == "human_confirmed_no_write"
+    assert action_path.read_bytes() == old_action
+    assert state_path.read_bytes() == old_state
+    assert submit_calls == []
+
+
+@pytest.mark.parametrize(
+    "invalid_boundary",
+    ("preview", "action_state", "request_id"),
+)
+def test_human_confirmed_unknown_requires_controlled_needs_admin_state(
+    tmp_path: Path,
+    invalid_boundary: str,
+) -> None:
+    engine = _engine(
+        tmp_path,
+        authorization_source=_grant,
+        submit_frozen=_success,
+    )
+    failed = engine.next_action("travel_expense")
+    action_path = Path(failed["action_file"])
+    for path in (action_path, Path(failed["state_file"])):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.update(
+            {
+                "action": "needs_admin",
+                "execution_state": "needs_admin",
+                "write_state": "unknown",
+                "reason": "writer_result_unknown",
+            }
+        )
+        if invalid_boundary == "action_state" and path == action_path:
+            payload["action"] = "review_required"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="recovery_not_safe"):
+        engine.recover_confirmed_no_write(
+            action_path,
+            mode=("preview" if invalid_boundary == "preview" else "controlled_write"),
+            confirmed=True,
+            confirmed_unknown_no_write=True,
+            confirmed_request_id=(
+                "different-request"
+                if invalid_boundary == "request_id"
+                else "recorded-request"
+            ),
+        )
+
+
+@pytest.mark.parametrize("blocked_by", ("handled", "receipt"))
+def test_human_confirmed_unknown_keeps_live_and_receipt_gates(
+    tmp_path: Path,
+    blocked_by: str,
+) -> None:
+    engine = _engine(
+        tmp_path,
+        authorization_source=_grant,
+        submit_frozen=_success,
+        handled=(
+            [{"request_id": "recorded-request"}]
+            if blocked_by == "handled"
+            else None
+        ),
+    )
+    failed = engine.next_action("travel_expense")
+    action_path = Path(failed["action_file"])
+    for path in (action_path, Path(failed["state_file"])):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.update(
+            {
+                "action": "needs_admin",
+                "execution_state": "needs_admin",
+                "write_state": "unknown",
+                "reason": "writer_result_unknown",
+            }
+        )
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    if blocked_by == "receipt":
+        (action_path.parent / "execution-receipt.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+
+    expected = (
+        "recovery_live_state_conflict"
+        if blocked_by == "handled"
+        else "recovery_not_safe"
+    )
+    with pytest.raises(ValueError, match=expected):
+        engine.recover_confirmed_no_write(
+            action_path,
+            mode="controlled_write",
+            confirmed=True,
+            confirmed_unknown_no_write=True,
+            confirmed_request_id="recorded-request",
         )
 
 

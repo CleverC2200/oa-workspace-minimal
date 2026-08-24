@@ -65,7 +65,7 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
 
 两条命令默认都是 preview，动作固定 `write_authorized=false`，写入状态固定为 `not_requested`；不会调用 OA 提交。模块和 CLI 共用同一业务实现，大对象通过本地文件传递，stdout 只输出一个版本化 JSON。四类财务流程无法可信取得材料时生成不含可疑证据的降级审核包，由 Agent 输出 `⚠️` 意见交财务判断；流程身份、冻结 attempt、写入授权或目标不一致时才返回 `needs_admin`。包装图片不可读仍停止，避免生成貌似完成的校对意见。五类流程的目录和当前动作投影相互独立；不同单据的材料收集与 Agent 审核可以并发，每个 attempt 使用自己的完成锁，互不等待；所有 OA 写入入口共用一把全局锁并严格串行。
 
-手工运行只使用 `next-action`、`complete-review`、`status` 和 `prune` 四个命令。差旅生产另由唯一滚动控制器编排同一深模块；候选发现、材料收集、冻结校验、单据锁、提交安全门和回执仍隐藏在模块内，没有角色 CLI、底层队列命令或跨任务消息协议。
+手工运行只使用 `next-action`、`complete-review`、`status` 和 `prune` 四个命令。差旅生产另由唯一滚动控制器编排同一深模块；候选发现、材料收集、冻结校验、单据锁、提交安全门和回执仍隐藏在模块内，没有角色 CLI、底层队列命令或跨任务消息协议。差旅手工受控入口默认拒绝；唯一例外是人工已核实未写入的 `writer_result_unknown` 恢复，它必须绑定精确 requestId，并在无活动控制器和 Writer 时仅创建新冻结 attempt，不直接提交 OA。
 
 ## 脱敏运行指标
 
@@ -73,7 +73,7 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
 
 内部离线验收报告固定检查审核项/资源/页面/格式/golden replay 100%、重复提交/跨单据混用/unknown 自动重试/Agent 消息 0，以及 P95 小于 900 秒、等待比例小于 20%、技术错误率不高于 2%。单变量实验报告同时输出裁剪前后的 P50/P95 和 Token 总量；任一闭合样本缺少精确 usage 时 Token 状态保持 `unknown`，不输出估算总量。每流程不足 20 个闭合脱敏样本时不建议调参。真实 `python -m` 入口会把四命令的成功、参数、JSON 合同和文件传递结果写入本地 30 天脱敏 CLI 日志；进程尚未启动时的失败和人工复现由本地 launcher/harness 补充。日志不含 argv、stderr 或路径；status/prune 每次只记一条 global 调用，按流程展示时投影影响范围，但 overall 不重复计数。未知值不能推断为 0。只有 CLI 故障严格多于其他技术故障且证据完整时，报告才允许提出独立 stdio MCP 后续 Issue；本项目当前不实现或安装 MCP。
 
-OA 提交只通过冻结写入入口执行。授权证明、token、冻结指纹和终态回执均绑定单个 `requestId + received_at + attempt` 及其材料版本：同一 attempt 单飞并幂等重放；不同单据的取数和审核可以并发，但 OA 写入统一经过全局单写锁。差旅费只接受滚动控制器的一次入口确认，准备动作生成一小时绑定 capability，完成动作再次验签；手工受控 CLI 对差旅明确拒绝。尚未迁移到滚动控制器的其他流程继续要求两步命令各自显式确认：
+OA 提交只通过冻结写入入口执行。授权证明、token、冻结指纹和终态回执均绑定单个 `requestId + received_at + attempt` 及其材料版本：同一 attempt 单飞并幂等重放；不同单据的取数和审核可以并发，但 OA 写入统一经过全局单写锁。差旅费只接受滚动控制器的一次入口确认，准备动作生成一小时绑定 capability，完成动作再次验签；除下述人工确认 unknown 未写入恢复外，手工受控 CLI 对差旅明确拒绝。尚未迁移到滚动控制器的其他流程继续要求两步命令各自显式确认：
 
 ```bash
 python3 -m apps.oa_finance_preaudit.cli next-action \
@@ -160,13 +160,17 @@ python3 -m apps.oa_finance_preaudit.cli status --check-live
 python3 -m apps.oa_finance_preaudit.cli status --reconcile
 ```
 
-只有 `material_collection_failed` 或 `writer_submit_rejected` 且 `write_state=not_requested` 才能由人工确认恢复。入口会重新核验同一身份仍在待办、未出现在已办、旧 attempt 仍为最新，然后创建新 attempt 并保留旧现场；任何 unknown 永远不能走此入口：
+普通人工恢复只允许 `material_collection_failed` 或 `writer_submit_rejected` 且 `write_state=not_requested`。普通 `--confirm-recovery` 仍拒绝所有 unknown。仅当人工已在 OA 核实未写入时，`writer_result_unknown + needs_admin + write_state=unknown` 才能使用独立确认：命令必须绑定精确 requestId，确认控制器和所有 Writer 均不活动，并重新核验同一身份唯一仍在待办、未出现在已办、旧 attempt 为最新且无执行回执。恢复保留旧现场，只创建新的受控冻结 attempt，不直接写 OA：
 
 ```bash
 python3 -m apps.oa_finance_preaudit.cli next-action \
   --workflow travel_expense \
+  --mode controlled-write \
+  --confirm-write YES \
   --recover-action-file /absolute/path/to/action.json \
-  --confirm-recovery YES
+  --confirm-recovery YES \
+  --confirm-unknown-no-write YES \
+  --confirm-unknown-request-id EXACT_REQUEST_ID
 ```
 
 受控清理使用同一 JSON CLI。它在同一维护锁和事件锁内先计算脱敏日聚合，完整校验计划与所有目标，再以不跟随符号链接的原子写入落盘，最后才归档或删除原始 attempt：

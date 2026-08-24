@@ -1609,6 +1609,33 @@ def run_rolling_drain(
     reconcile_status: Callable[[], dict] = _production_reconciliation,
     max_waves: int = 10,
 ) -> dict:
+    try:
+        with runtime_control.global_controller_lease():
+            return _run_rolling_drain_locked(
+                capacity=capacity,
+                adaptive=adaptive,
+                max_capacity=max_capacity,
+                live_status=live_status,
+                pipeline_runner=pipeline_runner,
+                reconcile_status=reconcile_status,
+                max_waves=max_waves,
+            )
+    except RuntimeError as error:
+        if str(error) == "controller_already_active":
+            raise ValueError("production_rolling_controller_active") from error
+        raise
+
+
+def _run_rolling_drain_locked(
+    *,
+    capacity: int,
+    adaptive: bool = False,
+    max_capacity: int = 12,
+    live_status: LiveStatus = runtime_doctor.status,
+    pipeline_runner: PipelineRunner = _run_dispatched_tasks,
+    reconcile_status: Callable[[], dict] = _production_reconciliation,
+    max_waves: int = 10,
+) -> dict:
     if not 1 <= capacity <= 6:
         raise ValueError("production_rolling_capacity_invalid")
     if adaptive and (
