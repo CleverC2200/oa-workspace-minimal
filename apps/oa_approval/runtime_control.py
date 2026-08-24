@@ -11,6 +11,7 @@ from typing import Iterator
 
 STOP_CODE = "oa_run_stopped"
 GLOBAL_WRITER_KEY = "finance-preaudit-global-writer"
+GLOBAL_CONTROLLER_KEY = "finance-preaudit-rolling-controller"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -53,6 +54,17 @@ def writer_lock_file() -> Path:
         Path(raw).expanduser()
         if raw
         else PROJECT_ROOT / "runtime" / "control" / "frozen-writer.lock"
+    )
+
+
+def controller_lock_file() -> Path:
+    raw = str(
+        os.environ.get("OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE") or ""
+    ).strip()
+    return (
+        Path(raw).expanduser()
+        if raw
+        else PROJECT_ROOT / "runtime" / "control" / "rolling-controller.lock"
     )
 
 
@@ -119,10 +131,17 @@ def writer_active(path: Path | None = None) -> bool:
         descriptor.close()
 
 
+def controller_active(path: Path | None = None) -> bool:
+    base = Path(path or controller_lock_file()).expanduser().resolve()
+    return writer_active(request_writer_lock_file(GLOBAL_CONTROLLER_KEY, base))
+
+
 @contextmanager
 def request_writer_lease(
     request_id: str,
     path: Path | None = None,
+    *,
+    blocking: bool = True,
 ) -> Iterator[None]:
     target = request_writer_lock_file(request_id, path)
     parent_descriptor = _open_directory_nofollow(target.parent)
@@ -166,15 +185,19 @@ def request_writer_lease(
     except Exception:
         os.close(file_descriptor)
         raise
+    acquired = False
     try:
-        fcntl.flock(descriptor.fileno(), fcntl.LOCK_EX)
+        flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+        fcntl.flock(descriptor.fileno(), flags)
+        acquired = True
         descriptor.seek(0)
         descriptor.truncate()
         descriptor.write(str(os.getpid()))
         descriptor.flush()
         yield
     finally:
-        fcntl.flock(descriptor.fileno(), fcntl.LOCK_UN)
+        if acquired:
+            fcntl.flock(descriptor.fileno(), fcntl.LOCK_UN)
         descriptor.close()
 
 
@@ -183,3 +206,17 @@ def global_writer_lease() -> Iterator[None]:
     """Acquire the one canonical lock shared by every OA write entrypoint."""
     with request_writer_lease(GLOBAL_WRITER_KEY, writer_lock_file()):
         yield
+
+
+@contextmanager
+def global_controller_lease() -> Iterator[None]:
+    """Acquire the one canonical lock shared by rolling controllers."""
+    try:
+        with request_writer_lease(
+            GLOBAL_CONTROLLER_KEY,
+            controller_lock_file(),
+            blocking=False,
+        ):
+            yield
+    except BlockingIOError as error:
+        raise RuntimeError("controller_already_active") from error

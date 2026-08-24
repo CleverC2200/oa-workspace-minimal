@@ -220,14 +220,33 @@ def test_controlled_travel_next_action_requires_rolling_controller() -> None:
 
 def test_recovery_requires_explicit_confirmation_and_uses_engine_gate(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[Path, str, bool]] = []
+    monkeypatch.setenv(
+        "OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE",
+        str(tmp_path / "rolling-controller.lock"),
+    )
+    calls: list[tuple[Path, str, bool, bool, str | None]] = []
 
     class Engine:
         def recover_confirmed_no_write(
-            self, action_file: Path, *, mode: str, confirmed: bool
+            self,
+            action_file: Path,
+            *,
+            mode: str,
+            confirmed: bool,
+            confirmed_unknown_no_write: bool = False,
+            confirmed_request_id: str | None = None,
         ) -> dict:
-            calls.append((action_file, mode, confirmed))
+            calls.append(
+                (
+                    action_file,
+                    mode,
+                    confirmed,
+                    confirmed_unknown_no_write,
+                    confirmed_request_id,
+                )
+            )
             return {
                 "schema_version": 1,
                 "kind": "preaudit_action",
@@ -237,7 +256,20 @@ def test_recovery_requires_explicit_confirmation_and_uses_engine_gate(
 
     action = tmp_path / "action.json"
     action.write_text(
-        json.dumps({"workflow_key": "travel_expense"}),
+        json.dumps(
+            {
+                "workflow_key": "travel_expense",
+                "action": "needs_admin",
+                "execution_state": "needs_admin",
+                "write_state": "unknown",
+                "reason": "writer_result_unknown",
+                "request_id": "recorded-request",
+            }
+        ),
+        encoding="utf-8",
+    )
+    action.with_name("state.json").write_text(
+        action.read_text(encoding="utf-8"),
         encoding="utf-8",
     )
     denied = io.StringIO()
@@ -270,8 +302,133 @@ def test_recovery_requires_explicit_confirmation_and_uses_engine_gate(
             ],
             flow_engine_factory=Engine,
         ) == 0
-    assert calls == [(action, "preview", True)]
+    assert calls == [(action, "preview", True, False, None)]
     assert json.loads(allowed.getvalue())["action"] == "review_required"
+
+    controlled = io.StringIO()
+    with redirect_stdout(controlled):
+        assert cli.main(
+            [
+                "next-action",
+                "--workflow",
+                "travel_expense",
+                "--mode",
+                "controlled-write",
+                "--confirm-write",
+                "YES",
+                "--recover-action-file",
+                str(action),
+                "--confirm-recovery",
+                "YES",
+                "--confirm-unknown-no-write",
+                "YES",
+                "--confirm-unknown-request-id",
+                "recorded-request",
+            ],
+            flow_engine_factory=Engine,
+        ) == 0
+    assert calls[-1] == (
+        action,
+        "controlled_write",
+        True,
+        True,
+        "recorded-request",
+    )
+    assert json.loads(controlled.getvalue())["action"] == "review_required"
+
+    monkeypatch.setattr(cli.runtime_control, "controller_active", lambda: True)
+    active = io.StringIO()
+    with redirect_stdout(active):
+        assert cli.main(
+            [
+                "next-action",
+                "--workflow",
+                "travel_expense",
+                "--mode",
+                "controlled-write",
+                "--confirm-write",
+                "YES",
+                "--recover-action-file",
+                str(action),
+                "--confirm-recovery",
+                "YES",
+                "--confirm-unknown-no-write",
+                "YES",
+                "--confirm-unknown-request-id",
+                "recorded-request",
+            ],
+            flow_engine_factory=Engine,
+        ) == 1
+    assert json.loads(active.getvalue())["failure"]["code"] == (
+        "recovery_runtime_active"
+    )
+    assert len(calls) == 2
+
+    monkeypatch.setattr(cli.runtime_control, "controller_active", lambda: False)
+    monkeypatch.setattr(cli.runtime_control, "writer_active", lambda: True)
+    writer_active = io.StringIO()
+    with redirect_stdout(writer_active):
+        assert cli.main(
+            [
+                "next-action",
+                "--workflow",
+                "travel_expense",
+                "--mode",
+                "controlled-write",
+                "--confirm-write",
+                "YES",
+                "--recover-action-file",
+                str(action),
+                "--confirm-recovery",
+                "YES",
+                "--confirm-unknown-no-write",
+                "YES",
+                "--confirm-unknown-request-id",
+                "recorded-request",
+            ],
+            flow_engine_factory=Engine,
+        ) == 1
+    assert json.loads(writer_active.getvalue())["failure"]["code"] == (
+        "recovery_runtime_active"
+    )
+    assert len(calls) == 2
+
+    monkeypatch.setattr(cli.runtime_control, "writer_active", lambda: False)
+    for path in (action, action.with_name("state.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.update(
+            {
+                "write_state": "not_requested",
+                "reason": "material_collection_failed",
+            }
+        )
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    other_reason = io.StringIO()
+    with redirect_stdout(other_reason):
+        assert cli.main(
+            [
+                "next-action",
+                "--workflow",
+                "travel_expense",
+                "--mode",
+                "controlled-write",
+                "--confirm-write",
+                "YES",
+                "--recover-action-file",
+                str(action),
+                "--confirm-recovery",
+                "YES",
+                "--confirm-unknown-no-write",
+                "YES",
+                "--confirm-unknown-request-id",
+                "recorded-request",
+            ],
+            flow_engine_factory=Engine,
+        ) == 1
+    assert json.loads(other_reason.getvalue())["failure"]["code"] == (
+        "production_rolling_controller_required"
+    )
+    assert len(calls) == 2
 
     mismatch = io.StringIO()
     with redirect_stdout(mismatch):
