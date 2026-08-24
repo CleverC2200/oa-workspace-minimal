@@ -623,6 +623,63 @@ def test_parent_completion_can_defer_first_invalid_decision_stop(
     assert not action_file.with_name("execution-receipt.json").exists()
 
 
+def test_host_completion_preserves_allowlisted_writer_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class Engine:
+        def complete_review(self, _action_file: Path, _decision_file: Path) -> dict:
+            return {
+                "action": "needs_admin",
+                "execution_state": "needs_admin",
+                "write_state": "unknown",
+                "reason": "writer_result_unknown",
+            }
+
+    monkeypatch.setattr(
+        "apps.oa_finance_preaudit.cli._live_flow_engine",
+        lambda *, controlled: Engine(),
+    )
+
+    assert (
+        codex_review_worker._complete_decision(
+            tmp_path / "action.json",
+            {"kind": "preaudit_review_decision"},
+        )
+        == "writer_result_unknown"
+    )
+
+
+def test_parent_completion_reports_unknown_writer_state(tmp_path: Path) -> None:
+    _task_value, action_file = _task(tmp_path)
+    stopped: list[bool] = []
+
+    result = codex_review_worker.complete_review_result(
+        action_file,
+        {
+            "status": "reviewed",
+            "process_attempts": 1,
+            "agent_wall_seconds": 12,
+            "token_usage": {"status": "unknown"},
+            "codex_events": {
+                "status": "recorded",
+                "attempts": 1,
+                "recorded_attempts": 1,
+                "unknown_attempts": 0,
+                "counts": {"turn.completed": 1},
+            },
+            "decision": {"kind": "preaudit_review_decision", "items": []},
+        },
+        completer=lambda _action, _decision: "writer_result_unknown",
+        request_stop=lambda: stopped.append(True),
+    )
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "writer_result_unknown"
+    assert result["write_state"] == "unknown"
+    assert stopped == [True]
+
+
 def test_usage_parser_reads_only_turn_completed_usage() -> None:
     stream = io.StringIO(
         '\n'.join(
