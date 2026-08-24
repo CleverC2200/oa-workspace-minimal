@@ -122,7 +122,26 @@ def decide_capacity(
             "healthy_windows": 0,
             "reason": "host_health_unknown",
         }
-    if int(wave.get("transient_error_events") or 0) > 0:
+    if wave.get("codex_event_status") != "recorded":
+        return {
+            "action": "hold",
+            "next_capacity": current_capacity,
+            "healthy_windows": 0,
+            "reason": "codex_events_unknown",
+        }
+    transient_errors = wave.get("transient_error_events")
+    if (
+        not isinstance(transient_errors, int)
+        or isinstance(transient_errors, bool)
+        or transient_errors < 0
+    ):
+        return {
+            "action": "hold",
+            "next_capacity": current_capacity,
+            "healthy_windows": 0,
+            "reason": "codex_events_unknown",
+        }
+    if transient_errors > 0:
         return {
             "action": "hold",
             "next_capacity": current_capacity,

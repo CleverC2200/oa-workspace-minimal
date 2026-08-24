@@ -627,6 +627,13 @@ def test_elastic_rolling_requires_two_healthy_waves_before_upgrade() -> None:
                         "process_attempts": 1,
                         "process_retries": 0,
                         "token_usage": {"status": "unknown"},
+                        "codex_events": {
+                            "status": "recorded",
+                            "attempts": 1,
+                            "recorded_attempts": 1,
+                            "unknown_attempts": 0,
+                            "counts": {"turn.completed": 1},
+                        },
                     },
                 )
                 for index in range(count)
@@ -661,6 +668,51 @@ def test_elastic_rolling_requires_two_healthy_waves_before_upgrade() -> None:
     assert result["status"] == "completed"
 
 
+def test_rolling_wave_preserves_transient_codex_error_counts() -> None:
+    metrics = finance_preaudit_concurrency_probe._rolling_wave_metrics(
+        process_pool.PoolResult(
+            requested=1,
+            started=1,
+            completed=1,
+            failed=0,
+            timed_out=0,
+            stopped=0,
+            peak_active=1,
+            elapsed_seconds=1.0,
+            outcomes=(
+                process_pool.TaskOutcome(
+                    index=0,
+                    status="completed",
+                    value={
+                        "status": "completed",
+                        "business_state": "pass",
+                        "process_attempts": 2,
+                        "process_retries": 1,
+                        "prepare_elapsed_seconds": 0.1,
+                        "token_usage": {"status": "unknown"},
+                        "codex_events": {
+                            "status": "recorded",
+                            "attempts": 2,
+                            "recorded_attempts": 2,
+                            "unknown_attempts": 0,
+                            "counts": {
+                                "error": 1,
+                                "turn.completed": 2,
+                            },
+                        },
+                    },
+                ),
+            ),
+        )
+    )
+
+    assert metrics["transient_error_events"] == 1
+    assert metrics["codex_events"]["counts"] == {
+        "error": 1,
+        "turn.completed": 2,
+    }
+
+
 def test_rolling_drain_excludes_quarantined_unknown_writes() -> None:
     calls: list[tuple[int, int]] = []
 
@@ -683,6 +735,17 @@ def test_rolling_drain_excludes_quarantined_unknown_writes() -> None:
     assert result["initial_actionable"] == 0
     assert result["quarantined_pending"] == 3
     assert result["final_pending"] == 3
+    assert result["codex_events"] == {
+        "status": "unknown",
+        "workers": 0,
+        "recorded_workers": 0,
+        "unknown_workers": 0,
+        "attempts": 0,
+        "recorded_attempts": 0,
+        "unknown_attempts": 0,
+        "counts": {},
+    }
+    assert result["transient_error_events"] is None
 
 
 def test_rolling_controller_reconciles_before_any_pipeline_work() -> None:
@@ -838,6 +901,7 @@ def test_dispatcher_assigns_each_open_action_once_with_rolling_capacity(
         executor_factory=lambda capacity: ThreadPoolExecutor(
             max_workers=capacity
         ),
+        runtime_status=lambda: {"status": "healthy"},
     )
 
     assert result.completed == 3
@@ -940,6 +1004,7 @@ def test_dispatcher_requests_stop_before_failed_sibling_can_write(
         executor_factory=lambda capacity: ThreadPoolExecutor(
             max_workers=capacity
         ),
+        runtime_status=lambda: {"status": "healthy"},
     )
 
     assert stop.is_set()
@@ -1025,6 +1090,7 @@ def test_dispatcher_lets_parent_writer_finish_before_stopping_failed_sibling(
         executor_factory=lambda capacity: ThreadPoolExecutor(
             max_workers=capacity
         ),
+        runtime_status=lambda: {"status": "healthy"},
     )
 
     assert completion_finished.is_set()
@@ -1119,9 +1185,17 @@ def test_read_only_probe_allows_twelve_slots_and_returns_sanitized_summary(
                         "status": "completed",
                         "business_state": "needs_human",
                         "error_code": None,
+                        "process_attempts": 1,
+                        "process_retries": 0,
                         "process_state": "exited",
                         "decision_state": "valid_object",
-                        "event_counts": {"turn.completed": 1},
+                        "codex_events": {
+                            "status": "recorded",
+                            "attempts": 1,
+                            "recorded_attempts": 1,
+                            "unknown_attempts": 0,
+                            "counts": {"turn.completed": 1},
+                        },
                         "exit_code": 0,
                         "token_usage": {
                             "status": "recorded",
@@ -1165,7 +1239,16 @@ def test_read_only_probe_allows_twelve_slots_and_returns_sanitized_summary(
     assert result["peak_active"] == 12
     assert result["process_states"] == {"exited": 12}
     assert result["decision_states"] == {"valid_object": 12}
-    assert result["event_counts"] == {"turn.completed": 12}
+    assert result["codex_events"] == {
+        "status": "recorded",
+        "workers": 12,
+        "recorded_workers": 12,
+        "unknown_workers": 0,
+        "attempts": 12,
+        "recorded_attempts": 12,
+        "unknown_attempts": 0,
+        "counts": {"turn.completed": 12},
+    }
     assert result["token_usage"]["total_tokens"] == 1320
     assert result["runtime_health"]["status"] == "healthy"
     assert result["watchdog"] == {
@@ -1175,6 +1258,28 @@ def test_read_only_probe_allows_twelve_slots_and_returns_sanitized_summary(
     }
     encoded = json.dumps(result)
     assert str(flow_root) not in encoded
+
+
+def test_event_aggregation_keeps_invalid_worker_attempts_unknown() -> None:
+    result = finance_preaudit_concurrency_probe._aggregate_codex_events(
+        [
+            {
+                "process_attempts": 2,
+                "codex_events": {"status": "unknown"},
+            }
+        ]
+    )
+
+    assert result == {
+        "status": "unknown",
+        "workers": 1,
+        "recorded_workers": 0,
+        "unknown_workers": 1,
+        "attempts": 2,
+        "recorded_attempts": 0,
+        "unknown_attempts": 2,
+        "counts": {},
+    }
 
 
 def test_adaptive_read_only_probe_requires_two_healthy_waves_per_upgrade() -> None:
@@ -1190,6 +1295,16 @@ def test_adaptive_read_only_probe_requires_two_healthy_waves_per_upgrade() -> No
             "timed_out": 0,
             "stopped": 0,
             "transient_error_events": 0,
+            "codex_events": {
+                "status": "recorded",
+                "workers": sample_size,
+                "recorded_workers": sample_size,
+                "unknown_workers": 0,
+                "attempts": sample_size,
+                "recorded_attempts": sample_size,
+                "unknown_attempts": 0,
+                "counts": {"turn.completed": sample_size},
+            },
             "elapsed_seconds": 10.0,
             "runtime_health": {
                 "status": "healthy",
@@ -1210,6 +1325,8 @@ def test_adaptive_read_only_probe_requires_two_healthy_waves_per_upgrade() -> No
     assert result["recommended_capacity"] == 12
     assert result["waves"] == 6
     assert result["token_usage"]["total_tokens"] == 600
+    assert result["codex_events"]["counts"] == {"turn.completed": 120}
+    assert result["transient_error_events"] == 0
     assert result["last_decision"] == {
         "action": "increase",
         "next_capacity": 12,

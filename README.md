@@ -69,7 +69,7 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
 
 ## 脱敏运行指标
 
-每个 attempt 的 `observability.json` 只保存 attempt 哈希、流程、阶段、耗时、结果和 Token 状态。阶段拆为机械取数、Agent 审核、提交和回查；协调秒数与 Token 必须为 0。生产 Worker 在调用完成动作前写入绑定 `action_token` 的 `agent-timing.json`，FlowEngine 校验后把 Agent 墙钟与精确 usage 写入审核事件；手工 preview 或 usage 不完整时保持 unknown，不做估算。`status` 按单据哈希、流程和 Asia/Shanghai 日期给出 P50/P95 与 Token 完整性。重复事件不会重复计数，冲突值会被拒绝；提交前的必要事件无法保存时停止当前单据，提交后的指标异常不会触发 OA 重放。
+每个 attempt 的 `observability.json` 只保存 attempt 哈希、流程、阶段、耗时、结果和 Token 状态。阶段拆为机械取数、Agent 审核、提交和回查；协调秒数与 Token 必须为 0。生产 Worker 在调用完成动作前写入绑定 `action_token` 的 `agent-timing.json`，FlowEngine 校验后把 Agent 墙钟与精确 usage 写入审核事件；手工 preview 或 usage 不完整时保持 unknown，不做估算。Worker 只把每次 Codex 进程的事件类型计数汇总为 `codex_events`，不保存 JSONL、提示词或回复正文；任一尝试缺少完整 `turn.completed` 时整体状态保持 unknown，并阻止弹性升档，已观察到的瞬时 `error` 仍如实累计。`status` 按单据哈希、流程和 Asia/Shanghai 日期给出 P50/P95 与 Token 完整性。重复事件不会重复计数，冲突值会被拒绝；提交前的必要事件无法保存时停止当前单据，提交后的指标异常不会触发 OA 重放。
 
 内部离线验收报告固定检查审核项/资源/页面/格式/golden replay 100%、重复提交/跨单据混用/unknown 自动重试/Agent 消息 0，以及 P95 小于 900 秒、等待比例小于 20%、技术错误率不高于 2%。每流程不足 20 个闭合脱敏样本时不建议调参；缺少平台精确 usage 时只停止 Token 调优。真实 `python -m` 入口会把四命令的成功、参数、JSON 合同和文件传递结果写入本地 30 天脱敏 CLI 日志；进程尚未启动时的失败和人工复现由本地 launcher/harness 补充。日志不含 argv、stderr 或路径；status/prune 每次只记一条 global 调用，按流程展示时投影影响范围，但 overall 不重复计数。未知值不能推断为 0。只有 CLI 故障严格多于其他技术故障且证据完整时，报告才允许提出独立 stdio MCP 后续 Issue；本项目当前不实现或安装 MCP。
 

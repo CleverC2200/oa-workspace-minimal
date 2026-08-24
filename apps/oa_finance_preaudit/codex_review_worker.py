@@ -16,6 +16,17 @@ from apps.oa_approval import runtime_control
 
 MODEL = "gpt-5.6-terra"
 REASONING_EFFORT = "high"
+_EVENT_TYPES = frozenset(
+    {
+        "error",
+        "item.completed",
+        "item.started",
+        "thread.started",
+        "turn.completed",
+        "turn.started",
+    }
+)
+_SANITIZED_EVENT_TYPES = _EVENT_TYPES | {"other"}
 
 
 @dataclass(frozen=True)
@@ -26,6 +37,7 @@ class CodexExecution:
     process_state: str = "unknown"
     decision_state: str = "unknown"
     event_counts: dict[str, int] = field(default_factory=dict)
+    event_status: str = "unknown"
     exit_code: int | None = None
 
 
@@ -184,8 +196,111 @@ def _parse_event_counts(stream: TextIO) -> dict[str, int]:
         event_type = event.get("type") if isinstance(event, dict) else None
         if not isinstance(event_type, str):
             continue
-        counts[event_type] = counts.get(event_type, 0) + 1
+        sanitized_type = event_type if event_type in _EVENT_TYPES else "other"
+        counts[sanitized_type] = counts.get(sanitized_type, 0) + 1
     return dict(sorted(counts.items()))
+
+
+def _event_status(stream: TextIO, counts: dict[str, int]) -> str:
+    stream.seek(0)
+    for line in stream:
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return "unknown"
+        if (
+            not isinstance(event, dict)
+            or not isinstance(event.get("type"), str)
+            or event["type"] not in _EVENT_TYPES
+        ):
+            return "unknown"
+    return "recorded" if counts.get("turn.completed") == 1 else "unknown"
+
+
+def _merge_events(executions: list[CodexExecution]) -> dict:
+    counts: dict[str, int] = {}
+    recorded_attempts = 0
+    for execution in executions:
+        if execution.event_status == "recorded":
+            recorded_attempts += 1
+        for event_type, count in execution.event_counts.items():
+            if (
+                isinstance(event_type, str)
+                and isinstance(count, int)
+                and not isinstance(count, bool)
+                and count >= 0
+            ):
+                counts[event_type] = counts.get(event_type, 0) + count
+    attempts = len(executions)
+    return {
+        "status": (
+            "recorded"
+            if attempts > 0 and recorded_attempts == attempts
+            else "unknown"
+        ),
+        "attempts": attempts,
+        "recorded_attempts": recorded_attempts,
+        "unknown_attempts": attempts - recorded_attempts,
+        "counts": dict(sorted(counts.items())),
+    }
+
+
+def _unknown_events(attempts: int) -> dict:
+    return {
+        "status": "unknown",
+        "attempts": attempts,
+        "recorded_attempts": 0,
+        "unknown_attempts": attempts,
+        "counts": {},
+    }
+
+
+def _valid_events(value: object, *, attempts: int) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "status",
+        "attempts",
+        "recorded_attempts",
+        "unknown_attempts",
+        "counts",
+    }:
+        return False
+    recorded = value.get("recorded_attempts")
+    unknown = value.get("unknown_attempts")
+    counts = value.get("counts")
+    if (
+        not isinstance(attempts, int)
+        or isinstance(attempts, bool)
+        or attempts < 0
+        or value.get("attempts") != attempts
+        or not isinstance(recorded, int)
+        or isinstance(recorded, bool)
+        or recorded < 0
+        or not isinstance(unknown, int)
+        or isinstance(unknown, bool)
+        or unknown < 0
+        or recorded + unknown != attempts
+        or not isinstance(counts, dict)
+        or any(
+            not isinstance(event_type, str)
+            or event_type not in _SANITIZED_EVENT_TYPES
+            or not isinstance(count, int)
+            or isinstance(count, bool)
+            or count < 0
+            for event_type, count in counts.items()
+        )
+    ):
+        return False
+    expected_status = (
+        "recorded" if attempts > 0 and recorded == attempts else "unknown"
+    )
+    completed = counts.get("turn.completed", 0)
+    if completed < recorded or (
+        expected_status == "recorded" and completed != attempts
+    ):
+        return False
+    return value.get("status") == expected_status
 
 
 def _execute_codex(
@@ -219,6 +334,7 @@ def _execute_codex(
                 _unknown_usage(),
                 process_state="start_failed",
                 decision_state="not_attempted",
+                event_status="unknown",
             )
         try:
             process.communicate(
@@ -237,6 +353,7 @@ def _execute_codex(
                 process.wait(timeout=5)
             usage = _parse_token_usage(output)
             event_counts = _parse_event_counts(output)
+            event_status = _event_status(output, event_counts)
             output.close()
             return CodexExecution(
                 "codex_process_timeout",
@@ -244,10 +361,12 @@ def _execute_codex(
                 process_state="timed_out",
                 decision_state="not_attempted",
                 event_counts=event_counts,
+                event_status=event_status,
                 exit_code=process.returncode,
             )
         usage = _parse_token_usage(output)
         event_counts = _parse_event_counts(output)
+        event_status = _event_status(output, event_counts)
         decision: dict | None = None
         decision_state = "not_written"
         if process.returncode == 0:
@@ -271,6 +390,7 @@ def _execute_codex(
         process_state="exited",
         decision_state=decision_state,
         event_counts=event_counts,
+        event_status=event_status,
         exit_code=process.returncode,
     )
 
@@ -559,18 +679,22 @@ def review(
     except ValueError:
         return {
             **_base_result(attempts=0, usages=[]),
+            "codex_events": _merge_events([]),
             "status": "failed",
             "business_state": "not_available",
             "write_state": "not_requested",
             "error_code": "codex_review_task_invalid",
         }
     usages: list[dict] = []
+    executions: list[CodexExecution] = []
     for attempt in (1, 2):
         execution = executor(project_root, action_file, timeout_seconds)
+        executions.append(execution)
         usages.append(execution.token_usage)
         if execution.error_code is None and isinstance(execution.decision, dict):
             return {
                 **_base_result(attempts=attempt, usages=usages),
+                "codex_events": _merge_events(executions),
                 "status": "reviewed",
                 "business_state": "not_available",
                 "write_state": "not_requested",
@@ -590,6 +714,7 @@ def review(
             continue
         return {
             **_base_result(attempts=attempt, usages=usages),
+            "codex_events": _merge_events(executions),
             "status": "failed",
             "business_state": "not_available",
             "write_state": "not_requested",
@@ -610,6 +735,14 @@ def complete_review_result(
     usage = reviewed.get("token_usage") if isinstance(reviewed, dict) else None
     attempts = reviewed.get("process_attempts") if isinstance(reviewed, dict) else None
     wall_seconds = reviewed.get("agent_wall_seconds") if isinstance(reviewed, dict) else None
+    codex_events = reviewed.get("codex_events") if isinstance(reviewed, dict) else None
+    known_attempts = (
+        attempts
+        if isinstance(attempts, int)
+        and not isinstance(attempts, bool)
+        and attempts >= 0
+        else 0
+    )
     if (
         reviewed.get("status") != "reviewed"
         or not isinstance(decision, dict)
@@ -620,8 +753,28 @@ def complete_review_result(
         or not isinstance(wall_seconds, int)
         or isinstance(wall_seconds, bool)
         or wall_seconds < 0
+        or not _valid_events(codex_events, attempts=attempts)
     ):
-        return _failure("codex_review_result_invalid", request_stop)
+        request_stop()
+        return {
+            "schema_version": 1,
+            "kind": "preaudit_review_worker_result",
+            "model": MODEL,
+            "reasoning_effort": REASONING_EFFORT,
+            "process_attempts": known_attempts,
+            "process_retries": max(0, known_attempts - 1),
+            "token_usage": dict(usage) if isinstance(usage, dict) else _unknown_usage(),
+            "codex_events": (
+                dict(codex_events)
+                if _valid_events(codex_events, attempts=known_attempts)
+                else _unknown_events(known_attempts)
+            ),
+            "status": "failed",
+            "execution_state": "failed",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "error_code": "codex_review_result_invalid",
+        }
     base = {
         "schema_version": 1,
         "kind": "preaudit_review_worker_result",
@@ -630,6 +783,7 @@ def complete_review_result(
         "process_attempts": attempts,
         "process_retries": max(0, attempts - 1),
         "token_usage": dict(usage),
+        "codex_events": dict(codex_events),
     }
 
     def failed(code: str) -> dict:
@@ -683,7 +837,7 @@ def run_read_only(
             "error_code": "codex_review_task_invalid",
             "process_state": "not_started",
             "decision_state": "not_attempted",
-            "event_counts": {},
+            "codex_events": _merge_events([]),
             "exit_code": None,
         }
     execution = executor(project_root, action_file, timeout_seconds)
@@ -709,6 +863,6 @@ def run_read_only(
         ),
         "process_state": execution.process_state,
         "decision_state": execution.decision_state,
-        "event_counts": execution.event_counts,
+        "codex_events": _merge_events([execution]),
         "exit_code": execution.exit_code,
     }
