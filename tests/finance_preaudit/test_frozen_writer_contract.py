@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import time
+import urllib.error
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -282,18 +283,23 @@ class TestFrozenWriterContract:
 
         assert len(api.calls) == 1
 
-    def test_confirmed_no_write_failure_can_retry_same_request(self) -> None:
+    def test_confirmed_no_write_failure_requires_a_new_attempt(self) -> None:
         api = _RecordedWriterApi(
-            {"submit_ok": False, "done_hit": False, "postcheck_done_hit": False}
+            {
+                "submit_ok": False,
+                "done_hit": False,
+                "postcheck_done_hit": False,
+                "failure_code": "writer_submit_rejected",
+            }
         )
 
         for _attempt in range(2):
             with pytest.raises(
-                frozen_writer.FrozenWriterError, match="writer_submit_failed"
+                frozen_writer.FrozenWriterError, match="writer_submit_rejected"
             ):
                 self._submit(api)
 
-        assert len(api.calls) == 2
+        assert len(api.calls) == 1
 
     def test_request_lock_paths_are_isolated(self) -> None:
         first = runtime_control.request_writer_lock_file("1004", self.lock_path)
@@ -485,6 +491,7 @@ class TestFrozenWriterApi:
             "submit_ok": True,
             "done_hit": True,
             "postcheck_done_hit": True,
+            "failure_code": None,
         }
         assert writer_api._format_remark("第一行\n<a>") == "第一行<br/>&lt;a&gt;"
 
@@ -506,6 +513,94 @@ class TestFrozenWriterApi:
             "submit_ok": False,
             "done_hit": False,
             "postcheck_done_hit": False,
+            "failure_code": "writer_submit_rejected",
         }
         handled.assert_not_called()
         pending.assert_not_called()
+
+    def test_transport_and_postcheck_failures_are_distinguished(self) -> None:
+        api = writer_api.FrozenWriterApi(
+            "token",
+            "user",
+            app_id="app",
+            base_url="https://oa.invalid",
+        )
+        with patch.object(
+            api,
+            "_post_submit",
+            side_effect=TimeoutError("sensitive transport detail"),
+        ):
+            transport = api.submit_and_verify("1004", "冻结意见")
+        with (
+            patch.object(api, "_post_submit", return_value={"code": "SUCCESS"}),
+            patch.object(
+                api,
+                "handled_rows",
+                side_effect=TimeoutError("sensitive postcheck detail"),
+            ),
+        ):
+            postcheck = api.submit_and_verify("1004", "冻结意见")
+        with (
+            patch.object(api, "_post_submit", return_value={"code": "SUCCESS"}),
+            patch.object(api, "handled_rows", return_value=[{"request_id": "1004"}]),
+            patch.object(api, "pending_rows", return_value=[{"request_id": "1004"}]),
+        ):
+            conflict = api.submit_and_verify("1004", "冻结意见")
+
+        assert transport["failure_code"] == "writer_transport_unknown"
+        assert postcheck["failure_code"] == "writer_postcheck_timeout"
+        assert conflict["failure_code"] == "writer_pending_conflict"
+        assert "sensitive" not in json.dumps(
+            [transport, postcheck, conflict], ensure_ascii=False
+        )
+
+    def test_http_error_after_submit_remains_transport_unknown(self) -> None:
+        api = writer_api.FrozenWriterApi(
+            "token",
+            "user",
+            app_id="app",
+            base_url="https://oa.invalid",
+        )
+        error = urllib.error.HTTPError(
+            "https://oa.invalid/submit",
+            500,
+            "sensitive upstream detail",
+            None,
+            None,
+        )
+
+        with patch(
+            "apps.oa_approval.writer_api.urllib.request.urlopen",
+            side_effect=error,
+        ):
+            result = api.submit_and_verify("1004", "冻结意见")
+
+        assert result == {
+            "submit_ok": False,
+            "done_hit": False,
+            "postcheck_done_hit": False,
+            "failure_code": "writer_transport_unknown",
+        }
+        assert "sensitive" not in json.dumps(result, ensure_ascii=False)
+
+    def test_postcheck_retries_without_resubmitting(self) -> None:
+        api = writer_api.FrozenWriterApi(
+            "token",
+            "user",
+            app_id="app",
+            base_url="https://oa.invalid",
+        )
+        with (
+            patch.object(api, "_post_submit", return_value={"code": "SUCCESS"}) as submit,
+            patch.object(api, "handled_rows", side_effect=[[], [{"request_id": "1004"}]]),
+            patch.object(api, "pending_rows", side_effect=[[{"request_id": "1004"}], []]),
+        ):
+            result = api.submit_and_verify("1004", "冻结意见")
+
+        assert result == {
+            "submit_ok": True,
+            "done_hit": True,
+            "postcheck_done_hit": True,
+            "failure_code": None,
+        }
+        submit.assert_called_once_with("1004", "冻结意见")

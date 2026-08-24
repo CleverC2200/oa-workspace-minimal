@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import html
-import urllib.error
+import time
 import urllib.parse
 import urllib.request
 from typing import Any
@@ -11,6 +11,8 @@ from apps.oa_approval.api import OaApi, TIMEOUT, _decode_json
 
 
 SUBMIT_ENDPOINT = "/api/workflow/paService/submitRequest"
+POSTCHECK_ATTEMPTS = 3
+POSTCHECK_INTERVAL_SECONDS = 0.25
 
 
 def _format_remark(remark: str) -> str:
@@ -37,39 +39,59 @@ class FrozenWriterApi(OaApi):
             },
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-                return _decode_json(response.read().decode("utf-8", errors="ignore"))
-        except urllib.error.HTTPError as error:
-            return {
-                "http_status": error.code,
-                "error": str(error),
-            }
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            return _decode_json(response.read().decode("utf-8", errors="ignore"))
 
-    def submit_and_verify(self, request_id: str, remark: str) -> dict[str, bool]:
-        response = self._post_submit(request_id, remark)
+    def submit_and_verify(self, request_id: str, remark: str) -> dict[str, Any]:
+        try:
+            response = self._post_submit(request_id, remark)
+        except Exception:
+            return {
+                "submit_ok": False,
+                "done_hit": False,
+                "postcheck_done_hit": False,
+                "failure_code": "writer_transport_unknown",
+            }
         submit_ok = str(response.get("code") or "").strip().upper() == "SUCCESS"
         if not submit_ok:
             return {
                 "submit_ok": False,
                 "done_hit": False,
                 "postcheck_done_hit": False,
+                "failure_code": "writer_submit_rejected",
             }
-        try:
-            target = str(request_id)
-            done_hit = any(
-                row.get("request_id") == target for row in self.handled_rows()
-            )
-            pending_hit = any(
-                row.get("request_id") == target for row in self.pending_rows()
-            )
-        except Exception:
-            done_hit = False
-            pending_hit = True
+        target = str(request_id)
+        for attempt in range(POSTCHECK_ATTEMPTS):
+            try:
+                done_hit = any(
+                    row.get("request_id") == target for row in self.handled_rows()
+                )
+                pending_hit = any(
+                    row.get("request_id") == target for row in self.pending_rows()
+                )
+            except Exception:
+                break
+            if done_hit and pending_hit:
+                return {
+                    "submit_ok": True,
+                    "done_hit": True,
+                    "postcheck_done_hit": False,
+                    "failure_code": "writer_pending_conflict",
+                }
+            if done_hit:
+                return {
+                    "submit_ok": True,
+                    "done_hit": True,
+                    "postcheck_done_hit": True,
+                    "failure_code": None,
+                }
+            if attempt + 1 < POSTCHECK_ATTEMPTS:
+                time.sleep(POSTCHECK_INTERVAL_SECONDS)
         return {
             "submit_ok": True,
-            "done_hit": done_hit,
-            "postcheck_done_hit": done_hit and not pending_hit,
+            "done_hit": False,
+            "postcheck_done_hit": False,
+            "failure_code": "writer_postcheck_timeout",
         }
 
 

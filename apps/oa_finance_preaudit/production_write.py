@@ -355,6 +355,19 @@ def build_ports(
             if runtime_control.stop_requested():
                 raise ValueError(runtime_control.STOP_CODE)
             result = api.submit_and_verify(job["request_id"], remark)
+            failure_code = result.get("failure_code")
+            if failure_code in {
+                "writer_submit_rejected",
+                "writer_transport_unknown",
+                "writer_postcheck_timeout",
+                "writer_pending_conflict",
+            }:
+                raise ValueError(str(failure_code))
+            if not all(
+                result.get(field) is True
+                for field in ("submit_ok", "done_hit", "postcheck_done_hit")
+            ):
+                raise ValueError("writer_result_unknown")
         return {
             "schema_version": 1,
             "kind": "preaudit_submission_result",
