@@ -50,6 +50,36 @@ def test_status_live_check_stays_inside_existing_public_command(
     }
 
 
+def test_status_reconciliation_stays_read_only_inside_status_command(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    output = io.StringIO()
+    calls: list[Path] = []
+
+    with redirect_stdout(output):
+        exit_code = cli.main(
+            ["status", "--root", str(root), "--reconcile"],
+            runtime_status=lambda _root: {
+                "schema_version": 1,
+                "kind": "preaudit_runtime_status",
+            },
+            reconcile_status=lambda current_root: (
+                calls.append(current_root)
+                or {
+                    "schema_version": 1,
+                    "kind": "preaudit_reconciliation",
+                    "read_only": True,
+                }
+            ),
+        )
+
+    assert exit_code == 0
+    assert calls == [root]
+    assert json.loads(output.getvalue())["reconciliation"]["read_only"] is True
+
+
 def test_status_live_check_fails_closed_without_configuration(
     tmp_path: Path,
 ) -> None:
@@ -184,6 +214,58 @@ def test_controlled_next_action_requires_explicit_confirmation() -> None:
     assert allowed_code == 0
     assert calls == [("travel_expense", "controlled_write")]
     assert json.loads(allowed.getvalue())["mode"] == "controlled_write"
+
+
+def test_recovery_requires_explicit_confirmation_and_uses_engine_gate(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[Path, str, bool]] = []
+
+    class Engine:
+        def recover_confirmed_no_write(
+            self, action_file: Path, *, mode: str, confirmed: bool
+        ) -> dict:
+            calls.append((action_file, mode, confirmed))
+            return {
+                "schema_version": 1,
+                "kind": "preaudit_action",
+                "action": "review_required",
+                "workflow_key": "travel_expense",
+            }
+
+    action = tmp_path / "action.json"
+    denied = io.StringIO()
+    with redirect_stdout(denied):
+        assert cli.main(
+            [
+                "next-action",
+                "--workflow",
+                "travel_expense",
+                "--recover-action-file",
+                str(action),
+            ],
+            flow_engine_factory=Engine,
+        ) == 1
+    assert json.loads(denied.getvalue())["failure"]["code"] == (
+        "recovery_confirmation_required"
+    )
+
+    allowed = io.StringIO()
+    with redirect_stdout(allowed):
+        assert cli.main(
+            [
+                "next-action",
+                "--workflow",
+                "travel_expense",
+                "--recover-action-file",
+                str(action),
+                "--confirm-recovery",
+                "YES",
+            ],
+            flow_engine_factory=Engine,
+        ) == 0
+    assert calls == [(action, "preview", True)]
+    assert json.loads(allowed.getvalue())["action"] == "review_required"
 
 
 def test_cli_failure_emits_sanitized_classification() -> None:

@@ -78,11 +78,13 @@ def _engine(
     collect_material=None,
     authorization_source=None,
     submit_frozen=None,
+    handled: list[dict] | None = None,
 ) -> flow_engine.FlowEngine:
     rows = candidates if candidates is not None else _candidates()
     return flow_engine.FlowEngine(
         root=root,
         discover_candidates=lambda _workflow_key: list(rows),
+        discover_handled=(lambda: list(handled or [])),
         collect_material=collect_material
         or (lambda request_id, _attempt_root: _material(request_id)),
         authorization_source=authorization_source,
@@ -91,6 +93,100 @@ def _engine(
         ),
         submit_frozen=submit_frozen,
     )
+
+
+def test_confirmed_material_failure_creates_fresh_attempt_only_after_live_check(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    def collect(request_id: str, _attempt_root: Path) -> dict:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("oa_run_stopped")
+        return _material(request_id)
+
+    engine = _engine(tmp_path, collect_material=collect)
+    failed = engine.next_action("travel_expense")
+    old_state = Path(failed["state_file"]).read_bytes()
+
+    with pytest.raises(ValueError, match="recovery_confirmation_required"):
+        engine.recover_confirmed_no_write(Path(failed["action_file"]))
+    recovered = engine.recover_confirmed_no_write(
+        Path(failed["action_file"]),
+        confirmed=True,
+    )
+
+    assert recovered["action"] == "review_required"
+    assert recovered["attempt"] == 2
+    assert Path(failed["state_file"]).read_bytes() == old_state
+    new_state = json.loads(Path(recovered["state_file"]).read_text(encoding="utf-8"))
+    assert new_state["attempt"] == 2
+
+
+def test_unknown_or_handled_case_cannot_enter_recovery(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    failed = engine.next_action("travel_expense")
+    state_path = Path(failed["state_file"])
+    action_path = Path(failed["action_file"])
+    for path in (state_path, action_path):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.update(
+            {
+                "action": "needs_admin",
+                "execution_state": "needs_admin",
+                "write_state": "unknown",
+                "reason": "writer_transport_unknown",
+            }
+        )
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="recovery_not_safe"):
+        engine.recover_confirmed_no_write(action_path, confirmed=True)
+
+    handled_engine = _engine(
+        tmp_path / "handled",
+        collect_material=lambda _request_id, _root: (_ for _ in ()).throw(
+            RuntimeError("oa_run_stopped")
+        ),
+        handled=[{"request_id": "recorded-request"}],
+    )
+    handled_failure = handled_engine.next_action("travel_expense")
+    with pytest.raises(ValueError, match="recovery_live_state_conflict"):
+        handled_engine.recover_confirmed_no_write(
+            Path(handled_failure["action_file"]), confirmed=True
+        )
+
+
+def test_confirmed_writer_rejection_creates_a_new_review_attempt(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path)
+    first = engine.next_action("travel_expense")
+    action_path = Path(first["action_file"])
+    state_path = Path(first["state_file"])
+    for path in (action_path, state_path):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.update(
+            {
+                "action": "needs_admin",
+                "execution_state": "needs_admin",
+                "write_state": "not_requested",
+                "reason": "writer_submit_rejected",
+            }
+        )
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    old_state = state_path.read_bytes()
+
+    recovered = engine.recover_confirmed_no_write(
+        action_path,
+        confirmed=True,
+    )
+
+    assert recovered["action"] == "review_required"
+    assert recovered["attempt"] == 2
+    assert state_path.read_bytes() == old_state
 
 
 def _decision(action: dict, *, conclusion: str = "证据符合当前审核项。") -> dict:

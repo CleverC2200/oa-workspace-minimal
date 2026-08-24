@@ -110,6 +110,21 @@ python3 -m apps.oa_finance_preaudit.cli status \
 python3 -m apps.oa_finance_preaudit.cli status --check-live
 ```
 
+启动或恢复前可在同一只读命令增加 `--reconcile`。它将本地最新 attempt 与实时待办、已办对账，区分 `handled_not_pending`、`pending_not_handled`、双边冲突、身份冲突和不可见，只生成脱敏建议，不领取或重提：
+
+```bash
+python3 -m apps.oa_finance_preaudit.cli status --reconcile
+```
+
+只有 `material_collection_failed` 或 `writer_submit_rejected` 且 `write_state=not_requested` 才能由人工确认恢复。入口会重新核验同一身份仍在待办、未出现在已办、旧 attempt 仍为最新，然后创建新 attempt 并保留旧现场；任何 unknown 永远不能走此入口：
+
+```bash
+python3 -m apps.oa_finance_preaudit.cli next-action \
+  --workflow travel_expense \
+  --recover-action-file /absolute/path/to/action.json \
+  --confirm-recovery YES
+```
+
 受控清理使用同一 JSON CLI。它在同一维护锁和事件锁内先计算脱敏日聚合，完整校验计划与所有目标，再以不跟随符号链接的原子写入落盘，最后才归档或删除原始 attempt：
 
 ```bash

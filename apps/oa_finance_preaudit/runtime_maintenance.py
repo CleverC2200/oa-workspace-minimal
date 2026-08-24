@@ -32,7 +32,11 @@ _FAILURE_CODES = {
     "state_invalid",
     "submission_adapter_unavailable",
     "write_authorization_invalid",
+    "writer_pending_conflict",
+    "writer_postcheck_timeout",
     "writer_result_unknown",
+    "writer_submit_rejected",
+    "writer_transport_unknown",
 }
 _MANAGED_PATH = re.compile(
     r"^(?:(?:\.archive/)?(?:travel_expense|business_entertainment|"
