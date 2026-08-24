@@ -982,7 +982,12 @@ def _run_dispatched_tasks(
                             )
                             started += 1
                             peak_active = max(peak_active, len(futures))
-            while not halted and next_index < count and len(futures) < capacity:
+            while (
+                not halted
+                and preparation is None
+                and next_index < count
+                and len(futures) < capacity
+            ):
                 prepare_started = time.monotonic()
                 available = [
                     path
