@@ -32,7 +32,11 @@ _FAILURE_CODES = {
     "state_invalid",
     "submission_adapter_unavailable",
     "write_authorization_invalid",
+    "writer_pending_conflict",
+    "writer_postcheck_timeout",
     "writer_result_unknown",
+    "writer_submit_rejected",
+    "writer_transport_unknown",
 }
 _MANAGED_PATH = re.compile(
     r"^(?:(?:\.archive/)?(?:travel_expense|business_entertainment|"
@@ -91,6 +95,19 @@ def _read_state(path: Path) -> dict:
         or not re.fullmatch(r"[0-9a-f]{64}", expected_case)
     ):
         raise ValueError("runtime_state_invalid")
+    request_id = state.get("request_id")
+    received_at = state.get("received_at")
+    if (
+        not isinstance(request_id, str)
+        or not request_id.strip()
+        or not isinstance(received_at, str)
+        or not received_at.strip()
+        or hashlib.sha256(
+            f"{request_id}\x1f{received_at}".encode("utf-8")
+        ).hexdigest()
+        != expected_case
+    ):
+        raise ValueError("runtime_state_identity_invalid")
     _timestamp(state.get("created_at"))
     return state
 
@@ -667,7 +684,9 @@ def status(root: Path, *, now: datetime | None = None) -> dict:
     for attempt_root in attempt_roots:
         try:
             state = _read_state(attempt_root / "state.json")
-        except ValueError:
+        except ValueError as error:
+            if str(error) == "runtime_state_identity_invalid":
+                raise ValueError("runtime_state_invalid") from error
             state_path = attempt_root / "state.json"
             created_at = datetime.fromtimestamp(
                 state_path.stat().st_mtime if state_path.exists() else 0,
@@ -713,15 +732,24 @@ def status(root: Path, *, now: datetime | None = None) -> dict:
     workflows: list[dict] = []
     for workflow_key, attempts in sorted(by_workflow.items()):
         attempts.sort(key=lambda item: (item["created_at"], item["item_key"]))
-        latest = attempts[-1]
+        latest_by_case: dict[str, dict] = {}
+        for item in attempts:
+            current = latest_by_case.get(item["case_key"])
+            if current is None or item["attempt"] > current["attempt"]:
+                latest_by_case[item["case_key"]] = item
+        current_attempts = sorted(
+            latest_by_case.values(),
+            key=lambda item: (item["created_at"], item["item_key"]),
+        )
+        latest = current_attempts[-1]
         open_attempts = [
-            item for item in attempts if item["execution_state"] != "closed"
+            item for item in current_attempts if item["execution_state"] != "closed"
         ]
         execution_states: dict[str, int] = {}
         business_states: dict[str, int] = {}
         write_states: dict[str, int] = {}
         failure_counts: dict[str, int] = {}
-        for item in attempts:
+        for item in current_attempts:
             for counts, key in (
                 (execution_states, item["execution_state"]),
                 (business_states, item["business_state"]),
@@ -745,7 +773,7 @@ def status(root: Path, *, now: datetime | None = None) -> dict:
                         "write_state",
                     )
                 },
-                "case_count": len({item["case_key"] for item in attempts}),
+                "case_count": len(current_attempts),
                 "attempt_count": len(attempts),
                 "backlog_count": len(open_attempts),
                 "oldest_backlog_age_seconds": (

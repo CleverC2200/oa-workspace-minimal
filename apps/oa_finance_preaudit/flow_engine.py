@@ -145,6 +145,7 @@ _WRITER_FAILURE_CODES = writer_outcomes.FAILURE_CODES
 
 
 CandidateSource = Callable[[str], Iterable[dict]]
+HandledSource = Callable[[], Iterable[dict]]
 MaterialCollector = Callable[[str, Path], dict]
 AuthorizationSource = submission.AuthorizationSource
 AuthorizationVerifier = submission.AuthorizationVerifier
@@ -793,6 +794,7 @@ class FlowEngine:
         *,
         root: Path,
         discover_candidates: CandidateSource,
+        discover_handled: HandledSource | None = None,
         collect_material: MaterialCollector,
         authorization_source: AuthorizationSource | None = None,
         authorization_verifier: AuthorizationVerifier | None = None,
@@ -800,6 +802,7 @@ class FlowEngine:
     ) -> None:
         self._root = Path(root).expanduser().resolve()
         self._discover_candidates = discover_candidates
+        self._discover_handled = discover_handled
         self._collect_material = collect_material
         self._authorization_source = authorization_source
         self._authorization_verifier = authorization_verifier
@@ -1937,6 +1940,133 @@ class FlowEngine:
 
         if prepare_root is None:
             raise ValueError("persistent_state_invalid")
+        return self._prepare_attempt(prepare_root)
+
+    def recover_confirmed_no_write(
+        self,
+        action_file: Path,
+        *,
+        mode: str = "preview",
+        confirmed: bool = False,
+    ) -> dict:
+        if confirmed is not True:
+            raise ValueError("recovery_confirmation_required")
+        if mode not in {"preview", "controlled_write"}:
+            raise ValueError("run_mode_unauthorized")
+        if mode == "controlled_write" and (
+            self._authorization_source is None
+            or self._authorization_verifier is None
+            or self._submit_frozen is None
+        ):
+            raise ValueError("run_mode_unauthorized")
+        if self._discover_handled is None:
+            raise ValueError("recovery_live_state_unavailable")
+
+        action_path = Path(action_file).expanduser().resolve()
+        if (
+            not action_path.is_relative_to(self._root)
+            or not _is_attempt_action_path(action_path, self._root)
+        ):
+            raise ValueError("recovery_not_safe")
+        attempt_root = action_path.parent
+        workflow_key = _attempt_workflow_key(attempt_root, self._root)
+        state_path = attempt_root / "state.json"
+        try:
+            action = _read_object(action_path, code="recovery_not_safe")
+            state = _read_object(state_path, code="recovery_not_safe")
+        except ValueError as error:
+            raise ValueError("recovery_not_safe") from error
+        reason = str(state.get("reason") or "")
+        if (
+            action.get("execution_state") != "needs_admin"
+            or state.get("execution_state") != "needs_admin"
+            or action.get("reason") != reason
+            or reason not in {
+                "material_collection_failed",
+                "writer_submit_rejected",
+            }
+            or action.get("write_state") != "not_requested"
+            or state.get("write_state") != "not_requested"
+            or not self._attempt_identity_matches(
+                attempt_root,
+                state,
+                require_material=False,
+            )
+            or (attempt_root / "execution-receipt.json").exists()
+        ):
+            raise ValueError("recovery_not_safe")
+        if reason == "material_collection_failed" and any(
+            (attempt_root / name).exists()
+            for name in (
+                "review-decision.json",
+                "remark.txt",
+                "submission-envelope.json",
+            )
+        ):
+            raise ValueError("recovery_not_safe")
+
+        discovery_started = time.monotonic()
+        try:
+            candidates = list(self._discover_candidates(workflow_key))
+            handled = list(self._discover_handled())
+        except Exception as error:
+            raise ValueError("recovery_live_state_unavailable") from error
+        discovery_seconds = max(0, int(time.monotonic() - discovery_started))
+        request_id = str(state["request_id"])
+        received_at = str(state["received_at"])
+        exact_pending = [
+            candidate
+            for candidate in candidates
+            if isinstance(candidate, dict)
+            and str(candidate.get("request_id") or "") == request_id
+            and str(candidate.get("received_at") or "") == received_at
+            and candidate.get("workflow_key") == workflow_key
+        ]
+        handled_hit = any(
+            isinstance(row, dict)
+            and str(row.get("request_id") or row.get("requestId") or "")
+            == request_id
+            for row in handled
+        )
+        if len(exact_pending) != 1 or handled_hit:
+            raise ValueError("recovery_live_state_conflict")
+
+        workflow_root = self._root / workflow_key
+        with _exclusive_lock(workflow_root / "flow.lock"):
+            latest = self._latest_case_attempts(workflow_root)
+            latest_for_case = [
+                path for path in latest if path.parent == attempt_root.parent
+            ]
+            if latest_for_case != [attempt_root]:
+                raise ValueError("recovery_not_safe")
+            next_attempt = int(state["attempt"]) + 1
+            prepare_root = attempt_root.parent / f"attempt-{next_attempt}"
+            if prepare_root.exists():
+                raise ValueError("recovery_not_safe")
+            action_file_next = prepare_root / "action.json"
+            state_file_next = prepare_root / "state.json"
+            claim = _action_payload(
+                action="collecting",
+                execution_state="collecting",
+                business_state="not_available",
+                write_state="not_requested",
+                workflow_key=workflow_key,
+                mode=mode,
+                write_authorized=False,
+                action_file=str(action_file_next),
+                state_file=str(state_file_next),
+                case_key=state["case_key"],
+                attempt=next_attempt,
+                request_id=request_id,
+                received_at=received_at,
+                created_at=datetime.now(timezone.utc).isoformat(),
+                discovery_seconds=discovery_seconds,
+                recovered_from_attempt=state["attempt"],
+                recovery_reason=reason,
+            )
+            prepare_root.mkdir(parents=True)
+            json_artifact.write_json_atomic(action_file_next, claim, indent=2)
+            json_artifact.write_json_atomic(state_file_next, claim, indent=2)
         return self._prepare_attempt(prepare_root)
 
     def complete_review(self, action_file: Path, decision_file: Path) -> dict:
