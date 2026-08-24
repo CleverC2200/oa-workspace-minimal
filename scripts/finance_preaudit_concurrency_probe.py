@@ -1627,6 +1627,7 @@ def run_rolling_drain(
     actionable = initial_actionable
     waves: list[dict] = []
     status = "completed"
+    stop_reason: str | None = None
     healthy_windows = 0
     current_capacity = capacity
     last_decision = {
@@ -1656,6 +1657,17 @@ def run_rolling_drain(
         ):
             runtime_control.request_stop()
             status = "failed"
+            stop_reason = (
+                "host_critical"
+                if wave["runtime_health"].get("status") == "critical"
+                else "technical_failure"
+            )
+            last_decision = {
+                "action": "stop",
+                "next_capacity": current_capacity,
+                "healthy_windows": 0,
+                "reason": stop_reason,
+            }
             break
         try:
             pending, quarantined_pending, actionable = _rolling_snapshot(
@@ -1668,6 +1680,7 @@ def run_rolling_drain(
         if quarantined_pending > initial_quarantined:
             runtime_control.request_stop()
             status = "failed"
+            stop_reason = "quarantine_increased"
             break
         if adaptive:
             last_decision = concurrency_control.decide_capacity(
@@ -1688,6 +1701,7 @@ def run_rolling_drain(
             if last_decision["action"] == "stop":
                 runtime_control.request_stop()
                 status = "failed"
+                stop_reason = str(last_decision["reason"])
                 break
             current_capacity = min(
                 int(last_decision["next_capacity"]),
@@ -1733,6 +1747,8 @@ def run_rolling_drain(
         "start_capacity": capacity,
         "recommended_capacity": current_capacity,
         "last_capacity_decision": last_decision,
+        "stop_reason": stop_reason,
+        "wave_runtime_health": [wave["runtime_health"] for wave in waves],
         "initial_pending": initial_pending,
         "initial_actionable": initial_actionable,
         "final_pending": (

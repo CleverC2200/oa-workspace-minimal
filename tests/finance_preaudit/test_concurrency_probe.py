@@ -715,6 +715,69 @@ def test_elastic_rolling_requires_two_healthy_waves_before_upgrade() -> None:
     assert result["status"] == "completed"
 
 
+def test_rolling_failure_retains_host_critical_health_reason() -> None:
+    result = finance_preaudit_concurrency_probe.run_rolling_drain(
+        capacity=6,
+        adaptive=True,
+        live_status=lambda: {
+            "credentials": {"status": "ok"},
+            "oa": {
+                "execution_identity": "verified",
+                "by_workflow": {"travel_expense": 12},
+            },
+        },
+        reconcile_status=lambda: _reconciliation_snapshot(12),
+        pipeline_runner=lambda count, capacity: process_pool.PoolResult(
+            requested=count,
+            started=1,
+            completed=0,
+            failed=0,
+            timed_out=0,
+            stopped=count,
+            peak_active=capacity,
+            elapsed_seconds=10,
+            outcomes=tuple(
+                process_pool.TaskOutcome(
+                    index=index,
+                    status="stopped",
+                    value=None,
+                    error_code="stop_requested",
+                )
+                for index in range(count)
+            ),
+            runtime_samples=(
+                {
+                    "active_workers": 6,
+                    "oldest_task_seconds": 8,
+                    "host": {
+                        "status": "critical",
+                        "memory_free_percent": 11,
+                        "load_per_cpu": 0.5,
+                        "active_threads": 1,
+                        "cpu_count": 10,
+                    },
+                },
+            ),
+            max_task_elapsed_seconds=8,
+        ),
+    )
+
+    assert result["status"] == "failed"
+    assert result["stop_reason"] == "host_critical"
+    assert result["last_capacity_decision"]["reason"] == "host_critical"
+    assert result["wave_runtime_health"] == [
+        {
+            "status": "critical",
+            "sample_count": 1,
+            "minimum_memory_free_percent": 11,
+            "maximum_load_per_cpu": 0.5,
+            "maximum_active_threads": 1,
+            "maximum_active_workers": 6,
+            "maximum_oldest_task_seconds": 8.0,
+        }
+    ]
+
+
 def test_rolling_wave_preserves_transient_codex_error_counts() -> None:
     metrics = finance_preaudit_concurrency_probe._rolling_wave_metrics(
         process_pool.PoolResult(
