@@ -891,6 +891,31 @@ def _validate_settings(value: object) -> dict:
     return dict(value)
 
 
+def _experiment_performance(report: dict) -> dict:
+    overall = report["overall"]
+    usage = overall["token_usage"]
+    token_usage = {
+        "status": (
+            "exact"
+            if usage["exact_samples"] > 0 and usage["unknown_samples"] == 0
+            else "unknown"
+        ),
+        "exact_samples": usage["exact_samples"],
+        "unknown_samples": usage["unknown_samples"],
+    }
+    if token_usage["status"] == "exact":
+        token_usage.update(
+            {
+                field: usage[field]
+                for field in ("input_tokens", "output_tokens", "total_tokens")
+            }
+        )
+    return {
+        "end_to_end_seconds": dict(overall["end_to_end_seconds"]),
+        "token_usage": token_usage,
+    }
+
+
 def evaluate_experiment(
     before: object,
     after: object,
@@ -979,6 +1004,10 @@ def evaluate_experiment(
         "token_tuning": {
             "eligible": token_eligible,
             "reason": "exact" if token_eligible else "exact_usage_missing",
+        },
+        "performance": {
+            "before": _experiment_performance(before),
+            "after": _experiment_performance(after),
         },
         "mcp_admission": after["mcp_admission"],
         "applied": False,

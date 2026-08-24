@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
+import hashlib
 import io
+import json
 from contextlib import redirect_stdout
 from pathlib import Path
 import threading
@@ -9,7 +10,7 @@ import threading
 import pytest
 
 from apps import json_artifact
-from apps.oa_finance_preaudit import cli, flow_engine
+from apps.oa_finance_preaudit import cli, flow_engine, flow_evals
 
 
 def _travel_material(request_id: str) -> dict:
@@ -59,6 +60,48 @@ def _travel_material_with_attachment(request_id: str, attempt_root: Path) -> dic
     return material
 
 
+def _travel_material_with_routed_pages(
+    request_id: str,
+    attempt_root: Path,
+) -> dict:
+    material = _travel_material(request_id)
+    resources = []
+    images = []
+    manifest = []
+    page_specs = (
+        ("trip-file", b"shared-trip-and-attendance-page"),
+        ("attendance-file", b"shared-trip-and-attendance-page"),
+        ("mileage-file", b"unique-mileage-page"),
+    )
+    for resource_id, content in page_specs:
+        source = attempt_root / "attachments" / f"{resource_id}.bin"
+        source.write_bytes(f"source:{resource_id}".encode())
+        image = attempt_root / "prepared" / f"{resource_id}.png"
+        image.write_bytes(content)
+        resources.append(
+            {
+                "request_id": request_id,
+                "resource_id": resource_id,
+                "source_resource_id": f"source-{resource_id}",
+                "source_system": "oa",
+                "local_readonly_path": str(source),
+            }
+        )
+        images.append(
+            {
+                "resource_id": resource_id,
+                "path": str(image),
+                "kind": "image",
+                "content_sha256": hashlib.sha256(content).hexdigest(),
+            }
+        )
+        manifest.append({"resource_id": resource_id, "status": "image"})
+    material["resources"] = resources
+    material["prepared"]["images"] = images
+    material["prepared"]["manifest"] = manifest
+    return material
+
+
 def _passing_decision(action: dict, packet: dict) -> dict:
     return {
         "schema_version": 1,
@@ -93,6 +136,234 @@ def _needs_human_decision(action: dict, packet: dict) -> dict:
     return decision
 
 
+def _page(path: Path, resource_id: str, content: bytes) -> dict:
+    path.write_bytes(content)
+    return {
+        "resource_id": resource_id,
+        "path": str(path),
+        "content_sha256": hashlib.sha256(content).hexdigest(),
+    }
+
+
+def test_travel_page_routing_reuses_only_exact_duplicate_pages(
+    tmp_path: Path,
+) -> None:
+    material = _travel_material("recorded-request")
+    material["prepared"]["images"] = [
+        _page(tmp_path / "trip-1.png", "trip_file:1", b"same-page"),
+        _page(tmp_path / "trip-2.png", "trip_file:2", b"same-page"),
+        _page(tmp_path / "trip-3.png", "trip_file:3", b"other-page"),
+        {
+            "resource_id": "trip_file:4",
+        },
+    ]
+
+    routing = flow_engine._review_packet_routing("travel_expense", material)
+
+    assert routing["before_page_count"] == 4
+    assert routing["review_page_count"] == 3
+    assert routing["reused_pages"] == [
+        {
+            "page_ref": "material:prepared.images.trip_file:2.1",
+            "resource_id": "trip_file:2",
+            "content_sha256": hashlib.sha256(b"same-page").hexdigest(),
+            "representative_page_ref": (
+                "material:prepared.images.trip_file:1.1"
+            ),
+        }
+    ]
+    assert routing["review_page_refs"] == [
+        "material:prepared.images.trip_file:1.1",
+        "material:prepared.images.trip_file:3.1",
+        "material:prepared.images.trip_file:4.1",
+    ]
+    assert routing["applicability"] == {
+        "item_keys": list(flow_engine._FLOW_SPECS["travel_expense"]["item_keys"]),
+        "basis": "full_coverage_without_trusted_item_relation",
+    }
+
+
+def test_travel_page_routing_does_not_trim_unverifiable_hashes() -> None:
+    material = _travel_material("recorded-request")
+    material["prepared"]["images"] = [
+        {"resource_id": "trip_file:1", "content_sha256": "not-a-sha"},
+        {"resource_id": "trip_file:2", "content_sha256": "not-a-sha"},
+    ]
+
+    routing = flow_engine._review_packet_routing("travel_expense", material)
+
+    assert routing["before_page_count"] == 2
+    assert routing["review_page_count"] == 2
+    assert routing["reused_pages"] == []
+
+
+def test_travel_page_routing_does_not_reuse_different_pdf_pages(
+    tmp_path: Path,
+) -> None:
+    material = _travel_material("recorded-request")
+    first = _page(tmp_path / "page-1.png", "trip_file:1", b"pdf-page-1")
+    second = _page(tmp_path / "page-2.png", "trip_file:1", b"pdf-page-2")
+    first["source_content_sha256"] = "c" * 64
+    second["source_content_sha256"] = "c" * 64
+    material["prepared"]["images"] = [first, second]
+
+    routing = flow_engine._review_packet_routing("travel_expense", material)
+
+    assert routing["review_page_count"] == 2
+    assert routing["reused_pages"] == []
+
+
+def test_travel_page_routing_does_not_trust_forged_declared_hash(
+    tmp_path: Path,
+) -> None:
+    material = _travel_material("recorded-request")
+    first = _page(tmp_path / "actual-a.png", "trip_file:1", b"actual-a")
+    second = _page(tmp_path / "actual-b.png", "trip_file:2", b"actual-b")
+    second["content_sha256"] = first["content_sha256"]
+    material["prepared"]["images"] = [first, second]
+
+    routing = flow_engine._review_packet_routing("travel_expense", material)
+
+    assert routing["review_page_count"] == 2
+    assert routing["review_page_refs"] == [
+        "material:prepared.images.trip_file:1.1",
+        "material:prepared.images.trip_file:2.1",
+    ]
+    assert routing["reused_pages"] == []
+
+
+def test_travel_review_requires_routed_pages_and_receipt_counts_reuse(
+    tmp_path: Path,
+) -> None:
+    engine = flow_engine.FlowEngine(
+        root=tmp_path / "runtime",
+        discover_candidates=lambda workflow_key: [
+            {
+                "request_id": "recorded-request",
+                "received_at": "2026-08-22T09:00:00+08:00",
+                "workflow_key": workflow_key,
+            }
+        ],
+        collect_material=_travel_material_with_routed_pages,
+    )
+    action = engine.next_action("travel_expense")
+    packet = json.loads(
+        Path(action["review_packet_file"]).read_text(encoding="utf-8")
+    )
+    one_item_only = _passing_decision(action, packet)
+    one_item_only["items"][0]["evidence_refs"].extend(
+        packet["page_routing"]["review_page_refs"]
+    )
+    uncovered = tmp_path / "one-item-only.json"
+    json_artifact.write_json_atomic(
+        uncovered,
+        one_item_only,
+    )
+
+    with pytest.raises(ValueError, match="review_decision_invalid"):
+        engine.complete_review(Path(action["action_file"]), uncovered)
+
+    decision = _passing_decision(action, packet)
+    for item in decision["items"]:
+        item["evidence_refs"].extend(packet["page_routing"]["review_page_refs"])
+    covered = tmp_path / "covered.json"
+    json_artifact.write_json_atomic(covered, decision)
+
+    closed = engine.complete_review(Path(action["action_file"]), covered)
+    receipt = json.loads(
+        Path(action["action_file"])
+        .with_name("execution-receipt.json")
+        .read_text(encoding="utf-8")
+    )
+
+    assert closed["action"] == "closed"
+    assert packet["page_routing"]["review_page_count"] == 2
+    assert receipt["quality"]["page_coverage"] == {
+        "applicable": True,
+        "covered": 3,
+        "total": 3,
+    }
+    assert receipt["quality"]["resource_coverage"] == {
+        "applicable": True,
+        "covered": 3,
+        "total": 3,
+    }
+    assert engine.complete_review(Path(action["action_file"]), covered) == closed
+
+
+def test_travel_cross_page_golden_routing_preserves_facts_and_results(
+    tmp_path: Path,
+) -> None:
+    fixture_root = Path(__file__).parent / "fixtures"
+    replay = json.loads(
+        (fixture_root / "travel_page_routing_replay.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    material = _travel_material(replay["case_id"])
+    page_facts: dict[str, set[str]] = {}
+    images = []
+    for index, page in enumerate(replay["pages"], start=1):
+        content = page["content"].encode()
+        image = _page(
+            tmp_path / f"page-{index}.png",
+            page["resource_id"],
+            content,
+        )
+        images.append(image)
+        page_facts[
+            f"material:prepared.images.{page['resource_id']}.1"
+        ] = set(page["facts"])
+    material["prepared"]["images"] = images
+
+    routing = flow_engine._review_packet_routing("travel_expense", material)
+    reviewed_facts = set().union(
+        *(page_facts[page_ref] for page_ref in routing["review_page_refs"])
+    )
+    all_facts = set().union(*page_facts.values())
+    suite = flow_evals.load_suite(fixture_root / "golden_replay.json")
+    normal = next(
+        case for case in suite["cases"] if case["case_id"] == "travel-normal-v1"
+    )
+
+    assert routing["review_page_count"] == replay["expected"]["review_page_count"]
+    assert [
+        page["resource_id"] for page in routing["reused_pages"]
+    ] == replay["expected"]["reused_resource_ids"]
+    assert reviewed_facts == all_facts == set(
+        flow_engine._FLOW_SPECS["travel_expense"]["item_keys"]
+    )
+    assert normal["expected"]["statuses"] == replay["expected"]["statuses"]
+
+
+def test_legacy_travel_packet_without_page_routing_uses_full_fallback(
+    tmp_path: Path,
+) -> None:
+    engine = flow_engine.FlowEngine(
+        root=tmp_path,
+        discover_candidates=lambda workflow_key: [
+            {
+                "request_id": "recorded-request",
+                "received_at": "2026-08-22T09:00:00+08:00",
+                "workflow_key": workflow_key,
+            }
+        ],
+        collect_material=lambda request_id, _attempt_root: _travel_material(
+            request_id
+        ),
+    )
+    action = engine.next_action("travel_expense")
+    packet_file = Path(action["review_packet_file"])
+    packet = json.loads(packet_file.read_text(encoding="utf-8"))
+    packet.pop("page_routing")
+    json_artifact.write_json_atomic(packet_file, packet, indent=2)
+
+    resumed = engine.next_action("travel_expense")
+
+    assert resumed["action"] == "review_required"
+    assert resumed["review_packet_file"] == str(packet_file)
+
+
 def test_travel_preview_closes_through_two_action_interface(tmp_path: Path) -> None:
     engine = flow_engine.FlowEngine(
         root=tmp_path,
@@ -125,6 +396,17 @@ def test_travel_preview_closes_through_two_action_interface(tmp_path: Path) -> N
     assert packet["workflow_key"] == "travel_expense"
     assert len(packet["items"]) == 8
     assert "request_id" not in packet
+    assert packet["page_routing"] == {
+        "strategy": "exact_page_duplicate_only",
+        "applicability": {
+            "item_keys": [item["item_key"] for item in packet["items"]],
+            "basis": "full_coverage_without_trusted_item_relation",
+        },
+        "before_page_count": 0,
+        "review_page_count": 0,
+        "review_page_refs": [],
+        "reused_pages": [],
+    }
 
     decision_path = packet_path.with_name("review-decision.json")
     json_artifact.write_json_atomic(

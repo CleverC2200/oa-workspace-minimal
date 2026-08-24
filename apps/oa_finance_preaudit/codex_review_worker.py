@@ -53,7 +53,7 @@ def _prompt(action_file: Path) -> str:
 只处理这个已冻结动作：{action_file}
 
 要求：
-1. 完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由只读取差旅费规则、动作引用的审核包、材料和准备页；不得读取其他 attempt。
+1. 完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由只读取差旅费规则、动作引用的审核包、材料和准备页；`page_routing` 只允许复用其中列出的页级精确重复；没有可信项关系时，所有 `review_page_refs` 必须分别写入八个审核项各自的 `evidence_refs` 或 `missing_evidence`；其余页面必须完整覆盖；不得读取其他 attempt。
 2. 不修改任何文件、项目代码、Skill、配置、授权清单或冻结材料；不得调用 `next-action`、`complete-review` 或任何 OA 写入，不得领取其他单据。
 3. 根据八个固定审核项动态形成结构化决定。证据不足使用 `uncertain` 交财务判断，不得因为材料缺口卡住业务流程；身份、归属、冻结或授权不可信时停止。
 4. 最终只输出符合 flow-engine-contract“结构化审核决定”的单个 JSON 对象，不添加 Markdown、解释、单号、人员、公司、附件原文、路径、意见正文、密钥或日志。宿主会校验并负责受控提交。
@@ -66,7 +66,7 @@ def _read_only_prompt(action_file: Path) -> str:
 只处理这个动作引用的审核包：{action_file}
 
 要求：
-1. 完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由只读取差旅费规则、该动作引用的审核包、材料和准备页；不得读取现有 decision、remark、receipt、events、其他 attempt 或其他单据。
+1. 完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由只读取差旅费规则、该动作引用的审核包、材料和准备页；`page_routing` 只允许复用其中列出的页级精确重复；没有可信项关系时，所有 `review_page_refs` 必须分别写入八个审核项各自的 `evidence_refs` 或 `missing_evidence`；其余页面必须完整覆盖；不得读取现有 decision、remark、receipt、events、其他 attempt 或其他单据。
 2. 不修改任何文件，不调用 `next-action`、`complete-review` 或任何 OA 写入，不访问实时待办；历史 closed 动作仅作为冻结证据入口。
 3. 根据八个固定审核项动态形成结构化决定。证据不足使用 `uncertain`；身份、归属或冻结证据不可信时也只在决定中表达缺口。
 4. `action_token` 固定填写 `capacity-probe`。最终只输出符合 flow-engine-contract 的单个 JSON 对象，不添加 Markdown、解释、单号、人员、公司、附件原文、路径、意见正文、密钥或日志。

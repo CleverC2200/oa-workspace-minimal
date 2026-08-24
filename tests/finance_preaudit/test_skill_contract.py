@@ -12,6 +12,7 @@ SKILL_ROOT = ROOT / ".agents" / "skills" / "oa-finance-preaudit"
 SKILL = SKILL_ROOT / "SKILL.md"
 REFERENCE_ROOT = SKILL_ROOT / "references"
 RESULT_CONTRACT = REFERENCE_ROOT / "result-contract.md"
+OBSERVATION_CONTRACT = REFERENCE_ROOT / "observation-contract.md"
 CONFIRMED_FEEDBACK = REFERENCE_ROOT / "confirmed-feedback.md"
 REGRESSION_CASES = REFERENCE_ROOT / "regression-cases.json"
 GOLDEN_REPLAY = ROOT / "tests" / "finance_preaudit" / "fixtures" / "golden_replay.json"
@@ -71,6 +72,17 @@ def test_shared_result_contract_routes_without_copying_flow_rules() -> None:
         "SAP 主数据接口未接入",
     ):
         assert flow_specific_rule not in contract
+
+
+def test_travel_page_routing_allows_only_exact_duplicate_reuse() -> None:
+    contract = OBSERVATION_CONTRACT.read_text(encoding="utf-8")
+
+    assert "只做页级 SHA-256 精确重复复用" in contract
+    assert "声明哈希与冻结页面实际字节复核" in contract
+    assert "`review_page_refs` 是必须直接覆盖的非重复页" in contract
+    assert "完成动作必须逐项验证所有 `review_page_refs`" in contract
+    assert "回退覆盖全部 `prepared.images`" in contract
+    assert "不得按文件名、页序、金额、日期或关键词继续裁剪" in contract
 
 
 def test_confirmed_feedback_and_regressions_stay_sanitized() -> None:
