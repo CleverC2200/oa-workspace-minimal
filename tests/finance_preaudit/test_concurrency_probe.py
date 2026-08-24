@@ -1321,6 +1321,182 @@ def test_dispatcher_prepare_timeout_reclaims_owned_child_process_group(
     assert stop_requests == [True]
 
 
+def test_dispatcher_retries_one_prewrite_invalid_decision_with_merged_usage(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stop_requests: list[bool] = []
+    review_calls: list[int] = []
+    completion_attempts: list[int] = []
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda: stop_requests.append(True),
+    )
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    _open_action(
+        flow_root,
+        case_key="9" * 64,
+        created_at="2026-08-24T12:00:00+00:00",
+    )
+
+    def review(_task: dict) -> dict:
+        current = len(review_calls) + 1
+        review_calls.append(current)
+        return {
+            "status": "reviewed",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "process_attempts": 1,
+            "process_retries": 0,
+            "token_usage": {
+                "status": "recorded",
+                "input_tokens": current * 10,
+                "cached_input_tokens": current,
+                "output_tokens": current * 2,
+                "total_tokens": current * 12,
+            },
+            "codex_events": {
+                "status": "recorded",
+                "attempts": 1,
+                "recorded_attempts": 1,
+                "unknown_attempts": 0,
+                "counts": {"turn.completed": 1},
+            },
+            "agent_wall_seconds": current,
+            "decision": {"overall": "needs_human"},
+        }
+
+    def complete(_action: Path, reviewed: dict) -> dict:
+        attempts = reviewed["process_attempts"]
+        completion_attempts.append(attempts)
+        if attempts == 1:
+            return {
+                **reviewed,
+                "status": "retry_required",
+                "error_code": "codex_decision_invalid",
+            }
+        return {
+            **reviewed,
+            "status": "completed",
+            "business_state": "needs_human",
+            "write_state": "submitted",
+            "error_code": None,
+        }
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        1,
+        1,
+        project_root=tmp_path,
+        renew_actions=lambda paths: paths,
+        review_worker=review,
+        complete_review=complete,
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        runtime_status=lambda: {"status": "healthy"},
+    )
+
+    value = result.outcomes[0].value
+    assert result.completed == 1
+    assert review_calls == [1, 2]
+    assert completion_attempts == [1, 2]
+    assert value["process_attempts"] == 2
+    assert value["process_retries"] == 1
+    assert value["token_usage"] == {
+        "status": "recorded",
+        "input_tokens": 30,
+        "cached_input_tokens": 3,
+        "output_tokens": 6,
+        "total_tokens": 36,
+    }
+    assert value["codex_events"] == {
+        "status": "recorded",
+        "attempts": 2,
+        "recorded_attempts": 2,
+        "unknown_attempts": 0,
+        "counts": {"turn.completed": 2},
+    }
+    assert stop_requests == []
+
+
+def test_dispatcher_stops_after_second_prewrite_invalid_decision(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stop_requests: list[bool] = []
+    review_calls: list[bool] = []
+    completion_calls: list[bool] = []
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda: stop_requests.append(True),
+    )
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    _open_action(
+        flow_root,
+        case_key="8" * 64,
+        created_at="2026-08-24T12:00:00+00:00",
+    )
+
+    def review(_task: dict) -> dict:
+        review_calls.append(True)
+        return {
+            "status": "reviewed",
+            "process_attempts": 1,
+            "process_retries": 0,
+            "token_usage": {"status": "unknown"},
+            "codex_events": {
+                "status": "unknown",
+                "attempts": 1,
+                "recorded_attempts": 0,
+                "unknown_attempts": 1,
+                "counts": {},
+            },
+            "agent_wall_seconds": 1,
+            "decision": {"overall": "needs_human"},
+        }
+
+    def complete(_action: Path, reviewed: dict) -> dict:
+        completion_calls.append(True)
+        return {
+            **reviewed,
+            "status": "retry_required",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "error_code": "codex_decision_invalid",
+        }
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        1,
+        1,
+        project_root=tmp_path,
+        renew_actions=lambda paths: paths,
+        review_worker=review,
+        complete_review=complete,
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        runtime_status=lambda: {"status": "healthy"},
+    )
+
+    value = result.outcomes[0].value
+    assert review_calls == [True, True]
+    assert completion_calls == [True, True]
+    assert value["status"] == "failed"
+    assert value["write_state"] == "not_requested"
+    assert value["error_code"] == "codex_decision_invalid"
+    assert value["process_attempts"] == 2
+    assert value["process_retries"] == 1
+    assert stop_requests == [True]
+
+
 def test_dispatcher_requests_stop_before_failed_sibling_can_write(
     tmp_path: Path,
     monkeypatch,
