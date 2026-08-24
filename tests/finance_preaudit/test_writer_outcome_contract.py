@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -130,3 +131,104 @@ def test_controlled_write_preserves_writer_failure_classification(
     assert result["reason"] == failure_code
     assert result["write_state"] == expected_write_state
     assert len(api.calls) == 1
+
+
+def test_controlled_write_serializes_different_requests_at_writer_boundary(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "flows"
+    policy_file = tmp_path / "write-policy.json"
+    json_artifact.write_json_atomic(
+        policy_file,
+        {
+            "schema_version": 1,
+            "kind": "preaudit_write_policy",
+            "authorized_workflows": ["travel_expense"],
+        },
+    )
+    active = 0
+    max_active = 0
+    guard = threading.Lock()
+    first_active = threading.Event()
+    second_active = threading.Event()
+    release = threading.Event()
+
+    class ConcurrentWriterApi:
+        def pending_rows(self, **_kwargs) -> list[dict]:
+            return [
+                {
+                    "request_id": request_id,
+                    "received_at": f"2026-08-23T08:3{index}:00+08:00",
+                }
+                for index, request_id in enumerate(("request-a", "request-b"))
+            ]
+
+        def submit_and_verify(self, request_id: str, _remark: str) -> dict:
+            nonlocal active, max_active
+            with guard:
+                active += 1
+                max_active = max(max_active, active)
+                if active == 1:
+                    first_active.set()
+                else:
+                    second_active.set()
+            release.wait(timeout=2)
+            with guard:
+                active -= 1
+            return {
+                "submit_ok": True,
+                "done_hit": True,
+                "postcheck_done_hit": True,
+                "failure_code": None,
+            }
+
+    api = ConcurrentWriterApi()
+    ports = production_write.build_ports(
+        root=root,
+        policy_file=policy_file,
+        signing_secret="local-test-secret",
+        api_factory=lambda: api,
+        now=lambda: NOW,
+    )
+    candidates = [
+        {
+            "request_id": request_id,
+            "received_at": f"2026-08-23T08:3{index}:00+08:00",
+            "workflow_key": "travel_expense",
+        }
+        for index, request_id in enumerate(("request-a", "request-b"))
+    ]
+    engine = flow_engine.FlowEngine(
+        root=root,
+        discover_candidates=lambda _workflow_key: list(candidates),
+        collect_material=lambda request_id, _root: _material(request_id),
+        **ports,
+    )
+    actions = [engine.next_action("travel_expense") for _index in range(2)]
+    decisions: list[Path] = []
+    for index, action in enumerate(actions):
+        decision_file = tmp_path / f"decision-{index}.json"
+        json_artifact.write_json_atomic(decision_file, _decision(action))
+        decisions.append(decision_file)
+    results: list[dict] = []
+    threads = [
+        threading.Thread(
+            target=lambda action=action, decision=decision: results.append(
+                engine.complete_review(Path(action["action_file"]), decision)
+            )
+        )
+        for action, decision in zip(actions, decisions)
+    ]
+
+    threads[0].start()
+    assert first_active.wait(timeout=2)
+    threads[1].start()
+    overlapped = second_active.wait(timeout=0.2)
+    release.set()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert overlapped is False
+    assert max_active == 1
+    assert len(results) == 2
+    assert all(result["write_state"] == "submitted" for result in results)

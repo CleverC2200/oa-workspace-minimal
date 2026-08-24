@@ -10,6 +10,7 @@ from typing import Iterator
 
 
 STOP_CODE = "oa_run_stopped"
+GLOBAL_WRITER_KEY = "finance-preaudit-global-writer"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 

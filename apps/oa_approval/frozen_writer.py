@@ -221,7 +221,10 @@ def submit_frozen(
     if runtime_control.stop_requested():
         raise FrozenWriterError(runtime_control.STOP_CODE)
     try:
-        lease = runtime_control.request_writer_lease(request_id, lock_path)
+        lease = runtime_control.request_writer_lease(
+            runtime_control.GLOBAL_WRITER_KEY,
+            lock_path,
+        )
         with lease:
             remark, attempt_root = _validate_frozen_inputs(
                 request_id=request_id,
