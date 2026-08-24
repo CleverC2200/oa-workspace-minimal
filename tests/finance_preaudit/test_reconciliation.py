@@ -221,6 +221,8 @@ def test_latest_state_rejects_identity_that_does_not_match_case_hash(
         ("attempt", True),
         ("schema_version", None),
         ("kind", "partial_state"),
+        ("request_id", 4004),
+        ("received_at", 20260824),
         ("execution_state", "invalid"),
         ("write_state", "invalid"),
     ),

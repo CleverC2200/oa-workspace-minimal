@@ -84,6 +84,16 @@ def latest_states(root: Path) -> list[dict]:
                     )
                 except ValueError as error:
                     raise ValueError("runtime_reconciliation_invalid") from error
+                request_id = (
+                    state.get("request_id") if isinstance(state, dict) else None
+                )
+                received_at = (
+                    state.get("received_at") if isinstance(state, dict) else None
+                )
+                if isinstance(request_id, str) and isinstance(received_at, str):
+                    identity = request_id.strip(), received_at.strip()
+                else:
+                    identity = "", ""
                 if (
                     not isinstance(state, dict)
                     or state.get("schema_version") != 1
@@ -93,9 +103,9 @@ def latest_states(root: Path) -> list[dict]:
                     or isinstance(state.get("attempt"), bool)
                     or state.get("attempt") != attempt
                     or state.get("case_key") != case_root.name
-                    or not _identity(state)[0]
-                    or not _identity(state)[1]
-                    or _item_key(*_identity(state)) != case_root.name
+                    or not identity[0]
+                    or not identity[1]
+                    or _item_key(*identity) != case_root.name
                     or state.get("execution_state")
                     not in {"collecting", "review_required", "needs_admin", "closed"}
                     or state.get("business_state")
