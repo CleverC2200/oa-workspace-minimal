@@ -1302,6 +1302,98 @@ def test_dispatcher_harvests_review_while_preparation_is_running(
     assert stop_requests == [True]
 
 
+def test_dispatcher_keeps_only_one_outstanding_preparation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    _open_action(
+        flow_root,
+        case_key="c" * 64,
+        created_at="2026-08-24T08:00:00+00:00",
+    )
+    first_finished = threading.Event()
+    submitted_while_first_running: list[bool] = []
+    preparation_calls: list[int] = []
+    preparation_guard = threading.Lock()
+
+    class TrackingExecutor:
+        _processes: dict = {}
+
+        def __init__(self) -> None:
+            self._executor = ThreadPoolExecutor(max_workers=1)
+            self._submitted = 0
+
+        def submit(self, action, *args) -> Future:
+            self._submitted += 1
+            ordinal = self._submitted
+            if ordinal > 1 and not first_finished.is_set():
+                submitted_while_first_running.append(True)
+
+            def run() -> dict:
+                try:
+                    return action(*args)
+                finally:
+                    if ordinal == 1:
+                        first_finished.set()
+
+            return self._executor.submit(run)
+
+        def shutdown(self, **kwargs) -> None:
+            self._executor.shutdown(**kwargs)
+
+    def prepare(_workflow: str) -> dict:
+        with preparation_guard:
+            ordinal = len(preparation_calls) + 1
+            preparation_calls.append(ordinal)
+        time.sleep(0.05)
+        action_file = _open_action(
+            flow_root,
+            case_key=str(ordinal) * 64,
+            created_at=f"2026-08-24T08:00:0{ordinal}+00:00",
+        )
+        return {
+            "action": "review_required",
+            "action_file": str(action_file),
+        }
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_preparation_executor",
+        TrackingExecutor,
+    )
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        3,
+        2,
+        project_root=tmp_path,
+        renew_actions=lambda paths: paths,
+        prepare_action=prepare,
+        review_worker=lambda _task: {
+            "status": "reviewed",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "process_attempts": 1,
+            "process_retries": 0,
+            "token_usage": {"status": "unknown"},
+            "agent_wall_seconds": 1,
+            "decision": {"overall": "needs_human"},
+        },
+        complete_review=lambda _action, _reviewed: {
+            "status": "completed",
+            "business_state": "needs_human",
+            "write_state": "submitted",
+        },
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        heartbeat_interval_sec=0.005,
+        runtime_status=lambda: {"status": "healthy"},
+    )
+
+    assert preparation_calls == [1, 2]
+    assert submitted_while_first_running == []
+    assert result.completed == 3
+    assert result.stopped == 0
+
+
 def test_dispatcher_stops_after_preparation_technical_error_without_review(
     tmp_path: Path,
     monkeypatch,
