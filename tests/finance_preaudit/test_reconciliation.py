@@ -28,12 +28,16 @@ def _state(
     (attempt_root / "state.json").write_text(
         json.dumps(
             {
+                "schema_version": 1,
+                "kind": "preaudit_action",
                 "workflow_key": "travel_expense",
                 "case_key": case_key,
                 "attempt": attempt,
                 "request_id": request_id,
                 "received_at": received_at,
+                "created_at": "2026-08-24T00:00:00+00:00",
                 "execution_state": execution_state,
+                "business_state": "not_available",
                 "write_state": write_state,
                 "reason": reason,
             }
@@ -205,6 +209,32 @@ def test_latest_state_rejects_identity_that_does_not_match_case_hash(
     state_file = next(root.glob("*/cases/*/attempt-1/state.json"))
     state = json.loads(state_file.read_text(encoding="utf-8"))
     state["request_id"] = "different-request"
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="runtime_reconciliation_invalid"):
+        reconciliation.latest_states(root)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("attempt", True),
+        ("schema_version", None),
+        ("kind", "partial_state"),
+        ("execution_state", "invalid"),
+        ("write_state", "invalid"),
+    ),
+)
+def test_latest_state_requires_the_complete_runtime_contract(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    root = tmp_path / "flows"
+    _state(root, "4004", "2026-08-24 12:03:00")
+    state_file = next(root.glob("*/cases/*/attempt-1/state.json"))
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    state[field] = value
     state_file.write_text(json.dumps(state), encoding="utf-8")
 
     with pytest.raises(ValueError, match="runtime_reconciliation_invalid"):

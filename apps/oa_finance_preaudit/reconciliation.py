@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
@@ -76,14 +77,38 @@ def latest_states(root: Path) -> list[dict]:
                 if state_file.is_symlink() or not state_file.is_file():
                     raise ValueError("runtime_reconciliation_invalid")
                 state = json.loads(state_file.read_text(encoding="utf-8"))
+                created_at = state.get("created_at") if isinstance(state, dict) else None
+                try:
+                    parsed_created_at = datetime.fromisoformat(
+                        str(created_at or "").replace("Z", "+00:00")
+                    )
+                except ValueError as error:
+                    raise ValueError("runtime_reconciliation_invalid") from error
                 if (
                     not isinstance(state, dict)
+                    or state.get("schema_version") != 1
+                    or state.get("kind") != "preaudit_action"
                     or state.get("workflow_key") != workflow_root.name
+                    or not isinstance(state.get("attempt"), int)
+                    or isinstance(state.get("attempt"), bool)
                     or state.get("attempt") != attempt
                     or state.get("case_key") != case_root.name
                     or not _identity(state)[0]
                     or not _identity(state)[1]
                     or _item_key(*_identity(state)) != case_root.name
+                    or state.get("execution_state")
+                    not in {"collecting", "review_required", "needs_admin", "closed"}
+                    or state.get("business_state")
+                    not in {"not_available", "pass", "needs_human"}
+                    or state.get("write_state")
+                    not in {
+                        "not_requested",
+                        "authorized",
+                        "submitting",
+                        "submitted",
+                        "unknown",
+                    }
+                    or parsed_created_at.tzinfo is None
                 ):
                     raise ValueError("runtime_reconciliation_invalid")
                 latest.append(state)
