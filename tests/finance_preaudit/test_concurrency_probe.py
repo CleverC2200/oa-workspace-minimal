@@ -851,6 +851,67 @@ def test_rolling_failure_retains_health_and_stable_reason(
     ]
 
 
+def test_rolling_controller_holds_unique_runtime_lease(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv(
+        "OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE",
+        str(tmp_path / "rolling-controller.lock"),
+    )
+    pending = iter((1, 0))
+    current_pending = [0]
+
+    def live_status() -> dict:
+        current_pending[0] = next(pending)
+        return {
+            "credentials": {"status": "ok"},
+            "oa": {
+                "execution_identity": "verified",
+                "by_workflow": {"travel_expense": current_pending[0]},
+            },
+        }
+
+    def pipeline(count: int, capacity: int) -> process_pool.PoolResult[dict]:
+        assert finance_preaudit_concurrency_probe.runtime_control.controller_active()
+        return process_pool.PoolResult(
+            requested=count,
+            started=count,
+            completed=count,
+            failed=0,
+            timed_out=0,
+            stopped=0,
+            peak_active=capacity,
+            elapsed_seconds=1.0,
+            outcomes=tuple(
+                process_pool.TaskOutcome(
+                    index=index,
+                    status="completed",
+                    value={
+                        "status": "completed",
+                        "business_state": "needs_human",
+                        "token_usage": {"status": "unknown"},
+                    },
+                )
+                for index in range(count)
+            ),
+        )
+
+    result = finance_preaudit_concurrency_probe.run_rolling_drain(
+        capacity=6,
+        live_status=live_status,
+        pipeline_runner=pipeline,
+        reconcile_status=lambda: _reconciliation_snapshot(current_pending[0]),
+    )
+
+    assert result["completed"] == 1
+    assert not finance_preaudit_concurrency_probe.runtime_control.controller_active()
+
+    with finance_preaudit_concurrency_probe.runtime_control.global_controller_lease():
+        with pytest.raises(
+            ValueError,
+            match="production_rolling_controller_active",
+        ):
+            finance_preaudit_concurrency_probe.run_rolling_drain(capacity=6)
+
+
 def test_rolling_failure_retains_host_critical_health_reason() -> None:
     result = finance_preaudit_concurrency_probe.run_rolling_drain(
         capacity=6,
