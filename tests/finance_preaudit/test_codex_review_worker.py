@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import io
 from pathlib import Path
+import signal
 import threading
 import time
 
@@ -254,6 +255,58 @@ def test_codex_command_pins_terra_high_and_json_output(tmp_path: Path) -> None:
     assert command[command.index("--output-last-message") + 1].endswith(
         "decision.json"
     )
+
+
+def test_codex_start_blocks_sigterm_until_process_group_is_registered(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    task, action_file = _task(tmp_path)
+    calls: list[tuple[str, object]] = []
+
+    def mask(how: object, values: object) -> set[signal.Signals]:
+        calls.append(("mask", how))
+        return set()
+
+    def install(signum: int, handler: object) -> object:
+        calls.append(("signal", signum))
+        return signal.SIG_DFL
+
+    class Process:
+        pid = 12345
+        returncode = 1
+
+        def communicate(self, *, input: str, timeout: int) -> None:
+            del input, timeout
+            calls.append(("communicate", self.pid))
+
+        def poll(self) -> int:
+            return self.returncode
+
+    def popen(*_args, **_kwargs) -> Process:
+        calls.append(("popen", "registered"))
+        return Process()
+
+    monkeypatch.setattr(codex_review_worker.signal, "pthread_sigmask", mask)
+    monkeypatch.setattr(codex_review_worker.signal, "signal", install)
+    monkeypatch.setattr(codex_review_worker.subprocess, "Popen", popen)
+
+    result = codex_review_worker._execute_codex(
+        Path(task["project_root"]),
+        action_file,
+        60,
+    )
+
+    assert result.error_code == "codex_process_failed"
+    assert [name for name, _value in calls[:5]] == [
+        "mask",
+        "signal",
+        "popen",
+        "mask",
+        "communicate",
+    ]
+    assert calls[0][1] == signal.SIG_BLOCK
+    assert calls[3][1] == signal.SIG_SETMASK
 
 
 def test_worker_submits_structured_agent_decision_through_host(
