@@ -747,11 +747,19 @@ def _run_dispatched_tasks(
             )
             timed_out_indices = {
                 index
-                for index, age in review_ages.items()
-                if age >= task_timeout_sec
+                for future, (
+                    index,
+                    _prepare_elapsed,
+                    _task_started,
+                    _action_file,
+                ) in futures.items()
+                if not future.done()
+                and review_ages[index] >= task_timeout_sec
             }
             prepare_timed_out = (
-                preparation is not None and prepare_age >= prepare_timeout_sec
+                preparation is not None
+                and not preparation[0].done()
+                and prepare_age >= prepare_timeout_sec
             )
             if timed_out_indices or prepare_timed_out:
                 for _future, (
