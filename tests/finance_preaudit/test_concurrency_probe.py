@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 import os
 from pathlib import Path
 import subprocess
@@ -1099,6 +1099,76 @@ def test_dispatcher_dispatches_successful_preparation_once(
     assert result.completed == 1
     assert result.timed_out == 0
     assert [task["action_file"] for task in reviews] == [str(prepared_action)]
+
+
+def test_dispatcher_harvests_completed_preparation_before_timeout_check(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class CompletedExecutor:
+        _processes: dict = {}
+
+        def submit(self, action, *args) -> Future:
+            future = Future()
+            future.set_result(action(*args))
+            return future
+
+        def shutdown(self, **_kwargs) -> None:
+            return None
+
+    prepared_action = (
+        tmp_path
+        / "runtime"
+        / "finance_preaudit_flows"
+        / "travel_expense"
+        / "cases"
+        / "prepared-at-boundary"
+        / "attempt-1"
+        / "action.json"
+    )
+    prepared_action.parent.mkdir(parents=True)
+    prepared_action.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("OA_TEST_PREPARED_ACTION_FILE", str(prepared_action))
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_preparation_executor",
+        CompletedExecutor,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        1,
+        1,
+        project_root=tmp_path,
+        prepare_action=_successful_prepare,
+        review_worker=lambda _task: {
+            "status": "reviewed",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "process_attempts": 1,
+            "process_retries": 0,
+            "token_usage": {"status": "unknown"},
+            "agent_wall_seconds": 1,
+            "decision": {"overall": "needs_human"},
+        },
+        complete_review=lambda _action, _reviewed: {
+            "status": "completed",
+            "business_state": "needs_human",
+            "write_state": "submitted",
+        },
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        prepare_timeout_sec=1e-9,
+        heartbeat_interval_sec=0.005,
+        runtime_status=lambda: {"status": "healthy"},
+    )
+
+    assert result.completed == 1
+    assert result.timed_out == 0
+    assert result.outcomes[0].error_code is None
 
 
 def test_dispatcher_harvests_review_while_preparation_is_running(
