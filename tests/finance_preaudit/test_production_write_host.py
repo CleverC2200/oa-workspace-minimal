@@ -1013,6 +1013,12 @@ def test_authorization_expiring_during_pending_query_stops_submit(
     assert result["reason"] == "writer_preflight_failed"
     assert result["write_state"] == "not_requested"
     assert api.calls == []
+    boundary = json.loads(
+        Path(action["action_file"])
+        .with_name("writer-boundary.json")
+        .read_text(encoding="utf-8")
+    )
+    assert boundary["failure_detail_code"] == "authorization_invalid"
 
 
 def test_evidence_changed_during_pending_query_stops_submit(tmp_path: Path) -> None:
@@ -1060,6 +1066,12 @@ def test_evidence_changed_during_pending_query_stops_submit(tmp_path: Path) -> N
     assert result["reason"] == "writer_preflight_failed"
     assert result["write_state"] == "not_requested"
     assert api.calls == []
+    boundary = json.loads(
+        Path(action["action_file"])
+        .with_name("writer-boundary.json")
+        .read_text(encoding="utf-8")
+    )
+    assert boundary["failure_detail_code"] == "frozen_evidence_invalid"
 
 
 @pytest.mark.parametrize("late_change", ("expire", "stop"))

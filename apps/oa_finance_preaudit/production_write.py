@@ -60,6 +60,15 @@ _BOUNDARY_TRANSITIONS = {
 _BOUNDARY_FAILURE_CODES = writer_outcomes.FAILURE_CODES | {
     "writer_result_unknown",
 }
+_PREFLIGHT_DETAIL_CODES = frozenset(
+    {
+        "authorization_invalid",
+        "frozen_evidence_invalid",
+        "pending_refresh_failed",
+        "stop_requested",
+        "submission_job_invalid",
+    }
+)
 
 
 def _utc_now() -> datetime:
@@ -196,9 +205,13 @@ def _read_boundary(path: Path, job: dict, secret: str) -> dict | None:
         "failure_code",
         "proof",
     }
+    accepted_fields = {frozenset(expected_fields), frozenset({
+        *expected_fields,
+        "failure_detail_code",
+    })}
     stages = boundary.get("stages")
     if (
-        set(boundary) != expected_fields
+        frozenset(boundary) not in accepted_fields
         or boundary.get("schema_version") != 1
         or boundary.get("kind") != "preaudit_writer_boundary"
         or any(
@@ -209,6 +222,12 @@ def _read_boundary(path: Path, job: dict, secret: str) -> dict | None:
         or not stages
         or any(stage not in _BOUNDARY_STAGES for stage in stages)
         or boundary.get("failure_code") not in _BOUNDARY_FAILURE_CODES | {None}
+        or boundary.get("failure_detail_code")
+        not in _PREFLIGHT_DETAIL_CODES | {None}
+        or (
+            boundary.get("failure_detail_code") is not None
+            and boundary.get("failure_code") != writer_outcomes.PREFLIGHT_FAILED
+        )
         or not hmac.compare_digest(
             str(boundary.get("proof") or ""),
             _boundary_proof(boundary, secret),
@@ -230,6 +249,7 @@ def _record_boundary(
     stage: str,
     *,
     failure_code: str | None = None,
+    failure_detail_code: str | None = None,
 ) -> dict:
     boundary = _read_boundary(path, job, secret)
     stages = list(boundary["stages"]) if boundary is not None else []
@@ -238,12 +258,21 @@ def _record_boundary(
         raise ValueError("writer_result_unknown")
     if failure_code not in _BOUNDARY_FAILURE_CODES | {None}:
         raise ValueError("writer_result_unknown")
+    if (
+        failure_detail_code not in _PREFLIGHT_DETAIL_CODES | {None}
+        or (
+            failure_detail_code is not None
+            and failure_code != writer_outcomes.PREFLIGHT_FAILED
+        )
+    ):
+        raise ValueError("writer_result_unknown")
     unsigned = {
         "schema_version": 1,
         "kind": "preaudit_writer_boundary",
         **_boundary_identity(job),
         "stages": [*stages, stage],
         "failure_code": failure_code,
+        "failure_detail_code": failure_detail_code,
     }
     payload = {**unsigned, "proof": _boundary_proof(unsigned, secret)}
     json_artifact.write_json_atomic(path, payload, indent=2)
@@ -262,6 +291,15 @@ def _replay_boundary(boundary: dict) -> dict:
     if code in _BOUNDARY_FAILURE_CODES:
         raise ValueError(code)
     raise ValueError("writer_result_unknown")
+
+
+def _preflight_detail_code(error: Exception) -> str:
+    code = str(error).strip()
+    if code == "write_authorization_invalid":
+        return "authorization_invalid"
+    if code == "submission_job_invalid":
+        return "submission_job_invalid"
+    return "frozen_evidence_invalid"
 
 
 def _submission_result(job: dict, result: dict) -> dict:
@@ -581,6 +619,7 @@ def build_ports(
                     secret,
                     "preflight_failed",
                     failure_code=writer_outcomes.PREFLIGHT_FAILED,
+                    failure_detail_code="stop_requested",
                 )
                 raise ValueError(writer_outcomes.PREFLIGHT_FAILED)
             try:
@@ -594,6 +633,7 @@ def build_ports(
                     secret,
                     "preflight_failed",
                     failure_code=writer_outcomes.PREFLIGHT_FAILED,
+                    failure_detail_code="pending_refresh_failed",
                 )
                 raise ValueError(writer_outcomes.PREFLIGHT_FAILED) from error
             matches = [
@@ -619,6 +659,7 @@ def build_ports(
                     secret,
                     "preflight_failed",
                     failure_code=writer_outcomes.PREFLIGHT_FAILED,
+                    failure_detail_code="stop_requested",
                 )
                 raise ValueError(writer_outcomes.PREFLIGHT_FAILED)
             try:
@@ -634,6 +675,7 @@ def build_ports(
                     secret,
                     "preflight_failed",
                     failure_code=writer_outcomes.PREFLIGHT_FAILED,
+                    failure_detail_code=_preflight_detail_code(error),
                 )
                 raise ValueError(writer_outcomes.PREFLIGHT_FAILED) from error
             if runtime_control.stop_requested():
@@ -643,6 +685,7 @@ def build_ports(
                     secret,
                     "preflight_failed",
                     failure_code=writer_outcomes.PREFLIGHT_FAILED,
+                    failure_detail_code="stop_requested",
                 )
                 raise ValueError(writer_outcomes.PREFLIGHT_FAILED)
             _record_boundary(boundary_path, job, secret, "submit_started")
