@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 import json
 import multiprocessing
+import os
 from pathlib import Path
+import signal
 import sys
 import time
 from typing import Callable, Sequence
@@ -26,6 +28,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RenewActions = Callable[[list[Path]], list[Path]]
 ReviewRunner = Callable[[list[dict], int], process_pool.PoolResult[dict]]
 PrepareRunner = Callable[[int], process_pool.PoolResult[dict]]
+PrepareAction = Callable[[str], dict]
 BatchRunner = Callable[..., dict]
 LiveStatus = Callable[[], dict]
 PipelineRunner = Callable[[int, int], process_pool.PoolResult[dict]]
@@ -609,16 +612,49 @@ def _process_executor(capacity: int) -> ProcessPoolExecutor:
     )
 
 
-def _terminate_executor(executor: object) -> None:
+def _preparation_executor() -> ProcessPoolExecutor:
+    return ProcessPoolExecutor(
+        max_workers=1,
+        mp_context=multiprocessing.get_context("spawn"),
+        initializer=os.setsid,
+    )
+
+
+def _terminate_executor(
+    executor: object,
+    *,
+    owned_process_groups: bool = False,
+) -> None:
     processes = list((getattr(executor, "_processes", None) or {}).values())
+    owned_groups: set[int] = set()
+    if owned_process_groups:
+        for process in processes:
+            if not process.is_alive() or process.pid is None:
+                continue
+            try:
+                if os.getpgid(process.pid) == process.pid:
+                    owned_groups.add(process.pid)
+            except OSError:
+                continue
     for process in processes:
-        if process.is_alive():
+        if process.pid in owned_groups:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except OSError:
+                pass
+        elif process.is_alive():
             process.terminate()
     for process in processes:
         process.join(timeout=1)
-        if process.is_alive():
+    for group in owned_groups:
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except OSError:
+            pass
+    for process in processes:
+        if process.is_alive() and process.pid not in owned_groups:
             process.kill()
-            process.join(timeout=1)
+        process.join(timeout=1)
     executor.shutdown(wait=False, cancel_futures=True)
 
 
@@ -628,14 +664,20 @@ def _run_dispatched_tasks(
     *,
     project_root: Path = PROJECT_ROOT,
     renew_actions: RenewActions = _renew_actions,
+    prepare_action: PrepareAction | None = None,
     review_worker: ReviewWorker = _review_only,
     complete_review: ReviewCompleter = codex_review_worker.complete_review_result,
     executor_factory: ExecutorFactory = _process_executor,
     task_timeout_sec: float = 960,
+    prepare_timeout_sec: float = 300,
     heartbeat_interval_sec: float = 15,
     runtime_status: Callable[[], dict] = concurrency_control.sample_local_health,
 ) -> process_pool.PoolResult[dict]:
-    if task_timeout_sec <= 0 or heartbeat_interval_sec <= 0:
+    if (
+        task_timeout_sec <= 0
+        or prepare_timeout_sec <= 0
+        or heartbeat_interval_sec <= 0
+    ):
         raise ValueError("production_dispatcher_watchdog_invalid")
     started_at = time.monotonic()
     root = Path(project_root).expanduser().resolve()
@@ -650,13 +692,38 @@ def _run_dispatched_tasks(
     runtime_samples: list[dict] = []
     max_task_elapsed_seconds = 0.0
     next_heartbeat = time.monotonic()
+    preparation: tuple[Future[dict], int, float] | None = None
+    prepare_action = prepare_action or _prepare_one
+    prepare_executor = _preparation_executor()
+    prepare_executor_terminated = False
     executor = executor_factory(capacity)
+
+    def stop_reviews() -> None:
+        nonlocal force_terminated
+        for _future, (
+            index,
+            _prepare_elapsed,
+            _task_started,
+            _action_file,
+        ) in futures.items():
+            outcomes[index] = process_pool.TaskOutcome(
+                index=index,
+                status="stopped",
+                value=None,
+                error_code="stop_requested",
+            )
+        futures.clear()
+        _terminate_executor(executor)
+        force_terminated = True
+
     try:
-        while futures or (next_index < count and not halted):
+        while futures or preparation is not None or (
+            next_index < count and not halted
+        ):
             if runtime_control.stop_requested():
                 halted = True
             now = time.monotonic()
-            active_ages = {
+            review_ages = {
                 index: max(0.0, now - task_started)
                 for (
                     index,
@@ -665,16 +732,28 @@ def _run_dispatched_tasks(
                     _action_file,
                 ) in futures.values()
             }
+            active_ages = dict(review_ages)
+            prepare_age = 0.0
+            if preparation is not None:
+                _prepare_future, prepare_index, prepare_started_at = preparation
+                prepare_age = max(
+                    0.0,
+                    now - prepare_started_at,
+                )
+                active_ages[prepare_index] = prepare_age
             max_task_elapsed_seconds = max(
                 max_task_elapsed_seconds,
                 max(active_ages.values(), default=0.0),
             )
             timed_out_indices = {
                 index
-                for index, age in active_ages.items()
+                for index, age in review_ages.items()
                 if age >= task_timeout_sec
             }
-            if timed_out_indices:
+            prepare_timed_out = (
+                preparation is not None and prepare_age >= prepare_timeout_sec
+            )
+            if timed_out_indices or prepare_timed_out:
                 for _future, (
                     index,
                     _prepare_elapsed,
@@ -691,6 +770,24 @@ def _run_dispatched_tasks(
                             else "worker_cancelled_after_timeout"
                         ),
                     )
+                if preparation is not None:
+                    _prepare_future, prepare_index, _prepare_started_at = preparation
+                    outcomes[prepare_index] = process_pool.TaskOutcome(
+                        index=prepare_index,
+                        status="timed_out",
+                        value=None,
+                        error_code=(
+                            "production_probe_prepare_timeout"
+                            if prepare_timed_out
+                            else "worker_cancelled_after_timeout"
+                        ),
+                    )
+                    _terminate_executor(
+                        prepare_executor,
+                        owned_process_groups=True,
+                    )
+                    prepare_executor_terminated = True
+                    preparation = None
                 futures.clear()
                 halted = True
                 runtime_control.request_stop()
@@ -706,7 +803,8 @@ def _run_dispatched_tasks(
                     {
                         "elapsed_seconds": round(now - started_at, 3),
                         "pending_tasks": max(0, count - next_index),
-                        "active_workers": len(futures),
+                        "active_workers": len(futures)
+                        + int(preparation is not None),
                         "completed_tasks": sum(
                             outcome is not None for outcome in outcomes
                         ),
@@ -720,6 +818,88 @@ def _run_dispatched_tasks(
                 if host.get("status") == "critical":
                     halted = True
                     runtime_control.request_stop()
+            if halted and preparation is not None:
+                _prepare_future, prepare_index, _prepare_started_at = preparation
+                outcomes[prepare_index] = process_pool.TaskOutcome(
+                    index=prepare_index,
+                    status="stopped",
+                    value=None,
+                    error_code="stop_requested",
+                )
+                _terminate_executor(
+                    prepare_executor,
+                    owned_process_groups=True,
+                )
+                prepare_executor_terminated = True
+                preparation = None
+            if preparation is not None:
+                prepare_future, index, prepare_started_at = preparation
+                if prepare_future.done():
+                    prepare_elapsed = time.monotonic() - prepare_started_at
+                    try:
+                        prepared = prepare_future.result()
+                    except Exception:
+                        prepared = {
+                            "action": "failed",
+                            "error_code": "production_probe_prepare_failed",
+                        }
+                    preparation = None
+                    if prepared.get("action") != "review_required":
+                        outcomes[index] = process_pool.TaskOutcome(
+                            index=index,
+                            status="completed",
+                            value={
+                                "status": "failed",
+                                "business_state": "not_available",
+                                "error_code": str(
+                                    prepared.get("error_code")
+                                    or "production_probe_prepare_failed"
+                                ),
+                                "prepare_elapsed_seconds": prepare_elapsed,
+                                "process_attempts": 0,
+                                "process_retries": 0,
+                                "token_usage": {"status": "unknown"},
+                            },
+                        )
+                        halted = True
+                        runtime_control.request_stop()
+                        _terminate_executor(
+                            prepare_executor,
+                            owned_process_groups=True,
+                        )
+                        prepare_executor_terminated = True
+                        stop_reviews()
+                        break
+                    else:
+                        action_file = Path(str(prepared["action_file"])).resolve()
+                        if (
+                            action_file in assigned
+                            or runtime_control.stop_requested()
+                        ):
+                            outcomes[index] = process_pool.TaskOutcome(
+                                index=index,
+                                status="stopped",
+                                value=None,
+                                error_code="stop_requested",
+                            )
+                            halted = True
+                            runtime_control.request_stop()
+                        else:
+                            assigned.add(action_file)
+                            task = {
+                                "project_root": str(root),
+                                "action_file": str(action_file),
+                                "timeout_seconds": 900,
+                            }
+                            future = executor.submit(review_worker, task)
+                            futures[future] = (
+                                index,
+                                prepare_elapsed,
+                                time.monotonic(),
+                                action_file,
+                            )
+                            started += 1
+                            peak_active = max(peak_active, len(futures))
             while not halted and next_index < count and len(futures) < capacity:
                 prepare_started = time.monotonic()
                 available = [
@@ -741,7 +921,16 @@ def _run_dispatched_tasks(
                         }
                     )
                 else:
-                    prepared = _prepare_one("travel_expense")
+                    preparation = (
+                        prepare_executor.submit(
+                            prepare_action,
+                            "travel_expense",
+                        ),
+                        next_index,
+                        time.monotonic(),
+                    )
+                    next_index += 1
+                    break
                 prepare_elapsed = time.monotonic() - prepare_started
                 if prepared.get("action") != "review_required":
                     outcomes[next_index] = process_pool.TaskOutcome(
@@ -763,21 +952,7 @@ def _run_dispatched_tasks(
                     next_index += 1
                     halted = True
                     runtime_control.request_stop()
-                    for _future, (
-                        index,
-                        _prepare_elapsed,
-                        _task_started,
-                        _action_file,
-                    ) in futures.items():
-                        outcomes[index] = process_pool.TaskOutcome(
-                            index=index,
-                            status="stopped",
-                            value=None,
-                            error_code="stop_requested",
-                        )
-                    futures.clear()
-                    _terminate_executor(executor)
-                    force_terminated = True
+                    stop_reviews()
                     break
                 action_file = Path(str(prepared["action_file"])).resolve()
                 if action_file in assigned or runtime_control.stop_requested():
@@ -801,6 +976,15 @@ def _run_dispatched_tasks(
                 peak_active = max(peak_active, len(futures))
 
             if not futures:
+                if preparation is not None:
+                    time.sleep(
+                        min(
+                            0.25,
+                            heartbeat_interval_sec,
+                            prepare_timeout_sec / 4,
+                        )
+                    )
+                    continue
                 break
             done, _pending = wait(
                 tuple(futures),
@@ -838,21 +1022,7 @@ def _run_dispatched_tasks(
                 reviewed_now.append((index, prepare_elapsed, action_file, value))
             if failed_now:
                 runtime_control.request_stop()
-                for _future, (
-                    index,
-                    _prepare_elapsed,
-                    _task_started,
-                    _action_file,
-                ) in futures.items():
-                    outcomes[index] = process_pool.TaskOutcome(
-                        index=index,
-                        status="stopped",
-                        value=None,
-                        error_code="stop_requested",
-                    )
-                futures.clear()
-                _terminate_executor(executor)
-                force_terminated = True
+                stop_reviews()
                 break
             for index, prepare_elapsed, action_file, reviewed in reviewed_now:
                 value = {
@@ -870,23 +1040,17 @@ def _run_dispatched_tasks(
                     break
             if failed_now:
                 runtime_control.request_stop()
-                for _future, (
-                    index,
-                    _prepare_elapsed,
-                    _task_started,
-                    _action_file,
-                ) in futures.items():
-                    outcomes[index] = process_pool.TaskOutcome(
-                        index=index,
-                        status="stopped",
-                        value=None,
-                        error_code="stop_requested",
-                    )
-                futures.clear()
-                _terminate_executor(executor)
-                force_terminated = True
+                stop_reviews()
                 break
     finally:
+        if not prepare_executor_terminated:
+            if preparation is not None:
+                _terminate_executor(
+                    prepare_executor,
+                    owned_process_groups=True,
+                )
+            else:
+                prepare_executor.shutdown(wait=True)
         if not force_terminated:
             executor.shutdown(wait=True)
 
