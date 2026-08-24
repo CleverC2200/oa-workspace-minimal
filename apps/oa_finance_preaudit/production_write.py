@@ -20,6 +20,7 @@ from . import flow_engine, submission
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _PROOF_DOMAIN = b"oa-finance-preaudit-controlled-write-v1\0"
 _BOUNDARY_PROOF_DOMAIN = b"oa-finance-preaudit-writer-boundary-v1\0"
+_AUTHORIZATION_REFRESH_WINDOW = timedelta(minutes=20)
 _FINGERPRINT = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SUBMISSION_TOKEN = re.compile(r"^[0-9a-f]{32}$")
 _ATTEMPT = re.compile(r"^attempt-[1-9][0-9]*$")
@@ -522,7 +523,8 @@ def build_ports(
         )
         if (
             expires_at.tzinfo is None
-            or expires_at.astimezone(timezone.utc) > now().astimezone(timezone.utc)
+            or expires_at.astimezone(timezone.utc)
+            > now().astimezone(timezone.utc) + _AUTHORIZATION_REFRESH_WINDOW
             or previous_grant.get("workflow_key") not in workflows
             or any(
                 previous_grant.get(key) != value
@@ -535,6 +537,17 @@ def build_ports(
         ):
             raise ValueError("write_authorization_invalid")
         return authorization_source(context)
+
+    def authorization_refresh_needed(grant: dict) -> bool:
+        try:
+            expires_at = datetime.fromisoformat(str(grant.get("expires_at") or ""))
+        except (TypeError, ValueError):
+            return True
+        return (
+            expires_at.tzinfo is None
+            or expires_at.astimezone(timezone.utc)
+            <= now().astimezone(timezone.utc) + _AUTHORIZATION_REFRESH_WINDOW
+        )
 
     def submit_frozen(job: dict) -> dict:
         if runtime_control.stop_requested():
@@ -724,6 +737,7 @@ def build_ports(
         "authorization_source": authorization_source,
         "authorization_verifier": authorization_verifier,
         "authorization_renewer": authorization_renewer,
+        "authorization_refresh_needed": authorization_refresh_needed,
         "submit_frozen": submit_frozen,
         "recover_frozen": recover_frozen,
     }

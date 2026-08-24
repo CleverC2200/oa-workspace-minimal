@@ -11,6 +11,7 @@ SCHEMA_VERSION = 1
 AuthorizationSource = Callable[[dict], dict]
 AuthorizationVerifier = Callable[[dict, dict], bool]
 AuthorizationRenewer = Callable[[dict, dict], dict]
+AuthorizationRefreshNeeded = Callable[[dict], bool]
 SubmitFrozen = Callable[[dict], dict]
 RecoverFrozen = Callable[[dict], dict]
 

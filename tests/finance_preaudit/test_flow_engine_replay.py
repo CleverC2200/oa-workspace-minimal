@@ -125,6 +125,127 @@ def test_confirmed_material_failure_creates_fresh_attempt_only_after_live_check(
     assert new_state["attempt"] == 2
 
 
+def test_validated_historical_authorization_failure_can_be_skipped(
+    tmp_path: Path,
+) -> None:
+    candidates = _candidates(("first-request", "second-request"))
+
+    def authorization_source(context: dict) -> dict:
+        if context["request_id"] == "first-request":
+            raise ValueError("write_authorization_invalid")
+        return _grant(context)
+
+    engine = _engine(
+        tmp_path,
+        candidates=candidates,
+        authorization_source=authorization_source,
+        submit_frozen=_success,
+    )
+    failed = engine.next_action("travel_expense", mode="controlled_write")
+
+    blocked = engine.next_action("travel_expense", mode="controlled_write")
+    resumed = engine.next_action(
+        "travel_expense",
+        mode="controlled_write",
+        skip_write_authorization_failures=frozenset(
+            {Path(failed["action_file"])}
+        ),
+    )
+
+    assert blocked == failed
+    assert resumed["action"] == "review_required"
+    assert resumed["case_key"] != failed["case_key"]
+
+
+def test_validated_historical_authorization_failure_is_not_reprojected(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(
+        tmp_path,
+        authorization_source=lambda _context: (_ for _ in ()).throw(
+            ValueError("write_authorization_invalid")
+        ),
+        submit_frozen=_success,
+    )
+    failed = engine.next_action("travel_expense", mode="controlled_write")
+    empty_live_engine = _engine(
+        tmp_path,
+        candidates=[],
+        authorization_source=_grant,
+        submit_frozen=_success,
+    )
+
+    result = empty_live_engine.next_action(
+        "travel_expense",
+        mode="controlled_write",
+        skip_write_authorization_failures=frozenset(
+            {Path(failed["action_file"])}
+        ),
+    )
+
+    assert result["action"] == "closed"
+    assert result["write_state"] == "not_requested"
+
+
+def test_tampered_historical_authorization_failure_cannot_be_skipped(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(
+        tmp_path,
+        authorization_source=lambda _context: (_ for _ in ()).throw(
+            ValueError("write_authorization_invalid")
+        ),
+        submit_frozen=_success,
+    )
+    failed = engine.next_action("travel_expense", mode="controlled_write")
+    state_file = Path(failed["state_file"])
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    state["action_file"] = str(tmp_path / "travel_expense" / "action.json")
+    json_artifact.write_json_atomic(state_file, state)
+
+    with pytest.raises(
+        ValueError,
+        match="historical_authorization_failure_invalid",
+    ):
+        engine.next_action(
+            "travel_expense",
+            mode="controlled_write",
+            skip_write_authorization_failures=frozenset(
+                {Path(failed["action_file"])}
+            ),
+        )
+
+
+def test_symlinked_historical_authorization_state_cannot_be_skipped(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(
+        tmp_path,
+        authorization_source=lambda _context: (_ for _ in ()).throw(
+            ValueError("write_authorization_invalid")
+        ),
+        submit_frozen=_success,
+    )
+    failed = engine.next_action("travel_expense", mode="controlled_write")
+    state_file = Path(failed["state_file"])
+    outside_state = tmp_path / "outside-state.json"
+    outside_state.write_bytes(state_file.read_bytes())
+    state_file.unlink()
+    state_file.symlink_to(outside_state)
+
+    with pytest.raises(
+        ValueError,
+        match="historical_authorization_failure_invalid",
+    ):
+        engine.next_action(
+            "travel_expense",
+            mode="controlled_write",
+            skip_write_authorization_failures=frozenset(
+                {Path(failed["action_file"])}
+            ),
+        )
+
+
 def test_unknown_or_handled_case_cannot_enter_recovery(tmp_path: Path) -> None:
     engine = _engine(tmp_path)
     failed = engine.next_action("travel_expense")

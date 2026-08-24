@@ -384,7 +384,9 @@ def test_probe_prepares_missing_actions_before_review(
     assert not prepared_file.exists()
 
 
-def test_prepare_skips_quarantined_item_without_global_stop(monkeypatch) -> None:
+def test_prepare_skips_quarantined_item_without_global_stop(
+    monkeypatch,
+) -> None:
     actions = iter(
         [
             {
@@ -424,12 +426,161 @@ def test_prepare_skips_quarantined_item_without_global_stop(monkeypatch) -> None
         "_local_quarantine_count",
         lambda: 1,
     )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_historical_write_authorization_failures",
+        frozenset,
+    )
 
     assert finance_preaudit_concurrency_probe._prepare_one("travel_expense") == {
         "action": "review_required",
         "action_file": "/safe/action.json",
     }
     assert stop_requests == []
+
+
+def test_prepare_stops_on_new_write_authorization_failure(monkeypatch) -> None:
+    stop_requests: list[bool] = []
+
+    class Engine:
+        def next_action(self, *_args, **_kwargs) -> dict:
+            return {
+                "action": "needs_admin",
+                "reason": "write_authorization_invalid",
+                "write_state": "not_requested",
+                "action_file": "/safe/new-action.json",
+            }
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.cli,
+        "_live_flow_engine",
+        lambda *, controlled: Engine(),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda: stop_requests.append(True),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantine_count",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_historical_write_authorization_failures",
+        lambda: frozenset({Path("/safe/old-action.json")}),
+    )
+
+    assert finance_preaudit_concurrency_probe._prepare_one(
+        "travel_expense"
+    ) == {
+        "action": "needs_admin",
+        "error_code": "write_authorization_invalid",
+    }
+    assert stop_requests == [True]
+
+
+def test_prepare_skips_exact_historical_write_authorization_failure(
+    monkeypatch,
+) -> None:
+    stop_requests: list[bool] = []
+    calls: list[frozenset[Path]] = []
+
+    class Engine:
+        def next_action(
+            self,
+            *_args,
+            skip_write_authorization_failures: frozenset[Path],
+            **_kwargs,
+        ) -> dict:
+            calls.append(skip_write_authorization_failures)
+            return {
+                "action": "review_required",
+                "action_file": "/safe/new-action.json",
+            }
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.cli,
+        "_live_flow_engine",
+        lambda *, controlled: Engine(),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda: stop_requests.append(True),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantine_count",
+        lambda: 1,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_historical_write_authorization_failures",
+        lambda: frozenset({Path("/safe/old-action.json")}),
+    )
+
+    assert finance_preaudit_concurrency_probe._prepare_one(
+        "travel_expense"
+    ) == {
+        "action": "review_required",
+        "action_file": "/safe/new-action.json",
+    }
+    assert stop_requests == []
+    assert calls == [frozenset({Path("/safe/old-action.json")})]
+
+
+def test_prepare_requests_stop_when_next_action_raises(monkeypatch) -> None:
+    stop_requests: list[bool] = []
+
+    class Engine:
+        def next_action(self, *_args, **_kwargs) -> dict:
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.cli,
+        "_live_flow_engine",
+        lambda *, controlled: Engine(),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda: stop_requests.append(True),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantine_count",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_historical_write_authorization_failures",
+        frozenset,
+    )
+
+    assert finance_preaudit_concurrency_probe._prepare_one(
+        "travel_expense"
+    ) == {
+        "action": "failed",
+        "error_code": "production_probe_prepare_failed",
+    }
+    assert stop_requests == [True]
 
 
 def test_prepare_stops_before_collecting_another_item_after_stop(monkeypatch) -> None:

@@ -119,9 +119,44 @@ def _renew_actions(action_files: list[Path]) -> list[Path]:
     return renewed
 
 
+def _historical_write_authorization_failures() -> frozenset[Path]:
+    flow_root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
+    historical: set[Path] = set()
+    for state in reconciliation.latest_states(flow_root):
+        if (
+            state.get("workflow_key") != "travel_expense"
+            or state.get("execution_state") != "needs_admin"
+            or state.get("reason") != "write_authorization_invalid"
+            or state.get("write_state") != "not_requested"
+        ):
+            continue
+        action_file = (
+            flow_root
+            / "travel_expense"
+            / "cases"
+            / str(state["case_key"])
+            / f"attempt-{state['attempt']}"
+            / "action.json"
+        )
+        if state.get("action_file") != str(action_file):
+            raise ValueError("production_probe_state_invalid")
+        historical.add(action_file)
+    return frozenset(historical)
+
+
 def _prepare_one(_workflow_key: str) -> dict:
     if runtime_control.stop_requested():
         return {"action": "failed", "error_code": "production_probe_stopped"}
+    try:
+        historical_authorization_failures = (
+            _historical_write_authorization_failures()
+        )
+    except ValueError:
+        runtime_control.request_stop()
+        return {
+            "action": "failed",
+            "error_code": "production_probe_prepare_failed",
+        }
     engine = cli._live_flow_engine(controlled=True)
     for _attempt in range(_local_quarantine_count() + 1):
         if runtime_control.stop_requested():
@@ -133,8 +168,12 @@ def _prepare_one(_workflow_key: str) -> dict:
             action = engine.next_action(
                 "travel_expense",
                 mode="controlled_write",
+                skip_write_authorization_failures=(
+                    historical_authorization_failures
+                ),
             )
         except Exception:
+            runtime_control.request_stop()
             return {
                 "action": "failed",
                 "error_code": "production_probe_prepare_failed",
@@ -146,9 +185,12 @@ def _prepare_one(_workflow_key: str) -> dict:
             }
         if (
             action.get("action") == "needs_admin"
-            and action.get("reason") in QUARANTINED_REASONS
+            and (
+                action.get("reason") in QUARANTINED_REASONS
+            )
         ):
             continue
+        runtime_control.request_stop()
         return {
             "action": str(action.get("action") or "failed"),
             "error_code": str(

@@ -21,6 +21,7 @@ _WORKFLOW_KEYS = {
 QUARANTINED_REASONS = frozenset(
     {
         "material_collection_failed",
+        "write_authorization_invalid",
         "writer_result_unknown",
         *writer_outcomes.FAILURE_CODES,
     }

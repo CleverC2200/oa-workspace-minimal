@@ -221,8 +221,14 @@ def test_authorized_travel_sample_uses_one_bound_submit_and_receipt(
     assert len(api.calls) == 1
 
 
-def test_expired_open_action_renews_same_bound_authorization_before_review(
+@pytest.mark.parametrize(
+    ("advance_minutes", "expected_renewal"),
+    ((39, False), (40, True), (41, True), (61, True)),
+)
+def test_expiring_open_action_renews_same_bound_authorization_before_review(
     tmp_path: Path,
+    advance_minutes: int,
+    expected_renewal: bool,
 ) -> None:
     root = tmp_path / "flows"
     policy_file = tmp_path / "write-policy.json"
@@ -259,8 +265,10 @@ def test_expired_open_action_renews_same_bound_authorization_before_review(
     original_state = json.loads(
         Path(original["state_file"]).read_text(encoding="utf-8")
     )
+    still_fresh = engine.next_action("travel_expense", mode="controlled_write")
+    assert still_fresh["action_token"] == original["action_token"]
 
-    current_time[0] = NOW + timedelta(minutes=61)
+    current_time[0] = NOW + timedelta(minutes=advance_minutes)
     renewed = engine.next_action("travel_expense", mode="controlled_write")
     renewed_state = json.loads(
         Path(renewed["state_file"]).read_text(encoding="utf-8")
@@ -270,10 +278,11 @@ def test_expired_open_action_renews_same_bound_authorization_before_review(
     assert renewed["case_key"] == original["case_key"]
     assert renewed["attempt"] == original["attempt"]
     assert renewed["review_packet_file"] == original["review_packet_file"]
-    assert renewed["action_token"] != original["action_token"]
-    assert renewed["authorization_fingerprint"] != original[
-        "authorization_fingerprint"
-    ]
+    assert (renewed["action_token"] != original["action_token"]) is expected_renewal
+    assert (
+        renewed["authorization_fingerprint"]
+        != original["authorization_fingerprint"]
+    ) is expected_renewal
     assert renewed_state["material_fingerprint"] == original_state[
         "material_fingerprint"
     ]
@@ -285,6 +294,52 @@ def test_expired_open_action_renews_same_bound_authorization_before_review(
     json_artifact.write_json_atomic(decision_file, _decision(renewed))
     closed = engine.complete_review(Path(renewed["action_file"]), decision_file)
 
+    assert closed["write_state"] == "submitted"
+    assert len(api.calls) == 1
+
+
+def test_completion_refreshes_expiring_authorization_without_changing_decision_token(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "flows"
+    policy_file = tmp_path / "write-policy.json"
+    json_artifact.write_json_atomic(
+        policy_file,
+        {
+            "schema_version": 1,
+            "kind": "preaudit_write_policy",
+            "authorized_workflows": ["travel_expense"],
+        },
+    )
+    current_time = [NOW]
+    api = FakeWriterApi()
+    ports = production_write.build_ports(
+        root=root,
+        policy_file=policy_file,
+        signing_secret="local-test-secret",
+        api_factory=lambda: api,
+        now=lambda: current_time[0],
+    )
+    engine = flow_engine.FlowEngine(
+        root=root,
+        discover_candidates=lambda workflow_key: [
+            {
+                "request_id": "live-request",
+                "received_at": "2026-08-23T08:30:00+08:00",
+                "workflow_key": workflow_key,
+            }
+        ],
+        collect_material=lambda request_id, _root: _material(request_id),
+        **ports,
+    )
+    action = engine.next_action("travel_expense", mode="controlled_write")
+    decision_file = tmp_path / "decision-before-refresh.json"
+    json_artifact.write_json_atomic(decision_file, _decision(action))
+
+    current_time[0] = NOW + timedelta(minutes=61)
+    closed = engine.complete_review(Path(action["action_file"]), decision_file)
+
+    assert closed["action"] == "closed"
     assert closed["write_state"] == "submitted"
     assert len(api.calls) == 1
 
@@ -728,12 +783,13 @@ def test_verified_boundary_recovers_receipt_without_second_submit(
         },
     )
     api = FakeWriterApi()
+    current_time = [NOW]
     ports = production_write.build_ports(
         root=root,
         policy_file=policy_file,
         signing_secret="local-test-secret",
         api_factory=lambda: api,
-        now=lambda: NOW,
+        now=lambda: current_time[0],
     )
     engine = flow_engine.FlowEngine(
         root=root,
@@ -748,6 +804,12 @@ def test_verified_boundary_recovers_receipt_without_second_submit(
         **ports,
     )
     action = engine.next_action("travel_expense", mode="controlled_write")
+    submitted_state = json.loads(
+        Path(action["state_file"]).read_text(encoding="utf-8")
+    )
+    submitted_token_hash = hashlib.sha256(
+        submitted_state["submission_token"].encode("utf-8")
+    ).hexdigest()
     decision_file = tmp_path / "review-decision.json"
     json_artifact.write_json_atomic(decision_file, _decision(action))
     original_write = json_artifact.write_json_atomic
@@ -765,6 +827,7 @@ def test_verified_boundary_recovers_receipt_without_second_submit(
     assert len(api.calls) == 1
     assert not Path(action["action_file"]).with_name("execution-receipt.json").exists()
 
+    current_time[0] = NOW + timedelta(minutes=61)
     recovered = flow_engine.FlowEngine(
         root=root,
         discover_candidates=lambda _workflow_key: [],
@@ -775,6 +838,15 @@ def test_verified_boundary_recovers_receipt_without_second_submit(
     assert recovered["action"] == "closed"
     assert recovered["write_state"] == "submitted"
     assert len(api.calls) == 1
+    receipt = json.loads(
+        Path(action["action_file"])
+        .with_name("execution-receipt.json")
+        .read_text(encoding="utf-8")
+    )
+    assert receipt["authorization_fingerprint"] == submitted_state[
+        "authorization_fingerprint"
+    ]
+    assert receipt["submission_token_sha256"] == submitted_token_hash
 
 
 def test_authorization_expiring_while_waiting_for_writer_stops_submit(
