@@ -257,6 +257,68 @@ def test_codex_command_pins_terra_high_and_json_output(tmp_path: Path) -> None:
     )
 
 
+def test_prompt_exposes_flow_engine_fallback_routing_for_legacy_packet(
+    tmp_path: Path,
+) -> None:
+    _task_payload, action_file = _task(tmp_path)
+    json_artifact.write_json_atomic(
+        action_file.with_name("review-packet.json"),
+        {
+            "schema_version": 1,
+            "kind": "preaudit_review_packet",
+            "workflow_key": "travel_expense",
+        },
+    )
+    json_artifact.write_json_atomic(
+        action_file.with_name("material.json"),
+        {
+            "prepared": {
+                "images": [
+                    {"parent_resource_id": "resource-a"},
+                    {"parent_resource_id": "resource-a"},
+                ]
+            }
+        },
+    )
+
+    prompt = codex_review_worker._prompt(action_file)
+
+    assert '"strategy":"full_page_fallback"' in prompt
+    assert '"review_page_count":2' in prompt
+    assert "material:prepared.images.resource-a.1" in prompt
+    assert "material:prepared.images.resource-a.2" in prompt
+    assert "逐项覆盖以下宿主 fallback 路由" in prompt
+    assert '"strategy":"full_page_fallback"' in (
+        codex_review_worker._read_only_prompt(action_file)
+    )
+
+
+def test_prompt_does_not_replace_explicit_or_unreadable_page_routing(
+    tmp_path: Path,
+) -> None:
+    _task_payload, action_file = _task(tmp_path)
+    packet_file = action_file.with_name("review-packet.json")
+    material_file = action_file.with_name("material.json")
+    json_artifact.write_json_atomic(
+        material_file,
+        {"prepared": {"images": [{"parent_resource_id": "resource-a"}]}},
+    )
+    json_artifact.write_json_atomic(
+        packet_file,
+        {
+            "page_routing": {
+                "strategy": "exact_page_duplicate_only",
+                "review_page_refs": ["packet-owned-ref"],
+            }
+        },
+    )
+
+    assert "full_page_fallback" not in codex_review_worker._prompt(action_file)
+
+    packet_file.write_text("not-json", encoding="utf-8")
+    assert "full_page_fallback" not in codex_review_worker._prompt(action_file)
+
+
 def test_codex_start_blocks_sigterm_until_process_group_is_registered(
     tmp_path: Path,
     monkeypatch,
