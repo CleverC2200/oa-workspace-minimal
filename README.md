@@ -65,19 +65,19 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
 
 两条命令默认都是 preview，动作固定 `write_authorized=false`，写入状态固定为 `not_requested`；不会调用 OA 提交。模块和 CLI 共用同一业务实现，大对象通过本地文件传递，stdout 只输出一个版本化 JSON。四类财务流程无法可信取得材料时生成不含可疑证据的降级审核包，由 Agent 输出 `⚠️` 意见交财务判断；流程身份、冻结 attempt、写入授权或目标不一致时才返回 `needs_admin`。包装图片不可读仍停止，避免生成貌似完成的校对意见。五类流程的目录和当前动作投影相互独立；不同单据的材料收集与 Agent 审核可以并发，每个 attempt 使用自己的完成锁，互不等待；所有 OA 写入入口共用一把全局锁并严格串行。
 
-正常运行只使用 `next-action`、`complete-review`、`status` 和 `prune` 四个命令。候选发现、材料收集、冻结校验、单据锁、提交安全门和回执均隐藏在深模块内；没有角色 CLI、底层队列命令或跨任务消息协议。
+手工运行只使用 `next-action`、`complete-review`、`status` 和 `prune` 四个命令。差旅生产另由唯一滚动控制器编排同一深模块；候选发现、材料收集、冻结校验、单据锁、提交安全门和回执仍隐藏在模块内，没有角色 CLI、底层队列命令或跨任务消息协议。
 
 ## 脱敏运行指标
 
-每个 attempt 的 `observability.json` 只保存 attempt 哈希、流程、阶段、耗时、结果和 Token 状态。阶段拆为机械取数、审核脚本、可选 exact 等待、提交和协调；协调秒数与 Token 必须为 0。FlowEngine 不猜测 Agent 活动或等待，宿主没有提供绑定当前 item 的 exact timing receipt 时，两者保持 unknown 并停止等待比例调优。当前运行固定记录 `token_usage=unknown`，不做估算；`status` 按单据哈希、流程和 Asia/Shanghai 日期给出 P50/P95 与 Token 完整性。重复事件不会重复计数，冲突值会被拒绝；提交前的必要事件无法保存时停止当前单据，提交后的指标异常不会触发 OA 重放。
+每个 attempt 的 `observability.json` 只保存 attempt 哈希、流程、阶段、耗时、结果和 Token 状态。阶段拆为机械取数、Agent 审核、提交和回查；协调秒数与 Token 必须为 0。生产 Worker 在调用完成动作前写入绑定 `action_token` 的 `agent-timing.json`，FlowEngine 校验后把 Agent 墙钟与精确 usage 写入审核事件；手工 preview 或 usage 不完整时保持 unknown，不做估算。`status` 按单据哈希、流程和 Asia/Shanghai 日期给出 P50/P95 与 Token 完整性。重复事件不会重复计数，冲突值会被拒绝；提交前的必要事件无法保存时停止当前单据，提交后的指标异常不会触发 OA 重放。
 
 内部离线验收报告固定检查审核项/资源/页面/格式/golden replay 100%、重复提交/跨单据混用/unknown 自动重试/Agent 消息 0，以及 P95 小于 900 秒、等待比例小于 20%、技术错误率不高于 2%。每流程不足 20 个闭合脱敏样本时不建议调参；缺少平台精确 usage 时只停止 Token 调优。真实 `python -m` 入口会把四命令的成功、参数、JSON 合同和文件传递结果写入本地 30 天脱敏 CLI 日志；进程尚未启动时的失败和人工复现由本地 launcher/harness 补充。日志不含 argv、stderr 或路径；status/prune 每次只记一条 global 调用，按流程展示时投影影响范围，但 overall 不重复计数。未知值不能推断为 0。只有 CLI 故障严格多于其他技术故障且证据完整时，报告才允许提出独立 stdio MCP 后续 Issue；本项目当前不实现或安装 MCP。
 
-OA 提交只通过冻结写入入口执行。授权证明、token、冻结指纹和终态回执均绑定单个 `requestId + received_at + attempt` 及其材料版本：同一 attempt 单飞并幂等重放；不同单据的取数和审核可以并发，但 OA 写入统一经过全局单写锁。受控写入由同一个 CLI 向 FlowEngine 注入授权源、外部 verifier 和提交适配器；必须同时满足本地流程授权清单和两步命令各自的显式 `--confirm-write YES`，缺一不可：
+OA 提交只通过冻结写入入口执行。授权证明、token、冻结指纹和终态回执均绑定单个 `requestId + received_at + attempt` 及其材料版本：同一 attempt 单飞并幂等重放；不同单据的取数和审核可以并发，但 OA 写入统一经过全局单写锁。差旅费只接受滚动控制器的一次入口确认，准备动作生成一小时绑定 capability，完成动作再次验签；手工受控 CLI 对差旅明确拒绝。尚未迁移到滚动控制器的其他流程继续要求两步命令各自显式确认：
 
 ```bash
 python3 -m apps.oa_finance_preaudit.cli next-action \
-  --workflow WORKFLOW_KEY \
+  --workflow NON_TRAVEL_WORKFLOW_KEY \
   --mode controlled-write \
   --confirm-write YES
 
@@ -91,7 +91,51 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
 
 ## 单流程运行
 
-每次 `next-action` 只处理参数指定的一类流程，规则包、状态目录和当前单据相互隔离。空队列立即闭合；积压并发由调用方对不同单据重复使用同一双动作接口实现，不在审核上下文建立角色或消息协调。仓库合并不会创建或启用生产 cron；每类流程仍需单独完成真实环境验收和当前授权后，才能建立并启用自己的定时入口。
+每次手工 `next-action` 只处理参数指定的一类流程，规则包、状态目录和当前单据相互隔离，且固定为 preview。差旅费生产处理只允许从滚动控制器进入；旧的受控手工 CLI 和批次/drain 入口明确拒绝。仓库合并不会创建或启用生产 cron；每类流程仍需单独完成真实环境验收和当前授权后，才能建立并启用自己的定时入口。
+
+内部并发使用有界、可复用的 Python 进程池，保持同一流程一个控制入口。子进程只执行一个单据动作；普通异常、进程崩溃、单任务超时、批次超时和人工停止分别输出稳定错误码，不携带异常正文，也不自动重试。每 15 秒只采集可用内存、按 CPU 归一化负载、宿主线程数、活动 Worker 和最老任务年龄；单任务 960 秒仍未返回时终止该进程池，下一轮使用全新进程。进程池容量、Codex 会话槽和商旅浏览器资源槽分别配置和测量；资源槽继续提供跨进程硬上限。
+
+离线稳定性门固定覆盖容量 `1/2/4/8/10/12`、进程复用、失败隔离、任务超时回收、强制停止和重复单据单飞。弹性审核从 6 槽开始，连续两个完整健康窗口才按 `6 → 8 → 10 → 12` 提升一级；内存或负载压力立即降一级，技术失败、容量完成数不一致或本机 critical 立即止损。材料领取与采集仍由单调度器串行，OA 提交仍由全局锁固定为 1，因此提升的是 AI 审核槽，不是浏览器或写入并发。离线通过不代表生产写入已启用。完整决策和递增/回退规则见 [ADR 0010](docs/adr/0010-bounded-process-pool.md)。
+
+差旅生产滚动控制器不属于四个手工 JSON CLI 命令，也不创建定时任务。它先完成只读对账，再由单调度器串行发现和冻结材料；每个 Codex 工作进程只审核一单，宿主在完成边界再次验证单据 capability 后通过全局单写提交。使用时仍要求本地流程授权清单和当前人工确认：
+
+```bash
+python3 -m scripts.finance_preaudit_concurrency_probe \
+  --capacity 4 \
+  --confirm-write YES
+```
+
+容量诊断优先使用只读探针。它复核已有冻结证据，只要求 Agent 输出结构化决定，不领取单据、不访问实时待办、不完成动作、不提交 OA，也不会清除生产止损文件：
+
+```bash
+python3 -m scripts.finance_preaudit_concurrency_probe \
+  --read-only \
+  --capacity 12 \
+  --samples 20
+```
+
+只读弹性验证从 6 槽开始，每档至少经过两个健康窗口：
+
+```bash
+python3 -m scripts.finance_preaudit_concurrency_probe \
+  --read-only --adaptive \
+  --capacity 6 \
+  --samples 20 \
+  --waves 6
+```
+
+首轮真实写入递增验证中，容量 `1/2/4/6` 均完成；旧版容量 `8` 出现一次 Codex 进程退出码为 0、但业务动作未完成的 `codex_process_incomplete`。结构化只读复验使用同一组 20 个冻结样本，容量 `8/10/12` 均为 20/20 有效决定，证明旧故障不是 8 槽资源上限，而是旧版让 Agent 同时承担判断和动作完成时的语义完成缺陷。当前只读审核验证上限为 `12`，尚未触达边界；这不代表材料采集或 OA 写入已验证到 12 并发，OA 写入仍固定串行。真实停止文件不会由测试或代码自动清除。
+
+生产弹性滚动入口仍受当前授权、写策略、停止文件和显式确认约束。它只把 AI 审核槽从 6 逐级提升，单调度器和单写锁不变：
+
+```bash
+python3 -m scripts.finance_preaudit_concurrency_probe \
+  --rolling --adaptive \
+  --capacity 6 \
+  --confirm-write YES
+```
+
+提交结果按可恢复性拆分：`writer_submit_rejected` 是确认未写入；`writer_transport_unknown`、`writer_postcheck_timeout`、`writer_pending_conflict` 都保持 unknown 并触发止损。同一 attempt 即使确认未写入也不会直接重放，必须走下述人工确认的新 attempt 恢复入口。
 
 ## 留存与清理
 

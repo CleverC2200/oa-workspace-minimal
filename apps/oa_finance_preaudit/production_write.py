@@ -326,6 +326,34 @@ def build_ports(
             and hmac.compare_digest(str(grant.get("proof") or ""), expected_proof)
         )
 
+    def authorization_renewer(previous_grant: dict, context: dict) -> dict:
+        try:
+            workflows = _authorized_workflows(resolved_policy)
+            expires_at = datetime.fromisoformat(
+                str(previous_grant.get("expires_at") or "")
+            )
+        except (TypeError, ValueError):
+            raise ValueError("write_authorization_invalid") from None
+        expected_proof = _proof(
+            {**previous_grant, "proof": "pending"},
+            secret,
+        )
+        if (
+            expires_at.tzinfo is None
+            or expires_at.astimezone(timezone.utc) > now().astimezone(timezone.utc)
+            or previous_grant.get("workflow_key") not in workflows
+            or any(
+                previous_grant.get(key) != value
+                for key, value in context.items()
+            )
+            or not hmac.compare_digest(
+                str(previous_grant.get("proof") or ""),
+                expected_proof,
+            )
+        ):
+            raise ValueError("write_authorization_invalid")
+        return authorization_source(context)
+
     def submit_frozen(job: dict) -> dict:
         if runtime_control.stop_requested():
             raise ValueError(runtime_control.STOP_CODE)
@@ -375,5 +403,6 @@ def build_ports(
     return {
         "authorization_source": authorization_source,
         "authorization_verifier": authorization_verifier,
+        "authorization_renewer": authorization_renewer,
         "submit_frozen": submit_frozen,
     }

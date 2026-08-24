@@ -1,0 +1,714 @@
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+import signal
+import subprocess
+import tempfile
+import time
+from typing import Callable, TextIO
+
+from apps import json_artifact
+from apps.oa_approval import runtime_control
+
+
+MODEL = "gpt-5.6-terra"
+REASONING_EFFORT = "high"
+
+
+@dataclass(frozen=True)
+class CodexExecution:
+    error_code: str | None
+    token_usage: dict
+    decision: dict | None = None
+    process_state: str = "unknown"
+    decision_state: str = "unknown"
+    event_counts: dict[str, int] = field(default_factory=dict)
+    exit_code: int | None = None
+
+
+Executor = Callable[[Path, Path, int], CodexExecution]
+Completer = Callable[[Path, dict], str | None]
+StopRequester = Callable[[], None]
+
+
+def _prompt(action_file: Path) -> str:
+    return f"""你是差旅费生产预审的单据工作进程。用户当前明确授权本轮真实审批提交；这是受控生产工作进程，不是手工 preview。
+
+只处理这个已冻结动作：{action_file}
+
+要求：
+1. 完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由只读取差旅费规则、动作引用的审核包、材料和准备页；不得读取其他 attempt。
+2. 不修改任何文件、项目代码、Skill、配置、授权清单或冻结材料；不得调用 `next-action`、`complete-review` 或任何 OA 写入，不得领取其他单据。
+3. 根据八个固定审核项动态形成结构化决定。证据不足使用 `uncertain` 交财务判断，不得因为材料缺口卡住业务流程；身份、归属、冻结或授权不可信时停止。
+4. 最终只输出符合 flow-engine-contract“结构化审核决定”的单个 JSON 对象，不添加 Markdown、解释、单号、人员、公司、附件原文、路径、意见正文、密钥或日志。宿主会校验并负责受控提交。
+"""
+
+
+def _read_only_prompt(action_file: Path) -> str:
+    return f"""你是差旅费预审的只读容量测试进程。本次只复核历史冻结证据，绝不提交、闭合或改变任何 OA 与本地流程状态。
+
+只处理这个动作引用的审核包：{action_file}
+
+要求：
+1. 完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由只读取差旅费规则、该动作引用的审核包、材料和准备页；不得读取现有 decision、remark、receipt、events、其他 attempt 或其他单据。
+2. 不修改任何文件，不调用 `next-action`、`complete-review` 或任何 OA 写入，不访问实时待办；历史 closed 动作仅作为冻结证据入口。
+3. 根据八个固定审核项动态形成结构化决定。证据不足使用 `uncertain`；身份、归属或冻结证据不可信时也只在决定中表达缺口。
+4. `action_token` 固定填写 `capacity-probe`。最终只输出符合 flow-engine-contract 的单个 JSON 对象，不添加 Markdown、解释、单号、人员、公司、附件原文、路径、意见正文、密钥或日志。
+"""
+
+
+def _codex_command(
+    project_root: Path,
+    schema_file: Path,
+    decision_file: Path,
+) -> list[str]:
+    return [
+        "codex",
+        "exec",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--json",
+        "--color",
+        "never",
+        "--model",
+        MODEL,
+        "--sandbox",
+        "read-only",
+        "--config",
+        'approval_policy="never"',
+        "--config",
+        f'model_reasoning_effort="{REASONING_EFFORT}"',
+        "--output-schema",
+        str(schema_file),
+        "--output-last-message",
+        str(decision_file),
+        "--cd",
+        str(project_root),
+        "-",
+    ]
+
+
+def _decision_schema() -> dict:
+    item_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "item_key",
+            "status",
+            "conclusion",
+            "evidence_refs",
+            "missing_evidence",
+        ],
+        "properties": {
+            "item_key": {"type": "string", "minLength": 1},
+            "status": {"type": "string", "enum": ["pass", "fail", "uncertain"]},
+            "conclusion": {"type": "string", "minLength": 1},
+            "evidence_refs": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+            },
+            "missing_evidence": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+            },
+        },
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "schema_version",
+            "kind",
+            "action_token",
+            "workflow_key",
+            "rule_version",
+            "overall",
+            "items",
+        ],
+        "properties": {
+            "schema_version": {"type": "integer", "const": 1},
+            "kind": {"type": "string", "const": "preaudit_review_decision"},
+            "action_token": {"type": "string", "minLength": 1},
+            "workflow_key": {"type": "string", "const": "travel_expense"},
+            "rule_version": {"type": "string", "minLength": 1},
+            "overall": {"type": "string", "enum": ["pass", "needs_human"]},
+            "items": {"type": "array", "items": item_schema},
+        },
+    }
+
+
+def _unknown_usage() -> dict:
+    return {"status": "unknown"}
+
+
+def _parse_token_usage(stream: TextIO) -> dict:
+    stream.seek(0)
+    for line in stream:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "turn.completed":
+            continue
+        usage = event.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        values = {
+            field: usage.get(field, 0)
+            for field in ("input_tokens", "cached_input_tokens", "output_tokens")
+        }
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in values.values()
+        ):
+            continue
+        return {
+            "status": "recorded",
+            **values,
+            "total_tokens": values["input_tokens"] + values["output_tokens"],
+        }
+    return _unknown_usage()
+
+
+def _parse_event_counts(stream: TextIO) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    stream.seek(0)
+    for line in stream:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        event_type = event.get("type") if isinstance(event, dict) else None
+        if not isinstance(event_type, str):
+            continue
+        counts[event_type] = counts.get(event_type, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _execute_codex(
+    project_root: Path,
+    action_file: Path,
+    timeout_seconds: int,
+    *,
+    prompt_builder: Callable[[Path], str] = _prompt,
+) -> CodexExecution:
+    output = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+    with tempfile.TemporaryDirectory(prefix="oa-preaudit-codex-") as temporary:
+        temporary_root = Path(temporary)
+        schema_file = temporary_root / "decision-schema.json"
+        decision_file = temporary_root / "decision.json"
+        json_artifact.write_json_atomic(schema_file, _decision_schema())
+        command = _codex_command(project_root, schema_file, decision_file)
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=project_root,
+                stdin=subprocess.PIPE,
+                stdout=output,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                start_new_session=True,
+            )
+        except OSError:
+            output.close()
+            return CodexExecution(
+                "codex_process_start_failed",
+                _unknown_usage(),
+                process_state="start_failed",
+                decision_state="not_attempted",
+            )
+        try:
+            process.communicate(
+                input=prompt_builder(action_file),
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                process.wait(timeout=5)
+            usage = _parse_token_usage(output)
+            event_counts = _parse_event_counts(output)
+            output.close()
+            return CodexExecution(
+                "codex_process_timeout",
+                usage,
+                process_state="timed_out",
+                decision_state="not_attempted",
+                event_counts=event_counts,
+                exit_code=process.returncode,
+            )
+        usage = _parse_token_usage(output)
+        event_counts = _parse_event_counts(output)
+        decision: dict | None = None
+        decision_state = "not_written"
+        if process.returncode == 0:
+            try:
+                candidate = json.loads(decision_file.read_text(encoding="utf-8"))
+            except OSError:
+                candidate = None
+            except json.JSONDecodeError:
+                candidate = None
+                decision_state = "unreadable"
+            if isinstance(candidate, dict):
+                decision = candidate
+                decision_state = "valid_object"
+            elif candidate is not None:
+                decision_state = "not_object"
+    output.close()
+    return CodexExecution(
+        None if process.returncode == 0 else "codex_process_failed",
+        usage,
+        decision,
+        process_state="exited",
+        decision_state=decision_state,
+        event_counts=event_counts,
+        exit_code=process.returncode,
+    )
+
+
+def _execute_read_only_codex(
+    project_root: Path,
+    action_file: Path,
+    timeout_seconds: int,
+) -> CodexExecution:
+    return _execute_codex(
+        project_root,
+        action_file,
+        timeout_seconds,
+        prompt_builder=_read_only_prompt,
+    )
+
+
+def _complete_decision(action_file: Path, decision: dict) -> str | None:
+    from apps.oa_finance_preaudit import cli
+
+    with tempfile.TemporaryDirectory(prefix="oa-preaudit-decision-") as temporary:
+        decision_file = Path(temporary) / "decision.json"
+        json_artifact.write_json_atomic(decision_file, decision, indent=2)
+        if runtime_control.stop_requested():
+            return "stop_requested"
+        try:
+            result = cli._live_flow_engine(controlled=True).complete_review(
+                action_file,
+                decision_file,
+            )
+        except ValueError as error:
+            if str(error) == "review_decision_invalid":
+                return "codex_decision_invalid"
+            runtime_control.request_stop()
+            return "codex_decision_submit_failed"
+        except Exception:
+            runtime_control.request_stop()
+            return "codex_decision_submit_failed"
+        if not (
+            result.get("action") == "closed"
+            and result.get("execution_state") == "closed"
+            and result.get("write_state") == "submitted"
+        ):
+            runtime_control.request_stop()
+            return "codex_decision_submit_incomplete"
+    return None
+
+
+def _merge_usage(usages: list[dict]) -> dict:
+    recorded = [usage for usage in usages if usage.get("status") == "recorded"]
+    if not recorded:
+        return _unknown_usage()
+    status = "recorded" if len(recorded) == len(usages) else "partial"
+    return {
+        "status": status,
+        **{
+            field: sum(int(usage.get(field, 0)) for usage in recorded)
+            for field in (
+                "input_tokens",
+                "cached_input_tokens",
+                "output_tokens",
+                "total_tokens",
+            )
+        },
+    }
+
+
+def _base_result(*, attempts: int, usages: list[dict]) -> dict:
+    return {
+        "schema_version": 1,
+        "kind": "preaudit_review_worker_result",
+        "model": MODEL,
+        "reasoning_effort": REASONING_EFFORT,
+        "process_attempts": attempts,
+        "process_retries": max(0, attempts - 1),
+        "token_usage": _merge_usage(usages),
+    }
+
+
+def _write_agent_timing(
+    action_file: Path,
+    *,
+    wall_seconds: float,
+    attempts: int,
+    token_usage: dict,
+) -> bool:
+    timing_file = action_file.with_name("agent-timing.json")
+    if timing_file.is_symlink():
+        return False
+    try:
+        action = json.loads(action_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    action_token = action.get("action_token") if isinstance(action, dict) else None
+    if (
+        not isinstance(action_token, str)
+        or not action_token
+        or action.get("action") != "review_required"
+        or action.get("workflow_key") != "travel_expense"
+    ):
+        return False
+    usage = dict(token_usage) if isinstance(token_usage, dict) else _unknown_usage()
+    try:
+        json_artifact.write_json_atomic(
+            timing_file,
+            {
+                "schema_version": 1,
+                "kind": "preaudit_agent_timing",
+                "action_token": action_token,
+                "workflow_key": "travel_expense",
+                "model": MODEL,
+                "reasoning_effort": REASONING_EFFORT,
+                "wall_seconds": max(0, int(wall_seconds)),
+                "process_attempts": attempts,
+                "token_usage": usage,
+            },
+            indent=2,
+        )
+    except OSError:
+        return False
+    return True
+
+
+def _failure(
+    code: str,
+    request_stop: StopRequester,
+    *,
+    attempts: int = 0,
+    usages: list[dict] | None = None,
+) -> dict:
+    request_stop()
+    return {
+        **_base_result(attempts=attempts, usages=usages or []),
+        "status": "failed",
+        "execution_state": "failed",
+        "business_state": "not_available",
+        "write_state": "not_requested",
+        "error_code": code,
+    }
+
+
+def _validated_task(task: dict) -> tuple[Path, Path, int]:
+    if not isinstance(task, dict) or set(task) != {
+        "project_root",
+        "action_file",
+        "timeout_seconds",
+    }:
+        raise ValueError("codex_review_task_invalid")
+    project_root = Path(str(task["project_root"])).expanduser().resolve()
+    action_file = Path(str(task["action_file"])).expanduser().resolve()
+    timeout_seconds = task["timeout_seconds"]
+    expected_root = project_root / "runtime" / "finance_preaudit_flows"
+    if (
+        not project_root.is_dir()
+        or not action_file.is_file()
+        or action_file.is_symlink()
+        or not action_file.is_relative_to(expected_root)
+        or action_file.name != "action.json"
+        or not isinstance(timeout_seconds, int)
+        or isinstance(timeout_seconds, bool)
+        or not 60 <= timeout_seconds <= 3600
+    ):
+        raise ValueError("codex_review_task_invalid")
+    return project_root, action_file, timeout_seconds
+
+
+def _read_completed(action_file: Path) -> str | None:
+    try:
+        action = json.loads(action_file.read_text(encoding="utf-8"))
+        receipt_file = Path(str(action["receipt_file"])).resolve(strict=True)
+        receipt = json.loads(receipt_file.read_text(encoding="utf-8"))
+    except (KeyError, OSError, json.JSONDecodeError):
+        return None
+    if (
+        action.get("action") == "closed"
+        and action.get("execution_state") == "closed"
+        and action.get("business_state") in {"pass", "needs_human"}
+        and action.get("write_state") == "submitted"
+        and receipt_file.is_relative_to(action_file.parent)
+        and all(
+            receipt.get(field) is True
+            for field in ("write", "submit_ok", "done_hit", "postcheck_done_hit")
+        )
+    ):
+        return str(action["business_state"])
+    return None
+
+
+def _safe_to_retry(action_file: Path) -> bool:
+    try:
+        action = json.loads(action_file.read_text(encoding="utf-8"))
+        state = json.loads(action_file.with_name("state.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    required = {
+        "action": "review_required",
+        "execution_state": "review_required",
+        "business_state": "not_available",
+        "write_state": "authorized",
+        "workflow_key": "travel_expense",
+        "mode": "controlled_write",
+        "write_authorized": True,
+    }
+    if any(action.get(key) != value for key, value in required.items()):
+        return False
+    if any(state.get(key) != value for key, value in required.items()):
+        return False
+    if action.get("receipt_file") or state.get("receipt_file"):
+        return False
+    return not action_file.with_name("execution-receipt.json").exists()
+
+
+def _legacy_run_with_completion(
+    task: dict,
+    *,
+    executor: Executor = _execute_codex,
+    completer: Completer = _complete_decision,
+    request_stop: StopRequester = runtime_control.request_stop,
+) -> dict:
+    run_started = time.monotonic()
+    try:
+        project_root, action_file, timeout_seconds = _validated_task(task)
+    except ValueError:
+        return _failure("codex_review_task_invalid", request_stop)
+    usages: list[dict] = []
+    for attempt in (1, 2):
+        execution = executor(project_root, action_file, timeout_seconds)
+        usages.append(execution.token_usage)
+        business_state = _read_completed(action_file)
+        completion_error: str | None = None
+        if (
+            business_state is None
+            and execution.error_code is None
+            and execution.decision is not None
+        ):
+            usage = _merge_usage(usages)
+            if not _write_agent_timing(
+                action_file,
+                wall_seconds=time.monotonic() - run_started,
+                attempts=attempt,
+                token_usage=usage,
+            ):
+                completion_error = "agent_timing_write_failed"
+            else:
+                completion_error = completer(action_file, execution.decision)
+            business_state = _read_completed(action_file)
+        if business_state is not None:
+            return {
+                **_base_result(attempts=attempt, usages=usages),
+                "status": "completed",
+                "execution_state": "closed",
+                "business_state": business_state,
+                "write_state": "submitted",
+                "error_code": None,
+            }
+        error_code = (
+            execution.error_code
+            or completion_error
+            or "codex_process_incomplete"
+        )
+        retryable = error_code in {
+            "codex_process_failed",
+            "codex_process_incomplete",
+            "codex_decision_invalid",
+        }
+        if attempt == 1 and retryable and _safe_to_retry(action_file):
+            continue
+        return _failure(
+            error_code,
+            request_stop,
+            attempts=attempt,
+            usages=usages,
+        )
+    raise AssertionError("unreachable")
+
+
+def review(
+    task: dict,
+    *,
+    executor: Executor = _execute_codex,
+) -> dict:
+    """Run only the AI review phase; never complete or write an OA action."""
+    run_started = time.monotonic()
+    try:
+        project_root, action_file, timeout_seconds = _validated_task(task)
+    except ValueError:
+        return {
+            **_base_result(attempts=0, usages=[]),
+            "status": "failed",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "error_code": "codex_review_task_invalid",
+        }
+    usages: list[dict] = []
+    for attempt in (1, 2):
+        execution = executor(project_root, action_file, timeout_seconds)
+        usages.append(execution.token_usage)
+        if execution.error_code is None and isinstance(execution.decision, dict):
+            return {
+                **_base_result(attempts=attempt, usages=usages),
+                "status": "reviewed",
+                "business_state": "not_available",
+                "write_state": "not_requested",
+                "error_code": None,
+                "agent_wall_seconds": max(
+                    0,
+                    int(time.monotonic() - run_started),
+                ),
+                "decision": execution.decision,
+            }
+        error_code = execution.error_code or "codex_process_incomplete"
+        if (
+            attempt == 1
+            and error_code in {"codex_process_failed", "codex_process_incomplete"}
+            and _safe_to_retry(action_file)
+        ):
+            continue
+        return {
+            **_base_result(attempts=attempt, usages=usages),
+            "status": "failed",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "error_code": error_code,
+        }
+    raise AssertionError("unreachable")
+
+
+def complete_review_result(
+    action_file: Path,
+    reviewed: dict,
+    *,
+    completer: Completer = _complete_decision,
+    request_stop: StopRequester = runtime_control.request_stop,
+) -> dict:
+    """Complete one reviewed action in the non-killable parent writer path."""
+    decision = reviewed.get("decision") if isinstance(reviewed, dict) else None
+    usage = reviewed.get("token_usage") if isinstance(reviewed, dict) else None
+    attempts = reviewed.get("process_attempts") if isinstance(reviewed, dict) else None
+    wall_seconds = reviewed.get("agent_wall_seconds") if isinstance(reviewed, dict) else None
+    if (
+        reviewed.get("status") != "reviewed"
+        or not isinstance(decision, dict)
+        or not isinstance(usage, dict)
+        or not isinstance(attempts, int)
+        or isinstance(attempts, bool)
+        or attempts < 1
+        or not isinstance(wall_seconds, int)
+        or isinstance(wall_seconds, bool)
+        or wall_seconds < 0
+    ):
+        return _failure("codex_review_result_invalid", request_stop)
+    base = {
+        "schema_version": 1,
+        "kind": "preaudit_review_worker_result",
+        "model": MODEL,
+        "reasoning_effort": REASONING_EFFORT,
+        "process_attempts": attempts,
+        "process_retries": max(0, attempts - 1),
+        "token_usage": dict(usage),
+    }
+
+    def failed(code: str) -> dict:
+        request_stop()
+        return {
+            **base,
+            "status": "failed",
+            "execution_state": "failed",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "error_code": code,
+        }
+
+    if runtime_control.stop_requested():
+        return failed("stop_requested")
+    if not _write_agent_timing(
+        action_file,
+        wall_seconds=wall_seconds,
+        attempts=attempts,
+        token_usage=usage,
+    ):
+        return failed("agent_timing_write_failed")
+    completion_error = completer(action_file, decision)
+    business_state = _read_completed(action_file)
+    if completion_error is None and business_state is not None:
+        return {
+            **base,
+            "status": "completed",
+            "execution_state": "closed",
+            "business_state": business_state,
+            "write_state": "submitted",
+            "error_code": None,
+        }
+    return failed(completion_error or "codex_decision_submit_incomplete")
+
+
+def run_read_only(
+    task: dict,
+    *,
+    executor: Executor = _execute_read_only_codex,
+) -> dict:
+    try:
+        project_root, action_file, timeout_seconds = _validated_task(task)
+    except ValueError:
+        return {
+            **_base_result(attempts=0, usages=[]),
+            "kind": "preaudit_read_only_review_result",
+            "status": "failed",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "error_code": "codex_review_task_invalid",
+            "process_state": "not_started",
+            "decision_state": "not_attempted",
+            "event_counts": {},
+            "exit_code": None,
+        }
+    execution = executor(project_root, action_file, timeout_seconds)
+    overall = (
+        execution.decision.get("overall")
+        if isinstance(execution.decision, dict)
+        else None
+    )
+    completed = execution.error_code is None and overall in {
+        "pass",
+        "needs_human",
+    }
+    return {
+        **_base_result(attempts=1, usages=[execution.token_usage]),
+        "kind": "preaudit_read_only_review_result",
+        "status": "completed" if completed else "failed",
+        "business_state": overall if completed else "not_available",
+        "write_state": "not_requested",
+        "error_code": (
+            None
+            if completed
+            else execution.error_code or "codex_process_incomplete"
+        ),
+        "process_state": execution.process_state,
+        "decision_state": execution.decision_state,
+        "event_counts": execution.event_counts,
+        "exit_code": execution.exit_code,
+    }
