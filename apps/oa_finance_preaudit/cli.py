@@ -40,6 +40,7 @@ _RUNTIME_FAILURE_CODES = {
     "runtime_state_invalid",
     "runtime_live_configuration_missing",
     "runtime_live_check_failed",
+    "runtime_reconciliation_invalid",
     "oa_auth_file_permissions_invalid",
     "oa_auth_file_outside_worktree_required",
 }
@@ -180,6 +181,17 @@ def _persisted_mode(action_file: Path) -> str | None:
     except (OSError, json.JSONDecodeError):
         return None
     return str(payload.get("mode") or "") if isinstance(payload, dict) else None
+
+
+def _persisted_workflow(action_file: Path) -> str | None:
+    try:
+        payload = json.loads(action_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    workflow_key = str(payload.get("workflow_key") or "")
+    return workflow_key if workflow_key in flow_engine.WORKFLOW_KEYS else None
 
 
 def _failure_payload(error: Exception, *, command: str = "next-action") -> dict:
@@ -331,6 +343,8 @@ def main(
                 if args.recover_action_file is not None:
                     if args.confirm_recovery != "YES":
                         raise ValueError("recovery_confirmation_required")
+                    if _persisted_workflow(args.recover_action_file) != args.workflow:
+                        raise ValueError("recovery_not_safe")
                     payload = engine.recover_confirmed_no_write(
                         args.recover_action_file,
                         mode=mode,

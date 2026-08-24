@@ -217,6 +217,37 @@ def test_status_and_cli_never_echo_unknown_failure_text(tmp_path: Path) -> None:
     assert stderr.getvalue().strip() == "runtime_failed"
 
 
+def test_status_counts_only_the_latest_attempt_per_case(tmp_path: Path) -> None:
+    root = tmp_path / "runtime"
+    _attempt(
+        root,
+        case_key="f" * 64,
+        attempt=1,
+        age_days=2,
+        execution_state="needs_admin",
+        business_state="not_available",
+        reason="writer_submit_rejected",
+    )
+    _attempt(
+        root,
+        case_key="f" * 64,
+        attempt=2,
+        age_days=1,
+        execution_state="review_required",
+        business_state="not_available",
+        write_state="authorized",
+    )
+
+    flow = runtime_maintenance.status(root, now=NOW)["workflows"][0]
+
+    assert flow["case_count"] == 1
+    assert flow["attempt_count"] == 2
+    assert flow["backlog_count"] == 1
+    assert flow["execution_states"] == {"review_required": 1}
+    assert flow["write_states"] == {"authorized": 1}
+    assert flow["failure_counts"] == {}
+
+
 def test_prune_archives_deletes_and_preserves_protected_attempts(
     tmp_path: Path,
 ) -> None:

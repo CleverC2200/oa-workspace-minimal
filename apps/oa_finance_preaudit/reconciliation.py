@@ -4,6 +4,7 @@ from collections import Counter
 import hashlib
 import json
 from pathlib import Path
+import re
 from typing import Iterable
 
 
@@ -24,6 +25,8 @@ QUARANTINED_REASONS = frozenset(
         "writer_transport_unknown",
     }
 )
+_CASE_KEY = re.compile(r"^[0-9a-f]{64}$")
+_ATTEMPT = re.compile(r"^attempt-([1-9][0-9]*)$")
 
 
 def _identity(row: dict) -> tuple[str, str]:
@@ -37,39 +40,64 @@ def _item_key(request_id: str, received_at: str) -> str:
 
 
 def latest_states(root: Path) -> list[dict]:
-    latest: dict[Path, tuple[int, dict]] = {}
-    for state_file in Path(root).glob("*/cases/*/attempt-*/state.json"):
-        try:
-            attempt = int(state_file.parent.name.removeprefix("attempt-"))
-            state = json.loads(state_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError, json.JSONDecodeError):
-            continue
-        workflow_key = state_file.parents[3].name
-        case_root = state_file.parent.parent
-        if (
-            not isinstance(state, dict)
-            or workflow_key not in _WORKFLOW_KEYS
-            or state.get("workflow_key") != workflow_key
-            or state.get("attempt") != attempt
-            or state.get("case_key") != case_root.name
-        ):
-            continue
-        current = latest.get(case_root)
-        if current is None or attempt > current[0]:
-            latest[case_root] = (attempt, state)
-    return [value[1] for value in latest.values()]
+    runtime_root = Path(root).expanduser()
+    if runtime_root.is_symlink() or not runtime_root.is_dir():
+        raise ValueError("runtime_reconciliation_invalid")
+    latest: list[dict] = []
+    try:
+        workflow_roots = sorted(runtime_root.iterdir(), key=lambda path: path.name)
+        for workflow_root in workflow_roots:
+            if workflow_root.name not in _WORKFLOW_KEYS:
+                continue
+            if workflow_root.is_symlink() or not workflow_root.is_dir():
+                raise ValueError("runtime_reconciliation_invalid")
+            cases_root = workflow_root / "cases"
+            if not cases_root.exists():
+                continue
+            if cases_root.is_symlink() or not cases_root.is_dir():
+                raise ValueError("runtime_reconciliation_invalid")
+            for case_root in sorted(cases_root.iterdir(), key=lambda path: path.name):
+                if case_root.is_symlink():
+                    raise ValueError("runtime_reconciliation_invalid")
+                if not case_root.is_dir() or not _CASE_KEY.fullmatch(case_root.name):
+                    continue
+                attempts: list[tuple[int, Path]] = []
+                for attempt_root in case_root.iterdir():
+                    match = _ATTEMPT.fullmatch(attempt_root.name)
+                    if match is None:
+                        continue
+                    if attempt_root.is_symlink() or not attempt_root.is_dir():
+                        raise ValueError("runtime_reconciliation_invalid")
+                    attempts.append((int(match.group(1)), attempt_root))
+                if not attempts:
+                    continue
+                attempt, attempt_root = max(attempts, key=lambda item: item[0])
+                state_file = attempt_root / "state.json"
+                if state_file.is_symlink() or not state_file.is_file():
+                    raise ValueError("runtime_reconciliation_invalid")
+                state = json.loads(state_file.read_text(encoding="utf-8"))
+                if (
+                    not isinstance(state, dict)
+                    or state.get("workflow_key") != workflow_root.name
+                    or state.get("attempt") != attempt
+                    or state.get("case_key") != case_root.name
+                ):
+                    raise ValueError("runtime_reconciliation_invalid")
+                latest.append(state)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("runtime_reconciliation_invalid") from error
+    return latest
 
 
-def quarantine_summary(
-    root: Path,
-    *,
+def _quarantine_summary(
+    states: Iterable[dict],
     pending_rows: Iterable[dict],
 ) -> dict[str, int]:
     pending = {_identity(row) for row in pending_rows if isinstance(row, dict)}
     pending = {identity for identity in pending if identity[0] and identity[1]}
     quarantined = {
         _identity(state)
-        for state in latest_states(root)
+        for state in states
         if state.get("execution_state") == "needs_admin"
         and state.get("reason") in QUARANTINED_REASONS
     }
@@ -82,13 +110,22 @@ def quarantine_summary(
     }
 
 
+def quarantine_summary(
+    root: Path,
+    *,
+    pending_rows: Iterable[dict],
+) -> dict[str, int]:
+    return _quarantine_summary(latest_states(root), pending_rows)
+
+
 def reconcile(
     root: Path,
     *,
     pending_rows: Iterable[dict],
     handled_rows: Iterable[dict],
 ) -> dict:
-    pending = {_identity(row) for row in pending_rows if isinstance(row, dict)}
+    pending_input = [row for row in pending_rows if isinstance(row, dict)]
+    pending = {_identity(row) for row in pending_input}
     pending = {identity for identity in pending if identity[0]}
     pending_ids = {request_id for request_id, _received_at in pending}
     handled_ids = {
@@ -101,7 +138,8 @@ def reconcile(
     counts: Counter[str] = Counter()
     recommendations: Counter[str] = Counter()
 
-    for state in latest_states(root):
+    states = latest_states(root)
+    for state in states:
         request_id = str(state.get("request_id") or "").strip()
         received_at = str(state.get("received_at") or "").strip()
         if not request_id or not received_at:
@@ -159,6 +197,7 @@ def reconcile(
         "kind": "preaudit_reconciliation",
         "read_only": True,
         "local_cases": len(findings),
+        "quarantine": _quarantine_summary(states, pending_input),
         "counts": dict(sorted(counts.items())),
         "recommendations": dict(sorted(recommendations.items())),
         "findings": sorted(findings, key=lambda item: item["item_key"]),

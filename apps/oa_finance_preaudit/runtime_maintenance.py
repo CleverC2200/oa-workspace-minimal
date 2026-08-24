@@ -717,15 +717,24 @@ def status(root: Path, *, now: datetime | None = None) -> dict:
     workflows: list[dict] = []
     for workflow_key, attempts in sorted(by_workflow.items()):
         attempts.sort(key=lambda item: (item["created_at"], item["item_key"]))
-        latest = attempts[-1]
+        latest_by_case: dict[str, dict] = {}
+        for item in attempts:
+            current = latest_by_case.get(item["case_key"])
+            if current is None or item["attempt"] > current["attempt"]:
+                latest_by_case[item["case_key"]] = item
+        current_attempts = sorted(
+            latest_by_case.values(),
+            key=lambda item: (item["created_at"], item["item_key"]),
+        )
+        latest = current_attempts[-1]
         open_attempts = [
-            item for item in attempts if item["execution_state"] != "closed"
+            item for item in current_attempts if item["execution_state"] != "closed"
         ]
         execution_states: dict[str, int] = {}
         business_states: dict[str, int] = {}
         write_states: dict[str, int] = {}
         failure_counts: dict[str, int] = {}
-        for item in attempts:
+        for item in current_attempts:
             for counts, key in (
                 (execution_states, item["execution_state"]),
                 (business_states, item["business_state"]),
@@ -749,7 +758,7 @@ def status(root: Path, *, now: datetime | None = None) -> dict:
                         "write_state",
                     )
                 },
-                "case_count": len({item["case_key"] for item in attempts}),
+                "case_count": len(current_attempts),
                 "attempt_count": len(attempts),
                 "backlog_count": len(open_attempts),
                 "oldest_backlog_age_seconds": (

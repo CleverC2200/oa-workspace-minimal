@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from apps.oa_finance_preaudit import reconciliation
 
 
@@ -166,3 +168,40 @@ def test_quarantine_counts_each_latest_case_identity_once(tmp_path: Path) -> Non
         "pending_quarantined": 1,
         "actionable_pending": 1,
     }
+
+
+def test_invalid_highest_attempt_never_falls_back_to_old_state(tmp_path: Path) -> None:
+    root = tmp_path / "flows"
+    _state(root, "4001", "2026-08-24 12:00:00", attempt=1)
+    latest = next(root.glob("*/cases/*")) / "attempt-2"
+    latest.mkdir()
+    (latest / "state.json").write_text("not-json", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="runtime_reconciliation_invalid"):
+        reconciliation.latest_states(root)
+
+
+@pytest.mark.parametrize("linked_level", ("workflow", "case", "attempt"))
+def test_reconciliation_rejects_managed_symlink_components(
+    tmp_path: Path,
+    linked_level: str,
+) -> None:
+    root = tmp_path / "flows"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    workflow = root / "travel_expense"
+    cases = workflow / "cases"
+    case = cases / ("a" * 64)
+    attempt = case / "attempt-1"
+    if linked_level == "workflow":
+        root.mkdir()
+        workflow.symlink_to(outside, target_is_directory=True)
+    elif linked_level == "case":
+        cases.mkdir(parents=True)
+        case.symlink_to(outside, target_is_directory=True)
+    else:
+        case.mkdir(parents=True)
+        attempt.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="runtime_reconciliation_invalid"):
+        reconciliation.latest_states(root)

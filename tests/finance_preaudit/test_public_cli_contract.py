@@ -234,6 +234,10 @@ def test_recovery_requires_explicit_confirmation_and_uses_engine_gate(
             }
 
     action = tmp_path / "action.json"
+    action.write_text(
+        json.dumps({"workflow_key": "travel_expense"}),
+        encoding="utf-8",
+    )
     denied = io.StringIO()
     with redirect_stdout(denied):
         assert cli.main(
@@ -266,6 +270,24 @@ def test_recovery_requires_explicit_confirmation_and_uses_engine_gate(
         ) == 0
     assert calls == [(action, "preview", True)]
     assert json.loads(allowed.getvalue())["action"] == "review_required"
+
+    mismatch = io.StringIO()
+    with redirect_stdout(mismatch):
+        assert cli.main(
+            [
+                "next-action",
+                "--workflow",
+                "business_entertainment",
+                "--recover-action-file",
+                str(action),
+                "--confirm-recovery",
+                "YES",
+            ],
+            flow_engine_factory=Engine,
+        ) == 1
+    assert json.loads(mismatch.getvalue())["failure"]["code"] == (
+        "recovery_not_safe"
+    )
 
 
 def test_cli_failure_emits_sanitized_classification() -> None:
