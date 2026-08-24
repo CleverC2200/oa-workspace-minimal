@@ -8,6 +8,8 @@ from pathlib import Path
 import re
 from typing import Iterable
 
+from apps.oa_approval import writer_outcomes
+
 
 _WORKFLOW_KEYS = {
     "travel_expense",
@@ -19,11 +21,8 @@ _WORKFLOW_KEYS = {
 QUARANTINED_REASONS = frozenset(
     {
         "material_collection_failed",
-        "writer_pending_conflict",
-        "writer_postcheck_timeout",
         "writer_result_unknown",
-        "writer_submit_rejected",
-        "writer_transport_unknown",
+        *writer_outcomes.FAILURE_CODES,
     }
 )
 _CASE_KEY = re.compile(r"^[0-9a-f]{64}$")
@@ -210,7 +209,7 @@ def reconcile(
             and state.get("execution_state") == "needs_admin"
             and state.get("reason") in {
                 "material_collection_failed",
-                "writer_submit_rejected",
+                *writer_outcomes.CONFIRMED_NO_WRITE_CODES,
             }
             and state.get("write_state") == "not_requested"
         ):

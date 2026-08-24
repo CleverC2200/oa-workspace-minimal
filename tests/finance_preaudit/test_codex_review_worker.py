@@ -632,6 +632,8 @@ def test_parent_completion_can_defer_first_invalid_decision_stop(
         "writer_transport_unknown",
         "writer_postcheck_timeout",
         "writer_pending_conflict",
+        "writer_preflight_failed",
+        "submission_target_changed",
         "writer_result_unknown",
     ),
 )
@@ -697,6 +699,8 @@ def test_host_completion_rejects_unrecognized_failure_reason(
         ("writer_transport_unknown", "unknown"),
         ("writer_postcheck_timeout", "unknown"),
         ("writer_pending_conflict", "unknown"),
+        ("writer_preflight_failed", "not_requested"),
+        ("submission_target_changed", "not_requested"),
         ("writer_result_unknown", "unknown"),
     ),
 )

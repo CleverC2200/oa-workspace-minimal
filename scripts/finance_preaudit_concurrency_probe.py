@@ -12,7 +12,7 @@ import sys
 import time
 from typing import Callable, Sequence
 
-from apps.oa_approval import runtime_control
+from apps.oa_approval import runtime_control, writer_outcomes
 from apps.oa_finance_preaudit import (
     cli,
     codex_review_worker,
@@ -37,11 +37,8 @@ ReviewCompleter = Callable[[Path, dict], dict]
 ExecutorFactory = Callable[[int], object]
 QUARANTINED_REASONS = {
     "material_collection_failed",
-    "writer_pending_conflict",
-    "writer_postcheck_timeout",
     "writer_result_unknown",
-    "writer_submit_rejected",
-    "writer_transport_unknown",
+    *writer_outcomes.FAILURE_CODES,
 }
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
 
@@ -96,10 +97,12 @@ class FakeWriterApi:
         *,
         received_at: str = "2026-08-23T08:30:00+08:00",
         on_pending=None,
+        result: dict | None = None,
     ) -> None:
         self.calls: list[tuple[str, str]] = []
         self.received_at = received_at
         self.on_pending = on_pending
+        self.result = result
 
     def pending_rows(self, **_kwargs) -> list[dict]:
         if self.on_pending is not None:
@@ -113,7 +116,7 @@ class FakeWriterApi:
 
     def submit_and_verify(self, request_id: str, remark: str) -> dict:
         self.calls.append((request_id, remark))
-        return {
+        return dict(self.result) if self.result is not None else {
             "submit_ok": True,
             "done_hit": True,
             "postcheck_done_hit": True,
@@ -141,6 +144,13 @@ def test_authorized_travel_sample_uses_one_bound_submit_and_receipt(
         api_factory=lambda: api,
         now=lambda: NOW,
     )
+    captured: list[dict] = []
+    submit_frozen = ports["submit_frozen"]
+
+    def capture_submit(job: dict) -> dict:
+        captured.append(dict(job))
+        return submit_frozen(job)
+
     engine = flow_engine.FlowEngine(
         root=root,
         discover_candidates=lambda workflow_key: [
@@ -151,7 +161,7 @@ def test_authorized_travel_sample_uses_one_bound_submit_and_receipt(
             }
         ],
         collect_material=lambda request_id, _root: _material(request_id),
-        **ports,
+        **{**ports, "submit_frozen": capture_submit},
     )
 
     action = engine.next_action("travel_expense", mode="controlled_write")
@@ -168,6 +178,47 @@ def test_authorized_travel_sample_uses_one_bound_submit_and_receipt(
     assert receipt["submit_ok"] is True
     assert receipt["done_hit"] is True
     assert receipt["postcheck_done_hit"] is True
+    boundary = json.loads(
+        Path(action["action_file"])
+        .with_name("writer-boundary.json")
+        .read_text(encoding="utf-8")
+    )
+    assert boundary["stages"] == [
+        "preflight_started",
+        "target_verified",
+        "submit_started",
+        "response_received",
+        "postcheck_started",
+        "postcheck_verified",
+    ]
+    assert boundary["failure_code"] is None
+    assert "live-request" not in json.dumps(boundary)
+
+    replayed = submit_frozen(captured[0])
+
+    assert replayed["submit_ok"] is True
+    assert replayed["done_hit"] is True
+    assert replayed["postcheck_done_hit"] is True
+    assert len(api.calls) == 1
+
+    changed_job = dict(captured[0])
+    remark_path = Path(changed_job["remark_file"])
+    remark_path.write_text("changed frozen remark\n", encoding="utf-8")
+    changed_job["remark_fingerprint"] = (
+        f"sha256:{hashlib.sha256(remark_path.read_bytes()).hexdigest()}"
+    )
+    envelope_path = Path(changed_job["envelope_file"])
+    envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+    envelope["remark_fingerprint"] = changed_job["remark_fingerprint"]
+    json_artifact.write_json_atomic(envelope_path, envelope, indent=2)
+    changed_job["envelope_fingerprint"] = (
+        f"sha256:{hashlib.sha256(envelope_path.read_bytes()).hexdigest()}"
+    )
+
+    with pytest.raises(ValueError, match="writer_result_unknown"):
+        ports["recover_frozen"](changed_job)
+
+    assert len(api.calls) == 1
 
 
 def test_expired_open_action_renews_same_bound_authorization_before_review(
@@ -364,9 +415,366 @@ def test_changed_live_version_stops_without_calling_submit(tmp_path: Path) -> No
     result = engine.complete_review(Path(action["action_file"]), decision_file)
 
     assert result["action"] == "needs_admin"
-    assert result["reason"] == "writer_result_unknown"
-    assert result["write_state"] == "unknown"
+    assert result["reason"] == "submission_target_changed"
+    assert result["write_state"] == "not_requested"
     assert api.calls == []
+
+
+def test_pending_refresh_failure_is_recorded_before_submit(tmp_path: Path) -> None:
+    root = tmp_path / "flows"
+    policy_file = tmp_path / "write-policy.json"
+    json_artifact.write_json_atomic(
+        policy_file,
+        {
+            "schema_version": 1,
+            "kind": "preaudit_write_policy",
+            "authorized_workflows": ["travel_expense"],
+        },
+    )
+
+    def fail_pending() -> None:
+        raise RuntimeError("sensitive pending refresh detail")
+
+    api = FakeWriterApi(on_pending=fail_pending)
+    ports = production_write.build_ports(
+        root=root,
+        policy_file=policy_file,
+        signing_secret="local-test-secret",
+        api_factory=lambda: api,
+        now=lambda: NOW,
+    )
+    engine = flow_engine.FlowEngine(
+        root=root,
+        discover_candidates=lambda workflow_key: [
+            {
+                "request_id": "live-request",
+                "received_at": "2026-08-23T08:30:00+08:00",
+                "workflow_key": workflow_key,
+            }
+        ],
+        collect_material=lambda request_id, _root: _material(request_id),
+        **ports,
+    )
+    action = engine.next_action("travel_expense", mode="controlled_write")
+    decision_file = tmp_path / "review-decision.json"
+    json_artifact.write_json_atomic(decision_file, _decision(action))
+
+    result = engine.complete_review(Path(action["action_file"]), decision_file)
+
+    assert result["reason"] == "writer_preflight_failed"
+    assert result["write_state"] == "not_requested"
+    assert api.calls == []
+    boundary = json.loads(
+        Path(action["action_file"])
+        .with_name("writer-boundary.json")
+        .read_text(encoding="utf-8")
+    )
+    assert boundary["stages"] == ["preflight_started", "preflight_failed"]
+    assert boundary["failure_code"] == "writer_preflight_failed"
+    serialized = json.dumps(boundary, ensure_ascii=False)
+    assert "live-request" not in serialized
+    assert "sensitive" not in serialized
+
+
+def test_writer_lease_failure_is_confirmed_before_submit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "flows"
+    policy_file = tmp_path / "write-policy.json"
+    json_artifact.write_json_atomic(
+        policy_file,
+        {
+            "schema_version": 1,
+            "kind": "preaudit_write_policy",
+            "authorized_workflows": ["travel_expense"],
+        },
+    )
+    api = FakeWriterApi()
+
+    @contextmanager
+    def fail_writer_lease():
+        raise RuntimeError("writer_lock_unsafe")
+        yield
+
+    monkeypatch.setattr(
+        production_write.runtime_control,
+        "global_writer_lease",
+        fail_writer_lease,
+    )
+    ports = production_write.build_ports(
+        root=root,
+        policy_file=policy_file,
+        signing_secret="local-test-secret",
+        api_factory=lambda: api,
+        now=lambda: NOW,
+    )
+    engine = flow_engine.FlowEngine(
+        root=root,
+        discover_candidates=lambda workflow_key: [
+            {
+                "request_id": "live-request",
+                "received_at": "2026-08-23T08:30:00+08:00",
+                "workflow_key": workflow_key,
+            }
+        ],
+        collect_material=lambda request_id, _root: _material(request_id),
+        **ports,
+    )
+    action = engine.next_action("travel_expense", mode="controlled_write")
+    decision_file = tmp_path / "review-decision.json"
+    json_artifact.write_json_atomic(decision_file, _decision(action))
+
+    result = engine.complete_review(Path(action["action_file"]), decision_file)
+
+    assert result["reason"] == "writer_preflight_failed"
+    assert result["write_state"] == "not_requested"
+    assert api.calls == []
+    assert not Path(action["action_file"]).with_name("writer-boundary.json").exists()
+
+
+def test_stop_before_writer_preflight_is_confirmed_no_write(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "flows"
+    policy_file = tmp_path / "write-policy.json"
+    json_artifact.write_json_atomic(
+        policy_file,
+        {
+            "schema_version": 1,
+            "kind": "preaudit_write_policy",
+            "authorized_workflows": ["travel_expense"],
+        },
+    )
+    api = FakeWriterApi()
+    ports = production_write.build_ports(
+        root=root,
+        policy_file=policy_file,
+        signing_secret="local-test-secret",
+        api_factory=lambda: api,
+        now=lambda: NOW,
+    )
+    engine = flow_engine.FlowEngine(
+        root=root,
+        discover_candidates=lambda workflow_key: [
+            {
+                "request_id": "live-request",
+                "received_at": "2026-08-23T08:30:00+08:00",
+                "workflow_key": workflow_key,
+            }
+        ],
+        collect_material=lambda request_id, _root: _material(request_id),
+        **ports,
+    )
+    action = engine.next_action("travel_expense", mode="controlled_write")
+    decision_file = tmp_path / "review-decision.json"
+    json_artifact.write_json_atomic(decision_file, _decision(action))
+    monkeypatch.setattr(
+        production_write.runtime_control,
+        "stop_requested",
+        lambda: True,
+    )
+
+    result = engine.complete_review(Path(action["action_file"]), decision_file)
+
+    assert result["reason"] == "writer_preflight_failed"
+    assert result["write_state"] == "not_requested"
+    assert api.calls == []
+
+
+def test_submit_started_unknown_is_not_replayed(tmp_path: Path) -> None:
+    root = tmp_path / "flows"
+    policy_file = tmp_path / "write-policy.json"
+    json_artifact.write_json_atomic(
+        policy_file,
+        {
+            "schema_version": 1,
+            "kind": "preaudit_write_policy",
+            "authorized_workflows": ["travel_expense"],
+        },
+    )
+    api = FakeWriterApi(
+        result={
+            "submit_ok": False,
+            "done_hit": False,
+            "postcheck_done_hit": False,
+            "failure_code": "writer_transport_unknown",
+        }
+    )
+    ports = production_write.build_ports(
+        root=root,
+        policy_file=policy_file,
+        signing_secret="local-test-secret",
+        api_factory=lambda: api,
+        now=lambda: NOW,
+    )
+    captured: list[dict] = []
+    submit_frozen = ports["submit_frozen"]
+
+    def capture_submit(job: dict) -> dict:
+        captured.append(dict(job))
+        return submit_frozen(job)
+
+    engine = flow_engine.FlowEngine(
+        root=root,
+        discover_candidates=lambda workflow_key: [
+            {
+                "request_id": "live-request",
+                "received_at": "2026-08-23T08:30:00+08:00",
+                "workflow_key": workflow_key,
+            }
+        ],
+        collect_material=lambda request_id, _root: _material(request_id),
+        **{**ports, "submit_frozen": capture_submit},
+    )
+    action = engine.next_action("travel_expense", mode="controlled_write")
+    decision_file = tmp_path / "review-decision.json"
+    json_artifact.write_json_atomic(decision_file, _decision(action))
+
+    result = engine.complete_review(Path(action["action_file"]), decision_file)
+
+    assert result["reason"] == "writer_transport_unknown"
+    assert result["write_state"] == "unknown"
+    assert len(api.calls) == 1
+    boundary = json.loads(
+        Path(action["action_file"])
+        .with_name("writer-boundary.json")
+        .read_text(encoding="utf-8")
+    )
+    assert boundary["stages"] == [
+        "preflight_started",
+        "target_verified",
+        "submit_started",
+        "submit_unknown",
+    ]
+    assert boundary["failure_code"] == "writer_transport_unknown"
+
+    with pytest.raises(ValueError, match="writer_transport_unknown"):
+        submit_frozen(captured[0])
+
+    assert len(api.calls) == 1
+
+
+def test_tampered_writer_boundary_is_not_trusted_or_replayed(tmp_path: Path) -> None:
+    root = tmp_path / "flows"
+    policy_file = tmp_path / "write-policy.json"
+    json_artifact.write_json_atomic(
+        policy_file,
+        {
+            "schema_version": 1,
+            "kind": "preaudit_write_policy",
+            "authorized_workflows": ["travel_expense"],
+        },
+    )
+    api = FakeWriterApi()
+    ports = production_write.build_ports(
+        root=root,
+        policy_file=policy_file,
+        signing_secret="local-test-secret",
+        api_factory=lambda: api,
+        now=lambda: NOW,
+    )
+    captured: list[dict] = []
+    submit_frozen = ports["submit_frozen"]
+
+    def capture_submit(job: dict) -> dict:
+        captured.append(dict(job))
+        return submit_frozen(job)
+
+    engine = flow_engine.FlowEngine(
+        root=root,
+        discover_candidates=lambda workflow_key: [
+            {
+                "request_id": "live-request",
+                "received_at": "2026-08-23T08:30:00+08:00",
+                "workflow_key": workflow_key,
+            }
+        ],
+        collect_material=lambda request_id, _root: _material(request_id),
+        **{**ports, "submit_frozen": capture_submit},
+    )
+    action = engine.next_action("travel_expense", mode="controlled_write")
+    decision_file = tmp_path / "review-decision.json"
+    json_artifact.write_json_atomic(decision_file, _decision(action))
+    completed = engine.complete_review(Path(action["action_file"]), decision_file)
+    assert completed["action"] == "closed"
+    assert len(api.calls) == 1
+
+    boundary_path = Path(action["action_file"]).with_name("writer-boundary.json")
+    boundary = json.loads(boundary_path.read_text(encoding="utf-8"))
+    boundary["stages"][-1] = "postcheck_unknown"
+    boundary["failure_code"] = "writer_postcheck_timeout"
+    json_artifact.write_json_atomic(boundary_path, boundary, indent=2)
+
+    with pytest.raises(ValueError, match="writer_result_unknown"):
+        submit_frozen(captured[0])
+
+    assert len(api.calls) == 1
+
+
+def test_verified_boundary_recovers_receipt_without_second_submit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "flows"
+    policy_file = tmp_path / "write-policy.json"
+    json_artifact.write_json_atomic(
+        policy_file,
+        {
+            "schema_version": 1,
+            "kind": "preaudit_write_policy",
+            "authorized_workflows": ["travel_expense"],
+        },
+    )
+    api = FakeWriterApi()
+    ports = production_write.build_ports(
+        root=root,
+        policy_file=policy_file,
+        signing_secret="local-test-secret",
+        api_factory=lambda: api,
+        now=lambda: NOW,
+    )
+    engine = flow_engine.FlowEngine(
+        root=root,
+        discover_candidates=lambda workflow_key: [
+            {
+                "request_id": "live-request",
+                "received_at": "2026-08-23T08:30:00+08:00",
+                "workflow_key": workflow_key,
+            }
+        ],
+        collect_material=lambda request_id, _root: _material(request_id),
+        **ports,
+    )
+    action = engine.next_action("travel_expense", mode="controlled_write")
+    decision_file = tmp_path / "review-decision.json"
+    json_artifact.write_json_atomic(decision_file, _decision(action))
+    original_write = json_artifact.write_json_atomic
+
+    with monkeypatch.context() as crash_patch:
+        def crash_before_receipt(path: Path, payload: dict, **kwargs) -> Path:
+            if Path(path).name == "execution-receipt.json":
+                raise SystemExit("receipt_not_persisted")
+            return original_write(path, payload, **kwargs)
+
+        crash_patch.setattr(json_artifact, "write_json_atomic", crash_before_receipt)
+        with pytest.raises(SystemExit, match="receipt_not_persisted"):
+            engine.complete_review(Path(action["action_file"]), decision_file)
+
+    assert len(api.calls) == 1
+    assert not Path(action["action_file"]).with_name("execution-receipt.json").exists()
+
+    recovered = flow_engine.FlowEngine(
+        root=root,
+        discover_candidates=lambda _workflow_key: [],
+        collect_material=lambda request_id, _root: _material(request_id),
+        **ports,
+    ).next_action("travel_expense")
+
+    assert recovered["action"] == "closed"
+    assert recovered["write_state"] == "submitted"
+    assert len(api.calls) == 1
 
 
 def test_authorization_expiring_while_waiting_for_writer_stops_submit(
@@ -422,7 +830,8 @@ def test_authorization_expiring_while_waiting_for_writer_stops_submit(
     result = engine.complete_review(Path(action["action_file"]), decision_file)
 
     assert result["action"] == "needs_admin"
-    assert result["write_state"] == "unknown"
+    assert result["reason"] == "writer_preflight_failed"
+    assert result["write_state"] == "not_requested"
     assert api.calls == []
 
 
@@ -483,7 +892,8 @@ def test_evidence_changed_while_waiting_for_writer_stops_submit(
     result = engine.complete_review(Path(action["action_file"]), decision_file)
 
     assert result["action"] == "needs_admin"
-    assert result["write_state"] == "unknown"
+    assert result["reason"] == "writer_preflight_failed"
+    assert result["write_state"] == "not_requested"
     assert api.calls == []
 
 
@@ -528,7 +938,8 @@ def test_authorization_expiring_during_pending_query_stops_submit(
     result = engine.complete_review(Path(action["action_file"]), decision_file)
 
     assert result["action"] == "needs_admin"
-    assert result["write_state"] == "unknown"
+    assert result["reason"] == "writer_preflight_failed"
+    assert result["write_state"] == "not_requested"
     assert api.calls == []
 
 
@@ -574,7 +985,8 @@ def test_evidence_changed_during_pending_query_stops_submit(tmp_path: Path) -> N
     result = engine.complete_review(Path(action["action_file"]), decision_file)
 
     assert result["action"] == "needs_admin"
-    assert result["write_state"] == "unknown"
+    assert result["reason"] == "writer_preflight_failed"
+    assert result["write_state"] == "not_requested"
     assert api.calls == []
 
 
@@ -639,5 +1051,6 @@ def test_final_evidence_gate_rechecks_lightweight_controls(
 
     assert validation_calls == 4
     assert result["action"] == "needs_admin"
-    assert result["write_state"] == "unknown"
+    assert result["reason"] == "writer_preflight_failed"
+    assert result["write_state"] == "not_requested"
     assert api.calls == []

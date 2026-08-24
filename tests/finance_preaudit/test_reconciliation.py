@@ -91,6 +91,30 @@ def test_reconciliation_classifies_live_state_without_exposing_request_ids(
     assert "1003" not in serialized
 
 
+@pytest.mark.parametrize(
+    "reason",
+    ("writer_preflight_failed", "submission_target_changed"),
+)
+def test_reconciliation_marks_preflight_no_write_as_recoverable(
+    tmp_path: Path,
+    reason: str,
+) -> None:
+    root = tmp_path / "flows"
+    _state(root, "1001", "2026-08-24 09:00:00", reason=reason)
+
+    result = reconciliation.reconcile(
+        root,
+        pending_rows=[
+            {"request_id": "1001", "received_at": "2026-08-24 09:00:00"}
+        ],
+        handled_rows=[],
+    )
+
+    assert result["recommendations"] == {
+        "confirmed_no_write_recovery_candidate": 1
+    }
+
+
 def test_reconciliation_detects_pending_handled_and_identity_conflicts(
     tmp_path: Path,
 ) -> None:

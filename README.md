@@ -135,7 +135,7 @@ python3 -m scripts.finance_preaudit_concurrency_probe \
   --confirm-write YES
 ```
 
-提交结果按可恢复性拆分：`writer_submit_rejected` 是确认未写入；`writer_transport_unknown`、`writer_postcheck_timeout`、`writer_pending_conflict` 都保持 unknown 并触发止损。同一 attempt 即使确认未写入也不会直接重放，必须走下述人工确认的新 attempt 恢复入口。
+提交结果按可恢复性拆分：`writer_submit_rejected`、`writer_preflight_failed` 和 `submission_target_changed` 是确认未写入；`writer_transport_unknown`、`writer_postcheck_timeout`、`writer_pending_conflict` 都保持 unknown 并触发止损。Writer 在 OA POST 前持久化带完整性证明的脱敏阶段边界；一旦进入 `submit_started` 而没有可信终态，同一 attempt 永不重放。已确认成功的边界可恢复本地回执，确认未写入也必须走下述新 attempt 恢复入口。
 
 ## 留存与清理
 
@@ -160,7 +160,7 @@ python3 -m apps.oa_finance_preaudit.cli status --check-live
 python3 -m apps.oa_finance_preaudit.cli status --reconcile
 ```
 
-普通人工恢复只允许 `material_collection_failed` 或 `writer_submit_rejected` 且 `write_state=not_requested`。普通 `--confirm-recovery` 仍拒绝所有 unknown。仅当人工已在 OA 核实未写入时，`writer_result_unknown + needs_admin + write_state=unknown` 才能使用独立确认：命令必须绑定精确 requestId，确认控制器和所有 Writer 均不活动，并重新核验同一身份唯一仍在待办、未出现在已办、旧 attempt 为最新且无执行回执。恢复保留旧现场，只创建新的受控冻结 attempt，不直接写 OA：
+普通人工恢复只允许 `material_collection_failed`、`writer_submit_rejected`、`writer_preflight_failed` 或 `submission_target_changed` 且 `write_state=not_requested`。普通 `--confirm-recovery` 仍拒绝所有 unknown。仅当人工已在 OA 核实未写入时，`writer_result_unknown + needs_admin + write_state=unknown` 才能使用独立确认：命令必须绑定精确 requestId，确认控制器和所有 Writer 均不活动，并重新核验同一身份唯一仍在待办、未出现在已办、旧 attempt 为最新且无执行回执。恢复保留旧现场，只创建新的受控冻结 attempt，不直接写 OA：
 
 ```bash
 python3 -m apps.oa_finance_preaudit.cli next-action \

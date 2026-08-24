@@ -31,9 +31,9 @@ _SANITIZED_EVENT_TYPES = _EVENT_TYPES | {"other"}
 _COMPLETION_FAILURE_CODES = writer_outcomes.FAILURE_CODES | {
     "writer_result_unknown",
 }
-_UNKNOWN_WRITE_FAILURE_CODES = _COMPLETION_FAILURE_CODES - {
-    writer_outcomes.SUBMIT_REJECTED,
-}
+_UNKNOWN_WRITE_FAILURE_CODES = (
+    _COMPLETION_FAILURE_CODES - writer_outcomes.CONFIRMED_NO_WRITE_CODES
+)
 
 
 @dataclass(frozen=True)

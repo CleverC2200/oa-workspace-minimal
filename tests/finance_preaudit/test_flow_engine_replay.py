@@ -301,8 +301,17 @@ def test_human_confirmed_unknown_keeps_live_and_receipt_gates(
         )
 
 
-def test_confirmed_writer_rejection_creates_a_new_review_attempt(
+@pytest.mark.parametrize(
+    "reason",
+    (
+        "writer_submit_rejected",
+        "writer_preflight_failed",
+        "submission_target_changed",
+    ),
+)
+def test_confirmed_no_write_failure_creates_a_new_review_attempt(
     tmp_path: Path,
+    reason: str,
 ) -> None:
     engine = _engine(tmp_path)
     first = engine.next_action("travel_expense")
@@ -315,7 +324,7 @@ def test_confirmed_writer_rejection_creates_a_new_review_attempt(
                 "action": "needs_admin",
                 "execution_state": "needs_admin",
                 "write_state": "not_requested",
-                "reason": "writer_submit_rejected",
+                "reason": reason,
             }
         )
         path.write_text(json.dumps(payload), encoding="utf-8")

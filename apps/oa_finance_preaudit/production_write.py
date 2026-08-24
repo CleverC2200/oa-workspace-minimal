@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
@@ -10,6 +11,7 @@ import re
 import secrets
 from typing import Callable
 
+from apps import json_artifact
 from apps.oa_approval import auth, runtime_control, writer_api, writer_outcomes
 
 from . import flow_engine, submission
@@ -17,10 +19,46 @@ from . import flow_engine, submission
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _PROOF_DOMAIN = b"oa-finance-preaudit-controlled-write-v1\0"
+_BOUNDARY_PROOF_DOMAIN = b"oa-finance-preaudit-writer-boundary-v1\0"
 _FINGERPRINT = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SUBMISSION_TOKEN = re.compile(r"^[0-9a-f]{32}$")
 _ATTEMPT = re.compile(r"^attempt-[1-9][0-9]*$")
 _UNRESOLVED = re.compile(r"\{[^{}\n]+\}")
+_BOUNDARY_FILE = "writer-boundary.json"
+_BOUNDARY_STAGES = frozenset(
+    {
+        "preflight_started",
+        "target_verified",
+        "submit_started",
+        "response_received",
+        "postcheck_started",
+        "postcheck_verified",
+        "preflight_failed",
+        "submit_rejected",
+        "submit_unknown",
+        "postcheck_unknown",
+        "postcheck_conflict",
+    }
+)
+_BOUNDARY_TRANSITIONS = {
+    None: {"preflight_started"},
+    "preflight_started": {"target_verified", "preflight_failed"},
+    "target_verified": {"submit_started", "preflight_failed"},
+    "submit_started": {"response_received", "submit_unknown"},
+    "response_received": {
+        "postcheck_started",
+        "submit_rejected",
+        "submit_unknown",
+    },
+    "postcheck_started": {
+        "postcheck_verified",
+        "postcheck_unknown",
+        "postcheck_conflict",
+    },
+}
+_BOUNDARY_FAILURE_CODES = writer_outcomes.FAILURE_CODES | {
+    "writer_result_unknown",
+}
 
 
 def _utc_now() -> datetime:
@@ -89,6 +127,150 @@ def _proof(grant: dict, secret: str) -> str:
 
 def _file_fingerprint(path: Path) -> str:
     return f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+
+
+def _boundary_identity(job: dict) -> dict:
+    frozen_binding = {
+        key: job[key]
+        for key in (
+            "case_key",
+            "authorization_fingerprint",
+            "material_fingerprint",
+            "evidence_fingerprint",
+            "decision_fingerprint",
+            "remark_fingerprint",
+            "envelope_fingerprint",
+        )
+    }
+    return {
+        "workflow_key": job["workflow_key"],
+        "attempt": job["attempt"],
+        "request_key": hashlib.sha256(
+            f"{job['request_id']}\0{job['received_at']}".encode("utf-8")
+        ).hexdigest(),
+        "submission_token_sha256": hashlib.sha256(
+            job["submission_token"].encode("utf-8")
+        ).hexdigest(),
+        "job_key": hashlib.sha256(
+            json.dumps(
+                frozen_binding,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _boundary_proof(boundary: dict, secret: str) -> str:
+    unsigned = {key: value for key, value in boundary.items() if key != "proof"}
+    digest = hmac.new(
+        secret.encode("utf-8"),
+        _BOUNDARY_PROOF_DOMAIN
+        + json.dumps(
+            unsigned,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"hmac-sha256:{digest}"
+
+
+def _read_boundary(path: Path, job: dict, secret: str) -> dict | None:
+    if not path.exists():
+        return None
+    if path.is_symlink():
+        raise ValueError("writer_result_unknown")
+    boundary = _read_object(path, code="writer_result_unknown")
+    expected_fields = {
+        "schema_version",
+        "kind",
+        "workflow_key",
+        "attempt",
+        "request_key",
+        "submission_token_sha256",
+        "job_key",
+        "stages",
+        "failure_code",
+        "proof",
+    }
+    stages = boundary.get("stages")
+    if (
+        set(boundary) != expected_fields
+        or boundary.get("schema_version") != 1
+        or boundary.get("kind") != "preaudit_writer_boundary"
+        or any(
+            boundary.get(key) != value
+            for key, value in _boundary_identity(job).items()
+        )
+        or not isinstance(stages, list)
+        or not stages
+        or any(stage not in _BOUNDARY_STAGES for stage in stages)
+        or boundary.get("failure_code") not in _BOUNDARY_FAILURE_CODES | {None}
+        or not hmac.compare_digest(
+            str(boundary.get("proof") or ""),
+            _boundary_proof(boundary, secret),
+        )
+    ):
+        raise ValueError("writer_result_unknown")
+    previous: str | None = None
+    for stage in stages:
+        if stage not in _BOUNDARY_TRANSITIONS.get(previous, set()):
+            raise ValueError("writer_result_unknown")
+        previous = stage
+    return boundary
+
+
+def _record_boundary(
+    path: Path,
+    job: dict,
+    secret: str,
+    stage: str,
+    *,
+    failure_code: str | None = None,
+) -> dict:
+    boundary = _read_boundary(path, job, secret)
+    stages = list(boundary["stages"]) if boundary is not None else []
+    previous = stages[-1] if stages else None
+    if stage not in _BOUNDARY_TRANSITIONS.get(previous, set()):
+        raise ValueError("writer_result_unknown")
+    if failure_code not in _BOUNDARY_FAILURE_CODES | {None}:
+        raise ValueError("writer_result_unknown")
+    unsigned = {
+        "schema_version": 1,
+        "kind": "preaudit_writer_boundary",
+        **_boundary_identity(job),
+        "stages": [*stages, stage],
+        "failure_code": failure_code,
+    }
+    payload = {**unsigned, "proof": _boundary_proof(unsigned, secret)}
+    json_artifact.write_json_atomic(path, payload, indent=2)
+    return payload
+
+
+def _replay_boundary(boundary: dict) -> dict:
+    last_stage = boundary["stages"][-1]
+    if last_stage == "postcheck_verified":
+        return {
+            "submit_ok": True,
+            "done_hit": True,
+            "postcheck_done_hit": True,
+        }
+    code = str(boundary.get("failure_code") or "")
+    if code in _BOUNDARY_FAILURE_CODES:
+        raise ValueError(code)
+    raise ValueError("writer_result_unknown")
+
+
+def _submission_result(job: dict, result: dict) -> dict:
+    return {
+        "schema_version": 1,
+        "kind": "preaudit_submission_result",
+        "submission_token": job["submission_token"],
+        "write": True,
+        **result,
+    }
 
 
 def _resolved_attempt_files(job: dict, root: Path) -> dict[str, Path]:
@@ -356,14 +538,51 @@ def build_ports(
 
     def submit_frozen(job: dict) -> dict:
         if runtime_control.stop_requested():
-            raise ValueError(runtime_control.STOP_CODE)
-        _verify_submit_gate(job, resolved_root, authorization_verifier)
-        with runtime_control.global_writer_lease():
-            if runtime_control.stop_requested():
-                raise ValueError(runtime_control.STOP_CODE)
+            raise ValueError(writer_outcomes.PREFLIGHT_FAILED)
+        try:
+            _remark, paths = _validate_job(job, resolved_root)
+        except Exception as error:
+            raise ValueError(writer_outcomes.PREFLIGHT_FAILED) from error
+        boundary_path = paths["material_file"].parent / _BOUNDARY_FILE
+        boundary = _read_boundary(boundary_path, job, secret)
+        if boundary is not None:
+            return _submission_result(job, _replay_boundary(boundary))
+        try:
             _verify_submit_gate(job, resolved_root, authorization_verifier)
-            api = api_factory()
-            pending = api.pending_rows(page_size=200, max_pages=100)
+        except Exception as error:
+            raise ValueError(writer_outcomes.PREFLIGHT_FAILED) from error
+        writer_stack = ExitStack()
+        try:
+            writer_stack.enter_context(runtime_control.global_writer_lease())
+        except Exception as error:
+            raise ValueError(writer_outcomes.PREFLIGHT_FAILED) from error
+        with writer_stack:
+            boundary = _read_boundary(boundary_path, job, secret)
+            if boundary is not None:
+                return _submission_result(job, _replay_boundary(boundary))
+            _record_boundary(boundary_path, job, secret, "preflight_started")
+            if runtime_control.stop_requested():
+                _record_boundary(
+                    boundary_path,
+                    job,
+                    secret,
+                    "preflight_failed",
+                    failure_code=writer_outcomes.PREFLIGHT_FAILED,
+                )
+                raise ValueError(writer_outcomes.PREFLIGHT_FAILED)
+            try:
+                _verify_submit_gate(job, resolved_root, authorization_verifier)
+                api = api_factory()
+                pending = api.pending_rows(page_size=200, max_pages=100)
+            except Exception as error:
+                _record_boundary(
+                    boundary_path,
+                    job,
+                    secret,
+                    "preflight_failed",
+                    failure_code=writer_outcomes.PREFLIGHT_FAILED,
+                )
+                raise ValueError(writer_outcomes.PREFLIGHT_FAILED) from error
             matches = [
                 row
                 for row in pending
@@ -371,25 +590,112 @@ def build_ports(
                 and str(row.get("received_at") or "") == job["received_at"]
             ]
             if len(matches) != 1:
-                raise ValueError("submission_target_changed")
+                _record_boundary(
+                    boundary_path,
+                    job,
+                    secret,
+                    "preflight_failed",
+                    failure_code=writer_outcomes.TARGET_CHANGED,
+                )
+                raise ValueError(writer_outcomes.TARGET_CHANGED)
+            _record_boundary(boundary_path, job, secret, "target_verified")
             if runtime_control.stop_requested():
-                raise ValueError(runtime_control.STOP_CODE)
-            remark, _paths = _verify_submit_gate(
-                job,
-                resolved_root,
-                authorization_verifier,
-            )
+                _record_boundary(
+                    boundary_path,
+                    job,
+                    secret,
+                    "preflight_failed",
+                    failure_code=writer_outcomes.PREFLIGHT_FAILED,
+                )
+                raise ValueError(writer_outcomes.PREFLIGHT_FAILED)
+            try:
+                remark, _paths = _verify_submit_gate(
+                    job,
+                    resolved_root,
+                    authorization_verifier,
+                )
+            except Exception as error:
+                _record_boundary(
+                    boundary_path,
+                    job,
+                    secret,
+                    "preflight_failed",
+                    failure_code=writer_outcomes.PREFLIGHT_FAILED,
+                )
+                raise ValueError(writer_outcomes.PREFLIGHT_FAILED) from error
             if runtime_control.stop_requested():
-                raise ValueError(runtime_control.STOP_CODE)
-            result = api.submit_and_verify(job["request_id"], remark)
+                _record_boundary(
+                    boundary_path,
+                    job,
+                    secret,
+                    "preflight_failed",
+                    failure_code=writer_outcomes.PREFLIGHT_FAILED,
+                )
+                raise ValueError(writer_outcomes.PREFLIGHT_FAILED)
+            _record_boundary(boundary_path, job, secret, "submit_started")
+            try:
+                result = api.submit_and_verify(job["request_id"], remark)
+            except Exception as error:
+                _record_boundary(
+                    boundary_path,
+                    job,
+                    secret,
+                    "submit_unknown",
+                    failure_code="writer_result_unknown",
+                )
+                raise ValueError("writer_result_unknown") from error
             failure_code = result.get("failure_code")
-            if failure_code in writer_outcomes.FAILURE_CODES:
-                raise ValueError(str(failure_code))
-            if not all(
-                result.get(field) is True
-                for field in ("submit_ok", "done_hit", "postcheck_done_hit")
+            if result.get("submit_ok") is not True:
+                code = (
+                    str(failure_code)
+                    if failure_code in writer_outcomes.FAILURE_CODES
+                    else "writer_result_unknown"
+                )
+                if code == writer_outcomes.SUBMIT_REJECTED:
+                    _record_boundary(
+                        boundary_path, job, secret, "response_received"
+                    )
+                    _record_boundary(
+                        boundary_path,
+                        job,
+                        secret,
+                        "submit_rejected",
+                        failure_code=code,
+                    )
+                else:
+                    _record_boundary(
+                        boundary_path,
+                        job,
+                        secret,
+                        "submit_unknown",
+                        failure_code=code,
+                    )
+                raise ValueError(code)
+            _record_boundary(boundary_path, job, secret, "response_received")
+            _record_boundary(boundary_path, job, secret, "postcheck_started")
+            if (
+                result.get("done_hit") is not True
+                or result.get("postcheck_done_hit") is not True
             ):
-                raise ValueError("writer_result_unknown")
+                code = (
+                    str(failure_code)
+                    if failure_code in writer_outcomes.FAILURE_CODES
+                    else "writer_result_unknown"
+                )
+                stage = (
+                    "postcheck_conflict"
+                    if code == writer_outcomes.PENDING_CONFLICT
+                    else "postcheck_unknown"
+                )
+                _record_boundary(
+                    boundary_path,
+                    job,
+                    secret,
+                    stage,
+                    failure_code=code,
+                )
+                raise ValueError(code)
+            _record_boundary(boundary_path, job, secret, "postcheck_verified")
         return {
             "schema_version": 1,
             "kind": "preaudit_submission_result",
@@ -400,9 +706,24 @@ def build_ports(
             "postcheck_done_hit": result.get("postcheck_done_hit") is True,
         }
 
+    def recover_frozen(job: dict) -> dict:
+        try:
+            _remark, paths = _validate_job(job, resolved_root)
+        except Exception as error:
+            raise ValueError("writer_result_unknown") from error
+        boundary = _read_boundary(
+            paths["material_file"].parent / _BOUNDARY_FILE,
+            job,
+            secret,
+        )
+        if boundary is None:
+            raise ValueError("writer_result_unknown")
+        return _submission_result(job, _replay_boundary(boundary))
+
     return {
         "authorization_source": authorization_source,
         "authorization_verifier": authorization_verifier,
         "authorization_renewer": authorization_renewer,
         "submit_frozen": submit_frozen,
+        "recover_frozen": recover_frozen,
     }

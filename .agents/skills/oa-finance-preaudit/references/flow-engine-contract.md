@@ -78,4 +78,6 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
 
 受控写入不是审核者可选择的模式。只有宿主同时注入绑定当前 `requestId + received_at + case_key + attempt + material_fingerprint + evidence_fingerprint` 的一小时授权、外部 verifier 和提交适配器时，FlowEngine 才生成写入 token；`complete-review` 提交前会再次验签并复核本地流程授权清单。提交适配器还要重新确认当前 OA 待办中的 `requestId + received_at` 完全一致。审核决定不能创建、修改或提升授权。
 
+提交适配器在 OA POST 前写入带 HMAC 完整性证明的 `writer-boundary.json`，其中只保留流程、attempt、请求身份哈希、冻结 job 哈希、提交 token 哈希、阶段和失败码。`writer_preflight_failed` 与 `submission_target_changed` 明确表示尚未发出 OA POST，状态为 `not_requested`；`submit_started` 之后缺少可信终态则保持 `unknown`，同一 attempt 禁止重放。`postcheck_verified` 可在宿主中断后恢复成功结果，但仍由 FlowEngine 生成和验证正式执行回执。边界缺失、篡改、身份不一致或非法阶段转换一律按 `writer_result_unknown` 止损。
+
 每个 attempt 至少记录 discover、collect、review、close；受控写入还记录 submit、postcheck。FlowEngine 不把“审核包已生成到结果写回”的墙钟时间直接当成等待或 Agent 活动；只有宿主提供绑定当前 item 的 exact timing receipt 时，验收报告才覆盖 `active_seconds` 与 `waiting_seconds`，否则两者保持 unknown 并阻止等待比例调优。coordination 秒数和 Token 固定为 0。当前运行的 Token 状态固定写 `unknown`。终态回执只保存审核项、资源、页面的 covered/total/applicable 计数和格式是否合规，不保存证据正文；资源 covered 必须来自决定中的具体资源引用，不能按材料存在自动填满。提交前事件不能保存时停止；已确认提交后才发生观测异常时，回执必须写 `observability_state=unknown`，禁止为了补日志重复提交。

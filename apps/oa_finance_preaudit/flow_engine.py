@@ -152,6 +152,7 @@ AuthorizationSource = submission.AuthorizationSource
 AuthorizationVerifier = submission.AuthorizationVerifier
 AuthorizationRenewer = submission.AuthorizationRenewer
 SubmitFrozen = submission.SubmitFrozen
+RecoverFrozen = submission.RecoverFrozen
 
 
 def _read_object(path: Path, *, code: str) -> dict:
@@ -903,6 +904,7 @@ class FlowEngine:
         authorization_verifier: AuthorizationVerifier | None = None,
         authorization_renewer: AuthorizationRenewer | None = None,
         submit_frozen: SubmitFrozen | None = None,
+        recover_frozen: RecoverFrozen | None = None,
     ) -> None:
         self._root = Path(root).expanduser().resolve()
         self._discover_candidates = discover_candidates
@@ -912,6 +914,7 @@ class FlowEngine:
         self._authorization_verifier = authorization_verifier
         self._authorization_renewer = authorization_renewer
         self._submit_frozen = submit_frozen
+        self._recover_frozen = recover_frozen
 
     def _persist_current_action(
         self,
@@ -1094,7 +1097,7 @@ class FlowEngine:
             state = _read_object(state_path, code="persistent_state_invalid")
         except ValueError:
             state = {}
-        if reason == writer_outcomes.SUBMIT_REJECTED:
+        if reason in writer_outcomes.CONFIRMED_NO_WRITE_CODES:
             write_state = "not_requested"
         else:
             write_state = (
@@ -1365,6 +1368,41 @@ class FlowEngine:
             expected_action_file=str(action_path),
         )
 
+    def _recover_frozen_submission(
+        self,
+        attempt_root: Path,
+        state: dict,
+    ) -> dict:
+        if self._recover_frozen is None:
+            raise ValueError("writer_result_unknown")
+        action = _read_object(
+            attempt_root / "action.json",
+            code="writer_result_unknown",
+        )
+        files = {
+            "decision_file": attempt_root / "review-decision.json",
+            "remark_file": attempt_root / "remark.txt",
+            "envelope_file": attempt_root / "submission-envelope.json",
+        }
+        try:
+            job = submission.build_job(
+                action=action,
+                state=state,
+                decision_file=str(files["decision_file"]),
+                remark_file=str(files["remark_file"]),
+                envelope_file=str(files["envelope_file"]),
+                decision_fingerprint=_file_fingerprint(files["decision_file"]),
+                remark_fingerprint=_file_fingerprint(files["remark_file"]),
+                envelope_fingerprint=_file_fingerprint(files["envelope_file"]),
+            )
+            recovered = self._recover_frozen(dict(job))
+            return submission.validate_result(
+                recovered,
+                str(state.get("submission_token") or ""),
+            )
+        except Exception as error:
+            raise ValueError("writer_result_unknown") from error
+
     def _recover_completion(self, attempt_root: Path, state: dict) -> dict:
         action_path = attempt_root / "action.json"
         if (
@@ -1377,7 +1415,21 @@ class FlowEngine:
         except ValueError as error:
             reason = str(error)
             if state.get("write_state") in {"submitting", "unknown"}:
-                reason = "writer_result_unknown"
+                try:
+                    recovered = self._recover_frozen_submission(attempt_root, state)
+                except ValueError:
+                    reason = "writer_result_unknown"
+                else:
+                    json_artifact.write_json_atomic(
+                        attempt_root / "state.json",
+                        {**state, "write_state": "authorized"},
+                        indent=2,
+                    )
+                    return self._complete_review_locked(
+                        action_path,
+                        attempt_root / "review-decision.json",
+                        recovered_submission_result=recovered,
+                    )
             return self._persist_attempt_needs_admin(action_path, reason)
         return self._persist_receipt_completion(action_path, state, receipt)
 
@@ -2240,7 +2292,7 @@ class FlowEngine:
             reason
             in {
                 "material_collection_failed",
-                "writer_submit_rejected",
+                *writer_outcomes.CONFIRMED_NO_WRITE_CODES,
             }
             and action.get("write_state") == "not_requested"
             and state.get("write_state") == "not_requested"
@@ -2358,6 +2410,8 @@ class FlowEngine:
         self,
         action_path: Path,
         decision_file: Path,
+        *,
+        recovered_submission_result: dict | None = None,
     ) -> dict:
         review_started = time.monotonic()
         try:
@@ -2374,7 +2428,10 @@ class FlowEngine:
             persisted_state = {}
         if (
             persisted_action.get("action") == "closed"
-            or persisted_state.get("write_state") in {"submitting", "unknown"}
+            or (
+                recovered_submission_result is None
+                and persisted_state.get("write_state") in {"submitting", "unknown"}
+            )
         ):
             recovered = self._recover_completion(action_path.parent, persisted_state)
             if recovered.get("action") == "closed":
@@ -2443,10 +2500,13 @@ class FlowEngine:
                 "agent_timing_invalid",
             )
         try:
-            submission.verify_persisted_authorization(
-                state,
-                verifier=self._authorization_verifier,
-            )
+            if recovered_submission_result is None:
+                submission.verify_persisted_authorization(
+                    state,
+                    verifier=self._authorization_verifier,
+                )
+            else:
+                submission.persisted_authorization_binding(state)
         except ValueError:
             return self._persist_attempt_needs_admin(
                 action_path,
@@ -2708,87 +2768,113 @@ class FlowEngine:
         envelope_file = action_path.with_name("submission-envelope.json")
         json_artifact.write_json_atomic(envelope_file, envelope, indent=2)
         envelope_fingerprint = _file_fingerprint(envelope_file)
-        self._record_phase(
-            state,
-            "review",
-            "business_warning" if needs_human else "success",
-            wall_seconds=(
-                agent_timing["wall_seconds"]
-                if agent_timing is not None
-                else max(0, int(time.monotonic() - review_started))
-            ),
-            model=agent_timing["model"] if agent_timing is not None else None,
-            token_usage=(
-                agent_timing["token_usage"] if agent_timing is not None else None
-            ),
-        )
+        if recovered_submission_result is None:
+            self._record_phase(
+                state,
+                "review",
+                "business_warning" if needs_human else "success",
+                wall_seconds=(
+                    agent_timing["wall_seconds"]
+                    if agent_timing is not None
+                    else max(0, int(time.monotonic() - review_started))
+                ),
+                model=agent_timing["model"] if agent_timing is not None else None,
+                token_usage=(
+                    agent_timing["token_usage"] if agent_timing is not None else None
+                ),
+            )
 
         write_state = "not_requested"
         submission_result = submission.empty_result()
         observability_complete = True
         if action["write_authorized"]:
-            submitting_state = {**state, "write_state": "submitting"}
-            json_artifact.write_json_atomic(
-                Path(action["state_file"]),
-                submitting_state,
-                indent=2,
-            )
-            job = submission.build_job(
-                action=action,
-                state=state,
-                decision_file=str(stored_decision),
-                remark_file=str(remark_file),
-                envelope_file=str(envelope_file),
-                decision_fingerprint=decision_fingerprint,
-                remark_fingerprint=remark_fingerprint,
-                envelope_fingerprint=envelope_fingerprint,
-            )
-            submit_started = time.monotonic()
-            try:
-                result = self._submit_frozen(dict(job)) if self._submit_frozen else None
-                submission_result = submission.validate_result(
-                    result,
-                    str(submission_token or ""),
+            if recovered_submission_result is not None:
+                submission_result = recovered_submission_result
+            else:
+                submitting_state = {**state, "write_state": "submitting"}
+                json_artifact.write_json_atomic(
+                    Path(action["state_file"]),
+                    submitting_state,
+                    indent=2,
                 )
-            except Exception as error:
-                reason = str(error).strip()
-                if reason not in _WRITER_FAILURE_CODES:
-                    reason = "writer_result_unknown"
-                self._record_phase(
+                job = submission.build_job(
+                    action=action,
+                    state=state,
+                    decision_file=str(stored_decision),
+                    remark_file=str(remark_file),
+                    envelope_file=str(envelope_file),
+                    decision_fingerprint=decision_fingerprint,
+                    remark_fingerprint=remark_fingerprint,
+                    envelope_fingerprint=envelope_fingerprint,
+                )
+                submit_started = time.monotonic()
+                try:
+                    result = (
+                        self._submit_frozen(dict(job)) if self._submit_frozen else None
+                    )
+                    submission_result = submission.validate_result(
+                        result,
+                        str(submission_token or ""),
+                    )
+                except Exception as error:
+                    reason = str(error).strip()
+                    if reason not in _WRITER_FAILURE_CODES:
+                        reason = "writer_result_unknown"
+                    self._record_phase(
+                        submitting_state,
+                        "submit",
+                        (
+                            "technical_failure"
+                            if reason in writer_outcomes.CONFIRMED_NO_WRITE_CODES
+                            else "unknown"
+                        ),
+                        wall_seconds=max(0, int(time.monotonic() - submit_started)),
+                        required=False,
+                    )
+                    return self._persist_attempt_needs_admin(
+                        action_path,
+                        reason,
+                    )
+            write_state = "submitted"
+            if recovered_submission_result is None:
+                observability_complete = self._record_phase(
                     submitting_state,
                     "submit",
-                    (
-                        "technical_failure"
-                        if reason == writer_outcomes.SUBMIT_REJECTED
-                        else "unknown"
-                    ),
                     wall_seconds=max(0, int(time.monotonic() - submit_started)),
                     required=False,
                 )
-                return self._persist_attempt_needs_admin(
-                    action_path,
-                    reason,
+                observability_complete = (
+                    self._record_phase(
+                        submitting_state,
+                        "postcheck",
+                        required=False,
+                    )
+                    and observability_complete
                 )
-            write_state = "submitted"
-            observability_complete = self._record_phase(
-                submitting_state,
-                "submit",
-                wall_seconds=max(0, int(time.monotonic() - submit_started)),
-                required=False,
-            )
+
+        if recovered_submission_result is None:
             observability_complete = (
-                self._record_phase(
-                    submitting_state,
-                    "postcheck",
-                    required=False,
-                )
+                self._record_phase(state, "close", required=False)
                 and observability_complete
             )
-
-        observability_complete = (
-            self._record_phase(state, "close", required=False)
-            and observability_complete
-        )
+        else:
+            try:
+                observability_complete = observability.attempt_has_phases(
+                    Path(action["events_file"]),
+                    request_id=state["request_id"],
+                    received_at=state["received_at"],
+                    attempt=state["attempt"],
+                    phases=(
+                        "discover",
+                        "collect",
+                        "review",
+                        "submit",
+                        "postcheck",
+                        "close",
+                    ),
+                )
+            except (OSError, KeyError, TypeError, ValueError):
+                observability_complete = False
 
         observability_state = "complete" if observability_complete else "unknown"
         quality = _quality_projection(

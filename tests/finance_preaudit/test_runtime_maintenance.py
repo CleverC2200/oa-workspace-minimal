@@ -259,6 +259,30 @@ def test_status_counts_only_the_latest_attempt_per_case(tmp_path: Path) -> None:
     assert flow["failure_counts"] == {}
 
 
+@pytest.mark.parametrize(
+    "reason",
+    ("writer_preflight_failed", "submission_target_changed"),
+)
+def test_status_keeps_sanitized_preflight_failure_codes(
+    tmp_path: Path,
+    reason: str,
+) -> None:
+    root = tmp_path / "runtime"
+    _attempt(
+        root,
+        case_key="e" * 64,
+        attempt=1,
+        age_days=1,
+        execution_state="needs_admin",
+        business_state="not_available",
+        reason=reason,
+    )
+
+    flow = runtime_maintenance.status(root, now=NOW)["workflows"][0]
+
+    assert flow["failure_counts"] == {reason: 1}
+
+
 def test_status_fails_closed_when_state_identity_does_not_match_case(
     tmp_path: Path,
 ) -> None:
