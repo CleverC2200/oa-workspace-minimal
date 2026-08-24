@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 
 import pytest
 
 from apps import json_artifact
-from apps.oa_finance_preaudit import flow_engine, production_write
+from apps.oa_finance_preaudit import flow_engine, production_write, submission
 
 
 NOW = datetime(2026, 8, 23, 1, 0, tzinfo=timezone.utc)
@@ -163,6 +163,123 @@ def test_authorized_travel_sample_uses_one_bound_submit_and_receipt(
     assert receipt["submit_ok"] is True
     assert receipt["done_hit"] is True
     assert receipt["postcheck_done_hit"] is True
+
+
+def test_expired_open_action_renews_same_bound_authorization_before_review(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "flows"
+    policy_file = tmp_path / "write-policy.json"
+    json_artifact.write_json_atomic(
+        policy_file,
+        {
+            "schema_version": 1,
+            "kind": "preaudit_write_policy",
+            "authorized_workflows": ["travel_expense"],
+        },
+    )
+    current_time = [NOW]
+    api = FakeWriterApi()
+    ports = production_write.build_ports(
+        root=root,
+        policy_file=policy_file,
+        signing_secret="local-test-secret",
+        api_factory=lambda: api,
+        now=lambda: current_time[0],
+    )
+    engine = flow_engine.FlowEngine(
+        root=root,
+        discover_candidates=lambda workflow_key: [
+            {
+                "request_id": "live-request",
+                "received_at": "2026-08-23T08:30:00+08:00",
+                "workflow_key": workflow_key,
+            }
+        ],
+        collect_material=lambda request_id, _root: _material(request_id),
+        **ports,
+    )
+    original = engine.next_action("travel_expense", mode="controlled_write")
+    original_state = json.loads(
+        Path(original["state_file"]).read_text(encoding="utf-8")
+    )
+
+    current_time[0] = NOW + timedelta(minutes=61)
+    renewed = engine.next_action("travel_expense", mode="controlled_write")
+    renewed_state = json.loads(
+        Path(renewed["state_file"]).read_text(encoding="utf-8")
+    )
+
+    assert renewed["action"] == "review_required"
+    assert renewed["case_key"] == original["case_key"]
+    assert renewed["attempt"] == original["attempt"]
+    assert renewed["review_packet_file"] == original["review_packet_file"]
+    assert renewed["action_token"] != original["action_token"]
+    assert renewed["authorization_fingerprint"] != original[
+        "authorization_fingerprint"
+    ]
+    assert renewed_state["material_fingerprint"] == original_state[
+        "material_fingerprint"
+    ]
+    assert renewed_state["evidence_fingerprint"] == original_state[
+        "evidence_fingerprint"
+    ]
+
+    decision_file = tmp_path / "renewed-decision.json"
+    json_artifact.write_json_atomic(decision_file, _decision(renewed))
+    closed = engine.complete_review(Path(renewed["action_file"]), decision_file)
+
+    assert closed["write_state"] == "submitted"
+    assert len(api.calls) == 1
+
+
+def test_expired_tampered_authorization_is_not_renewed(tmp_path: Path) -> None:
+    root = tmp_path / "flows"
+    policy_file = tmp_path / "write-policy.json"
+    json_artifact.write_json_atomic(
+        policy_file,
+        {
+            "schema_version": 1,
+            "kind": "preaudit_write_policy",
+            "authorized_workflows": ["travel_expense"],
+        },
+    )
+    current_time = [NOW]
+    ports = production_write.build_ports(
+        root=root,
+        policy_file=policy_file,
+        signing_secret="local-test-secret",
+        api_factory=FakeWriterApi,
+        now=lambda: current_time[0],
+    )
+    engine = flow_engine.FlowEngine(
+        root=root,
+        discover_candidates=lambda workflow_key: [
+            {
+                "request_id": "live-request",
+                "received_at": "2026-08-23T08:30:00+08:00",
+                "workflow_key": workflow_key,
+            }
+        ],
+        collect_material=lambda request_id, _root: _material(request_id),
+        **ports,
+    )
+    action = engine.next_action("travel_expense", mode="controlled_write")
+    action_path = Path(action["action_file"])
+    state_path = Path(action["state_file"])
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["authorization_grant"]["proof"] = "tampered"
+    forged_fingerprint = submission.fingerprint(state["authorization_grant"])
+    state["authorization_fingerprint"] = forged_fingerprint
+    action["authorization_fingerprint"] = forged_fingerprint
+    json_artifact.write_json_atomic(state_path, state)
+    json_artifact.write_json_atomic(action_path, action)
+
+    current_time[0] = NOW + timedelta(minutes=61)
+    blocked = engine.next_action("travel_expense", mode="controlled_write")
+
+    assert blocked["action"] == "needs_admin"
+    assert blocked["reason"] == "write_authorization_invalid"
 
 
 def test_policy_blocks_an_unapproved_flow_before_submit(tmp_path: Path) -> None:

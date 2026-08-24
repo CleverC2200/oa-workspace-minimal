@@ -56,6 +56,7 @@ _FLOW_FAILURE_CODES = {
     "recovery_live_state_unavailable",
     "recovery_not_safe",
     "run_mode_unauthorized",
+    "production_rolling_controller_required",
     "write_authorization_invalid",
     "workflow_not_implemented",
 }
@@ -155,13 +156,22 @@ def _live_flow_engine(*, controlled: bool = False) -> flow_engine.FlowEngine:
     )
 
 
-def _live_reconciliation(root: Path) -> dict:
+def _live_reconciliation(
+    root: Path,
+    *,
+    workflow_key: str | None = None,
+) -> dict:
     configs = legacy_flow.load_all_configs()
     oa_api = legacy_api.build_api(configs[0])
     pending = production_pending.identify_pending_rows(
         oa_api.pending_rows(page_size=200, max_pages=100),
         configs,
     )
+    selected = [
+        item
+        for item in pending
+        if workflow_key is None or item["flow_key"] == workflow_key
+    ]
     return reconciliation.reconcile(
         root,
         pending_rows=[
@@ -169,9 +179,10 @@ def _live_reconciliation(root: Path) -> dict:
                 "request_id": item["requestId"],
                 "received_at": item["received_at"],
             }
-            for item in pending
+            for item in selected
         ],
         handled_rows=oa_api.handled_rows(page_size=200, max_pages=100),
+        workflow_key=workflow_key,
     )
 
 
@@ -334,6 +345,8 @@ def main(
                 controlled = args.mode == "controlled-write"
                 if controlled != (args.confirm_write == "YES"):
                     raise ValueError("run_mode_unauthorized")
+                if controlled and args.workflow == "travel_expense":
+                    raise ValueError("production_rolling_controller_required")
                 engine = (
                     flow_engine_factory()
                     if flow_engine_factory is not None
@@ -357,6 +370,8 @@ def main(
                 controlled = persisted_mode == "controlled_write"
                 if controlled != (args.confirm_write == "YES"):
                     raise ValueError("run_mode_unauthorized")
+                if controlled and _persisted_workflow(args.action_file) == "travel_expense":
+                    raise ValueError("production_rolling_controller_required")
                 engine = (
                     flow_engine_factory()
                     if flow_engine_factory is not None

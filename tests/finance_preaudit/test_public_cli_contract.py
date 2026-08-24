@@ -167,7 +167,7 @@ def test_next_action_uses_the_deep_module_and_prints_one_json() -> None:
     }
 
 
-def test_controlled_next_action_requires_explicit_confirmation() -> None:
+def test_controlled_travel_next_action_requires_rolling_controller() -> None:
     calls: list[tuple[str, str]] = []
 
     class Engine:
@@ -211,9 +211,11 @@ def test_controlled_next_action_requires_explicit_confirmation() -> None:
 
     assert denied_code == 1
     assert json.loads(denied.getvalue())["failure"]["code"] == "run_mode_unauthorized"
-    assert allowed_code == 0
-    assert calls == [("travel_expense", "controlled_write")]
-    assert json.loads(allowed.getvalue())["mode"] == "controlled_write"
+    assert allowed_code == 1
+    assert json.loads(allowed.getvalue())["failure"]["code"] == (
+        "production_rolling_controller_required"
+    )
+    assert calls == []
 
 
 def test_recovery_requires_explicit_confirmation_and_uses_engine_gate(
@@ -419,7 +421,9 @@ def test_controlled_complete_review_requires_confirmation(tmp_path: Path) -> Non
     action_file = tmp_path / "action.json"
     decision_file = tmp_path / "decision.json"
     action_file.write_text(
-        json.dumps({"mode": "controlled_write"}),
+        json.dumps(
+            {"mode": "controlled_write", "workflow_key": "travel_expense"}
+        ),
         encoding="utf-8",
     )
     calls: list[tuple[object, object]] = []
@@ -459,5 +463,8 @@ def test_controlled_complete_review_requires_confirmation(tmp_path: Path) -> Non
 
     assert denied_code == 1
     assert json.loads(denied.getvalue())["failure"]["code"] == "run_mode_unauthorized"
-    assert allowed_code == 0
-    assert calls == [(action_file, decision_file)]
+    assert allowed_code == 1
+    assert json.loads(allowed.getvalue())["failure"]["code"] == (
+        "production_rolling_controller_required"
+    )
+    assert calls == []

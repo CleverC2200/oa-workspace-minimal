@@ -149,6 +149,7 @@ HandledSource = Callable[[], Iterable[dict]]
 MaterialCollector = Callable[[str, Path], dict]
 AuthorizationSource = submission.AuthorizationSource
 AuthorizationVerifier = submission.AuthorizationVerifier
+AuthorizationRenewer = submission.AuthorizationRenewer
 SubmitFrozen = submission.SubmitFrozen
 
 
@@ -798,6 +799,7 @@ class FlowEngine:
         collect_material: MaterialCollector,
         authorization_source: AuthorizationSource | None = None,
         authorization_verifier: AuthorizationVerifier | None = None,
+        authorization_renewer: AuthorizationRenewer | None = None,
         submit_frozen: SubmitFrozen | None = None,
     ) -> None:
         self._root = Path(root).expanduser().resolve()
@@ -806,6 +808,7 @@ class FlowEngine:
         self._collect_material = collect_material
         self._authorization_source = authorization_source
         self._authorization_verifier = authorization_verifier
+        self._authorization_renewer = authorization_renewer
         self._submit_frozen = submit_frozen
 
     def _persist_current_action(
@@ -843,6 +846,8 @@ class FlowEngine:
         *,
         wall_seconds: int = 0,
         required: bool = True,
+        model: str | None = None,
+        token_usage: dict | None = None,
     ) -> bool:
         order = {
             "discover": 1,
@@ -867,13 +872,70 @@ class FlowEngine:
                 wall_seconds=duration,
                 active_seconds=duration,
                 result=result,
-                token_usage={"status": "unknown"},
+                model=model,
+                token_usage=token_usage or {"status": "unknown"},
             )
             return True
         except (OSError, KeyError, TypeError, ValueError) as error:
             if not required:
                 return False
             raise ValueError("observability_write_failed") from error
+
+    def _read_agent_timing(self, action_path: Path, action: dict) -> dict | None:
+        timing_path = action_path.with_name("agent-timing.json")
+        if not timing_path.exists():
+            return None
+        if timing_path.is_symlink():
+            raise ValueError("agent_timing_invalid")
+        timing = _read_object(timing_path, code="agent_timing_invalid")
+        if (
+            set(timing)
+            != {
+                "schema_version",
+                "kind",
+                "action_token",
+                "workflow_key",
+                "model",
+                "reasoning_effort",
+                "wall_seconds",
+                "process_attempts",
+                "token_usage",
+            }
+            or timing.get("schema_version") != 1
+            or timing.get("kind") != "preaudit_agent_timing"
+            or timing.get("action_token") != action.get("action_token")
+            or timing.get("workflow_key") != action.get("workflow_key")
+            or timing.get("model") != "gpt-5.6-terra"
+            or timing.get("reasoning_effort") != "high"
+            or not isinstance(timing.get("wall_seconds"), int)
+            or isinstance(timing.get("wall_seconds"), bool)
+            or timing["wall_seconds"] < 0
+            or not isinstance(timing.get("process_attempts"), int)
+            or isinstance(timing.get("process_attempts"), bool)
+            or timing["process_attempts"] < 1
+            or not isinstance(timing.get("token_usage"), dict)
+        ):
+            raise ValueError("agent_timing_invalid")
+        usage = timing["token_usage"]
+        if usage.get("status") == "recorded" and all(
+            isinstance(usage.get(field), int)
+            and not isinstance(usage.get(field), bool)
+            and usage[field] >= 0
+            for field in ("input_tokens", "output_tokens", "total_tokens")
+        ) and usage["input_tokens"] + usage["output_tokens"] == usage["total_tokens"]:
+            observable_usage = {
+                "status": "exact",
+                "input_tokens": usage["input_tokens"],
+                "output_tokens": usage["output_tokens"],
+                "total_tokens": usage["total_tokens"],
+            }
+        else:
+            observable_usage = {"status": "unknown"}
+        return {
+            "wall_seconds": timing["wall_seconds"],
+            "model": timing["model"],
+            "token_usage": observable_usage,
+        }
 
     def _latest_case_attempts(self, workflow_root: Path) -> list[Path]:
         latest: list[Path] = []
@@ -1330,6 +1392,58 @@ class FlowEngine:
             _needs_admin(workflow_root.name, "persistent_state_invalid"),
         )
 
+    def _renew_expired_authorization(
+        self,
+        action_path: Path,
+        action: dict,
+        state: dict,
+    ) -> dict:
+        if state.get("mode") != "controlled_write":
+            return action
+        try:
+            submission.verify_persisted_authorization(
+                state,
+                verifier=self._authorization_verifier,
+            )
+            return action
+        except ValueError:
+            pass
+        if self._authorization_renewer is None:
+            raise ValueError("write_authorization_invalid")
+        context, previous_grant = submission.persisted_authorization_binding(state)
+        authorization = submission.resolve_authorization(
+            context,
+            source=lambda current_context: self._authorization_renewer(
+                previous_grant,
+                current_context,
+            ),
+            verifier=self._authorization_verifier,
+            submitter_available=self._submit_frozen is not None,
+        )
+        refreshed_action = {
+            **action,
+            "authorization_fingerprint": authorization[
+                "authorization_fingerprint"
+            ],
+            "action_token": secrets.token_urlsafe(32),
+        }
+        refreshed_state = {
+            **state,
+            "authorization_fingerprint": authorization[
+                "authorization_fingerprint"
+            ],
+            "authorization_grant": authorization["authorization_grant"],
+            "submission_token": authorization["submission_token"],
+            "action_token": refreshed_action["action_token"],
+        }
+        json_artifact.write_json_atomic(
+            action_path.with_name("state.json"),
+            refreshed_state,
+            indent=2,
+        )
+        json_artifact.write_json_atomic(action_path, refreshed_action, indent=2)
+        return refreshed_action
+
     def _resume_active_action(
         self,
         workflow_root: Path,
@@ -1389,7 +1503,12 @@ class FlowEngine:
                 )
             return self._persist_current_action(workflow_root, action)
         try:
-            action, _state, _packet = self._open_attempt(action_path)
+            action, state, _packet = self._open_attempt(action_path)
+            action = self._renew_expired_authorization(
+                action_path,
+                action,
+                state,
+            )
         except ValueError as error:
             return self._persist_attempt_needs_admin(action_path, str(error))
         return self._persist_current_action(workflow_root, action)
@@ -2162,6 +2281,13 @@ class FlowEngine:
                 )
             return _needs_admin("unknown", reason)
         try:
+            agent_timing = self._read_agent_timing(action_path, action)
+        except ValueError:
+            return self._persist_attempt_needs_admin(
+                action_path,
+                "agent_timing_invalid",
+            )
+        try:
             submission.verify_persisted_authorization(
                 state,
                 verifier=self._authorization_verifier,
@@ -2400,7 +2526,15 @@ class FlowEngine:
             state,
             "review",
             "business_warning" if needs_human else "success",
-            wall_seconds=max(0, int(time.monotonic() - review_started)),
+            wall_seconds=(
+                agent_timing["wall_seconds"]
+                if agent_timing is not None
+                else max(0, int(time.monotonic() - review_started))
+            ),
+            model=agent_timing["model"] if agent_timing is not None else None,
+            token_usage=(
+                agent_timing["token_usage"] if agent_timing is not None else None
+            ),
         )
 
         write_state = "not_requested"

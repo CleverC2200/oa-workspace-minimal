@@ -23,6 +23,7 @@ _WORKFLOW_KEYS = {
     "packaging_layout_approval",
 }
 _FAILURE_CODES = {
+    "agent_timing_invalid",
     "frozen_material_changed",
     "frozen_packet_changed",
     "material_collection_failed",

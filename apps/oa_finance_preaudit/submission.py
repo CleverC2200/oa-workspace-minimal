@@ -10,6 +10,7 @@ SCHEMA_VERSION = 1
 
 AuthorizationSource = Callable[[dict], dict]
 AuthorizationVerifier = Callable[[dict, dict], bool]
+AuthorizationRenewer = Callable[[dict, dict], dict]
 SubmitFrozen = Callable[[dict], dict]
 
 _GRANT_FIELDS = {
@@ -124,17 +125,7 @@ def resolve_authorization(
     }
 
 
-def verify_persisted_authorization(
-    state: dict,
-    *,
-    verifier: AuthorizationVerifier | None,
-) -> None:
-    if state.get("mode") == "preview":
-        if state.get("write_authorized") is not False:
-            raise ValueError("write_authorization_invalid")
-        return
-    if verifier is None:
-        raise ValueError("write_authorization_invalid")
+def persisted_authorization_binding(state: dict) -> tuple[dict, dict]:
     context = authorization_context(
         workflow_key=state.get("workflow_key"),
         request_id=state.get("request_id"),
@@ -147,6 +138,21 @@ def verify_persisted_authorization(
     grant = _validate_grant_shape(state.get("authorization_grant"), context)
     if state.get("authorization_fingerprint") != fingerprint(grant):
         raise ValueError("write_authorization_invalid")
+    return context, grant
+
+
+def verify_persisted_authorization(
+    state: dict,
+    *,
+    verifier: AuthorizationVerifier | None,
+) -> None:
+    if state.get("mode") == "preview":
+        if state.get("write_authorized") is not False:
+            raise ValueError("write_authorization_invalid")
+        return
+    if verifier is None:
+        raise ValueError("write_authorization_invalid")
+    context, grant = persisted_authorization_binding(state)
     try:
         verified = verifier(dict(grant), dict(context)) is True
     except Exception as error:

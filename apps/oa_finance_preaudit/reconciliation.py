@@ -161,7 +161,10 @@ def reconcile(
     *,
     pending_rows: Iterable[dict],
     handled_rows: Iterable[dict],
+    workflow_key: str | None = None,
 ) -> dict:
+    if workflow_key is not None and workflow_key not in _WORKFLOW_KEYS:
+        raise ValueError("runtime_reconciliation_invalid")
     pending_input = [row for row in pending_rows if isinstance(row, dict)]
     pending = {_identity(row) for row in pending_input}
     pending = {identity for identity in pending if identity[0]}
@@ -176,7 +179,11 @@ def reconcile(
     counts: Counter[str] = Counter()
     recommendations: Counter[str] = Counter()
 
-    states = latest_states(root)
+    states = [
+        state
+        for state in latest_states(root)
+        if workflow_key is None or state.get("workflow_key") == workflow_key
+    ]
     for state in states:
         request_id = str(state.get("request_id") or "").strip()
         received_at = str(state.get("received_at") or "").strip()

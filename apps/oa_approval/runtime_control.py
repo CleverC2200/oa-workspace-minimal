@@ -26,6 +26,21 @@ def stop_requested() -> bool:
     return raw in {"1", "true", "yes", "y", "on"} or stop_file().exists()
 
 
+def request_stop() -> None:
+    target = stop_file().expanduser()
+    if not target.is_absolute():
+        target = PROJECT_ROOT / target
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(target, flags, 0o600)
+    try:
+        os.write(descriptor, b"stop_requested\n")
+    finally:
+        os.close(descriptor)
+
+
 def stop_error(
     message: str = "已请求停止当前财务预审材料收集",
 ) -> dict[str, str]:

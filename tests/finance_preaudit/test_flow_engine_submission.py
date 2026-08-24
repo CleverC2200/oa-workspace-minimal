@@ -312,6 +312,53 @@ def test_preview_never_calls_submitter_and_cannot_be_promoted_by_decision(
     assert receipt["write_state"] == "not_requested"
 
 
+def test_agent_timing_receipt_binds_exact_review_time_and_tokens(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path, "recorded-request")
+    action = engine.next_action("travel_expense")
+    json_artifact.write_json_atomic(
+        Path(action["action_file"]).with_name("agent-timing.json"),
+        {
+            "schema_version": 1,
+            "kind": "preaudit_agent_timing",
+            "action_token": action["action_token"],
+            "workflow_key": "travel_expense",
+            "model": "gpt-5.6-terra",
+            "reasoning_effort": "high",
+            "wall_seconds": 123,
+            "process_attempts": 1,
+            "token_usage": {
+                "status": "recorded",
+                "input_tokens": 100,
+                "cached_input_tokens": 80,
+                "output_tokens": 20,
+                "total_tokens": 120,
+            },
+        },
+    )
+    decision_file = tmp_path / "timed-decision.json"
+    json_artifact.write_json_atomic(decision_file, _decision(action))
+
+    closed = engine.complete_review(Path(action["action_file"]), decision_file)
+    review = next(
+        event
+        for event in json.loads(
+            Path(closed["events_file"]).read_text(encoding="utf-8")
+        )["events"]
+        if event["phase"] == "review"
+    )
+
+    assert review["wall_seconds"] == 123
+    assert review["model"] == "gpt-5.6-terra"
+    assert review["token_usage"] == {
+        "status": "exact",
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "total_tokens": 120,
+    }
+
+
 def test_controlled_write_keeps_needs_human_as_a_business_result(
     tmp_path: Path,
 ) -> None:
