@@ -47,7 +47,7 @@ Completer = Callable[[Path, dict], str | None]
 StopRequester = Callable[[], None]
 
 
-def _legacy_fallback_routing_instruction(action_file: Path) -> str:
+def _page_routing_instruction(action_file: Path) -> str:
     packet_file = action_file.with_name("review-packet.json")
     material_file = action_file.with_name("material.json")
     if any(
@@ -60,26 +60,35 @@ def _legacy_fallback_routing_instruction(action_file: Path) -> str:
         material = json.loads(material_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return ""
-    if (
-        not isinstance(packet, dict)
-        or not isinstance(material, dict)
-        or isinstance(packet.get("page_routing"), dict)
-    ):
+    if not isinstance(packet, dict) or not isinstance(material, dict):
         return ""
-    from apps.oa_finance_preaudit import flow_engine
+    routing = packet.get("page_routing")
+    fallback = not isinstance(routing, dict)
+    if fallback:
+        from apps.oa_finance_preaudit import flow_engine
 
-    routing = flow_engine._full_travel_page_routing(material)
+        routing = flow_engine._full_travel_page_routing(material)
+    source = (
+        "兼容旧版冻结审核包：该包没有 `page_routing`，完成宿主会使用"
+        "以下只读计算的保守路由。"
+        if fallback
+        else "冻结审核包已声明以下宿主路由；必须原样使用，不得替换或重算。"
+    )
+    coverage = (
+        "逐项覆盖以下宿主 fallback 路由"
+        if fallback
+        else "逐项覆盖以下宿主路由"
+    )
     return (
-        "\n兼容旧版冻结审核包：该包没有 `page_routing`，完成宿主会使用"
-        "以下只读计算的保守路由。八个适用审核项必须逐项覆盖以下宿主 "
-        "fallback 路由中的全部 `review_page_refs`，分别写入每项的 "
+        f"\n{source}八个适用审核项必须{coverage}中的全部 "
+        "`review_page_refs`，分别写入每项的 "
         "`evidence_refs` 或 `missing_evidence`；不得省略、替换或猜测页引用：\n"
         f"{json.dumps(routing, ensure_ascii=False, separators=(',', ':'))}\n"
     )
 
 
 def _prompt(action_file: Path) -> str:
-    fallback_routing = _legacy_fallback_routing_instruction(action_file)
+    fallback_routing = _page_routing_instruction(action_file)
     return f"""你是差旅费生产预审的单据工作进程。用户当前明确授权本轮真实审批提交；这是受控生产工作进程，不是手工 preview。
 
 只处理这个已冻结动作：{action_file}
@@ -94,7 +103,7 @@ def _prompt(action_file: Path) -> str:
 
 
 def _read_only_prompt(action_file: Path) -> str:
-    fallback_routing = _legacy_fallback_routing_instruction(action_file)
+    fallback_routing = _page_routing_instruction(action_file)
     return f"""你是差旅费预审的只读容量测试进程。本次只复核历史冻结证据，绝不提交、闭合或改变任何 OA 与本地流程状态。
 
 只处理这个动作引用的审核包：{action_file}
