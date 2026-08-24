@@ -63,7 +63,7 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
   --decision-file /absolute/path/to/review-decision.json
 ```
 
-两条命令默认都是 preview，动作固定 `write_authorized=false`，写入状态固定为 `not_requested`；不会调用 OA 提交。模块和 CLI 共用同一业务实现，大对象通过本地文件传递，stdout 只输出一个版本化 JSON。四类财务流程无法可信取得材料时生成不含可疑证据的降级审核包，由 Agent 输出 `⚠️` 意见交财务判断；流程身份、冻结 attempt、写入授权或目标不一致时才返回 `needs_admin`。包装图片不可读仍停止，避免生成貌似完成的校对意见。五类流程的目录、锁和当前动作投影相互独立；积压中已有单据等待审核时，后续调用可取得另一单据，每个 attempt 使用自己的完成锁，互不等待。
+两条命令默认都是 preview，动作固定 `write_authorized=false`，写入状态固定为 `not_requested`；不会调用 OA 提交。模块和 CLI 共用同一业务实现，大对象通过本地文件传递，stdout 只输出一个版本化 JSON。四类财务流程无法可信取得材料时生成不含可疑证据的降级审核包，由 Agent 输出 `⚠️` 意见交财务判断；流程身份、冻结 attempt、写入授权或目标不一致时才返回 `needs_admin`。包装图片不可读仍停止，避免生成貌似完成的校对意见。五类流程的目录和当前动作投影相互独立；不同单据的材料收集与 Agent 审核可以并发，每个 attempt 使用自己的完成锁，互不等待；所有 OA 写入入口共用一把全局锁并严格串行。
 
 正常运行只使用 `next-action`、`complete-review`、`status` 和 `prune` 四个命令。候选发现、材料收集、冻结校验、单据锁、提交安全门和回执均隐藏在深模块内；没有角色 CLI、底层队列命令或跨任务消息协议。
 
@@ -73,7 +73,7 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
 
 内部离线验收报告固定检查审核项/资源/页面/格式/golden replay 100%、重复提交/跨单据混用/unknown 自动重试/Agent 消息 0，以及 P95 小于 900 秒、等待比例小于 20%、技术错误率不高于 2%。每流程不足 20 个闭合脱敏样本时不建议调参；缺少平台精确 usage 时只停止 Token 调优。真实 `python -m` 入口会把四命令的成功、参数、JSON 合同和文件传递结果写入本地 30 天脱敏 CLI 日志；进程尚未启动时的失败和人工复现由本地 launcher/harness 补充。日志不含 argv、stderr 或路径；status/prune 每次只记一条 global 调用，按流程展示时投影影响范围，但 overall 不重复计数。未知值不能推断为 0。只有 CLI 故障严格多于其他技术故障且证据完整时，报告才允许提出独立 stdio MCP 后续 Issue；本项目当前不实现或安装 MCP。
 
-OA 提交只通过冻结写入入口执行。授权证明、锁、token、冻结指纹和终态回执均绑定单个 `requestId + received_at + attempt` 及其材料版本：同一 attempt 单飞并幂等重放，不同单据可以并发。受控写入由同一个 CLI 向 FlowEngine 注入授权源、外部 verifier 和提交适配器；必须同时满足本地流程授权清单和两步命令各自的显式 `--confirm-write YES`，缺一不可：
+OA 提交只通过冻结写入入口执行。授权证明、token、冻结指纹和终态回执均绑定单个 `requestId + received_at + attempt` 及其材料版本：同一 attempt 单飞并幂等重放；不同单据的取数和审核可以并发，但 OA 写入统一经过全局单写锁。受控写入由同一个 CLI 向 FlowEngine 注入授权源、外部 verifier 和提交适配器；必须同时满足本地流程授权清单和两步命令各自的显式 `--confirm-write YES`，缺一不可：
 
 ```bash
 python3 -m apps.oa_finance_preaudit.cli next-action \

@@ -330,11 +330,7 @@ def build_ports(
         if runtime_control.stop_requested():
             raise ValueError(runtime_control.STOP_CODE)
         _verify_submit_gate(job, resolved_root, authorization_verifier)
-        lock_path = resolved_root.parent / "control" / "flow-writer.lock"
-        with runtime_control.request_writer_lease(
-            runtime_control.GLOBAL_WRITER_KEY,
-            lock_path,
-        ):
+        with runtime_control.global_writer_lease():
             if runtime_control.stop_requested():
                 raise ValueError(runtime_control.STOP_CODE)
             _verify_submit_gate(job, resolved_root, authorization_verifier)

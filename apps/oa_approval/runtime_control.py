@@ -161,3 +161,10 @@ def request_writer_lease(
     finally:
         fcntl.flock(descriptor.fileno(), fcntl.LOCK_UN)
         descriptor.close()
+
+
+@contextmanager
+def global_writer_lease() -> Iterator[None]:
+    """Acquire the one canonical lock shared by every OA write entrypoint."""
+    with request_writer_lease(GLOBAL_WRITER_KEY, writer_lock_file()):
+        yield

@@ -287,13 +287,13 @@ def test_authorization_expiring_while_waiting_for_writer_stops_submit(
     json_artifact.write_json_atomic(decision_file, _decision(action))
 
     @contextmanager
-    def expire_while_waiting(_request_id, _lock_path):
+    def expire_while_waiting():
         clock[0] = NOW.replace(hour=2, minute=1)
         yield
 
     monkeypatch.setattr(
         production_write.runtime_control,
-        "request_writer_lease",
+        "global_writer_lease",
         expire_while_waiting,
     )
 
@@ -343,7 +343,7 @@ def test_evidence_changed_while_waiting_for_writer_stops_submit(
     json_artifact.write_json_atomic(decision_file, _decision(action))
 
     @contextmanager
-    def mutate_while_waiting(_request_id, _lock_path):
+    def mutate_while_waiting():
         state = json.loads(Path(action["state_file"]).read_text(encoding="utf-8"))
         material = json.loads(Path(state["material_file"]).read_text(encoding="utf-8"))
         Path(material["prepared"]["images"][0]["path"]).write_text(
@@ -354,7 +354,7 @@ def test_evidence_changed_while_waiting_for_writer_stops_submit(
 
     monkeypatch.setattr(
         production_write.runtime_control,
-        "request_writer_lease",
+        "global_writer_lease",
         mutate_while_waiting,
     )
 
