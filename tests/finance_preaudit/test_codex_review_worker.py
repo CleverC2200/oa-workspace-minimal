@@ -7,6 +7,8 @@ import signal
 import threading
 import time
 
+import pytest
+
 from apps import json_artifact
 from apps.oa_finance_preaudit import codex_review_worker
 from apps.oa_approval import runtime_control
@@ -623,9 +625,20 @@ def test_parent_completion_can_defer_first_invalid_decision_stop(
     assert not action_file.with_name("execution-receipt.json").exists()
 
 
+@pytest.mark.parametrize(
+    "failure_code",
+    (
+        "writer_submit_rejected",
+        "writer_transport_unknown",
+        "writer_postcheck_timeout",
+        "writer_pending_conflict",
+        "writer_result_unknown",
+    ),
+)
 def test_host_completion_preserves_allowlisted_writer_failure(
     tmp_path: Path,
     monkeypatch,
+    failure_code: str,
 ) -> None:
     class Engine:
         def complete_review(self, _action_file: Path, _decision_file: Path) -> dict:
@@ -633,7 +646,7 @@ def test_host_completion_preserves_allowlisted_writer_failure(
                 "action": "needs_admin",
                 "execution_state": "needs_admin",
                 "write_state": "unknown",
-                "reason": "writer_result_unknown",
+                "reason": failure_code,
             }
 
     monkeypatch.setattr(
@@ -646,11 +659,52 @@ def test_host_completion_preserves_allowlisted_writer_failure(
             tmp_path / "action.json",
             {"kind": "preaudit_review_decision"},
         )
-        == "writer_result_unknown"
+        == failure_code
     )
 
 
-def test_parent_completion_reports_unknown_writer_state(tmp_path: Path) -> None:
+def test_host_completion_rejects_unrecognized_failure_reason(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class Engine:
+        def complete_review(self, _action_file: Path, _decision_file: Path) -> dict:
+            return {
+                "action": "needs_admin",
+                "execution_state": "needs_admin",
+                "write_state": "unknown",
+                "reason": "unrecognized_internal_detail",
+            }
+
+    monkeypatch.setattr(
+        "apps.oa_finance_preaudit.cli._live_flow_engine",
+        lambda *, controlled: Engine(),
+    )
+
+    assert (
+        codex_review_worker._complete_decision(
+            tmp_path / "action.json",
+            {"kind": "preaudit_review_decision"},
+        )
+        == "codex_decision_submit_incomplete"
+    )
+
+
+@pytest.mark.parametrize(
+    ("failure_code", "expected_write_state"),
+    (
+        ("writer_submit_rejected", "not_requested"),
+        ("writer_transport_unknown", "unknown"),
+        ("writer_postcheck_timeout", "unknown"),
+        ("writer_pending_conflict", "unknown"),
+        ("writer_result_unknown", "unknown"),
+    ),
+)
+def test_parent_completion_reports_writer_failure_state(
+    tmp_path: Path,
+    failure_code: str,
+    expected_write_state: str,
+) -> None:
     _task_value, action_file = _task(tmp_path)
     stopped: list[bool] = []
 
@@ -670,13 +724,13 @@ def test_parent_completion_reports_unknown_writer_state(tmp_path: Path) -> None:
             },
             "decision": {"kind": "preaudit_review_decision", "items": []},
         },
-        completer=lambda _action, _decision: "writer_result_unknown",
+        completer=lambda _action, _decision: failure_code,
         request_stop=lambda: stopped.append(True),
     )
 
     assert result["status"] == "failed"
-    assert result["error_code"] == "writer_result_unknown"
-    assert result["write_state"] == "unknown"
+    assert result["error_code"] == failure_code
+    assert result["write_state"] == expected_write_state
     assert stopped == [True]
 
 
