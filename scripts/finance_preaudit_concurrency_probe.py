@@ -151,6 +151,7 @@ def _prepare_one(_workflow_key: str) -> dict:
         historical_authorization_failures = (
             _historical_write_authorization_failures()
         )
+        quarantine_budget = _local_quarantine_count() + 1
     except ValueError:
         runtime_control.request_stop("production_probe_prepare_failed")
         return {
@@ -158,7 +159,8 @@ def _prepare_one(_workflow_key: str) -> dict:
             "error_code": "production_probe_prepare_failed",
         }
     engine = cli._live_flow_engine(controlled=True)
-    for _attempt in range(_local_quarantine_count() + 1):
+    quarantined = 0
+    while quarantined < quarantine_budget:
         if runtime_control.stop_requested():
             return {
                 "action": "failed",
@@ -205,6 +207,19 @@ def _prepare_one(_workflow_key: str) -> dict:
                 action.get("reason") in QUARANTINED_REASONS
             )
         ):
+            quarantined += 1
+            try:
+                current_quarantine_count = _local_quarantine_count()
+            except ValueError:
+                runtime_control.request_stop("production_probe_prepare_failed")
+                return {
+                    "action": "failed",
+                    "error_code": "production_probe_prepare_failed",
+                }
+            quarantine_budget = max(
+                quarantine_budget,
+                current_quarantine_count + 1,
+            )
             continue
         error_code = str(
             action.get("reason") or "production_probe_prepare_failed"

@@ -439,6 +439,125 @@ def test_prepare_skips_quarantined_item_without_global_stop(
     assert stop_requests == []
 
 
+def test_prepare_extends_skip_budget_when_new_item_is_quarantined(
+    monkeypatch,
+) -> None:
+    actions = iter(
+        [
+            {
+                "action": "needs_admin",
+                "reason": "writer_result_unknown",
+                "write_state": "unknown",
+            },
+            {
+                "action": "needs_admin",
+                "reason": "material_collection_failed",
+                "write_state": "not_requested",
+            },
+            {
+                "action": "review_required",
+                "action_file": "/safe/action.json",
+            },
+        ]
+    )
+    quarantine_counts = iter((1, 1, 2))
+    stop_requests: list[bool] = []
+
+    class Engine:
+        def next_action(self, *_args, **_kwargs) -> dict:
+            return next(actions)
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.cli,
+        "_live_flow_engine",
+        lambda *, controlled: Engine(),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda _reason=None: stop_requests.append(True),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantine_count",
+        lambda: next(quarantine_counts),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_historical_write_authorization_failures",
+        frozenset,
+    )
+
+    assert finance_preaudit_concurrency_probe._prepare_one(
+        "travel_expense"
+    ) == {
+        "action": "review_required",
+        "action_file": "/safe/action.json",
+    }
+    assert stop_requests == []
+
+
+def test_prepare_stops_when_dynamic_quarantine_count_is_invalid(
+    monkeypatch,
+) -> None:
+    quarantine_reads = 0
+    stop_requests: list[str | None] = []
+
+    class Engine:
+        def next_action(self, *_args, **_kwargs) -> dict:
+            return {
+                "action": "needs_admin",
+                "reason": "material_collection_failed",
+                "write_state": "not_requested",
+            }
+
+    def quarantine_count() -> int:
+        nonlocal quarantine_reads
+        quarantine_reads += 1
+        if quarantine_reads == 1:
+            return 1
+        raise ValueError("local_quarantine_invalid")
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.cli,
+        "_live_flow_engine",
+        lambda *, controlled: Engine(),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda reason=None: stop_requests.append(reason),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantine_count",
+        quarantine_count,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_historical_write_authorization_failures",
+        frozenset,
+    )
+
+    assert finance_preaudit_concurrency_probe._prepare_one(
+        "travel_expense"
+    ) == {
+        "action": "failed",
+        "error_code": "production_probe_prepare_failed",
+    }
+    assert stop_requests == ["production_probe_prepare_failed"]
+
+
 def test_prepare_stops_on_new_write_authorization_failure(monkeypatch) -> None:
     stop_requests: list[bool] = []
 
