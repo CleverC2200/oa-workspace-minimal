@@ -10,7 +10,7 @@ import re
 import secrets
 from typing import Callable
 
-from apps.oa_approval import auth, runtime_control, writer_api
+from apps.oa_approval import auth, runtime_control, writer_api, writer_outcomes
 
 from . import flow_engine, submission
 
@@ -356,12 +356,7 @@ def build_ports(
                 raise ValueError(runtime_control.STOP_CODE)
             result = api.submit_and_verify(job["request_id"], remark)
             failure_code = result.get("failure_code")
-            if failure_code in {
-                "writer_submit_rejected",
-                "writer_transport_unknown",
-                "writer_postcheck_timeout",
-                "writer_pending_conflict",
-            }:
+            if failure_code in writer_outcomes.FAILURE_CODES:
                 raise ValueError(str(failure_code))
             if not all(
                 result.get(field) is True

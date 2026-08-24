@@ -15,6 +15,7 @@ from typing import Callable, Iterable
 import fitz
 
 from apps import json_artifact
+from apps.oa_approval import writer_outcomes
 
 from . import observability, submission
 
@@ -140,12 +141,7 @@ SHARED_FAILURE_CODES = {
     "submission_adapter_unavailable",
     "write_authorization_invalid",
 }
-_WRITER_FAILURE_CODES = {
-    "writer_pending_conflict",
-    "writer_postcheck_timeout",
-    "writer_submit_rejected",
-    "writer_transport_unknown",
-}
+_WRITER_FAILURE_CODES = writer_outcomes.FAILURE_CODES
 
 
 CandidateSource = Callable[[str], Iterable[dict]]
@@ -931,7 +927,7 @@ class FlowEngine:
             state = _read_object(state_path, code="persistent_state_invalid")
         except ValueError:
             state = {}
-        if reason == "writer_submit_rejected":
+        if reason == writer_outcomes.SUBMIT_REJECTED:
             write_state = "not_requested"
         else:
             write_state = (
@@ -2313,7 +2309,7 @@ class FlowEngine:
                     "submit",
                     (
                         "technical_failure"
-                        if reason == "writer_submit_rejected"
+                        if reason == writer_outcomes.SUBMIT_REJECTED
                         else "unknown"
                     ),
                     wall_seconds=max(0, int(time.monotonic() - submit_started)),

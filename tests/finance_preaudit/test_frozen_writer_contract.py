@@ -518,6 +518,36 @@ class TestFrozenWriterApi:
         handled.assert_not_called()
         pending.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "response",
+        (
+            {},
+            {"raw_text": "upstream gateway response"},
+            {"code": "UNRECOGNIZED"},
+        ),
+    )
+    def test_unrecognized_submit_response_remains_transport_unknown(
+        self,
+        response: dict,
+    ) -> None:
+        api = writer_api.FrozenWriterApi(
+            "token",
+            "user",
+            app_id="app",
+            base_url="https://oa.invalid",
+        )
+
+        with patch.object(api, "_post_submit", return_value=response):
+            result = api.submit_and_verify("1004", "冻结意见")
+
+        assert result == {
+            "submit_ok": False,
+            "done_hit": False,
+            "postcheck_done_hit": False,
+            "failure_code": "writer_transport_unknown",
+        }
+        assert "upstream" not in json.dumps(result, ensure_ascii=False)
+
     def test_transport_and_postcheck_failures_are_distinguished(self) -> None:
         api = writer_api.FrozenWriterApi(
             "token",

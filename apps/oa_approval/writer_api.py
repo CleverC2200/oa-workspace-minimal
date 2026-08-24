@@ -8,11 +8,13 @@ from typing import Any
 
 from apps.oa_approval import auth
 from apps.oa_approval.api import OaApi, TIMEOUT, _decode_json
+from apps.oa_approval import writer_outcomes
 
 
 SUBMIT_ENDPOINT = "/api/workflow/paService/submitRequest"
 POSTCHECK_ATTEMPTS = 3
 POSTCHECK_INTERVAL_SECONDS = 0.25
+SUBMIT_REJECTION_CODES = frozenset({"ERROR"})
 
 
 def _format_remark(remark: str) -> str:
@@ -50,15 +52,23 @@ class FrozenWriterApi(OaApi):
                 "submit_ok": False,
                 "done_hit": False,
                 "postcheck_done_hit": False,
-                "failure_code": "writer_transport_unknown",
+                "failure_code": writer_outcomes.TRANSPORT_UNKNOWN,
             }
-        submit_ok = str(response.get("code") or "").strip().upper() == "SUCCESS"
+        response_code = str(response.get("code") or "").strip().upper()
+        submit_ok = response_code == "SUCCESS"
+        if response_code in SUBMIT_REJECTION_CODES:
+            return {
+                "submit_ok": False,
+                "done_hit": False,
+                "postcheck_done_hit": False,
+                "failure_code": writer_outcomes.SUBMIT_REJECTED,
+            }
         if not submit_ok:
             return {
                 "submit_ok": False,
                 "done_hit": False,
                 "postcheck_done_hit": False,
-                "failure_code": "writer_submit_rejected",
+                "failure_code": writer_outcomes.TRANSPORT_UNKNOWN,
             }
         target = str(request_id)
         for attempt in range(POSTCHECK_ATTEMPTS):
@@ -76,7 +86,7 @@ class FrozenWriterApi(OaApi):
                     "submit_ok": True,
                     "done_hit": True,
                     "postcheck_done_hit": False,
-                    "failure_code": "writer_pending_conflict",
+                    "failure_code": writer_outcomes.PENDING_CONFLICT,
                 }
             if done_hit:
                 return {
@@ -91,7 +101,7 @@ class FrozenWriterApi(OaApi):
             "submit_ok": True,
             "done_hit": False,
             "postcheck_done_hit": False,
-            "failure_code": "writer_postcheck_timeout",
+            "failure_code": writer_outcomes.POSTCHECK_TIMEOUT,
         }
 
 
