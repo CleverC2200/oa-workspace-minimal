@@ -259,6 +259,118 @@ def _run_read_only_reviews(
     )
 
 
+def _aggregate_codex_events(values: list[dict]) -> dict:
+    counts: Counter[str] = Counter()
+    attempts = 0
+    attempts_known = True
+    recorded_attempts = 0
+    unknown_attempts = 0
+    recorded_workers = 0
+    for value in values:
+        events = value.get("codex_events") if isinstance(value, dict) else None
+        current_process_attempts = (
+            value.get("process_attempts") if isinstance(value, dict) else None
+        )
+        if (
+            not isinstance(current_process_attempts, int)
+            or isinstance(current_process_attempts, bool)
+            or current_process_attempts < 0
+        ):
+            attempts_known = False
+            continue
+        attempts += current_process_attempts
+        if not codex_review_worker._valid_events(
+            events,
+            attempts=current_process_attempts,
+        ):
+            unknown_attempts += current_process_attempts
+            continue
+        current_recorded = events.get("recorded_attempts")
+        current_unknown = events.get("unknown_attempts")
+        current_counts = events.get("counts")
+        if (
+            isinstance(current_recorded, int)
+            and not isinstance(current_recorded, bool)
+            and current_recorded >= 0
+        ):
+            recorded_attempts += current_recorded
+        if (
+            isinstance(current_unknown, int)
+            and not isinstance(current_unknown, bool)
+            and current_unknown >= 0
+        ):
+            unknown_attempts += current_unknown
+        if events.get("status") == "recorded":
+            recorded_workers += 1
+        if isinstance(current_counts, dict):
+            for event_type, count in current_counts.items():
+                if (
+                    isinstance(event_type, str)
+                    and isinstance(count, int)
+                    and not isinstance(count, bool)
+                    and count >= 0
+                ):
+                    counts[event_type] += count
+    workers = len(values)
+    status = (
+        "recorded"
+        if workers > 0 and recorded_workers == workers
+        else "unknown"
+    )
+    return {
+        "status": status,
+        "workers": workers,
+        "recorded_workers": recorded_workers,
+        "unknown_workers": workers - recorded_workers,
+        "attempts": attempts if attempts_known else None,
+        "recorded_attempts": recorded_attempts,
+        "unknown_attempts": unknown_attempts if attempts_known else None,
+        "counts": dict(sorted(counts.items())),
+    }
+
+
+def _merge_codex_event_summaries(summaries: list[dict]) -> dict:
+    counts: Counter[str] = Counter()
+    totals: Counter[str] = Counter()
+    count_fields = (
+        "workers",
+        "recorded_workers",
+        "unknown_workers",
+        "recorded_attempts",
+    )
+    attempts_known = True
+    for summary in summaries:
+        for field in count_fields:
+            value = summary.get(field)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                totals[field] += value
+        for field in ("attempts", "unknown_attempts"):
+            value = summary.get(field)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                totals[field] += value
+            else:
+                attempts_known = False
+        current_counts = summary.get("counts")
+        if isinstance(current_counts, dict):
+            for event_type, count in current_counts.items():
+                if isinstance(event_type, str) and isinstance(count, int):
+                    counts[event_type] += count
+    return {
+        "status": (
+            "recorded"
+            if totals["workers"] > 0
+            and totals["recorded_workers"] == totals["workers"]
+            else "unknown"
+        ),
+        **{field: totals[field] for field in count_fields},
+        "attempts": totals["attempts"] if attempts_known else None,
+        "unknown_attempts": (
+            totals["unknown_attempts"] if attempts_known else None
+        ),
+        "counts": dict(sorted(counts.items())),
+    }
+
+
 def run_read_only_probe(
     *,
     capacity: int,
@@ -295,7 +407,6 @@ def run_read_only_probe(
     error_counts: Counter[str] = Counter()
     process_states: Counter[str] = Counter()
     decision_states: Counter[str] = Counter()
-    event_counts: Counter[str] = Counter()
     exit_codes: Counter[str] = Counter()
     usage_statuses: Counter[str] = Counter()
     token_totals: Counter[str] = Counter()
@@ -317,11 +428,6 @@ def run_read_only_probe(
         decision_states[str(value.get("decision_state") or "unknown")] += 1
         exit_code = value.get("exit_code")
         exit_codes[str(exit_code) if isinstance(exit_code, int) else "none"] += 1
-        worker_events = value.get("event_counts")
-        if isinstance(worker_events, dict):
-            for event_type, count in worker_events.items():
-                if isinstance(event_type, str) and isinstance(count, int):
-                    event_counts[event_type] += count
         usage = value.get("token_usage")
         usage_status = usage.get("status") if isinstance(usage, dict) else None
         if usage_status not in {"recorded", "partial"}:
@@ -337,6 +443,15 @@ def run_read_only_probe(
                 count = usage.get(field)
                 if isinstance(count, int) and not isinstance(count, bool):
                     token_totals[field] += count
+    codex_events = _aggregate_codex_events(
+        [
+            outcome.value if isinstance(outcome.value, dict) else {}
+            for outcome in result.outcomes
+        ]
+    )
+    transient_error_events = codex_events["counts"].get("error")
+    if transient_error_events is None and codex_events["status"] == "recorded":
+        transient_error_events = 0
     return {
         "schema_version": 1,
         "kind": "preaudit_read_only_concurrency_probe",
@@ -352,8 +467,8 @@ def run_read_only_probe(
         "error_counts": dict(sorted(error_counts.items())),
         "process_states": dict(sorted(process_states.items())),
         "decision_states": dict(sorted(decision_states.items())),
-        "event_counts": dict(sorted(event_counts.items())),
-        "transient_error_events": event_counts["error"],
+        "codex_events": codex_events,
+        "transient_error_events": transient_error_events,
         "exit_codes": dict(sorted(exit_codes.items())),
         "model": codex_review_worker.MODEL,
         "reasoning_effort": codex_review_worker.REASONING_EFFORT,
@@ -434,8 +549,11 @@ def run_adaptive_read_only_probe(
                 "failed": int(wave.get("failed") or 0),
                 "timed_out": int(wave.get("timed_out") or 0),
                 "stopped": int(wave.get("stopped") or 0),
-                "transient_error_events": int(
-                    wave.get("transient_error_events") or 0
+                "transient_error_events": wave.get("transient_error_events"),
+                "codex_event_status": (
+                    wave.get("codex_events", {}).get("status")
+                    if isinstance(wave.get("codex_events"), dict)
+                    else "unknown"
                 ),
             },
             host=(
@@ -450,6 +568,16 @@ def run_adaptive_read_only_probe(
         if decision["action"] == "stop":
             status = "stopped"
             break
+    codex_events = _merge_codex_event_summaries(
+        [
+            wave["codex_events"]
+            for wave in waves
+            if isinstance(wave.get("codex_events"), dict)
+        ]
+    )
+    transient_error_events = codex_events["counts"].get("error")
+    if transient_error_events is None and codex_events["status"] == "recorded":
+        transient_error_events = 0
     return {
         "schema_version": 1,
         "kind": "preaudit_adaptive_read_only_probe",
@@ -464,6 +592,8 @@ def run_adaptive_read_only_probe(
         "completed": sum(int(wave.get("completed") or 0) for wave in waves),
         "failed": sum(int(wave.get("failed") or 0) for wave in waves),
         "token_usage": dict(token_totals),
+        "codex_events": codex_events,
+        "transient_error_events": transient_error_events,
         "production_write": False,
     }
 
@@ -1114,8 +1244,10 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
     process_attempts = 0
     process_retries = 0
     prepare_active_seconds = 0.0
+    worker_values: list[dict] = []
     for outcome in result.outcomes:
         value = outcome.value if isinstance(outcome.value, dict) else {}
+        worker_values.append(value)
         worker_status = value.get("status")
         if outcome.status == "completed" and worker_status == "completed":
             completed += 1
@@ -1145,6 +1277,10 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
                 count = usage.get(field)
                 if isinstance(count, int) and not isinstance(count, bool):
                     token_totals[field] += count
+    codex_events = _aggregate_codex_events(worker_values)
+    transient_error_events = codex_events["counts"].get("error")
+    if transient_error_events is None and codex_events["status"] == "recorded":
+        transient_error_events = 0
     return {
         "requested": result.requested,
         "started": result.started,
@@ -1167,6 +1303,8 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
         },
         "business_results": dict(sorted(business_results.items())),
         "error_counts": dict(sorted(error_counts.items())),
+        "codex_events": codex_events,
+        "transient_error_events": transient_error_events,
         "token_usage": {
             "status": (
                 "recorded"
@@ -1266,9 +1404,8 @@ def run_rolling_drain(
                     "failed": wave["failed"],
                     "timed_out": wave["timed_out"],
                     "stopped": wave["stopped"],
-                    "transient_error_events": sum(
-                        wave["error_counts"].values()
-                    ),
+                    "transient_error_events": wave["transient_error_events"],
+                    "codex_event_status": wave["codex_events"]["status"],
                 },
                 host=wave["runtime_health"],
             )
@@ -1303,6 +1440,12 @@ def run_rolling_drain(
         ):
             token_totals[field] += int(usage.get(field) or 0)
     completed = sum(wave["completed"] for wave in waves)
+    codex_events = _merge_codex_event_summaries(
+        [wave["codex_events"] for wave in waves]
+    )
+    transient_error_events = codex_events["counts"].get("error")
+    if transient_error_events is None and codex_events["status"] == "recorded":
+        transient_error_events = 0
     return {
         "schema_version": 1,
         "kind": "preaudit_production_rolling_drain",
@@ -1340,6 +1483,8 @@ def run_rolling_drain(
         "process_retries": sum(wave["process_retries"] for wave in waves),
         "business_results": dict(sorted(business_results.items())),
         "error_counts": dict(sorted(error_counts.items())),
+        "codex_events": codex_events,
+        "transient_error_events": transient_error_events,
         "token_usage": {
             "status": (
                 "recorded"

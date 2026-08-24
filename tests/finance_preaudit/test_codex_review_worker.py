@@ -335,11 +335,75 @@ def test_production_review_phase_returns_decision_without_completing_action(
     assert result["status"] == "reviewed"
     assert result["write_state"] == "not_requested"
     assert result["decision"] == decision
+    assert result["codex_events"] == {
+        "status": "unknown",
+        "attempts": 1,
+        "recorded_attempts": 0,
+        "unknown_attempts": 1,
+        "counts": {},
+    }
     assert json.loads(action_file.read_text(encoding="utf-8"))["action"] == (
         "review_required"
     )
     assert not action_file.with_name("agent-timing.json").exists()
     assert not action_file.with_name("execution-receipt.json").exists()
+
+
+def test_production_review_accumulates_retry_events_and_tokens(
+    tmp_path: Path,
+) -> None:
+    task, _action_file = _task(tmp_path)
+    executions = iter(
+        [
+            codex_review_worker.CodexExecution(
+                error_code="codex_process_failed",
+                token_usage={
+                    "status": "recorded",
+                    "input_tokens": 10,
+                    "cached_input_tokens": 2,
+                    "output_tokens": 1,
+                    "total_tokens": 11,
+                },
+                event_counts={"error": 1, "turn.completed": 1},
+                event_status="recorded",
+            ),
+            codex_review_worker.CodexExecution(
+                error_code=None,
+                token_usage={
+                    "status": "recorded",
+                    "input_tokens": 20,
+                    "cached_input_tokens": 5,
+                    "output_tokens": 3,
+                    "total_tokens": 23,
+                },
+                decision={"overall": "pass"},
+                event_counts={"turn.completed": 1},
+                event_status="recorded",
+            ),
+        ]
+    )
+
+    result = codex_review_worker.review(
+        task,
+        executor=lambda *_args: next(executions),
+    )
+
+    assert result["status"] == "reviewed"
+    assert result["process_attempts"] == 2
+    assert result["token_usage"] == {
+        "status": "recorded",
+        "input_tokens": 30,
+        "cached_input_tokens": 7,
+        "output_tokens": 4,
+        "total_tokens": 34,
+    }
+    assert result["codex_events"] == {
+        "status": "recorded",
+        "attempts": 2,
+        "recorded_attempts": 2,
+        "unknown_attempts": 0,
+        "counts": {"error": 1, "turn.completed": 2},
+    }
 
 
 def test_parent_completion_persists_timing_and_bound_receipt(
@@ -381,6 +445,13 @@ def test_parent_completion_persists_timing_and_bound_receipt(
             "process_attempts": 1,
             "agent_wall_seconds": 12,
             "token_usage": {"status": "unknown"},
+            "codex_events": {
+                "status": "recorded",
+                "attempts": 1,
+                "recorded_attempts": 1,
+                "unknown_attempts": 0,
+                "counts": {"turn.completed": 1},
+            },
             "decision": decision,
         },
         completer=complete,
@@ -389,6 +460,7 @@ def test_parent_completion_persists_timing_and_bound_receipt(
 
     assert result["status"] == "completed"
     assert result["write_state"] == "submitted"
+    assert result["codex_events"]["counts"] == {"turn.completed": 1}
     timing = json.loads(
         action_file.with_name("agent-timing.json").read_text(encoding="utf-8")
     )
@@ -413,6 +485,81 @@ def test_usage_parser_reads_only_turn_completed_usage() -> None:
         "output_tokens": 30,
         "total_tokens": 150,
     }
+
+
+def test_event_status_rejects_missing_or_malformed_jsonl() -> None:
+    complete = io.StringIO('{"type":"turn.completed"}\n')
+    missing = io.StringIO('{"type":"error"}\n')
+    malformed = io.StringIO('{"type":"turn.completed"}\nnot-json\n')
+
+    assert codex_review_worker._event_status(
+        complete,
+        {"turn.completed": 1},
+    ) == "recorded"
+    assert codex_review_worker._event_status(missing, {"error": 1}) == "unknown"
+    assert codex_review_worker._event_status(
+        malformed,
+        {"turn.completed": 1},
+    ) == "unknown"
+
+
+def test_event_parser_sanitizes_unknown_event_types() -> None:
+    sensitive_type = "request-123-/internal/path"
+    stream = io.StringIO(
+        f'{{"type":"{sensitive_type}"}}\n{{"type":"turn.completed"}}\n'
+    )
+
+    counts = codex_review_worker._parse_event_counts(stream)
+
+    assert counts == {"other": 1, "turn.completed": 1}
+    assert sensitive_type not in repr(counts)
+    assert codex_review_worker._event_status(stream, counts) == "unknown"
+
+
+def test_parent_invalid_review_preserves_known_attempts_as_unknown_events(
+    tmp_path: Path,
+) -> None:
+    _task_value, action_file = _task(tmp_path)
+    stopped: list[bool] = []
+
+    result = codex_review_worker.complete_review_result(
+        action_file,
+        {
+            "status": "reviewed",
+            "process_attempts": 2,
+            "agent_wall_seconds": 12,
+            "token_usage": {"status": "unknown"},
+            "codex_events": {"status": "unknown"},
+            "decision": {"overall": "pass"},
+        },
+        request_stop=lambda: stopped.append(True),
+    )
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "codex_review_result_invalid"
+    assert result["process_attempts"] == 2
+    assert result["process_retries"] == 1
+    assert result["codex_events"] == {
+        "status": "unknown",
+        "attempts": 2,
+        "recorded_attempts": 0,
+        "unknown_attempts": 2,
+        "counts": {},
+    }
+    assert stopped == [True]
+
+
+def test_event_contract_rejects_recorded_attempt_without_completed_event() -> None:
+    assert not codex_review_worker._valid_events(
+        {
+            "status": "recorded",
+            "attempts": 1,
+            "recorded_attempts": 1,
+            "unknown_attempts": 0,
+            "counts": {},
+        },
+        attempts=1,
+    )
 
 
 def test_host_completion_does_not_add_a_second_writer_lock(
@@ -506,6 +653,7 @@ def test_read_only_worker_returns_structured_decision_without_completion(
             process_state="exited",
             decision_state="valid_object",
             event_counts={"turn.completed": 1},
+            event_status="recorded",
             exit_code=0,
         ),
     )
@@ -523,7 +671,13 @@ def test_read_only_worker_returns_structured_decision_without_completion(
         "process_retries": 0,
         "process_state": "exited",
         "decision_state": "valid_object",
-        "event_counts": {"turn.completed": 1},
+        "codex_events": {
+            "status": "recorded",
+            "attempts": 1,
+            "recorded_attempts": 1,
+            "unknown_attempts": 0,
+            "counts": {"turn.completed": 1},
+        },
         "exit_code": 0,
         "token_usage": {
             "status": "recorded",

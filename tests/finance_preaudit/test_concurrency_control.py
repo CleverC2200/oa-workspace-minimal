@@ -12,7 +12,7 @@ HEALTHY = {
 }
 
 
-def _wave(**changes: int) -> dict:
+def _wave(**changes: object) -> dict:
     wave = {
         "requested": 20,
         "completed": 20,
@@ -20,6 +20,7 @@ def _wave(**changes: int) -> dict:
         "timed_out": 0,
         "stopped": 0,
         "transient_error_events": 0,
+        "codex_event_status": "recorded",
     }
     wave.update(changes)
     return wave
@@ -101,6 +102,25 @@ def test_transient_errors_or_unknown_host_hold_without_upgrade() -> None:
     assert unknown["action"] == "hold"
     assert unknown["healthy_windows"] == 0
     assert unknown["reason"] == "host_health_unknown"
+
+
+def test_unknown_codex_events_reset_healthy_window() -> None:
+    decision = concurrency_control.decide_capacity(
+        current_capacity=8,
+        healthy_windows=1,
+        wave=_wave(
+            transient_error_events=None,
+            codex_event_status="unknown",
+        ),
+        host=HEALTHY,
+    )
+
+    assert decision == {
+        "action": "hold",
+        "next_capacity": 8,
+        "healthy_windows": 0,
+        "reason": "codex_events_unknown",
+    }
 
 
 def test_local_health_is_sanitized_and_classifies_memory_pressure() -> None:
