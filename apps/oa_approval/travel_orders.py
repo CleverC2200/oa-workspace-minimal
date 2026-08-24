@@ -37,8 +37,8 @@ TRIP_ATTACHMENT_API_PATHS = {
 TRIP_EXPENSE_API_PATH = "/fcecf/fcc/pcapi/COMM_B2G_LoadBxmxList"
 HOTEL_ORDER_DETAIL_PATH = "/hotel/fcc/hotel/order/b2ghotelzcd/getOrderDetail"
 TRAVEL_ATTACHMENT_DISCOVERY_FAILED_CODE = "travel_attachment_discovery_failed"
-DEFAULT_TRAVEL_BROWSER_CAPACITY = 1
-MAX_TRAVEL_BROWSER_CAPACITY = 2
+DEFAULT_TRAVEL_BROWSER_CAPACITY = 2
+MAX_TRAVEL_BROWSER_CAPACITY = 8
 
 
 def _travel_browser_capacity() -> int:

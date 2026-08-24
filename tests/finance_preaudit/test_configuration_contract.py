@@ -301,3 +301,4 @@ class TestConfigurationContract:
         )
 
         assert sorted(name for name in names if name not in implementation) == []
+        assert "OA_TRAVEL_BROWSER_CAPACITY=2" in template

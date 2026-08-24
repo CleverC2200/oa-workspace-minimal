@@ -486,8 +486,12 @@ class TestReadAdaptersContract:
             ("visible-browser", 1),
         ]
 
-    def test_travel_browser_paths_use_separate_global_resource_slots(self) -> None:
+    def test_travel_browser_paths_use_separate_global_resource_slots(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         calls: list[tuple[str, int]] = []
+        monkeypatch.delenv("OA_TRAVEL_BROWSER_CAPACITY", raising=False)
 
         @contextmanager
         def recorded_acquire(
@@ -524,10 +528,26 @@ class TestReadAdaptersContract:
                 storage_state={},
                 headless=False,
             )
+            monkeypatch.setenv("OA_TRAVEL_BROWSER_CAPACITY", "6")
+            travel_orders._read_browser_trip_candidates(
+                ["https://travel.example.com/recorded"],
+                timeout_sec=5,
+                storage_state={},
+                headless=True,
+            )
+            monkeypatch.setenv("OA_TRAVEL_BROWSER_CAPACITY", "999")
+            travel_orders._read_browser_trip_candidates(
+                ["https://travel.example.com/recorded"],
+                timeout_sec=5,
+                storage_state={},
+                headless=True,
+            )
 
         assert calls == [
             ("travel-browser", travel_orders.DEFAULT_TRAVEL_BROWSER_CAPACITY),
             ("visible-browser", 1),
+            ("travel-browser", 6),
+            ("travel-browser", 8),
         ]
 
     def test_identical_attachment_resource_is_downloaded_once(self) -> None:
