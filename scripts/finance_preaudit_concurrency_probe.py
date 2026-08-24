@@ -37,8 +37,7 @@ ReviewCompleter = Callable[[Path, dict], dict]
 ExecutorFactory = Callable[[int], object]
 QUARANTINED_REASONS = {
     "material_collection_failed",
-    "writer_result_unknown",
-    *writer_outcomes.FAILURE_CODES,
+    *writer_outcomes.CONFIRMED_NO_WRITE_CODES,
 }
 
 
@@ -196,6 +195,11 @@ def _prepare_one(_workflow_key: str) -> dict:
                     "error_code": "production_probe_prepare_failed",
                 }
             break
+        if runtime_control.stop_requested():
+            return {
+                "action": "failed",
+                "error_code": "production_probe_stopped",
+            }
         if action.get("action") == "review_required":
             return {
                 "action": "review_required",
@@ -227,8 +231,7 @@ def _prepare_one(_workflow_key: str) -> dict:
         try:
             runtime_control.request_stop(error_code)
         except ValueError:
-            error_code = "production_probe_prepare_failed"
-            runtime_control.request_stop(error_code)
+            runtime_control.request_stop()
         return {
             "action": str(action.get("action") or "failed"),
             "error_code": error_code,

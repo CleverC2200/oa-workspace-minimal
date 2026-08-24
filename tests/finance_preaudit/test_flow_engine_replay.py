@@ -125,6 +125,64 @@ def test_confirmed_material_failure_creates_fresh_attempt_only_after_live_check(
     assert new_state["attempt"] == 2
 
 
+def test_quarantined_candidate_does_not_mask_later_review_required(
+    tmp_path: Path,
+) -> None:
+    candidates = _candidates(("first-request", "second-request"))
+    first_engine = _engine(
+        tmp_path,
+        candidates=[candidates[0]],
+        collect_material=lambda _request_id, _root: (_ for _ in ()).throw(
+            RuntimeError("oa_run_stopped")
+        ),
+    )
+    failed = first_engine.next_action("travel_expense")
+    second_engine = _engine(tmp_path, candidates=[candidates[1]])
+    review = second_engine.next_action("travel_expense")
+
+    resumed = _engine(tmp_path, candidates=candidates).next_action(
+        "travel_expense"
+    )
+
+    assert failed["action"] == "needs_admin"
+    assert failed["reason"] == "material_collection_failed"
+    assert review["action"] == "review_required"
+    assert resumed["action"] == "review_required"
+    assert resumed["action_file"] == review["action_file"]
+
+
+def test_unknown_writer_result_blocks_later_review_required(
+    tmp_path: Path,
+) -> None:
+    candidates = _candidates(("first-request", "second-request"))
+    first = _engine(tmp_path, candidates=[candidates[0]]).next_action(
+        "travel_expense"
+    )
+    later = _engine(tmp_path, candidates=[candidates[1]]).next_action(
+        "travel_expense"
+    )
+    for path in (Path(first["action_file"]), Path(first["state_file"])):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.update(
+            {
+                "action": "needs_admin",
+                "execution_state": "needs_admin",
+                "write_state": "unknown",
+                "reason": "writer_result_unknown",
+            }
+        )
+        json_artifact.write_json_atomic(path, payload)
+
+    blocked = _engine(tmp_path, candidates=[candidates[1]]).next_action(
+        "travel_expense"
+    )
+
+    assert later["action"] == "review_required"
+    assert blocked["action"] == "needs_admin"
+    assert blocked["reason"] == "writer_result_unknown"
+    assert blocked["action_file"] == first["action_file"]
+
+
 def test_validated_historical_authorization_failure_can_be_skipped(
     tmp_path: Path,
 ) -> None:
@@ -723,7 +781,7 @@ def test_shared_authorization_failure_stops_flow_but_item_failure_does_not(
     assert collected == ["request-a", "request-a"]
 
 
-def test_unknown_write_stops_only_its_item(tmp_path: Path) -> None:
+def test_unknown_write_blocks_later_items(tmp_path: Path) -> None:
     rows = _candidates(("request-a", "request-b"))
     calls: list[dict] = []
     engine = _engine(
@@ -741,8 +799,9 @@ def test_unknown_write_stops_only_its_item(tmp_path: Path) -> None:
     second = engine.next_action("travel_expense")
 
     assert unknown["write_state"] == "unknown"
-    assert second["action"] == "review_required"
-    assert second["case_key"] != first["case_key"]
+    assert second["action"] == "needs_admin"
+    assert second["reason"] == "writer_result_unknown"
+    assert second["case_key"] == first["case_key"]
     assert len(calls) == 1
 
 

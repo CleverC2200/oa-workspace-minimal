@@ -391,8 +391,8 @@ def test_prepare_skips_quarantined_item_without_global_stop(
         [
             {
                 "action": "needs_admin",
-                "reason": "writer_result_unknown",
-                "write_state": "unknown",
+                "reason": "writer_preflight_failed",
+                "write_state": "not_requested",
             },
             {
                 "action": "review_required",
@@ -439,6 +439,61 @@ def test_prepare_skips_quarantined_item_without_global_stop(
     assert stop_requests == []
 
 
+def test_prepare_stops_on_unknown_write_result(monkeypatch) -> None:
+    calls = 0
+    stop_requests: list[str | None] = []
+
+    class Engine:
+        def next_action(self, *_args, **_kwargs) -> dict:
+            nonlocal calls
+            calls += 1
+            return {
+                "action": "needs_admin",
+                "reason": "writer_result_unknown",
+                "write_state": "unknown",
+            }
+
+    def request_stop(reason=None) -> None:
+        stop_requests.append(reason)
+        if reason is not None:
+            raise ValueError("stop_reason_invalid")
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.cli,
+        "_live_flow_engine",
+        lambda *, controlled: Engine(),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        request_stop,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantine_count",
+        lambda: 1,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_historical_write_authorization_failures",
+        frozenset,
+    )
+
+    assert finance_preaudit_concurrency_probe._prepare_one(
+        "travel_expense"
+    ) == {
+        "action": "needs_admin",
+        "error_code": "writer_result_unknown",
+    }
+    assert calls == 1
+    assert stop_requests == ["writer_result_unknown", None]
+
+
 def test_prepare_extends_skip_budget_when_new_item_is_quarantined(
     monkeypatch,
 ) -> None:
@@ -446,8 +501,8 @@ def test_prepare_extends_skip_budget_when_new_item_is_quarantined(
         [
             {
                 "action": "needs_admin",
-                "reason": "writer_result_unknown",
-                "write_state": "unknown",
+                "reason": "writer_preflight_failed",
+                "write_state": "not_requested",
             },
             {
                 "action": "needs_admin",

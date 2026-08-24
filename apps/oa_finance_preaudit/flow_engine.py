@@ -143,6 +143,10 @@ SHARED_FAILURE_CODES = {
     "write_authorization_invalid",
 }
 _WRITER_FAILURE_CODES = writer_outcomes.FAILURE_CODES
+_CONTINUABLE_QUARANTINE_CODES = {
+    "material_collection_failed",
+    *writer_outcomes.CONFIRMED_NO_WRITE_CODES,
+}
 
 
 CandidateSource = Callable[[str], Iterable[dict]]
@@ -1486,13 +1490,7 @@ class FlowEngine:
                 and _exclusive_lock_active(attempt_root / "complete.lock")
             ):
                 raise ValueError("completion_in_progress")
-            if (
-                state.get("write_state") == "submitting"
-                or (
-                    include_open
-                    and state.get("write_state") == "unknown"
-                )
-            ):
+            if state.get("write_state") in {"submitting", "unknown"}:
                 unsafe.append((attempt_root, state))
                 continue
             try:
@@ -2176,6 +2174,7 @@ class FlowEngine:
                 path.parent.name: path for path in latest_attempts
             }
             first_active: Path | None = None
+            first_quarantined: Path | None = None
             first_terminal: Path | None = None
             selected: dict | None = None
             for candidate in candidates:
@@ -2213,6 +2212,24 @@ class FlowEngine:
                         )
                     ):
                         return self._recover_completion(latest, state)
+                    if (
+                        state.get("execution_state") == "needs_admin"
+                        and state.get("write_state") == "unknown"
+                    ):
+                        return self._resume_active_action(
+                            workflow_root,
+                            case_key=latest.parent.name,
+                        ) or self._persist_attempt_needs_admin(
+                            latest / "action.json",
+                            "persistent_state_invalid",
+                        )
+                    if (
+                        state.get("execution_state") == "needs_admin"
+                        and state.get("reason")
+                        in _CONTINUABLE_QUARANTINE_CODES
+                    ):
+                        first_quarantined = first_quarantined or latest
+                        continue
                     if (
                         state.get("execution_state") == "needs_admin"
                         and state.get("reason") in SHARED_FAILURE_CODES
@@ -2260,6 +2277,8 @@ class FlowEngine:
                 break
 
             if selected is None:
+                if first_active is None and first_quarantined is not None:
+                    first_active = first_quarantined
                 if not candidates:
                     for latest in latest_attempts:
                         if (
