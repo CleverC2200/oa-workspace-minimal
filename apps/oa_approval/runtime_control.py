@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import os
 from pathlib import Path
+import re
 import stat
 from typing import Iterator
 
@@ -13,6 +14,14 @@ STOP_CODE = "oa_run_stopped"
 GLOBAL_WRITER_KEY = "finance-preaudit-global-writer"
 GLOBAL_CONTROLLER_KEY = "finance-preaudit-rolling-controller"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_STOP_REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_ALLOWED_STOP_REASONS = frozenset(
+    {
+        "production_probe_prepare_failed",
+        "production_probe_renew_failed",
+        "write_authorization_invalid",
+    }
+)
 
 
 def stop_file() -> Path:
@@ -27,19 +36,46 @@ def stop_requested() -> bool:
     return raw in {"1", "true", "yes", "y", "on"} or stop_file().exists()
 
 
-def request_stop() -> None:
+def request_stop(reason: str | None = None) -> None:
+    if reason is not None and (
+        _STOP_REASON.fullmatch(reason) is None
+        or reason not in _ALLOWED_STOP_REASONS
+    ):
+        raise ValueError("stop_reason_invalid")
     target = stop_file().expanduser()
     if not target.is_absolute():
         target = PROJECT_ROOT / target
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    descriptor = os.open(target, flags, 0o600)
     try:
-        os.write(descriptor, b"stop_requested\n")
+        descriptor = os.open(target, flags, 0o600)
+    except FileExistsError:
+        return
+    try:
+        payload = (
+            "stop_requested\n"
+            if reason is None
+            else f"stop_requested:{reason}\n"
+        )
+        os.write(descriptor, payload.encode("ascii"))
     finally:
         os.close(descriptor)
+
+
+def stop_reason() -> str | None:
+    target = stop_file().expanduser()
+    if target.is_symlink() or not target.is_file():
+        return None
+    try:
+        payload = target.read_bytes()
+    except OSError:
+        return None
+    for reason in _ALLOWED_STOP_REASONS:
+        if payload == f"stop_requested:{reason}\n".encode("ascii"):
+            return reason
+    return None
 
 
 def stop_error(

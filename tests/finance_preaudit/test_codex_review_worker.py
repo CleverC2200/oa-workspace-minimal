@@ -899,6 +899,62 @@ def test_global_stop_request_is_visible_to_all_workers(
     assert stop_file.stat().st_mode & 0o777 == 0o600
 
 
+def test_global_stop_preserves_first_sanitized_reason(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stop_file = tmp_path / "control" / "stop.flag"
+    monkeypatch.setenv("OA_FINANCE_PREAUDIT_STOP_FILE", str(stop_file))
+
+    runtime_control.request_stop("production_probe_prepare_failed")
+    runtime_control.request_stop("production_probe_renew_failed")
+
+    assert runtime_control.stop_requested() is True
+    assert runtime_control.stop_reason() == "production_probe_prepare_failed"
+    assert (
+        stop_file.read_text(encoding="utf-8")
+        == "stop_requested:production_probe_prepare_failed\n"
+    )
+
+
+def test_global_stop_rejects_unlisted_reason(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stop_file = tmp_path / "control" / "stop.flag"
+    monkeypatch.setenv("OA_FINANCE_PREAUDIT_STOP_FILE", str(stop_file))
+
+    with pytest.raises(ValueError, match="stop_reason_invalid"):
+        runtime_control.request_stop("unexpected_reason")
+
+    assert not stop_file.exists()
+
+
+def test_global_stop_reason_rejects_tampered_or_symlinked_content(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stop_file = tmp_path / "control" / "stop.flag"
+    stop_file.parent.mkdir(parents=True)
+    monkeypatch.setenv("OA_FINANCE_PREAUDIT_STOP_FILE", str(stop_file))
+    stop_file.write_text(
+        "stop_requested:production_probe_prepare_failed \n",
+        encoding="ascii",
+    )
+
+    assert runtime_control.stop_reason() is None
+
+    outside = tmp_path / "outside-stop.flag"
+    outside.write_text(
+        "stop_requested:production_probe_prepare_failed\n",
+        encoding="ascii",
+    )
+    stop_file.unlink()
+    stop_file.symlink_to(outside)
+
+    assert runtime_control.stop_reason() is None
+
+
 def test_read_only_worker_returns_structured_decision_without_completion(
     tmp_path: Path,
 ) -> None:

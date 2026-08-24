@@ -419,7 +419,7 @@ def test_prepare_skips_quarantined_item_without_global_stop(
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.runtime_control,
         "request_stop",
-        lambda: stop_requests.append(True),
+        lambda _reason=None: stop_requests.append(True),
     )
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe,
@@ -464,7 +464,7 @@ def test_prepare_stops_on_new_write_authorization_failure(monkeypatch) -> None:
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.runtime_control,
         "request_stop",
-        lambda: stop_requests.append(True),
+        lambda _reason=None: stop_requests.append(True),
     )
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe,
@@ -518,7 +518,7 @@ def test_prepare_skips_exact_historical_write_authorization_failure(
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.runtime_control,
         "request_stop",
-        lambda: stop_requests.append(True),
+        lambda _reason=None: stop_requests.append(True),
     )
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe,
@@ -561,7 +561,7 @@ def test_prepare_requests_stop_when_next_action_raises(monkeypatch) -> None:
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.runtime_control,
         "request_stop",
-        lambda: stop_requests.append(True),
+        lambda _reason=None: stop_requests.append(True),
     )
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe,

@@ -105,7 +105,7 @@ def _renew_actions(action_files: list[Path]) -> list[Path]:
                     case_key=case_key,
                 )
         except Exception as error:
-            runtime_control.request_stop()
+            runtime_control.request_stop("production_probe_renew_failed")
             raise ValueError("production_probe_renew_failed") from error
         if (
             current is None
@@ -113,7 +113,7 @@ def _renew_actions(action_files: list[Path]) -> list[Path]:
             or current.get("action_file") != str(action_file)
             or current.get("write_state") != "authorized"
         ):
-            runtime_control.request_stop()
+            runtime_control.request_stop("production_probe_renew_failed")
             raise ValueError("production_probe_renew_failed")
         renewed.append(action_file)
     return renewed
@@ -152,7 +152,7 @@ def _prepare_one(_workflow_key: str) -> dict:
             _historical_write_authorization_failures()
         )
     except ValueError:
-        runtime_control.request_stop()
+        runtime_control.request_stop("production_probe_prepare_failed")
         return {
             "action": "failed",
             "error_code": "production_probe_prepare_failed",
@@ -173,7 +173,7 @@ def _prepare_one(_workflow_key: str) -> dict:
                 ),
             )
         except Exception:
-            runtime_control.request_stop()
+            runtime_control.request_stop("production_probe_prepare_failed")
             return {
                 "action": "failed",
                 "error_code": "production_probe_prepare_failed",
@@ -190,12 +190,17 @@ def _prepare_one(_workflow_key: str) -> dict:
             )
         ):
             continue
-        runtime_control.request_stop()
+        error_code = str(
+            action.get("reason") or "production_probe_prepare_failed"
+        )
+        try:
+            runtime_control.request_stop(error_code)
+        except ValueError:
+            error_code = "production_probe_prepare_failed"
+            runtime_control.request_stop(error_code)
         return {
             "action": str(action.get("action") or "failed"),
-            "error_code": str(
-                action.get("reason") or "production_probe_prepare_failed"
-            ),
+            "error_code": error_code,
         }
     return {
         "action": "failed",
