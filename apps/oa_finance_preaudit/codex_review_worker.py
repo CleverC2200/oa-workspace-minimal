@@ -12,7 +12,7 @@ import time
 from typing import Callable, TextIO
 
 from apps import json_artifact
-from apps.oa_approval import runtime_control
+from apps.oa_approval import runtime_control, writer_outcomes
 
 
 MODEL = "gpt-5.6-terra"
@@ -28,6 +28,12 @@ _EVENT_TYPES = frozenset(
     }
 )
 _SANITIZED_EVENT_TYPES = _EVENT_TYPES | {"other"}
+_COMPLETION_FAILURE_CODES = writer_outcomes.FAILURE_CODES | {
+    "writer_result_unknown",
+}
+_UNKNOWN_WRITE_FAILURE_CODES = _COMPLETION_FAILURE_CODES - {
+    writer_outcomes.SUBMIT_REJECTED,
+}
 
 
 @dataclass(frozen=True)
@@ -551,6 +557,9 @@ def _complete_decision(action_file: Path, decision: dict) -> str | None:
             and result.get("write_state") == "submitted"
         ):
             runtime_control.request_stop()
+            reason = result.get("reason")
+            if reason in _COMPLETION_FAILURE_CODES:
+                return str(reason)
             return "codex_decision_submit_incomplete"
     return None
 
@@ -910,7 +919,11 @@ def complete_review_result(
             "status": "failed",
             "execution_state": "failed",
             "business_state": "not_available",
-            "write_state": "not_requested",
+            "write_state": (
+                "unknown"
+                if code in _UNKNOWN_WRITE_FAILURE_CODES
+                else "not_requested"
+            ),
             "error_code": code,
         }
 
