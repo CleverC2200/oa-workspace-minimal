@@ -846,6 +846,8 @@ def _run_dispatched_tasks(
     next_heartbeat = time.monotonic()
     preparation: tuple[Future[dict], int, float] | None = None
     preparation_stop_deadline: float | None = None
+    preparation_deferred = False
+    unblocked_duplicate_retries = 0
     prepare_action = prepare_action or _prepare_one
     prepare_executor = _preparation_executor()
     prepare_executor_terminated = False
@@ -1104,10 +1106,37 @@ def _run_dispatched_tasks(
                         break
                     else:
                         action_file = Path(str(prepared["action_file"])).resolve()
-                        if (
-                            action_file in assigned
-                            or runtime_control.stop_requested()
-                        ):
+                        if action_file in assigned:
+                            next_index -= 1
+                            if futures:
+                                preparation_deferred = True
+                            else:
+                                unblocked_duplicate_retries += 1
+                                if unblocked_duplicate_retries > 1:
+                                    outcomes[index] = process_pool.TaskOutcome(
+                                        index=index,
+                                        status="completed",
+                                        value={
+                                            "status": "failed",
+                                            "business_state": "not_available",
+                                            "error_code": (
+                                                "production_probe_duplicate_action"
+                                            ),
+                                            "prepare_elapsed_seconds": (
+                                                prepare_elapsed
+                                            ),
+                                            "process_attempts": 0,
+                                            "process_retries": 0,
+                                            "token_usage": {
+                                                "status": "unknown"
+                                            },
+                                        },
+                                    )
+                                    halted = True
+                                    runtime_control.request_stop()
+                                    stop_reviews()
+                                    break
+                        elif runtime_control.stop_requested():
                             outcomes[index] = process_pool.TaskOutcome(
                                 index=index,
                                 status="stopped",
@@ -1117,6 +1146,7 @@ def _run_dispatched_tasks(
                             halted = True
                             runtime_control.request_stop()
                         else:
+                            unblocked_duplicate_retries = 0
                             assigned.add(action_file)
                             task = {
                                 "project_root": str(root),
@@ -1137,6 +1167,7 @@ def _run_dispatched_tasks(
                 and preparation is None
                 and next_index < count
                 and len(futures) < capacity
+                and not preparation_deferred
             ):
                 prepare_started = time.monotonic()
                 available = [
@@ -1229,6 +1260,8 @@ def _run_dispatched_tasks(
                 timeout=min(1.0, heartbeat_interval_sec, task_timeout_sec / 4),
                 return_when=FIRST_COMPLETED,
             )
+            if done:
+                preparation_deferred = False
             if runtime_control.stop_requested() and preparation is not None:
                 halted = True
                 harvest_stopped_reviews(done)

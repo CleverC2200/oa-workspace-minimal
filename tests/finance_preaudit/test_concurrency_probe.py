@@ -2232,6 +2232,190 @@ def test_dispatcher_preserves_prepare_failure_when_stop_races_review_completion(
     assert harvested.value["process_attempts"] == 1
 
 
+def test_dispatcher_treats_assigned_prepare_result_as_review_backpressure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stopped = False
+    duplicate_returned = threading.Event()
+    preparation_calls = 0
+    completions: list[Path] = []
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    first_action = _open_action(
+        flow_root,
+        case_key="assigned-first",
+        created_at="2026-08-25T01:02:00+00:00",
+    )
+
+    def prepare(_workflow: str) -> dict:
+        nonlocal preparation_calls
+        preparation_calls += 1
+        if preparation_calls == 1:
+            duplicate_returned.set()
+            action_file = first_action
+        else:
+            action_file = _open_action(
+                flow_root,
+                case_key="assigned-second",
+                created_at="2026-08-25T01:03:00+00:00",
+            )
+        return {
+            "action": "review_required",
+            "action_file": str(action_file),
+        }
+
+    def review(task: dict) -> dict:
+        if Path(task["action_file"]) == first_action:
+            assert duplicate_returned.wait(timeout=1)
+        return {
+            "status": "reviewed",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "process_attempts": 1,
+            "process_retries": 0,
+            "token_usage": {"status": "unknown"},
+            "agent_wall_seconds": 1,
+            "decision": {"overall": "needs_human"},
+        }
+
+    def request_stop() -> None:
+        nonlocal stopped
+        stopped = True
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_preparation_executor",
+        lambda: ThreadPoolExecutor(max_workers=1),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: stopped,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        request_stop,
+    )
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        2,
+        2,
+        project_root=tmp_path,
+        renew_actions=lambda paths: paths,
+        prepare_action=prepare,
+        review_worker=review,
+        complete_review=lambda action, _reviewed: completions.append(action)
+        or {
+            "status": "completed",
+            "business_state": "needs_human",
+            "write_state": "submitted",
+        },
+        executor_factory=lambda capacity: ThreadPoolExecutor(
+            max_workers=capacity
+        ),
+        heartbeat_interval_sec=0.005,
+        runtime_status=lambda: {"status": "healthy"},
+    )
+
+    assert stopped is False
+    assert preparation_calls == 2
+    assert len(completions) == 2
+    assert completions[0] == first_action
+    assert completions[1] != first_action
+    assert result.completed == 2
+    assert result.failed == 0
+    assert result.stopped == 0
+
+
+def test_dispatcher_bounds_repeated_assigned_result_without_active_review(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stopped = False
+    duplicate_returned = threading.Event()
+    preparation_calls = 0
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    action_file = _open_action(
+        flow_root,
+        case_key="assigned-repeated",
+        created_at="2026-08-25T01:04:00+00:00",
+    )
+
+    def prepare(_workflow: str) -> dict:
+        nonlocal preparation_calls
+        preparation_calls += 1
+        duplicate_returned.set()
+        if preparation_calls >= 4:
+            return {
+                "action": "failed",
+                "error_code": "unbounded_duplicate_test_guard",
+            }
+        return {
+            "action": "review_required",
+            "action_file": str(action_file),
+        }
+
+    def review(_task: dict) -> dict:
+        assert duplicate_returned.wait(timeout=1)
+        time.sleep(0.05)
+        return {
+            "status": "reviewed",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "process_attempts": 1,
+            "process_retries": 0,
+            "token_usage": {"status": "unknown"},
+            "agent_wall_seconds": 1,
+            "decision": {"overall": "needs_human"},
+        }
+
+    def request_stop() -> None:
+        nonlocal stopped
+        stopped = True
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_preparation_executor",
+        lambda: ThreadPoolExecutor(max_workers=1),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: stopped,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        request_stop,
+    )
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        2,
+        2,
+        project_root=tmp_path,
+        renew_actions=lambda paths: paths,
+        prepare_action=prepare,
+        review_worker=review,
+        complete_review=lambda _action, _reviewed: {
+            "status": "completed",
+            "business_state": "needs_human",
+            "write_state": "submitted",
+        },
+        executor_factory=lambda capacity: ThreadPoolExecutor(
+            max_workers=capacity
+        ),
+        heartbeat_interval_sec=0.005,
+        runtime_status=lambda: {"status": "healthy"},
+    )
+
+    assert preparation_calls == 3
+    assert stopped is True
+    assert result.outcomes[1].value["error_code"] == (
+        "production_probe_duplicate_action"
+    )
+
+
 def test_dispatcher_harvests_review_done_before_prepare_failure_is_processed(
     tmp_path: Path,
     monkeypatch,
