@@ -126,7 +126,20 @@ def _runtime_root(value: Path | None) -> Path:
     )
 
 
-def _live_flow_engine(*, controlled: bool = False) -> flow_engine.FlowEngine:
+def _live_pending_identities() -> list[dict]:
+    configs = legacy_flow.load_all_configs()
+    oa_api = legacy_api.build_api(configs[0])
+    return production_pending.identify_pending_rows(
+        oa_api.pending_rows(page_size=200, max_pages=100),
+        configs,
+    )
+
+
+def _live_flow_engine(
+    *,
+    controlled: bool = False,
+    selected_identity: tuple[str, str] | None = None,
+) -> flow_engine.FlowEngine:
     configs = legacy_flow.load_all_configs()
     oa_api = legacy_api.build_api(configs[0])
 
@@ -142,6 +155,11 @@ def _live_flow_engine(*, controlled: bool = False) -> flow_engine.FlowEngine:
             for item in identities
             if item["support_status"] == "supported"
             and item["flow_key"] == workflow_key
+            and (
+                selected_identity is None
+                or (item["requestId"], item["received_at"])
+                == selected_identity
+            )
         ]
 
     def collect(request_id: str, attempt_root: Path) -> dict:
@@ -173,7 +191,10 @@ def _live_reconciliation(
     root: Path,
     *,
     workflow_key: str | None = None,
+    workflow_keys: frozenset[str] | None = None,
 ) -> dict:
+    if workflow_key is not None and workflow_keys is not None:
+        raise ValueError("runtime_reconciliation_invalid")
     configs = legacy_flow.load_all_configs()
     oa_api = legacy_api.build_api(configs[0])
     pending = production_pending.identify_pending_rows(
@@ -183,7 +204,9 @@ def _live_reconciliation(
     selected = [
         item
         for item in pending
-        if workflow_key is None or item["flow_key"] == workflow_key
+        if item["support_status"] == "supported"
+        and (workflow_key is None or item["flow_key"] == workflow_key)
+        and (workflow_keys is None or item["flow_key"] in workflow_keys)
     ]
     return reconciliation.reconcile(
         root,

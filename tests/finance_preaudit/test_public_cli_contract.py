@@ -80,6 +80,130 @@ def test_status_reconciliation_stays_read_only_inside_status_command(
     assert json.loads(output.getvalue())["reconciliation"]["read_only"] is True
 
 
+def test_live_global_reconciliation_excludes_unsupported_pending(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    configs = [
+        {
+            "flow_key": "travel_expense",
+            "workflow_id": "supported-workflow",
+            "workflow_name": "supported",
+        }
+    ]
+
+    class API:
+        def pending_rows(self, **_kwargs) -> list[dict]:
+            return [
+                {
+                    "request_id": "supported-request",
+                    "received_at": "2026-08-25T08:00:00+08:00",
+                    "workflow_id": "supported-workflow",
+                    "workflow_name": "supported",
+                },
+                {
+                    "request_id": "unsupported-request",
+                    "received_at": "2026-08-25T07:00:00+08:00",
+                    "workflow_id": "unsupported-workflow",
+                    "workflow_name": "unsupported",
+                },
+            ]
+
+        def handled_rows(self, **_kwargs) -> list[dict]:
+            return []
+
+    captured: list[list[dict]] = []
+    monkeypatch.setattr(
+        cli.legacy_flow,
+        "load_all_configs",
+        lambda: configs,
+    )
+    monkeypatch.setattr(
+        cli.legacy_api,
+        "build_api",
+        lambda _config: API(),
+    )
+    monkeypatch.setattr(
+        cli.reconciliation,
+        "reconcile",
+        lambda _root, *, pending_rows, handled_rows, workflow_key: (
+            captured.append(pending_rows)
+            or {
+                "handled_rows": handled_rows,
+                "workflow_key": workflow_key,
+            }
+        ),
+    )
+
+    cli._live_reconciliation(tmp_path)
+
+    assert captured == [
+        [
+            {
+                "request_id": "supported-request",
+                "received_at": "2026-08-25T08:00:00+08:00",
+            }
+        ]
+    ]
+
+
+def test_live_flow_engine_can_pin_discovery_to_global_fifo_identity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    configs = [
+        {
+            "flow_key": "travel_expense",
+            "workflow_id": "travel-workflow",
+            "workflow_name": "travel",
+        }
+    ]
+
+    class API:
+        def pending_rows(self, **_kwargs) -> list[dict]:
+            return [
+                {
+                    "request_id": "fifo-head",
+                    "received_at": "2026-08-25T08:00:00+08:00",
+                    "workflow_id": "travel-workflow",
+                    "workflow_name": "travel",
+                },
+                {
+                    "request_id": "newer-request",
+                    "received_at": "2026-08-25T09:00:00+08:00",
+                    "workflow_id": "travel-workflow",
+                    "workflow_name": "travel",
+                },
+            ]
+
+        def handled_rows(self, **_kwargs) -> list[dict]:
+            return []
+
+    monkeypatch.setenv("OA_FINANCE_PREAUDIT_FLOW_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        cli.legacy_flow,
+        "load_all_configs",
+        lambda: configs,
+    )
+    monkeypatch.setattr(
+        cli.legacy_api,
+        "build_api",
+        lambda _config: API(),
+    )
+
+    engine = cli._live_flow_engine(
+        selected_identity=("fifo-head", "2026-08-25T08:00:00+08:00")
+    )
+
+    assert engine._discover_candidates("travel_expense") == [
+        {
+            "request_id": "fifo-head",
+            "received_at": "2026-08-25T08:00:00+08:00",
+            "workflow_key": "travel_expense",
+        }
+    ]
+
+
 def test_status_live_check_fails_closed_without_configuration(
     tmp_path: Path,
 ) -> None:

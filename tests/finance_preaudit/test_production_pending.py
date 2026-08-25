@@ -86,3 +86,60 @@ def test_missing_or_duplicate_request_identity_is_rejected(
             [TRAVEL_CONFIG],
         )
 
+
+def test_actionable_fifo_orders_by_absolute_received_time_and_stable_key() -> None:
+    items = [
+        {
+            "requestId": "request-c",
+            "received_at": "2026-08-25T09:00:00+08:00",
+            "flow_key": "travel_expense",
+            "support_status": "supported",
+            "can_submit": True,
+        },
+        {
+            "requestId": "request-b",
+            "received_at": "2026-08-25T00:30:00Z",
+            "flow_key": "business_entertainment",
+            "support_status": "supported",
+            "can_submit": True,
+        },
+        {
+            "requestId": "request-a",
+            "received_at": "2026-08-25T08:30:00+08:00",
+            "flow_key": "business_support_fee",
+            "support_status": "supported",
+            "can_submit": True,
+        },
+        {
+            "requestId": "unsupported",
+            "received_at": "2026-08-24T00:00:00Z",
+            "flow_key": "",
+            "support_status": "unsupported_workflow",
+            "can_submit": False,
+        },
+        {
+            "requestId": "packaging-head",
+            "received_at": "2026-08-24T00:00:00Z",
+            "flow_key": "packaging_layout_approval",
+            "support_status": "supported",
+            "can_submit": True,
+        },
+    ]
+
+    ordered = production_pending.actionable_fifo(
+        items,
+        excluded_identities={
+            ("request-a", "2026-08-25T08:30:00+08:00")
+        },
+        allowed_workflows={
+            "travel_expense",
+            "business_entertainment",
+            "business_support_fee",
+            "small_marketing_fee",
+        },
+    )
+
+    assert [item["requestId"] for item in ordered] == [
+        "request-b",
+        "request-c",
+    ]

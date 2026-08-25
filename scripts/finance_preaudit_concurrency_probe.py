@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter, deque
+from collections import Counter
 from concurrent.futures import (
     FIRST_COMPLETED,
     Future,
@@ -26,6 +26,7 @@ from apps.oa_finance_preaudit import (
     controller_handoff,
     flow_engine,
     process_pool,
+    production_pending,
     reconciliation,
 )
 from apps.oa_finance_preaudit import runtime_doctor
@@ -35,7 +36,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RenewActions = Callable[[list[Path]], list[Path]]
 ReviewRunner = Callable[[list[dict], int], process_pool.PoolResult[dict]]
 PrepareRunner = Callable[[int], process_pool.PoolResult[dict]]
-PrepareAction = Callable[[str], dict]
+PrepareSelection = str | dict[str, object]
+PrepareAction = Callable[[PrepareSelection], dict]
 BatchRunner = Callable[..., dict]
 LiveStatus = Callable[[], dict]
 PipelineRunner = Callable[[int, int], process_pool.PoolResult[dict]]
@@ -46,6 +48,14 @@ QUARANTINED_REASONS = {
     "material_collection_failed",
     *writer_outcomes.CONFIRMED_NO_WRITE_CODES,
 }
+ROLLING_WORKFLOW_KEYS = frozenset(
+    {
+        "travel_expense",
+        "business_entertainment",
+        "business_support_fee",
+        "small_marketing_fee",
+    }
+)
 
 
 def _read_object(path: Path) -> dict:
@@ -59,20 +69,18 @@ def _read_object(path: Path) -> dict:
 
 
 def _open_action_files(project_root: Path) -> list[Path]:
-    flow_root = (
-        project_root
-        / "runtime"
-        / "finance_preaudit_flows"
-        / "travel_expense"
-    )
-    if not flow_root.parent.exists():
+    flow_root = project_root / "runtime" / "finance_preaudit_flows"
+    if not flow_root.exists():
         return []
-    opened: list[tuple[str, Path]] = []
-    for state in reconciliation.latest_states(flow_root.parent):
-        if state.get("workflow_key") != "travel_expense":
+    opened: dict[tuple[str, str], Path] = {}
+    identities: list[dict] = []
+    for state in reconciliation.latest_states(flow_root):
+        workflow_key = str(state.get("workflow_key") or "")
+        if workflow_key not in ROLLING_WORKFLOW_KEYS:
             continue
         action_file = (
             flow_root
+            / workflow_key
             / "cases"
             / str(state["case_key"])
             / f"attempt-{state['attempt']}"
@@ -83,27 +91,41 @@ def _open_action_files(project_root: Path) -> list[Path]:
             and state.get("write_state") == "authorized"
             and state.get("mode") == "controlled_write"
             and state.get("write_authorized") is True
-            and state.get("workflow_key") == "travel_expense"
             and state.get("action_file") == str(action_file)
             and action_file.is_file()
             and not action_file.is_symlink()
         ):
-            opened.append((str(state.get("created_at") or ""), action_file))
-    return [path for _created_at, path in sorted(opened)]
+            request_id = str(state.get("request_id") or "")
+            received_at = str(state.get("received_at") or "")
+            identity = (request_id, received_at)
+            opened[identity] = action_file
+            identities.append(
+                {
+                    "requestId": request_id,
+                    "received_at": received_at,
+                    "flow_key": workflow_key,
+                    "support_status": "supported",
+                    "can_submit": True,
+                }
+            )
+    ordered = production_pending.actionable_fifo(identities)
+    return [
+        opened[(str(item["requestId"]), str(item["received_at"]))]
+        for item in ordered
+    ]
 
 
 def _renew_actions(action_files: list[Path]) -> list[Path]:
     engine = cli._live_flow_engine(controlled=True)
-    workflow_root = (
-        PROJECT_ROOT
-        / "runtime"
-        / "finance_preaudit_flows"
-        / "travel_expense"
-    )
+    flow_root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
     renewed: list[Path] = []
     for action_file in action_files:
         action = _read_object(action_file)
         case_key = str(action.get("case_key") or "")
+        workflow_key = str(action.get("workflow_key") or "")
+        if workflow_key not in flow_engine.WORKFLOW_KEYS:
+            raise ValueError("production_probe_renew_failed")
+        workflow_root = flow_root / workflow_key
         try:
             with flow_engine._exclusive_lock(workflow_root / "flow.lock"):
                 current = engine._resume_active_action(
@@ -130,7 +152,7 @@ def _historical_write_authorization_failures() -> frozenset[Path]:
     historical: set[Path] = set()
     for state in reconciliation.latest_states(flow_root):
         if (
-            state.get("workflow_key") != "travel_expense"
+            state.get("workflow_key") not in ROLLING_WORKFLOW_KEYS
             or state.get("execution_state") != "needs_admin"
             or state.get("reason") != "write_authorization_invalid"
             or state.get("write_state") != "not_requested"
@@ -138,7 +160,7 @@ def _historical_write_authorization_failures() -> frozenset[Path]:
             continue
         action_file = (
             flow_root
-            / "travel_expense"
+            / str(state["workflow_key"])
             / "cases"
             / str(state["case_key"])
             / f"attempt-{state['attempt']}"
@@ -150,7 +172,52 @@ def _historical_write_authorization_failures() -> frozenset[Path]:
     return frozenset(historical)
 
 
-def _prepare_one(_workflow_key: str) -> dict:
+def _local_quarantined_identities() -> frozenset[tuple[str, str]]:
+    flow_root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
+    identities: set[tuple[str, str]] = set()
+    for state in reconciliation.latest_states(flow_root):
+        if (
+            state.get("execution_state") == "needs_admin"
+            and state.get("reason")
+            in {"write_authorization_invalid", *QUARANTINED_REASONS}
+            and state.get("write_state") == "not_requested"
+        ):
+            request_id = str(state.get("request_id") or "").strip()
+            received_at = str(state.get("received_at") or "").strip()
+            if not request_id or not received_at:
+                raise ValueError("production_probe_state_invalid")
+            identities.add((request_id, received_at))
+    return frozenset(identities)
+
+
+def _prepare_one(selection: PrepareSelection) -> dict:
+    assigned_identities: set[tuple[str, str]] = set()
+    if isinstance(selection, str):
+        workflow_key = selection
+    elif isinstance(selection, dict) and selection.get("workflow_key") == "*":
+        workflow_key = "*"
+        raw_assigned = selection.get("assigned_identities")
+        if not isinstance(raw_assigned, list):
+            return {
+                "action": "failed",
+                "error_code": "production_probe_prepare_failed",
+            }
+        for identity in raw_assigned:
+            if (
+                not isinstance(identity, list)
+                or len(identity) != 2
+                or not all(isinstance(value, str) and value for value in identity)
+            ):
+                return {
+                    "action": "failed",
+                    "error_code": "production_probe_prepare_failed",
+                }
+            assigned_identities.add((identity[0], identity[1]))
+    else:
+        return {
+            "action": "failed",
+            "error_code": "production_probe_prepare_failed",
+        }
     if runtime_control.stop_requested():
         return {"action": "failed", "error_code": "production_probe_stopped"}
     try:
@@ -164,7 +231,6 @@ def _prepare_one(_workflow_key: str) -> dict:
             "action": "failed",
             "error_code": "production_probe_prepare_failed",
         }
-    engine = cli._live_flow_engine(controlled=True)
     quarantined = 0
     while quarantined < quarantine_budget:
         if runtime_control.stop_requested():
@@ -172,10 +238,46 @@ def _prepare_one(_workflow_key: str) -> dict:
                 "action": "failed",
                 "error_code": "production_probe_stopped",
             }
+        selected: dict | None = None
+        selected_workflow = workflow_key
+        if workflow_key == "*":
+            try:
+                candidates = production_pending.actionable_fifo(
+                    cli._live_pending_identities(),
+                    excluded_identities=(
+                        _local_quarantined_identities()
+                        | assigned_identities
+                    ),
+                    allowed_workflows=ROLLING_WORKFLOW_KEYS,
+                )
+            except (ValueError, OSError):
+                runtime_control.request_stop("production_probe_prepare_failed")
+                return {
+                    "action": "failed",
+                    "error_code": "production_probe_prepare_failed",
+                }
+            if not candidates:
+                runtime_control.request_stop("production_probe_prepare_failed")
+                return {
+                    "action": "failed",
+                    "error_code": "production_probe_prepare_failed",
+                }
+            selected = candidates[0]
+            selected_workflow = str(selected.get("flow_key") or "")
+        if selected is None:
+            engine = cli._live_flow_engine(controlled=True)
+        else:
+            engine = cli._live_flow_engine(
+                controlled=True,
+                selected_identity=(
+                    str(selected["requestId"]),
+                    str(selected["received_at"]),
+                ),
+            )
         while True:
             try:
                 action = engine.next_action(
-                    "travel_expense",
+                    selected_workflow,
                     mode="controlled_write",
                     skip_write_authorization_failures=(
                         historical_authorization_failures
@@ -208,6 +310,24 @@ def _prepare_one(_workflow_key: str) -> dict:
                 "error_code": "production_probe_stopped",
             }
         if action.get("action") == "review_required":
+            if selected is not None:
+                try:
+                    persisted = _read_object(Path(str(action["action_file"])))
+                except (KeyError, ValueError):
+                    persisted = {}
+                if (
+                    persisted.get("request_id") != selected.get("requestId")
+                    or persisted.get("received_at")
+                    != selected.get("received_at")
+                    or persisted.get("workflow_key") != selected_workflow
+                ):
+                    runtime_control.request_stop(
+                        "production_probe_prepare_failed"
+                    )
+                    return {
+                        "action": "failed",
+                        "error_code": "production_probe_fifo_mismatch",
+                    }
             return {
                 "action": "review_required",
                 "action_file": action["action_file"],
@@ -830,11 +950,22 @@ def _run_dispatched_tasks(
     prepare_timeout_sec: float = 300,
     heartbeat_interval_sec: float = 15,
     runtime_status: Callable[[], dict] = concurrency_control.sample_local_health,
+    strict_global_fifo: bool = False,
+    adaptive: bool = False,
+    max_capacity: int | None = None,
 ) -> process_pool.PoolResult[dict]:
+    maximum_capacity = capacity if max_capacity is None else max_capacity
     if (
-        task_timeout_sec <= 0
+        not 1 <= capacity <= process_pool.MAX_PROCESS_POOL_CAPACITY
+        or not capacity <= maximum_capacity <= process_pool.MAX_PROCESS_POOL_CAPACITY
+        or task_timeout_sec <= 0
         or prepare_timeout_sec <= 0
         or heartbeat_interval_sec <= 0
+    ):
+        raise ValueError("production_dispatcher_watchdog_invalid")
+    if adaptive and (
+        capacity not in concurrency_control.CAPACITY_STEPS
+        or maximum_capacity not in concurrency_control.CAPACITY_STEPS
     ):
         raise ValueError("production_dispatcher_watchdog_invalid")
     started_at = time.monotonic()
@@ -842,13 +973,21 @@ def _run_dispatched_tasks(
     outcomes: list[process_pool.TaskOutcome[dict] | None] = [None] * count
     assigned: set[Path] = set()
     futures: dict[object, tuple[int, float, float, Path]] = {}
-    write_ready: deque[tuple[int, float, Path, dict, float, int]] = deque()
+    write_ready: dict[int, tuple[float, Path, dict, float, int]] = {}
     writer: (
         tuple[Future[dict], int, float, Path, dict, float, float, int] | None
     ) = None
     review_histories: dict[int, list[dict]] = {}
     decision_retries: set[int] = set()
     next_index = 0
+    next_write_index = 0
+    current_review_capacity = capacity
+    adaptive_healthy_windows = 0
+    adaptive_window_target = capacity * 2
+    adaptive_window_values: list[dict] = []
+    adaptive_window_hosts: list[dict] = []
+    capacity_decisions: list[dict] = []
+    adaptive_pressure_active = False
     started = 0
     peak_active = 0
     halted = False
@@ -860,12 +999,12 @@ def _run_dispatched_tasks(
     preparation_stop_deadline: float | None = None
     preparation_deferred = False
     unblocked_duplicate_retries = 0
-    write_queue_capacity = max(2, capacity * 2)
+    write_queue_capacity = max(2, maximum_capacity * 2)
     max_write_queue_depth = 0
     prepare_action = prepare_action or _prepare_one
     prepare_executor = _preparation_executor()
     prepare_executor_terminated = False
-    executor = executor_factory(capacity)
+    executor = executor_factory(maximum_capacity)
     reaping_succeeded = True
     writer_executor = ThreadPoolExecutor(
         max_workers=1,
@@ -959,11 +1098,12 @@ def _run_dispatched_tasks(
         force_terminated = True
 
     def stop_write_queue() -> None:
-        while write_ready:
-            index, prepare_elapsed, _action, reviewed, _ready_at, _depth = (
-                write_ready.popleft()
+        for index in sorted(write_ready):
+            prepare_elapsed, _action, reviewed, _ready_at, _depth = (
+                write_ready[index]
             )
             stopped_review(index, prepare_elapsed, reviewed)
+        write_ready.clear()
 
     def request_pipeline_stop() -> None:
         nonlocal halted
@@ -971,6 +1111,103 @@ def _run_dispatched_tasks(
         runtime_control.request_stop()
         stop_reviews()
         stop_write_queue()
+
+    def observe_adaptive_window(value: dict) -> None:
+        nonlocal adaptive_healthy_windows
+        nonlocal adaptive_window_target
+        nonlocal current_review_capacity
+        nonlocal adaptive_pressure_active
+        if not adaptive:
+            return
+        adaptive_window_values.append(value)
+        if len(adaptive_window_values) < adaptive_window_target:
+            return
+        codex_events = _aggregate_codex_events(adaptive_window_values)
+        transient_errors = codex_events["counts"].get("error")
+        if transient_errors is None and codex_events["status"] == "recorded":
+            transient_errors = 0
+        try:
+            host = runtime_status()
+        except Exception:
+            host = {"status": "unknown"}
+        adaptive_window_hosts.append(host)
+        window_host = concurrency_control.summarize_runtime(
+            tuple({"host": item} for item in adaptive_window_hosts)
+        )
+        if (
+            adaptive_pressure_active
+            and window_host.get("status") == "pressure"
+        ):
+            decision = {
+                "action": "hold",
+                "next_capacity": current_review_capacity,
+                "healthy_windows": 0,
+                "reason": "host_pressure_active",
+            }
+        else:
+            decision = concurrency_control.decide_capacity(
+                current_capacity=current_review_capacity,
+                healthy_windows=adaptive_healthy_windows,
+                wave={
+                    "requested": len(adaptive_window_values),
+                    "completed": len(adaptive_window_values),
+                    "failed": 0,
+                    "timed_out": 0,
+                    "stopped": 0,
+                    "codex_event_status": codex_events["status"],
+                    "transient_error_events": transient_errors,
+                },
+                host=window_host,
+            )
+        if int(decision["next_capacity"]) > maximum_capacity:
+            decision = {
+                "action": "hold",
+                "next_capacity": maximum_capacity,
+                "healthy_windows": 1,
+                "reason": "configured_maximum",
+            }
+        capacity_decisions.append(decision)
+        if decision["reason"] == "host_pressure":
+            adaptive_pressure_active = True
+        elif window_host.get("status") == "healthy":
+            adaptive_pressure_active = False
+        adaptive_healthy_windows = int(decision["healthy_windows"])
+        current_review_capacity = min(
+            maximum_capacity,
+            int(decision["next_capacity"]),
+        )
+        adaptive_window_values.clear()
+        adaptive_window_hosts.clear()
+        adaptive_window_target = current_review_capacity * 2
+        if decision["action"] == "stop":
+            request_pipeline_stop()
+
+    def apply_immediate_host_pressure(host: dict) -> None:
+        nonlocal adaptive_healthy_windows
+        nonlocal adaptive_pressure_active
+        nonlocal adaptive_window_target
+        nonlocal current_review_capacity
+        if not adaptive or adaptive_pressure_active:
+            return
+        decision = concurrency_control.decide_capacity(
+            current_capacity=current_review_capacity,
+            healthy_windows=adaptive_healthy_windows,
+            wave={
+                "requested": 0,
+                "completed": 0,
+                "failed": 0,
+                "timed_out": 0,
+                "stopped": 0,
+            },
+            host=host,
+        )
+        capacity_decisions.append(decision)
+        current_review_capacity = int(decision["next_capacity"])
+        adaptive_healthy_windows = 0
+        adaptive_pressure_active = True
+        adaptive_window_values.clear()
+        adaptive_window_hosts.clear()
+        adaptive_window_target = current_review_capacity * 2
 
     def submit_review(
         index: int,
@@ -997,6 +1234,20 @@ def _run_dispatched_tasks(
         if first_attempt:
             started += 1
         peak_active = max(peak_active, len(futures))
+
+    def global_prepare_selection() -> dict:
+        identities: list[list[str]] = []
+        for action_file in sorted(assigned):
+            action = _read_object(action_file)
+            request_id = str(action.get("request_id") or "").strip()
+            received_at = str(action.get("received_at") or "").strip()
+            if not request_id or not received_at:
+                raise ValueError("production_probe_state_invalid")
+            identities.append([request_id, received_at])
+        return {
+            "workflow_key": "*",
+            "assigned_identities": identities,
+        }
 
     try:
         while (
@@ -1072,6 +1323,9 @@ def _run_dispatched_tasks(
                     review_histories.pop(index, None)
                     if value.get("status") != "completed":
                         request_pipeline_stop()
+                    else:
+                        next_write_index += 1
+                        observe_adaptive_window(value)
 
             review_ages = {
                 index: max(0.0, now - task_started)
@@ -1164,6 +1418,7 @@ def _run_dispatched_tasks(
                         "active_workers": len(futures)
                         + int(preparation is not None),
                         "active_reviews": len(futures),
+                        "review_capacity": current_review_capacity,
                         "writer_active": writer is not None,
                         "write_queue_depth": len(write_ready),
                         "write_queue_capacity": write_queue_capacity,
@@ -1178,6 +1433,12 @@ def _run_dispatched_tasks(
                         "host": host,
                     }
                 )
+                if adaptive and host.get("status") == "pressure":
+                    apply_immediate_host_pressure(host)
+                elif adaptive:
+                    if host.get("status") == "healthy":
+                        adaptive_pressure_active = False
+                    adaptive_window_hosts.append(host)
                 next_heartbeat = now + heartbeat_interval_sec
                 if host.get("status") == "critical" and not halted:
                     request_pipeline_stop()
@@ -1326,15 +1587,12 @@ def _run_dispatched_tasks(
                     merged = _merge_review_attempts(
                         [*review_histories.get(index, []), reviewed]
                     )
-                    write_ready.append(
-                        (
-                            index,
-                            prepare_elapsed,
-                            action_file,
-                            merged,
-                            time.monotonic(),
-                            len(write_ready) + 1,
-                        )
+                    write_ready[index] = (
+                        prepare_elapsed,
+                        action_file,
+                        merged,
+                        time.monotonic(),
+                        len(write_ready) + 1,
                     )
                     max_write_queue_depth = max(
                         max_write_queue_depth,
@@ -1344,17 +1602,17 @@ def _run_dispatched_tasks(
             if (
                 not halted
                 and writer is None
-                and write_ready
+                and next_write_index in write_ready
                 and not runtime_control.stop_requested()
             ):
                 (
-                    index,
                     prepare_elapsed,
                     action_file,
                     reviewed,
                     review_ready_at,
                     enqueue_depth,
-                ) = write_ready.popleft()
+                ) = write_ready.pop(next_write_index)
+                index = next_write_index
                 writer_started_at = time.monotonic()
                 writer = (
                     writer_executor.submit(
@@ -1375,7 +1633,7 @@ def _run_dispatched_tasks(
                 not halted
                 and preparation is None
                 and next_index < count
-                and len(futures) < capacity
+                and len(futures) < current_review_capacity
                 and (
                     len(futures)
                     + len(write_ready)
@@ -1385,16 +1643,43 @@ def _run_dispatched_tasks(
                 and not preparation_deferred
             ):
                 prepare_started = time.monotonic()
-                available = [
-                    path
-                    for path in _open_action_files(root)
-                    if path not in assigned
-                ]
+                available = (
+                    []
+                    if strict_global_fifo
+                    else [
+                        path
+                        for path in _open_action_files(root)
+                        if path not in assigned
+                    ]
+                )
                 if not available:
+                    try:
+                        selection = (
+                            global_prepare_selection()
+                            if strict_global_fifo
+                            else "*"
+                        )
+                    except ValueError:
+                        outcomes[next_index] = process_pool.TaskOutcome(
+                            index=next_index,
+                            status="completed",
+                            value={
+                                "status": "failed",
+                                "business_state": "not_available",
+                                "error_code": "production_probe_prepare_failed",
+                                "prepare_elapsed_seconds": 0.0,
+                                "process_attempts": 0,
+                                "process_retries": 0,
+                                "token_usage": {"status": "unknown"},
+                            },
+                        )
+                        next_index += 1
+                        request_pipeline_stop()
+                        break
                     preparation = (
                         prepare_executor.submit(
                             prepare_action,
-                            "travel_expense",
+                            selection,
                         ),
                         next_index,
                         time.monotonic(),
@@ -1508,6 +1793,24 @@ def _run_dispatched_tasks(
         runtime_samples=tuple(runtime_samples),
         max_task_elapsed_seconds=round(max_task_elapsed_seconds, 3),
         processes_reaped=processes_reaped,
+        recommended_capacity=current_review_capacity,
+        capacity_decisions=tuple(capacity_decisions),
+    )
+
+
+def _run_global_dispatched_tasks(
+    count: int,
+    capacity: int,
+    *,
+    adaptive: bool = False,
+    max_capacity: int | None = None,
+) -> process_pool.PoolResult[dict]:
+    return _run_dispatched_tasks(
+        count,
+        capacity,
+        strict_global_fifo=True,
+        adaptive=adaptive,
+        max_capacity=max_capacity,
     )
 
 
@@ -1679,14 +1982,41 @@ def _travel_pending(live: dict) -> int:
 
 def _production_reconciliation() -> dict:
     root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
-    return cli._live_reconciliation(root, workflow_key="travel_expense")
+    return cli._live_reconciliation(
+        root,
+        workflow_keys=ROLLING_WORKFLOW_KEYS,
+    )
+
+
+def _supported_pending(live: dict) -> int:
+    credentials = live.get("credentials")
+    oa = live.get("oa")
+    if (
+        not isinstance(credentials, dict)
+        or credentials.get("status") != "ok"
+        or not isinstance(oa, dict)
+        or oa.get("execution_identity") not in {"verified", "unknown"}
+    ):
+        raise ValueError("production_drain_live_status_invalid")
+    by_workflow = oa.get("by_workflow")
+    if not isinstance(by_workflow, dict):
+        raise ValueError("production_drain_live_status_invalid")
+    pending = 0
+    for workflow_key in ROLLING_WORKFLOW_KEYS:
+        count = by_workflow.get(workflow_key, 0)
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError("production_drain_live_status_invalid")
+        pending += count
+    if pending and oa.get("execution_identity") != "verified":
+        raise ValueError("production_drain_live_status_invalid")
+    return pending
 
 
 def _rolling_snapshot(
     live_status: LiveStatus,
     reconcile_status: Callable[[], dict],
 ) -> tuple[int, int, int]:
-    pending = _travel_pending(live_status())
+    pending = _supported_pending(live_status())
     try:
         reconciled = reconcile_status()
         quarantine = reconciled["quarantine"]
@@ -1913,7 +2243,13 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
         int(sample["active_reviews"]) for sample in review_samples
     )
     review_capacity_sum = sum(
-        max(1, int(sample["write_queue_capacity"]) // 2)
+        max(
+            1,
+            int(
+                sample.get("review_capacity")
+                or int(sample["write_queue_capacity"]) // 2
+            ),
+        )
         for sample in review_samples
     )
     sampled_queue_depths = [
@@ -1982,6 +2318,8 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
         "transient_error_events": transient_error_events,
         "pipeline": pipeline,
         "processes_reaped": result.processes_reaped,
+        "recommended_capacity": result.recommended_capacity,
+        "capacity_decisions": list(result.capacity_decisions),
         "_pipeline_review_wait_samples": review_to_write,
         "_pipeline_active_review_sum": active_review_sum,
         "_pipeline_review_capacity_sum": review_capacity_sum,
@@ -2005,7 +2343,7 @@ def run_rolling_drain(
     adaptive: bool = False,
     max_capacity: int = 12,
     live_status: LiveStatus = runtime_doctor.status,
-    pipeline_runner: PipelineRunner = _run_dispatched_tasks,
+    pipeline_runner: PipelineRunner = _run_global_dispatched_tasks,
     reconcile_status: Callable[[], dict] = _production_reconciliation,
     max_waves: int = 10,
 ) -> dict:
@@ -2034,7 +2372,15 @@ def run_rolling_drain(
             ) -> process_pool.PoolResult[dict]:
                 nonlocal children_reaped
                 children_reaped = False
-                wave_result = pipeline_runner(count, review_capacity)
+                if pipeline_runner is _run_global_dispatched_tasks:
+                    wave_result = _run_global_dispatched_tasks(
+                        count,
+                        review_capacity,
+                        adaptive=adaptive,
+                        max_capacity=max_capacity,
+                    )
+                else:
+                    wave_result = pipeline_runner(count, review_capacity)
                 children_reaped = wave_result.processes_reaped is True
                 return wave_result
 
@@ -2090,7 +2436,7 @@ def _run_rolling_drain_locked(
     adaptive: bool = False,
     max_capacity: int = 12,
     live_status: LiveStatus = runtime_doctor.status,
-    pipeline_runner: PipelineRunner = _run_dispatched_tasks,
+    pipeline_runner: PipelineRunner = _run_global_dispatched_tasks,
     reconcile_status: Callable[[], dict] = _production_reconciliation,
     max_waves: int = 10,
 ) -> dict:
@@ -2133,12 +2479,19 @@ def _run_rolling_drain_locked(
             runtime_control.request_stop()
             raise ValueError("production_rolling_wave_limit_reached")
         cache_maintenance_waves.append(attachment_cache.prune_expired())
-        wave_size = (
-            min(actionable, current_capacity * 2) if adaptive else actionable
+        # A health window observes the continuous drain; it never caps claims.
+        wave_size = actionable
+        pipeline_result = (
+            _run_global_dispatched_tasks(
+                wave_size,
+                current_capacity,
+                adaptive=adaptive,
+                max_capacity=max_capacity,
+            )
+            if pipeline_runner is _run_global_dispatched_tasks
+            else pipeline_runner(wave_size, current_capacity)
         )
-        wave = _rolling_wave_metrics(
-            pipeline_runner(wave_size, current_capacity)
-        )
+        wave = _rolling_wave_metrics(pipeline_result)
         wave["capacity"] = current_capacity
         waves.append(wave)
         if (
@@ -2149,17 +2502,26 @@ def _run_rolling_drain_locked(
         ):
             runtime_control.request_stop()
             status = "failed"
-            stop_reason = (
-                "host_critical"
-                if wave["runtime_health"].get("status") == "critical"
-                else "technical_failure"
-            )
-            last_decision = {
-                "action": "stop",
-                "next_capacity": current_capacity,
-                "healthy_windows": 0,
-                "reason": stop_reason,
-            }
+            internal_stops = [
+                decision
+                for decision in wave.get("capacity_decisions", [])
+                if decision.get("action") == "stop"
+            ]
+            if internal_stops:
+                last_decision = internal_stops[-1]
+                stop_reason = str(last_decision["reason"])
+            else:
+                stop_reason = (
+                    "host_critical"
+                    if wave["runtime_health"].get("status") == "critical"
+                    else "technical_failure"
+                )
+                last_decision = {
+                    "action": "stop",
+                    "next_capacity": current_capacity,
+                    "healthy_windows": 0,
+                    "reason": stop_reason,
+                }
             break
         try:
             pending, quarantined_pending, actionable = _rolling_snapshot(
@@ -2175,30 +2537,40 @@ def _run_rolling_drain_locked(
             stop_reason = "quarantine_increased"
             break
         if adaptive:
-            last_decision = concurrency_control.decide_capacity(
-                current_capacity=current_capacity,
-                healthy_windows=healthy_windows,
-                wave={
-                    "requested": wave["requested"],
-                    "completed": wave["completed"],
-                    "failed": wave["failed"],
-                    "timed_out": wave["timed_out"],
-                    "stopped": wave["stopped"],
-                    "transient_error_events": wave["transient_error_events"],
-                    "codex_event_status": wave["codex_events"]["status"],
-                },
-                host=wave["runtime_health"],
-            )
+            internal_decisions = wave.get("capacity_decisions") or []
+            if internal_decisions:
+                last_decision = internal_decisions[-1]
+                current_capacity = int(
+                    wave.get("recommended_capacity") or current_capacity
+                )
+            else:
+                last_decision = concurrency_control.decide_capacity(
+                    current_capacity=current_capacity,
+                    healthy_windows=healthy_windows,
+                    wave={
+                        "requested": wave["requested"],
+                        "completed": wave["completed"],
+                        "failed": wave["failed"],
+                        "timed_out": wave["timed_out"],
+                        "stopped": wave["stopped"],
+                        "transient_error_events": wave[
+                            "transient_error_events"
+                        ],
+                        "codex_event_status": wave["codex_events"]["status"],
+                    },
+                    host=wave["runtime_health"],
+                )
             healthy_windows = int(last_decision["healthy_windows"])
             if last_decision["action"] == "stop":
                 runtime_control.request_stop()
                 status = "failed"
                 stop_reason = str(last_decision["reason"])
                 break
-            current_capacity = min(
-                int(last_decision["next_capacity"]),
-                max_capacity,
-            )
+            if not internal_decisions:
+                current_capacity = min(
+                    int(last_decision["next_capacity"]),
+                    max_capacity,
+                )
 
     if status == "completed" and quarantined_pending:
         status = "completed_with_quarantine"
