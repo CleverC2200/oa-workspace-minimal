@@ -845,13 +845,55 @@ def _run_dispatched_tasks(
     max_task_elapsed_seconds = 0.0
     next_heartbeat = time.monotonic()
     preparation: tuple[Future[dict], int, float] | None = None
+    preparation_stop_deadline: float | None = None
     prepare_action = prepare_action or _prepare_one
     prepare_executor = _preparation_executor()
     prepare_executor_terminated = False
     executor = executor_factory(capacity)
 
+    def harvest_stopped_reviews(completed_futures: set[object]) -> None:
+        for future in completed_futures:
+            assignment = futures.pop(future, None)
+            if assignment is None:
+                continue
+            index, prepare_elapsed, _task_started, _action_file = assignment
+            try:
+                value = future.result()
+            except Exception:
+                outcomes[index] = process_pool.TaskOutcome(
+                    index=index,
+                    status="failed",
+                    value=None,
+                    error_code="worker_process_failed",
+                )
+                continue
+            if value.get("status") == "reviewed":
+                outcomes[index] = process_pool.TaskOutcome(
+                    index=index,
+                    status="stopped",
+                    value={
+                        **value,
+                        "status": "stopped",
+                        "error_code": "stop_requested",
+                        "prepare_elapsed_seconds": prepare_elapsed,
+                    },
+                    error_code="stop_requested",
+                )
+            else:
+                outcomes[index] = process_pool.TaskOutcome(
+                    index=index,
+                    status="completed",
+                    value={
+                        **value,
+                        "prepare_elapsed_seconds": prepare_elapsed,
+                    },
+                )
+
     def stop_reviews() -> None:
         nonlocal force_terminated
+        harvest_stopped_reviews(
+            {future for future in futures if future.done()}
+        )
         for _future, (
             index,
             _prepare_elapsed,
@@ -983,15 +1025,29 @@ def _run_dispatched_tasks(
                 and preparation is not None
                 and not preparation[0].done()
             ):
+                if preparation_stop_deadline is None:
+                    preparation_stop_deadline = time.monotonic() + min(
+                        5.0,
+                        prepare_timeout_sec,
+                    )
                 wait(
                     (preparation[0],),
-                    timeout=min(0.25, prepare_timeout_sec),
+                    timeout=min(
+                        0.25,
+                        heartbeat_interval_sec,
+                        max(
+                            0.0,
+                            preparation_stop_deadline - time.monotonic(),
+                        ),
+                    ),
                     return_when=FIRST_COMPLETED,
                 )
             if (
                 halted
                 and preparation is not None
                 and not preparation[0].done()
+                and preparation_stop_deadline is not None
+                and time.monotonic() >= preparation_stop_deadline
             ):
                 _prepare_future, prepare_index, _prepare_started_at = preparation
                 outcomes[prepare_index] = process_pool.TaskOutcome(
@@ -1006,6 +1062,7 @@ def _run_dispatched_tasks(
                 )
                 prepare_executor_terminated = True
                 preparation = None
+                preparation_stop_deadline = None
             if preparation is not None:
                 prepare_future, index, prepare_started_at = preparation
                 if prepare_future.done():
@@ -1018,6 +1075,7 @@ def _run_dispatched_tasks(
                             "error_code": "production_probe_prepare_failed",
                         }
                     preparation = None
+                    preparation_stop_deadline = None
                     if prepared.get("action") != "review_required":
                         outcomes[index] = process_pool.TaskOutcome(
                             index=index,
@@ -1108,6 +1166,7 @@ def _run_dispatched_tasks(
                         next_index,
                         time.monotonic(),
                     )
+                    preparation_stop_deadline = None
                     next_index += 1
                     break
                 prepare_elapsed = time.monotonic() - prepare_started
@@ -1170,6 +1229,10 @@ def _run_dispatched_tasks(
                 timeout=min(1.0, heartbeat_interval_sec, task_timeout_sec / 4),
                 return_when=FIRST_COMPLETED,
             )
+            if runtime_control.stop_requested() and preparation is not None:
+                halted = True
+                harvest_stopped_reviews(done)
+                continue
             failed_now = False
             reviewed_now: list[tuple[int, float, Path, dict]] = []
             for future in done:

@@ -2147,6 +2147,182 @@ def test_dispatcher_bounded_drains_prepare_error_after_stop_signal(
     assert reviews == []
 
 
+def test_dispatcher_preserves_prepare_failure_when_stop_races_review_completion(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stopped = threading.Event()
+    completions: list[Path] = []
+    heartbeats: list[bool] = []
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    _open_action(
+        flow_root,
+        case_key="prepare-race",
+        created_at="2026-08-25T01:00:00+00:00",
+    )
+
+    def prepare(_workflow: str) -> dict:
+        stopped.set()
+        time.sleep(0.4)
+        return {
+            "action": "failed",
+            "error_code": "production_probe_prepare_failed",
+        }
+
+    def review(_task: dict) -> dict:
+        assert stopped.wait(timeout=1)
+        return {
+            "status": "reviewed",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "process_attempts": 1,
+            "process_retries": 0,
+            "token_usage": {"status": "unknown"},
+            "agent_wall_seconds": 1,
+            "decision": {"overall": "needs_human"},
+        }
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_preparation_executor",
+        lambda: ThreadPoolExecutor(max_workers=1),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        stopped.is_set,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        stopped.set,
+    )
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        2,
+        2,
+        project_root=tmp_path,
+        renew_actions=lambda paths: paths,
+        prepare_action=prepare,
+        review_worker=review,
+        complete_review=lambda action, _reviewed: completions.append(action) or {
+            "status": "failed",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "error_code": "stop_requested",
+        },
+        executor_factory=lambda capacity: ThreadPoolExecutor(
+            max_workers=capacity
+        ),
+        heartbeat_interval_sec=0.005,
+        runtime_status=lambda: heartbeats.append(True)
+        or {"status": "healthy"},
+    )
+
+    assert completions == []
+    assert len(heartbeats) >= 2
+    assert any(
+        outcome.value
+        and outcome.value.get("error_code")
+        == "production_probe_prepare_failed"
+        for outcome in result.outcomes
+    )
+    harvested = result.outcomes[0]
+    assert harvested.status == "stopped"
+    assert harvested.value["process_attempts"] == 1
+
+
+def test_dispatcher_harvests_review_done_before_prepare_failure_is_processed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stopped = threading.Event()
+    completions: list[Path] = []
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    _open_action(
+        flow_root,
+        case_key="prepare-first",
+        created_at="2026-08-25T01:01:00+00:00",
+    )
+
+    def prepare(_workflow: str) -> dict:
+        stopped.set()
+        return {
+            "action": "failed",
+            "error_code": "production_probe_prepare_failed",
+        }
+
+    def review(_task: dict) -> dict:
+        return {
+            "status": "reviewed",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "process_attempts": 1,
+            "process_retries": 0,
+            "token_usage": {"status": "unknown"},
+            "agent_wall_seconds": 1,
+            "decision": {"overall": "needs_human"},
+        }
+
+    real_wait = finance_preaudit_concurrency_probe.wait
+    hidden_once = False
+
+    def hide_completed_once(futures, **kwargs):
+        nonlocal hidden_once
+        if not hidden_once:
+            hidden_once = True
+            deadline = time.monotonic() + 1
+            while not all(future.done() for future in futures):
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+            return set(), set(futures)
+        return real_wait(futures, **kwargs)
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_preparation_executor",
+        lambda: ThreadPoolExecutor(max_workers=1),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "wait",
+        hide_completed_once,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        stopped.is_set,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        stopped.set,
+    )
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        2,
+        2,
+        project_root=tmp_path,
+        renew_actions=lambda paths: paths,
+        prepare_action=prepare,
+        review_worker=review,
+        complete_review=lambda action, _reviewed: completions.append(action)
+        or {"status": "completed"},
+        executor_factory=lambda capacity: ThreadPoolExecutor(
+            max_workers=capacity
+        ),
+        heartbeat_interval_sec=0.005,
+        runtime_status=lambda: {"status": "healthy"},
+    )
+
+    assert completions == []
+    assert result.outcomes[0].status == "stopped"
+    assert result.outcomes[0].value["process_attempts"] == 1
+    assert result.outcomes[1].value["error_code"] == (
+        "production_probe_prepare_failed"
+    )
+
+
 def test_dispatcher_prepare_timeout_reclaims_owned_child_process_group(
     tmp_path: Path,
     monkeypatch,
