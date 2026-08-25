@@ -35,6 +35,7 @@ class PoolResult(Generic[Output]):
     outcomes: tuple[TaskOutcome[Output], ...]
     runtime_samples: tuple[dict, ...] = ()
     max_task_elapsed_seconds: float = 0.0
+    processes_reaped: bool = True
 
 
 @dataclass

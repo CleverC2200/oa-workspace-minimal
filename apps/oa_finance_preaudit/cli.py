@@ -10,9 +10,10 @@ from datetime import datetime, timezone
 
 from apps.oa_approval import api as legacy_api
 from apps.oa_approval import flow as legacy_flow
-from apps.oa_approval import runtime_control
+from apps.oa_approval import attachment_cache, runtime_control
 from .case_bundle import collect_case
 from . import (
+    controller_handoff,
     flow_engine,
     observability,
     production_pending,
@@ -44,6 +45,8 @@ _RUNTIME_FAILURE_CODES = {
     "runtime_reconciliation_invalid",
     "oa_auth_file_permissions_invalid",
     "oa_auth_file_outside_worktree_required",
+    "cache_clean_failed",
+    "cache_clean_runtime_active",
 }
 _FLOW_FAILURE_CODES = {
     "flow_candidate_invalid",
@@ -110,6 +113,8 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--reconcile", action="store_true")
     prune = subparsers.add_parser("prune")
     prune.add_argument("--root", type=Path, default=None)
+    clean = subparsers.add_parser("clean")
+    clean.add_argument("--all-cache", action="store_true", required=True)
     return parser
 
 
@@ -242,7 +247,7 @@ def _matches_confirmed_unknown_recovery(
 
 
 def _failure_payload(error: Exception, *, command: str = "next-action") -> dict:
-    if command in {"status", "prune"}:
+    if command in {"status", "prune", "clean"}:
         raw_code = str(error).strip()
         code = raw_code if raw_code in _RUNTIME_FAILURE_CODES else "runtime_failed"
         return {
@@ -274,7 +279,7 @@ def _failure_payload(error: Exception, *, command: str = "next-action") -> dict:
 def _fail(args: argparse.Namespace, error: Exception) -> int:
     failure = _failure_payload(error, command=args.command)
     _print_payload(failure)
-    if args.command in {"status", "prune"}:
+    if args.command in {"status", "prune", "clean"}:
         print(failure["failure"]["code"], file=sys.stderr)
     return 1
 
@@ -301,7 +306,7 @@ def _emit_invocation(
         [workflow_key]
         if workflow_key in flow_engine.WORKFLOW_KEYS
         else ["global"]
-        if command in {"status", "prune"}
+        if command in {"status", "prune", "clean"}
         else []
     )
     for current_workflow in workflow_keys:
@@ -373,9 +378,33 @@ def main(
             if args.reconcile:
                 reconcile_operation = reconcile_status or _live_reconciliation
                 payload["reconciliation"] = reconcile_operation(root)
+            payload["controller_handoff"] = controller_handoff.status()
         elif args.command == "prune":
             operation = runtime_prune or runtime_maintenance.prune
             payload = operation(_runtime_root(args.root))
+        elif args.command == "clean":
+            try:
+                with runtime_control.global_controller_lease():
+                    if (
+                        runtime_control.writer_active()
+                        or runtime_control.active_request_writers() != 0
+                    ):
+                        raise RuntimeError("cache_clean_runtime_active")
+                    try:
+                        with runtime_control.request_writer_lease(
+                            runtime_control.GLOBAL_WRITER_KEY,
+                            runtime_control.writer_lock_file(),
+                            blocking=False,
+                        ):
+                            payload = attachment_cache.clean_all_cache()
+                    except BlockingIOError as error:
+                        raise RuntimeError(
+                            "cache_clean_runtime_active"
+                        ) from error
+            except (BlockingIOError, RuntimeError) as error:
+                if str(error) == "controller_already_active":
+                    raise RuntimeError("cache_clean_runtime_active") from error
+                raise
         else:
             if args.command == "next-action":
                 controlled = args.mode == "controlled-write"

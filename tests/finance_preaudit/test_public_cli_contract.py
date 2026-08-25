@@ -11,10 +11,10 @@ from apps.oa_finance_preaudit import cli
 from apps.oa_approval import frozen_writer
 
 
-PUBLIC_COMMANDS = {"next-action", "complete-review", "status", "prune"}
+PUBLIC_COMMANDS = {"next-action", "complete-review", "status", "prune", "clean"}
 
 
-def test_public_cli_exposes_exactly_four_commands() -> None:
+def test_public_cli_exposes_only_the_supported_commands() -> None:
     parser = cli.build_parser()
     subparsers = next(
         action for action in parser._actions if action.dest == "command"

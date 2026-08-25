@@ -17,6 +17,10 @@
 
 `python3 -m apps.oa_finance_preaudit.cli prune --root <path>` 调用 `runtime_maintenance`，在同一维护锁和源事件锁内计算日聚合、校验完整预期计划及全部路径，随后以不跟随符号链接的原子写入保存 `.metrics/daily/`，最后才执行归档和删除。计划不得来自未来且生成后 5 分钟失效。30 天内的旧已闭合 attempt 移入根内 `.archive/`；严格超期的旧 attempt 删除；最新、未闭合、状态无效或 `write_state=unknown` 的恢复证据保留。严格超过 180 天的合法日聚合由同一计划删除。重复执行时，已不存在的目标计为 `missing`，不得扩展目标范围或报为成功删除。
 
+附件下载索引属于可重建缓存，不属于业务 attempt。滚动生产控制器在每次启动及每个滚动轮次前只删除严格超过 30 天或时间戳无效的缓存行；缓存维护失败只返回脱敏 `status=failed`，不得阻断当前生产轮次。人工全量清理固定使用 `python3 -m apps.oa_finance_preaudit.cli clean --all-cache`，只清空当前配置的附件缓存数据库；控制器、全局 Writer 或任一请求 Writer 活动时必须拒绝。重复执行返回 `deleted_entries=0`，不得删除业务 attempt、提交边界、终态回执、unknown 对账证据或审计日聚合。
+
+滚动控制器在唯一控制器锁内原子记录脱敏 run manifest；只读 `status` 同时返回 handoff 状态。manifest 只保留代码提交、配置指纹、进程实例链、fresh-process 重启证明、锁拥有者一致性、Writer 启动前空闲、子进程回收和终态健康，不包含原始配置、业务身份或附件。上次 manifest 仍为 `running`、无效、属于当前同一进程实例或明确未回收子进程时，新控制器必须失败关闭；普通已终态技术失败在子进程确认回收且由新进程接管后仍可廉价重试。
+
 `apps.oa_finance_preaudit.retention` 保留纯计划器、受限文件执行器和任务回调接口，不内置真实任务系统凭据。
 
 ## 脱敏回执

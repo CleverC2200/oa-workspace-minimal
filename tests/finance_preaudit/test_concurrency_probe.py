@@ -1465,18 +1465,9 @@ def test_rolling_controller_reconciles_before_any_pipeline_work() -> None:
     assert calls == []
 
 
-def test_rolling_controller_rejects_untrusted_live_state_before_reconciliation(
-    monkeypatch,
-) -> None:
-    reconciliations: list[bool] = []
-    pipelines: list[tuple[int, int]] = []
-    monkeypatch.setattr(
-        finance_preaudit_concurrency_probe.runtime_control,
-        "stop_requested",
-        lambda: False,
-    )
-
-    for live in (
+@pytest.mark.parametrize(
+    "live",
+    (
         {
             "credentials": {"status": "expired"},
             "oa": {
@@ -1491,21 +1482,34 @@ def test_rolling_controller_rejects_untrusted_live_state_before_reconciliation(
                 "by_workflow": {"travel_expense": 2},
             },
         },
-    ):
-        try:
-            finance_preaudit_concurrency_probe.run_rolling_drain(
-                capacity=6,
-                live_status=lambda live=live: live,
-                reconcile_status=lambda: reconciliations.append(True)
-                or _reconciliation_snapshot(2),
-                pipeline_runner=lambda count, capacity: pipelines.append(
-                    (count, capacity)
-                ),
-            )
-        except ValueError as error:
-            assert str(error) == "production_rolling_reconciliation_invalid"
-        else:  # pragma: no cover - failure assertion
-            raise AssertionError("untrusted live state unexpectedly accepted")
+    ),
+)
+def test_rolling_controller_rejects_untrusted_live_state_before_reconciliation(
+    live: dict,
+    monkeypatch,
+) -> None:
+    reconciliations: list[bool] = []
+    pipelines: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+
+    try:
+        finance_preaudit_concurrency_probe.run_rolling_drain(
+            capacity=6,
+            live_status=lambda: live,
+            reconcile_status=lambda: reconciliations.append(True)
+            or _reconciliation_snapshot(2),
+            pipeline_runner=lambda count, capacity: pipelines.append(
+                (count, capacity)
+            ),
+        )
+    except ValueError as error:
+        assert str(error) == "production_rolling_reconciliation_invalid"
+    else:  # pragma: no cover - failure assertion
+        raise AssertionError("untrusted live state unexpectedly accepted")
 
     assert reconciliations == []
     assert pipelines == []
@@ -1636,9 +1640,57 @@ def test_dispatcher_times_out_stuck_task_and_stops_new_work(
     )
 
     assert result.timed_out == 1
+    assert result.processes_reaped is True
     assert result.outcomes[0].error_code == "worker_task_timeout"
     assert result.runtime_samples
     assert stop_requests == [True]
+
+
+def test_dispatcher_reports_failed_executor_reaping(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda: None,
+    )
+    original_terminate = finance_preaudit_concurrency_probe._terminate_executor
+
+    def terminate_but_report_failure(executor, **kwargs) -> bool:
+        original_terminate(executor, **kwargs)
+        return False
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_terminate_executor",
+        terminate_but_report_failure,
+    )
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    _open_action(
+        flow_root,
+        case_key="9" * 64,
+        created_at="2026-08-23T16:00:00+00:00",
+    )
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        1,
+        1,
+        project_root=tmp_path,
+        renew_actions=lambda paths: paths,
+        review_worker=lambda _task: time.sleep(0.05) or {"status": "completed"},
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        task_timeout_sec=0.01,
+        heartbeat_interval_sec=0.005,
+        runtime_status=lambda: {"status": "healthy"},
+    )
+
+    assert result.processes_reaped is False
 
 
 def test_dispatcher_times_out_stuck_preparation_before_review(
@@ -2537,6 +2589,7 @@ def test_dispatcher_prepare_timeout_reclaims_owned_child_process_group(
     )
 
     assert result.timed_out == 1
+    assert result.processes_reaped is True
     assert marker.is_file()
     child_pid = int(marker.read_text(encoding="utf-8"))
     deadline = time.monotonic() + 2

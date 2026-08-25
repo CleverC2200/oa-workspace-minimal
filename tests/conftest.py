@@ -18,3 +18,7 @@ def isolate_production_runtime_controls(
         "OA_FROZEN_WRITER_LOCK_FILE",
         str(tmp_path / "control" / "frozen-writer.lock"),
     )
+    monkeypatch.setenv(
+        "OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE",
+        str(tmp_path / "control" / "rolling-controller.lock"),
+    )

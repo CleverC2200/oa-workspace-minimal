@@ -375,7 +375,7 @@ def test_prompt_exposes_flow_engine_fallback_routing_for_legacy_packet(
     )
 
 
-def test_prompt_preserves_explicit_routing_and_fails_closed_when_unreadable(
+def test_prompt_references_frozen_routing_without_copying_it_twice(
     tmp_path: Path,
 ) -> None:
     _task_payload, action_file = _task(tmp_path)
@@ -397,10 +397,10 @@ def test_prompt_preserves_explicit_routing_and_fails_closed_when_unreadable(
 
     prompt = codex_review_worker._prompt(action_file)
     assert "full_page_fallback" not in prompt
-    assert '"strategy":"exact_page_duplicate_only"' in prompt
-    assert '"review_page_refs":["packet-owned-ref"]' in prompt
-    assert "逐项覆盖以下宿主路由" in prompt
-    assert '"review_page_refs":["packet-owned-ref"]' in (
+    assert '"strategy":"exact_page_duplicate_only"' not in prompt
+    assert '"review_page_refs":["packet-owned-ref"]' not in prompt
+    assert "直接读取冻结审核包中的 `page_routing`" in prompt
+    assert '"review_page_refs":["packet-owned-ref"]' not in (
         codex_review_worker._read_only_prompt(action_file)
     )
 

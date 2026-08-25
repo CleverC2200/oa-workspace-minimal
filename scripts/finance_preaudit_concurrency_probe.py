@@ -18,11 +18,12 @@ import sys
 import time
 from typing import Callable, Sequence
 
-from apps.oa_approval import runtime_control, writer_outcomes
+from apps.oa_approval import attachment_cache, runtime_control, writer_outcomes
 from apps.oa_finance_preaudit import (
     cli,
     codex_review_worker,
     concurrency_control,
+    controller_handoff,
     flow_engine,
     process_pool,
     reconciliation,
@@ -780,7 +781,7 @@ def _terminate_executor(
     executor: object,
     *,
     owned_process_groups: bool = False,
-) -> None:
+) -> bool:
     processes = list((getattr(executor, "_processes", None) or {}).values())
     owned_groups: set[int] = set()
     if owned_process_groups:
@@ -812,6 +813,7 @@ def _terminate_executor(
             process.kill()
         process.join(timeout=1)
     executor.shutdown(wait=False, cancel_futures=True)
+    return all(not process.is_alive() for process in processes)
 
 
 def _run_dispatched_tasks(
@@ -864,10 +866,23 @@ def _run_dispatched_tasks(
     prepare_executor = _preparation_executor()
     prepare_executor_terminated = False
     executor = executor_factory(capacity)
+    reaping_succeeded = True
     writer_executor = ThreadPoolExecutor(
         max_workers=1,
         thread_name_prefix="oa-global-writer",
     )
+
+    def terminate_executor(
+        target: object,
+        *,
+        owned_process_groups: bool = False,
+    ) -> None:
+        nonlocal reaping_succeeded
+        reaped = _terminate_executor(
+            target,
+            owned_process_groups=owned_process_groups,
+        )
+        reaping_succeeded = reaping_succeeded and reaped
 
     def stopped_review(
         index: int,
@@ -940,7 +955,7 @@ def _run_dispatched_tasks(
         ) in futures.items():
             stopped_review(index, prepare_elapsed, None)
         futures.clear()
-        _terminate_executor(executor)
+        terminate_executor(executor)
         force_terminated = True
 
     def stop_write_queue() -> None:
@@ -1123,7 +1138,7 @@ def _run_dispatched_tasks(
                             else "worker_cancelled_after_timeout"
                         ),
                     )
-                    _terminate_executor(
+                    terminate_executor(
                         prepare_executor,
                         owned_process_groups=True,
                     )
@@ -1133,7 +1148,7 @@ def _run_dispatched_tasks(
                 runtime_control.request_stop()
                 stop_write_queue()
                 if not force_terminated:
-                    _terminate_executor(executor)
+                    terminate_executor(executor)
                     force_terminated = True
                 continue
 
@@ -1185,7 +1200,7 @@ def _run_dispatched_tasks(
                         value=None,
                         error_code="stop_requested",
                     )
-                    _terminate_executor(
+                    terminate_executor(
                         prepare_executor,
                         owned_process_groups=True,
                     )
@@ -1224,7 +1239,7 @@ def _run_dispatched_tasks(
                     )
                     request_pipeline_stop()
                     if not prepare_executor_terminated:
-                        _terminate_executor(
+                        terminate_executor(
                             prepare_executor,
                             owned_process_groups=True,
                         )
@@ -1442,9 +1457,13 @@ def _run_dispatched_tasks(
             else:
                 time.sleep(min(0.01, heartbeat_interval_sec))
     finally:
+        known_processes = [
+            *(getattr(prepare_executor, "_processes", None) or {}).values(),
+            *(getattr(executor, "_processes", None) or {}).values(),
+        ]
         if not prepare_executor_terminated:
             if preparation is not None:
-                _terminate_executor(
+                terminate_executor(
                     prepare_executor,
                     owned_process_groups=True,
                 )
@@ -1453,6 +1472,9 @@ def _run_dispatched_tasks(
         if not force_terminated:
             executor.shutdown(wait=True)
         writer_executor.shutdown(wait=True)
+    processes_reaped = reaping_succeeded and all(
+        not process.is_alive() for process in known_processes
+    )
 
     for index, outcome in enumerate(outcomes):
         if outcome is None:
@@ -1485,6 +1507,7 @@ def _run_dispatched_tasks(
         outcomes=completed_outcomes,
         runtime_samples=tuple(runtime_samples),
         max_task_elapsed_seconds=round(max_task_elapsed_seconds, 3),
+        processes_reaped=processes_reaped,
     )
 
 
@@ -1958,6 +1981,7 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
         "codex_events": codex_events,
         "transient_error_events": transient_error_events,
         "pipeline": pipeline,
+        "processes_reaped": result.processes_reaped,
         "_pipeline_review_wait_samples": review_to_write,
         "_pipeline_active_review_sum": active_review_sum,
         "_pipeline_review_capacity_sum": review_capacity_sum,
@@ -1985,17 +2009,75 @@ def run_rolling_drain(
     reconcile_status: Callable[[], dict] = _production_reconciliation,
     max_waves: int = 10,
 ) -> dict:
+    controller_handoff.assert_ready_for_start()
     try:
         with runtime_control.global_controller_lease():
-            return _run_rolling_drain_locked(
-                capacity=capacity,
-                adaptive=adaptive,
-                max_capacity=max_capacity,
-                live_status=live_status,
-                pipeline_runner=pipeline_runner,
-                reconcile_status=reconcile_status,
-                max_waves=max_waves,
+            cache_maintenance = attachment_cache.prune_expired()
+            manifest = controller_handoff.begin(
+                {
+                    "capacity": capacity,
+                    "adaptive": adaptive,
+                    "max_capacity": max_capacity,
+                    "model": codex_review_worker.MODEL,
+                    "reasoning_effort": codex_review_worker.REASONING_EFFORT,
+                    "prepare_capacity": 1,
+                    "prepare_timeout_seconds": 300,
+                    "review_timeout_seconds": 960,
+                    "writer_capacity": 1,
+                }
             )
+            children_reaped = True
+
+            def tracked_pipeline_runner(
+                count: int,
+                review_capacity: int,
+            ) -> process_pool.PoolResult[dict]:
+                nonlocal children_reaped
+                children_reaped = False
+                wave_result = pipeline_runner(count, review_capacity)
+                children_reaped = wave_result.processes_reaped is True
+                return wave_result
+
+            try:
+                result = _run_rolling_drain_locked(
+                    capacity=capacity,
+                    adaptive=adaptive,
+                    max_capacity=max_capacity,
+                    live_status=live_status,
+                    pipeline_runner=tracked_pipeline_runner,
+                    reconcile_status=reconcile_status,
+                    max_waves=max_waves,
+                )
+                if result["processes_reaped"] is not True:
+                    children_reaped = False
+                    runtime_control.request_stop()
+                    raise ValueError("production_controller_children_active")
+            except Exception:
+                controller_handoff.finish(
+                    manifest,
+                    status="failed",
+                    children_reaped=children_reaped,
+                    health="degraded",
+                )
+                raise
+            handoff = controller_handoff.finish(
+                manifest,
+                status=(
+                    "completed"
+                    if result["status"]
+                    in {"completed", "completed_with_quarantine"}
+                    else "failed"
+                ),
+                children_reaped=True,
+                health=(
+                    "healthy" if result["status"] == "completed" else "degraded"
+                ),
+            )
+            return {
+                **result,
+                "cache_maintenance": cache_maintenance,
+                "controller_handoff": handoff,
+            }
     except RuntimeError as error:
         if str(error) == "controller_already_active":
             raise ValueError("production_rolling_controller_active") from error
@@ -2034,6 +2116,7 @@ def _run_rolling_drain_locked(
     pending = initial_pending
     actionable = initial_actionable
     waves: list[dict] = []
+    cache_maintenance_waves: list[dict] = []
     status = "completed"
     stop_reason: str | None = None
     healthy_windows = 0
@@ -2049,6 +2132,7 @@ def _run_rolling_drain_locked(
         if len(waves) >= max_waves:
             runtime_control.request_stop()
             raise ValueError("production_rolling_wave_limit_reached")
+        cache_maintenance_waves.append(attachment_cache.prune_expired())
         wave_size = (
             min(actionable, current_capacity * 2) if adaptive else actionable
         )
@@ -2220,6 +2304,9 @@ def _run_rolling_drain_locked(
             ),
         },
     }
+    processes_reaped = all(
+        wave.get("processes_reaped") is True for wave in waves
+    )
     return {
         "schema_version": 1,
         "kind": "preaudit_production_rolling_drain",
@@ -2243,6 +2330,7 @@ def _run_rolling_drain_locked(
         ),
         "quarantined_pending": quarantined_pending,
         "waves": len(waves),
+        "cache_maintenance_waves": cache_maintenance_waves,
         "completed": completed,
         "failed": sum(wave["failed"] for wave in waves),
         "timed_out": sum(wave["timed_out"] for wave in waves),
@@ -2262,6 +2350,7 @@ def _run_rolling_drain_locked(
         "codex_events": codex_events,
         "transient_error_events": transient_error_events,
         "pipeline": pipeline,
+        "processes_reaped": processes_reaped,
         "token_usage": {
             "status": (
                 "recorded"
