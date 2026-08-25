@@ -245,6 +245,11 @@ def test_rolling_controller_prunes_only_expired_cache_entries_at_startup(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "PROJECT_ROOT",
+        tmp_path,
+    )
     cache_path = tmp_path / "cache.sqlite3"
     monkeypatch.setenv("OA_FINANCE_PREAUDIT_CACHE_DB", str(cache_path))
     monkeypatch.setenv(
