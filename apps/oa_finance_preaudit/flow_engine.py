@@ -1468,6 +1468,7 @@ class FlowEngine:
         *,
         include_open: bool,
         skipped_write_authorization_failures: frozenset[Path],
+        skipped_unknown_failures: frozenset[Path],
     ) -> dict | None:
         unsafe: list[tuple[Path, dict]] = []
         shared: list[tuple[Path, dict]] = []
@@ -1490,6 +1491,11 @@ class FlowEngine:
                 and _exclusive_lock_active(attempt_root / "complete.lock")
             ):
                 raise ValueError("completion_in_progress")
+            if (
+                state.get("write_state") == "unknown"
+                and action_path in skipped_unknown_failures
+            ):
+                continue
             if state.get("write_state") in {"submitting", "unknown"}:
                 unsafe.append((attempt_root, state))
                 continue
@@ -2085,17 +2091,103 @@ class FlowEngine:
             validated.add(action_path)
         return frozenset(validated)
 
+    def _validate_skipped_unknown_failures(
+        self,
+        workflow_root: Path,
+        action_files: frozenset[Path],
+    ) -> frozenset[Path]:
+        latest_by_case = {
+            path.parent.name: path
+            for path in self._latest_case_attempts(workflow_root)
+        }
+        validated: set[Path] = set()
+        for action_path in action_files:
+            state_path = action_path.with_name("state.json")
+            if (
+                not action_path.is_absolute()
+                or not action_path.is_relative_to(workflow_root)
+                or not _is_attempt_action_path(action_path, self._root)
+                or not _managed_existing_path(action_path, self._root)
+                or not _managed_existing_path(state_path, self._root)
+            ):
+                raise ValueError("historical_unknown_failure_invalid")
+            action = _read_object(
+                action_path,
+                code="historical_unknown_failure_invalid",
+            )
+            state = _read_object(
+                state_path,
+                code="historical_unknown_failure_invalid",
+            )
+            expected = (
+                workflow_root
+                / "cases"
+                / str(state.get("case_key") or "")
+                / f"attempt-{state.get('attempt')}"
+                / "action.json"
+            )
+            case_key = str(state.get("case_key") or "").strip()
+            required = {
+                "schema_version": SCHEMA_VERSION,
+                "kind": "preaudit_action",
+                "action": "needs_admin",
+                "execution_state": "needs_admin",
+                "write_state": "unknown",
+                "workflow_key": workflow_root.name,
+                "case_key": state.get("case_key"),
+                "attempt": state.get("attempt"),
+                "action_file": str(action_path),
+                "state_file": str(state_path),
+            }
+            reason = state.get("reason")
+            mode_binding = (state.get("mode"), state.get("write_authorized"))
+            preview_confirmed_no_write = (
+                mode_binding == ("preview", False)
+                and reason == "writer_result_unknown"
+                and not os.path.lexists(
+                    action_path.parent / "writer-boundary.json"
+                )
+                and not os.path.lexists(
+                    action_path.parent / "execution-receipt.json"
+                )
+            )
+            if (
+                expected != action_path
+                or latest_by_case.get(case_key) != action_path.parent
+                or not self._attempt_identity_matches(
+                    action_path.parent,
+                    state,
+                    require_material=False,
+                )
+                or reason != "writer_result_unknown"
+                or action.get("reason") != reason
+                or action.get("mode") != state.get("mode")
+                or action.get("write_authorized")
+                != state.get("write_authorized")
+                or "request_id" in action
+                or "received_at" in action
+                or not preview_confirmed_no_write
+                or any(action.get(key) != value for key, value in required.items())
+                or any(state.get(key) != value for key, value in required.items())
+            ):
+                raise ValueError("historical_unknown_failure_invalid")
+            validated.add(action_path)
+        return frozenset(validated)
+
     def next_action(
         self,
         workflow_key: str,
         *,
         mode: str = "preview",
         skip_write_authorization_failures: frozenset[Path] = frozenset(),
+        skip_unknown_failures: frozenset[Path] = frozenset(),
     ) -> dict:
         if workflow_key not in _FLOW_SPECS:
             raise ValueError("workflow_not_implemented")
         if mode not in {"preview", "controlled_write"}:
             raise ValueError("run_mode_unauthorized")
+        if skip_unknown_failures and mode != "controlled_write":
+            raise ValueError("historical_unknown_failure_invalid")
         if mode == "controlled_write" and (
             self._authorization_source is None
             or self._authorization_verifier is None
@@ -2112,15 +2204,25 @@ class FlowEngine:
         )
         try:
             with _exclusive_lock(workflow_root / "flow.lock"):
+                skipped_unknown_failures = (
+                    self._validate_skipped_unknown_failures(
+                        workflow_root,
+                        skip_unknown_failures,
+                    )
+                )
                 recovered = self._recover_before_discovery(
                     workflow_root,
                     include_open=False,
                     skipped_write_authorization_failures=(
                         skipped_write_authorization_failures
                     ),
+                    skipped_unknown_failures=skipped_unknown_failures,
                 )
         except ValueError as error:
-            if str(error) == "completion_in_progress":
+            if str(error) in {
+                "completion_in_progress",
+                "historical_unknown_failure_invalid",
+            }:
                 raise
             return self._persist_tree_invalid(workflow_root)
         if recovered is not None:
@@ -2132,15 +2234,25 @@ class FlowEngine:
         except Exception:
             try:
                 with _exclusive_lock(workflow_root / "flow.lock"):
+                    skipped_unknown_failures = (
+                        self._validate_skipped_unknown_failures(
+                            workflow_root,
+                            skip_unknown_failures,
+                        )
+                    )
                     recovered = self._recover_before_discovery(
                         workflow_root,
                         include_open=True,
                         skipped_write_authorization_failures=(
                             skipped_write_authorization_failures
                         ),
+                        skipped_unknown_failures=skipped_unknown_failures,
                     )
             except ValueError as error:
-                if str(error) == "completion_in_progress":
+                if str(error) in {
+                    "completion_in_progress",
+                    "historical_unknown_failure_invalid",
+                }:
                     raise
                 return self._persist_tree_invalid(workflow_root)
             if recovered is not None:
@@ -2166,6 +2278,10 @@ class FlowEngine:
 
         prepare_root: Path | None = None
         with _exclusive_lock(workflow_root / "flow.lock"):
+            skipped_unknown_failures = self._validate_skipped_unknown_failures(
+                workflow_root,
+                skip_unknown_failures,
+            )
             try:
                 latest_attempts = self._latest_case_attempts(workflow_root)
             except ValueError:
@@ -2187,6 +2303,7 @@ class FlowEngine:
                     if (
                         latest / "action.json"
                         in skipped_write_authorization_failures
+                        or latest / "action.json" in skipped_unknown_failures
                     ):
                         continue
                     try:
@@ -2284,6 +2401,7 @@ class FlowEngine:
                         if (
                             latest / "action.json"
                             in skipped_write_authorization_failures
+                            or latest / "action.json" in skipped_unknown_failures
                         ):
                             continue
                         try:
@@ -2348,7 +2466,10 @@ class FlowEngine:
                     active_action = self._resume_active_action(workflow_root)
                     if active_action is not None and Path(
                         str(active_action.get("action_file") or "")
-                    ) not in skipped_write_authorization_failures:
+                    ) not in (
+                        skipped_write_authorization_failures
+                        | skipped_unknown_failures
+                    ):
                         return active_action
                     return self._persist_current_action(
                         workflow_root,

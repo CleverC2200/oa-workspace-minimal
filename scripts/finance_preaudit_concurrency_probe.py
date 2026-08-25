@@ -207,6 +207,39 @@ def _local_unknown_quarantined_identities() -> frozenset[tuple[str, str]]:
     return frozenset(identities)
 
 
+def _historical_unknown_action_files(
+    identities: set[tuple[str, str]],
+    *,
+    workflow_key: str,
+) -> frozenset[Path]:
+    if not identities:
+        return frozenset()
+    flow_root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
+    action_files: set[Path] = set()
+    for state in reconciliation.latest_states(flow_root):
+        identity = (
+            str(state.get("request_id") or "").strip(),
+            str(state.get("received_at") or "").strip(),
+        )
+        if (
+            identity not in identities
+            or state.get("workflow_key") != workflow_key
+            or state.get("execution_state") != "needs_admin"
+            or state.get("write_state") != "unknown"
+            or state.get("reason") not in reconciliation.QUARANTINED_REASONS
+        ):
+            continue
+        action_files.add(
+            flow_root
+            / workflow_key
+            / "cases"
+            / str(state["case_key"])
+            / f"attempt-{state['attempt']}"
+            / "action.json"
+        )
+    return frozenset(action_files)
+
+
 def _prepare_one(selection: PrepareSelection) -> dict:
     assigned_identities: set[tuple[str, str]] = set()
     historical_unknown_identities: set[tuple[str, str]] = set()
@@ -318,6 +351,10 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                     mode="controlled_write",
                     skip_write_authorization_failures=(
                         historical_authorization_failures
+                    ),
+                    skip_unknown_failures=_historical_unknown_action_files(
+                        historical_unknown_identities,
+                        workflow_key=selected_workflow,
                     ),
                 )
             except ValueError as error:

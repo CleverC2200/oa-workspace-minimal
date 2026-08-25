@@ -697,6 +697,8 @@ def test_prepare_global_fifo_skips_only_frozen_historical_unknown(
     monkeypatch,
 ) -> None:
     historical = ("historical-unknown", "2026-08-25T08:00:00+08:00")
+    historical_action = Path("/safe/historical-action.json")
+    skip_calls: list[frozenset[Path]] = []
     selected = {
         "requestId": "next-request",
         "received_at": "2026-08-25T08:01:00+08:00",
@@ -720,7 +722,14 @@ def test_prepare_global_fifo_skips_only_frozen_historical_unknown(
     )
 
     class Engine:
-        def next_action(self, _workflow_key: str, **_kwargs) -> dict:
+        def next_action(
+            self,
+            _workflow_key: str,
+            *,
+            skip_unknown_failures: frozenset[Path],
+            **_kwargs,
+        ) -> dict:
+            skip_calls.append(skip_unknown_failures)
             return {
                 "action": "review_required",
                 "action_file": "/safe/next-action.json",
@@ -765,6 +774,15 @@ def test_prepare_global_fifo_skips_only_frozen_historical_unknown(
         "_local_quarantined_identities",
         frozenset,
     )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_historical_unknown_action_files",
+        lambda identities, *, workflow_key: (
+            frozenset({historical_action})
+            if identities == {historical} and workflow_key == "travel_expense"
+            else frozenset()
+        ),
+    )
 
     assert finance_preaudit_concurrency_probe._prepare_one(
         {
@@ -776,6 +794,7 @@ def test_prepare_global_fifo_skips_only_frozen_historical_unknown(
         "action": "review_required",
         "action_file": "/safe/next-action.json",
     }
+    assert skip_calls == [frozenset({historical_action})]
 
 
 def test_local_quarantine_excludes_historical_no_write_failure(
