@@ -10,9 +10,10 @@ from datetime import datetime, timezone
 
 from apps.oa_approval import api as legacy_api
 from apps.oa_approval import flow as legacy_flow
-from apps.oa_approval import runtime_control
+from apps.oa_approval import attachment_cache, runtime_control
 from .case_bundle import collect_case
 from . import (
+    controller_handoff,
     flow_engine,
     observability,
     production_pending,
@@ -44,6 +45,8 @@ _RUNTIME_FAILURE_CODES = {
     "runtime_reconciliation_invalid",
     "oa_auth_file_permissions_invalid",
     "oa_auth_file_outside_worktree_required",
+    "cache_clean_failed",
+    "cache_clean_runtime_active",
 }
 _FLOW_FAILURE_CODES = {
     "flow_candidate_invalid",
@@ -110,6 +113,8 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--reconcile", action="store_true")
     prune = subparsers.add_parser("prune")
     prune.add_argument("--root", type=Path, default=None)
+    clean = subparsers.add_parser("clean")
+    clean.add_argument("--all-cache", action="store_true", required=True)
     return parser
 
 
@@ -121,7 +126,20 @@ def _runtime_root(value: Path | None) -> Path:
     )
 
 
-def _live_flow_engine(*, controlled: bool = False) -> flow_engine.FlowEngine:
+def _live_pending_identities() -> list[dict]:
+    configs = legacy_flow.load_all_configs()
+    oa_api = legacy_api.build_api(configs[0])
+    return production_pending.identify_pending_rows(
+        oa_api.pending_rows(page_size=200, max_pages=100),
+        configs,
+    )
+
+
+def _live_flow_engine(
+    *,
+    controlled: bool = False,
+    selected_identity: tuple[str, str] | None = None,
+) -> flow_engine.FlowEngine:
     configs = legacy_flow.load_all_configs()
     oa_api = legacy_api.build_api(configs[0])
 
@@ -137,6 +155,11 @@ def _live_flow_engine(*, controlled: bool = False) -> flow_engine.FlowEngine:
             for item in identities
             if item["support_status"] == "supported"
             and item["flow_key"] == workflow_key
+            and (
+                selected_identity is None
+                or (item["requestId"], item["received_at"])
+                == selected_identity
+            )
         ]
 
     def collect(request_id: str, attempt_root: Path) -> dict:
@@ -168,7 +191,10 @@ def _live_reconciliation(
     root: Path,
     *,
     workflow_key: str | None = None,
+    workflow_keys: frozenset[str] | None = None,
 ) -> dict:
+    if workflow_key is not None and workflow_keys is not None:
+        raise ValueError("runtime_reconciliation_invalid")
     configs = legacy_flow.load_all_configs()
     oa_api = legacy_api.build_api(configs[0])
     pending = production_pending.identify_pending_rows(
@@ -178,7 +204,9 @@ def _live_reconciliation(
     selected = [
         item
         for item in pending
-        if workflow_key is None or item["flow_key"] == workflow_key
+        if item["support_status"] == "supported"
+        and (workflow_key is None or item["flow_key"] == workflow_key)
+        and (workflow_keys is None or item["flow_key"] in workflow_keys)
     ]
     return reconciliation.reconcile(
         root,
@@ -242,7 +270,7 @@ def _matches_confirmed_unknown_recovery(
 
 
 def _failure_payload(error: Exception, *, command: str = "next-action") -> dict:
-    if command in {"status", "prune"}:
+    if command in {"status", "prune", "clean"}:
         raw_code = str(error).strip()
         code = raw_code if raw_code in _RUNTIME_FAILURE_CODES else "runtime_failed"
         return {
@@ -274,7 +302,7 @@ def _failure_payload(error: Exception, *, command: str = "next-action") -> dict:
 def _fail(args: argparse.Namespace, error: Exception) -> int:
     failure = _failure_payload(error, command=args.command)
     _print_payload(failure)
-    if args.command in {"status", "prune"}:
+    if args.command in {"status", "prune", "clean"}:
         print(failure["failure"]["code"], file=sys.stderr)
     return 1
 
@@ -301,7 +329,7 @@ def _emit_invocation(
         [workflow_key]
         if workflow_key in flow_engine.WORKFLOW_KEYS
         else ["global"]
-        if command in {"status", "prune"}
+        if command in {"status", "prune", "clean"}
         else []
     )
     for current_workflow in workflow_keys:
@@ -339,6 +367,75 @@ def _invocation_workflow(
     return None
 
 
+def _attach_live_queue_projection(payload: dict) -> None:
+    live = payload.get("live_check")
+    reconciled = payload.get("reconciliation")
+    operations = payload.get("operations")
+    if not isinstance(operations, dict) or not isinstance(live, dict):
+        return
+    oa = live.get("oa")
+    if not isinstance(oa, dict):
+        return
+    supported = oa.get("supported")
+    unsupported = oa.get("unsupported")
+    trusted_live = (
+        live.get("schema_version") == 1
+        and live.get("kind") == "preaudit_live_status"
+        and oa.get("execution_identity") == "verified"
+        and isinstance(supported, int)
+        and not isinstance(supported, bool)
+        and supported >= 0
+        and isinstance(unsupported, int)
+        and not isinstance(unsupported, bool)
+        and unsupported >= 0
+    )
+    quarantine = (
+        reconciled.get("quarantine")
+        if isinstance(reconciled, dict)
+        else None
+    )
+    actionable = (
+        quarantine.get("actionable_pending")
+        if isinstance(quarantine, dict)
+        else None
+    )
+    quarantined = (
+        quarantine.get("pending_quarantined")
+        if isinstance(quarantine, dict)
+        else None
+    )
+    trusted_reconciliation = (
+        isinstance(reconciled, dict)
+        and reconciled.get("schema_version") == 1
+        and reconciled.get("kind") == "preaudit_reconciliation"
+        and reconciled.get("read_only") is True
+        and isinstance(actionable, int)
+        and not isinstance(actionable, bool)
+        and actionable >= 0
+        and isinstance(quarantined, int)
+        and not isinstance(quarantined, bool)
+        and quarantined >= 0
+        and actionable + quarantined == supported
+    )
+    operations["live_queue"] = (
+        {
+            "evidence_status": "exact",
+            "remaining": supported,
+            "actionable": actionable,
+            "quarantined": quarantined,
+            "unsupported": unsupported,
+        }
+        if trusted_live and trusted_reconciliation
+        else {
+            "evidence_status": "unknown",
+            "remaining": supported if trusted_live else "unknown",
+            "actionable": "unknown",
+            "quarantined": "unknown",
+            "unsupported": unsupported if trusted_live else "unknown",
+        }
+    )
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -373,9 +470,34 @@ def main(
             if args.reconcile:
                 reconcile_operation = reconcile_status or _live_reconciliation
                 payload["reconciliation"] = reconcile_operation(root)
+            _attach_live_queue_projection(payload)
+            payload["controller_handoff"] = controller_handoff.status()
         elif args.command == "prune":
             operation = runtime_prune or runtime_maintenance.prune
             payload = operation(_runtime_root(args.root))
+        elif args.command == "clean":
+            try:
+                with runtime_control.global_controller_lease():
+                    if (
+                        runtime_control.writer_active()
+                        or runtime_control.active_request_writers() != 0
+                    ):
+                        raise RuntimeError("cache_clean_runtime_active")
+                    try:
+                        with runtime_control.request_writer_lease(
+                            runtime_control.GLOBAL_WRITER_KEY,
+                            runtime_control.writer_lock_file(),
+                            blocking=False,
+                        ):
+                            payload = attachment_cache.clean_all_cache()
+                    except BlockingIOError as error:
+                        raise RuntimeError(
+                            "cache_clean_runtime_active"
+                        ) from error
+            except (BlockingIOError, RuntimeError) as error:
+                if str(error) == "controller_already_active":
+                    raise RuntimeError("cache_clean_runtime_active") from error
+                raise
         else:
             if args.command == "next-action":
                 controlled = args.mode == "controlled-write"
@@ -486,6 +608,7 @@ def entrypoint(argv: Sequence[str] | None = None) -> int:
             "complete-review",
             "status",
             "prune",
+            "clean",
         }:
             return code
         command = raw[0]

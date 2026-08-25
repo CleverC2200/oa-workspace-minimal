@@ -14,13 +14,17 @@ from apps.oa_finance_preaudit import codex_review_worker
 from apps.oa_approval import runtime_control
 
 
-def _task(tmp_path: Path) -> tuple[dict, Path]:
+def _task(
+    tmp_path: Path,
+    *,
+    workflow_key: str = "travel_expense",
+) -> tuple[dict, Path]:
     project_root = tmp_path / "project"
     attempt_root = (
         project_root
         / "runtime"
         / "finance_preaudit_flows"
-        / "travel_expense"
+        / workflow_key
         / "cases"
         / ("a" * 64)
         / "attempt-1"
@@ -36,7 +40,7 @@ def _task(tmp_path: Path) -> tuple[dict, Path]:
             "execution_state": "review_required",
             "business_state": "not_available",
             "write_state": "authorized",
-            "workflow_key": "travel_expense",
+            "workflow_key": workflow_key,
             "mode": "controlled_write",
             "write_authorized": True,
             "action_token": "test-action-token",
@@ -46,11 +50,87 @@ def _task(tmp_path: Path) -> tuple[dict, Path]:
         action_file.with_name("state.json"),
         json.loads(action_file.read_text(encoding="utf-8")),
     )
+    json_artifact.write_json_atomic(
+        action_file.with_name("review-packet.json"),
+        {
+            "workflow_key": workflow_key,
+            "rule_version": f"{workflow_key}:1",
+        },
+    )
     return {
         "project_root": str(project_root),
         "action_file": str(action_file),
         "timeout_seconds": 900,
     }, action_file
+
+
+def test_non_travel_schema_and_timing_follow_bound_action(tmp_path: Path) -> None:
+    _task_payload, action_file = _task(
+        tmp_path,
+        workflow_key="business_entertainment",
+    )
+
+    schema = codex_review_worker._decision_schema(action_file)
+
+    assert schema["properties"]["workflow_key"] == {
+        "type": "string",
+        "const": "business_entertainment",
+    }
+    assert schema["properties"]["rule_version"] == {
+        "type": "string",
+        "const": "business_entertainment:1",
+    }
+    assert codex_review_worker._write_agent_timing(
+        action_file,
+        wall_seconds=12.9,
+        attempts=1,
+        token_usage={"status": "unknown"},
+    )
+    timing = json.loads(
+        action_file.with_name("agent-timing.json").read_text(encoding="utf-8")
+    )
+    assert timing["workflow_key"] == "business_entertainment"
+    prompt = codex_review_worker._prompt(action_file)
+    assert "业务招待费生产预审" in prompt
+    assert "business-entertainment.md" in prompt
+    assert "page_routing" not in prompt
+
+
+def test_schema_uses_frozen_packet_rule_version(tmp_path: Path) -> None:
+    _task_payload, action_file = _task(
+        tmp_path,
+        workflow_key="business_entertainment",
+    )
+    packet_file = action_file.with_name("review-packet.json")
+    packet = json.loads(packet_file.read_text(encoding="utf-8"))
+    json_artifact.write_json_atomic(
+        packet_file,
+        {**packet, "rule_version": "business_entertainment:2"},
+    )
+
+    schema = codex_review_worker._decision_schema(action_file)
+
+    assert schema["properties"]["rule_version"] == {
+        "type": "string",
+        "const": "business_entertainment:2",
+    }
+
+
+def test_worker_rejects_non_object_frozen_packet(tmp_path: Path) -> None:
+    task, action_file = _task(tmp_path)
+    json_artifact.write_json_atomic(
+        action_file.with_name("review-packet.json"),
+        ["not-an-object"],
+    )
+
+    result = codex_review_worker.review(
+        task,
+        executor=lambda *_args: pytest.fail("executor must not start"),
+    )
+
+    assert result["status"] == "failed"
+    assert result["write_state"] == "not_requested"
+    assert result["error_code"] == "codex_review_task_invalid"
 
 
 def test_worker_returns_sanitized_success_only_after_bound_receipt(
@@ -295,7 +375,7 @@ def test_prompt_exposes_flow_engine_fallback_routing_for_legacy_packet(
     )
 
 
-def test_prompt_preserves_explicit_routing_and_fails_closed_when_unreadable(
+def test_prompt_references_frozen_routing_without_copying_it_twice(
     tmp_path: Path,
 ) -> None:
     _task_payload, action_file = _task(tmp_path)
@@ -317,10 +397,10 @@ def test_prompt_preserves_explicit_routing_and_fails_closed_when_unreadable(
 
     prompt = codex_review_worker._prompt(action_file)
     assert "full_page_fallback" not in prompt
-    assert '"strategy":"exact_page_duplicate_only"' in prompt
-    assert '"review_page_refs":["packet-owned-ref"]' in prompt
-    assert "逐项覆盖以下宿主路由" in prompt
-    assert '"review_page_refs":["packet-owned-ref"]' in (
+    assert '"strategy":"exact_page_duplicate_only"' not in prompt
+    assert '"review_page_refs":["packet-owned-ref"]' not in prompt
+    assert "直接读取冻结审核包中的 `page_routing`" in prompt
+    assert '"review_page_refs":["packet-owned-ref"]' not in (
         codex_review_worker._read_only_prompt(action_file)
     )
 
@@ -378,6 +458,52 @@ def test_codex_start_blocks_sigterm_until_process_group_is_registered(
     ]
     assert calls[0][1] == signal.SIG_BLOCK
     assert calls[3][1] == signal.SIG_SETMASK
+
+
+def test_codex_process_receives_only_reviewer_runtime_environment(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    task, action_file = _task(tmp_path)
+    captured_environment: dict[str, str] = {}
+    monkeypatch.setenv("OA_APP_SECRET", "must-not-reach-reviewer")
+    monkeypatch.setenv("OA_DB_PASSWORD", "must-not-reach-reviewer")
+    monkeypatch.setenv("OA_BASE_URL", "must-not-reach-reviewer")
+    monkeypatch.setenv("OA_UID", "must-not-reach-reviewer")
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-reach-reviewer")
+    monkeypatch.setenv("OPENAI_API_KEY", "reviewer-auth")
+
+    class Process:
+        pid = 12345
+        returncode = 1
+
+        def communicate(self, *, input: str, timeout: int) -> None:
+            del input, timeout
+
+        def poll(self) -> int:
+            return self.returncode
+
+    def popen(*_args, **kwargs) -> Process:
+        captured_environment.update(kwargs["env"])
+        return Process()
+
+    monkeypatch.setattr(codex_review_worker.subprocess, "Popen", popen)
+
+    result = codex_review_worker._execute_codex(
+        Path(task["project_root"]),
+        action_file,
+        60,
+    )
+
+    assert result.error_code == "codex_process_failed"
+    assert captured_environment["HOME"]
+    assert captured_environment["PATH"]
+    assert captured_environment["OPENAI_API_KEY"] == "reviewer-auth"
+    assert "OA_APP_SECRET" not in captured_environment
+    assert "OA_DB_PASSWORD" not in captured_environment
+    assert "OA_BASE_URL" not in captured_environment
+    assert "OA_UID" not in captured_environment
+    assert "UNRELATED_SECRET" not in captured_environment
 
 
 def test_worker_submits_structured_agent_decision_through_host(
@@ -632,6 +758,8 @@ def test_parent_completion_can_defer_first_invalid_decision_stop(
         "writer_transport_unknown",
         "writer_postcheck_timeout",
         "writer_pending_conflict",
+        "writer_preflight_failed",
+        "submission_target_changed",
         "writer_result_unknown",
     ),
 )
@@ -697,6 +825,8 @@ def test_host_completion_rejects_unrecognized_failure_reason(
         ("writer_transport_unknown", "unknown"),
         ("writer_postcheck_timeout", "unknown"),
         ("writer_pending_conflict", "unknown"),
+        ("writer_preflight_failed", "not_requested"),
+        ("submission_target_changed", "not_requested"),
         ("writer_result_unknown", "unknown"),
     ),
 )
@@ -893,6 +1023,62 @@ def test_global_stop_request_is_visible_to_all_workers(
     assert runtime_control.stop_requested() is True
     assert stop_file.read_text(encoding="utf-8") == "stop_requested\n"
     assert stop_file.stat().st_mode & 0o777 == 0o600
+
+
+def test_global_stop_preserves_first_sanitized_reason(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stop_file = tmp_path / "control" / "stop.flag"
+    monkeypatch.setenv("OA_FINANCE_PREAUDIT_STOP_FILE", str(stop_file))
+
+    runtime_control.request_stop("production_probe_prepare_failed")
+    runtime_control.request_stop("production_probe_renew_failed")
+
+    assert runtime_control.stop_requested() is True
+    assert runtime_control.stop_reason() == "production_probe_prepare_failed"
+    assert (
+        stop_file.read_text(encoding="utf-8")
+        == "stop_requested:production_probe_prepare_failed\n"
+    )
+
+
+def test_global_stop_rejects_unlisted_reason(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stop_file = tmp_path / "control" / "stop.flag"
+    monkeypatch.setenv("OA_FINANCE_PREAUDIT_STOP_FILE", str(stop_file))
+
+    with pytest.raises(ValueError, match="stop_reason_invalid"):
+        runtime_control.request_stop("unexpected_reason")
+
+    assert not stop_file.exists()
+
+
+def test_global_stop_reason_rejects_tampered_or_symlinked_content(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stop_file = tmp_path / "control" / "stop.flag"
+    stop_file.parent.mkdir(parents=True)
+    monkeypatch.setenv("OA_FINANCE_PREAUDIT_STOP_FILE", str(stop_file))
+    stop_file.write_text(
+        "stop_requested:production_probe_prepare_failed \n",
+        encoding="ascii",
+    )
+
+    assert runtime_control.stop_reason() is None
+
+    outside = tmp_path / "outside-stop.flag"
+    outside.write_text(
+        "stop_requested:production_probe_prepare_failed\n",
+        encoding="ascii",
+    )
+    stop_file.unlink()
+    stop_file.symlink_to(outside)
+
+    assert runtime_control.stop_reason() is None
 
 
 def test_read_only_worker_returns_structured_decision_without_completion(

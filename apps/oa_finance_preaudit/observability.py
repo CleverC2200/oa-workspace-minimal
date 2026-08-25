@@ -48,7 +48,7 @@ _EVENT_FIELDS = {
 _SAFE_TEXT = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
-_CLI_COMMANDS = {"next-action", "complete-review", "status", "prune"}
+_CLI_COMMANDS = {"next-action", "complete-review", "status", "prune", "clean"}
 _CLI_OUTCOMES = {
     "success",
     "argument_error",
@@ -359,6 +359,43 @@ def latest_event_at(path: Path) -> datetime | None:
     if not events:
         return None
     return max(_timestamp(event["occurred_at"]) for event in events)
+
+
+def attempt_stage_timestamps(path: Path, *, item_key: str) -> dict:
+    if _SHA256.fullmatch(item_key) is None:
+        raise ValueError("observability_identity_invalid")
+    stages = {
+        "discovered": "discover",
+        "prepared": "collect",
+        "review_done": "review",
+        "write_ready": "wait",
+        "writer": "submit",
+        "postcheck": "postcheck",
+        "closed": "close",
+    }
+    events = [
+        event
+        for event in _read_log(Path(path).expanduser().resolve())["events"]
+        if event["item_key"] == item_key
+    ]
+    projected: dict[str, dict] = {}
+    for stage, phase in stages.items():
+        timestamps = [
+            event["occurred_at"]
+            for event in events
+            if event["phase"] == phase
+        ]
+        projected[stage] = (
+            {
+                "status": "exact",
+                "occurred_at": (
+                    min(timestamps) if stage == "write_ready" else max(timestamps)
+                ),
+            }
+            if timestamps
+            else {"status": "unknown"}
+        )
+    return projected
 
 
 def _empty_metrics() -> dict:

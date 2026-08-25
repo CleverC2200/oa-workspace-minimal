@@ -66,6 +66,13 @@ def _codex_task(tmp_path: Path) -> tuple[dict, Path]:
             "action_token": "test-action-token",
         },
     )
+    json_artifact.write_json_atomic(
+        action_file.with_name("review-packet.json"),
+        {
+            "workflow_key": "travel_expense",
+            "rule_version": "travel_expense:1",
+        },
+    )
     return {
         "project_root": str(project_root),
         "action_file": str(action_file),
@@ -99,7 +106,7 @@ import sys
 import time
 
 child = subprocess.Popen([sys.executable, "-c", {child_program!r}, {marker!r}])
-Path(os.environ["OA_TEST_CODEX_PID_FILE"]).write_text(
+Path({str(pid_file)!r}).write_text(
     f"{{os.getpid()}}\\n{{child.pid}}\\n", encoding="utf-8"
 )
 sys.stdin.read()
@@ -109,7 +116,6 @@ time.sleep(15)
     )
     fake_codex.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_root}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setenv("OA_TEST_CODEX_PID_FILE", str(pid_file))
     return pid_file, fake_codex, marker
 
 

@@ -180,12 +180,46 @@ def test_packaging_collection_failure_remains_a_hard_stop(tmp_path: Path) -> Non
 def test_explicit_runtime_stop_is_not_converted_to_a_material_gap(
     tmp_path: Path,
 ) -> None:
-    engine = _engine(tmp_path, "travel_expense", RuntimeError("oa_run_stopped"))
+    error = RuntimeError("oa_run_stopped")
+    error.counts = {
+        "declared_attachment_count": 12,
+        "discovered_resource_count": 3,
+        "unsafe_internal_counter": 99,
+    }
+    engine = _engine(tmp_path, "travel_expense", error)
 
     action = engine.next_action("travel_expense")
 
     assert action["action"] == "needs_admin"
     assert action["reason"] == "material_collection_failed"
+    assert action["failure_detail_code"] == "oa_run_stopped"
+    assert action["failure_counts"] == {
+        "declared_attachment_count": 12,
+        "discovered_resource_count": 3,
+    }
+    state = json.loads(Path(action["state_file"]).read_text(encoding="utf-8"))
+    assert state["failure_detail_code"] == "oa_run_stopped"
+    assert state["failure_counts"] == action["failure_counts"]
+    assert "unsafe_internal_counter" not in json.dumps(state, ensure_ascii=False)
+
+
+def test_material_bundle_failure_persists_only_a_safe_detail_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject_bundle(*_args: object, **_kwargs: object) -> dict:
+        raise ValueError("material_bundle_schema_invalid")
+
+    monkeypatch.setattr(flow_engine, "_validate_material_bundle", reject_bundle)
+    engine = _engine(tmp_path, "travel_expense", RuntimeError("collector timeout"))
+
+    action = engine.next_action("travel_expense")
+
+    assert action["action"] == "needs_admin"
+    assert action["reason"] == "material_collection_failed"
+    assert action["failure_detail_code"] == "material_bundle_schema_invalid"
+    serialized = json.dumps(action, ensure_ascii=False)
+    assert "collector timeout" not in serialized
 
 
 def test_authorized_writer_can_submit_the_dynamic_gap_opinion(tmp_path: Path) -> None:

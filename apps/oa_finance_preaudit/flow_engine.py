@@ -138,11 +138,34 @@ _SAFE_COLLECTION_COUNT_KEYS = {
     "trusted_source_sighting_count",
 }
 _HARD_COLLECTION_FAILURE_CODES = {"oa_run_stopped"}
+_SAFE_MATERIAL_FAILURE_DETAIL_CODES = (
+    _SAFE_MATERIAL_GAP_CODES
+    | _HARD_COLLECTION_FAILURE_CODES
+    | {
+        "frozen_file_unreadable",
+        "frozen_material_changed",
+        "manifest_resource_coverage_incomplete",
+        "manifest_resource_unbound",
+        "material_bundle_schema_invalid",
+        "material_bundle_unreadable",
+        "material_request_mismatch",
+        "prepared_path_outside_request_root",
+        "prepared_resource_path_mismatch",
+        "prepared_resource_unbound",
+        "resource_identity_invalid",
+        "resource_request_mismatch",
+        "resource_source_identity_missing",
+    }
+)
 SHARED_FAILURE_CODES = {
     "submission_adapter_unavailable",
     "write_authorization_invalid",
 }
 _WRITER_FAILURE_CODES = writer_outcomes.FAILURE_CODES
+_CONTINUABLE_QUARANTINE_CODES = {
+    "material_collection_failed",
+    *writer_outcomes.CONFIRMED_NO_WRITE_CODES,
+}
 
 
 CandidateSource = Callable[[str], Iterable[dict]]
@@ -151,7 +174,9 @@ MaterialCollector = Callable[[str, Path], dict]
 AuthorizationSource = submission.AuthorizationSource
 AuthorizationVerifier = submission.AuthorizationVerifier
 AuthorizationRenewer = submission.AuthorizationRenewer
+AuthorizationRefreshNeeded = submission.AuthorizationRefreshNeeded
 SubmitFrozen = submission.SubmitFrozen
+RecoverFrozen = submission.RecoverFrozen
 
 
 def _read_object(path: Path, *, code: str) -> dict:
@@ -225,6 +250,21 @@ def _exclusive_lock(path: Path):
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
+def _exclusive_lock_active(path: Path) -> bool:
+    descriptor = os.open(
+        path,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    with os.fdopen(descriptor, "a+", encoding="utf-8") as stream:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        return False
+
+
 def _action_payload(
     *,
     action: str,
@@ -280,6 +320,19 @@ def _material_gap(error: Exception) -> dict:
     if counts:
         gap["counts"] = counts
     return gap
+
+
+def _material_failure_details(error: Exception) -> dict:
+    raw_code = str(error).strip()
+    gap = _material_gap(error)
+    return {
+        "failure_detail_code": (
+            raw_code
+            if raw_code in _SAFE_MATERIAL_FAILURE_DETAIL_CODES
+            else "material_collection_failed"
+        ),
+        **({"failure_counts": gap["counts"]} if "counts" in gap else {}),
+    }
 
 
 def _degraded_material(request_id: str, workflow_key: str, error: Exception) -> dict:
@@ -902,7 +955,9 @@ class FlowEngine:
         authorization_source: AuthorizationSource | None = None,
         authorization_verifier: AuthorizationVerifier | None = None,
         authorization_renewer: AuthorizationRenewer | None = None,
+        authorization_refresh_needed: AuthorizationRefreshNeeded | None = None,
         submit_frozen: SubmitFrozen | None = None,
+        recover_frozen: RecoverFrozen | None = None,
     ) -> None:
         self._root = Path(root).expanduser().resolve()
         self._discover_candidates = discover_candidates
@@ -911,7 +966,9 @@ class FlowEngine:
         self._authorization_source = authorization_source
         self._authorization_verifier = authorization_verifier
         self._authorization_renewer = authorization_renewer
+        self._authorization_refresh_needed = authorization_refresh_needed
         self._submit_frozen = submit_frozen
+        self._recover_frozen = recover_frozen
 
     def _persist_current_action(
         self,
@@ -1080,6 +1137,8 @@ class FlowEngine:
         self,
         action_path: Path,
         reason: str,
+        *,
+        failure_details: dict | None = None,
     ) -> dict:
         attempt_root = action_path.parent
         workflow_key = _attempt_workflow_key(attempt_root, self._root)
@@ -1094,7 +1153,7 @@ class FlowEngine:
             state = _read_object(state_path, code="persistent_state_invalid")
         except ValueError:
             state = {}
-        if reason == writer_outcomes.SUBMIT_REJECTED:
+        if reason in writer_outcomes.CONFIRMED_NO_WRITE_CODES:
             write_state = "not_requested"
         else:
             write_state = (
@@ -1110,6 +1169,7 @@ class FlowEngine:
             state_file=str(state_path),
             case_key=attempt_root.parent.name,
             attempt=_attempt_number(attempt_root),
+            **(failure_details or {}),
         )
         json_artifact.write_json_atomic(action_path, action, indent=2)
         json_artifact.write_json_atomic(
@@ -1365,6 +1425,41 @@ class FlowEngine:
             expected_action_file=str(action_path),
         )
 
+    def _recover_frozen_submission(
+        self,
+        attempt_root: Path,
+        state: dict,
+    ) -> dict:
+        if self._recover_frozen is None:
+            raise ValueError("writer_result_unknown")
+        action = _read_object(
+            attempt_root / "action.json",
+            code="writer_result_unknown",
+        )
+        files = {
+            "decision_file": attempt_root / "review-decision.json",
+            "remark_file": attempt_root / "remark.txt",
+            "envelope_file": attempt_root / "submission-envelope.json",
+        }
+        try:
+            job = submission.build_job(
+                action=action,
+                state=state,
+                decision_file=str(files["decision_file"]),
+                remark_file=str(files["remark_file"]),
+                envelope_file=str(files["envelope_file"]),
+                decision_fingerprint=_file_fingerprint(files["decision_file"]),
+                remark_fingerprint=_file_fingerprint(files["remark_file"]),
+                envelope_fingerprint=_file_fingerprint(files["envelope_file"]),
+            )
+            recovered = self._recover_frozen(dict(job))
+            return submission.validate_result(
+                recovered,
+                str(state.get("submission_token") or ""),
+            )
+        except Exception as error:
+            raise ValueError("writer_result_unknown") from error
+
     def _recover_completion(self, attempt_root: Path, state: dict) -> dict:
         action_path = attempt_root / "action.json"
         if (
@@ -1377,7 +1472,21 @@ class FlowEngine:
         except ValueError as error:
             reason = str(error)
             if state.get("write_state") in {"submitting", "unknown"}:
-                reason = "writer_result_unknown"
+                try:
+                    recovered = self._recover_frozen_submission(attempt_root, state)
+                except ValueError:
+                    reason = "writer_result_unknown"
+                else:
+                    json_artifact.write_json_atomic(
+                        attempt_root / "state.json",
+                        {**state, "write_state": "authorized"},
+                        indent=2,
+                    )
+                    return self._complete_review_locked(
+                        action_path,
+                        attempt_root / "review-decision.json",
+                        recovered_submission_result=recovered,
+                    )
             return self._persist_attempt_needs_admin(action_path, reason)
         return self._persist_receipt_completion(action_path, state, receipt)
 
@@ -1393,6 +1502,8 @@ class FlowEngine:
         workflow_root: Path,
         *,
         include_open: bool,
+        skipped_write_authorization_failures: frozenset[Path],
+        skipped_unknown_failures: frozenset[Path],
     ) -> dict | None:
         unsafe: list[tuple[Path, dict]] = []
         shared: list[tuple[Path, dict]] = []
@@ -1411,12 +1522,16 @@ class FlowEngine:
                     "persistent_state_invalid",
                 )
             if (
-                state.get("write_state") == "submitting"
-                or (
-                    include_open
-                    and state.get("write_state") == "unknown"
-                )
+                state.get("execution_state") != "closed"
+                and _exclusive_lock_active(attempt_root / "complete.lock")
             ):
+                raise ValueError("completion_in_progress")
+            if (
+                state.get("write_state") == "unknown"
+                and action_path in skipped_unknown_failures
+            ):
+                continue
+            if state.get("write_state") in {"submitting", "unknown"}:
                 unsafe.append((attempt_root, state))
                 continue
             try:
@@ -1442,6 +1557,8 @@ class FlowEngine:
                 state.get("execution_state") == "needs_admin"
                 and state.get("reason") in SHARED_FAILURE_CODES
             ):
+                if action_path in skipped_write_authorization_failures:
+                    continue
                 shared.append((attempt_root, state))
                 continue
             if not include_open:
@@ -1499,17 +1616,27 @@ class FlowEngine:
         action_path: Path,
         action: dict,
         state: dict,
+        *,
+        preserve_action_token: bool = False,
     ) -> dict:
         if state.get("mode") != "controlled_write":
             return action
+        valid = False
         try:
             submission.verify_persisted_authorization(
                 state,
                 verifier=self._authorization_verifier,
             )
-            return action
+            valid = True
         except ValueError:
             pass
+        if valid and (
+            self._authorization_refresh_needed is None
+            or not self._authorization_refresh_needed(
+                dict(state.get("authorization_grant") or {})
+            )
+        ):
+            return action
         if self._authorization_renewer is None:
             raise ValueError("write_authorization_invalid")
         context, previous_grant = submission.persisted_authorization_binding(state)
@@ -1527,7 +1654,11 @@ class FlowEngine:
             "authorization_fingerprint": authorization[
                 "authorization_fingerprint"
             ],
-            "action_token": secrets.token_urlsafe(32),
+            "action_token": (
+                action["action_token"]
+                if preserve_action_token
+                else secrets.token_urlsafe(32)
+            ),
         }
         refreshed_state = {
             **state,
@@ -1566,6 +1697,11 @@ class FlowEngine:
                     attempt_root / "action.json",
                     "persistent_state_invalid",
                 )
+            if (
+                state.get("execution_state") != "closed"
+                and _exclusive_lock_active(attempt_root / "complete.lock")
+            ):
+                raise ValueError("completion_in_progress")
             if state.get("write_state") in {"submitting", "unknown"}:
                 return self._recover_completion(attempt_root, state)
             if state.get("execution_state") in {"review_required", "needs_admin"}:
@@ -1789,6 +1925,7 @@ class FlowEngine:
                     return self._persist_attempt_needs_admin(
                         attempt_root / "action.json",
                         "material_collection_failed",
+                        failure_details=_material_failure_details(error),
                     )
                 material = _degraded_material(
                     claim["request_id"],
@@ -1831,10 +1968,11 @@ class FlowEngine:
                 }
                 packet_file = attempt_root / "review-packet.json"
                 json_artifact.write_json_atomic(packet_file, packet, indent=2)
-            except Exception:
+            except Exception as error:
                 return self._persist_attempt_needs_admin(
                     attempt_root / "action.json",
                     "material_collection_failed",
+                    failure_details=_material_failure_details(error),
                 )
             try:
                 authorization = submission.resolve_authorization(
@@ -1937,11 +2075,156 @@ class FlowEngine:
                 )
             return self._persist_current_action(workflow_root, action)
 
-    def next_action(self, workflow_key: str, *, mode: str = "preview") -> dict:
+    def _validate_skipped_write_authorization_failures(
+        self,
+        workflow_root: Path,
+        action_files: frozenset[Path],
+    ) -> frozenset[Path]:
+        validated: set[Path] = set()
+        for action_path in action_files:
+            state_path = action_path.with_name("state.json")
+            if (
+                not action_path.is_absolute()
+                or not action_path.is_relative_to(workflow_root)
+                or not _is_attempt_action_path(action_path, self._root)
+                or not _managed_existing_path(action_path, self._root)
+                or not _managed_existing_path(state_path, self._root)
+            ):
+                raise ValueError("historical_authorization_failure_invalid")
+            action = _read_object(
+                action_path,
+                code="historical_authorization_failure_invalid",
+            )
+            state = _read_object(
+                state_path,
+                code="historical_authorization_failure_invalid",
+            )
+            expected = (
+                workflow_root
+                / "cases"
+                / str(state.get("case_key") or "")
+                / f"attempt-{state.get('attempt')}"
+                / "action.json"
+            )
+            required = {
+                "schema_version": SCHEMA_VERSION,
+                "kind": "preaudit_action",
+                "action": "needs_admin",
+                "execution_state": "needs_admin",
+                "write_state": "not_requested",
+                "reason": "write_authorization_invalid",
+                "workflow_key": workflow_root.name,
+                "case_key": state.get("case_key"),
+                "attempt": state.get("attempt"),
+                "action_file": str(action_path),
+                "state_file": str(state_path),
+            }
+            if (
+                expected != action_path
+                or any(action.get(key) != value for key, value in required.items())
+                or any(state.get(key) != value for key, value in required.items())
+            ):
+                raise ValueError("historical_authorization_failure_invalid")
+            validated.add(action_path)
+        return frozenset(validated)
+
+    def _validate_skipped_unknown_failures(
+        self,
+        workflow_root: Path,
+        action_files: frozenset[Path],
+    ) -> frozenset[Path]:
+        latest_by_case = {
+            path.parent.name: path
+            for path in self._latest_case_attempts(workflow_root)
+        }
+        validated: set[Path] = set()
+        for action_path in action_files:
+            state_path = action_path.with_name("state.json")
+            if (
+                not action_path.is_absolute()
+                or not action_path.is_relative_to(workflow_root)
+                or not _is_attempt_action_path(action_path, self._root)
+                or not _managed_existing_path(action_path, self._root)
+                or not _managed_existing_path(state_path, self._root)
+            ):
+                raise ValueError("historical_unknown_failure_invalid")
+            action = _read_object(
+                action_path,
+                code="historical_unknown_failure_invalid",
+            )
+            state = _read_object(
+                state_path,
+                code="historical_unknown_failure_invalid",
+            )
+            expected = (
+                workflow_root
+                / "cases"
+                / str(state.get("case_key") or "")
+                / f"attempt-{state.get('attempt')}"
+                / "action.json"
+            )
+            case_key = str(state.get("case_key") or "").strip()
+            required = {
+                "schema_version": SCHEMA_VERSION,
+                "kind": "preaudit_action",
+                "action": "needs_admin",
+                "execution_state": "needs_admin",
+                "write_state": "unknown",
+                "workflow_key": workflow_root.name,
+                "case_key": state.get("case_key"),
+                "attempt": state.get("attempt"),
+                "action_file": str(action_path),
+                "state_file": str(state_path),
+            }
+            reason = state.get("reason")
+            mode_binding = (state.get("mode"), state.get("write_authorized"))
+            preview_confirmed_no_write = (
+                mode_binding == ("preview", False)
+                and reason == "writer_result_unknown"
+                and not os.path.lexists(
+                    action_path.parent / "writer-boundary.json"
+                )
+                and not os.path.lexists(
+                    action_path.parent / "execution-receipt.json"
+                )
+            )
+            if (
+                expected != action_path
+                or latest_by_case.get(case_key) != action_path.parent
+                or not self._attempt_identity_matches(
+                    action_path.parent,
+                    state,
+                    require_material=False,
+                )
+                or reason != "writer_result_unknown"
+                or action.get("reason") != reason
+                or action.get("mode") != state.get("mode")
+                or action.get("write_authorized")
+                != state.get("write_authorized")
+                or "request_id" in action
+                or "received_at" in action
+                or not preview_confirmed_no_write
+                or any(action.get(key) != value for key, value in required.items())
+                or any(state.get(key) != value for key, value in required.items())
+            ):
+                raise ValueError("historical_unknown_failure_invalid")
+            validated.add(action_path)
+        return frozenset(validated)
+
+    def next_action(
+        self,
+        workflow_key: str,
+        *,
+        mode: str = "preview",
+        skip_write_authorization_failures: frozenset[Path] = frozenset(),
+        skip_unknown_failures: frozenset[Path] = frozenset(),
+    ) -> dict:
         if workflow_key not in _FLOW_SPECS:
             raise ValueError("workflow_not_implemented")
         if mode not in {"preview", "controlled_write"}:
             raise ValueError("run_mode_unauthorized")
+        if skip_unknown_failures and mode != "controlled_write":
+            raise ValueError("historical_unknown_failure_invalid")
         if mode == "controlled_write" and (
             self._authorization_source is None
             or self._authorization_verifier is None
@@ -1950,13 +2233,34 @@ class FlowEngine:
             raise ValueError("run_mode_unauthorized")
 
         workflow_root = self._root / workflow_key
+        skipped_write_authorization_failures = (
+            self._validate_skipped_write_authorization_failures(
+                workflow_root,
+                skip_write_authorization_failures,
+            )
+        )
         try:
             with _exclusive_lock(workflow_root / "flow.lock"):
+                skipped_unknown_failures = (
+                    self._validate_skipped_unknown_failures(
+                        workflow_root,
+                        skip_unknown_failures,
+                    )
+                )
                 recovered = self._recover_before_discovery(
                     workflow_root,
                     include_open=False,
+                    skipped_write_authorization_failures=(
+                        skipped_write_authorization_failures
+                    ),
+                    skipped_unknown_failures=skipped_unknown_failures,
                 )
-        except ValueError:
+        except ValueError as error:
+            if str(error) in {
+                "completion_in_progress",
+                "historical_unknown_failure_invalid",
+            }:
+                raise
             return self._persist_tree_invalid(workflow_root)
         if recovered is not None:
             return recovered
@@ -1967,11 +2271,26 @@ class FlowEngine:
         except Exception:
             try:
                 with _exclusive_lock(workflow_root / "flow.lock"):
+                    skipped_unknown_failures = (
+                        self._validate_skipped_unknown_failures(
+                            workflow_root,
+                            skip_unknown_failures,
+                        )
+                    )
                     recovered = self._recover_before_discovery(
                         workflow_root,
                         include_open=True,
+                        skipped_write_authorization_failures=(
+                            skipped_write_authorization_failures
+                        ),
+                        skipped_unknown_failures=skipped_unknown_failures,
                     )
-            except ValueError:
+            except ValueError as error:
+                if str(error) in {
+                    "completion_in_progress",
+                    "historical_unknown_failure_invalid",
+                }:
+                    raise
                 return self._persist_tree_invalid(workflow_root)
             if recovered is not None:
                 return recovered
@@ -1996,6 +2315,10 @@ class FlowEngine:
 
         prepare_root: Path | None = None
         with _exclusive_lock(workflow_root / "flow.lock"):
+            skipped_unknown_failures = self._validate_skipped_unknown_failures(
+                workflow_root,
+                skip_unknown_failures,
+            )
             try:
                 latest_attempts = self._latest_case_attempts(workflow_root)
             except ValueError:
@@ -2004,6 +2327,7 @@ class FlowEngine:
                 path.parent.name: path for path in latest_attempts
             }
             first_active: Path | None = None
+            first_quarantined: Path | None = None
             first_terminal: Path | None = None
             selected: dict | None = None
             for candidate in candidates:
@@ -2013,6 +2337,12 @@ class FlowEngine:
                 )
                 latest = latest_by_case.get(case_key)
                 if latest is not None:
+                    if (
+                        latest / "action.json"
+                        in skipped_write_authorization_failures
+                        or latest / "action.json" in skipped_unknown_failures
+                    ):
+                        continue
                     try:
                         state = _read_object(
                             latest / "state.json",
@@ -2024,6 +2354,11 @@ class FlowEngine:
                             "persistent_state_invalid",
                         )
                     if (
+                        state.get("execution_state") != "closed"
+                        and _exclusive_lock_active(latest / "complete.lock")
+                    ):
+                        raise ValueError("completion_in_progress")
+                    if (
                         state.get("write_state") == "submitting"
                         or (
                             state.get("write_state") == "unknown"
@@ -2031,6 +2366,24 @@ class FlowEngine:
                         )
                     ):
                         return self._recover_completion(latest, state)
+                    if (
+                        state.get("execution_state") == "needs_admin"
+                        and state.get("write_state") == "unknown"
+                    ):
+                        return self._resume_active_action(
+                            workflow_root,
+                            case_key=latest.parent.name,
+                        ) or self._persist_attempt_needs_admin(
+                            latest / "action.json",
+                            "persistent_state_invalid",
+                        )
+                    if (
+                        state.get("execution_state") == "needs_admin"
+                        and state.get("reason")
+                        in _CONTINUABLE_QUARANTINE_CODES
+                    ):
+                        first_quarantined = first_quarantined or latest
+                        continue
                     if (
                         state.get("execution_state") == "needs_admin"
                         and state.get("reason") in SHARED_FAILURE_CODES
@@ -2078,8 +2431,16 @@ class FlowEngine:
                 break
 
             if selected is None:
+                if first_active is None and first_quarantined is not None:
+                    first_active = first_quarantined
                 if not candidates:
                     for latest in latest_attempts:
+                        if (
+                            latest / "action.json"
+                            in skipped_write_authorization_failures
+                            or latest / "action.json" in skipped_unknown_failures
+                        ):
+                            continue
                         try:
                             state = _read_object(
                                 latest / "state.json",
@@ -2140,7 +2501,12 @@ class FlowEngine:
                     return self._persist_current_action(workflow_root, closed)
                 elif not candidates:
                     active_action = self._resume_active_action(workflow_root)
-                    if active_action is not None:
+                    if active_action is not None and Path(
+                        str(active_action.get("action_file") or "")
+                    ) not in (
+                        skipped_write_authorization_failures
+                        | skipped_unknown_failures
+                    ):
                         return active_action
                     return self._persist_current_action(
                         workflow_root,
@@ -2240,7 +2606,7 @@ class FlowEngine:
             reason
             in {
                 "material_collection_failed",
-                "writer_submit_rejected",
+                *writer_outcomes.CONFIRMED_NO_WRITE_CODES,
             }
             and action.get("write_state") == "not_requested"
             and state.get("write_state") == "not_requested"
@@ -2358,6 +2724,8 @@ class FlowEngine:
         self,
         action_path: Path,
         decision_file: Path,
+        *,
+        recovered_submission_result: dict | None = None,
     ) -> dict:
         review_started = time.monotonic()
         try:
@@ -2374,7 +2742,10 @@ class FlowEngine:
             persisted_state = {}
         if (
             persisted_action.get("action") == "closed"
-            or persisted_state.get("write_state") in {"submitting", "unknown"}
+            or (
+                recovered_submission_result is None
+                and persisted_state.get("write_state") in {"submitting", "unknown"}
+            )
         ):
             recovered = self._recover_completion(action_path.parent, persisted_state)
             if recovered.get("action") == "closed":
@@ -2435,6 +2806,21 @@ class FlowEngine:
                     _needs_admin(workflow_key, reason),
                 )
             return _needs_admin("unknown", reason)
+        if recovered_submission_result is None:
+            try:
+                refreshed_action = self._renew_expired_authorization(
+                    action_path,
+                    action,
+                    state,
+                    preserve_action_token=True,
+                )
+                if refreshed_action != action:
+                    action, state, packet = self._open_attempt(action_path)
+            except ValueError:
+                return self._persist_attempt_needs_admin(
+                    action_path,
+                    "write_authorization_invalid",
+                )
         try:
             agent_timing = self._read_agent_timing(action_path, action)
         except ValueError:
@@ -2443,10 +2829,13 @@ class FlowEngine:
                 "agent_timing_invalid",
             )
         try:
-            submission.verify_persisted_authorization(
-                state,
-                verifier=self._authorization_verifier,
-            )
+            if recovered_submission_result is None:
+                submission.verify_persisted_authorization(
+                    state,
+                    verifier=self._authorization_verifier,
+                )
+            else:
+                submission.persisted_authorization_binding(state)
         except ValueError:
             return self._persist_attempt_needs_admin(
                 action_path,
@@ -2708,87 +3097,113 @@ class FlowEngine:
         envelope_file = action_path.with_name("submission-envelope.json")
         json_artifact.write_json_atomic(envelope_file, envelope, indent=2)
         envelope_fingerprint = _file_fingerprint(envelope_file)
-        self._record_phase(
-            state,
-            "review",
-            "business_warning" if needs_human else "success",
-            wall_seconds=(
-                agent_timing["wall_seconds"]
-                if agent_timing is not None
-                else max(0, int(time.monotonic() - review_started))
-            ),
-            model=agent_timing["model"] if agent_timing is not None else None,
-            token_usage=(
-                agent_timing["token_usage"] if agent_timing is not None else None
-            ),
-        )
+        if recovered_submission_result is None:
+            self._record_phase(
+                state,
+                "review",
+                "business_warning" if needs_human else "success",
+                wall_seconds=(
+                    agent_timing["wall_seconds"]
+                    if agent_timing is not None
+                    else max(0, int(time.monotonic() - review_started))
+                ),
+                model=agent_timing["model"] if agent_timing is not None else None,
+                token_usage=(
+                    agent_timing["token_usage"] if agent_timing is not None else None
+                ),
+            )
 
         write_state = "not_requested"
         submission_result = submission.empty_result()
         observability_complete = True
         if action["write_authorized"]:
-            submitting_state = {**state, "write_state": "submitting"}
-            json_artifact.write_json_atomic(
-                Path(action["state_file"]),
-                submitting_state,
-                indent=2,
-            )
-            job = submission.build_job(
-                action=action,
-                state=state,
-                decision_file=str(stored_decision),
-                remark_file=str(remark_file),
-                envelope_file=str(envelope_file),
-                decision_fingerprint=decision_fingerprint,
-                remark_fingerprint=remark_fingerprint,
-                envelope_fingerprint=envelope_fingerprint,
-            )
-            submit_started = time.monotonic()
-            try:
-                result = self._submit_frozen(dict(job)) if self._submit_frozen else None
-                submission_result = submission.validate_result(
-                    result,
-                    str(submission_token or ""),
+            if recovered_submission_result is not None:
+                submission_result = recovered_submission_result
+            else:
+                submitting_state = {**state, "write_state": "submitting"}
+                json_artifact.write_json_atomic(
+                    Path(action["state_file"]),
+                    submitting_state,
+                    indent=2,
                 )
-            except Exception as error:
-                reason = str(error).strip()
-                if reason not in _WRITER_FAILURE_CODES:
-                    reason = "writer_result_unknown"
-                self._record_phase(
+                job = submission.build_job(
+                    action=action,
+                    state=state,
+                    decision_file=str(stored_decision),
+                    remark_file=str(remark_file),
+                    envelope_file=str(envelope_file),
+                    decision_fingerprint=decision_fingerprint,
+                    remark_fingerprint=remark_fingerprint,
+                    envelope_fingerprint=envelope_fingerprint,
+                )
+                submit_started = time.monotonic()
+                try:
+                    result = (
+                        self._submit_frozen(dict(job)) if self._submit_frozen else None
+                    )
+                    submission_result = submission.validate_result(
+                        result,
+                        str(submission_token or ""),
+                    )
+                except Exception as error:
+                    reason = str(error).strip()
+                    if reason not in _WRITER_FAILURE_CODES:
+                        reason = "writer_result_unknown"
+                    self._record_phase(
+                        submitting_state,
+                        "submit",
+                        (
+                            "technical_failure"
+                            if reason in writer_outcomes.CONFIRMED_NO_WRITE_CODES
+                            else "unknown"
+                        ),
+                        wall_seconds=max(0, int(time.monotonic() - submit_started)),
+                        required=False,
+                    )
+                    return self._persist_attempt_needs_admin(
+                        action_path,
+                        reason,
+                    )
+            write_state = "submitted"
+            if recovered_submission_result is None:
+                observability_complete = self._record_phase(
                     submitting_state,
                     "submit",
-                    (
-                        "technical_failure"
-                        if reason == writer_outcomes.SUBMIT_REJECTED
-                        else "unknown"
-                    ),
                     wall_seconds=max(0, int(time.monotonic() - submit_started)),
                     required=False,
                 )
-                return self._persist_attempt_needs_admin(
-                    action_path,
-                    reason,
+                observability_complete = (
+                    self._record_phase(
+                        submitting_state,
+                        "postcheck",
+                        required=False,
+                    )
+                    and observability_complete
                 )
-            write_state = "submitted"
-            observability_complete = self._record_phase(
-                submitting_state,
-                "submit",
-                wall_seconds=max(0, int(time.monotonic() - submit_started)),
-                required=False,
-            )
+
+        if recovered_submission_result is None:
             observability_complete = (
-                self._record_phase(
-                    submitting_state,
-                    "postcheck",
-                    required=False,
-                )
+                self._record_phase(state, "close", required=False)
                 and observability_complete
             )
-
-        observability_complete = (
-            self._record_phase(state, "close", required=False)
-            and observability_complete
-        )
+        else:
+            try:
+                observability_complete = observability.attempt_has_phases(
+                    Path(action["events_file"]),
+                    request_id=state["request_id"],
+                    received_at=state["received_at"],
+                    attempt=state["attempt"],
+                    phases=(
+                        "discover",
+                        "collect",
+                        "review",
+                        "submit",
+                        "postcheck",
+                        "close",
+                    ),
+                )
+            except (OSError, KeyError, TypeError, ValueError):
+                observability_complete = False
 
         observability_state = "complete" if observability_complete else "unknown"
         quality = _quality_projection(

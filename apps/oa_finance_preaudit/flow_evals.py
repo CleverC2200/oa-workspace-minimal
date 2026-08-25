@@ -283,6 +283,8 @@ _CASE_METRIC_FIELDS = {
     "waiting_seconds",
     "timing_status",
     "phase_seconds",
+    "stage_timestamps",
+    "pipeline_evidence",
     "token_usage",
     "business_state",
     "write_state",
@@ -303,7 +305,7 @@ _CLI_OUTCOMES = {
     "process_start_error",
     "other",
 }
-_CLI_COMMANDS = {"next-action", "complete-review", "status", "prune"}
+_CLI_COMMANDS = {"next-action", "complete-review", "status", "prune", "clean"}
 _SETTINGS = {
     "frequency_seconds",
     "review_concurrency",
@@ -315,6 +317,65 @@ _LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 def _nonnegative_integer(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _valid_pipeline_evidence(value: object) -> bool:
+    if value == {"status": "unknown"}:
+        return True
+    fields = {
+        "status",
+        "write_ready_at",
+        "write_start_at",
+        "write_queue_depth_at_enqueue",
+        "write_wait_attribution",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != fields
+        or value.get("status") != "exact"
+        or not _nonnegative_integer(value.get("write_queue_depth_at_enqueue"))
+    ):
+        return False
+    try:
+        ready_at = datetime.fromisoformat(str(value["write_ready_at"]))
+        start_at = datetime.fromisoformat(str(value["write_start_at"]))
+    except ValueError:
+        return False
+    if ready_at.tzinfo is None or start_at.tzinfo is None or ready_at > start_at:
+        return False
+    attribution = value.get("write_wait_attribution")
+    if attribution == {"status": "unknown"}:
+        return True
+    attribution_fields = {
+        "status",
+        "total_seconds",
+        "writer_busy_seconds",
+        "fifo_head_of_line_seconds",
+        "controller_scheduling_seconds",
+    }
+    if not isinstance(attribution, dict) or set(attribution) != attribution_fields:
+        return False
+    numbers = [
+        attribution.get(field)
+        for field in attribution_fields - {"status"}
+    ]
+    return (
+        attribution.get("status") == "exact"
+        and all(
+            isinstance(number, (int, float))
+            and not isinstance(number, bool)
+            and math.isfinite(float(number))
+            and number >= 0
+            for number in numbers
+        )
+        and math.isclose(
+            float(attribution["total_seconds"]),
+            float(attribution["writer_busy_seconds"])
+            + float(attribution["fifo_head_of_line_seconds"])
+            + float(attribution["controller_scheduling_seconds"]),
+            abs_tol=1e-6,
+        )
+    )
 
 
 def _validate_coverage(value: object) -> dict:
@@ -373,7 +434,6 @@ def _validate_case_metric(raw: object) -> dict:
     for field in (
         "end_to_end_seconds",
         "active_seconds",
-        "waiting_seconds",
         "duplicate_submissions",
         "cross_case_mix",
         "unknown_auto_retries",
@@ -394,9 +454,18 @@ def _validate_case_metric(raw: object) -> dict:
         sample.get("backlog_age_seconds")
     ):
         raise ValueError("acceptance_sample_invalid")
+    waiting_seconds = sample.get("waiting_seconds")
+    timing_status = sample.get("timing_status")
+    if timing_status not in {"exact", "unknown"} or (
+        timing_status == "exact" and not _nonnegative_integer(waiting_seconds)
+    ) or (timing_status == "unknown" and waiting_seconds != "unknown"):
+        raise ValueError("acceptance_sample_invalid")
     if (
-        sample["active_seconds"] + sample["waiting_seconds"]
-        > sample["end_to_end_seconds"]
+        (
+            timing_status == "exact"
+            and sample["active_seconds"] + waiting_seconds
+            > sample["end_to_end_seconds"]
+        )
         or sample["coordination_seconds"] != 0
         or sample["coordination_tokens"] != 0
     ):
@@ -406,20 +475,37 @@ def _validate_case_metric(raw: object) -> dict:
             else "acceptance_sample_invalid"
         )
         raise ValueError(code)
-    if sample.get("timing_status") not in {"exact", "unknown"}:
-        raise ValueError("acceptance_sample_invalid")
-    if sample["timing_status"] == "unknown" and sample["waiting_seconds"] != 0:
-        raise ValueError("acceptance_sample_invalid")
     phases = sample.get("phase_seconds")
     if (
         not isinstance(phases, dict)
         or set(phases) != _PHASES
-        or not all(_nonnegative_integer(value) for value in phases.values())
+        or not all(
+            value == "unknown" or _nonnegative_integer(value)
+            for value in phases.values()
+        )
         or (
             sample["timing_status"] == "exact"
             and phases["wait"] != sample["waiting_seconds"]
         )
     ):
+        raise ValueError("acceptance_sample_invalid")
+    stage_timestamps = sample.get("stage_timestamps")
+    if not isinstance(stage_timestamps, dict) or any(
+        not isinstance(stage, str)
+        or not isinstance(value, dict)
+        or value.get("status") not in {"exact", "unknown"}
+        or (
+            value.get("status") == "exact"
+            and (
+                set(value) != {"status", "occurred_at"}
+                or not isinstance(value.get("occurred_at"), str)
+            )
+        )
+        or (value.get("status") == "unknown" and set(value) != {"status"})
+        for stage, value in stage_timestamps.items()
+    ):
+        raise ValueError("acceptance_sample_invalid")
+    if not _valid_pipeline_evidence(sample.get("pipeline_evidence")):
         raise ValueError("acceptance_sample_invalid")
     usage = sample.get("token_usage")
     if usage == {"status": "unknown"}:
@@ -493,7 +579,11 @@ def _aggregate_samples(samples: list[dict]) -> dict:
     timing_exact = bool(closed) and all(
         sample["timing_status"] == "exact" for sample in closed
     )
-    waiting_seconds = sum(sample["waiting_seconds"] for sample in closed)
+    waiting_seconds = sum(
+        sample["waiting_seconds"]
+        for sample in closed
+        if isinstance(sample["waiting_seconds"], int)
+    )
     exact = [
         sample["token_usage"]
         for sample in closed
@@ -505,10 +595,20 @@ def _aggregate_samples(samples: list[dict]) -> dict:
     phase_seconds = {
         phase: {
             "p50": _nearest_rank(
-                [sample["phase_seconds"][phase] for sample in closed], 0.50
+                [
+                    sample["phase_seconds"][phase]
+                    for sample in closed
+                    if isinstance(sample["phase_seconds"][phase], int)
+                ],
+                0.50,
             ),
             "p95": _nearest_rank(
-                [sample["phase_seconds"][phase] for sample in closed], 0.95
+                [
+                    sample["phase_seconds"][phase]
+                    for sample in closed
+                    if isinstance(sample["phase_seconds"][phase], int)
+                ],
+                0.95,
             ),
         }
         for phase in sorted(_PHASES)

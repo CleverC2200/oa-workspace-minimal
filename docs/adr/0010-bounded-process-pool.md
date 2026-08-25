@@ -63,4 +63,4 @@ Codex 会话槽、Python 工作进程和外部资源容量是三个不同限制�
 
 2026-08-24 增加每任务 960 秒看门狗和 15 秒脱敏心跳。超时先停止新领取，再终止故障进程池；Codex 子进程自身 900 秒超时先负责清理进程组，外层多留 60 秒回收窗口，避免遗留工作进程。下一轮必须创建新池，不复用疑似卡死的 Worker。
 
-提交适配器同时拆分为四种稳定结果：`writer_submit_rejected` 表示确认未写入；`writer_transport_unknown`、`writer_postcheck_timeout`、`writer_pending_conflict` 均表示写入状态不可信并禁止自动重试。启动前可执行只读 reconciliation；只有确认未写入且人工确认、实时身份一致的单据才能创建新 attempt。
+提交适配器把结果拆分为六种稳定结果：`writer_submit_rejected`、`writer_preflight_failed`、`submission_target_changed` 表示确认未写入；`writer_transport_unknown`、`writer_postcheck_timeout`、`writer_pending_conflict` 均表示写入状态不可信并禁止自动重试。OA POST 前写入带完整性证明的脱敏阶段边界；进入 `submit_started` 后没有可信终态的同一 attempt 不再调用接口，`postcheck_verified` 则可恢复本地成功结果。启动前可执行只读 reconciliation；只有确认未写入且人工确认、实时身份一致的单据才能创建新 attempt。

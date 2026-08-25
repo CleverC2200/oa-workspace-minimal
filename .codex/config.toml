@@ -2,3 +2,6 @@
 # 业务写入边界由冻结材料、requestId 级单飞锁和写后回执控制。
 default_permissions = ":danger-full-access"
 approval_policy = "never"
+
+[agents]
+max_concurrent_threads_per_session = 4

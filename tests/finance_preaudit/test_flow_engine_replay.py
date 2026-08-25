@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 
 import pytest
 
@@ -71,6 +72,20 @@ def _candidates(request_ids: tuple[str, ...] = ("recorded-request",)) -> list[di
     ]
 
 
+def _mark_unknown(action: dict) -> None:
+    for path in (Path(action["action_file"]), Path(action["state_file"])):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.update(
+            {
+                "action": "needs_admin",
+                "execution_state": "needs_admin",
+                "write_state": "unknown",
+                "reason": "writer_result_unknown",
+            }
+        )
+        json_artifact.write_json_atomic(path, payload)
+
+
 def _engine(
     root: Path,
     *,
@@ -123,6 +138,381 @@ def test_confirmed_material_failure_creates_fresh_attempt_only_after_live_check(
     assert Path(failed["state_file"]).read_bytes() == old_state
     new_state = json.loads(Path(recovered["state_file"]).read_text(encoding="utf-8"))
     assert new_state["attempt"] == 2
+
+
+def test_quarantined_candidate_does_not_mask_later_review_required(
+    tmp_path: Path,
+) -> None:
+    candidates = _candidates(("first-request", "second-request"))
+    first_engine = _engine(
+        tmp_path,
+        candidates=[candidates[0]],
+        collect_material=lambda _request_id, _root: (_ for _ in ()).throw(
+            RuntimeError("oa_run_stopped")
+        ),
+    )
+    failed = first_engine.next_action("travel_expense")
+    second_engine = _engine(tmp_path, candidates=[candidates[1]])
+    review = second_engine.next_action("travel_expense")
+
+    resumed = _engine(tmp_path, candidates=candidates).next_action(
+        "travel_expense"
+    )
+
+    assert failed["action"] == "needs_admin"
+    assert failed["reason"] == "material_collection_failed"
+    assert review["action"] == "review_required"
+    assert resumed["action"] == "review_required"
+    assert resumed["action_file"] == review["action_file"]
+
+
+def test_unknown_writer_result_blocks_later_review_required(
+    tmp_path: Path,
+) -> None:
+    candidates = _candidates(("first-request", "second-request"))
+    first = _engine(tmp_path, candidates=[candidates[0]]).next_action(
+        "travel_expense"
+    )
+    later = _engine(tmp_path, candidates=[candidates[1]]).next_action(
+        "travel_expense"
+    )
+    for path in (Path(first["action_file"]), Path(first["state_file"])):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.update(
+            {
+                "action": "needs_admin",
+                "execution_state": "needs_admin",
+                "write_state": "unknown",
+                "reason": "writer_result_unknown",
+            }
+        )
+        json_artifact.write_json_atomic(path, payload)
+
+    blocked = _engine(tmp_path, candidates=[candidates[1]]).next_action(
+        "travel_expense"
+    )
+
+    assert later["action"] == "review_required"
+    assert blocked["action"] == "needs_admin"
+    assert blocked["reason"] == "writer_result_unknown"
+    assert blocked["action_file"] == first["action_file"]
+
+
+def test_validated_preview_no_write_unknown_can_be_skipped_before_discovery(
+    tmp_path: Path,
+) -> None:
+    candidates = _candidates(("first-request", "second-request"))
+    first = _engine(tmp_path, candidates=[candidates[0]]).next_action(
+        "travel_expense"
+    )
+    _mark_unknown(first)
+
+    resumed = _engine(
+        tmp_path,
+        candidates=[candidates[1]],
+        authorization_source=_grant,
+        submit_frozen=_success,
+    ).next_action(
+        "travel_expense",
+        mode="controlled_write",
+        skip_unknown_failures=frozenset({Path(first["action_file"])}),
+    )
+
+    assert resumed["action"] == "review_required"
+    assert resumed["case_key"] != first["case_key"]
+
+
+def test_preview_unknown_with_writer_boundary_cannot_be_skipped(
+    tmp_path: Path,
+) -> None:
+    first = _engine(tmp_path).next_action("travel_expense")
+    _mark_unknown(first)
+    action_path = Path(first["action_file"])
+    (action_path.parent / "writer-boundary.json").write_text(
+        "{}",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="historical_unknown_failure_invalid",
+    ):
+        _engine(
+            tmp_path,
+            authorization_source=_grant,
+            submit_frozen=_success,
+        ).next_action(
+            "travel_expense",
+            mode="controlled_write",
+            skip_unknown_failures=frozenset({action_path}),
+        )
+
+
+def test_controlled_unknown_cannot_be_skipped(tmp_path: Path) -> None:
+    engine = _engine(
+        tmp_path,
+        authorization_source=_grant,
+        submit_frozen=_success,
+    )
+    first = engine.next_action("travel_expense", mode="controlled_write")
+    _mark_unknown(first)
+
+    with pytest.raises(
+        ValueError,
+        match="historical_unknown_failure_invalid",
+    ):
+        engine.next_action(
+            "travel_expense",
+            mode="controlled_write",
+            skip_unknown_failures=frozenset({Path(first["action_file"])}),
+        )
+
+
+@pytest.mark.parametrize(
+    "reserved_name",
+    ("writer-boundary.json", "execution-receipt.json"),
+)
+def test_preview_unknown_with_dangling_reserved_link_cannot_be_skipped(
+    tmp_path: Path,
+    reserved_name: str,
+) -> None:
+    first = _engine(tmp_path).next_action("travel_expense")
+    _mark_unknown(first)
+    action_path = Path(first["action_file"])
+    (action_path.parent / reserved_name).symlink_to(
+        action_path.parent / "missing-artifact"
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="historical_unknown_failure_invalid",
+    ):
+        _engine(
+            tmp_path,
+            authorization_source=_grant,
+            submit_frozen=_success,
+        ).next_action(
+            "travel_expense",
+            mode="controlled_write",
+            skip_unknown_failures=frozenset({action_path}),
+        )
+
+
+def test_historical_unknown_skip_is_rejected_in_preview(tmp_path: Path) -> None:
+    first = _engine(tmp_path).next_action("travel_expense")
+    _mark_unknown(first)
+
+    with pytest.raises(
+        ValueError,
+        match="historical_unknown_failure_invalid",
+    ):
+        _engine(tmp_path).next_action(
+            "travel_expense",
+            skip_unknown_failures=frozenset({Path(first["action_file"])}),
+        )
+
+
+def test_historical_unknown_skip_rejects_identity_mismatch(tmp_path: Path) -> None:
+    first = _engine(tmp_path).next_action("travel_expense")
+    _mark_unknown(first)
+    action_path = Path(first["action_file"])
+    action = json.loads(action_path.read_text(encoding="utf-8"))
+    action["request_id"] = "different-request"
+    json_artifact.write_json_atomic(action_path, action)
+
+    with pytest.raises(
+        ValueError,
+        match="historical_unknown_failure_invalid",
+    ):
+        _engine(
+            tmp_path,
+            authorization_source=_grant,
+            submit_frozen=_success,
+        ).next_action(
+            "travel_expense",
+            mode="controlled_write",
+            skip_unknown_failures=frozenset({action_path}),
+        )
+
+
+def test_historical_unknown_skip_rejects_stale_attempt(tmp_path: Path) -> None:
+    first = _engine(tmp_path).next_action("travel_expense")
+    _mark_unknown(first)
+    stale_action = Path(first["action_file"])
+    latest_root = stale_action.parent.parent / "attempt-2"
+    shutil.copytree(stale_action.parent, latest_root)
+    for name in ("action.json", "state.json"):
+        path = latest_root / name
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.update(
+            {
+                "attempt": 2,
+                "action_file": str(latest_root / "action.json"),
+                "state_file": str(latest_root / "state.json"),
+            }
+        )
+        json_artifact.write_json_atomic(path, payload)
+
+    with pytest.raises(
+        ValueError,
+        match="historical_unknown_failure_invalid",
+    ):
+        _engine(
+            tmp_path,
+            authorization_source=_grant,
+            submit_frozen=_success,
+        ).next_action(
+            "travel_expense",
+            mode="controlled_write",
+            skip_unknown_failures=frozenset({stale_action}),
+        )
+
+
+def test_historical_unknown_skip_rejects_confirmed_no_write_reason(
+    tmp_path: Path,
+) -> None:
+    first = _engine(tmp_path).next_action("travel_expense")
+    _mark_unknown(first)
+    action_path = Path(first["action_file"])
+    for path in (action_path, Path(first["state_file"])):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["reason"] = "writer_preflight_failed"
+        json_artifact.write_json_atomic(path, payload)
+
+    with pytest.raises(
+        ValueError,
+        match="historical_unknown_failure_invalid",
+    ):
+        _engine(
+            tmp_path,
+            authorization_source=_grant,
+            submit_frozen=_success,
+        ).next_action(
+            "travel_expense",
+            mode="controlled_write",
+            skip_unknown_failures=frozenset({action_path}),
+        )
+
+
+def test_validated_historical_authorization_failure_can_be_skipped(
+    tmp_path: Path,
+) -> None:
+    candidates = _candidates(("first-request", "second-request"))
+
+    def authorization_source(context: dict) -> dict:
+        if context["request_id"] == "first-request":
+            raise ValueError("write_authorization_invalid")
+        return _grant(context)
+
+    engine = _engine(
+        tmp_path,
+        candidates=candidates,
+        authorization_source=authorization_source,
+        submit_frozen=_success,
+    )
+    failed = engine.next_action("travel_expense", mode="controlled_write")
+
+    blocked = engine.next_action("travel_expense", mode="controlled_write")
+    resumed = engine.next_action(
+        "travel_expense",
+        mode="controlled_write",
+        skip_write_authorization_failures=frozenset(
+            {Path(failed["action_file"])}
+        ),
+    )
+
+    assert blocked == failed
+    assert resumed["action"] == "review_required"
+    assert resumed["case_key"] != failed["case_key"]
+
+
+def test_validated_historical_authorization_failure_is_not_reprojected(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(
+        tmp_path,
+        authorization_source=lambda _context: (_ for _ in ()).throw(
+            ValueError("write_authorization_invalid")
+        ),
+        submit_frozen=_success,
+    )
+    failed = engine.next_action("travel_expense", mode="controlled_write")
+    empty_live_engine = _engine(
+        tmp_path,
+        candidates=[],
+        authorization_source=_grant,
+        submit_frozen=_success,
+    )
+
+    result = empty_live_engine.next_action(
+        "travel_expense",
+        mode="controlled_write",
+        skip_write_authorization_failures=frozenset(
+            {Path(failed["action_file"])}
+        ),
+    )
+
+    assert result["action"] == "closed"
+    assert result["write_state"] == "not_requested"
+
+
+def test_tampered_historical_authorization_failure_cannot_be_skipped(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(
+        tmp_path,
+        authorization_source=lambda _context: (_ for _ in ()).throw(
+            ValueError("write_authorization_invalid")
+        ),
+        submit_frozen=_success,
+    )
+    failed = engine.next_action("travel_expense", mode="controlled_write")
+    state_file = Path(failed["state_file"])
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    state["action_file"] = str(tmp_path / "travel_expense" / "action.json")
+    json_artifact.write_json_atomic(state_file, state)
+
+    with pytest.raises(
+        ValueError,
+        match="historical_authorization_failure_invalid",
+    ):
+        engine.next_action(
+            "travel_expense",
+            mode="controlled_write",
+            skip_write_authorization_failures=frozenset(
+                {Path(failed["action_file"])}
+            ),
+        )
+
+
+def test_symlinked_historical_authorization_state_cannot_be_skipped(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(
+        tmp_path,
+        authorization_source=lambda _context: (_ for _ in ()).throw(
+            ValueError("write_authorization_invalid")
+        ),
+        submit_frozen=_success,
+    )
+    failed = engine.next_action("travel_expense", mode="controlled_write")
+    state_file = Path(failed["state_file"])
+    outside_state = tmp_path / "outside-state.json"
+    outside_state.write_bytes(state_file.read_bytes())
+    state_file.unlink()
+    state_file.symlink_to(outside_state)
+
+    with pytest.raises(
+        ValueError,
+        match="historical_authorization_failure_invalid",
+    ):
+        engine.next_action(
+            "travel_expense",
+            mode="controlled_write",
+            skip_write_authorization_failures=frozenset(
+                {Path(failed["action_file"])}
+            ),
+        )
 
 
 def test_unknown_or_handled_case_cannot_enter_recovery(tmp_path: Path) -> None:
@@ -301,8 +691,17 @@ def test_human_confirmed_unknown_keeps_live_and_receipt_gates(
         )
 
 
-def test_confirmed_writer_rejection_creates_a_new_review_attempt(
+@pytest.mark.parametrize(
+    "reason",
+    (
+        "writer_submit_rejected",
+        "writer_preflight_failed",
+        "submission_target_changed",
+    ),
+)
+def test_confirmed_no_write_failure_creates_a_new_review_attempt(
     tmp_path: Path,
+    reason: str,
 ) -> None:
     engine = _engine(tmp_path)
     first = engine.next_action("travel_expense")
@@ -315,7 +714,7 @@ def test_confirmed_writer_rejection_creates_a_new_review_attempt(
                 "action": "needs_admin",
                 "execution_state": "needs_admin",
                 "write_state": "not_requested",
-                "reason": "writer_submit_rejected",
+                "reason": reason,
             }
         )
         path.write_text(json.dumps(payload), encoding="utf-8")
@@ -593,7 +992,7 @@ def test_shared_authorization_failure_stops_flow_but_item_failure_does_not(
     assert collected == ["request-a", "request-a"]
 
 
-def test_unknown_write_stops_only_its_item(tmp_path: Path) -> None:
+def test_unknown_write_blocks_later_items(tmp_path: Path) -> None:
     rows = _candidates(("request-a", "request-b"))
     calls: list[dict] = []
     engine = _engine(
@@ -611,8 +1010,9 @@ def test_unknown_write_stops_only_its_item(tmp_path: Path) -> None:
     second = engine.next_action("travel_expense")
 
     assert unknown["write_state"] == "unknown"
-    assert second["action"] == "review_required"
-    assert second["case_key"] != first["case_key"]
+    assert second["action"] == "needs_admin"
+    assert second["reason"] == "writer_result_unknown"
+    assert second["case_key"] == first["case_key"]
     assert len(calls) == 1
 
 

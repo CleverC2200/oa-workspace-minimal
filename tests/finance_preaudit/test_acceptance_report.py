@@ -69,6 +69,8 @@ def _samples(
                         "postcheck": 0,
                         "close": 1,
                     },
+                    "stage_timestamps": {},
+                    "pipeline_evidence": {"status": "unknown"},
                     "token_usage": (
                         {
                             "status": "exact",
@@ -231,6 +233,27 @@ def test_global_cli_calls_project_to_flows_without_inflating_overall() -> None:
     assert report["cli_quality"]["failure_count"] == 1
     assert all(
         metrics["sample_count"] == 20
+        for metrics in report["cli_quality"]["by_flow"].values()
+    )
+
+
+def test_global_cache_clean_invocation_is_included_in_cli_quality() -> None:
+    report = _report(
+        _samples(),
+        cli=[
+            {
+                "workflow_key": "global",
+                "command": "clean",
+                "occurred_at": (START + timedelta(days=10)).isoformat(),
+                "outcome": "success",
+                "human_reproduction": "not_attempted",
+            }
+        ],
+    )
+
+    assert report["cli_quality"]["sample_count"] == 1
+    assert all(
+        metrics["sample_count"] == 1
         for metrics in report["cli_quality"]["by_flow"].values()
     )
 

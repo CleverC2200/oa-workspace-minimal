@@ -11,10 +11,10 @@ from apps.oa_finance_preaudit import cli
 from apps.oa_approval import frozen_writer
 
 
-PUBLIC_COMMANDS = {"next-action", "complete-review", "status", "prune"}
+PUBLIC_COMMANDS = {"next-action", "complete-review", "status", "prune", "clean"}
 
 
-def test_public_cli_exposes_exactly_four_commands() -> None:
+def test_public_cli_exposes_only_the_supported_commands() -> None:
     parser = cli.build_parser()
     subparsers = next(
         action for action in parser._actions if action.dest == "command"
@@ -78,6 +78,184 @@ def test_status_reconciliation_stays_read_only_inside_status_command(
     assert exit_code == 0
     assert calls == [root]
     assert json.loads(output.getvalue())["reconciliation"]["read_only"] is True
+
+
+def test_status_combines_fresh_live_queue_counts_without_identities(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    output = io.StringIO()
+
+    with redirect_stdout(output):
+        exit_code = cli.main(
+            [
+                "status",
+                "--root",
+                str(root),
+                "--check-live",
+                "--reconcile",
+            ],
+            runtime_status=lambda _root: {
+                "schema_version": 1,
+                "kind": "preaudit_runtime_status",
+                "operations": {"remaining": 1},
+            },
+            live_status=lambda: {
+                "schema_version": 1,
+                "kind": "preaudit_live_status",
+                "status": "ok",
+                "oa": {
+                    "execution_identity": "verified",
+                    "supported": 5,
+                    "unsupported": 1,
+                },
+            },
+            reconcile_status=lambda _root: {
+                "schema_version": 1,
+                "kind": "preaudit_reconciliation",
+                "read_only": True,
+                "quarantine": {
+                    "pending_quarantined": 2,
+                    "actionable_pending": 3,
+                },
+            },
+        )
+
+    assert exit_code == 0
+    payload = json.loads(output.getvalue())
+    assert payload["operations"]["live_queue"] == {
+        "evidence_status": "exact",
+        "remaining": 5,
+        "actionable": 3,
+        "quarantined": 2,
+        "unsupported": 1,
+    }
+    assert "request_id" not in json.dumps(payload)
+
+
+def test_live_global_reconciliation_excludes_unsupported_pending(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    configs = [
+        {
+            "flow_key": "travel_expense",
+            "workflow_id": "supported-workflow",
+            "workflow_name": "supported",
+        }
+    ]
+
+    class API:
+        def pending_rows(self, **_kwargs) -> list[dict]:
+            return [
+                {
+                    "request_id": "supported-request",
+                    "received_at": "2026-08-25T08:00:00+08:00",
+                    "workflow_id": "supported-workflow",
+                    "workflow_name": "supported",
+                },
+                {
+                    "request_id": "unsupported-request",
+                    "received_at": "2026-08-25T07:00:00+08:00",
+                    "workflow_id": "unsupported-workflow",
+                    "workflow_name": "unsupported",
+                },
+            ]
+
+        def handled_rows(self, **_kwargs) -> list[dict]:
+            return []
+
+    captured: list[list[dict]] = []
+    monkeypatch.setattr(
+        cli.legacy_flow,
+        "load_all_configs",
+        lambda: configs,
+    )
+    monkeypatch.setattr(
+        cli.legacy_api,
+        "build_api",
+        lambda _config: API(),
+    )
+    monkeypatch.setattr(
+        cli.reconciliation,
+        "reconcile",
+        lambda _root, *, pending_rows, handled_rows, workflow_key: (
+            captured.append(pending_rows)
+            or {
+                "handled_rows": handled_rows,
+                "workflow_key": workflow_key,
+            }
+        ),
+    )
+
+    cli._live_reconciliation(tmp_path)
+
+    assert captured == [
+        [
+            {
+                "request_id": "supported-request",
+                "received_at": "2026-08-25T08:00:00+08:00",
+            }
+        ]
+    ]
+
+
+def test_live_flow_engine_can_pin_discovery_to_global_fifo_identity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    configs = [
+        {
+            "flow_key": "travel_expense",
+            "workflow_id": "travel-workflow",
+            "workflow_name": "travel",
+        }
+    ]
+
+    class API:
+        def pending_rows(self, **_kwargs) -> list[dict]:
+            return [
+                {
+                    "request_id": "fifo-head",
+                    "received_at": "2026-08-25T08:00:00+08:00",
+                    "workflow_id": "travel-workflow",
+                    "workflow_name": "travel",
+                },
+                {
+                    "request_id": "newer-request",
+                    "received_at": "2026-08-25T09:00:00+08:00",
+                    "workflow_id": "travel-workflow",
+                    "workflow_name": "travel",
+                },
+            ]
+
+        def handled_rows(self, **_kwargs) -> list[dict]:
+            return []
+
+    monkeypatch.setenv("OA_FINANCE_PREAUDIT_FLOW_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        cli.legacy_flow,
+        "load_all_configs",
+        lambda: configs,
+    )
+    monkeypatch.setattr(
+        cli.legacy_api,
+        "build_api",
+        lambda _config: API(),
+    )
+
+    engine = cli._live_flow_engine(
+        selected_identity=("fifo-head", "2026-08-25T08:00:00+08:00")
+    )
+
+    assert engine._discover_candidates("travel_expense") == [
+        {
+            "request_id": "fifo-head",
+            "received_at": "2026-08-25T08:00:00+08:00",
+            "workflow_key": "travel_expense",
+        }
+    ]
 
 
 def test_status_live_check_fails_closed_without_configuration(
@@ -540,6 +718,30 @@ def test_module_entry_records_argument_error_without_argv(
     assert all(event["outcome"] == "argument_error" for event in payload["events"])
     assert str(root) not in text
     assert "--unexpected" not in text
+
+
+def test_module_entry_records_clean_argument_error_as_one_global_event(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    monkeypatch.setenv("OA_FINANCE_PREAUDIT_FLOW_ROOT", str(root))
+    stderr = io.StringIO()
+
+    with redirect_stderr(stderr):
+        exit_code = cli.entrypoint(["clean"])
+
+    assert exit_code == 2
+    text = (root / ".metrics" / "cli-invocations.json").read_text(
+        encoding="utf-8"
+    )
+    payload = json.loads(text)
+    assert [
+        (event["workflow_key"], event["command"], event["outcome"])
+        for event in payload["events"]
+    ] == [("global", "clean", "argument_error")]
+    assert "--all-cache" not in text
 
 
 def test_complete_review_uses_the_same_deep_module(tmp_path) -> None:
