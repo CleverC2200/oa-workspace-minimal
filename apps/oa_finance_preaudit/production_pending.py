@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from apps.oa_approval import flow
+
+
+_OA_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 def _support_identity(
@@ -87,7 +91,7 @@ def actionable_fifo(
         except ValueError as error:
             raise ValueError("production_pending_received_at_invalid") from error
         if timestamp.tzinfo is None:
-            raise ValueError("production_pending_received_at_invalid")
+            timestamp = timestamp.replace(tzinfo=_OA_TIMEZONE)
         ordered.append(
             (timestamp.astimezone(timezone.utc), request_id, item)
         )

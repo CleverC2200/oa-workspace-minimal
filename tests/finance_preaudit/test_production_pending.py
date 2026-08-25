@@ -111,6 +111,13 @@ def test_actionable_fifo_orders_by_absolute_received_time_and_stable_key() -> No
             "can_submit": True,
         },
         {
+            "requestId": "request-local-time",
+            "received_at": "2026-08-25 08:45:00",
+            "flow_key": "small_marketing_fee",
+            "support_status": "supported",
+            "can_submit": True,
+        },
+        {
             "requestId": "unsupported",
             "received_at": "2026-08-24T00:00:00Z",
             "flow_key": "",
@@ -141,5 +148,6 @@ def test_actionable_fifo_orders_by_absolute_received_time_and_stable_key() -> No
 
     assert [item["requestId"] for item in ordered] == [
         "request-b",
+        "request-local-time",
         "request-c",
     ]
