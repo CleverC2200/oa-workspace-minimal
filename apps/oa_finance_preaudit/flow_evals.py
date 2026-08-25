@@ -303,7 +303,7 @@ _CLI_OUTCOMES = {
     "process_start_error",
     "other",
 }
-_CLI_COMMANDS = {"next-action", "complete-review", "status", "prune"}
+_CLI_COMMANDS = {"next-action", "complete-review", "status", "prune", "clean"}
 _SETTINGS = {
     "frequency_seconds",
     "review_concurrency",

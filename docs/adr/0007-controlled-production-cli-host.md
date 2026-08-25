@@ -10,7 +10,7 @@ FlowEngine 已具备绑定授权、外部复核和冻结提交三个端口，但
 
 ## 决定
 
-继续只保留 `next-action`、`complete-review`、`status` 和 `prune` 四个 JSON 命令。默认调用保持 preview；受控生产任务在前两个命令上分别显式传入 `--confirm-write YES`，并由同一 CLI 为 FlowEngine 注入三个生产端口。
+继续只保留 `next-action`、`complete-review`、`status`、`prune` 和 `clean` 五个 JSON 命令。`clean --all-cache` 只维护可重建附件缓存，并要求控制器和所有 Writer 均为空闲；默认业务调用保持 preview，受控生产任务在前两个命令上分别显式传入 `--confirm-write YES`，并由同一 CLI 为 FlowEngine 注入三个生产端口。
 
 生产授权同时要求：
 

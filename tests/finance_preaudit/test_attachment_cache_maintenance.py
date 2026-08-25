@@ -62,6 +62,34 @@ def test_clean_all_cache_is_idempotent_and_preserves_business_attempts(
     assert json.loads(second_output.getvalue())["deleted_entries"] == 0
 
 
+def test_clean_all_cache_persists_one_sanitized_global_invocation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cache_path = tmp_path / "cache.sqlite3"
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("OA_FINANCE_PREAUDIT_FLOW_ROOT", str(runtime_root))
+    _record(cache_path, monkeypatch)
+
+    output = io.StringIO()
+    with redirect_stdout(output):
+        exit_code = cli.main(
+            ["clean", "--all-cache"],
+            persist_invocations=True,
+        )
+
+    assert exit_code == 0
+    payload = json.loads(
+        (runtime_root / ".metrics" / "cli-invocations.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert [
+        (event["workflow_key"], event["command"], event["outcome"])
+        for event in payload["events"]
+    ] == [("global", "clean", "success")]
+
+
 def test_clean_all_cache_refuses_an_active_controller(
     tmp_path: Path,
     monkeypatch,

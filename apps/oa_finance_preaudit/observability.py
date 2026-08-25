@@ -48,7 +48,7 @@ _EVENT_FIELDS = {
 _SAFE_TEXT = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
-_CLI_COMMANDS = {"next-action", "complete-review", "status", "prune"}
+_CLI_COMMANDS = {"next-action", "complete-review", "status", "prune", "clean"}
 _CLI_OUTCOMES = {
     "success",
     "argument_error",

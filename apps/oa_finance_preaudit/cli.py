@@ -515,6 +515,7 @@ def entrypoint(argv: Sequence[str] | None = None) -> int:
             "complete-review",
             "status",
             "prune",
+            "clean",
         }:
             return code
         command = raw[0]

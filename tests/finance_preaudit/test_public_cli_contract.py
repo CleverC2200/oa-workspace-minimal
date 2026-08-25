@@ -542,6 +542,30 @@ def test_module_entry_records_argument_error_without_argv(
     assert "--unexpected" not in text
 
 
+def test_module_entry_records_clean_argument_error_as_one_global_event(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    monkeypatch.setenv("OA_FINANCE_PREAUDIT_FLOW_ROOT", str(root))
+    stderr = io.StringIO()
+
+    with redirect_stderr(stderr):
+        exit_code = cli.entrypoint(["clean"])
+
+    assert exit_code == 2
+    text = (root / ".metrics" / "cli-invocations.json").read_text(
+        encoding="utf-8"
+    )
+    payload = json.loads(text)
+    assert [
+        (event["workflow_key"], event["command"], event["outcome"])
+        for event in payload["events"]
+    ] == [("global", "clean", "argument_error")]
+    assert "--all-cache" not in text
+
+
 def test_complete_review_uses_the_same_deep_module(tmp_path) -> None:
     action_file = tmp_path / "action.json"
     decision_file = tmp_path / "decision.json"
