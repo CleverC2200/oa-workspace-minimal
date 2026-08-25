@@ -56,6 +56,27 @@ _COMPLETION_FAILURE_CODES = writer_outcomes.FAILURE_CODES | {
 _UNKNOWN_WRITE_FAILURE_CODES = (
     _COMPLETION_FAILURE_CODES - writer_outcomes.CONFIRMED_NO_WRITE_CODES
 )
+_REVIEWER_ENVIRONMENT_KEYS = frozenset(
+    {
+        "CODEX_API_KEY",
+        "CODEX_HOME",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LOGNAME",
+        "OPENAI_API_KEY",
+        "PATH",
+        "SHELL",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "TZ",
+        "USER",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -73,6 +94,17 @@ class CodexExecution:
 Executor = Callable[[Path, Path, int], CodexExecution]
 Completer = Callable[[Path, dict], str | None]
 StopRequester = Callable[[], None]
+
+
+def _reviewer_environment() -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key in _REVIEWER_ENVIRONMENT_KEYS
+    }
+    if not environment.get("HOME") or not environment.get("PATH"):
+        raise ValueError("codex_reviewer_environment_invalid")
+    return environment
 
 
 def _page_routing_instruction(action_file: Path) -> str:
@@ -525,6 +557,7 @@ def _execute_codex(
             process = subprocess.Popen(
                 command,
                 cwd=project_root,
+                env=_reviewer_environment(),
                 stdin=subprocess.PIPE,
                 stdout=output,
                 stderr=subprocess.DEVNULL,

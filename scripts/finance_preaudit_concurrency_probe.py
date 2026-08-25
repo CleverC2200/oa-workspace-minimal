@@ -2142,6 +2142,7 @@ def _run_global_dispatched_tasks(
     historical_unknown_identities: frozenset[tuple[str, str]] | None = None,
     recovery_action_files: Sequence[Path] = (),
 ) -> process_pool.PoolResult[dict]:
+    codex_review_worker._reviewer_environment()
     frozen_unknown = (
         _local_unknown_quarantined_identities()
         if historical_unknown_identities is None

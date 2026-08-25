@@ -460,6 +460,52 @@ def test_codex_start_blocks_sigterm_until_process_group_is_registered(
     assert calls[3][1] == signal.SIG_SETMASK
 
 
+def test_codex_process_receives_only_reviewer_runtime_environment(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    task, action_file = _task(tmp_path)
+    captured_environment: dict[str, str] = {}
+    monkeypatch.setenv("OA_APP_SECRET", "must-not-reach-reviewer")
+    monkeypatch.setenv("OA_DB_PASSWORD", "must-not-reach-reviewer")
+    monkeypatch.setenv("OA_BASE_URL", "must-not-reach-reviewer")
+    monkeypatch.setenv("OA_UID", "must-not-reach-reviewer")
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-reach-reviewer")
+    monkeypatch.setenv("OPENAI_API_KEY", "reviewer-auth")
+
+    class Process:
+        pid = 12345
+        returncode = 1
+
+        def communicate(self, *, input: str, timeout: int) -> None:
+            del input, timeout
+
+        def poll(self) -> int:
+            return self.returncode
+
+    def popen(*_args, **kwargs) -> Process:
+        captured_environment.update(kwargs["env"])
+        return Process()
+
+    monkeypatch.setattr(codex_review_worker.subprocess, "Popen", popen)
+
+    result = codex_review_worker._execute_codex(
+        Path(task["project_root"]),
+        action_file,
+        60,
+    )
+
+    assert result.error_code == "codex_process_failed"
+    assert captured_environment["HOME"]
+    assert captured_environment["PATH"]
+    assert captured_environment["OPENAI_API_KEY"] == "reviewer-auth"
+    assert "OA_APP_SECRET" not in captured_environment
+    assert "OA_DB_PASSWORD" not in captured_environment
+    assert "OA_BASE_URL" not in captured_environment
+    assert "OA_UID" not in captured_environment
+    assert "UNRELATED_SECRET" not in captured_environment
+
+
 def test_worker_submits_structured_agent_decision_through_host(
     tmp_path: Path,
 ) -> None:

@@ -4264,6 +4264,31 @@ def test_dispatcher_refills_reviews_while_single_writer_is_slow(
     assert result.failed == 0
 
 
+def test_global_dispatcher_validates_reviewer_environment_before_prepare(
+    monkeypatch,
+) -> None:
+    dispatched: list[bool] = []
+
+    def invalid_environment() -> dict[str, str]:
+        raise ValueError("codex_reviewer_environment_invalid")
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.codex_review_worker,
+        "_reviewer_environment",
+        invalid_environment,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_run_dispatched_tasks",
+        lambda *_args, **_kwargs: dispatched.append(True),
+    )
+
+    with pytest.raises(ValueError, match="codex_reviewer_environment_invalid"):
+        finance_preaudit_concurrency_probe._run_global_dispatched_tasks(1, 1)
+
+    assert dispatched == []
+
+
 def test_dispatcher_single_writer_is_fifo_and_never_concurrent(
     tmp_path: Path,
     monkeypatch,
