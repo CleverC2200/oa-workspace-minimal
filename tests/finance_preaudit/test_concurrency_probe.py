@@ -1066,8 +1066,15 @@ def test_prepare_global_fifo_scopes_historical_skips_to_selected_workflow(
 
 
 def test_local_quarantine_excludes_historical_no_write_failure(
+    tmp_path: Path,
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "PROJECT_ROOT",
+        tmp_path,
+    )
+    (tmp_path / "runtime" / "finance_preaudit_flows").mkdir(parents=True)
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.reconciliation,
         "latest_states",
@@ -1109,7 +1116,16 @@ def test_missing_local_runtime_is_empty_but_symlink_is_invalid(
         finance_preaudit_concurrency_probe._latest_local_states()
 
 
-def test_local_unknown_quarantine_snapshot_is_separate(monkeypatch) -> None:
+def test_local_unknown_quarantine_snapshot_is_separate(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "PROJECT_ROOT",
+        tmp_path,
+    )
+    (tmp_path / "runtime" / "finance_preaudit_flows").mkdir(parents=True)
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.reconciliation,
         "latest_states",
