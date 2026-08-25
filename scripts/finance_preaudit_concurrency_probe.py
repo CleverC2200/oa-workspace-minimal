@@ -9,6 +9,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     wait,
 )
+import hashlib
 import json
 import multiprocessing
 import os
@@ -66,6 +67,63 @@ def _read_object(path: Path) -> dict:
     if not isinstance(value, dict):
         raise ValueError("production_probe_state_invalid")
     return value
+
+
+def _prepared_action_matches_selection(
+    action_path: Path,
+    action: dict,
+    state: dict,
+    selected: dict,
+    workflow_key: str,
+    *,
+    project_root: Path = PROJECT_ROOT,
+) -> bool:
+    request_id = str(selected.get("requestId") or "").strip()
+    received_at = str(selected.get("received_at") or "").strip()
+    attempt = state.get("attempt")
+    if (
+        not request_id
+        or not received_at
+        or not isinstance(attempt, int)
+        or isinstance(attempt, bool)
+        or attempt < 1
+    ):
+        return False
+    case_key = hashlib.sha256(
+        f"{request_id}\x1f{received_at}".encode("utf-8")
+    ).hexdigest()
+    root = Path(project_root).expanduser().resolve()
+    expected_action = (
+        root
+        / "runtime"
+        / "finance_preaudit_flows"
+        / workflow_key
+        / "cases"
+        / case_key
+        / f"attempt-{attempt}"
+        / "action.json"
+    )
+    expected_state = expected_action.with_name("state.json")
+    shared = {
+        "action": "review_required",
+        "execution_state": "review_required",
+        "business_state": "not_available",
+        "write_state": "authorized",
+        "workflow_key": workflow_key,
+        "case_key": case_key,
+        "attempt": attempt,
+        "mode": "controlled_write",
+        "write_authorized": True,
+        "action_file": str(expected_action),
+        "state_file": str(expected_state),
+    }
+    return (
+        action_path == expected_action
+        and state.get("request_id") == request_id
+        and state.get("received_at") == received_at
+        and all(action.get(key) == value for key, value in shared.items())
+        and all(state.get(key) == value for key, value in shared.items())
+    )
 
 
 def _open_action_files(project_root: Path) -> list[Path]:
@@ -385,15 +443,30 @@ def _prepare_one(selection: PrepareSelection) -> dict:
             }
         if action.get("action") == "review_required":
             if selected is not None:
+                persisted_action: dict = {}
+                persisted: dict = {}
+                raw_action_path = Path(str(action.get("action_file") or ""))
+                action_path = raw_action_path.resolve()
+                state_path = action_path.with_name("state.json")
                 try:
-                    persisted = _read_object(Path(str(action["action_file"])))
+                    if (
+                        raw_action_path.is_absolute()
+                        and not raw_action_path.is_symlink()
+                        and raw_action_path == action_path
+                        and not state_path.is_symlink()
+                    ):
+                        persisted_action = _read_object(action_path)
+                        persisted = _read_object(state_path)
                 except (KeyError, ValueError):
-                    persisted = {}
+                    pass
                 if (
-                    persisted.get("request_id") != selected.get("requestId")
-                    or persisted.get("received_at")
-                    != selected.get("received_at")
-                    or persisted.get("workflow_key") != selected_workflow
+                    not _prepared_action_matches_selection(
+                        action_path,
+                        persisted_action,
+                        persisted,
+                        selected,
+                        selected_workflow,
+                    )
                 ):
                     runtime_control.request_stop(
                         "production_probe_prepare_failed"

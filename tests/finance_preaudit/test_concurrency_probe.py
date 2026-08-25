@@ -30,6 +30,35 @@ def _successful_prepare(_workflow: str) -> dict:
     }
 
 
+def _persisted_identity_reader(
+    action_file: str,
+    *,
+    request_id: str,
+    received_at: str,
+    workflow_key: str,
+):
+    action_path = Path(action_file)
+    state_path = action_path.with_name("state.json")
+
+    def read(path: Path) -> dict:
+        if path == action_path:
+            return {
+                "action_file": str(action_path),
+                "state_file": str(state_path),
+            }
+        if path == state_path:
+            return {
+                "action_file": str(action_path),
+                "state_file": str(state_path),
+                "request_id": request_id,
+                "received_at": received_at,
+                "workflow_key": workflow_key,
+            }
+        return {}
+
+    return read
+
+
 def _spawn_ignoring_term_child() -> subprocess.Popen:
     child = subprocess.Popen(
         [
@@ -492,11 +521,17 @@ def test_prepare_global_fifo_selects_oldest_supported_workflow(
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe,
         "_read_object",
-        lambda _path: {
-            "request_id": selected["requestId"],
-            "received_at": selected["received_at"],
-            "workflow_key": selected["flow_key"],
-        },
+        _persisted_identity_reader(
+            "/safe/older-action.json",
+            request_id=selected["requestId"],
+            received_at=selected["received_at"],
+            workflow_key=selected["flow_key"],
+        ),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_prepared_action_matches_selection",
+        lambda *_args, **_kwargs: True,
     )
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.runtime_control,
@@ -535,6 +570,70 @@ def test_prepare_global_fifo_selects_oldest_supported_workflow(
     ]
 
 
+def test_prepared_action_matches_selected_case_path(tmp_path: Path) -> None:
+    selected = {
+        "requestId": "selected-request",
+        "received_at": "2026-08-25T08:00:00+08:00",
+    }
+    workflow_key = "travel_expense"
+    case_key = hashlib.sha256(
+        f"{selected['requestId']}\x1f{selected['received_at']}".encode()
+    ).hexdigest()
+    action_path = (
+        tmp_path
+        / "runtime"
+        / "finance_preaudit_flows"
+        / workflow_key
+        / "cases"
+        / case_key
+        / "attempt-1"
+        / "action.json"
+    )
+    shared = {
+        "action": "review_required",
+        "execution_state": "review_required",
+        "business_state": "not_available",
+        "write_state": "authorized",
+        "workflow_key": workflow_key,
+        "case_key": case_key,
+        "attempt": 1,
+        "mode": "controlled_write",
+        "write_authorized": True,
+        "action_file": str(action_path),
+        "state_file": str(action_path.with_name("state.json")),
+    }
+    state = {
+        **shared,
+        "request_id": selected["requestId"],
+        "received_at": selected["received_at"],
+    }
+
+    assert finance_preaudit_concurrency_probe._prepared_action_matches_selection(
+        action_path,
+        shared,
+        state,
+        selected,
+        workflow_key,
+        project_root=tmp_path,
+    )
+    assert not finance_preaudit_concurrency_probe._prepared_action_matches_selection(
+        action_path.parent.parent.parent / "different-case" / "attempt-1" / "action.json",
+        shared,
+        state,
+        selected,
+        workflow_key,
+        project_root=tmp_path,
+    )
+    assert not finance_preaudit_concurrency_probe._prepared_action_matches_selection(
+        action_path,
+        {**shared, "workflow_key": "business_support_fee"},
+        state,
+        selected,
+        workflow_key,
+        project_root=tmp_path,
+    )
+
+
 def test_prepare_global_fifo_stops_when_claimed_identity_changes(
     monkeypatch,
 ) -> None:
@@ -569,11 +668,17 @@ def test_prepare_global_fifo_stops_when_claimed_identity_changes(
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe,
         "_read_object",
-        lambda _path: {
-            "request_id": "different-request",
-            "received_at": "2026-08-25T08:00:00+08:00",
-            "workflow_key": "travel_expense",
-        },
+        _persisted_identity_reader(
+            "/safe/wrong-action.json",
+            request_id="different-request",
+            received_at="2026-08-25T08:00:00+08:00",
+            workflow_key="travel_expense",
+        ),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_prepared_action_matches_selection",
+        lambda *_args, **_kwargs: False,
     )
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.runtime_control,
@@ -650,11 +755,17 @@ def test_prepare_global_fifo_skips_actions_already_claimed_by_controller(
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe,
         "_read_object",
-        lambda _path: {
-            "request_id": "next-request",
-            "received_at": "2026-08-25T08:01:00+08:00",
-            "workflow_key": "business_entertainment",
-        },
+        _persisted_identity_reader(
+            "/safe/next-action.json",
+            request_id="next-request",
+            received_at="2026-08-25T08:01:00+08:00",
+            workflow_key="business_entertainment",
+        ),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_prepared_action_matches_selection",
+        lambda *_args, **_kwargs: True,
     )
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.runtime_control,
@@ -743,11 +854,17 @@ def test_prepare_global_fifo_skips_only_frozen_historical_unknown(
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe,
         "_read_object",
-        lambda _path: {
-            "request_id": selected["requestId"],
-            "received_at": selected["received_at"],
-            "workflow_key": selected["flow_key"],
-        },
+        _persisted_identity_reader(
+            "/safe/next-action.json",
+            request_id=selected["requestId"],
+            received_at=selected["received_at"],
+            workflow_key=selected["flow_key"],
+        ),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_prepared_action_matches_selection",
+        lambda *_args, **_kwargs: True,
     )
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.runtime_control,
