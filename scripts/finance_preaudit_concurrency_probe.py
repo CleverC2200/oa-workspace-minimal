@@ -176,11 +176,28 @@ def _local_quarantined_identities() -> frozenset[tuple[str, str]]:
     flow_root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
     identities: set[tuple[str, str]] = set()
     for state in reconciliation.latest_states(flow_root):
+        reason = state.get("reason")
         if (
             state.get("execution_state") == "needs_admin"
-            and state.get("reason")
-            in {"write_authorization_invalid", *QUARANTINED_REASONS}
             and state.get("write_state") == "not_requested"
+            and reason in {"write_authorization_invalid", *QUARANTINED_REASONS}
+        ):
+            request_id = str(state.get("request_id") or "").strip()
+            received_at = str(state.get("received_at") or "").strip()
+            if not request_id or not received_at:
+                raise ValueError("production_probe_state_invalid")
+            identities.add((request_id, received_at))
+    return frozenset(identities)
+
+
+def _local_unknown_quarantined_identities() -> frozenset[tuple[str, str]]:
+    flow_root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
+    identities: set[tuple[str, str]] = set()
+    for state in reconciliation.latest_states(flow_root):
+        if (
+            state.get("execution_state") == "needs_admin"
+            and state.get("write_state") == "unknown"
+            and state.get("reason") in reconciliation.QUARANTINED_REASONS
         ):
             request_id = str(state.get("request_id") or "").strip()
             received_at = str(state.get("received_at") or "").strip()
@@ -192,12 +209,20 @@ def _local_quarantined_identities() -> frozenset[tuple[str, str]]:
 
 def _prepare_one(selection: PrepareSelection) -> dict:
     assigned_identities: set[tuple[str, str]] = set()
+    historical_unknown_identities: set[tuple[str, str]] = set()
     if isinstance(selection, str):
         workflow_key = selection
     elif isinstance(selection, dict) and selection.get("workflow_key") == "*":
         workflow_key = "*"
         raw_assigned = selection.get("assigned_identities")
-        if not isinstance(raw_assigned, list):
+        raw_historical_unknown = selection.get(
+            "historical_unknown_identities",
+            [],
+        )
+        if not isinstance(raw_assigned, list) or not isinstance(
+            raw_historical_unknown,
+            list,
+        ):
             return {
                 "action": "failed",
                 "error_code": "production_probe_prepare_failed",
@@ -213,6 +238,17 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                     "error_code": "production_probe_prepare_failed",
                 }
             assigned_identities.add((identity[0], identity[1]))
+        for identity in raw_historical_unknown:
+            if (
+                not isinstance(identity, list)
+                or len(identity) != 2
+                or not all(isinstance(value, str) and value for value in identity)
+            ):
+                return {
+                    "action": "failed",
+                    "error_code": "production_probe_prepare_failed",
+                }
+            historical_unknown_identities.add((identity[0], identity[1]))
     else:
         return {
             "action": "failed",
@@ -246,6 +282,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                     cli._live_pending_identities(),
                     excluded_identities=(
                         _local_quarantined_identities()
+                        | historical_unknown_identities
                         | assigned_identities
                     ),
                     allowed_workflows=ROLLING_WORKFLOW_KEYS,
@@ -953,6 +990,7 @@ def _run_dispatched_tasks(
     strict_global_fifo: bool = False,
     adaptive: bool = False,
     max_capacity: int | None = None,
+    historical_unknown_identities: frozenset[tuple[str, str]] = frozenset(),
 ) -> process_pool.PoolResult[dict]:
     maximum_capacity = capacity if max_capacity is None else max_capacity
     if (
@@ -1247,6 +1285,10 @@ def _run_dispatched_tasks(
         return {
             "workflow_key": "*",
             "assigned_identities": identities,
+            "historical_unknown_identities": [
+                list(identity)
+                for identity in sorted(historical_unknown_identities)
+            ],
         }
 
     try:
@@ -1804,13 +1846,20 @@ def _run_global_dispatched_tasks(
     *,
     adaptive: bool = False,
     max_capacity: int | None = None,
+    historical_unknown_identities: frozenset[tuple[str, str]] | None = None,
 ) -> process_pool.PoolResult[dict]:
+    frozen_unknown = (
+        _local_unknown_quarantined_identities()
+        if historical_unknown_identities is None
+        else historical_unknown_identities
+    )
     return _run_dispatched_tasks(
         count,
         capacity,
         strict_global_fifo=True,
         adaptive=adaptive,
         max_capacity=max_capacity,
+        historical_unknown_identities=frozen_unknown,
     )
 
 
@@ -2351,6 +2400,11 @@ def run_rolling_drain(
     try:
         with runtime_control.global_controller_lease():
             cache_maintenance = attachment_cache.prune_expired()
+            historical_unknown_identities = (
+                _local_unknown_quarantined_identities()
+                if pipeline_runner is _run_global_dispatched_tasks
+                else frozenset()
+            )
             manifest = controller_handoff.begin(
                 {
                     "capacity": capacity,
@@ -2378,6 +2432,9 @@ def run_rolling_drain(
                         review_capacity,
                         adaptive=adaptive,
                         max_capacity=max_capacity,
+                        historical_unknown_identities=(
+                            historical_unknown_identities
+                        ),
                     )
                 else:
                     wave_result = pipeline_runner(count, review_capacity)

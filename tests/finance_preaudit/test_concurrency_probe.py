@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import subprocess
@@ -692,7 +693,92 @@ def test_prepare_global_fifo_skips_actions_already_claimed_by_controller(
     assert calls == ["business_entertainment"]
 
 
-def test_local_quarantine_excludes_historical_write_authorization_failure(
+def test_prepare_global_fifo_skips_only_frozen_historical_unknown(
+    monkeypatch,
+) -> None:
+    historical = ("historical-unknown", "2026-08-25T08:00:00+08:00")
+    selected = {
+        "requestId": "next-request",
+        "received_at": "2026-08-25T08:01:00+08:00",
+        "flow_key": "travel_expense",
+        "support_status": "supported",
+        "can_submit": True,
+    }
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.cli,
+        "_live_pending_identities",
+        lambda: [
+            {
+                "requestId": historical[0],
+                "received_at": historical[1],
+                "flow_key": "travel_expense",
+                "support_status": "supported",
+                "can_submit": True,
+            },
+            selected,
+        ],
+    )
+
+    class Engine:
+        def next_action(self, _workflow_key: str, **_kwargs) -> dict:
+            return {
+                "action": "review_required",
+                "action_file": "/safe/next-action.json",
+            }
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.cli,
+        "_live_flow_engine",
+        lambda *, controlled, selected_identity: Engine(),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_read_object",
+        lambda _path: {
+            "request_id": selected["requestId"],
+            "received_at": selected["received_at"],
+            "workflow_key": selected["flow_key"],
+        },
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda _reason=None: None,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantine_count",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_historical_write_authorization_failures",
+        frozenset,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantined_identities",
+        frozenset,
+    )
+
+    assert finance_preaudit_concurrency_probe._prepare_one(
+        {
+            "workflow_key": "*",
+            "assigned_identities": [],
+            "historical_unknown_identities": [list(historical)],
+        }
+    ) == {
+        "action": "review_required",
+        "action_file": "/safe/next-action.json",
+    }
+
+
+def test_local_quarantine_excludes_historical_no_write_failure(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
@@ -711,14 +797,107 @@ def test_local_quarantine_excludes_historical_write_authorization_failure(
 
     assert finance_preaudit_concurrency_probe._local_quarantined_identities() == (
         frozenset(
-            {
-                (
-                    "historical-request",
-                    "2026-08-25T08:00:00+08:00",
-                )
-            }
+            {("historical-request", "2026-08-25T08:00:00+08:00")}
         )
     )
+
+
+def test_local_unknown_quarantine_snapshot_is_separate(monkeypatch) -> None:
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.reconciliation,
+        "latest_states",
+        lambda _root: [
+            {
+                "request_id": "historical-request",
+                "received_at": "2026-08-25T08:00:00+08:00",
+                "execution_state": "needs_admin",
+                "write_state": "unknown",
+                "reason": "writer_result_unknown",
+            }
+        ],
+    )
+
+    assert (
+        finance_preaudit_concurrency_probe._local_unknown_quarantined_identities()
+        == frozenset(
+            {("historical-request", "2026-08-25T08:00:00+08:00")}
+        )
+    )
+    assert finance_preaudit_concurrency_probe._local_quarantined_identities() == (
+        frozenset()
+    )
+
+
+def test_global_dispatcher_passes_frozen_unknown_snapshot(monkeypatch) -> None:
+    historical = frozenset(
+        {("historical-request", "2026-08-25T08:00:00+08:00")}
+    )
+    captured: list[dict] = []
+    sentinel = object()
+
+    def run(_count: int, _capacity: int, **kwargs):
+        captured.append(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_run_dispatched_tasks",
+        run,
+    )
+
+    result = finance_preaudit_concurrency_probe._run_global_dispatched_tasks(
+        3,
+        6,
+        historical_unknown_identities=historical,
+    )
+
+    assert result is sentinel
+    assert captured == [
+        {
+            "strict_global_fifo": True,
+            "adaptive": False,
+            "max_capacity": None,
+            "historical_unknown_identities": historical,
+        }
+    ]
+
+
+def test_unknown_snapshot_failure_happens_before_handoff_begin(monkeypatch) -> None:
+    begins: list[dict] = []
+
+    def fail_snapshot() -> frozenset[tuple[str, str]]:
+        raise ValueError("production_probe_state_invalid")
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.controller_handoff,
+        "assert_ready_for_start",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "global_controller_lease",
+        nullcontext,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.attachment_cache,
+        "prune_expired",
+        lambda: {"status": "ok"},
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_unknown_quarantined_identities",
+        fail_snapshot,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.controller_handoff,
+        "begin",
+        lambda payload: begins.append(payload),
+    )
+
+    with pytest.raises(ValueError, match="production_probe_state_invalid"):
+        finance_preaudit_concurrency_probe.run_rolling_drain(capacity=6)
+
+    assert begins == []
 
 
 def test_open_actions_are_global_fifo_across_workflows(tmp_path: Path) -> None:
