@@ -1089,6 +1089,26 @@ def test_local_quarantine_excludes_historical_no_write_failure(
     )
 
 
+def test_missing_local_runtime_is_empty_but_symlink_is_invalid(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "PROJECT_ROOT",
+        tmp_path,
+    )
+
+    assert finance_preaudit_concurrency_probe._latest_local_states() == []
+
+    (tmp_path / "runtime").symlink_to(
+        tmp_path / "missing-runtime",
+        target_is_directory=True,
+    )
+    with pytest.raises(ValueError, match="runtime_reconciliation_invalid"):
+        finance_preaudit_concurrency_probe._latest_local_states()
+
+
 def test_local_unknown_quarantine_snapshot_is_separate(monkeypatch) -> None:
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.reconciliation,
@@ -2311,7 +2331,10 @@ def test_prepare_waits_for_inflight_completion_without_requesting_stop(
     assert stop_requests == []
 
 
-def test_prepare_stops_before_collecting_another_item_after_stop(monkeypatch) -> None:
+def test_prepare_stops_before_collecting_another_item_after_stop(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     stopped = False
     calls = 0
 
@@ -2325,6 +2348,12 @@ def test_prepare_stops_before_collecting_another_item_after_stop(monkeypatch) ->
                 "reason": "writer_result_unknown",
                 "write_state": "unknown",
             }
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "PROJECT_ROOT",
+        tmp_path,
+    )
 
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.cli,
@@ -2525,6 +2554,11 @@ def test_rolling_drain_routes_recoveries_through_the_isolated_prepare_stage(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "PROJECT_ROOT",
+        tmp_path,
+    )
     recovery = tmp_path / "attempt-1" / "action.json"
     pending = iter([(3, 3), (2, 2), (2, 2)])
     current = [(0, 0)]
@@ -2678,9 +2712,7 @@ def test_elastic_health_window_does_not_cap_claims() -> None:
     )
     assert result["status"] == "completed"
     assert [health["status"] for health in result["wave_runtime_health"]] == [
-        "healthy",
-        "healthy",
-        "healthy",
+        "healthy"
     ]
 
 

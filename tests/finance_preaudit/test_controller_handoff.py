@@ -40,6 +40,11 @@ def test_completed_controller_run_publishes_sanitized_handoff_status(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "PROJECT_ROOT",
+        tmp_path,
+    )
     monkeypatch.setenv(
         "OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE",
         str(tmp_path / "control" / "rolling-controller.lock"),
@@ -200,6 +205,11 @@ def test_terminal_handoff_requires_a_fresh_controller_process(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "PROJECT_ROOT",
+        tmp_path,
+    )
     monkeypatch.setenv(
         "OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE",
         str(tmp_path / "control" / "rolling-controller.lock"),

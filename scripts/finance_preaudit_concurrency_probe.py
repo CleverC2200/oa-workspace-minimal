@@ -595,10 +595,22 @@ def _renew_actions(action_files: list[Path]) -> list[Path]:
     return renewed
 
 
+def _latest_local_states() -> list[dict]:
+    runtime_root = PROJECT_ROOT / "runtime"
+    flow_root = runtime_root / "finance_preaudit_flows"
+    if runtime_root.is_symlink() or flow_root.is_symlink():
+        raise ValueError("runtime_reconciliation_invalid")
+    if not flow_root.exists():
+        if runtime_root.exists() and not runtime_root.is_dir():
+            raise ValueError("runtime_reconciliation_invalid")
+        return []
+    return reconciliation.latest_states(flow_root)
+
+
 def _historical_write_authorization_failures() -> frozenset[Path]:
     flow_root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
     historical: set[Path] = set()
-    for state in reconciliation.latest_states(flow_root):
+    for state in _latest_local_states():
         if (
             state.get("workflow_key") not in ROLLING_WORKFLOW_KEYS
             or state.get("execution_state") != "needs_admin"
@@ -621,9 +633,8 @@ def _historical_write_authorization_failures() -> frozenset[Path]:
 
 
 def _local_quarantined_identities() -> frozenset[tuple[str, str]]:
-    flow_root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
     identities: set[tuple[str, str]] = set()
-    for state in reconciliation.latest_states(flow_root):
+    for state in _latest_local_states():
         reason = state.get("reason")
         if (
             state.get("execution_state") == "needs_admin"
@@ -639,9 +650,8 @@ def _local_quarantined_identities() -> frozenset[tuple[str, str]]:
 
 
 def _local_unknown_quarantined_identities() -> frozenset[tuple[str, str]]:
-    flow_root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
     identities: set[tuple[str, str]] = set()
-    for state in reconciliation.latest_states(flow_root):
+    for state in _latest_local_states():
         if (
             state.get("execution_state") == "needs_admin"
             and state.get("write_state") == "unknown"
@@ -664,7 +674,7 @@ def _historical_unknown_action_files(
         return frozenset()
     flow_root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
     action_files: set[Path] = set()
-    for state in reconciliation.latest_states(flow_root):
+    for state in _latest_local_states():
         identity = (
             str(state.get("request_id") or "").strip(),
             str(state.get("received_at") or "").strip(),
@@ -3259,15 +3269,9 @@ def _quarantined_pending_count() -> int:
 
 
 def _local_quarantine_count() -> int:
-    flow_root = (
-        PROJECT_ROOT
-        / "runtime"
-        / "finance_preaudit_flows"
-        / "travel_expense"
-    )
-    return reconciliation.quarantine_summary(
-        flow_root.parent,
-        pending_rows=[],
+    return reconciliation._quarantine_summary(
+        _latest_local_states(),
+        [],
     )["local_quarantined"]
 
 
