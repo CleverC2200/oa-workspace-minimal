@@ -138,6 +138,25 @@ _SAFE_COLLECTION_COUNT_KEYS = {
     "trusted_source_sighting_count",
 }
 _HARD_COLLECTION_FAILURE_CODES = {"oa_run_stopped"}
+_SAFE_MATERIAL_FAILURE_DETAIL_CODES = (
+    _SAFE_MATERIAL_GAP_CODES
+    | _HARD_COLLECTION_FAILURE_CODES
+    | {
+        "frozen_file_unreadable",
+        "frozen_material_changed",
+        "manifest_resource_coverage_incomplete",
+        "manifest_resource_unbound",
+        "material_bundle_schema_invalid",
+        "material_bundle_unreadable",
+        "material_request_mismatch",
+        "prepared_path_outside_request_root",
+        "prepared_resource_path_mismatch",
+        "prepared_resource_unbound",
+        "resource_identity_invalid",
+        "resource_request_mismatch",
+        "resource_source_identity_missing",
+    }
+)
 SHARED_FAILURE_CODES = {
     "submission_adapter_unavailable",
     "write_authorization_invalid",
@@ -301,6 +320,19 @@ def _material_gap(error: Exception) -> dict:
     if counts:
         gap["counts"] = counts
     return gap
+
+
+def _material_failure_details(error: Exception) -> dict:
+    raw_code = str(error).strip()
+    gap = _material_gap(error)
+    return {
+        "failure_detail_code": (
+            raw_code
+            if raw_code in _SAFE_MATERIAL_FAILURE_DETAIL_CODES
+            else "material_collection_failed"
+        ),
+        **({"failure_counts": gap["counts"]} if "counts" in gap else {}),
+    }
 
 
 def _degraded_material(request_id: str, workflow_key: str, error: Exception) -> dict:
@@ -1105,6 +1137,8 @@ class FlowEngine:
         self,
         action_path: Path,
         reason: str,
+        *,
+        failure_details: dict | None = None,
     ) -> dict:
         attempt_root = action_path.parent
         workflow_key = _attempt_workflow_key(attempt_root, self._root)
@@ -1135,6 +1169,7 @@ class FlowEngine:
             state_file=str(state_path),
             case_key=attempt_root.parent.name,
             attempt=_attempt_number(attempt_root),
+            **(failure_details or {}),
         )
         json_artifact.write_json_atomic(action_path, action, indent=2)
         json_artifact.write_json_atomic(
@@ -1890,6 +1925,7 @@ class FlowEngine:
                     return self._persist_attempt_needs_admin(
                         attempt_root / "action.json",
                         "material_collection_failed",
+                        failure_details=_material_failure_details(error),
                     )
                 material = _degraded_material(
                     claim["request_id"],
@@ -1932,10 +1968,11 @@ class FlowEngine:
                 }
                 packet_file = attempt_root / "review-packet.json"
                 json_artifact.write_json_atomic(packet_file, packet, indent=2)
-            except Exception:
+            except Exception as error:
                 return self._persist_attempt_needs_admin(
                     attempt_root / "action.json",
                     "material_collection_failed",
+                    failure_details=_material_failure_details(error),
                 )
             try:
                 authorization = submission.resolve_authorization(
