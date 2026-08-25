@@ -804,16 +804,27 @@ def test_prepare_global_fifo_skips_actions_already_claimed_by_controller(
     assert calls == ["business_entertainment"]
 
 
-def test_prepare_global_fifo_skips_only_frozen_historical_unknown(
+def test_prepare_global_fifo_scopes_historical_skips_to_selected_workflow(
     monkeypatch,
 ) -> None:
     historical = ("historical-unknown", "2026-08-25T08:00:00+08:00")
     historical_action = Path("/safe/historical-action.json")
     skip_calls: list[frozenset[Path]] = []
+    authorization_skip_calls: list[frozenset[Path]] = []
+    historical_travel_authorization = (
+        finance_preaudit_concurrency_probe.PROJECT_ROOT
+        / "runtime"
+        / "finance_preaudit_flows"
+        / "travel_expense"
+        / "cases"
+        / "historical"
+        / "attempt-1"
+        / "action.json"
+    )
     selected = {
         "requestId": "next-request",
         "received_at": "2026-08-25T08:01:00+08:00",
-        "flow_key": "travel_expense",
+        "flow_key": "business_support_fee",
         "support_status": "supported",
         "can_submit": True,
     }
@@ -824,7 +835,7 @@ def test_prepare_global_fifo_skips_only_frozen_historical_unknown(
             {
                 "requestId": historical[0],
                 "received_at": historical[1],
-                "flow_key": "travel_expense",
+                "flow_key": "business_support_fee",
                 "support_status": "supported",
                 "can_submit": True,
             },
@@ -837,9 +848,11 @@ def test_prepare_global_fifo_skips_only_frozen_historical_unknown(
             self,
             _workflow_key: str,
             *,
+            skip_write_authorization_failures: frozenset[Path],
             skip_unknown_failures: frozenset[Path],
             **_kwargs,
         ) -> dict:
+            authorization_skip_calls.append(skip_write_authorization_failures)
             skip_calls.append(skip_unknown_failures)
             return {
                 "action": "review_required",
@@ -884,7 +897,7 @@ def test_prepare_global_fifo_skips_only_frozen_historical_unknown(
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe,
         "_historical_write_authorization_failures",
-        frozenset,
+        lambda: frozenset({historical_travel_authorization}),
     )
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe,
@@ -896,7 +909,8 @@ def test_prepare_global_fifo_skips_only_frozen_historical_unknown(
         "_historical_unknown_action_files",
         lambda identities, *, workflow_key: (
             frozenset({historical_action})
-            if identities == {historical} and workflow_key == "travel_expense"
+            if identities == {historical}
+            and workflow_key == "business_support_fee"
             else frozenset()
         ),
     )
@@ -911,6 +925,7 @@ def test_prepare_global_fifo_skips_only_frozen_historical_unknown(
         "action": "review_required",
         "action_file": "/safe/next-action.json",
     }
+    assert authorization_skip_calls == [frozenset()]
     assert skip_calls == [frozenset({historical_action})]
 
 
@@ -1285,6 +1300,16 @@ def test_prepare_skips_exact_historical_write_authorization_failure(
 ) -> None:
     stop_requests: list[bool] = []
     calls: list[frozenset[Path]] = []
+    historical_action = (
+        finance_preaudit_concurrency_probe.PROJECT_ROOT
+        / "runtime"
+        / "finance_preaudit_flows"
+        / "travel_expense"
+        / "cases"
+        / "historical"
+        / "attempt-1"
+        / "action.json"
+    )
 
     class Engine:
         def next_action(
@@ -1322,7 +1347,7 @@ def test_prepare_skips_exact_historical_write_authorization_failure(
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe,
         "_historical_write_authorization_failures",
-        lambda: frozenset({Path("/safe/old-action.json")}),
+        lambda: frozenset({historical_action}),
     )
 
     assert finance_preaudit_concurrency_probe._prepare_one(
@@ -1332,7 +1357,7 @@ def test_prepare_skips_exact_historical_write_authorization_failure(
         "action_file": "/safe/new-action.json",
     }
     assert stop_requests == []
-    assert calls == [frozenset({Path("/safe/old-action.json")})]
+    assert calls == [frozenset({historical_action})]
 
 
 def test_prepare_requests_stop_when_next_action_raises(monkeypatch) -> None:

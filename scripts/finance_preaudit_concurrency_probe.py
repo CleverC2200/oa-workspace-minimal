@@ -402,13 +402,24 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                     str(selected["received_at"]),
                 ),
             )
+        selected_workflow_root = (
+            PROJECT_ROOT
+            / "runtime"
+            / "finance_preaudit_flows"
+            / selected_workflow
+        )
+        workflow_authorization_failures = frozenset(
+            action_file
+            for action_file in historical_authorization_failures
+            if action_file.is_relative_to(selected_workflow_root)
+        )
         while True:
             try:
                 action = engine.next_action(
                     selected_workflow,
                     mode="controlled_write",
                     skip_write_authorization_failures=(
-                        historical_authorization_failures
+                        workflow_authorization_failures
                     ),
                     skip_unknown_failures=_historical_unknown_action_files(
                         historical_unknown_identities,
