@@ -136,6 +136,46 @@ def _open_action(
     return action_file
 
 
+def _quarantined_action(
+    root: Path,
+    *,
+    request_id: str,
+    received_at: str,
+) -> Path:
+    case_key = hashlib.sha256(
+        f"{request_id}\x1f{received_at}".encode("utf-8")
+    ).hexdigest()
+    attempt_root = (
+        root
+        / "travel_expense"
+        / "cases"
+        / case_key
+        / "attempt-1"
+    )
+    action_file = attempt_root / "action.json"
+    state_file = attempt_root / "state.json"
+    payload = {
+        "schema_version": 1,
+        "kind": "preaudit_action",
+        "action": "needs_admin",
+        "execution_state": "needs_admin",
+        "business_state": "not_available",
+        "write_state": "not_requested",
+        "workflow_key": "travel_expense",
+        "reason": "material_collection_failed",
+        "request_id": request_id,
+        "received_at": received_at,
+        "case_key": case_key,
+        "attempt": 1,
+        "action_file": str(action_file),
+        "state_file": str(state_file),
+    }
+    attempt_root.mkdir(parents=True)
+    json_artifact.write_json_atomic(action_file, payload)
+    json_artifact.write_json_atomic(state_file, payload)
+    return action_file
+
+
 def _reconciliation_snapshot(pending: int, quarantined: int = 0) -> dict:
     return {
         "schema_version": 1,
@@ -1013,6 +1053,462 @@ def test_global_dispatcher_passes_frozen_unknown_snapshot(monkeypatch) -> None:
     ]
 
 
+def test_prepare_one_recovers_an_explicit_confirmed_no_write_action(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    action_file = _quarantined_action(
+        flow_root,
+        request_id="recovery-request",
+        received_at="2026-08-25T08:00:00+08:00",
+    )
+    calls: list[tuple[Path, str, bool]] = []
+
+    class Engine:
+        def recover_confirmed_no_write(
+            self,
+            path: Path,
+            *,
+            mode: str,
+            confirmed: bool,
+        ) -> dict:
+            calls.append((path, mode, confirmed))
+            return {
+                "action": "review_required",
+                "action_file": str(tmp_path / "attempt-2" / "action.json"),
+            }
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.cli,
+        "_live_flow_engine",
+        lambda *, controlled: Engine(),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.cli,
+        "_live_pending_identities",
+        lambda: [],
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "PROJECT_ROOT",
+        tmp_path,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_historical_write_authorization_failures",
+        frozenset,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantine_count",
+        lambda: 1,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantined_identities",
+        frozenset,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_prepared_action_matches_selection",
+        lambda *_args, **_kwargs: True,
+    )
+
+    result = finance_preaudit_concurrency_probe._prepare_one(
+        {
+            "workflow_key": "*",
+            "assigned_identities": [],
+            "historical_unknown_identities": [],
+            "recover_action_files": [str(action_file)],
+        }
+    )
+
+    assert result == {
+        "action": "review_required",
+        "action_file": str(tmp_path / "attempt-2" / "action.json"),
+    }
+    assert calls == [(action_file, "controlled_write", True)]
+
+
+def test_prepare_one_merges_live_and_recovery_candidates_in_global_fifo(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    recovery = _quarantined_action(
+        flow_root,
+        request_id="newer-recovery",
+        received_at="2026-08-25T09:00:00+08:00",
+    )
+    selected_identities: list[tuple[str, str]] = []
+
+    class Engine:
+        def next_action(self, *_args: object, **_kwargs: object) -> dict:
+            return {
+                "action": "review_required",
+                "action_file": str(tmp_path / "live" / "action.json"),
+            }
+
+    def engine_factory(
+        *,
+        controlled: bool,
+        selected_identity: tuple[str, str] | None = None,
+    ) -> Engine:
+        if selected_identity is not None:
+            selected_identities.append(selected_identity)
+        return Engine()
+
+    monkeypatch.setattr(finance_preaudit_concurrency_probe, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.cli,
+        "_live_flow_engine",
+        engine_factory,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.cli,
+        "_live_pending_identities",
+        lambda: [
+            {
+                "requestId": "older-live",
+                "received_at": "2026-08-25T08:00:00+08:00",
+                "flow_key": "travel_expense",
+                "support_status": "supported",
+                "can_submit": True,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_historical_write_authorization_failures",
+        frozenset,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantine_count",
+        lambda: 1,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantined_identities",
+        frozenset,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_prepared_action_matches_selection",
+        lambda *_args, **_kwargs: True,
+    )
+
+    result = finance_preaudit_concurrency_probe._prepare_one(
+        {
+            "workflow_key": "*",
+            "assigned_identities": [],
+            "historical_unknown_identities": [],
+            "recover_action_files": [str(recovery)],
+        }
+    )
+
+    assert result["action"] == "review_required"
+    assert selected_identities == [
+        ("older-live", "2026-08-25T08:00:00+08:00")
+    ]
+
+
+def test_prepare_one_sorts_recovery_inputs_by_operation_time(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    newer = _quarantined_action(
+        flow_root,
+        request_id="newer-recovery",
+        received_at="2026-08-25T09:00:00+08:00",
+    )
+    older = _quarantined_action(
+        flow_root,
+        request_id="older-recovery",
+        received_at="2026-08-25T08:00:00+08:00",
+    )
+    recovered: list[Path] = []
+
+    class Engine:
+        def recover_confirmed_no_write(
+            self,
+            path: Path,
+            **_kwargs: object,
+        ) -> dict:
+            recovered.append(path)
+            return {
+                "action": "review_required",
+                "action_file": str(tmp_path / "attempt-2" / "action.json"),
+            }
+
+    monkeypatch.setattr(finance_preaudit_concurrency_probe, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.cli,
+        "_live_flow_engine",
+        lambda *, controlled: Engine(),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.cli,
+        "_live_pending_identities",
+        lambda: [],
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_historical_write_authorization_failures",
+        frozenset,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantine_count",
+        lambda: 2,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantined_identities",
+        frozenset,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_prepared_action_matches_selection",
+        lambda *_args, **_kwargs: True,
+    )
+
+    result = finance_preaudit_concurrency_probe._prepare_one(
+        {
+            "workflow_key": "*",
+            "assigned_identities": [],
+            "historical_unknown_identities": [],
+            "recover_action_files": [str(newer), str(older)],
+        }
+    )
+
+    assert result["action"] == "review_required"
+    assert recovered == [older]
+
+
+@pytest.mark.parametrize("outcome", ["raises", "needs_admin"])
+def test_prepare_one_recovery_failure_requests_a_valid_stop(
+    tmp_path: Path,
+    monkeypatch,
+    outcome: str,
+) -> None:
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    recovery = _quarantined_action(
+        flow_root,
+        request_id="failed-recovery",
+        received_at="2026-08-25T08:00:00+08:00",
+    )
+    stops: list[str | None] = []
+
+    class Engine:
+        def recover_confirmed_no_write(self, *_args: object, **_kwargs: object) -> dict:
+            if outcome == "raises":
+                raise ValueError("recovery_not_safe")
+            return {"action": "needs_admin"}
+
+    monkeypatch.setattr(finance_preaudit_concurrency_probe, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.cli,
+        "_live_flow_engine",
+        lambda *, controlled: Engine(),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.cli,
+        "_live_pending_identities",
+        lambda: [],
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda reason=None: stops.append(reason),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_historical_write_authorization_failures",
+        frozenset,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantine_count",
+        lambda: 1,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantined_identities",
+        frozenset,
+    )
+
+    result = finance_preaudit_concurrency_probe._prepare_one(
+        {
+            "workflow_key": "*",
+            "assigned_identities": [],
+            "historical_unknown_identities": [],
+            "recover_action_files": [str(recovery)],
+        }
+    )
+
+    assert result == {
+        "action": "failed",
+        "error_code": "production_probe_recovery_failed",
+    }
+    assert stops == ["production_probe_prepare_failed"]
+
+
+def test_prepare_one_recovery_preflight_failure_keeps_recovery_error_semantics(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    missing_action = (
+        tmp_path
+        / "runtime"
+        / "finance_preaudit_flows"
+        / "travel_expense"
+        / "cases"
+        / ("a" * 64)
+        / "attempt-1"
+        / "action.json"
+    )
+    stops: list[str | None] = []
+    monkeypatch.setattr(finance_preaudit_concurrency_probe, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.cli,
+        "_live_pending_identities",
+        lambda: [],
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda reason=None: stops.append(reason),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_historical_write_authorization_failures",
+        frozenset,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantine_count",
+        lambda: 1,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantined_identities",
+        frozenset,
+    )
+
+    result = finance_preaudit_concurrency_probe._prepare_one(
+        {
+            "workflow_key": "*",
+            "assigned_identities": [],
+            "historical_unknown_identities": [],
+            "recover_action_files": [str(missing_action)],
+        }
+    )
+
+    assert result == {
+        "action": "failed",
+        "error_code": "production_probe_recovery_failed",
+    }
+    assert stops == ["production_probe_prepare_failed"]
+
+
+def test_prepare_one_rejects_duplicate_recovery_identity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    first = _quarantined_action(
+        flow_root,
+        request_id="duplicate-recovery",
+        received_at="2026-08-25T08:00:00+08:00",
+    )
+    second = first.parent.parent / "attempt-2" / "action.json"
+    second_state = second.with_name("state.json")
+    payload = json.loads(first.read_text(encoding="utf-8"))
+    payload.update(
+        attempt=2,
+        action_file=str(second),
+        state_file=str(second_state),
+    )
+    second.parent.mkdir()
+    json_artifact.write_json_atomic(second, payload)
+    json_artifact.write_json_atomic(second_state, payload)
+    stops: list[str | None] = []
+    monkeypatch.setattr(finance_preaudit_concurrency_probe, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.cli,
+        "_live_pending_identities",
+        lambda: [],
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda reason=None: stops.append(reason),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_historical_write_authorization_failures",
+        frozenset,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantine_count",
+        lambda: 2,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantined_identities",
+        frozenset,
+    )
+
+    result = finance_preaudit_concurrency_probe._prepare_one(
+        {
+            "workflow_key": "*",
+            "assigned_identities": [],
+            "historical_unknown_identities": [],
+            "recover_action_files": [str(first), str(second)],
+        }
+    )
+
+    assert result == {
+        "action": "failed",
+        "error_code": "production_probe_recovery_failed",
+    }
+    assert stops == ["production_probe_prepare_failed"]
+
+
 def test_unknown_snapshot_failure_happens_before_handoff_begin(monkeypatch) -> None:
     begins: list[dict] = []
 
@@ -1670,6 +2166,84 @@ def test_rolling_drain_runs_full_pipeline_without_batch_barriers() -> None:
     assert result["token_usage"]["total_tokens"] == 880
 
 
+def test_rolling_drain_routes_recoveries_through_the_isolated_prepare_stage(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    recovery = tmp_path / "attempt-1" / "action.json"
+    pending = iter([(3, 3), (2, 2)])
+    current = [(0, 0)]
+    calls: list[tuple[int, int, tuple[Path, ...]]] = []
+
+    def live_status() -> dict:
+        count, quarantined = next(pending)
+        current[0] = (count, quarantined)
+        return {
+            "credentials": {"status": "ok"},
+            "oa": {
+                "execution_identity": "verified",
+                "by_workflow": {"travel_expense": count},
+            },
+        }
+
+    def pipeline(
+        count: int,
+        capacity: int,
+        **kwargs: object,
+    ) -> process_pool.PoolResult[dict]:
+        calls.append(
+            (
+                count,
+                capacity,
+                tuple(kwargs.get("recovery_action_files", ())),
+            )
+        )
+        return process_pool.PoolResult(
+            requested=count,
+            started=count,
+            completed=count,
+            failed=0,
+            timed_out=0,
+            stopped=0,
+            peak_active=1,
+            elapsed_seconds=1.0,
+            outcomes=(
+                process_pool.TaskOutcome(
+                    index=0,
+                    status="completed",
+                    value={
+                        "status": "completed",
+                        "business_state": "needs_human",
+                        "token_usage": {"status": "unknown"},
+                    },
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_run_global_dispatched_tasks",
+        pipeline,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+
+    result = finance_preaudit_concurrency_probe.run_rolling_drain(
+        capacity=6,
+        recovery_action_files=(recovery,),
+        live_status=live_status,
+        pipeline_runner=pipeline,
+        reconcile_status=lambda: _reconciliation_snapshot(*current[0]),
+    )
+
+    assert calls == [(1, 6, (recovery,))]
+    assert result["completed"] == 1
+    assert result["quarantined_pending"] == 2
+
+
 def test_elastic_health_window_does_not_cap_claims() -> None:
     pending = iter([36, 0])
     current_pending = [0]
@@ -2193,18 +2767,34 @@ def test_production_cli_defaults_to_rolling_and_rejects_legacy_drain(
     monkeypatch,
     capsys,
 ) -> None:
-    calls: list[tuple[int, bool]] = []
+    calls: list[tuple[int, bool, tuple[Path, ...]]] = []
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe,
         "run_rolling_drain",
-        lambda *, capacity, adaptive: calls.append((capacity, adaptive))
+        lambda *, capacity, adaptive, recovery_action_files=(): calls.append(
+            (capacity, adaptive, tuple(recovery_action_files))
+        )
         or {"status": "completed"},
     )
 
     assert finance_preaudit_concurrency_probe.main(
         ["--capacity", "6", "--confirm-write", "YES"]
     ) == 0
-    assert calls == [(6, False)]
+    assert calls == [(6, False, ())]
+    capsys.readouterr()
+
+    recovery = Path("/safe/attempt-1/action.json")
+    assert finance_preaudit_concurrency_probe.main(
+        [
+            "--capacity",
+            "6",
+            "--confirm-write",
+            "YES",
+            "--recover-action-file",
+            str(recovery),
+        ]
+    ) == 0
+    assert calls[-1] == (6, False, (recovery,))
     capsys.readouterr()
 
     assert finance_preaudit_concurrency_probe.main(
@@ -2212,7 +2802,7 @@ def test_production_cli_defaults_to_rolling_and_rejects_legacy_drain(
     ) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["error_code"] == "production_legacy_scheduler_removed"
-    assert calls == [(6, False)]
+    assert calls == [(6, False, ()), (6, False, (recovery,))]
 
 
 def test_dispatcher_assigns_each_open_action_once_with_rolling_capacity(
@@ -2367,7 +2957,7 @@ def test_dispatcher_reports_failed_executor_reaping(
     assert result.processes_reaped is False
 
 
-def test_dispatcher_times_out_stuck_preparation_before_review(
+def test_dispatcher_times_out_stuck_recovery_before_review(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -2394,6 +2984,8 @@ def test_dispatcher_times_out_stuck_preparation_before_review(
         1,
         1,
         project_root=tmp_path,
+        strict_global_fifo=True,
+        recovery_action_files=(tmp_path / "attempt-1" / "action.json",),
         review_worker=lambda task: reviews.append(task) or {"status": "reviewed"},
         complete_review=lambda action, _reviewed: completions.append(action)
         or {"status": "completed"},

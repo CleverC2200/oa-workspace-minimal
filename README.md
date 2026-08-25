@@ -135,6 +135,18 @@ python3 -m scripts.finance_preaudit_concurrency_probe \
   --confirm-write YES
 ```
 
+差旅历史 `material_collection_failed` 等已确认未写入的隔离项，只能把精确旧
+`action.json` 交给同一个滚动控制器恢复；参数可重复。恢复仍在容量为 1、300 秒
+硬超时且可回收的 prepare 进程中完成，只创建新 attempt，后续审核和提交继续经过
+同一 FIFO 与唯一 Writer：
+
+```bash
+python3 -m scripts.finance_preaudit_concurrency_probe \
+  --rolling --capacity 6 --confirm-write YES \
+  --recover-action-file /absolute/path/to/first/action.json \
+  --recover-action-file /absolute/path/to/second/action.json
+```
+
 提交结果按可恢复性拆分：`writer_submit_rejected`、`writer_preflight_failed` 和 `submission_target_changed` 是确认未写入；`writer_transport_unknown`、`writer_postcheck_timeout`、`writer_pending_conflict` 都保持 unknown 并触发止损。Writer 在 OA POST 前持久化带完整性证明的脱敏阶段边界；一旦进入 `submit_started` 而没有可信终态，同一 attempt 永不重放。已确认成功的边界可恢复本地回执，确认未写入也必须走下述新 attempt 恢复入口。
 
 ## 留存与清理

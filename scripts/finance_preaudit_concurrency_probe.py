@@ -298,9 +298,63 @@ def _historical_unknown_action_files(
     return frozenset(action_files)
 
 
+def _recovery_candidates(
+    action_files: Sequence[Path],
+    *,
+    assigned_identities: set[tuple[str, str]],
+) -> list[dict]:
+    flow_root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
+    candidates: list[dict] = []
+    seen_identities: set[tuple[str, str]] = set()
+    for raw_path in action_files:
+        action_path = Path(raw_path).expanduser()
+        resolved = action_path.resolve()
+        state_path = resolved.with_name("state.json")
+        if (
+            not action_path.is_absolute()
+            or action_path.is_symlink()
+            or action_path != resolved
+            or not resolved.is_relative_to(flow_root)
+            or not flow_engine._is_attempt_action_path(resolved, flow_root)
+            or state_path.is_symlink()
+        ):
+            raise ValueError("production_probe_recovery_invalid")
+        state = _read_object(state_path)
+        request_id = str(state.get("request_id") or "").strip()
+        received_at = str(state.get("received_at") or "").strip()
+        workflow_key = str(state.get("workflow_key") or "").strip()
+        identity = (request_id, received_at)
+        if identity in assigned_identities:
+            continue
+        if (
+            not request_id
+            or not received_at
+            or workflow_key not in ROLLING_WORKFLOW_KEYS
+            or state.get("action_file") != str(resolved)
+            or state.get("execution_state") != "needs_admin"
+            or state.get("write_state") != "not_requested"
+            or state.get("reason") not in QUARANTINED_REASONS
+            or identity in seen_identities
+        ):
+            raise ValueError("production_probe_recovery_invalid")
+        seen_identities.add(identity)
+        candidates.append(
+            {
+                "requestId": request_id,
+                "received_at": received_at,
+                "flow_key": workflow_key,
+                "support_status": "supported",
+                "can_submit": True,
+                "recovery_action_file": str(resolved),
+            }
+        )
+    return candidates
+
+
 def _prepare_one(selection: PrepareSelection) -> dict:
     assigned_identities: set[tuple[str, str]] = set()
     historical_unknown_identities: set[tuple[str, str]] = set()
+    recovery_action_files: tuple[Path, ...] = ()
     if isinstance(selection, str):
         workflow_key = selection
     elif isinstance(selection, dict) and selection.get("workflow_key") == "*":
@@ -310,9 +364,13 @@ def _prepare_one(selection: PrepareSelection) -> dict:
             "historical_unknown_identities",
             [],
         )
+        raw_recovery_actions = selection.get("recover_action_files", [])
         if not isinstance(raw_assigned, list) or not isinstance(
             raw_historical_unknown,
             list,
+        ) or not isinstance(raw_recovery_actions, list) or any(
+            not isinstance(path, str) or not path
+            for path in raw_recovery_actions
         ):
             return {
                 "action": "failed",
@@ -340,6 +398,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                     "error_code": "production_probe_prepare_failed",
                 }
             historical_unknown_identities.add((identity[0], identity[1]))
+        recovery_action_files = tuple(Path(path) for path in raw_recovery_actions)
     else:
         return {
             "action": "failed",
@@ -366,10 +425,11 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 "error_code": "production_probe_stopped",
             }
         selected: dict | None = None
+        recovery_action_file: Path | None = None
         selected_workflow = workflow_key
         if workflow_key == "*":
             try:
-                candidates = production_pending.actionable_fifo(
+                live_candidates = production_pending.actionable_fifo(
                     cli._live_pending_identities(),
                     excluded_identities=(
                         _local_quarantined_identities()
@@ -384,6 +444,24 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                     "action": "failed",
                     "error_code": "production_probe_prepare_failed",
                 }
+            try:
+                recovery_candidates = production_pending.actionable_fifo(
+                    _recovery_candidates(
+                        recovery_action_files,
+                        assigned_identities=assigned_identities,
+                    ),
+                    allowed_workflows=ROLLING_WORKFLOW_KEYS,
+                )
+            except (ValueError, OSError):
+                runtime_control.request_stop("production_probe_prepare_failed")
+                return {
+                    "action": "failed",
+                    "error_code": "production_probe_recovery_failed",
+                }
+            candidates = production_pending.actionable_fifo(
+                [*live_candidates, *recovery_candidates],
+                allowed_workflows=ROLLING_WORKFLOW_KEYS,
+            )
             if not candidates:
                 runtime_control.request_stop("production_probe_prepare_failed")
                 return {
@@ -392,7 +470,11 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 }
             selected = candidates[0]
             selected_workflow = str(selected.get("flow_key") or "")
+            if selected.get("recovery_action_file") is not None:
+                recovery_action_file = Path(selected["recovery_action_file"])
         if selected is None:
+            engine = cli._live_flow_engine(controlled=True)
+        elif recovery_action_file is not None:
             engine = cli._live_flow_engine(controlled=True)
         else:
             engine = cli._live_flow_engine(
@@ -415,17 +497,24 @@ def _prepare_one(selection: PrepareSelection) -> dict:
         )
         while True:
             try:
-                action = engine.next_action(
-                    selected_workflow,
-                    mode="controlled_write",
-                    skip_write_authorization_failures=(
-                        workflow_authorization_failures
-                    ),
-                    skip_unknown_failures=_historical_unknown_action_files(
-                        historical_unknown_identities,
-                        workflow_key=selected_workflow,
-                    ),
-                )
+                if recovery_action_file is not None:
+                    action = engine.recover_confirmed_no_write(
+                        recovery_action_file,
+                        mode="controlled_write",
+                        confirmed=True,
+                    )
+                else:
+                    action = engine.next_action(
+                        selected_workflow,
+                        mode="controlled_write",
+                        skip_write_authorization_failures=(
+                            workflow_authorization_failures
+                        ),
+                        skip_unknown_failures=_historical_unknown_action_files(
+                            historical_unknown_identities,
+                            workflow_key=selected_workflow,
+                        ),
+                    )
             except ValueError as error:
                 if str(error) == "completion_in_progress":
                     if runtime_control.stop_requested():
@@ -438,19 +527,33 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 runtime_control.request_stop("production_probe_prepare_failed")
                 return {
                     "action": "failed",
-                    "error_code": "production_probe_prepare_failed",
+                    "error_code": (
+                        "production_probe_recovery_failed"
+                        if recovery_action_file is not None
+                        else "production_probe_prepare_failed"
+                    ),
                 }
             except Exception:
                 runtime_control.request_stop("production_probe_prepare_failed")
                 return {
                     "action": "failed",
-                    "error_code": "production_probe_prepare_failed",
+                    "error_code": (
+                        "production_probe_recovery_failed"
+                        if recovery_action_file is not None
+                        else "production_probe_prepare_failed"
+                    ),
                 }
             break
         if runtime_control.stop_requested():
             return {
                 "action": "failed",
                 "error_code": "production_probe_stopped",
+            }
+        if recovery_action_file is not None and action.get("action") != "review_required":
+            runtime_control.request_stop("production_probe_prepare_failed")
+            return {
+                "action": "failed",
+                "error_code": "production_probe_recovery_failed",
             }
         if action.get("action") == "review_required":
             if selected is not None:
@@ -1112,14 +1215,21 @@ def _run_dispatched_tasks(
     adaptive: bool = False,
     max_capacity: int | None = None,
     historical_unknown_identities: frozenset[tuple[str, str]] = frozenset(),
+    recovery_action_files: Sequence[Path] = (),
 ) -> process_pool.PoolResult[dict]:
     maximum_capacity = capacity if max_capacity is None else max_capacity
+    recovery_queue = tuple(
+        Path(path).expanduser().resolve() for path in recovery_action_files
+    )
     if (
         not 1 <= capacity <= process_pool.MAX_PROCESS_POOL_CAPACITY
         or not capacity <= maximum_capacity <= process_pool.MAX_PROCESS_POOL_CAPACITY
         or task_timeout_sec <= 0
         or prepare_timeout_sec <= 0
         or heartbeat_interval_sec <= 0
+        or (recovery_queue and not strict_global_fifo)
+        or len(recovery_queue) > count
+        or len(set(recovery_queue)) != len(recovery_queue)
     ):
         raise ValueError("production_dispatcher_watchdog_invalid")
     if adaptive and (
@@ -1435,7 +1545,7 @@ def _run_dispatched_tasks(
             if identity is None:
                 raise ValueError("production_probe_state_invalid")
             identities.append(list(identity))
-        return {
+        selection: dict[str, object] = {
             "workflow_key": "*",
             "assigned_identities": identities,
             "historical_unknown_identities": [
@@ -1443,6 +1553,11 @@ def _run_dispatched_tasks(
                 for identity in sorted(historical_unknown_identities)
             ],
         }
+        if recovery_queue:
+            selection["recover_action_files"] = [
+                str(path) for path in recovery_queue
+            ]
+        return selection
 
     try:
         while (
@@ -2025,20 +2140,22 @@ def _run_global_dispatched_tasks(
     adaptive: bool = False,
     max_capacity: int | None = None,
     historical_unknown_identities: frozenset[tuple[str, str]] | None = None,
+    recovery_action_files: Sequence[Path] = (),
 ) -> process_pool.PoolResult[dict]:
     frozen_unknown = (
         _local_unknown_quarantined_identities()
         if historical_unknown_identities is None
         else historical_unknown_identities
     )
-    return _run_dispatched_tasks(
-        count,
-        capacity,
-        strict_global_fifo=True,
-        adaptive=adaptive,
-        max_capacity=max_capacity,
-        historical_unknown_identities=frozen_unknown,
-    )
+    dispatcher_args = {
+        "strict_global_fifo": True,
+        "adaptive": adaptive,
+        "max_capacity": max_capacity,
+        "historical_unknown_identities": frozen_unknown,
+    }
+    if recovery_action_files:
+        dispatcher_args["recovery_action_files"] = recovery_action_files
+    return _run_dispatched_tasks(count, capacity, **dispatcher_args)
 
 
 def _legacy_run_existing_batch(
@@ -2573,7 +2690,13 @@ def run_rolling_drain(
     pipeline_runner: PipelineRunner = _run_global_dispatched_tasks,
     reconcile_status: Callable[[], dict] = _production_reconciliation,
     max_waves: int = 10,
+    recovery_action_files: Sequence[Path] = (),
 ) -> dict:
+    recovery_queue = tuple(
+        Path(path).expanduser().resolve() for path in recovery_action_files
+    )
+    if recovery_queue and pipeline_runner is not _run_global_dispatched_tasks:
+        raise ValueError("production_rolling_recovery_runner_invalid")
     controller_handoff.assert_ready_for_start()
     try:
         with runtime_control.global_controller_lease():
@@ -2594,15 +2717,17 @@ def run_rolling_drain(
                     "prepare_timeout_seconds": 300,
                     "review_timeout_seconds": 960,
                     "writer_capacity": 1,
+                    "recovery_count": len(recovery_queue),
                 }
             )
             children_reaped = True
+            pending_recoveries = recovery_queue
 
             def tracked_pipeline_runner(
                 count: int,
                 review_capacity: int,
             ) -> process_pool.PoolResult[dict]:
-                nonlocal children_reaped
+                nonlocal children_reaped, pending_recoveries
                 children_reaped = False
                 if pipeline_runner is _run_global_dispatched_tasks:
                     wave_result = _run_global_dispatched_tasks(
@@ -2613,7 +2738,9 @@ def run_rolling_drain(
                         historical_unknown_identities=(
                             historical_unknown_identities
                         ),
+                        recovery_action_files=pending_recoveries,
                     )
+                    pending_recoveries = ()
                 else:
                     wave_result = pipeline_runner(count, review_capacity)
                 children_reaped = wave_result.processes_reaped is True
@@ -2628,6 +2755,7 @@ def run_rolling_drain(
                     pipeline_runner=tracked_pipeline_runner,
                     reconcile_status=reconcile_status,
                     max_waves=max_waves,
+                    recovery_count=len(recovery_queue),
                 )
                 if result["processes_reaped"] is not True:
                     children_reaped = False
@@ -2674,8 +2802,14 @@ def _run_rolling_drain_locked(
     pipeline_runner: PipelineRunner = _run_global_dispatched_tasks,
     reconcile_status: Callable[[], dict] = _production_reconciliation,
     max_waves: int = 10,
+    recovery_count: int = 0,
 ) -> dict:
-    if not 1 <= capacity <= 6:
+    if (
+        not 1 <= capacity <= 6
+        or not isinstance(recovery_count, int)
+        or isinstance(recovery_count, bool)
+        or recovery_count < 0
+    ):
         raise ValueError("production_rolling_capacity_invalid")
     if adaptive and (
         capacity not in concurrency_control.CAPACITY_STEPS
@@ -2695,7 +2829,7 @@ def _run_rolling_drain_locked(
             raise
         raise ValueError("production_rolling_reconciliation_invalid") from error
     pending = initial_pending
-    actionable = initial_actionable
+    actionable = initial_actionable + recovery_count
     waves: list[dict] = []
     cache_maintenance_waves: list[dict] = []
     status = "completed"
@@ -2982,10 +3116,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--samples", type=int, default=20)
     parser.add_argument("--drain", action="store_true")
     parser.add_argument("--rolling", action="store_true")
+    parser.add_argument(
+        "--recover-action-file",
+        action="append",
+        type=Path,
+        default=[],
+    )
     args = parser.parse_args(argv)
     try:
         if args.read_only:
-            if args.drain or args.rolling:
+            if args.drain or args.rolling or args.recover_action_file:
                 raise ValueError("read_only_probe_scheduler_invalid")
             payload = (
                 run_adaptive_read_only_probe(
@@ -3004,10 +3144,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.drain:
             raise ValueError("production_legacy_scheduler_removed")
         else:
-            payload = run_rolling_drain(
-                capacity=args.capacity,
-                adaptive=args.adaptive,
-            )
+            rolling_args = {
+                "capacity": args.capacity,
+                "adaptive": args.adaptive,
+            }
+            if args.recover_action_file:
+                rolling_args["recovery_action_files"] = tuple(
+                    args.recover_action_file
+                )
+            payload = run_rolling_drain(**rolling_args)
     except ValueError as error:
         payload = {
             "schema_version": 1,
