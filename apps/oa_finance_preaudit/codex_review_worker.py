@@ -17,6 +17,28 @@ from apps.oa_approval import runtime_control, writer_outcomes
 
 MODEL = "gpt-5.6-terra"
 REASONING_EFFORT = "high"
+_FINANCE_RULES = {
+    "travel_expense": (
+        "travel_expense:1",
+        "差旅费",
+        "references/flows/travel-expense.md",
+    ),
+    "business_entertainment": (
+        "business_entertainment:1",
+        "业务招待费",
+        "references/flows/business-entertainment.md",
+    ),
+    "business_support_fee": (
+        "business_support_fee:1",
+        "业务支持费",
+        "references/flows/business-support-fee.md",
+    ),
+    "small_marketing_fee": (
+        "small_marketing_fee:1",
+        "小额市场费",
+        "references/flows/small-marketing-fee.md",
+    ),
+}
 _EVENT_TYPES = frozenset(
     {
         "error",
@@ -93,17 +115,59 @@ def _page_routing_instruction(action_file: Path) -> str:
     )
 
 
+def _action_workflow(action_file: Path) -> str | None:
+    try:
+        action = json.loads(action_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    workflow_key = action.get("workflow_key") if isinstance(action, dict) else None
+    return str(workflow_key) if workflow_key in _FINANCE_RULES else None
+
+
+def _frozen_rule_version(action_file: Path, workflow_key: str) -> str | None:
+    packet_file = action_file.with_name("review-packet.json")
+    if packet_file.is_symlink() or not packet_file.is_file():
+        return None
+    try:
+        packet = json.loads(packet_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(packet, dict):
+        return None
+    rule_version = packet.get("rule_version")
+    if (
+        packet.get("workflow_key") != workflow_key
+        or not isinstance(rule_version, str)
+        or not rule_version.strip()
+    ):
+        return None
+    return rule_version
+
+
 def _prompt(action_file: Path) -> str:
-    fallback_routing = _page_routing_instruction(action_file)
-    return f"""你是差旅费生产预审的单据工作进程。用户当前明确授权本轮真实审批提交；这是受控生产工作进程，不是手工 preview。
+    workflow_key = _action_workflow(action_file) or "travel_expense"
+    _rule_version, workflow_name, rule_reference = _FINANCE_RULES[workflow_key]
+    fallback_routing = (
+        _page_routing_instruction(action_file)
+        if workflow_key == "travel_expense"
+        else ""
+    )
+    travel_requirement = (
+        "`page_routing` 只允许复用其中列出的页级精确重复；没有可信项关系时，"
+        "所有 `review_page_refs` 必须分别写入八个审核项各自的 `evidence_refs` "
+        "或 `missing_evidence`；其余页面必须完整覆盖；"
+        if workflow_key == "travel_expense"
+        else "只按该流程固定审核项判断，不得读取其他流程规则或证据；"
+    )
+    return f"""你是{workflow_name}生产预审的单据工作进程。用户当前明确授权本轮真实审批提交；这是受控生产工作进程，不是手工 preview。
 
 只处理这个已冻结动作：{action_file}
 {fallback_routing}
 
 要求：
-1. 完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由只读取差旅费规则、动作引用的审核包、材料和准备页；`page_routing` 只允许复用其中列出的页级精确重复；没有可信项关系时，所有 `review_page_refs` 必须分别写入八个审核项各自的 `evidence_refs` 或 `missing_evidence`；其余页面必须完整覆盖；不得读取其他 attempt。
+1. 完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由读取 `references/result-contract.md`、`references/observation-contract.md`、`{rule_reference}`、动作引用的审核包、材料和准备页；{travel_requirement}不得读取其他 attempt。
 2. 不修改任何文件、项目代码、Skill、配置、授权清单或冻结材料；不得调用 `next-action`、`complete-review` 或任何 OA 写入，不得领取其他单据。
-3. 根据八个固定审核项动态形成结构化决定。证据不足使用 `uncertain` 交财务判断，不得因为材料缺口卡住业务流程；身份、归属、冻结或授权不可信时停止。
+3. 根据审核包中的固定审核项动态形成结构化决定。证据不足使用 `uncertain` 交财务判断，不得因为材料缺口卡住业务流程；身份、归属、冻结或授权不可信时停止。
 4. 最终只输出符合 flow-engine-contract“结构化审核决定”的单个 JSON 对象，不添加 Markdown、解释、单号、人员、公司、附件原文、路径、意见正文、密钥或日志。宿主会校验并负责受控提交。
 """
 
@@ -154,7 +218,21 @@ def _codex_command(
     ]
 
 
-def _decision_schema() -> dict:
+def _decision_schema(action_file: Path | None = None) -> dict:
+    workflow_key = (
+        _action_workflow(action_file)
+        if action_file is not None
+        else "travel_expense"
+    )
+    if workflow_key is None:
+        workflow_key = "travel_expense"
+    rule_version = (
+        _FINANCE_RULES[workflow_key][0]
+        if action_file is None
+        else _frozen_rule_version(action_file, workflow_key)
+    )
+    if rule_version is None:
+        raise ValueError("codex_review_task_invalid")
     item_schema = {
         "type": "object",
         "additionalProperties": False,
@@ -195,8 +273,8 @@ def _decision_schema() -> dict:
             "schema_version": {"type": "integer", "const": 1},
             "kind": {"type": "string", "const": "preaudit_review_decision"},
             "action_token": {"type": "string", "minLength": 1},
-            "workflow_key": {"type": "string", "const": "travel_expense"},
-            "rule_version": {"type": "string", "minLength": 1},
+            "workflow_key": {"type": "string", "const": workflow_key},
+            "rule_version": {"type": "string", "const": rule_version},
             "overall": {"type": "string", "enum": ["pass", "needs_human"]},
             "items": {"type": "array", "items": item_schema},
         },
@@ -404,7 +482,7 @@ def _execute_codex(
         temporary_root = Path(temporary)
         schema_file = temporary_root / "decision-schema.json"
         decision_file = temporary_root / "decision.json"
-        json_artifact.write_json_atomic(schema_file, _decision_schema())
+        json_artifact.write_json_atomic(schema_file, _decision_schema(action_file))
         command = _codex_command(project_root, schema_file, decision_file)
         process: subprocess.Popen | None = None
         previous_sigterm: object | None = None
@@ -614,7 +692,7 @@ def _write_agent_timing(
         not isinstance(action_token, str)
         or not action_token
         or action.get("action") != "review_required"
-        or action.get("workflow_key") != "travel_expense"
+        or action.get("workflow_key") not in _FINANCE_RULES
     ):
         return False
     usage = dict(token_usage) if isinstance(token_usage, dict) else _unknown_usage()
@@ -625,7 +703,7 @@ def _write_agent_timing(
                 "schema_version": 1,
                 "kind": "preaudit_agent_timing",
                 "action_token": action_token,
-                "workflow_key": "travel_expense",
+                "workflow_key": action["workflow_key"],
                 "model": MODEL,
                 "reasoning_effort": REASONING_EFFORT,
                 "wall_seconds": max(0, int(wall_seconds)),
@@ -677,6 +755,12 @@ def _validated_task(task: dict) -> tuple[Path, Path, int]:
         or not isinstance(timeout_seconds, int)
         or isinstance(timeout_seconds, bool)
         or not 60 <= timeout_seconds <= 3600
+        or _action_workflow(action_file) is None
+        or _frozen_rule_version(
+            action_file,
+            _action_workflow(action_file) or "",
+        )
+        is None
     ):
         raise ValueError("codex_review_task_invalid")
     return project_root, action_file, timeout_seconds
@@ -715,13 +799,17 @@ def _safe_to_retry(action_file: Path) -> bool:
         "execution_state": "review_required",
         "business_state": "not_available",
         "write_state": "authorized",
-        "workflow_key": "travel_expense",
         "mode": "controlled_write",
         "write_authorized": True,
     }
     if any(action.get(key) != value for key, value in required.items()):
         return False
     if any(state.get(key) != value for key, value in required.items()):
+        return False
+    if (
+        action.get("workflow_key") not in _FINANCE_RULES
+        or state.get("workflow_key") != action.get("workflow_key")
+    ):
         return False
     if action.get("receipt_file") or state.get("receipt_file"):
         return False

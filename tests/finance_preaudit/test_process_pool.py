@@ -66,6 +66,13 @@ def _codex_task(tmp_path: Path) -> tuple[dict, Path]:
             "action_token": "test-action-token",
         },
     )
+    json_artifact.write_json_atomic(
+        action_file.with_name("review-packet.json"),
+        {
+            "workflow_key": "travel_expense",
+            "rule_version": "travel_expense:1",
+        },
+    )
     return {
         "project_root": str(project_root),
         "action_file": str(action_file),

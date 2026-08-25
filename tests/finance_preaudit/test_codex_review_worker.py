@@ -14,13 +14,17 @@ from apps.oa_finance_preaudit import codex_review_worker
 from apps.oa_approval import runtime_control
 
 
-def _task(tmp_path: Path) -> tuple[dict, Path]:
+def _task(
+    tmp_path: Path,
+    *,
+    workflow_key: str = "travel_expense",
+) -> tuple[dict, Path]:
     project_root = tmp_path / "project"
     attempt_root = (
         project_root
         / "runtime"
         / "finance_preaudit_flows"
-        / "travel_expense"
+        / workflow_key
         / "cases"
         / ("a" * 64)
         / "attempt-1"
@@ -36,7 +40,7 @@ def _task(tmp_path: Path) -> tuple[dict, Path]:
             "execution_state": "review_required",
             "business_state": "not_available",
             "write_state": "authorized",
-            "workflow_key": "travel_expense",
+            "workflow_key": workflow_key,
             "mode": "controlled_write",
             "write_authorized": True,
             "action_token": "test-action-token",
@@ -46,11 +50,87 @@ def _task(tmp_path: Path) -> tuple[dict, Path]:
         action_file.with_name("state.json"),
         json.loads(action_file.read_text(encoding="utf-8")),
     )
+    json_artifact.write_json_atomic(
+        action_file.with_name("review-packet.json"),
+        {
+            "workflow_key": workflow_key,
+            "rule_version": f"{workflow_key}:1",
+        },
+    )
     return {
         "project_root": str(project_root),
         "action_file": str(action_file),
         "timeout_seconds": 900,
     }, action_file
+
+
+def test_non_travel_schema_and_timing_follow_bound_action(tmp_path: Path) -> None:
+    _task_payload, action_file = _task(
+        tmp_path,
+        workflow_key="business_entertainment",
+    )
+
+    schema = codex_review_worker._decision_schema(action_file)
+
+    assert schema["properties"]["workflow_key"] == {
+        "type": "string",
+        "const": "business_entertainment",
+    }
+    assert schema["properties"]["rule_version"] == {
+        "type": "string",
+        "const": "business_entertainment:1",
+    }
+    assert codex_review_worker._write_agent_timing(
+        action_file,
+        wall_seconds=12.9,
+        attempts=1,
+        token_usage={"status": "unknown"},
+    )
+    timing = json.loads(
+        action_file.with_name("agent-timing.json").read_text(encoding="utf-8")
+    )
+    assert timing["workflow_key"] == "business_entertainment"
+    prompt = codex_review_worker._prompt(action_file)
+    assert "业务招待费生产预审" in prompt
+    assert "business-entertainment.md" in prompt
+    assert "page_routing" not in prompt
+
+
+def test_schema_uses_frozen_packet_rule_version(tmp_path: Path) -> None:
+    _task_payload, action_file = _task(
+        tmp_path,
+        workflow_key="business_entertainment",
+    )
+    packet_file = action_file.with_name("review-packet.json")
+    packet = json.loads(packet_file.read_text(encoding="utf-8"))
+    json_artifact.write_json_atomic(
+        packet_file,
+        {**packet, "rule_version": "business_entertainment:2"},
+    )
+
+    schema = codex_review_worker._decision_schema(action_file)
+
+    assert schema["properties"]["rule_version"] == {
+        "type": "string",
+        "const": "business_entertainment:2",
+    }
+
+
+def test_worker_rejects_non_object_frozen_packet(tmp_path: Path) -> None:
+    task, action_file = _task(tmp_path)
+    json_artifact.write_json_atomic(
+        action_file.with_name("review-packet.json"),
+        ["not-an-object"],
+    )
+
+    result = codex_review_worker.review(
+        task,
+        executor=lambda *_args: pytest.fail("executor must not start"),
+    )
+
+    assert result["status"] == "failed"
+    assert result["write_state"] == "not_requested"
+    assert result["error_code"] == "codex_review_task_invalid"
 
 
 def test_worker_returns_sanitized_success_only_after_bound_receipt(
