@@ -2875,6 +2875,334 @@ def test_dispatcher_lets_parent_writer_finish_before_stopping_failed_sibling(
     assert result.outcomes[1].value["error_code"] == "codex_process_incomplete"
 
 
+def test_dispatcher_refills_reviews_while_single_writer_is_slow(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    action_files = [
+        _open_action(
+            flow_root,
+            case_key=f"stream-{index}",
+            created_at=f"2026-08-25T02:00:0{index}+00:00",
+        )
+        for index in range(3)
+    ]
+    writer_started = threading.Event()
+    third_review_started = threading.Event()
+    writer_saw_refill: list[bool] = []
+
+    def review(task: dict) -> dict:
+        action_file = Path(task["action_file"])
+        if action_file == action_files[1]:
+            assert writer_started.wait(timeout=1)
+        if action_file == action_files[2]:
+            third_review_started.set()
+        return {
+            "status": "reviewed",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "process_attempts": 1,
+            "process_retries": 0,
+            "token_usage": {"status": "unknown"},
+            "agent_wall_seconds": 1,
+            "decision": {"overall": "needs_human"},
+        }
+
+    def complete(_action: Path, reviewed: dict) -> dict:
+        if not writer_started.is_set():
+            writer_started.set()
+            writer_saw_refill.append(third_review_started.wait(timeout=0.2))
+        return {
+            **reviewed,
+            "status": "completed",
+            "business_state": "needs_human",
+            "write_state": "submitted",
+            "error_code": None,
+        }
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        3,
+        2,
+        project_root=tmp_path,
+        renew_actions=lambda paths: paths,
+        review_worker=review,
+        complete_review=complete,
+        executor_factory=lambda capacity: ThreadPoolExecutor(
+            max_workers=capacity
+        ),
+        heartbeat_interval_sec=0.005,
+        runtime_status=lambda: {"status": "healthy"},
+    )
+
+    assert writer_saw_refill == [True]
+    assert result.completed == 3
+    assert result.failed == 0
+
+
+def test_dispatcher_single_writer_is_fifo_and_never_concurrent(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    action_files = [
+        _open_action(
+            flow_root,
+            case_key=f"fifo-{index}",
+            created_at=f"2026-08-25T02:01:0{index}+00:00",
+        )
+        for index in range(3)
+    ]
+    release_reviews = threading.Barrier(3)
+    writer_active = 0
+    writer_peak = 0
+    writer_order: list[Path] = []
+    guard = threading.Lock()
+    real_wait = finance_preaudit_concurrency_probe.wait
+    coalesced = False
+
+    def coalesce_simultaneous(futures, **kwargs):
+        nonlocal coalesced
+        current = tuple(futures)
+        if not coalesced and len(current) == 3:
+            coalesced = True
+            deadline = time.monotonic() + 1
+            while not all(future.done() for future in current):
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+            return set(current), set()
+        return real_wait(current, **kwargs)
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "wait",
+        coalesce_simultaneous,
+    )
+
+    def review(_task: dict) -> dict:
+        release_reviews.wait(timeout=1)
+        return {
+            "status": "reviewed",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "process_attempts": 1,
+            "process_retries": 0,
+            "token_usage": {"status": "unknown"},
+            "agent_wall_seconds": 1,
+            "decision": {"overall": "needs_human"},
+        }
+
+    def complete(action: Path, reviewed: dict) -> dict:
+        nonlocal writer_active, writer_peak
+        with guard:
+            writer_active += 1
+            writer_peak = max(writer_peak, writer_active)
+            writer_order.append(action)
+        time.sleep(0.01)
+        with guard:
+            writer_active -= 1
+        return {
+            **reviewed,
+            "status": "completed",
+            "business_state": "needs_human",
+            "write_state": "submitted",
+            "error_code": None,
+        }
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        3,
+        3,
+        project_root=tmp_path,
+        renew_actions=lambda paths: paths,
+        review_worker=review,
+        complete_review=complete,
+        executor_factory=lambda capacity: ThreadPoolExecutor(
+            max_workers=capacity
+        ),
+        runtime_status=lambda: {"status": "healthy"},
+    )
+
+    assert result.completed == 3
+    assert writer_peak == 1
+    assert writer_order == action_files
+
+
+def test_dispatcher_backpressures_claims_but_keeps_harvesting_and_heartbeat(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    for index in range(7):
+        _open_action(
+            flow_root,
+            case_key=f"backpressure-{index}",
+            created_at=f"2026-08-25T02:02:0{index}+00:00",
+        )
+    writer_started = threading.Event()
+    release_writer = threading.Event()
+    five_reviews_started = threading.Event()
+    review_calls: list[bool] = []
+    heartbeat_calls: list[int] = []
+    checkpoint: list[int] = []
+    guard = threading.Lock()
+
+    def review(_task: dict) -> dict:
+        with guard:
+            review_calls.append(True)
+            if len(review_calls) == 5:
+                five_reviews_started.set()
+        return {
+            "status": "reviewed",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "process_attempts": 1,
+            "process_retries": 0,
+            "token_usage": {"status": "unknown"},
+            "agent_wall_seconds": 1,
+            "decision": {"overall": "needs_human"},
+        }
+
+    def complete(_action: Path, reviewed: dict) -> dict:
+        if not writer_started.is_set():
+            writer_started.set()
+            assert release_writer.wait(timeout=1)
+        return {
+            **reviewed,
+            "status": "completed",
+            "business_state": "needs_human",
+            "write_state": "submitted",
+            "error_code": None,
+        }
+
+    def check_backpressure() -> None:
+        assert writer_started.wait(timeout=1)
+        assert five_reviews_started.wait(timeout=1)
+        time.sleep(0.05)
+        with guard:
+            checkpoint.append(len(review_calls))
+        release_writer.set()
+
+    checker = threading.Thread(target=check_backpressure)
+    checker.start()
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        7,
+        2,
+        project_root=tmp_path,
+        renew_actions=lambda paths: paths,
+        review_worker=review,
+        complete_review=complete,
+        executor_factory=lambda capacity: ThreadPoolExecutor(
+            max_workers=capacity
+        ),
+        heartbeat_interval_sec=0.005,
+        runtime_status=lambda: heartbeat_calls.append(len(review_calls))
+        or {"status": "healthy"},
+    )
+    checker.join(timeout=1)
+
+    assert checkpoint == [5]
+    assert heartbeat_calls
+    assert result.completed == 7
+    assert max(
+        sample["max_write_queue_depth"] for sample in result.runtime_samples
+    ) <= 4
+    pipeline = finance_preaudit_concurrency_probe._rolling_wave_metrics(result)[
+        "pipeline"
+    ]
+    assert pipeline["review_done_to_write_start_seconds"]["samples"] == 7
+    assert pipeline["writer"]["max_concurrency"] == 1
+    assert 0 < pipeline["writer"]["busy_ratio"] <= 1
+    assert pipeline["review_slots"]["samples"] == len(
+        result.runtime_samples
+    )
+    assert pipeline["write_queue"] == {
+        "capacity": 4,
+        "max_depth": 4,
+    }
+
+
+def test_dispatcher_unknown_writer_stops_queue_without_second_write(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stop = threading.Event()
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        stop.is_set,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        stop.set,
+    )
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    for index in range(3):
+        _open_action(
+            flow_root,
+            case_key=f"writer-unknown-{index}",
+            created_at=f"2026-08-25T02:03:0{index}+00:00",
+        )
+    writes: list[Path] = []
+
+    def review(_task: dict) -> dict:
+        return {
+            "status": "reviewed",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "process_attempts": 1,
+            "process_retries": 0,
+            "token_usage": {"status": "unknown"},
+            "agent_wall_seconds": 1,
+            "decision": {"overall": "needs_human"},
+        }
+
+    def complete(action: Path, _reviewed: dict) -> dict:
+        writes.append(action)
+        return {
+            "status": "failed",
+            "business_state": "not_available",
+            "write_state": "unknown",
+            "error_code": "writer_result_unknown",
+        }
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        3,
+        2,
+        project_root=tmp_path,
+        renew_actions=lambda paths: paths,
+        review_worker=review,
+        complete_review=complete,
+        executor_factory=lambda capacity: ThreadPoolExecutor(
+            max_workers=capacity
+        ),
+        runtime_status=lambda: {"status": "healthy"},
+    )
+
+    assert stop.is_set()
+    assert len(writes) == 1
+    assert any(
+        outcome.value
+        and outcome.value.get("write_state") == "unknown"
+        for outcome in result.outcomes
+    )
+
+
 def test_probe_counts_returned_worker_failure_as_batch_failure(
     tmp_path: Path,
     monkeypatch,

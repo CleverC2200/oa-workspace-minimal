@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
-from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
+from collections import Counter, deque
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    wait,
+)
 import json
 import multiprocessing
 import os
@@ -834,6 +840,10 @@ def _run_dispatched_tasks(
     outcomes: list[process_pool.TaskOutcome[dict] | None] = [None] * count
     assigned: set[Path] = set()
     futures: dict[object, tuple[int, float, float, Path]] = {}
+    write_ready: deque[tuple[int, float, Path, dict, float, int]] = deque()
+    writer: (
+        tuple[Future[dict], int, float, Path, dict, float, float, int] | None
+    ) = None
     review_histories: dict[int, list[dict]] = {}
     decision_retries: set[int] = set()
     next_index = 0
@@ -848,17 +858,51 @@ def _run_dispatched_tasks(
     preparation_stop_deadline: float | None = None
     preparation_deferred = False
     unblocked_duplicate_retries = 0
+    write_queue_capacity = max(2, capacity * 2)
+    max_write_queue_depth = 0
     prepare_action = prepare_action or _prepare_one
     prepare_executor = _preparation_executor()
     prepare_executor_terminated = False
     executor = executor_factory(capacity)
+    writer_executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="oa-global-writer",
+    )
+
+    def stopped_review(
+        index: int,
+        prepare_elapsed: float,
+        value: dict | None,
+    ) -> None:
+        outcomes[index] = process_pool.TaskOutcome(
+            index=index,
+            status="stopped",
+            value=(
+                {
+                    **value,
+                    "status": "stopped",
+                    "error_code": "stop_requested",
+                    "prepare_elapsed_seconds": prepare_elapsed,
+                }
+                if isinstance(value, dict)
+                else None
+            ),
+            error_code="stop_requested",
+        )
 
     def harvest_stopped_reviews(completed_futures: set[object]) -> None:
-        for future in completed_futures:
-            assignment = futures.pop(future, None)
-            if assignment is None:
-                continue
-            index, prepare_elapsed, _task_started, _action_file = assignment
+        assignments = sorted(
+            (
+                futures[future][0],
+                future,
+            )
+            for future in completed_futures
+            if future in futures
+        )
+        for _index, future in assignments:
+            index, prepare_elapsed, _task_started, _action_file = futures.pop(
+                future
+            )
             try:
                 value = future.result()
             except Exception:
@@ -870,17 +914,7 @@ def _run_dispatched_tasks(
                 )
                 continue
             if value.get("status") == "reviewed":
-                outcomes[index] = process_pool.TaskOutcome(
-                    index=index,
-                    status="stopped",
-                    value={
-                        **value,
-                        "status": "stopped",
-                        "error_code": "stop_requested",
-                        "prepare_elapsed_seconds": prepare_elapsed,
-                    },
-                    error_code="stop_requested",
-                )
+                stopped_review(index, prepare_elapsed, value)
             else:
                 outcomes[index] = process_pool.TaskOutcome(
                     index=index,
@@ -893,32 +927,137 @@ def _run_dispatched_tasks(
 
     def stop_reviews() -> None:
         nonlocal force_terminated
+        if force_terminated:
+            return
         harvest_stopped_reviews(
             {future for future in futures if future.done()}
         )
         for _future, (
             index,
-            _prepare_elapsed,
+            prepare_elapsed,
             _task_started,
             _action_file,
         ) in futures.items():
-            outcomes[index] = process_pool.TaskOutcome(
-                index=index,
-                status="stopped",
-                value=None,
-                error_code="stop_requested",
-            )
+            stopped_review(index, prepare_elapsed, None)
         futures.clear()
         _terminate_executor(executor)
         force_terminated = True
 
+    def stop_write_queue() -> None:
+        while write_ready:
+            index, prepare_elapsed, _action, reviewed, _ready_at, _depth = (
+                write_ready.popleft()
+            )
+            stopped_review(index, prepare_elapsed, reviewed)
+
+    def request_pipeline_stop() -> None:
+        nonlocal halted
+        halted = True
+        runtime_control.request_stop()
+        stop_reviews()
+        stop_write_queue()
+
+    def submit_review(
+        index: int,
+        prepare_elapsed: float,
+        action_file: Path,
+        *,
+        first_attempt: bool,
+    ) -> None:
+        nonlocal started, peak_active
+        future = executor.submit(
+            review_worker,
+            {
+                "project_root": str(root),
+                "action_file": str(action_file),
+                "timeout_seconds": 900,
+            },
+        )
+        futures[future] = (
+            index,
+            prepare_elapsed,
+            time.monotonic(),
+            action_file,
+        )
+        if first_attempt:
+            started += 1
+        peak_active = max(peak_active, len(futures))
+
     try:
-        while futures or preparation is not None or (
-            next_index < count and not halted
+        while (
+            futures
+            or preparation is not None
+            or writer is not None
+            or write_ready
+            or (next_index < count and not halted)
         ):
-            if runtime_control.stop_requested():
+            if runtime_control.stop_requested() and not halted:
                 halted = True
+                stop_reviews()
+                stop_write_queue()
+
             now = time.monotonic()
+            if writer is not None and writer[0].done():
+                (
+                    writer_future,
+                    index,
+                    prepare_elapsed,
+                    action_file,
+                    submitted_review,
+                    review_ready_at,
+                    writer_started_at,
+                    enqueue_depth,
+                ) = writer
+                writer = None
+                preparation_deferred = False
+                try:
+                    completed = writer_future.result()
+                except Exception:
+                    completed = {
+                        "status": "failed",
+                        "business_state": "not_available",
+                        "write_state": "unknown",
+                        "error_code": "writer_result_unknown",
+                    }
+                value = {
+                    **completed,
+                    "prepare_elapsed_seconds": prepare_elapsed,
+                    "review_done_to_write_start_seconds": round(
+                        max(0.0, writer_started_at - review_ready_at),
+                        6,
+                    ),
+                    "writer_seconds": round(
+                        max(0.0, time.monotonic() - writer_started_at),
+                        6,
+                    ),
+                    "write_queue_depth_at_enqueue": enqueue_depth,
+                }
+                if (
+                    value.get("status") == "retry_required"
+                    and value.get("error_code") == "codex_decision_invalid"
+                    and index not in decision_retries
+                    and not halted
+                ):
+                    decision_retries.add(index)
+                    review_histories[index] = [submitted_review]
+                    submit_review(
+                        index,
+                        prepare_elapsed,
+                        action_file,
+                        first_attempt=False,
+                    )
+                else:
+                    if value.get("status") == "retry_required":
+                        value = {**value, "status": "failed"}
+                    outcomes[index] = process_pool.TaskOutcome(
+                        index=index,
+                        status="completed",
+                        value=value,
+                    )
+                    review_histories.pop(index, None)
+                    if value.get("status") != "completed":
+                        request_pipeline_stop()
+
             review_ages = {
                 index: max(0.0, now - task_started)
                 for (
@@ -932,10 +1071,7 @@ def _run_dispatched_tasks(
             prepare_age = 0.0
             if preparation is not None:
                 _prepare_future, prepare_index, prepare_started_at = preparation
-                prepare_age = max(
-                    0.0,
-                    now - prepare_started_at,
-                )
+                prepare_age = max(0.0, now - prepare_started_at)
                 active_ages[prepare_index] = prepare_age
             max_task_elapsed_seconds = max(
                 max_task_elapsed_seconds,
@@ -974,8 +1110,9 @@ def _run_dispatched_tasks(
                             else "worker_cancelled_after_timeout"
                         ),
                     )
+                futures.clear()
                 if preparation is not None:
-                    _prepare_future, prepare_index, _prepare_started_at = preparation
+                    _prepare_future, prepare_index, _started_at = preparation
                     outcomes[prepare_index] = process_pool.TaskOutcome(
                         index=prepare_index,
                         status="timed_out",
@@ -992,12 +1129,14 @@ def _run_dispatched_tasks(
                     )
                     prepare_executor_terminated = True
                     preparation = None
-                futures.clear()
                 halted = True
                 runtime_control.request_stop()
-                _terminate_executor(executor)
-                force_terminated = True
-                break
+                stop_write_queue()
+                if not force_terminated:
+                    _terminate_executor(executor)
+                    force_terminated = True
+                continue
+
             if now >= next_heartbeat:
                 try:
                     host = runtime_status()
@@ -1009,19 +1148,25 @@ def _run_dispatched_tasks(
                         "pending_tasks": max(0, count - next_index),
                         "active_workers": len(futures)
                         + int(preparation is not None),
+                        "active_reviews": len(futures),
+                        "writer_active": writer is not None,
+                        "write_queue_depth": len(write_ready),
+                        "write_queue_capacity": write_queue_capacity,
+                        "max_write_queue_depth": max_write_queue_depth,
                         "completed_tasks": sum(
                             outcome is not None for outcome in outcomes
                         ),
                         "oldest_task_seconds": round(
-                            max(active_ages.values(), default=0.0), 3
+                            max(active_ages.values(), default=0.0),
+                            3,
                         ),
                         "host": host,
                     }
                 )
                 next_heartbeat = now + heartbeat_interval_sec
-                if host.get("status") == "critical":
-                    halted = True
-                    runtime_control.request_stop()
+                if host.get("status") == "critical" and not halted:
+                    request_pipeline_stop()
+
             if (
                 halted
                 and preparation is not None
@@ -1032,178 +1177,37 @@ def _run_dispatched_tasks(
                         5.0,
                         prepare_timeout_sec,
                     )
-                wait(
-                    (preparation[0],),
-                    timeout=min(
-                        0.25,
-                        heartbeat_interval_sec,
-                        max(
-                            0.0,
-                            preparation_stop_deadline - time.monotonic(),
-                        ),
-                    ),
-                    return_when=FIRST_COMPLETED,
-                )
-            if (
-                halted
-                and preparation is not None
-                and not preparation[0].done()
-                and preparation_stop_deadline is not None
-                and time.monotonic() >= preparation_stop_deadline
-            ):
-                _prepare_future, prepare_index, _prepare_started_at = preparation
-                outcomes[prepare_index] = process_pool.TaskOutcome(
-                    index=prepare_index,
-                    status="stopped",
-                    value=None,
-                    error_code="stop_requested",
-                )
-                _terminate_executor(
-                    prepare_executor,
-                    owned_process_groups=True,
-                )
-                prepare_executor_terminated = True
-                preparation = None
-                preparation_stop_deadline = None
-            if preparation is not None:
-                prepare_future, index, prepare_started_at = preparation
-                if prepare_future.done():
-                    prepare_elapsed = time.monotonic() - prepare_started_at
-                    try:
-                        prepared = prepare_future.result()
-                    except Exception:
-                        prepared = {
-                            "action": "failed",
-                            "error_code": "production_probe_prepare_failed",
-                        }
+                if time.monotonic() >= preparation_stop_deadline:
+                    _future, prepare_index, _started_at = preparation
+                    outcomes[prepare_index] = process_pool.TaskOutcome(
+                        index=prepare_index,
+                        status="stopped",
+                        value=None,
+                        error_code="stop_requested",
+                    )
+                    _terminate_executor(
+                        prepare_executor,
+                        owned_process_groups=True,
+                    )
+                    prepare_executor_terminated = True
                     preparation = None
                     preparation_stop_deadline = None
-                    if prepared.get("action") != "review_required":
-                        outcomes[index] = process_pool.TaskOutcome(
-                            index=index,
-                            status="completed",
-                            value={
-                                "status": "failed",
-                                "business_state": "not_available",
-                                "error_code": str(
-                                    prepared.get("error_code")
-                                    or "production_probe_prepare_failed"
-                                ),
-                                "prepare_elapsed_seconds": prepare_elapsed,
-                                "process_attempts": 0,
-                                "process_retries": 0,
-                                "token_usage": {"status": "unknown"},
-                            },
-                        )
-                        halted = True
-                        runtime_control.request_stop()
-                        _terminate_executor(
-                            prepare_executor,
-                            owned_process_groups=True,
-                        )
-                        prepare_executor_terminated = True
-                        stop_reviews()
-                        break
-                    else:
-                        action_file = Path(str(prepared["action_file"])).resolve()
-                        if action_file in assigned:
-                            next_index -= 1
-                            if futures:
-                                preparation_deferred = True
-                            else:
-                                unblocked_duplicate_retries += 1
-                                if unblocked_duplicate_retries > 1:
-                                    outcomes[index] = process_pool.TaskOutcome(
-                                        index=index,
-                                        status="completed",
-                                        value={
-                                            "status": "failed",
-                                            "business_state": "not_available",
-                                            "error_code": (
-                                                "production_probe_duplicate_action"
-                                            ),
-                                            "prepare_elapsed_seconds": (
-                                                prepare_elapsed
-                                            ),
-                                            "process_attempts": 0,
-                                            "process_retries": 0,
-                                            "token_usage": {
-                                                "status": "unknown"
-                                            },
-                                        },
-                                    )
-                                    halted = True
-                                    runtime_control.request_stop()
-                                    stop_reviews()
-                                    break
-                        elif runtime_control.stop_requested():
-                            outcomes[index] = process_pool.TaskOutcome(
-                                index=index,
-                                status="stopped",
-                                value=None,
-                                error_code="stop_requested",
-                            )
-                            halted = True
-                            runtime_control.request_stop()
-                        else:
-                            unblocked_duplicate_retries = 0
-                            assigned.add(action_file)
-                            task = {
-                                "project_root": str(root),
-                                "action_file": str(action_file),
-                                "timeout_seconds": 900,
-                            }
-                            future = executor.submit(review_worker, task)
-                            futures[future] = (
-                                index,
-                                prepare_elapsed,
-                                time.monotonic(),
-                                action_file,
-                            )
-                            started += 1
-                            peak_active = max(peak_active, len(futures))
-            while (
-                not halted
-                and preparation is None
-                and next_index < count
-                and len(futures) < capacity
-                and not preparation_deferred
-            ):
-                prepare_started = time.monotonic()
-                available = [
-                    path
-                    for path in _open_action_files(root)
-                    if path not in assigned
-                ]
-                if available:
-                    renewed = renew_actions([available[0]])
-                    prepared = (
-                        {
-                            "action": "review_required",
-                            "action_file": str(renewed[0]),
-                        }
-                        if renewed == [available[0]]
-                        else {
-                            "action": "failed",
-                            "error_code": "production_probe_renew_failed",
-                        }
-                    )
-                else:
-                    preparation = (
-                        prepare_executor.submit(
-                            prepare_action,
-                            "travel_expense",
-                        ),
-                        next_index,
-                        time.monotonic(),
-                    )
-                    preparation_stop_deadline = None
-                    next_index += 1
-                    break
-                prepare_elapsed = time.monotonic() - prepare_started
+
+            if preparation is not None and preparation[0].done():
+                prepare_future, index, prepare_started_at = preparation
+                prepare_elapsed = time.monotonic() - prepare_started_at
+                try:
+                    prepared = prepare_future.result()
+                except Exception:
+                    prepared = {
+                        "action": "failed",
+                        "error_code": "production_probe_prepare_failed",
+                    }
+                preparation = None
+                preparation_stop_deadline = None
                 if prepared.get("action") != "review_required":
-                    outcomes[next_index] = process_pool.TaskOutcome(
-                        index=next_index,
+                    outcomes[index] = process_pool.TaskOutcome(
+                        index=index,
                         status="completed",
                         value={
                             "status": "failed",
@@ -1218,58 +1222,58 @@ def _run_dispatched_tasks(
                             "token_usage": {"status": "unknown"},
                         },
                     )
-                    next_index += 1
-                    halted = True
-                    runtime_control.request_stop()
-                    stop_reviews()
-                    break
-                action_file = Path(str(prepared["action_file"])).resolve()
-                if action_file in assigned or runtime_control.stop_requested():
-                    halted = True
-                    break
-                assigned.add(action_file)
-                task = {
-                    "project_root": str(root),
-                    "action_file": str(action_file),
-                    "timeout_seconds": 900,
-                }
-                future = executor.submit(review_worker, task)
-                futures[future] = (
-                    next_index,
-                    prepare_elapsed,
-                    time.monotonic(),
-                    action_file,
-                )
-                next_index += 1
-                started += 1
-                peak_active = max(peak_active, len(futures))
-
-            if not futures:
-                if preparation is not None:
-                    time.sleep(
-                        min(
-                            0.25,
-                            heartbeat_interval_sec,
-                            prepare_timeout_sec / 4,
+                    request_pipeline_stop()
+                    if not prepare_executor_terminated:
+                        _terminate_executor(
+                            prepare_executor,
+                            owned_process_groups=True,
                         )
-                    )
-                    continue
-                break
-            done, _pending = wait(
-                tuple(futures),
-                timeout=min(1.0, heartbeat_interval_sec, task_timeout_sec / 4),
-                return_when=FIRST_COMPLETED,
-            )
-            if done:
-                preparation_deferred = False
-            if runtime_control.stop_requested() and preparation is not None:
-                halted = True
-                harvest_stopped_reviews(done)
-                continue
-            failed_now = False
+                        prepare_executor_terminated = True
+                else:
+                    action_file = Path(str(prepared["action_file"])).resolve()
+                    if action_file in assigned:
+                        next_index -= 1
+                        if futures or write_ready or writer is not None:
+                            preparation_deferred = True
+                        else:
+                            unblocked_duplicate_retries += 1
+                            if unblocked_duplicate_retries > 1:
+                                outcomes[index] = process_pool.TaskOutcome(
+                                    index=index,
+                                    status="completed",
+                                    value={
+                                        "status": "failed",
+                                        "business_state": "not_available",
+                                        "error_code": (
+                                            "production_probe_duplicate_action"
+                                        ),
+                                        "prepare_elapsed_seconds": prepare_elapsed,
+                                        "process_attempts": 0,
+                                        "process_retries": 0,
+                                        "token_usage": {"status": "unknown"},
+                                    },
+                                )
+                                request_pipeline_stop()
+                    elif halted or runtime_control.stop_requested():
+                        stopped_review(index, prepare_elapsed, None)
+                        halted = True
+                    else:
+                        unblocked_duplicate_retries = 0
+                        assigned.add(action_file)
+                        submit_review(
+                            index,
+                            prepare_elapsed,
+                            action_file,
+                            first_attempt=True,
+                        )
+
+            done = {future for future in futures if future.done()}
             reviewed_now: list[tuple[int, float, Path, dict]] = []
-            for future in done:
-                index, prepare_elapsed, _task_started, action_file = futures.pop(future)
+            failed_now = False
+            for future in sorted(done, key=lambda item: futures[item][0]):
+                index, prepare_elapsed, _started_at, action_file = futures.pop(
+                    future
+                )
                 try:
                     value = future.result()
                 except Exception:
@@ -1279,7 +1283,6 @@ def _run_dispatched_tasks(
                         value=None,
                         error_code="worker_process_failed",
                     )
-                    halted = True
                     failed_now = True
                     continue
                 if value.get("status") != "reviewed":
@@ -1291,61 +1294,153 @@ def _run_dispatched_tasks(
                             "prepare_elapsed_seconds": prepare_elapsed,
                         },
                     )
-                    halted = True
                     failed_now = True
                     continue
-                reviewed_now.append((index, prepare_elapsed, action_file, value))
-            if failed_now:
-                runtime_control.request_stop()
-                stop_reviews()
-                break
-            for index, prepare_elapsed, action_file, reviewed in reviewed_now:
-                merged_review = _merge_review_attempts(
-                    [*review_histories.get(index, []), reviewed]
+                reviewed_now.append(
+                    (index, prepare_elapsed, action_file, value)
                 )
-                value = {
-                    **complete_review(action_file, merged_review),
-                    "prepare_elapsed_seconds": prepare_elapsed,
-                }
-                if (
-                    value.get("status") == "retry_required"
-                    and value.get("error_code") == "codex_decision_invalid"
-                    and index not in decision_retries
-                ):
-                    decision_retries.add(index)
-                    review_histories[index] = [merged_review]
-                    future = executor.submit(
-                        review_worker,
-                        {
-                            "project_root": str(root),
-                            "action_file": str(action_file),
-                            "timeout_seconds": 900,
+            if failed_now:
+                for index, prepare_elapsed, _action, reviewed in reviewed_now:
+                    stopped_review(index, prepare_elapsed, reviewed)
+                request_pipeline_stop()
+            elif halted:
+                for index, prepare_elapsed, _action, reviewed in reviewed_now:
+                    stopped_review(index, prepare_elapsed, reviewed)
+            else:
+                for index, prepare_elapsed, action_file, reviewed in reviewed_now:
+                    merged = _merge_review_attempts(
+                        [*review_histories.get(index, []), reviewed]
+                    )
+                    write_ready.append(
+                        (
+                            index,
+                            prepare_elapsed,
+                            action_file,
+                            merged,
+                            time.monotonic(),
+                            len(write_ready) + 1,
+                        )
+                    )
+                    max_write_queue_depth = max(
+                        max_write_queue_depth,
+                        len(write_ready),
+                    )
+
+            if (
+                not halted
+                and writer is None
+                and write_ready
+                and not runtime_control.stop_requested()
+            ):
+                (
+                    index,
+                    prepare_elapsed,
+                    action_file,
+                    reviewed,
+                    review_ready_at,
+                    enqueue_depth,
+                ) = write_ready.popleft()
+                writer_started_at = time.monotonic()
+                writer = (
+                    writer_executor.submit(
+                        complete_review,
+                        action_file,
+                        reviewed,
+                    ),
+                    index,
+                    prepare_elapsed,
+                    action_file,
+                    reviewed,
+                    review_ready_at,
+                    writer_started_at,
+                    enqueue_depth,
+                )
+
+            while (
+                not halted
+                and preparation is None
+                and next_index < count
+                and len(futures) < capacity
+                and (
+                    len(futures)
+                    + len(write_ready)
+                    + int(preparation is not None)
+                    < write_queue_capacity
+                )
+                and not preparation_deferred
+            ):
+                prepare_started = time.monotonic()
+                available = [
+                    path
+                    for path in _open_action_files(root)
+                    if path not in assigned
+                ]
+                if not available:
+                    preparation = (
+                        prepare_executor.submit(
+                            prepare_action,
+                            "travel_expense",
+                        ),
+                        next_index,
+                        time.monotonic(),
+                    )
+                    preparation_stop_deadline = None
+                    next_index += 1
+                    break
+                renewed = renew_actions([available[0]])
+                prepare_elapsed = time.monotonic() - prepare_started
+                if renewed != [available[0]]:
+                    outcomes[next_index] = process_pool.TaskOutcome(
+                        index=next_index,
+                        status="completed",
+                        value={
+                            "status": "failed",
+                            "business_state": "not_available",
+                            "error_code": "production_probe_renew_failed",
+                            "prepare_elapsed_seconds": prepare_elapsed,
+                            "process_attempts": 0,
+                            "process_retries": 0,
+                            "token_usage": {"status": "unknown"},
                         },
                     )
-                    futures[future] = (
-                        index,
-                        prepare_elapsed,
-                        time.monotonic(),
-                        action_file,
-                    )
-                    peak_active = max(peak_active, len(futures))
-                    continue
-                if value.get("status") == "retry_required":
-                    value = {**value, "status": "failed"}
-                outcomes[index] = process_pool.TaskOutcome(
-                    index=index,
-                    status="completed",
-                    value=value,
-                )
-                review_histories.pop(index, None)
-                if value.get("status") != "completed":
-                    halted = True
-                    failed_now = True
+                    next_index += 1
+                    request_pipeline_stop()
                     break
-            if failed_now:
-                runtime_control.request_stop()
-                stop_reviews()
+                action_file = available[0]
+                assigned.add(action_file)
+                submit_review(
+                    next_index,
+                    prepare_elapsed,
+                    action_file,
+                    first_attempt=True,
+                )
+                next_index += 1
+
+            if (
+                not futures
+                and preparation is None
+                and writer is None
+                and not write_ready
+                and (halted or next_index >= count)
+            ):
                 break
+            waitables = [*futures]
+            if preparation is not None:
+                waitables.append(preparation[0])
+            if writer is not None:
+                waitables.append(writer[0])
+            if waitables:
+                wait(
+                    waitables,
+                    timeout=min(
+                        0.25,
+                        heartbeat_interval_sec,
+                        task_timeout_sec / 4,
+                    ),
+                    return_when=FIRST_COMPLETED,
+                )
+            else:
+                time.sleep(min(0.01, heartbeat_interval_sec))
     finally:
         if not prepare_executor_terminated:
             if preparation is not None:
@@ -1357,6 +1452,7 @@ def _run_dispatched_tasks(
                 prepare_executor.shutdown(wait=True)
         if not force_terminated:
             executor.shutdown(wait=True)
+        writer_executor.shutdown(wait=True)
 
     for index, outcome in enumerate(outcomes):
         if outcome is None:
@@ -1702,6 +1798,22 @@ def run_drain(*, max_capacity: int, **_legacy_options: object) -> dict:
     raise ValueError("production_legacy_scheduler_removed")
 
 
+def _pipeline_percentiles(values: list[float]) -> dict:
+    if not values:
+        return {"samples": 0, "p50": "unknown", "p95": "unknown"}
+    ordered = sorted(max(0.0, float(value)) for value in values)
+
+    def nearest(percent: int) -> float:
+        rank = max(1, (len(ordered) * percent + 99) // 100)
+        return round(ordered[rank - 1], 6)
+
+    return {
+        "samples": len(ordered),
+        "p50": nearest(50),
+        "p95": nearest(95),
+    }
+
+
 def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
     business_results: Counter[str] = Counter()
     error_counts: Counter[str] = Counter()
@@ -1713,6 +1825,9 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
     process_retries = 0
     prepare_active_seconds = 0.0
     worker_values: list[dict] = []
+    review_to_write: list[float] = []
+    writer_seconds: list[float] = []
+    queue_depths: list[int] = []
     for outcome in result.outcomes:
         value = outcome.value if isinstance(outcome.value, dict) else {}
         worker_values.append(value)
@@ -1730,6 +1845,21 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
         process_attempts += int(value.get("process_attempts") or 0)
         process_retries += int(value.get("process_retries") or 0)
         prepare_active_seconds += float(value.get("prepare_elapsed_seconds") or 0)
+        review_wait = value.get("review_done_to_write_start_seconds")
+        if isinstance(review_wait, (int, float)) and not isinstance(
+            review_wait,
+            bool,
+        ):
+            review_to_write.append(float(review_wait))
+        writer_elapsed = value.get("writer_seconds")
+        if isinstance(writer_elapsed, (int, float)) and not isinstance(
+            writer_elapsed,
+            bool,
+        ):
+            writer_seconds.append(float(writer_elapsed))
+        queue_depth = value.get("write_queue_depth_at_enqueue")
+        if isinstance(queue_depth, int) and not isinstance(queue_depth, bool):
+            queue_depths.append(queue_depth)
         usage = value.get("token_usage")
         status = usage.get("status") if isinstance(usage, dict) else "unknown"
         if status not in {"recorded", "partial"}:
@@ -1749,6 +1879,60 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
     transient_error_events = codex_events["counts"].get("error")
     if transient_error_events is None and codex_events["status"] == "recorded":
         transient_error_events = 0
+    review_samples = [
+        sample
+        for sample in result.runtime_samples
+        if isinstance(sample.get("active_reviews"), int)
+        and isinstance(sample.get("write_queue_capacity"), int)
+        and sample["write_queue_capacity"] >= 2
+    ]
+    active_review_sum = sum(
+        int(sample["active_reviews"]) for sample in review_samples
+    )
+    review_capacity_sum = sum(
+        max(1, int(sample["write_queue_capacity"]) // 2)
+        for sample in review_samples
+    )
+    sampled_queue_depths = [
+        int(sample.get("max_write_queue_depth") or 0)
+        for sample in result.runtime_samples
+    ]
+    queue_capacities = [
+        int(sample["write_queue_capacity"])
+        for sample in review_samples
+    ]
+    writer_busy_seconds = sum(writer_seconds)
+    pipeline = {
+        "review_done_to_write_start_seconds": _pipeline_percentiles(
+            review_to_write
+        ),
+        "writer": {
+            "max_concurrency": 1 if writer_seconds else 0,
+            "busy_seconds": round(writer_busy_seconds, 6),
+            "busy_ratio": round(
+                min(
+                    1.0,
+                    writer_busy_seconds / max(result.elapsed_seconds, 1e-9),
+                ),
+                6,
+            ),
+        },
+        "review_slots": {
+            "samples": len(review_samples),
+            "utilization": (
+                round(active_review_sum / review_capacity_sum, 6)
+                if review_capacity_sum
+                else "unknown"
+            ),
+        },
+        "write_queue": {
+            "capacity": max(queue_capacities, default=0),
+            "max_depth": max(
+                [*queue_depths, *sampled_queue_depths],
+                default=0,
+            ),
+        },
+    }
     return {
         "requested": result.requested,
         "started": result.started,
@@ -1773,6 +1957,10 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
         "error_counts": dict(sorted(error_counts.items())),
         "codex_events": codex_events,
         "transient_error_events": transient_error_events,
+        "pipeline": pipeline,
+        "_pipeline_review_wait_samples": review_to_write,
+        "_pipeline_active_review_sum": active_review_sum,
+        "_pipeline_review_capacity_sum": review_capacity_sum,
         "token_usage": {
             "status": (
                 "recorded"
@@ -1955,6 +2143,83 @@ def _run_rolling_drain_locked(
     transient_error_events = codex_events["counts"].get("error")
     if transient_error_events is None and codex_events["status"] == "recorded":
         transient_error_events = 0
+    pipeline_wait_samples = [
+        float(value)
+        for wave in waves
+        for value in wave.get("_pipeline_review_wait_samples", [])
+    ]
+    pipeline_writer_seconds = sum(
+        float(wave.get("pipeline", {}).get("writer", {}).get("busy_seconds") or 0)
+        for wave in waves
+    )
+    pipeline_active_review_sum = sum(
+        int(wave.get("_pipeline_active_review_sum") or 0) for wave in waves
+    )
+    pipeline_review_capacity_sum = sum(
+        int(wave.get("_pipeline_review_capacity_sum") or 0) for wave in waves
+    )
+    pipeline_elapsed = sum(float(wave["elapsed_seconds"]) for wave in waves)
+    pipeline = {
+        "review_done_to_write_start_seconds": _pipeline_percentiles(
+            pipeline_wait_samples
+        ),
+        "writer": {
+            "max_concurrency": max(
+                (
+                    int(wave.get("pipeline", {}).get("writer", {}).get(
+                        "max_concurrency"
+                    ) or 0)
+                    for wave in waves
+                ),
+                default=0,
+            ),
+            "busy_seconds": round(pipeline_writer_seconds, 6),
+            "busy_ratio": round(
+                min(
+                    1.0,
+                    pipeline_writer_seconds / max(pipeline_elapsed, 1e-9),
+                ),
+                6,
+            ),
+        },
+        "review_slots": {
+            "samples": sum(
+                int(wave.get("pipeline", {}).get("review_slots", {}).get(
+                    "samples"
+                ) or 0)
+                for wave in waves
+            ),
+            "utilization": (
+                round(
+                    pipeline_active_review_sum
+                    / pipeline_review_capacity_sum,
+                    6,
+                )
+                if pipeline_review_capacity_sum
+                else "unknown"
+            ),
+        },
+        "write_queue": {
+            "capacity": max(
+                (
+                    int(wave.get("pipeline", {}).get("write_queue", {}).get(
+                        "capacity"
+                    ) or 0)
+                    for wave in waves
+                ),
+                default=0,
+            ),
+            "max_depth": max(
+                (
+                    int(wave.get("pipeline", {}).get("write_queue", {}).get(
+                        "max_depth"
+                    ) or 0)
+                    for wave in waves
+                ),
+                default=0,
+            ),
+        },
+    }
     return {
         "schema_version": 1,
         "kind": "preaudit_production_rolling_drain",
@@ -1996,6 +2261,7 @@ def _run_rolling_drain_locked(
         "error_counts": dict(sorted(error_counts.items())),
         "codex_events": codex_events,
         "transient_error_events": transient_error_events,
+        "pipeline": pipeline,
         "token_usage": {
             "status": (
                 "recorded"
