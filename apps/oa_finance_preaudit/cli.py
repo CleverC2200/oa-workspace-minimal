@@ -367,6 +367,75 @@ def _invocation_workflow(
     return None
 
 
+def _attach_live_queue_projection(payload: dict) -> None:
+    live = payload.get("live_check")
+    reconciled = payload.get("reconciliation")
+    operations = payload.get("operations")
+    if not isinstance(operations, dict) or not isinstance(live, dict):
+        return
+    oa = live.get("oa")
+    if not isinstance(oa, dict):
+        return
+    supported = oa.get("supported")
+    unsupported = oa.get("unsupported")
+    trusted_live = (
+        live.get("schema_version") == 1
+        and live.get("kind") == "preaudit_live_status"
+        and oa.get("execution_identity") == "verified"
+        and isinstance(supported, int)
+        and not isinstance(supported, bool)
+        and supported >= 0
+        and isinstance(unsupported, int)
+        and not isinstance(unsupported, bool)
+        and unsupported >= 0
+    )
+    quarantine = (
+        reconciled.get("quarantine")
+        if isinstance(reconciled, dict)
+        else None
+    )
+    actionable = (
+        quarantine.get("actionable_pending")
+        if isinstance(quarantine, dict)
+        else None
+    )
+    quarantined = (
+        quarantine.get("pending_quarantined")
+        if isinstance(quarantine, dict)
+        else None
+    )
+    trusted_reconciliation = (
+        isinstance(reconciled, dict)
+        and reconciled.get("schema_version") == 1
+        and reconciled.get("kind") == "preaudit_reconciliation"
+        and reconciled.get("read_only") is True
+        and isinstance(actionable, int)
+        and not isinstance(actionable, bool)
+        and actionable >= 0
+        and isinstance(quarantined, int)
+        and not isinstance(quarantined, bool)
+        and quarantined >= 0
+        and actionable + quarantined == supported
+    )
+    operations["live_queue"] = (
+        {
+            "evidence_status": "exact",
+            "remaining": supported,
+            "actionable": actionable,
+            "quarantined": quarantined,
+            "unsupported": unsupported,
+        }
+        if trusted_live and trusted_reconciliation
+        else {
+            "evidence_status": "unknown",
+            "remaining": supported if trusted_live else "unknown",
+            "actionable": "unknown",
+            "quarantined": "unknown",
+            "unsupported": unsupported if trusted_live else "unknown",
+        }
+    )
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -401,6 +470,7 @@ def main(
             if args.reconcile:
                 reconcile_operation = reconcile_status or _live_reconciliation
                 payload["reconciliation"] = reconcile_operation(root)
+            _attach_live_queue_projection(payload)
             payload["controller_handoff"] = controller_handoff.status()
         elif args.command == "prune":
             operation = runtime_prune or runtime_maintenance.prune

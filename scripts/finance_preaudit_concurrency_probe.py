@@ -9,8 +9,10 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     wait,
 )
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import math
 import multiprocessing
 import os
 from pathlib import Path
@@ -18,7 +20,9 @@ import signal
 import sys
 import time
 from typing import Callable, Sequence
+from zoneinfo import ZoneInfo
 
+from apps import json_artifact
 from apps.oa_approval import attachment_cache, runtime_control, writer_outcomes
 from apps.oa_finance_preaudit import (
     cli,
@@ -26,9 +30,11 @@ from apps.oa_finance_preaudit import (
     concurrency_control,
     controller_handoff,
     flow_engine,
+    observability,
     process_pool,
     production_pending,
     reconciliation,
+    runtime_maintenance,
 )
 from apps.oa_finance_preaudit import runtime_doctor
 
@@ -49,6 +55,10 @@ QUARANTINED_REASONS = {
     "material_collection_failed",
     *writer_outcomes.CONFIRMED_NO_WRITE_CODES,
 }
+ITEM_LOCAL_QUARANTINE_REASONS = {"material_collection_failed"}
+ITEM_LOCAL_MATERIAL_FAILURE_DETAILS = (
+    runtime_maintenance.ITEM_LOCAL_MATERIAL_FAILURE_DETAILS
+)
 ROLLING_WORKFLOW_KEYS = frozenset(
     {
         "travel_expense",
@@ -57,6 +67,23 @@ ROLLING_WORKFLOW_KEYS = frozenset(
         "small_marketing_fee",
     }
 )
+_OA_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+
+def _received_at_utc(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("production_pending_received_at_invalid") from error
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_OA_TIMEZONE)
+    return parsed.astimezone(timezone.utc)
+
+
+def _pending_identity_key(request_id: str, received_at: str) -> str:
+    return hashlib.sha256(
+        f"{request_id}\x1f{received_at}".encode("utf-8")
+    ).hexdigest()
 
 
 def _read_object(path: Path) -> dict:
@@ -67,6 +94,293 @@ def _read_object(path: Path) -> dict:
     if not isinstance(value, dict):
         raise ValueError("production_probe_state_invalid")
     return value
+
+
+def _persist_write_wait_evidence(
+    action_file: Path,
+    *,
+    ready_at: float,
+    write_started_at: float,
+    queue_depth: int,
+    attribution: dict,
+    event_suffix: int,
+) -> bool:
+    try:
+        state = _read_object(action_file.with_name("state.json"))
+        request_id = str(state["request_id"])
+        received_at = str(state["received_at"])
+        attempt = state["attempt"]
+        workflow_key = str(state["workflow_key"])
+        if (
+            not request_id
+            or not received_at
+            or not workflow_key
+            or not isinstance(attempt, int)
+            or isinstance(attempt, bool)
+            or attempt < 1
+            or not isinstance(event_suffix, int)
+            or isinstance(event_suffix, bool)
+            or event_suffix < 1
+        ):
+            raise ValueError("pipeline_metrics_invalid")
+        item_key = observability.attempt_key(
+            request_id,
+            received_at,
+            attempt,
+        )
+        metrics_path = action_file.with_name("pipeline-metrics.json")
+        if metrics_path.is_symlink():
+            raise ValueError("pipeline_metrics_invalid")
+        persisted: dict
+        if metrics_path.exists():
+            if not metrics_path.is_file():
+                raise ValueError("pipeline_metrics_invalid")
+            existing = _read_object(metrics_path)
+            existing_suffix = existing.get("event_suffix")
+            if (
+                not isinstance(existing_suffix, int)
+                or isinstance(existing_suffix, bool)
+                or existing_suffix < 1
+                or not _write_wait_evidence_matches(
+                    existing,
+                    item_key=item_key,
+                    workflow_key=workflow_key,
+                    attempt=attempt,
+                    event_suffix=existing_suffix,
+                )
+            ):
+                raise ValueError("pipeline_metrics_invalid")
+            existing_events = _write_wait_events(existing)
+            events_complete = _write_wait_events_complete(
+                action_file.with_name("observability.json"),
+                existing_events,
+            )
+            if not events_complete:
+                persisted = existing
+            else:
+                if not events_complete:
+                    raise ValueError("pipeline_metrics_invalid")
+                persisted = _new_write_wait_evidence(
+                    item_key=item_key,
+                    workflow_key=workflow_key,
+                    attempt=attempt,
+                    ready_at=ready_at,
+                    write_started_at=write_started_at,
+                    queue_depth=queue_depth,
+                    attribution=attribution,
+                    event_suffix=max(event_suffix, existing_suffix + 1),
+                )
+                json_artifact.write_json_atomic(
+                    metrics_path,
+                    persisted,
+                    indent=2,
+                )
+        else:
+            persisted = _new_write_wait_evidence(
+                item_key=item_key,
+                workflow_key=workflow_key,
+                attempt=attempt,
+                ready_at=ready_at,
+                write_started_at=write_started_at,
+                queue_depth=queue_depth,
+                attribution=attribution,
+                event_suffix=event_suffix,
+            )
+            json_artifact.write_json_atomic(metrics_path, persisted, indent=2)
+        if not _write_wait_evidence_matches(
+            persisted,
+            item_key=item_key,
+            workflow_key=workflow_key,
+            attempt=attempt,
+            event_suffix=int(persisted["event_suffix"]),
+        ):
+            raise ValueError("pipeline_metrics_invalid")
+        for event in _write_wait_events(persisted):
+            observability.record_event(
+                action_file.with_name("observability.json"),
+                event,
+            )
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _new_write_wait_evidence(
+    *,
+    item_key: str,
+    workflow_key: str,
+    attempt: int,
+    ready_at: float,
+    write_started_at: float,
+    queue_depth: int,
+    attribution: dict,
+    event_suffix: int,
+) -> dict:
+    if (
+        not math.isfinite(ready_at)
+        or not math.isfinite(write_started_at)
+        or write_started_at < ready_at
+        or not isinstance(queue_depth, int)
+        or isinstance(queue_depth, bool)
+        or queue_depth < 0
+        or not _valid_write_wait_attribution(attribution)
+    ):
+        raise ValueError("pipeline_metrics_invalid")
+    write_started_utc = datetime.now(timezone.utc)
+    ready_utc = write_started_utc - timedelta(
+        seconds=write_started_at - ready_at
+    )
+    return {
+        "schema_version": 1,
+        "kind": "preaudit_pipeline_metrics",
+        "status": "exact",
+        "item_key": item_key,
+        "workflow_key": workflow_key,
+        "attempt": attempt,
+        "event_suffix": event_suffix,
+        "write_ready_at": ready_utc.isoformat(),
+        "write_start_at": write_started_utc.isoformat(),
+        "write_queue_depth_at_enqueue": queue_depth,
+        "write_wait_attribution": attribution,
+    }
+
+
+def _write_wait_evidence_matches(
+    payload: dict,
+    *,
+    item_key: str,
+    workflow_key: str,
+    attempt: int,
+    event_suffix: int,
+) -> bool:
+    expected_fields = {
+        "schema_version",
+        "kind",
+        "status",
+        "item_key",
+        "workflow_key",
+        "attempt",
+        "event_suffix",
+        "write_ready_at",
+        "write_start_at",
+        "write_queue_depth_at_enqueue",
+        "write_wait_attribution",
+    }
+    try:
+        ready = datetime.fromisoformat(
+            str(payload["write_ready_at"]).replace("Z", "+00:00")
+        )
+        started = datetime.fromisoformat(
+            str(payload["write_start_at"]).replace("Z", "+00:00")
+        )
+    except (KeyError, ValueError):
+        return False
+    return (
+        set(payload) == expected_fields
+        and isinstance(payload.get("schema_version"), int)
+        and not isinstance(payload.get("schema_version"), bool)
+        and payload["schema_version"] == 1
+        and payload.get("kind") == "preaudit_pipeline_metrics"
+        and payload.get("status") == "exact"
+        and payload.get("item_key") == item_key
+        and payload.get("workflow_key") == workflow_key
+        and isinstance(payload.get("attempt"), int)
+        and not isinstance(payload.get("attempt"), bool)
+        and payload["attempt"] == attempt
+        and isinstance(payload.get("event_suffix"), int)
+        and not isinstance(payload.get("event_suffix"), bool)
+        and payload["event_suffix"] == event_suffix
+        and ready.tzinfo is not None
+        and started.tzinfo is not None
+        and ready <= started
+        and isinstance(payload.get("write_queue_depth_at_enqueue"), int)
+        and not isinstance(
+            payload.get("write_queue_depth_at_enqueue"),
+            bool,
+        )
+        and payload["write_queue_depth_at_enqueue"] >= 0
+        and _valid_write_wait_attribution(
+            payload.get("write_wait_attribution")
+        )
+    )
+
+
+def _write_wait_events(payload: dict) -> tuple[dict, dict]:
+    ready_utc = datetime.fromisoformat(
+        str(payload["write_ready_at"]).replace("Z", "+00:00")
+    ).astimezone(timezone.utc)
+    write_started_utc = datetime.fromisoformat(
+        str(payload["write_start_at"]).replace("Z", "+00:00")
+    ).astimezone(timezone.utc)
+    suffix = int(payload["event_suffix"])
+    shared = {
+        "item_key": str(payload["item_key"]),
+        "workflow_key": str(payload["workflow_key"]),
+        "phase": "wait",
+        "active_seconds": 0,
+        "result": "success",
+        "model": None,
+        "token_usage": {"status": "unknown"},
+    }
+    total_seconds = max(
+        0,
+        int((write_started_utc - ready_utc).total_seconds()),
+    )
+    return (
+        {
+            **shared,
+            "event_id": f"04-wait-ready-{suffix}",
+            "occurred_at": ready_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "wall_seconds": 0,
+            "queue_wait_seconds": 0,
+        },
+        {
+            **shared,
+            "event_id": f"04-wait-duration-{suffix}",
+            "occurred_at": write_started_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "wall_seconds": total_seconds,
+            "queue_wait_seconds": total_seconds,
+        },
+    )
+
+
+def _write_wait_events_complete(path: Path, expected: tuple[dict, dict]) -> bool:
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        payload = _read_object(path)
+        events = payload["events"]
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
+    return isinstance(events, list) and all(event in events for event in expected)
+
+
+def _valid_write_wait_attribution(value: object) -> bool:
+    if value == {"status": "unknown"}:
+        return True
+    fields = {
+        "status",
+        "total_seconds",
+        "writer_busy_seconds",
+        "fifo_head_of_line_seconds",
+        "controller_scheduling_seconds",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        return False
+    numbers = [value.get(field) for field in fields - {"status"}]
+    return value.get("status") == "exact" and all(
+        isinstance(number, (int, float))
+        and not isinstance(number, bool)
+        and math.isfinite(float(number))
+        and number >= 0
+        for number in numbers
+    ) and math.isclose(
+        float(value["total_seconds"]),
+        float(value["writer_busy_seconds"])
+        + float(value["fifo_head_of_line_seconds"])
+        + float(value["controller_scheduling_seconds"]),
+        abs_tol=1e-6,
+    )
 
 
 def _prepared_action_matches_selection(
@@ -123,6 +437,82 @@ def _prepared_action_matches_selection(
         and state.get("received_at") == received_at
         and all(action.get(key) == value for key, value in shared.items())
         and all(state.get(key) == value for key, value in shared.items())
+    )
+
+
+def _quarantined_action_matches_selection(
+    action_path: Path,
+    action: dict,
+    state: dict,
+    selected: dict,
+    workflow_key: str,
+    *,
+    project_root: Path = PROJECT_ROOT,
+) -> bool:
+    request_id = str(selected.get("requestId") or "").strip()
+    received_at = str(selected.get("received_at") or "").strip()
+    attempt = state.get("attempt")
+    reason = str(state.get("reason") or "")
+    detail_code = str(state.get("failure_detail_code") or "")
+    if (
+        not request_id
+        or not received_at
+        or not isinstance(attempt, int)
+        or isinstance(attempt, bool)
+        or attempt < 1
+        or reason not in ITEM_LOCAL_QUARANTINE_REASONS
+        or detail_code not in ITEM_LOCAL_MATERIAL_FAILURE_DETAILS
+    ):
+        return False
+    case_key = hashlib.sha256(
+        f"{request_id}\x1f{received_at}".encode("utf-8")
+    ).hexdigest()
+    root = Path(project_root).expanduser().resolve()
+    expected_action = (
+        root
+        / "runtime"
+        / "finance_preaudit_flows"
+        / workflow_key
+        / "cases"
+        / case_key
+        / f"attempt-{attempt}"
+        / "action.json"
+    )
+    expected_state = expected_action.with_name("state.json")
+    shared = {
+        "action": "needs_admin",
+        "execution_state": "needs_admin",
+        "business_state": "not_available",
+        "write_state": "not_requested",
+        "workflow_key": workflow_key,
+        "reason": reason,
+        "failure_detail_code": detail_code,
+        "case_key": case_key,
+        "attempt": attempt,
+        "action_file": str(expected_action),
+        "state_file": str(expected_state),
+    }
+    attempt_root = expected_action.parent
+    forbidden = [
+        attempt_root / "writer-boundary.json",
+        attempt_root / "execution-receipt.json",
+    ]
+    if reason == "material_collection_failed":
+        forbidden.extend(
+            attempt_root / name
+            for name in (
+                "review-decision.json",
+                "remark.txt",
+                "submission-envelope.json",
+            )
+        )
+    return (
+        action_path == expected_action
+        and state.get("request_id") == request_id
+        and state.get("received_at") == received_at
+        and all(action.get(key) == value for key, value in shared.items())
+        and all(state.get(key) == value for key, value in shared.items())
+        and not any(path.is_symlink() or path.exists() for path in forbidden)
     )
 
 
@@ -352,12 +742,18 @@ def _recovery_candidates(
 
 
 def _prepare_one(selection: PrepareSelection) -> dict:
+    global_selection = False
     assigned_identities: set[tuple[str, str]] = set()
     historical_unknown_identities: set[tuple[str, str]] = set()
     recovery_action_files: tuple[Path, ...] = ()
+    committed_received_at: datetime | None = None
+    committed_request_id: str | None = None
+    known_late_visible_keys: set[str] = set()
+    admission_cutoff: datetime | None = None
     if isinstance(selection, str):
         workflow_key = selection
     elif isinstance(selection, dict) and selection.get("workflow_key") == "*":
+        global_selection = True
         workflow_key = "*"
         raw_assigned = selection.get("assigned_identities")
         raw_historical_unknown = selection.get(
@@ -365,12 +761,24 @@ def _prepare_one(selection: PrepareSelection) -> dict:
             [],
         )
         raw_recovery_actions = selection.get("recover_action_files", [])
+        raw_committed_received_at = selection.get("committed_received_at")
+        raw_committed_request_id = selection.get("committed_request_id")
+        raw_late_visible_keys = selection.get("known_late_visible_keys", [])
+        raw_admission_cutoff = selection.get("admission_cutoff")
         if not isinstance(raw_assigned, list) or not isinstance(
             raw_historical_unknown,
             list,
-        ) or not isinstance(raw_recovery_actions, list) or any(
+        ) or not isinstance(raw_recovery_actions, list) or not isinstance(
+            raw_late_visible_keys,
+            list,
+        ) or any(
             not isinstance(path, str) or not path
             for path in raw_recovery_actions
+        ) or any(
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in raw_late_visible_keys
         ):
             return {
                 "action": "failed",
@@ -399,6 +807,30 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 }
             historical_unknown_identities.add((identity[0], identity[1]))
         recovery_action_files = tuple(Path(path) for path in raw_recovery_actions)
+        known_late_visible_keys.update(raw_late_visible_keys)
+        try:
+            if raw_committed_received_at is not None:
+                if (
+                    not isinstance(raw_committed_received_at, str)
+                    or not isinstance(raw_committed_request_id, str)
+                    or not raw_committed_request_id
+                ):
+                    raise ValueError
+                committed_received_at = _received_at_utc(
+                    raw_committed_received_at
+                )
+                committed_request_id = raw_committed_request_id
+            elif raw_committed_request_id is not None:
+                raise ValueError
+            if raw_admission_cutoff is not None:
+                if not isinstance(raw_admission_cutoff, str):
+                    raise ValueError
+                admission_cutoff = _received_at_utc(raw_admission_cutoff)
+        except ValueError:
+            return {
+                "action": "failed",
+                "error_code": "production_probe_prepare_failed",
+            }
     else:
         return {
             "action": "failed",
@@ -418,6 +850,8 @@ def _prepare_one(selection: PrepareSelection) -> dict:
             "error_code": "production_probe_prepare_failed",
         }
     quarantined = 0
+    newly_late_visible_keys: set[str] = set()
+    late_visible_pending_count = 0
     while quarantined < quarantine_budget:
         if runtime_control.stop_requested():
             return {
@@ -428,6 +862,11 @@ def _prepare_one(selection: PrepareSelection) -> dict:
         recovery_action_file: Path | None = None
         selected_workflow = workflow_key
         if workflow_key == "*":
+            if (
+                admission_cutoff is not None
+                and datetime.now(timezone.utc) > admission_cutoff
+            ):
+                return {"action": "admission_closed"}
             try:
                 live_candidates = production_pending.actionable_fifo(
                     cli._live_pending_identities(),
@@ -444,6 +883,38 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                     "action": "failed",
                     "error_code": "production_probe_prepare_failed",
                 }
+            eligible_live_candidates: list[dict] = []
+            for candidate in live_candidates:
+                request_id = str(candidate.get("requestId") or "")
+                received_at = str(candidate.get("received_at") or "")
+                identity_key = _pending_identity_key(request_id, received_at)
+                if identity_key in known_late_visible_keys:
+                    late_visible_pending_count += 1
+                    continue
+                try:
+                    candidate_received_at = _received_at_utc(received_at)
+                except ValueError:
+                    runtime_control.request_stop(
+                        "production_probe_prepare_failed"
+                    )
+                    return {
+                        "action": "failed",
+                        "error_code": "production_probe_prepare_failed",
+                    }
+                if committed_received_at is not None and (
+                    candidate_received_at,
+                    request_id,
+                ) < (committed_received_at, str(committed_request_id)):
+                    newly_late_visible_keys.add(identity_key)
+                    late_visible_pending_count += 1
+                    continue
+                eligible_live_candidates.append(candidate)
+            live_candidates = eligible_live_candidates
+            if (
+                admission_cutoff is not None
+                and datetime.now(timezone.utc) > admission_cutoff
+            ):
+                return {"action": "admission_closed"}
             try:
                 recovery_candidates = production_pending.actionable_fifo(
                     _recovery_candidates(
@@ -463,15 +934,31 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 allowed_workflows=ROLLING_WORKFLOW_KEYS,
             )
             if not candidates:
-                runtime_control.request_stop("production_probe_prepare_failed")
-                return {
-                    "action": "failed",
-                    "error_code": "production_probe_prepare_failed",
-                }
+                return (
+                    {
+                        "action": "late_visible",
+                        "late_visible_keys": sorted(newly_late_visible_keys),
+                        "late_visible_pending_count": (
+                            late_visible_pending_count
+                        ),
+                    }
+                    if newly_late_visible_keys
+                    else {
+                        "action": "no_action",
+                        "late_visible_pending_count": (
+                            late_visible_pending_count
+                        ),
+                    }
+                )
             selected = candidates[0]
             selected_workflow = str(selected.get("flow_key") or "")
             if selected.get("recovery_action_file") is not None:
                 recovery_action_file = Path(selected["recovery_action_file"])
+            if (
+                admission_cutoff is not None
+                and datetime.now(timezone.utc) > admission_cutoff
+            ):
+                return {"action": "admission_closed"}
         if selected is None:
             engine = cli._live_flow_engine(controlled=True)
         elif recovery_action_file is not None:
@@ -592,6 +1079,16 @@ def _prepare_one(selection: PrepareSelection) -> dict:
             return {
                 "action": "review_required",
                 "action_file": action["action_file"],
+                **(
+                    {"late_visible_keys": sorted(newly_late_visible_keys)}
+                    if newly_late_visible_keys
+                    else {}
+                ),
+                **(
+                    {"late_visible_pending_count": late_visible_pending_count}
+                    if global_selection and late_visible_pending_count
+                    else {}
+                ),
             }
         if (
             action.get("action") == "needs_admin"
@@ -599,6 +1096,57 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 action.get("reason") in QUARANTINED_REASONS
             )
         ):
+            if selected is not None:
+                persisted_action: dict = {}
+                persisted: dict = {}
+                raw_action_path = Path(str(action.get("action_file") or ""))
+                action_path = raw_action_path.resolve()
+                state_path = action_path.with_name("state.json")
+                try:
+                    if (
+                        raw_action_path.is_absolute()
+                        and not raw_action_path.is_symlink()
+                        and raw_action_path == action_path
+                        and not state_path.is_symlink()
+                    ):
+                        persisted_action = _read_object(action_path)
+                        persisted = _read_object(state_path)
+                except (KeyError, OSError, ValueError):
+                    pass
+                if not _quarantined_action_matches_selection(
+                    action_path,
+                    persisted_action,
+                    persisted,
+                    selected,
+                    selected_workflow,
+                    project_root=PROJECT_ROOT,
+                ):
+                    runtime_control.request_stop(
+                        "production_probe_prepare_failed"
+                    )
+                    return {
+                        "action": "failed",
+                        "error_code": "production_probe_fifo_mismatch",
+                    }
+                return {
+                    "action": "quarantined",
+                    "error_code": str(action["reason"]),
+                    "write_state": "not_requested",
+                    **(
+                        {"late_visible_keys": sorted(newly_late_visible_keys)}
+                        if newly_late_visible_keys
+                        else {}
+                    ),
+                    **(
+                        {
+                            "late_visible_pending_count": (
+                                late_visible_pending_count
+                            )
+                        }
+                        if global_selection and late_visible_pending_count
+                        else {}
+                    ),
+                }
             quarantined += 1
             try:
                 current_quarantine_count = _local_quarantine_count()
@@ -1216,6 +1764,11 @@ def _run_dispatched_tasks(
     max_capacity: int | None = None,
     historical_unknown_identities: frozenset[tuple[str, str]] = frozenset(),
     recovery_action_files: Sequence[Path] = (),
+    committed_received_at: str | None = None,
+    committed_request_id: str | None = None,
+    known_late_visible_keys: frozenset[str] = frozenset(),
+    admission_cutoff: str | None = None,
+    continuous_discovery: bool = False,
 ) -> process_pool.PoolResult[dict]:
     maximum_capacity = capacity if max_capacity is None else max_capacity
     recovery_queue = tuple(
@@ -1237,18 +1790,62 @@ def _run_dispatched_tasks(
         or maximum_capacity not in concurrency_control.CAPACITY_STEPS
     ):
         raise ValueError("production_dispatcher_watchdog_invalid")
+    try:
+        if (committed_received_at is None) != (committed_request_id is None):
+            raise ValueError
+        committed_watermark = (
+            (_received_at_utc(committed_received_at), str(committed_request_id))
+            if committed_received_at is not None
+            else None
+        )
+        admission_deadline = (
+            _received_at_utc(admission_cutoff)
+            if admission_cutoff is not None
+            else None
+        )
+    except ValueError as error:
+        raise ValueError("production_dispatcher_watchdog_invalid") from error
+    if any(
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+        for value in known_late_visible_keys
+    ):
+        raise ValueError("production_dispatcher_watchdog_invalid")
     started_at = time.monotonic()
     root = Path(project_root).expanduser().resolve()
     outcomes: list[process_pool.TaskOutcome[dict] | None] = [None] * count
     assigned: set[Path] = set()
     assigned_identities: dict[Path, tuple[str, str]] = {}
+    assigned_order_keys: dict[int, tuple[datetime, str]] = {}
+    pending_write_indices: set[int] = set()
     futures: dict[object, tuple[int, float, float, Path]] = {}
-    write_ready: dict[int, tuple[float, Path, dict, float, int]] = {}
+    write_ready: dict[
+        int,
+        tuple[float, Path, dict, float, int, float | None],
+    ] = {}
     writer: (
-        tuple[Future[dict], int, float, Path, dict, float, float, int] | None
+        tuple[
+            Future[dict],
+            int,
+            float,
+            Path,
+            dict,
+            float,
+            float,
+            int,
+            dict,
+        ]
+        | None
     ) = None
+    writer_busy_intervals: list[tuple[float, float]] = []
     review_histories: dict[int, list[dict]] = {}
     decision_retries: set[int] = set()
+    skipped_write_indices: set[int] = set()
+    initial_late_visible_keys = set(known_late_visible_keys)
+    late_visible_keys = set(initial_late_visible_keys)
+    late_visible_pending_count = 0
+    committed_order_key = committed_watermark
     next_index = 0
     next_write_index = 0
     current_review_capacity = capacity
@@ -1265,6 +1862,10 @@ def _run_dispatched_tasks(
     runtime_samples: list[dict] = []
     max_task_elapsed_seconds = 0.0
     next_heartbeat = time.monotonic()
+    discovery_closed = not continuous_discovery
+    admission_was_closed = False
+    empty_discovery_snapshots = 0
+    next_discovery_at = time.monotonic()
     preparation: tuple[Future[dict], int, float] | None = None
     preparation_stop_deadline: float | None = None
     preparation_deferred = False
@@ -1369,7 +1970,7 @@ def _run_dispatched_tasks(
 
     def stop_write_queue() -> None:
         for index in sorted(write_ready):
-            prepare_elapsed, _action, reviewed, _ready_at, _depth = (
+            prepare_elapsed, _action, reviewed, _ready_at, _depth, _blocked = (
                 write_ready[index]
             )
             stopped_review(index, prepare_elapsed, reviewed)
@@ -1381,6 +1982,31 @@ def _run_dispatched_tasks(
         runtime_control.request_stop()
         stop_reviews()
         stop_write_queue()
+
+    def advance_write_head() -> None:
+        nonlocal next_write_index
+        if not strict_global_fifo:
+            while next_write_index in skipped_write_indices:
+                skipped_write_indices.remove(next_write_index)
+                next_write_index += 1
+        head = current_write_head()
+        for queued_index, queued in list(write_ready.items()):
+            if queued_index == head and queued[-1] is None:
+                write_ready[queued_index] = (*queued[:-1], time.monotonic())
+            elif queued_index != head and queued[-1] is not None:
+                write_ready[queued_index] = (*queued[:-1], None)
+
+    def current_write_head() -> int | None:
+        if strict_global_fifo:
+            return (
+                min(
+                    pending_write_indices,
+                    key=lambda value: assigned_order_keys[value],
+                )
+                if pending_write_indices
+                else None
+            )
+        return next_write_index
 
     def observe_adaptive_window(value: dict) -> None:
         nonlocal adaptive_healthy_windows
@@ -1557,6 +2183,15 @@ def _run_dispatched_tasks(
             selection["recover_action_files"] = [
                 str(path) for path in recovery_queue
             ]
+        if committed_order_key is not None:
+            selection["committed_received_at"] = (
+                committed_order_key[0].isoformat()
+            )
+            selection["committed_request_id"] = committed_order_key[1]
+        if late_visible_keys:
+            selection["known_late_visible_keys"] = sorted(late_visible_keys)
+        if admission_deadline is not None:
+            selection["admission_cutoff"] = admission_deadline.isoformat()
         return selection
 
     try:
@@ -1565,7 +2200,13 @@ def _run_dispatched_tasks(
             or preparation is not None
             or writer is not None
             or write_ready
-            or (next_index < count and not halted)
+            or (
+                (
+                    next_index < len(outcomes)
+                    or (continuous_discovery and not discovery_closed)
+                )
+                and not halted
+            )
         ):
             if runtime_control.stop_requested() and not halted:
                 halted = True
@@ -1583,6 +2224,7 @@ def _run_dispatched_tasks(
                     review_ready_at,
                     writer_started_at,
                     enqueue_depth,
+                    write_wait,
                 ) = writer
                 writer = None
                 preparation_deferred = False
@@ -1595,6 +2237,10 @@ def _run_dispatched_tasks(
                         "write_state": "unknown",
                         "error_code": "writer_result_unknown",
                     }
+                writer_finished_at = time.monotonic()
+                writer_busy_intervals.append(
+                    (writer_started_at, writer_finished_at)
+                )
                 value = {
                     **completed,
                     "prepare_elapsed_seconds": prepare_elapsed,
@@ -1603,10 +2249,11 @@ def _run_dispatched_tasks(
                         6,
                     ),
                     "writer_seconds": round(
-                        max(0.0, time.monotonic() - writer_started_at),
+                        max(0.0, writer_finished_at - writer_started_at),
                         6,
                     ),
                     "write_queue_depth_at_enqueue": enqueue_depth,
+                    "write_wait_attribution": write_wait,
                 }
                 if (
                     value.get("status") == "retry_required"
@@ -1634,7 +2281,11 @@ def _run_dispatched_tasks(
                     if value.get("status") != "completed":
                         request_pipeline_stop()
                     else:
-                        next_write_index += 1
+                        if strict_global_fifo:
+                            pending_write_indices.remove(index)
+                        else:
+                            next_write_index += 1
+                        advance_write_head()
                         observe_adaptive_window(value)
 
             review_ages = {
@@ -1791,7 +2442,101 @@ def _run_dispatched_tasks(
                     }
                 preparation = None
                 preparation_stop_deadline = None
-                if prepared.get("action") != "review_required":
+                raw_late_keys = prepared.get("late_visible_keys", [])
+                raw_late_pending_count = prepared.get(
+                    "late_visible_pending_count",
+                    0,
+                )
+                if (
+                    not isinstance(raw_late_keys, list)
+                    or not isinstance(raw_late_pending_count, int)
+                    or isinstance(raw_late_pending_count, bool)
+                    or raw_late_pending_count < 0
+                    or any(
+                        not isinstance(value, str)
+                        or len(value) != 64
+                        or any(
+                            character not in "0123456789abcdef"
+                            for character in value
+                        )
+                        for value in raw_late_keys
+                    )
+                ):
+                    prepared = {
+                        "action": "failed",
+                        "error_code": "production_probe_prepare_failed",
+                    }
+                else:
+                    late_visible_keys.update(raw_late_keys)
+                    late_visible_pending_count = raw_late_pending_count
+                if prepared.get("action") == "late_visible":
+                    outcomes[index] = process_pool.TaskOutcome(
+                        index=index,
+                        status="completed",
+                        value={
+                            "status": "late_visible",
+                            "business_state": "not_available",
+                            "write_state": "not_requested",
+                            "prepare_elapsed_seconds": prepare_elapsed,
+                            "process_attempts": 0,
+                            "process_retries": 0,
+                            "token_usage": {"status": "unknown"},
+                        },
+                    )
+                    skipped_write_indices.add(index)
+                    empty_discovery_snapshots = 0
+                    advance_write_head()
+                elif prepared.get("action") in {"no_action", "admission_closed"}:
+                    outcomes[index] = process_pool.TaskOutcome(
+                        index=index,
+                        status="completed",
+                        value={
+                            "status": "no_action",
+                            "business_state": "not_available",
+                            "write_state": "not_requested",
+                            "prepare_elapsed_seconds": prepare_elapsed,
+                            "process_attempts": 0,
+                            "process_retries": 0,
+                            "token_usage": {"status": "unknown"},
+                        },
+                    )
+                    skipped_write_indices.add(index)
+                    advance_write_head()
+                    if prepared.get("action") == "admission_closed":
+                        discovery_closed = True
+                        admission_was_closed = True
+                    elif continuous_discovery:
+                        if futures or write_ready or writer is not None:
+                            empty_discovery_snapshots = 0
+                        else:
+                            empty_discovery_snapshots += 1
+                            if empty_discovery_snapshots >= 2:
+                                discovery_closed = True
+                        next_discovery_at = time.monotonic() + 0.05
+                elif (
+                    prepared.get("action") == "quarantined"
+                    and prepared.get("write_state") == "not_requested"
+                    and prepared.get("error_code") in ITEM_LOCAL_QUARANTINE_REASONS
+                ):
+                    outcomes[index] = process_pool.TaskOutcome(
+                        index=index,
+                        status="completed",
+                        value={
+                            "status": "quarantined",
+                            "business_state": "not_available",
+                            "write_state": "not_requested",
+                            "error_code": str(
+                                prepared["error_code"]
+                            ),
+                            "prepare_elapsed_seconds": prepare_elapsed,
+                            "process_attempts": 0,
+                            "process_retries": 0,
+                            "token_usage": {"status": "unknown"},
+                        },
+                    )
+                    skipped_write_indices.add(index)
+                    advance_write_head()
+                elif prepared.get("action") != "review_required":
                     outcomes[index] = process_pool.TaskOutcome(
                         index=index,
                         status="completed",
@@ -1816,6 +2561,7 @@ def _run_dispatched_tasks(
                         )
                         prepare_executor_terminated = True
                 else:
+                    empty_discovery_snapshots = 0
                     action_file = Path(str(prepared["action_file"])).resolve()
                     if action_file in assigned:
                         next_index -= 1
@@ -1847,9 +2593,19 @@ def _run_dispatched_tasks(
                         unblocked_duplicate_retries = 0
                         if strict_global_fifo:
                             try:
-                                assigned_identities[action_file] = (
-                                    validated_assigned_identity(action_file)
-                                )
+                                identity = validated_assigned_identity(action_file)
+                                assigned_identities[action_file] = identity
+                                received_at = _received_at_utc(identity[1])
+                                order_key = (received_at, identity[0])
+                                if (
+                                    committed_order_key is not None
+                                    and order_key < committed_order_key
+                                ):
+                                    raise ValueError(
+                                        "production_probe_late_claim"
+                                    )
+                                assigned_order_keys[index] = order_key
+                                pending_write_indices.add(index)
                             except ValueError:
                                 outcomes[index] = process_pool.TaskOutcome(
                                     index=index,
@@ -1871,6 +2627,7 @@ def _run_dispatched_tasks(
                                 request_pipeline_stop()
                                 continue
                         assigned.add(action_file)
+                        advance_write_head()
                         submit_review(
                             index,
                             prepare_elapsed,
@@ -1922,22 +2679,28 @@ def _run_dispatched_tasks(
                     merged = _merge_review_attempts(
                         [*review_histories.get(index, []), reviewed]
                     )
+                    head = current_write_head()
                     write_ready[index] = (
                         prepare_elapsed,
                         action_file,
                         merged,
-                        time.monotonic(),
+                        (ready_at := time.monotonic()),
                         len(write_ready) + 1,
+                        ready_at if index == head else None,
                     )
                     max_write_queue_depth = max(
                         max_write_queue_depth,
                         len(write_ready),
                     )
+                advance_write_head()
 
+            write_head = current_write_head()
             if (
                 not halted
                 and writer is None
-                and next_write_index in write_ready
+                and (preparation is None or not strict_global_fifo)
+                and write_head is not None
+                and write_head in write_ready
                 and not runtime_control.stop_requested()
             ):
                 (
@@ -1946,9 +2709,59 @@ def _run_dispatched_tasks(
                     reviewed,
                     review_ready_at,
                     enqueue_depth,
-                ) = write_ready.pop(next_write_index)
-                index = next_write_index
+                    became_write_head_at,
+                ) = write_ready.pop(write_head)
+                index = write_head
                 writer_started_at = time.monotonic()
+                write_wait = _write_wait_attribution(
+                    ready_at=review_ready_at,
+                    write_started_at=writer_started_at,
+                    writer_busy_intervals=writer_busy_intervals,
+                    became_write_head_at=became_write_head_at,
+                )
+                if not _persist_write_wait_evidence(
+                    action_file,
+                    ready_at=review_ready_at,
+                    write_started_at=writer_started_at,
+                    queue_depth=enqueue_depth,
+                    attribution=write_wait,
+                    event_suffix=(2 if index in decision_retries else 1),
+                ):
+                    outcomes[index] = process_pool.TaskOutcome(
+                        index=index,
+                        status="completed",
+                        value={
+                            **reviewed,
+                            "status": "failed",
+                            "business_state": "not_available",
+                            "write_state": "not_requested",
+                            "error_code": "observability_write_failed",
+                            "prepare_elapsed_seconds": prepare_elapsed,
+                        },
+                    )
+                    request_pipeline_stop()
+                    continue
+                if strict_global_fifo:
+                    order_key = assigned_order_keys[index]
+                    if (
+                        committed_order_key is not None
+                        and order_key < committed_order_key
+                    ):
+                        outcomes[index] = process_pool.TaskOutcome(
+                            index=index,
+                            status="completed",
+                            value={
+                                **reviewed,
+                                "status": "failed",
+                                "business_state": "not_available",
+                                "write_state": "not_requested",
+                                "error_code": "production_probe_fifo_mismatch",
+                                "prepare_elapsed_seconds": prepare_elapsed,
+                            },
+                        )
+                        request_pipeline_stop()
+                        continue
+                    committed_order_key = order_key
                 writer = (
                     writer_executor.submit(
                         complete_review,
@@ -1962,12 +2775,17 @@ def _run_dispatched_tasks(
                     review_ready_at,
                     writer_started_at,
                     enqueue_depth,
+                    write_wait,
                 )
 
             while (
                 not halted
                 and preparation is None
-                and next_index < count
+                and (
+                    next_index < len(outcomes)
+                    or (continuous_discovery and not discovery_closed)
+                )
+                and time.monotonic() >= next_discovery_at
                 and len(futures) < current_review_capacity
                 and (
                     len(futures)
@@ -1977,6 +2795,8 @@ def _run_dispatched_tasks(
                 )
                 and not preparation_deferred
             ):
+                if next_index >= len(outcomes):
+                    outcomes.append(None)
                 prepare_started = time.monotonic()
                 available = (
                     []
@@ -2056,7 +2876,13 @@ def _run_dispatched_tasks(
                 and preparation is None
                 and writer is None
                 and not write_ready
-                and (halted or next_index >= count)
+                and (
+                    halted
+                    or (
+                        next_index >= len(outcomes)
+                        and (not continuous_discovery or discovery_closed)
+                    )
+                )
             ):
                 break
             waitables = [*futures]
@@ -2105,12 +2931,18 @@ def _run_dispatched_tasks(
                 error_code="stop_requested",
             )
     completed_outcomes = tuple(
-        outcome for outcome in outcomes if outcome is not None
+        outcome
+        for outcome in outcomes
+        if outcome is not None
+        and not (
+            isinstance(outcome.value, dict)
+            and outcome.value.get("status") in {"late_visible", "no_action"}
+        )
     )
     if halted and not force_terminated and not runtime_control.stop_requested():
         runtime_control.request_stop()
     return process_pool.PoolResult(
-        requested=count,
+        requested=len(completed_outcomes),
         started=started,
         completed=sum(
             outcome.status == "completed" for outcome in completed_outcomes
@@ -2130,6 +2962,25 @@ def _run_dispatched_tasks(
         processes_reaped=processes_reaped,
         recommended_capacity=current_review_capacity,
         capacity_decisions=tuple(capacity_decisions),
+        discovery_refreshes=(next_index if strict_global_fifo else 0),
+        late_visible_count=len(late_visible_keys - initial_late_visible_keys),
+        late_visible_keys=tuple(sorted(late_visible_keys)),
+        committed_received_at=(
+            committed_order_key[0].isoformat()
+            if committed_order_key is not None
+            else None
+        ),
+        committed_request_id=(
+            committed_order_key[1] if committed_order_key is not None else None
+        ),
+        late_visible_pending_count=late_visible_pending_count,
+        discovery_exhausted=(
+            continuous_discovery
+            and discovery_closed
+            and not admission_was_closed
+            and not halted
+        ),
+        admission_closed=admission_was_closed,
     )
 
 
@@ -2141,6 +2992,10 @@ def _run_global_dispatched_tasks(
     max_capacity: int | None = None,
     historical_unknown_identities: frozenset[tuple[str, str]] | None = None,
     recovery_action_files: Sequence[Path] = (),
+    committed_received_at: str | None = None,
+    committed_request_id: str | None = None,
+    known_late_visible_keys: frozenset[str] = frozenset(),
+    admission_cutoff: str | None = None,
 ) -> process_pool.PoolResult[dict]:
     codex_review_worker._reviewer_environment()
     frozen_unknown = (
@@ -2153,6 +3008,11 @@ def _run_global_dispatched_tasks(
         "adaptive": adaptive,
         "max_capacity": max_capacity,
         "historical_unknown_identities": frozen_unknown,
+        "committed_received_at": committed_received_at,
+        "committed_request_id": committed_request_id,
+        "known_late_visible_keys": known_late_visible_keys,
+        "admission_cutoff": admission_cutoff,
+        "continuous_discovery": True,
     }
     if recovery_action_files:
         dispatcher_args["recovery_action_files"] = recovery_action_files
@@ -2360,8 +3220,17 @@ def _supported_pending(live: dict) -> int:
 def _rolling_snapshot(
     live_status: LiveStatus,
     reconcile_status: Callable[[], dict],
-) -> tuple[int, int, int]:
-    pending = _supported_pending(live_status())
+) -> tuple[int, int, int, int]:
+    live = live_status()
+    pending = _supported_pending(live)
+    oa = live.get("oa")
+    unauthorized = oa.get("unsupported", 0) if isinstance(oa, dict) else 0
+    if (
+        not isinstance(unauthorized, int)
+        or isinstance(unauthorized, bool)
+        or unauthorized < 0
+    ):
+        raise ValueError("production_drain_live_status_invalid")
     try:
         reconciled = reconcile_status()
         quarantine = reconciled["quarantine"]
@@ -2382,7 +3251,7 @@ def _rolling_snapshot(
         or quarantined + actionable != pending
     ):
         raise ValueError("production_rolling_reconciliation_invalid")
-    return pending, quarantined, actionable
+    return pending, quarantined, actionable, unauthorized
 
 
 def _quarantined_pending_count() -> int:
@@ -2498,7 +3367,12 @@ def run_drain(*, max_capacity: int, **_legacy_options: object) -> dict:
 
 def _pipeline_percentiles(values: list[float]) -> dict:
     if not values:
-        return {"samples": 0, "p50": "unknown", "p95": "unknown"}
+        return {
+            "samples": 0,
+            "p50": "unknown",
+            "p95": "unknown",
+            "p99": "unknown",
+        }
     ordered = sorted(max(0.0, float(value)) for value in values)
 
     def nearest(percent: int) -> float:
@@ -2507,8 +3381,53 @@ def _pipeline_percentiles(values: list[float]) -> dict:
 
     return {
         "samples": len(ordered),
-        "p50": nearest(50),
-        "p95": nearest(95),
+        "p50": nearest(50) if len(ordered) >= 5 else "unknown",
+        "p95": nearest(95) if len(ordered) >= 20 else "unknown",
+        "p99": nearest(99) if len(ordered) >= 100 else "unknown",
+    }
+
+
+def _write_wait_attribution(
+    *,
+    ready_at: float,
+    write_started_at: float,
+    writer_busy_intervals: Sequence[tuple[float, float]],
+    became_write_head_at: float | None,
+) -> dict:
+    total = max(0.0, write_started_at - ready_at)
+    if (
+        became_write_head_at is None
+        or became_write_head_at < ready_at
+        or became_write_head_at > write_started_at
+    ):
+        return {"status": "unknown"}
+
+    def overlap(start: float, end: float) -> float:
+        return sum(
+            max(0.0, min(end, interval_end) - max(start, interval_start))
+            for interval_start, interval_end in writer_busy_intervals
+        )
+
+    writer_busy = overlap(ready_at, write_started_at)
+    writer_busy = min(total, writer_busy)
+    before_head = max(0.0, became_write_head_at - ready_at)
+    fifo_head = max(0.0, before_head - overlap(ready_at, became_write_head_at))
+    rounded_total = round(total, 6)
+    rounded_busy = min(rounded_total, round(writer_busy, 6))
+    rounded_fifo = min(
+        max(0.0, rounded_total - rounded_busy),
+        round(fifo_head, 6),
+    )
+    rounded_scheduling = max(
+        0.0,
+        round(rounded_total - rounded_busy - rounded_fifo, 6),
+    )
+    return {
+        "status": "exact",
+        "total_seconds": rounded_total,
+        "writer_busy_seconds": rounded_busy,
+        "fifo_head_of_line_seconds": rounded_fifo,
+        "controller_scheduling_seconds": rounded_scheduling,
     }
 
 
@@ -2519,22 +3438,35 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
     token_totals: Counter[str] = Counter()
     completed = 0
     failed = 0
+    isolated_quarantines = 0
     process_attempts = 0
     process_retries = 0
     prepare_active_seconds = 0.0
     worker_values: list[dict] = []
     review_to_write: list[float] = []
     writer_seconds: list[float] = []
+    write_wait_samples: list[dict] = []
     queue_depths: list[int] = []
     for outcome in result.outcomes:
         value = outcome.value if isinstance(outcome.value, dict) else {}
         worker_values.append(value)
         worker_status = value.get("status")
-        if outcome.status == "completed" and worker_status == "completed":
-            completed += 1
-            business_state = value.get("business_state")
-            if isinstance(business_state, str):
-                business_results[business_state] += 1
+        if outcome.status == "completed" and worker_status in {
+            "completed",
+            "quarantined",
+        }:
+            if worker_status == "quarantined" and not (
+                value.get("write_state") == "not_requested"
+                and value.get("error_code") in ITEM_LOCAL_QUARANTINE_REASONS
+            ):
+                failed += 1
+            else:
+                completed += 1
+                if worker_status == "quarantined":
+                    isolated_quarantines += 1
+                business_state = value.get("business_state")
+                if isinstance(business_state, str):
+                    business_results[business_state] += 1
         elif outcome.status not in {"timed_out", "stopped"}:
             failed += 1
         error_code = value.get("error_code") or outcome.error_code
@@ -2555,6 +3487,22 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
             bool,
         ):
             writer_seconds.append(float(writer_elapsed))
+        write_wait = value.get("write_wait_attribution")
+        if (
+            isinstance(write_wait, dict)
+            and write_wait.get("status") == "exact"
+            and all(
+                isinstance(write_wait.get(field), (int, float))
+                and not isinstance(write_wait.get(field), bool)
+                for field in (
+                    "total_seconds",
+                    "writer_busy_seconds",
+                    "fifo_head_of_line_seconds",
+                    "controller_scheduling_seconds",
+                )
+            )
+        ):
+            write_wait_samples.append(write_wait)
         queue_depth = value.get("write_queue_depth_at_enqueue")
         if isinstance(queue_depth, int) and not isinstance(queue_depth, bool):
             queue_depths.append(queue_depth)
@@ -2636,11 +3584,33 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
                 default=0,
             ),
         },
+        "write_wait_attribution": {
+            "samples": len(write_wait_samples),
+            "writer_busy_seconds": round(
+                sum(item["writer_busy_seconds"] for item in write_wait_samples),
+                6,
+            ),
+            "fifo_head_of_line_seconds": round(
+                sum(
+                    item["fifo_head_of_line_seconds"]
+                    for item in write_wait_samples
+                ),
+                6,
+            ),
+            "controller_scheduling_seconds": round(
+                sum(
+                    item["controller_scheduling_seconds"]
+                    for item in write_wait_samples
+                ),
+                6,
+            ),
+        },
     }
     return {
         "requested": result.requested,
         "started": result.started,
         "completed": completed,
+        "isolated_quarantines": isolated_quarantines,
         "failed": failed + result.failed,
         "timed_out": result.timed_out,
         "stopped": result.stopped,
@@ -2663,9 +3633,15 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
         "transient_error_events": transient_error_events,
         "pipeline": pipeline,
         "processes_reaped": result.processes_reaped,
+        "discovery_refreshes": result.discovery_refreshes,
+        "late_visible": result.late_visible_count,
+        "late_visible_pending": result.late_visible_pending_count,
+        "discovery_exhausted": result.discovery_exhausted,
+        "admission_closed": result.admission_closed,
         "recommended_capacity": result.recommended_capacity,
         "capacity_decisions": list(result.capacity_decisions),
         "_pipeline_review_wait_samples": review_to_write,
+        "_pipeline_write_wait_samples": write_wait_samples,
         "_pipeline_active_review_sum": active_review_sum,
         "_pipeline_review_capacity_sum": review_capacity_sum,
         "token_usage": {
@@ -2702,6 +3678,9 @@ def run_rolling_drain(
     try:
         with runtime_control.global_controller_lease():
             cache_maintenance = attachment_cache.prune_expired()
+            admission_cutoff = (
+                datetime.now(timezone.utc) + timedelta(minutes=60)
+            ).isoformat()
             historical_unknown_identities = (
                 _local_unknown_quarantined_identities()
                 if pipeline_runner is _run_global_dispatched_tasks
@@ -2719,16 +3698,22 @@ def run_rolling_drain(
                     "review_timeout_seconds": 960,
                     "writer_capacity": 1,
                     "recovery_count": len(recovery_queue),
+                    "admission_cutoff": admission_cutoff,
                 }
             )
             children_reaped = True
             pending_recoveries = recovery_queue
+            committed_received_at: str | None = None
+            committed_request_id: str | None = None
+            known_late_visible_keys: frozenset[str] = frozenset()
 
             def tracked_pipeline_runner(
                 count: int,
                 review_capacity: int,
             ) -> process_pool.PoolResult[dict]:
                 nonlocal children_reaped, pending_recoveries
+                nonlocal committed_received_at, committed_request_id
+                nonlocal known_late_visible_keys
                 children_reaped = False
                 if pipeline_runner is _run_global_dispatched_tasks:
                     wave_result = _run_global_dispatched_tasks(
@@ -2740,8 +3725,17 @@ def run_rolling_drain(
                             historical_unknown_identities
                         ),
                         recovery_action_files=pending_recoveries,
+                        committed_received_at=committed_received_at,
+                        committed_request_id=committed_request_id,
+                        known_late_visible_keys=known_late_visible_keys,
+                        admission_cutoff=admission_cutoff,
                     )
                     pending_recoveries = ()
+                    committed_received_at = wave_result.committed_received_at
+                    committed_request_id = wave_result.committed_request_id
+                    known_late_visible_keys = frozenset(
+                        wave_result.late_visible_keys
+                    )
                 else:
                     wave_result = pipeline_runner(count, review_capacity)
                 children_reaped = wave_result.processes_reaped is True
@@ -2822,7 +3816,12 @@ def _run_rolling_drain_locked(
         raise ValueError("production_probe_stopped")
     started_at = time.monotonic()
     try:
-        initial_pending, quarantined_pending, initial_actionable = (
+        (
+            initial_pending,
+            quarantined_pending,
+            initial_actionable,
+            unauthorized_pending,
+        ) = (
             _rolling_snapshot(live_status, reconcile_status)
         )
     except ValueError as error:
@@ -2843,8 +3842,36 @@ def _run_rolling_drain_locked(
         "healthy_windows": 0,
         "reason": "fixed_capacity",
     }
-    initial_quarantined = quarantined_pending
-    while actionable:
+    discovery_refreshes = 1
+    late_visible_pending = 0
+    post_boundary_actionable = 0
+    admission_closed = False
+    empty_snapshots = 0 if actionable else 1
+    required_empty_snapshots = 2
+    while actionable or empty_snapshots < required_empty_snapshots:
+        if not actionable:
+            quarantined_before_refresh = quarantined_pending
+            try:
+                (
+                    pending,
+                    quarantined_pending,
+                    actionable,
+                    unauthorized_pending,
+                ) = _rolling_snapshot(live_status, reconcile_status)
+            except ValueError:
+                runtime_control.request_stop()
+                raise
+            discovery_refreshes += 1
+            if quarantined_pending > quarantined_before_refresh:
+                runtime_control.request_stop()
+                status = "failed"
+                stop_reason = "quarantine_increased"
+                break
+            if actionable:
+                empty_snapshots = 0
+                continue
+            empty_snapshots += 1
+            continue
         if len(waves) >= max_waves:
             runtime_control.request_stop()
             raise ValueError("production_rolling_wave_limit_reached")
@@ -2864,6 +3891,7 @@ def _run_rolling_drain_locked(
         wave = _rolling_wave_metrics(pipeline_result)
         wave["capacity"] = current_capacity
         waves.append(wave)
+        late_visible_pending = int(wave.get("late_visible_pending") or 0)
         if (
             wave["failed"]
             or wave["timed_out"]
@@ -2893,19 +3921,43 @@ def _run_rolling_drain_locked(
                     "reason": stop_reason,
                 }
             break
+        quarantined_before_wave = quarantined_pending
         try:
-            pending, quarantined_pending, actionable = _rolling_snapshot(
-                live_status,
-                reconcile_status,
-            )
+            (
+                pending,
+                quarantined_pending,
+                actionable,
+                unauthorized_pending,
+            ) = _rolling_snapshot(live_status, reconcile_status)
         except ValueError:
             runtime_control.request_stop()
             raise
-        if quarantined_pending > initial_quarantined:
+        discovery_refreshes += 1
+        quarantine_growth = max(
+            0,
+            quarantined_pending - quarantined_before_wave,
+        )
+        if quarantine_growth > int(wave.get("isolated_quarantines") or 0):
             runtime_control.request_stop()
             status = "failed"
             stop_reason = "quarantine_increased"
             break
+        if wave.get("admission_closed") is True:
+            admission_closed = True
+            unauthorized_pending += actionable
+            actionable = 0
+            empty_snapshots = required_empty_snapshots
+            break
+        if wave.get("discovery_exhausted") is True:
+            unauthorized_pending += min(actionable, late_visible_pending)
+            post_boundary_actionable = max(
+                0,
+                actionable - late_visible_pending,
+            )
+            actionable = 0
+            empty_snapshots = required_empty_snapshots
+            break
+        empty_snapshots = 0 if actionable else 1
         if adaptive:
             internal_decisions = wave.get("capacity_decisions") or []
             if internal_decisions:
@@ -2973,6 +4025,11 @@ def _run_rolling_drain_locked(
         float(value)
         for wave in waves
         for value in wave.get("_pipeline_review_wait_samples", [])
+    ]
+    pipeline_write_wait_samples = [
+        value
+        for wave in waves
+        for value in wave.get("_pipeline_write_wait_samples", [])
     ]
     pipeline_writer_seconds = sum(
         float(wave.get("pipeline", {}).get("writer", {}).get("busy_seconds") or 0)
@@ -3045,6 +4102,30 @@ def _run_rolling_drain_locked(
                 default=0,
             ),
         },
+        "write_wait_attribution": {
+            "samples": len(pipeline_write_wait_samples),
+            "writer_busy_seconds": round(
+                sum(
+                    float(item["writer_busy_seconds"])
+                    for item in pipeline_write_wait_samples
+                ),
+                6,
+            ),
+            "fifo_head_of_line_seconds": round(
+                sum(
+                    float(item["fifo_head_of_line_seconds"])
+                    for item in pipeline_write_wait_samples
+                ),
+                6,
+            ),
+            "controller_scheduling_seconds": round(
+                sum(
+                    float(item["controller_scheduling_seconds"])
+                    for item in pipeline_write_wait_samples
+                ),
+                6,
+            ),
+        },
     }
     processes_reaped = all(
         wave.get("processes_reaped") is True for wave in waves
@@ -3071,6 +4152,17 @@ def _run_rolling_drain_locked(
             else "unknown"
         ),
         "quarantined_pending": quarantined_pending,
+        "unauthorized_pending": unauthorized_pending,
+        "empty_snapshots": empty_snapshots,
+        "discovery_refreshes": discovery_refreshes,
+        "prepare_discovery_refreshes": sum(
+            int(wave.get("discovery_refreshes") or 0) for wave in waves
+        ),
+        "late_visible": sum(
+            int(wave.get("late_visible") or 0) for wave in waves
+        ),
+        "admission_closed": admission_closed,
+        "post_boundary_actionable": post_boundary_actionable,
         "waves": len(waves),
         "cache_maintenance_waves": cache_maintenance_waves,
         "completed": completed,

@@ -106,7 +106,7 @@ import sys
 import time
 
 child = subprocess.Popen([sys.executable, "-c", {child_program!r}, {marker!r}])
-Path(os.environ["OA_TEST_CODEX_PID_FILE"]).write_text(
+Path({str(pid_file)!r}).write_text(
     f"{{os.getpid()}}\\n{{child.pid}}\\n", encoding="utf-8"
 )
 sys.stdin.read()
@@ -116,7 +116,6 @@ time.sleep(15)
     )
     fake_codex.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_root}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setenv("OA_TEST_CODEX_PID_FILE", str(pid_file))
     return pid_file, fake_codex, marker
 
 

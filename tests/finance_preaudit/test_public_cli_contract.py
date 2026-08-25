@@ -80,6 +80,60 @@ def test_status_reconciliation_stays_read_only_inside_status_command(
     assert json.loads(output.getvalue())["reconciliation"]["read_only"] is True
 
 
+def test_status_combines_fresh_live_queue_counts_without_identities(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    output = io.StringIO()
+
+    with redirect_stdout(output):
+        exit_code = cli.main(
+            [
+                "status",
+                "--root",
+                str(root),
+                "--check-live",
+                "--reconcile",
+            ],
+            runtime_status=lambda _root: {
+                "schema_version": 1,
+                "kind": "preaudit_runtime_status",
+                "operations": {"remaining": 1},
+            },
+            live_status=lambda: {
+                "schema_version": 1,
+                "kind": "preaudit_live_status",
+                "status": "ok",
+                "oa": {
+                    "execution_identity": "verified",
+                    "supported": 5,
+                    "unsupported": 1,
+                },
+            },
+            reconcile_status=lambda _root: {
+                "schema_version": 1,
+                "kind": "preaudit_reconciliation",
+                "read_only": True,
+                "quarantine": {
+                    "pending_quarantined": 2,
+                    "actionable_pending": 3,
+                },
+            },
+        )
+
+    assert exit_code == 0
+    payload = json.loads(output.getvalue())
+    assert payload["operations"]["live_queue"] == {
+        "evidence_status": "exact",
+        "remaining": 5,
+        "actionable": 3,
+        "quarantined": 2,
+        "unsupported": 1,
+    }
+    assert "request_id" not in json.dumps(payload)
+
+
 def test_live_global_reconciliation_excludes_unsupported_pending(
     tmp_path: Path,
     monkeypatch,

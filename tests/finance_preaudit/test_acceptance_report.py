@@ -69,6 +69,8 @@ def _samples(
                         "postcheck": 0,
                         "close": 1,
                     },
+                    "stage_timestamps": {},
+                    "pipeline_evidence": {"status": "unknown"},
                     "token_usage": (
                         {
                             "status": "exact",

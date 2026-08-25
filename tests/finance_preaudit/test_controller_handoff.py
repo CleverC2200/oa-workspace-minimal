@@ -153,7 +153,7 @@ def test_unreaped_pipeline_blocks_terminal_handoff(
         "OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE",
         str(tmp_path / "control" / "rolling-controller.lock"),
     )
-    pending = iter((1, 0))
+    pending = iter((1, 0, 0))
     current = [0]
 
     def live() -> dict:

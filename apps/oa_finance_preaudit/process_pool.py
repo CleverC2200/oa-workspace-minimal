@@ -38,6 +38,14 @@ class PoolResult(Generic[Output]):
     processes_reaped: bool = True
     recommended_capacity: int | None = None
     capacity_decisions: tuple[dict, ...] = ()
+    discovery_refreshes: int = 0
+    late_visible_count: int = 0
+    late_visible_keys: tuple[str, ...] = ()
+    committed_received_at: str | None = None
+    committed_request_id: str | None = None
+    late_visible_pending_count: int = 0
+    discovery_exhausted: bool = False
+    admission_closed: bool = False
 
 
 @dataclass

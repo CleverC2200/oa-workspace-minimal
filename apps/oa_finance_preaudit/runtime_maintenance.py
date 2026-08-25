@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -38,6 +39,19 @@ _FAILURE_CODES = {
     "writer_result_unknown",
     *writer_outcomes.FAILURE_CODES,
 }
+ITEM_LOCAL_MATERIAL_FAILURE_DETAILS = frozenset(
+    {
+        "attachment_download_capacity_timeout",
+        "attachment_download_failed",
+        "attachment_download_incomplete",
+        "attachment_download_launch_timeout",
+        "attachment_download_timeout",
+        "invoice_buyer_read_failed",
+        "travel_attachment_discovery_failed",
+        "travel_attachment_failed",
+        "travel_attachment_resources_incomplete",
+    }
+)
 _MANAGED_PATH = re.compile(
     r"^(?:(?:\.archive/)?(?:travel_expense|business_entertainment|"
     r"business_support_fee|small_marketing_fee|packaging_layout_approval)/"
@@ -211,6 +225,103 @@ def _quality_from_receipt(attempt_root: Path, *, closed: bool) -> dict:
     }
 
 
+def _pipeline_evidence(
+    attempt_root: Path,
+    *,
+    item_key: str,
+    workflow_key: str,
+    attempt: int,
+) -> dict:
+    path = attempt_root / "pipeline-metrics.json"
+    if path.is_symlink() or not path.is_file():
+        return {"status": "unknown"}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        attribution = payload["write_wait_attribution"]
+        expected_fields = {
+            "schema_version",
+            "kind",
+            "status",
+            "item_key",
+            "workflow_key",
+            "attempt",
+            "event_suffix",
+            "write_ready_at",
+            "write_start_at",
+            "write_queue_depth_at_enqueue",
+            "write_wait_attribution",
+        }
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != expected_fields
+            or not isinstance(payload.get("schema_version"), int)
+            or isinstance(payload.get("schema_version"), bool)
+            or payload["schema_version"] != SCHEMA_VERSION
+            or payload.get("kind") != "preaudit_pipeline_metrics"
+            or payload.get("status") != "exact"
+            or payload.get("item_key") != item_key
+            or payload.get("workflow_key") != workflow_key
+            or not isinstance(payload.get("attempt"), int)
+            or isinstance(payload.get("attempt"), bool)
+            or payload["attempt"] != attempt
+            or not isinstance(payload.get("event_suffix"), int)
+            or isinstance(payload.get("event_suffix"), bool)
+            or payload["event_suffix"] < 1
+            or not isinstance(payload.get("write_queue_depth_at_enqueue"), int)
+            or isinstance(payload.get("write_queue_depth_at_enqueue"), bool)
+            or payload["write_queue_depth_at_enqueue"] < 0
+            or not _valid_write_wait_attribution(attribution)
+        ):
+            raise ValueError
+        write_ready_at = _timestamp(payload["write_ready_at"])
+        write_start_at = _timestamp(payload["write_start_at"])
+        if write_ready_at > write_start_at:
+            raise ValueError
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {"status": "unknown"}
+    return {
+        "status": "exact",
+        "write_ready_at": write_ready_at.isoformat(),
+        "write_start_at": write_start_at.isoformat(),
+        "write_queue_depth_at_enqueue": payload[
+            "write_queue_depth_at_enqueue"
+        ],
+        "write_wait_attribution": attribution,
+    }
+
+
+def _valid_write_wait_attribution(value: object) -> bool:
+    if value == {"status": "unknown"}:
+        return True
+    fields = {
+        "status",
+        "total_seconds",
+        "writer_busy_seconds",
+        "fifo_head_of_line_seconds",
+        "controller_scheduling_seconds",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        return False
+    if value.get("status") == "unknown":
+        return all(value.get(field) == "unknown" for field in fields - {"status"})
+    numbers = [value.get(field) for field in fields - {"status"}]
+    if value.get("status") != "exact" or not all(
+        isinstance(number, (int, float))
+        and not isinstance(number, bool)
+        and math.isfinite(float(number))
+        and number >= 0
+        for number in numbers
+    ):
+        return False
+    return math.isclose(
+        float(value["total_seconds"]),
+        float(value["writer_busy_seconds"])
+        + float(value["fifo_head_of_line_seconds"])
+        + float(value["controller_scheduling_seconds"]),
+        abs_tol=1e-6,
+    )
+
+
 def _project_case_metric(attempt_root: Path, state: dict) -> dict | None:
     execution_state = state.get("execution_state")
     if execution_state not in {"closed", "needs_admin"}:
@@ -242,8 +353,8 @@ def _project_case_metric(attempt_root: Path, state: dict) -> dict | None:
     except (KeyError, TypeError, ValueError):
         return None
     observed = summary["by_item"].get(expected_item_key)
-    phases = {
-        phase: 0
+    phases: dict[str, int | str] = {
+        phase: "unknown"
         for phase in (
             "discover",
             "collect",
@@ -255,6 +366,8 @@ def _project_case_metric(attempt_root: Path, state: dict) -> dict | None:
         )
     }
     active_seconds = 0
+    waiting_seconds: int | str = "unknown"
+    timing_status = "unknown"
     token_usage = {"status": "unknown"}
     if observed is not None:
         for phase, metrics in observed["phases"].items():
@@ -262,6 +375,10 @@ def _project_case_metric(attempt_root: Path, state: dict) -> dict | None:
                 phases[phase] = metrics["wall_seconds"]
         active_seconds = min(end_to_end, observed["active_seconds"])
         token_usage = observed["token_usage"]
+        wait_metrics = observed["phases"].get("wait")
+        if wait_metrics is not None:
+            waiting_seconds = observed["waiting_seconds"]
+            timing_status = "exact"
     coordination = summary["totals"]["coordination"]
     submit_events = (
         observed["phases"].get("submit", {}).get("event_count", 0)
@@ -271,6 +388,14 @@ def _project_case_metric(attempt_root: Path, state: dict) -> dict | None:
     write_state = state.get("write_state")
     if write_state not in {"not_requested", "submitted", "unknown"}:
         write_state = "unknown"
+    stage_timestamps = observability.attempt_stage_timestamps(
+        attempt_root / "observability.json",
+        item_key=expected_item_key,
+    )
+    stage_timestamps["claimed"] = {
+        "status": "exact",
+        "occurred_at": created_at.isoformat(),
+    }
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": "preaudit_case_metric",
@@ -281,9 +406,16 @@ def _project_case_metric(attempt_root: Path, state: dict) -> dict | None:
         "backlog_age_seconds": backlog_age,
         "end_to_end_seconds": end_to_end,
         "active_seconds": active_seconds,
-        "waiting_seconds": 0,
-        "timing_status": "unknown",
+        "waiting_seconds": waiting_seconds,
+        "timing_status": timing_status,
         "phase_seconds": phases,
+        "stage_timestamps": stage_timestamps,
+        "pipeline_evidence": _pipeline_evidence(
+            attempt_root,
+            item_key=expected_item_key,
+            workflow_key=str(state["workflow_key"]),
+            attempt=int(state["attempt"]),
+        ),
         "token_usage": token_usage,
         "business_state": state["business_state"],
         "write_state": write_state,
@@ -297,6 +429,82 @@ def _project_case_metric(attempt_root: Path, state: dict) -> dict | None:
         "agent_messages": "unknown",
         "coordination_seconds": coordination["wall_seconds"],
         "coordination_tokens": coordination["total_tokens"],
+    }
+
+
+def _operation_projection(items: list[dict]) -> dict:
+    open_items = [item for item in items if item["execution_state"] != "closed"]
+    unknown = [item for item in open_items if item["write_state"] == "unknown"]
+    isolated = [
+        item
+        for item in open_items
+        if item["execution_state"] == "needs_admin"
+        and item["write_state"] == "not_requested"
+        and item["failure_code"] == "material_collection_failed"
+        and item["failure_detail_code"]
+        in ITEM_LOCAL_MATERIAL_FAILURE_DETAILS
+    ]
+    technical = [
+        item
+        for item in open_items
+        if item["execution_state"] == "needs_admin"
+        and item not in isolated
+        and item not in unknown
+    ]
+    stages: dict[str, int] = {}
+    for item in open_items:
+        stage = str(item["execution_state"])
+        stages[stage] = stages.get(stage, 0) + 1
+    if unknown:
+        next_step = "reconcile_unknown"
+        bottleneck_kind = "unknown_write_outcome"
+        bottleneck_count = len(unknown)
+        bottleneck_evidence = "exact"
+    elif technical:
+        next_step = "inspect_technical_failure"
+        bottleneck_kind = "technical_failure"
+        bottleneck_count = len(technical)
+        bottleneck_evidence = "exact"
+    elif open_items:
+        next_step = "continue_fifo"
+        bottleneck_kind = "unknown"
+        bottleneck_count = len(open_items)
+        bottleneck_evidence = "unknown"
+    else:
+        next_step = "complete"
+        bottleneck_kind = "none"
+        bottleneck_count = 0
+        bottleneck_evidence = "exact"
+    oldest_wait_seconds = max(
+        (int(item["age_seconds"]) for item in open_items),
+        default=0,
+    )
+    return {
+        "remaining": len(open_items),
+        "completed": sum(
+            item["execution_state"] == "closed" for item in items
+        ),
+        "needs_human": sum(
+            item["execution_state"] == "closed"
+            and item["business_state"] == "needs_human"
+            for item in items
+        ),
+        "item_local_quarantined": len(isolated),
+        "technical_failures": len(technical),
+        "unknown": len(unknown),
+        "oldest_wait_seconds": oldest_wait_seconds,
+        "backlog_wait": {
+            "evidence_status": "exact",
+            "open_cases": len(open_items),
+            "oldest_seconds": oldest_wait_seconds,
+        },
+        "current_bottleneck": {
+            "evidence_status": bottleneck_evidence,
+            "kind": bottleneck_kind,
+            "affected_cases": bottleneck_count,
+        },
+        "current_stages": dict(sorted(stages.items())),
+        "next_step": next_step,
     }
 
 
@@ -715,6 +923,12 @@ def status(root: Path, *, now: datetime | None = None) -> dict:
             if reason in _FAILURE_CODES
             else ("unknown_failure" if reason else None)
         )
+        raw_failure_detail = str(state.get("failure_detail_code") or "")
+        failure_detail_code = (
+            raw_failure_detail
+            if raw_failure_detail in ITEM_LOCAL_MATERIAL_FAILURE_DETAILS
+            else ("unclassified" if raw_failure_detail else None)
+        )
         by_workflow.setdefault(state["workflow_key"], []).append(
             {
                 "item_key": _item_key(state["case_key"], state["attempt"]),
@@ -726,10 +940,12 @@ def status(root: Path, *, now: datetime | None = None) -> dict:
                 "business_state": state["business_state"],
                 "write_state": state["write_state"],
                 "failure_code": failure_code,
+                "failure_detail_code": failure_detail_code,
             }
         )
 
     workflows: list[dict] = []
+    operation_items: list[dict] = []
     for workflow_key, attempts in sorted(by_workflow.items()):
         attempts.sort(key=lambda item: (item["created_at"], item["item_key"]))
         latest_by_case: dict[str, dict] = {}
@@ -741,6 +957,7 @@ def status(root: Path, *, now: datetime | None = None) -> dict:
             latest_by_case.values(),
             key=lambda item: (item["created_at"], item["item_key"]),
         )
+        operation_items.extend(current_attempts)
         latest = current_attempts[-1]
         open_attempts = [
             item for item in current_attempts if item["execution_state"] != "closed"
@@ -785,6 +1002,7 @@ def status(root: Path, *, now: datetime | None = None) -> dict:
                 "business_states": business_states,
                 "write_states": write_states,
                 "failure_counts": failure_counts,
+                "operations": _operation_projection(current_attempts),
             }
         )
     daily_cutoff = current_time.astimezone(_LOCAL_TIMEZONE).date() - timedelta(
@@ -816,6 +1034,7 @@ def status(root: Path, *, now: datetime | None = None) -> dict:
         "schema_version": SCHEMA_VERSION,
         "kind": "preaudit_runtime_status",
         "generated_at": current_time.isoformat(),
+        "operations": _operation_projection(operation_items),
         "workflows": workflows,
         "observability": observability.summarize_logs(
             path

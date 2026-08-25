@@ -29,6 +29,7 @@ def _attempt(
     business_state: str = "pass",
     write_state: str = "not_requested",
     reason: str | None = None,
+    failure_detail_code: str | None = None,
     archived: bool = False,
     received_at: str | None = None,
 ) -> Path:
@@ -62,6 +63,8 @@ def _attempt(
     }
     if reason is not None:
         state["reason"] = reason
+    if failure_detail_code is not None:
+        state["failure_detail_code"] = failure_detail_code
     json_artifact.write_json_atomic(attempt_root / "state.json", state)
     (attempt_root / "material.json").write_text(
         '{"sensitive":"must-not-appear"}',
@@ -193,6 +196,425 @@ def test_status_is_versioned_and_sanitized(tmp_path: Path) -> None:
     assert "sensitive" not in encoded
     assert str(root) not in encoded
     assert "request_id" not in encoded
+
+
+def test_status_projects_operational_summary_and_exact_stage_timeline(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    closed = _attempt(
+        root,
+        case_key="closed",
+        attempt=1,
+        age_days=2,
+        execution_state="closed",
+        business_state="needs_human",
+        write_state="submitted",
+    )
+    _attempt(
+        root,
+        case_key="isolated",
+        attempt=1,
+        age_days=1,
+        execution_state="needs_admin",
+        business_state="not_available",
+        write_state="not_requested",
+        reason="material_collection_failed",
+        failure_detail_code="attachment_download_failed",
+    )
+    _attempt(
+        root,
+        case_key="unknown",
+        attempt=1,
+        age_days=0,
+        execution_state="needs_admin",
+        business_state="not_available",
+        write_state="unknown",
+        reason="writer_result_unknown",
+    )
+    _attempt(
+        root,
+        case_key="reviewing",
+        attempt=1,
+        age_days=0,
+        execution_state="review_required",
+        business_state="not_available",
+        write_state="authorized",
+    )
+    state = json.loads((closed / "state.json").read_text(encoding="utf-8"))
+    item_key = observability.attempt_key(
+        state["request_id"],
+        state["received_at"],
+        state["attempt"],
+    )
+    for index, phase in enumerate(
+        ("discover", "collect", "review", "submit", "postcheck", "close"),
+        start=1,
+    ):
+        observability.record_event(
+            closed / "observability.json",
+            {
+                "event_id": f"{index:02d}-{phase}",
+                "item_key": item_key,
+                "workflow_key": "travel_expense",
+                "occurred_at": f"2026-08-20T12:00:{index:02d}Z",
+                "phase": phase,
+                "wall_seconds": 1,
+                "active_seconds": 1,
+                "queue_wait_seconds": 0,
+                "result": "success",
+                "model": None,
+                "token_usage": {"status": "unknown"},
+            },
+        )
+
+    status = runtime_maintenance.status(root, now=NOW)
+    encoded = json.dumps(status, ensure_ascii=False)
+
+    assert status["operations"] == {
+        "remaining": 3,
+        "completed": 1,
+        "needs_human": 1,
+        "item_local_quarantined": 1,
+        "technical_failures": 0,
+        "unknown": 1,
+        "oldest_wait_seconds": 86400,
+        "backlog_wait": {
+            "evidence_status": "exact",
+            "open_cases": 3,
+            "oldest_seconds": 86400,
+        },
+        "current_bottleneck": {
+            "evidence_status": "exact",
+            "kind": "unknown_write_outcome",
+            "affected_cases": 1,
+        },
+        "current_stages": {"needs_admin": 2, "review_required": 1},
+        "next_step": "reconcile_unknown",
+    }
+    timeline = status["case_metrics"][0]["stage_timestamps"]
+    assert status["case_metrics"][0]["waiting_seconds"] == "unknown"
+    assert status["case_metrics"][0]["timing_status"] == "unknown"
+    assert status["case_metrics"][0]["phase_seconds"] == {
+        "discover": 1,
+        "collect": 1,
+        "review": 1,
+        "wait": "unknown",
+        "submit": 1,
+        "postcheck": 1,
+        "close": 1,
+    }
+    assert timeline["claimed"]["status"] == "exact"
+    assert timeline["discovered"] == {
+        "status": "exact",
+        "occurred_at": "2026-08-20T12:00:01Z",
+    }
+    assert timeline["prepared"] == {
+        "status": "exact",
+        "occurred_at": "2026-08-20T12:00:02Z",
+    }
+    assert timeline["write_ready"] == {"status": "unknown"}
+    assert timeline["writer"] == {
+        "status": "exact",
+        "occurred_at": "2026-08-20T12:00:04Z",
+    }
+    assert timeline["postcheck"] == {
+        "status": "exact",
+        "occurred_at": "2026-08-20T12:00:05Z",
+    }
+    assert timeline["closed"] == {
+        "status": "exact",
+        "occurred_at": "2026-08-20T12:00:06Z",
+    }
+    assert "request-" not in encoded
+    assert str(root) not in encoded
+
+
+def test_status_projects_wait_evidence_without_guessing_legacy_wait(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    closed = _attempt(
+        root,
+        case_key="wait-evidence",
+        attempt=1,
+        age_days=0,
+        execution_state="closed",
+        business_state="pass",
+        write_state="submitted",
+    )
+    state = json.loads((closed / "state.json").read_text(encoding="utf-8"))
+    item_key = observability.attempt_key(
+        state["request_id"],
+        state["received_at"],
+        state["attempt"],
+    )
+    for event_id, occurred_at, wall_seconds in (
+        ("wait-ready", "2026-08-22T12:00:00Z", 0),
+        ("wait-duration", "2026-08-22T12:00:12Z", 12),
+    ):
+        observability.record_event(
+            closed / "observability.json",
+            {
+            "event_id": event_id,
+            "item_key": item_key,
+            "workflow_key": "travel_expense",
+            "occurred_at": occurred_at,
+            "phase": "wait",
+            "wall_seconds": wall_seconds,
+            "active_seconds": 0,
+            "queue_wait_seconds": wall_seconds,
+            "result": "success",
+            "model": None,
+            "token_usage": {"status": "unknown"},
+            },
+        )
+    json_artifact.write_json_atomic(
+        closed / "pipeline-metrics.json",
+        {
+            "schema_version": 1,
+            "kind": "preaudit_pipeline_metrics",
+            "status": "exact",
+            "item_key": item_key,
+            "workflow_key": "travel_expense",
+            "attempt": 1,
+            "event_suffix": 1,
+            "write_ready_at": "2026-08-22T12:00:00+00:00",
+            "write_start_at": "2026-08-22T12:00:12+00:00",
+            "write_queue_depth_at_enqueue": 2,
+            "write_wait_attribution": {
+                "status": "exact",
+                "total_seconds": 12.0,
+                "writer_busy_seconds": 5.0,
+                "fifo_head_of_line_seconds": 4.0,
+                "controller_scheduling_seconds": 3.0,
+            },
+        },
+    )
+
+    status = runtime_maintenance.status(root, now=NOW)
+    metric = status["case_metrics"][0]
+
+    assert metric["waiting_seconds"] == 12
+    assert metric["timing_status"] == "exact"
+    assert metric["stage_timestamps"]["write_ready"] == {
+        "status": "exact",
+        "occurred_at": "2026-08-22T12:00:00Z",
+    }
+    assert metric["pipeline_evidence"]["write_queue_depth_at_enqueue"] == 2
+    assert metric["pipeline_evidence"]["write_wait_attribution"] == {
+        "status": "exact",
+        "total_seconds": 12.0,
+        "writer_busy_seconds": 5.0,
+        "fifo_head_of_line_seconds": 4.0,
+        "controller_scheduling_seconds": 3.0,
+    }
+
+
+def test_status_keeps_each_missing_phase_unknown(tmp_path: Path) -> None:
+    root = tmp_path / "runtime"
+    closed = _attempt(
+        root,
+        case_key="missing-phases",
+        attempt=1,
+        age_days=0,
+        execution_state="closed",
+        business_state="pass",
+        write_state="submitted",
+    )
+    state = json.loads((closed / "state.json").read_text(encoding="utf-8"))
+    item_key = observability.attempt_key(
+        state["request_id"],
+        state["received_at"],
+        state["attempt"],
+    )
+    observability.record_event(
+        closed / "observability.json",
+        {
+            "event_id": "01-discover",
+            "item_key": item_key,
+            "workflow_key": "travel_expense",
+            "occurred_at": "2026-08-22T12:00:00Z",
+            "phase": "discover",
+            "wall_seconds": 1,
+            "active_seconds": 1,
+            "queue_wait_seconds": 0,
+            "result": "success",
+            "model": None,
+            "token_usage": {"status": "unknown"},
+        },
+    )
+
+    phases = runtime_maintenance.status(root, now=NOW)["case_metrics"][0][
+        "phase_seconds"
+    ]
+
+    assert phases == {
+        "discover": 1,
+        "collect": "unknown",
+        "review": "unknown",
+        "wait": "unknown",
+        "submit": "unknown",
+        "postcheck": "unknown",
+        "close": "unknown",
+    }
+
+
+def test_status_only_counts_allowlisted_material_failures_as_local_quarantine(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    _attempt(
+        root,
+        case_key="stable-material-failure",
+        attempt=1,
+        age_days=1,
+        execution_state="needs_admin",
+        business_state="not_available",
+        write_state="not_requested",
+        reason="material_collection_failed",
+        failure_detail_code="attachment_download_failed",
+    )
+    _attempt(
+        root,
+        case_key="unsafe-material-failure",
+        attempt=1,
+        age_days=0,
+        execution_state="needs_admin",
+        business_state="not_available",
+        write_state="not_requested",
+        reason="material_collection_failed",
+        failure_detail_code="frozen_material_changed",
+    )
+
+    status = runtime_maintenance.status(root, now=NOW)
+
+    assert status["operations"]["item_local_quarantined"] == 1
+    assert status["operations"]["technical_failures"] == 1
+    assert status["operations"]["current_bottleneck"] == {
+        "evidence_status": "exact",
+        "kind": "technical_failure",
+        "affected_cases": 1,
+    }
+    assert "frozen_material_changed" not in json.dumps(status)
+
+
+@pytest.mark.parametrize(
+    "attribution",
+    (
+        {
+            "status": "exact",
+            "total_seconds": 10,
+            "writer_busy_seconds": 8,
+            "fifo_head_of_line_seconds": 8,
+            "controller_scheduling_seconds": 0,
+        },
+        {
+            "status": "exact",
+            "total_seconds": -1,
+            "writer_busy_seconds": 0,
+            "fifo_head_of_line_seconds": 0,
+            "controller_scheduling_seconds": 0,
+        },
+        {"status": "unknown", "secret": "must-not-pass"},
+    ),
+)
+def test_pipeline_evidence_rejects_untrusted_attribution(
+    tmp_path: Path,
+    attribution: dict,
+) -> None:
+    root = tmp_path / "runtime"
+    closed = _attempt(
+        root,
+        case_key="pipeline-untrusted",
+        attempt=1,
+        age_days=0,
+        execution_state="closed",
+        business_state="pass",
+        write_state="submitted",
+    )
+    state = json.loads((closed / "state.json").read_text(encoding="utf-8"))
+    item_key = observability.attempt_key(
+        state["request_id"],
+        state["received_at"],
+        state["attempt"],
+    )
+    json_artifact.write_json_atomic(
+        closed / "pipeline-metrics.json",
+        {
+            "schema_version": 1,
+            "kind": "preaudit_pipeline_metrics",
+            "status": "exact",
+            "item_key": item_key,
+            "workflow_key": "travel_expense",
+            "attempt": 1,
+            "event_suffix": 1,
+            "write_ready_at": "2026-08-22T12:00:00+00:00",
+            "write_start_at": "2026-08-22T12:00:12+00:00",
+            "write_queue_depth_at_enqueue": 1,
+            "write_wait_attribution": attribution,
+        },
+    )
+
+    metric = runtime_maintenance.status(root, now=NOW)["case_metrics"][0]
+
+    assert metric["pipeline_evidence"] == {"status": "unknown"}
+    assert "must-not-pass" not in json.dumps(metric)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("schema_version", True),
+        ("attempt", True),
+        ("event_suffix", True),
+        ("schema_version", 1.0),
+        ("attempt", 1.0),
+    ),
+)
+def test_pipeline_evidence_rejects_boolean_integer_fields(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    root = tmp_path / "runtime"
+    closed = _attempt(
+        root,
+        case_key="pipeline-boolean",
+        attempt=1,
+        age_days=0,
+        execution_state="closed",
+        business_state="pass",
+        write_state="submitted",
+    )
+    state = json.loads((closed / "state.json").read_text(encoding="utf-8"))
+    item_key = observability.attempt_key(
+        state["request_id"],
+        state["received_at"],
+        state["attempt"],
+    )
+    payload = {
+        "schema_version": 1,
+        "kind": "preaudit_pipeline_metrics",
+        "status": "exact",
+        "item_key": item_key,
+        "workflow_key": "travel_expense",
+        "attempt": 1,
+        "event_suffix": 1,
+        "write_ready_at": "2026-08-22T12:00:00+00:00",
+        "write_start_at": "2026-08-22T12:00:12+00:00",
+        "write_queue_depth_at_enqueue": 1,
+        "write_wait_attribution": {"status": "unknown"},
+    }
+    payload[field] = value
+    json_artifact.write_json_atomic(
+        closed / "pipeline-metrics.json",
+        payload,
+    )
+
+    metric = runtime_maintenance.status(root, now=NOW)["case_metrics"][0]
+
+    assert metric["pipeline_evidence"] == {"status": "unknown"}
 
 
 def test_status_and_cli_never_echo_unknown_failure_text(tmp_path: Path) -> None:

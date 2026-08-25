@@ -308,7 +308,7 @@ def test_rolling_controller_runs_cache_maintenance_at_startup_and_each_wave(
         str(tmp_path / "rolling-controller.lock"),
     )
     maintenance_calls: list[int] = []
-    pending_values = iter((2, 1, 0))
+    pending_values = iter((2, 1, 0, 0))
     current_pending = [0]
 
     def maintain() -> dict:
