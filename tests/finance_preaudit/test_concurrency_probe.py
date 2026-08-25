@@ -3925,6 +3925,21 @@ def test_strict_global_fifo_merges_recovered_open_and_live_claim_order(
         "_preparation_executor",
         lambda: ThreadPoolExecutor(max_workers=1),
     )
+
+    class ImmediateWriterExecutor:
+        def submit(self, function, *args) -> Future:
+            future: Future = Future()
+            future.set_result(function(*args))
+            return future
+
+        def shutdown(self, **_kwargs) -> None:
+            return None
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "ThreadPoolExecutor",
+        lambda **_kwargs: ImmediateWriterExecutor(),
+    )
     flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
     newer_open = _open_action(
         flow_root,
@@ -3932,15 +3947,23 @@ def test_strict_global_fifo_merges_recovered_open_and_live_claim_order(
         created_at="2026-08-25T10:01:00+08:00",
         received_at="2026-08-25T10:00:00+08:00",
     )
-    older_live = tmp_path / "older-live-action.json"
-    json_artifact.write_json_atomic(
-        older_live,
-        {
-            "request_id": "older-live-request",
-            "received_at": "2026-08-25T09:00:00+08:00",
-            "workflow_key": "business_entertainment",
-        },
+    newest_open = _open_action(
+        flow_root,
+        case_key="recovered-newest",
+        created_at="2026-08-25T11:01:00+08:00",
+        received_at="2026-08-25T11:00:00+08:00",
     )
+    older_live = _open_action(
+        flow_root,
+        case_key="older-live",
+        created_at="2026-08-25T09:01:00+08:00",
+        received_at="2026-08-25T09:00:00+08:00",
+        workflow_key="business_entertainment",
+    )
+    older_live_action = json.loads(older_live.read_text(encoding="utf-8"))
+    older_live_action.pop("request_id")
+    older_live_action.pop("received_at")
+    json_artifact.write_json_atomic(older_live, older_live_action)
     selections: list[dict] = []
     writes: list[Path] = []
 
@@ -3953,12 +3976,15 @@ def test_strict_global_fifo_merges_recovered_open_and_live_claim_order(
             tuple(identity)
             for identity in selection["assigned_identities"]
         }
-        next_action = (
-            newer_open
-            if ("older-live-request", "2026-08-25T09:00:00+08:00")
-            in assigned
-            else older_live
-        )
+        if ("request-older-live", "2026-08-25T09:00:00+08:00") not in assigned:
+            next_action = older_live
+        elif (
+            "request-recovered-newer",
+            "2026-08-25T10:00:00+08:00",
+        ) not in assigned:
+            next_action = newer_open
+        else:
+            next_action = newest_open
         return {
             "action": "review_required",
             "action_file": str(next_action),
@@ -3978,6 +4004,19 @@ def test_strict_global_fifo_merges_recovered_open_and_live_claim_order(
 
     def complete(action: Path, reviewed: dict) -> dict:
         writes.append(action)
+        if action == older_live:
+            for artifact in (action, action.with_name("state.json")):
+                persisted = json.loads(artifact.read_text(encoding="utf-8"))
+                json_artifact.write_json_atomic(
+                    artifact,
+                    {
+                        **persisted,
+                        "action": "closed",
+                        "execution_state": "closed",
+                        "business_state": "needs_human",
+                        "write_state": "submitted",
+                    },
+                )
         return {
             **reviewed,
             "status": "completed",
@@ -3987,7 +4026,7 @@ def test_strict_global_fifo_merges_recovered_open_and_live_claim_order(
         }
 
     result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
-        2,
+        3,
         2,
         project_root=tmp_path,
         renew_actions=lambda _paths: (_ for _ in ()).throw(
@@ -4003,11 +4042,15 @@ def test_strict_global_fifo_merges_recovered_open_and_live_claim_order(
         strict_global_fifo=True,
     )
 
-    assert result.completed == 2
-    assert writes == [older_live, newer_open]
+    assert result.completed == 3
+    assert writes == [older_live, newer_open, newest_open]
     assert selections[0]["assigned_identities"] == []
     assert selections[1]["assigned_identities"] == [
-        ["older-live-request", "2026-08-25T09:00:00+08:00"]
+        ["request-older-live", "2026-08-25T09:00:00+08:00"]
+    ]
+    assert selections[2]["assigned_identities"] == [
+        ["request-older-live", "2026-08-25T09:00:00+08:00"],
+        ["request-recovered-newer", "2026-08-25T10:00:00+08:00"],
     ]
 
 

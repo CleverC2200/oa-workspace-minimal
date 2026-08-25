@@ -1120,6 +1120,7 @@ def _run_dispatched_tasks(
     root = Path(project_root).expanduser().resolve()
     outcomes: list[process_pool.TaskOutcome[dict] | None] = [None] * count
     assigned: set[Path] = set()
+    assigned_identities: dict[Path, tuple[str, str]] = {}
     futures: dict[object, tuple[int, float, float, Path]] = {}
     write_ready: dict[int, tuple[float, Path, dict, float, int]] = {}
     writer: (
@@ -1383,15 +1384,46 @@ def _run_dispatched_tasks(
             started += 1
         peak_active = max(peak_active, len(futures))
 
+    def validated_assigned_identity(action_file: Path) -> tuple[str, str]:
+        action_path = action_file.resolve()
+        state_path = action_path.with_name("state.json")
+        if (
+            not action_file.is_absolute()
+            or action_file.is_symlink()
+            or action_file != action_path
+            or state_path.is_symlink()
+        ):
+            raise ValueError("production_probe_state_invalid")
+        action = _read_object(action_path)
+        state = _read_object(state_path)
+        request_id = str(state.get("request_id") or "").strip()
+        received_at = str(state.get("received_at") or "").strip()
+        workflow_key = str(state.get("workflow_key") or "").strip()
+        selected = {
+            "requestId": request_id,
+            "received_at": received_at,
+        }
+        if (
+            workflow_key not in ROLLING_WORKFLOW_KEYS
+            or not _prepared_action_matches_selection(
+                action_path,
+                action,
+                state,
+                selected,
+                workflow_key,
+                project_root=root,
+            )
+        ):
+            raise ValueError("production_probe_state_invalid")
+        return request_id, received_at
+
     def global_prepare_selection() -> dict:
         identities: list[list[str]] = []
         for action_file in sorted(assigned):
-            action = _read_object(action_file)
-            request_id = str(action.get("request_id") or "").strip()
-            received_at = str(action.get("received_at") or "").strip()
-            if not request_id or not received_at:
+            identity = assigned_identities.get(action_file)
+            if identity is None:
                 raise ValueError("production_probe_state_invalid")
-            identities.append([request_id, received_at])
+            identities.append(list(identity))
         return {
             "workflow_key": "*",
             "assigned_identities": identities,
@@ -1687,6 +1719,31 @@ def _run_dispatched_tasks(
                         halted = True
                     else:
                         unblocked_duplicate_retries = 0
+                        if strict_global_fifo:
+                            try:
+                                assigned_identities[action_file] = (
+                                    validated_assigned_identity(action_file)
+                                )
+                            except ValueError:
+                                outcomes[index] = process_pool.TaskOutcome(
+                                    index=index,
+                                    status="completed",
+                                    value={
+                                        "status": "failed",
+                                        "business_state": "not_available",
+                                        "error_code": (
+                                            "production_probe_prepare_failed"
+                                        ),
+                                        "prepare_elapsed_seconds": (
+                                            prepare_elapsed
+                                        ),
+                                        "process_attempts": 0,
+                                        "process_retries": 0,
+                                        "token_usage": {"status": "unknown"},
+                                    },
+                                )
+                                request_pipeline_stop()
+                                continue
                         assigned.add(action_file)
                         submit_review(
                             index,
