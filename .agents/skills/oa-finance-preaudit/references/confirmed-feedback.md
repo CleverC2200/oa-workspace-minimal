@@ -30,6 +30,7 @@
 | F-016 | 包装版面/无 Excel 图片校对 | 没有 Excel 时仍须下载原图并完成图片自身校对；不得仅因无 Excel 把四项统一标为人工判断。原先要求每单覆盖审计和三路盲审的执行方式已由 F-018 收敛 | 已采纳 | `audit-chinese-image-text/SKILL.md` G0-G4；`output-contract.md` OA 签字意见投影；`flows/packaging-layout-approval.md` 包装固定四项 |
 | F-017 | 包装版面/Excel 来源说明 | 配料、过敏原、营养成分表和地址通常来自同一 Excel；Excel 是否提供及是否执行对照只在四项之后统一说明一次，实际差异仍写入受影响项目 | 已采纳 | `output-contract.md` OA 签字意见投影；`flows/packaging-layout-approval.md` 包装固定四项 |
 | F-018 | 包装版面/审核范围与复核强度 | 默认只审核固定四项及影响产品识别或使用的关键文字；装饰性和营销文字不做全面逐字校对。简单清晰版面由协调者直接主审，只有低置信、高影响或冲突内容增加独立复核，并在一次定向重切后有限收敛 | 已采纳 | `audit-chinese-image-text/SKILL.md` 关键文字范围与 G0-G4；`flows/packaging-layout-approval.md` 包装执行；`output-contract.md` 完整性计数 |
+| F-019 | 差旅/页面覆盖与证据缺口 | 缺少审核项专属页面关系只表示每个审核项都要覆盖全部代表页，不表示这些页面本身构成证据缺口；不确定项必须另行说明具体缺失事实或关系 | 已采纳 | `observation-contract.md` 页面覆盖；`flow-engine-contract.md` 结构化审核决定 |
 
 ## 新反馈记录规则
 

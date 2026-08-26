@@ -291,6 +291,54 @@ def test_travel_review_requires_routed_pages_and_receipt_counts_reuse(
     assert engine.complete_review(Path(action["action_file"]), covered) == closed
 
 
+def test_travel_review_requires_concrete_uncertainty_reason_beyond_page_refs(
+    tmp_path: Path,
+) -> None:
+    engine = flow_engine.FlowEngine(
+        root=tmp_path / "runtime",
+        discover_candidates=lambda workflow_key: [
+            {
+                "request_id": "recorded-request",
+                "received_at": "2026-08-22T09:00:00+08:00",
+                "workflow_key": workflow_key,
+            }
+        ],
+        collect_material=_travel_material_with_routed_pages,
+    )
+    action = engine.next_action("travel_expense")
+    packet = json.loads(
+        Path(action["review_packet_file"]).read_text(encoding="utf-8")
+    )
+    page_refs = packet["page_routing"]["review_page_refs"]
+    decision = _passing_decision(action, packet)
+    decision["overall"] = "needs_human"
+    for item in decision["items"]:
+        item["status"] = "uncertain"
+        item["conclusion"] = "路由页面与当前审核项的关系不明确。"
+        item["evidence_refs"] = []
+        item["missing_evidence"] = list(page_refs)
+    decision_file = tmp_path / "blanket-warning.json"
+    json_artifact.write_json_atomic(decision_file, decision)
+
+    with pytest.raises(ValueError, match="review_decision_invalid"):
+        engine.complete_review(Path(action["action_file"]), decision_file)
+
+    for item in decision["items"]:
+        item["missing_evidence"].append(
+            f"{item['item_key']} 所需的具体事实或关系"
+        )
+    concrete_gap_file = tmp_path / "concrete-gaps.json"
+    json_artifact.write_json_atomic(concrete_gap_file, decision)
+
+    closed = engine.complete_review(
+        Path(action["action_file"]),
+        concrete_gap_file,
+    )
+
+    assert closed["action"] == "closed"
+    assert closed["business_state"] == "needs_human"
+
+
 def test_travel_cross_page_golden_routing_preserves_facts_and_results(
     tmp_path: Path,
 ) -> None:

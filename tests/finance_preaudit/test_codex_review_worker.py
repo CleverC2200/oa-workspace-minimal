@@ -400,7 +400,12 @@ def test_prompt_references_frozen_routing_without_copying_it_twice(
     assert '"strategy":"exact_page_duplicate_only"' not in prompt
     assert '"review_page_refs":["packet-owned-ref"]' not in prompt
     assert "直接读取冻结审核包中的 `page_routing`" in prompt
+    assert "只表示逐项覆盖全部页面，不表示这些页面构成证据缺口" in prompt
+    assert "除页面引用外还必须写明具体缺失事实或关系" in prompt
     assert '"review_page_refs":["packet-owned-ref"]' not in (
+        codex_review_worker._read_only_prompt(action_file)
+    )
+    assert "只表示逐项覆盖全部页面，不表示这些页面构成证据缺口" in (
         codex_review_worker._read_only_prompt(action_file)
     )
 
