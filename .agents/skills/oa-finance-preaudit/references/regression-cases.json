@@ -220,6 +220,21 @@
             "expected_output": "先建立关键文字区域清单，简单清晰版面由协调者直接主审；只对低置信、高影响或冲突区域增加一次独立复核，最多一次定向重切后把仍不确定的受影响项目标为人工判断",
             "failure_mode": "把非关键文案和可选复核升级为全单准确性门禁，导致单据无法有限闭合",
             "rule_ref": "audit-chinese-image-text/SKILL.md#oa-包装版面流程"
+        },
+        {
+            "id": "RC-016-travel-page-routing-blanket-warning",
+            "scope": "travel-expense",
+            "audit_item": "all-items;page-coverage",
+            "status": "confirmed",
+            "input_facts": [
+                "冻结材料完整且所有准备页均为支持格式",
+                "页面路由只执行精确重复复用",
+                "缺少审核项专属页面关系，因此每个审核项必须覆盖全部非重复代表页"
+            ],
+            "incorrect_output": "仅因缺少审核项专属页面关系，把八项统一标为人工判断，并只把全部代表页引用列为缺口",
+            "expected_output": "逐项读取全部代表页并按实际事实形成结论；确实不确定时，在页面引用之外说明该项具体缺失的事实或关系",
+            "failure_mode": "把页面全覆盖要求误解为全部页面缺少审核适用性",
+            "rule_ref": "observation-contract.md#页面覆盖;flow-engine-contract.md#结构化审核决定"
         }
   ]
 }

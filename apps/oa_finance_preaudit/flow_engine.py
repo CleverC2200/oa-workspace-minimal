@@ -3026,6 +3026,18 @@ class FlowEngine:
                 routing = _full_travel_page_routing(quality_material)
             review_page_refs = set(routing["review_page_refs"])
             applicable_item_keys = set(routing["applicability"]["item_keys"])
+            if (
+                packet.get("material_state") == "complete"
+                and routing["applicability"].get("basis")
+                == "full_coverage_without_trusted_item_relation"
+                and any(
+                    item["item_key"] in applicable_item_keys
+                    and item["status"] == "uncertain"
+                    and set(item["missing_evidence"]).issubset(review_page_refs)
+                    for item in normalized_items
+                )
+            ):
+                raise ValueError("review_decision_invalid")
             if any(
                 item["item_key"] in applicable_item_keys
                 and not review_page_refs.issubset(

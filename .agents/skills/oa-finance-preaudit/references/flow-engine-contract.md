@@ -61,6 +61,7 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
 
 - `pass` 和 `fail` 至少有一个 `evidence_refs`。
 - `uncertain` 至少有一个 `missing_evidence`。
+- 差旅完整材料采用 `full_coverage_without_trusted_item_relation` 路由时，页面引用只记录覆盖范围；`uncertain` 的 `missing_evidence` 除页面引用外还必须包含当前审核项具体缺失的事实或关系，只有页面引用的决定无效。
 - 任一项目为 `fail` 或 `uncertain` 时，`overall` 必须为 `needs_human`；全部为 `pass` 时必须为 `pass`。
 - 不增加 requestId、人员、公司、写入模式、意见文本或其他字段。
 

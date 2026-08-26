@@ -47,7 +47,7 @@ Codex 的工作笔记至少保留：
 2. `prepared.images[*].content_sha256` 与已观察页面相同时，标记“页级精确重复”，复用观察并分别映射全部资源归属；
 3. 其余页面按 `owner_detail_id`、`resource_id`、页码和当前审核项直接观察。
 
-差旅审核包的 `page_routing` 只做页级 SHA-256 精确重复复用，生成路由时必须把声明哈希与冻结页面实际字节复核。`review_page_refs` 是必须直接覆盖的非重复页；`reused_pages` 中的页面必须同时核对 `resource_id`、已复核的 `content_sha256` 和代表页引用。任一字段缺失、冲突、字节不匹配或策略未知时回退覆盖全部 `prepared.images`。`applicability.basis=full_coverage_without_trusted_item_relation` 表示尚无可信的审核项专属关系，所有非重复代表页仍分别适用于八个审核项，不得按文件名、页序、金额、日期或关键词继续裁剪。完成动作必须逐项验证所有 `review_page_refs` 已出现在该项的证据或缺口引用中，并把代表页覆盖投影回重复页和全部资源归属。
+差旅审核包的 `page_routing` 只做页级 SHA-256 精确重复复用，生成路由时必须把声明哈希与冻结页面实际字节复核。`review_page_refs` 是必须直接覆盖的非重复页；`reused_pages` 中的页面必须同时核对 `resource_id`、已复核的 `content_sha256` 和代表页引用。任一字段缺失、冲突、字节不匹配或策略未知时回退覆盖全部 `prepared.images`。`applicability.basis=full_coverage_without_trusted_item_relation` 表示尚无可信的审核项专属关系，所有非重复代表页仍分别适用于八个审核项，不得按文件名、页序、金额、日期或关键词继续裁剪；它是页面覆盖要求，不是证据缺口。完成动作必须逐项验证所有 `review_page_refs` 已出现在该项的证据或缺口引用中，并把代表页覆盖投影回重复页和全部资源归属。完整材料中的 `uncertain` 除相关页面引用外，还必须写明当前审核项具体缺失的事实或关系；不得仅因缺少审核项专属页面关系，把八项统一标为 `uncertain`。
 
 同一单据由当前审核调用完整读取，不在单据内部建立角色、消息交接或第二套页面队列。涉及版面对应、印章、手写、照片或结构化文字未覆盖区域时仍须读取页面。`source_content_sha256` 只能说明源文件字节相同，不能代替页级覆盖。
 
