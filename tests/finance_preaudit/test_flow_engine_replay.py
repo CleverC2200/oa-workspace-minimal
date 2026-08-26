@@ -730,6 +730,158 @@ def test_confirmed_no_write_failure_creates_a_new_review_attempt(
     assert state_path.read_bytes() == old_state
 
 
+def test_controlled_authorization_failure_creates_fresh_review_attempt(
+    tmp_path: Path,
+) -> None:
+    authorization_calls = 0
+    submit_calls: list[dict] = []
+
+    def authorization_source(context: dict) -> dict:
+        nonlocal authorization_calls
+        authorization_calls += 1
+        if authorization_calls == 1:
+            raise ValueError("write_authorization_invalid")
+        return _grant(context)
+
+    engine = _engine(
+        tmp_path,
+        authorization_source=authorization_source,
+        submit_frozen=lambda job: submit_calls.append(dict(job)) or _success(job),
+    )
+    failed = engine.next_action("travel_expense", mode="controlled_write")
+
+    recovered = engine.recover_confirmed_no_write(
+        Path(failed["action_file"]),
+        mode="controlled_write",
+        confirmed=True,
+    )
+
+    assert failed["reason"] == "write_authorization_invalid"
+    assert failed["write_state"] == "not_requested"
+    assert recovered["action"] == "review_required"
+    assert recovered["attempt"] == 2
+    assert recovered["write_state"] == "authorized"
+    assert submit_calls == []
+
+
+def test_recovered_authorization_failure_stops_again_without_submit(
+    tmp_path: Path,
+) -> None:
+    submit_calls: list[dict] = []
+    engine = _engine(
+        tmp_path,
+        authorization_source=lambda _context: (_ for _ in ()).throw(
+            ValueError("write_authorization_invalid")
+        ),
+        submit_frozen=lambda job: submit_calls.append(dict(job)) or _success(job),
+    )
+    failed = engine.next_action("travel_expense", mode="controlled_write")
+
+    recovered = engine.recover_confirmed_no_write(
+        Path(failed["action_file"]),
+        mode="controlled_write",
+        confirmed=True,
+    )
+
+    assert recovered["action"] == "needs_admin"
+    assert recovered["attempt"] == 2
+    assert recovered["reason"] == "write_authorization_invalid"
+    assert recovered["write_state"] == "not_requested"
+    assert submit_calls == []
+
+
+@pytest.mark.parametrize(
+    ("artifact_name", "symlink"),
+    (
+        ("writer-boundary.json", False),
+        ("writer-boundary.json", True),
+        ("execution-receipt.json", False),
+        ("execution-receipt.json", True),
+    ),
+)
+def test_authorization_failure_recovery_rejects_any_writer_artifact(
+    tmp_path: Path,
+    artifact_name: str,
+    symlink: bool,
+) -> None:
+    submit_calls: list[dict] = []
+    engine = _engine(
+        tmp_path,
+        authorization_source=lambda _context: (_ for _ in ()).throw(
+            ValueError("write_authorization_invalid")
+        ),
+        submit_frozen=lambda job: submit_calls.append(dict(job)) or _success(job),
+    )
+    failed = engine.next_action("travel_expense", mode="controlled_write")
+    artifact = Path(failed["action_file"]).with_name(artifact_name)
+    if symlink:
+        artifact.symlink_to(artifact.with_name("missing-artifact"))
+    else:
+        artifact.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="recovery_not_safe"):
+        engine.recover_confirmed_no_write(
+            Path(failed["action_file"]),
+            mode="controlled_write",
+            confirmed=True,
+        )
+
+    assert submit_calls == []
+
+
+@pytest.mark.parametrize("artifact_name", ("material.json", "review-packet.json"))
+def test_authorization_failure_recovery_rejects_changed_frozen_input(
+    tmp_path: Path,
+    artifact_name: str,
+) -> None:
+    submit_calls: list[dict] = []
+    engine = _engine(
+        tmp_path,
+        authorization_source=lambda _context: (_ for _ in ()).throw(
+            ValueError("write_authorization_invalid")
+        ),
+        submit_frozen=lambda job: submit_calls.append(dict(job)) or _success(job),
+    )
+    failed = engine.next_action("travel_expense", mode="controlled_write")
+    Path(failed["action_file"]).with_name(artifact_name).write_text(
+        "{}",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="recovery_not_safe"):
+        engine.recover_confirmed_no_write(
+            Path(failed["action_file"]),
+            mode="controlled_write",
+            confirmed=True,
+        )
+
+    assert submit_calls == []
+
+
+def test_authorization_failure_recovery_requires_canonical_travel_routing(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(
+        tmp_path,
+        authorization_source=lambda _context: (_ for _ in ()).throw(
+            ValueError("write_authorization_invalid")
+        ),
+        submit_frozen=_success,
+    )
+    failed = engine.next_action("travel_expense", mode="controlled_write")
+    packet_file = Path(failed["action_file"]).with_name("review-packet.json")
+    packet = json.loads(packet_file.read_text(encoding="utf-8"))
+    packet.pop("page_routing")
+    json_artifact.write_json_atomic(packet_file, packet)
+
+    with pytest.raises(ValueError, match="recovery_not_safe"):
+        engine.recover_confirmed_no_write(
+            Path(failed["action_file"]),
+            mode="controlled_write",
+            confirmed=True,
+        )
+
+
 def _decision(action: dict, *, conclusion: str = "证据符合当前审核项。") -> dict:
     packet = json.loads(
         Path(action["review_packet_file"]).read_text(encoding="utf-8")

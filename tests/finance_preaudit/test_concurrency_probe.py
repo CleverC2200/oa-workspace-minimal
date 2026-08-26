@@ -143,6 +143,7 @@ def _quarantined_action(
     request_id: str,
     received_at: str,
     failure_detail_code: str = "attachment_download_failed",
+    reason: str = "material_collection_failed",
 ) -> Path:
     case_key = hashlib.sha256(
         f"{request_id}\x1f{received_at}".encode("utf-8")
@@ -164,7 +165,7 @@ def _quarantined_action(
         "business_state": "not_available",
         "write_state": "not_requested",
         "workflow_key": "travel_expense",
-        "reason": "material_collection_failed",
+        "reason": reason,
         "failure_detail_code": failure_detail_code,
         "request_id": request_id,
         "received_at": received_at,
@@ -1190,15 +1191,21 @@ def test_global_dispatcher_passes_frozen_unknown_snapshot(monkeypatch) -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    "reason",
+    ("material_collection_failed", "write_authorization_invalid"),
+)
 def test_prepare_one_recovers_an_explicit_confirmed_no_write_action(
     tmp_path: Path,
     monkeypatch,
+    reason: str,
 ) -> None:
     flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
     action_file = _quarantined_action(
         flow_root,
         request_id="recovery-request",
         received_at="2026-08-25T08:00:00+08:00",
+        reason=reason,
     )
     calls: list[tuple[Path, str, bool]] = []
 

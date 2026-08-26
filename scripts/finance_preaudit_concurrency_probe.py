@@ -55,6 +55,10 @@ QUARANTINED_REASONS = {
     "material_collection_failed",
     *writer_outcomes.CONFIRMED_NO_WRITE_CODES,
 }
+RECOVERABLE_NO_WRITE_REASONS = {
+    "write_authorization_invalid",
+    *QUARANTINED_REASONS,
+}
 ITEM_LOCAL_QUARANTINE_REASONS = {"material_collection_failed"}
 ITEM_LOCAL_MATERIAL_FAILURE_DETAILS = (
     runtime_maintenance.ITEM_LOCAL_MATERIAL_FAILURE_DETAILS
@@ -733,7 +737,7 @@ def _recovery_candidates(
             or state.get("action_file") != str(resolved)
             or state.get("execution_state") != "needs_admin"
             or state.get("write_state") != "not_requested"
-            or state.get("reason") not in QUARANTINED_REASONS
+            or state.get("reason") not in RECOVERABLE_NO_WRITE_REASONS
             or identity in seen_identities
         ):
             raise ValueError("production_probe_recovery_invalid")
