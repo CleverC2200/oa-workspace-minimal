@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
 import re
 from typing import Iterable
+from zoneinfo import ZoneInfo
 
 from apps.oa_approval import writer_outcomes
 
@@ -28,6 +29,7 @@ QUARANTINED_REASONS = frozenset(
 )
 _CASE_KEY = re.compile(r"^[0-9a-f]{64}$")
 _ATTEMPT = re.compile(r"^attempt-([1-9][0-9]*)$")
+_OA_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 def _identity(row: dict) -> tuple[str, str]:
@@ -38,6 +40,71 @@ def _identity(row: dict) -> tuple[str, str]:
 
 def _item_key(request_id: str, received_at: str) -> str:
     return hashlib.sha256(f"{request_id}\x1f{received_at}".encode("utf-8")).hexdigest()
+
+
+def _attempt_roots(case_root: Path) -> list[tuple[int, Path]]:
+    attempts: list[tuple[int, Path]] = []
+    for attempt_root in case_root.iterdir():
+        match = _ATTEMPT.fullmatch(attempt_root.name)
+        if match is None:
+            continue
+        if attempt_root.is_symlink() or not attempt_root.is_dir():
+            raise ValueError("runtime_reconciliation_invalid")
+        attempts.append((int(match.group(1)), attempt_root))
+    return attempts
+
+
+def _validated_state(
+    state_file: Path,
+    *,
+    workflow_key: str,
+    case_key: str,
+    attempt: int,
+) -> dict:
+    if state_file.is_symlink() or not state_file.is_file():
+        raise ValueError("runtime_reconciliation_invalid")
+    try:
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        created_at = state.get("created_at") if isinstance(state, dict) else None
+        parsed_created_at = datetime.fromisoformat(
+            str(created_at or "").replace("Z", "+00:00")
+        )
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError("runtime_reconciliation_invalid") from error
+    request_id = state.get("request_id") if isinstance(state, dict) else None
+    received_at = state.get("received_at") if isinstance(state, dict) else None
+    if isinstance(request_id, str) and isinstance(received_at, str):
+        identity = request_id.strip(), received_at.strip()
+    else:
+        identity = "", ""
+    if (
+        not isinstance(state, dict)
+        or state.get("schema_version") != 1
+        or state.get("kind") != "preaudit_action"
+        or state.get("workflow_key") != workflow_key
+        or not isinstance(state.get("attempt"), int)
+        or isinstance(state.get("attempt"), bool)
+        or state.get("attempt") != attempt
+        or state.get("case_key") != case_key
+        or not identity[0]
+        or not identity[1]
+        or _item_key(*identity) != case_key
+        or state.get("execution_state")
+        not in {"collecting", "review_required", "needs_admin", "closed"}
+        or state.get("business_state")
+        not in {"not_available", "pass", "needs_human"}
+        or state.get("write_state")
+        not in {
+            "not_requested",
+            "authorized",
+            "submitting",
+            "submitted",
+            "unknown",
+        }
+        or parsed_created_at.tzinfo is None
+    ):
+        raise ValueError("runtime_reconciliation_invalid")
+    return state
 
 
 def latest_states(root: Path) -> list[dict]:
@@ -62,69 +129,52 @@ def latest_states(root: Path) -> list[dict]:
                     raise ValueError("runtime_reconciliation_invalid")
                 if not case_root.is_dir() or not _CASE_KEY.fullmatch(case_root.name):
                     continue
-                attempts: list[tuple[int, Path]] = []
-                for attempt_root in case_root.iterdir():
-                    match = _ATTEMPT.fullmatch(attempt_root.name)
-                    if match is None:
-                        continue
-                    if attempt_root.is_symlink() or not attempt_root.is_dir():
-                        raise ValueError("runtime_reconciliation_invalid")
-                    attempts.append((int(match.group(1)), attempt_root))
+                attempts = _attempt_roots(case_root)
                 if not attempts:
                     continue
                 attempt, attempt_root = max(attempts, key=lambda item: item[0])
-                state_file = attempt_root / "state.json"
-                if state_file.is_symlink() or not state_file.is_file():
-                    raise ValueError("runtime_reconciliation_invalid")
-                state = json.loads(state_file.read_text(encoding="utf-8"))
-                created_at = state.get("created_at") if isinstance(state, dict) else None
-                try:
-                    parsed_created_at = datetime.fromisoformat(
-                        str(created_at or "").replace("Z", "+00:00")
-                    )
-                except ValueError as error:
-                    raise ValueError("runtime_reconciliation_invalid") from error
-                request_id = (
-                    state.get("request_id") if isinstance(state, dict) else None
+                state = _validated_state(
+                    attempt_root / "state.json",
+                    workflow_key=workflow_root.name,
+                    case_key=case_root.name,
+                    attempt=attempt,
                 )
-                received_at = (
-                    state.get("received_at") if isinstance(state, dict) else None
-                )
-                if isinstance(request_id, str) and isinstance(received_at, str):
-                    identity = request_id.strip(), received_at.strip()
-                else:
-                    identity = "", ""
-                if (
-                    not isinstance(state, dict)
-                    or state.get("schema_version") != 1
-                    or state.get("kind") != "preaudit_action"
-                    or state.get("workflow_key") != workflow_root.name
-                    or not isinstance(state.get("attempt"), int)
-                    or isinstance(state.get("attempt"), bool)
-                    or state.get("attempt") != attempt
-                    or state.get("case_key") != case_root.name
-                    or not identity[0]
-                    or not identity[1]
-                    or _item_key(*identity) != case_root.name
-                    or state.get("execution_state")
-                    not in {"collecting", "review_required", "needs_admin", "closed"}
-                    or state.get("business_state")
-                    not in {"not_available", "pass", "needs_human"}
-                    or state.get("write_state")
-                    not in {
-                        "not_requested",
-                        "authorized",
-                        "submitting",
-                        "submitted",
-                        "unknown",
-                    }
-                    or parsed_created_at.tzinfo is None
-                ):
-                    raise ValueError("runtime_reconciliation_invalid")
                 latest.append(state)
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError("runtime_reconciliation_invalid") from error
     return latest
+
+
+def _failure_attempt_count(root: Path, state: dict) -> int:
+    workflow_key = str(state["workflow_key"])
+    case_key = str(state["case_key"])
+    case_root = Path(root).expanduser() / workflow_key / "cases" / case_key
+    if case_root.is_symlink() or not case_root.is_dir():
+        raise ValueError("runtime_reconciliation_invalid")
+    try:
+        attempts = _attempt_roots(case_root)
+        return sum(
+            _validated_state(
+                attempt_root / "state.json",
+                workflow_key=workflow_key,
+                case_key=case_key,
+                attempt=attempt,
+            ).get("execution_state")
+            == "needs_admin"
+            for attempt, attempt_root in attempts
+        )
+    except OSError as error:
+        raise ValueError("runtime_reconciliation_invalid") from error
+
+
+def _received_at_utc(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("runtime_reconciliation_invalid") from error
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_OA_TIMEZONE)
+    return parsed.astimezone(timezone.utc)
 
 
 def _quarantine_summary(
@@ -162,6 +212,7 @@ def reconcile(
     pending_rows: Iterable[dict],
     handled_rows: Iterable[dict],
     workflow_key: str | None = None,
+    now: datetime | None = None,
 ) -> dict:
     if workflow_key is not None and workflow_key not in _WORKFLOW_KEYS:
         raise ValueError("runtime_reconciliation_invalid")
@@ -178,6 +229,10 @@ def reconcile(
     findings: list[dict] = []
     counts: Counter[str] = Counter()
     recommendations: Counter[str] = Counter()
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        raise ValueError("runtime_reconciliation_invalid")
+    live_failed: list[dict] = []
 
     states = [
         state
@@ -225,6 +280,23 @@ def reconcile(
 
         counts[category] += 1
         recommendations[recommendation] += 1
+        if exact_pending and state.get("execution_state") == "needs_admin":
+            failure_attempts = _failure_attempt_count(root, state)
+            received_at_utc = _received_at_utc(received_at)
+            live_failed.append(
+                {
+                    "failure_attempts": failure_attempts,
+                    "age_seconds": max(
+                        0,
+                        int((current_time - received_at_utc).total_seconds()),
+                    ),
+                    "failure_code": (
+                        str(state.get("reason"))
+                        if state.get("reason") in QUARANTINED_REASONS
+                        else "unknown_failure"
+                    ),
+                }
+            )
         findings.append(
             {
                 "item_key": _item_key(request_id, received_at),
@@ -237,6 +309,14 @@ def reconcile(
             }
         )
 
+    long_wait_threshold_seconds = 24 * 60 * 60
+    attention = [
+        item
+        for item in live_failed
+        if item["failure_attempts"] >= 2
+        or item["age_seconds"] >= long_wait_threshold_seconds
+    ]
+    failure_counts = Counter(item["failure_code"] for item in attention)
     return {
         "schema_version": 1,
         "kind": "preaudit_reconciliation",
@@ -245,5 +325,27 @@ def reconcile(
         "quarantine": _quarantine_summary(states, pending_input),
         "counts": dict(sorted(counts.items())),
         "recommendations": dict(sorted(recommendations.items())),
+        "failure_attention": {
+            "scope": "live_pending",
+            "status": "attention_required" if attention else "clear",
+            "affected_cases": len(attention),
+            "repeated_failure_cases": sum(
+                item["failure_attempts"] >= 2 for item in live_failed
+            ),
+            "long_wait_failure_cases": sum(
+                item["age_seconds"] >= long_wait_threshold_seconds
+                for item in live_failed
+            ),
+            "long_wait_threshold_seconds": long_wait_threshold_seconds,
+            "max_failure_attempts": max(
+                (item["failure_attempts"] for item in attention),
+                default=0,
+            ),
+            "oldest_wait_seconds": max(
+                (item["age_seconds"] for item in attention),
+                default=0,
+            ),
+            "failure_counts": dict(sorted(failure_counts.items())),
+        },
         "findings": sorted(findings, key=lambda item: item["item_key"]),
     }
