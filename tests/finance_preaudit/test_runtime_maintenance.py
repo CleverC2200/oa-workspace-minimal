@@ -284,6 +284,17 @@ def test_status_projects_operational_summary_and_exact_stage_timeline(
             "open_cases": 3,
             "oldest_seconds": 86400,
         },
+        "failure_attention": {
+            "scope": "local_open_history",
+            "status": "attention_required",
+            "affected_cases": 1,
+            "repeated_failure_cases": 0,
+            "long_wait_failure_cases": 1,
+            "long_wait_threshold_seconds": 86400,
+            "max_failure_attempts": 1,
+            "oldest_wait_seconds": 86400,
+            "failure_counts": {"material_collection_failed": 1},
+        },
         "current_bottleneck": {
             "evidence_status": "exact",
             "kind": "unknown_write_outcome",
@@ -497,6 +508,72 @@ def test_status_only_counts_allowlisted_material_failures_as_local_quarantine(
         "affected_cases": 1,
     }
     assert "frozen_material_changed" not in json.dumps(status)
+
+
+def test_status_highlights_repeated_and_long_lived_failed_backlog(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    repeated_received_at = NOW.isoformat()
+    _attempt(
+        root,
+        case_key="repeated-failure",
+        attempt=1,
+        age_days=0,
+        execution_state="needs_admin",
+        business_state="not_available",
+        write_state="not_requested",
+        reason="writer_preflight_failed",
+        received_at=repeated_received_at,
+    )
+    _attempt(
+        root,
+        case_key="repeated-failure",
+        attempt=2,
+        age_days=0,
+        execution_state="needs_admin",
+        business_state="not_available",
+        write_state="not_requested",
+        reason="material_collection_failed",
+        failure_detail_code="attachment_download_failed",
+        received_at=repeated_received_at,
+    )
+    _attempt(
+        root,
+        case_key="long-lived-failure",
+        attempt=1,
+        age_days=2,
+        execution_state="needs_admin",
+        business_state="not_available",
+        write_state="not_requested",
+        reason="write_authorization_invalid",
+    )
+    _attempt(
+        root,
+        case_key="active-review",
+        attempt=1,
+        age_days=2,
+        execution_state="review_required",
+        business_state="not_available",
+        write_state="authorized",
+    )
+
+    status = runtime_maintenance.status(root, now=NOW)
+
+    assert status["operations"]["failure_attention"] == {
+        "scope": "local_open_history",
+        "status": "attention_required",
+        "affected_cases": 2,
+        "repeated_failure_cases": 1,
+        "long_wait_failure_cases": 1,
+        "long_wait_threshold_seconds": 86400,
+        "max_failure_attempts": 2,
+        "oldest_wait_seconds": 172800,
+        "failure_counts": {
+            "material_collection_failed": 1,
+            "write_authorization_invalid": 1,
+        },
+    }
 
 
 @pytest.mark.parametrize(

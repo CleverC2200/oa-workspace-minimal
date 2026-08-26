@@ -479,6 +479,20 @@ def _operation_projection(items: list[dict]) -> dict:
         (int(item["age_seconds"]) for item in open_items),
         default=0,
     )
+    long_wait_threshold_seconds = 24 * 60 * 60
+    failed_items = [
+        item for item in open_items if item["execution_state"] == "needs_admin"
+    ]
+    attention_items = [
+        item
+        for item in failed_items
+        if int(item["failure_attempts"]) >= 2
+        or int(item["age_seconds"]) >= long_wait_threshold_seconds
+    ]
+    attention_failure_counts: dict[str, int] = {}
+    for item in attention_items:
+        code = str(item["failure_code"] or "unknown_failure")
+        attention_failure_counts[code] = attention_failure_counts.get(code, 0) + 1
     return {
         "remaining": len(open_items),
         "completed": sum(
@@ -497,6 +511,28 @@ def _operation_projection(items: list[dict]) -> dict:
             "evidence_status": "exact",
             "open_cases": len(open_items),
             "oldest_seconds": oldest_wait_seconds,
+        },
+        "failure_attention": {
+            "scope": "local_open_history",
+            "status": "attention_required" if attention_items else "clear",
+            "affected_cases": len(attention_items),
+            "repeated_failure_cases": sum(
+                int(item["failure_attempts"]) >= 2 for item in failed_items
+            ),
+            "long_wait_failure_cases": sum(
+                int(item["age_seconds"]) >= long_wait_threshold_seconds
+                for item in failed_items
+            ),
+            "long_wait_threshold_seconds": long_wait_threshold_seconds,
+            "max_failure_attempts": max(
+                (int(item["failure_attempts"]) for item in attention_items),
+                default=0,
+            ),
+            "oldest_wait_seconds": max(
+                (int(item["age_seconds"]) for item in attention_items),
+                default=0,
+            ),
+            "failure_counts": dict(sorted(attention_failure_counts.items())),
         },
         "current_bottleneck": {
             "evidence_status": bottleneck_evidence,
@@ -953,6 +989,16 @@ def status(root: Path, *, now: datetime | None = None) -> dict:
             current = latest_by_case.get(item["case_key"])
             if current is None or item["attempt"] > current["attempt"]:
                 latest_by_case[item["case_key"]] = item
+        failure_attempts_by_case: dict[str, int] = {}
+        for item in attempts:
+            if item["execution_state"] == "needs_admin":
+                failure_attempts_by_case[item["case_key"]] = (
+                    failure_attempts_by_case.get(item["case_key"], 0) + 1
+                )
+        for item in latest_by_case.values():
+            item["failure_attempts"] = failure_attempts_by_case.get(
+                item["case_key"], 0
+            )
         current_attempts = sorted(
             latest_by_case.values(),
             key=lambda item: (item["created_at"], item["item_key"]),

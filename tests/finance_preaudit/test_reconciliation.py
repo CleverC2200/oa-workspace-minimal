@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 
@@ -17,6 +18,7 @@ def _state(
     execution_state: str = "needs_admin",
     write_state: str = "not_requested",
     reason: str = "material_collection_failed",
+    created_at: str = "2026-08-24T00:00:00+00:00",
 ) -> None:
     import hashlib
 
@@ -35,7 +37,7 @@ def _state(
                 "attempt": attempt,
                 "request_id": request_id,
                 "received_at": received_at,
-                "created_at": "2026-08-24T00:00:00+00:00",
+                "created_at": created_at,
                 "execution_state": execution_state,
                 "business_state": "not_available",
                 "write_state": write_state,
@@ -89,6 +91,98 @@ def test_reconciliation_classifies_live_state_without_exposing_request_ids(
     assert "1001" not in serialized
     assert "1002" not in serialized
     assert "1003" not in serialized
+
+
+def test_reconciliation_highlights_only_failures_still_live_pending(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "flows"
+    repeated_received_at = "2026-08-26T11:00:00+00:00"
+    _state(
+        root,
+        "live-repeated",
+        repeated_received_at,
+        attempt=1,
+        reason="writer_preflight_failed",
+        created_at="2026-08-26T11:00:00+00:00",
+    )
+    _state(
+        root,
+        "live-repeated",
+        repeated_received_at,
+        attempt=2,
+        reason="material_collection_failed",
+        created_at="2026-08-26T11:30:00+00:00",
+    )
+    _state(
+        root,
+        "live-long",
+        "2026-08-24T00:00:00+00:00",
+        reason="write_authorization_invalid",
+        created_at="2026-08-26T11:55:00+00:00",
+    )
+    _state(
+        root,
+        "first-failure-on-attempt-two",
+        "2026-08-26T11:45:00+00:00",
+        attempt=1,
+        execution_state="closed",
+        write_state="submitted",
+        reason="",
+        created_at="2026-08-26T11:45:00+00:00",
+    )
+    _state(
+        root,
+        "first-failure-on-attempt-two",
+        "2026-08-26T11:45:00+00:00",
+        attempt=2,
+        reason="writer_preflight_failed",
+        created_at="2026-08-26T11:50:00+00:00",
+    )
+    _state(
+        root,
+        "handled-old",
+        "2026-08-23T00:00:00+00:00",
+        attempt=4,
+        reason="writer_result_unknown",
+        write_state="unknown",
+        created_at="2026-08-23T00:00:00+00:00",
+    )
+
+    result = reconciliation.reconcile(
+        root,
+        pending_rows=[
+            {
+                "request_id": "live-repeated",
+                "received_at": repeated_received_at,
+            },
+            {
+                "request_id": "live-long",
+                "received_at": "2026-08-24T00:00:00+00:00",
+            },
+            {
+                "request_id": "first-failure-on-attempt-two",
+                "received_at": "2026-08-26T11:45:00+00:00",
+            },
+        ],
+        handled_rows=[{"request_id": "handled-old"}],
+        now=datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert result["failure_attention"] == {
+        "scope": "live_pending",
+        "status": "attention_required",
+        "affected_cases": 2,
+        "repeated_failure_cases": 1,
+        "long_wait_failure_cases": 1,
+        "long_wait_threshold_seconds": 86400,
+        "max_failure_attempts": 2,
+        "oldest_wait_seconds": 216000,
+        "failure_counts": {
+            "material_collection_failed": 1,
+            "write_authorization_invalid": 1,
+        },
+    }
 
 
 @pytest.mark.parametrize(

@@ -434,6 +434,51 @@ def _attach_live_queue_projection(payload: dict) -> None:
             "unsupported": unsupported if trusted_live else "unknown",
         }
     )
+    attention = (
+        reconciled.get("failure_attention")
+        if isinstance(reconciled, dict)
+        else None
+    )
+    attention_fields = {
+        "scope",
+        "status",
+        "affected_cases",
+        "repeated_failure_cases",
+        "long_wait_failure_cases",
+        "long_wait_threshold_seconds",
+        "max_failure_attempts",
+        "oldest_wait_seconds",
+        "failure_counts",
+    }
+    counts = attention.get("failure_counts") if isinstance(attention, dict) else None
+    numeric_fields = attention_fields - {"scope", "status", "failure_counts"}
+    trusted_attention = (
+        trusted_live
+        and trusted_reconciliation
+        and isinstance(attention, dict)
+        and set(attention) == attention_fields
+        and attention.get("scope") == "live_pending"
+        and attention.get("status") in {"clear", "attention_required"}
+        and all(
+            isinstance(attention.get(field), int)
+            and not isinstance(attention.get(field), bool)
+            and attention[field] >= 0
+            for field in numeric_fields
+        )
+        and isinstance(counts, dict)
+        and all(
+            code in reconciliation.QUARANTINED_REASONS | {"unknown_failure"}
+            and isinstance(count, int)
+            and not isinstance(count, bool)
+            and count >= 0
+            for code, count in counts.items()
+        )
+        and sum(counts.values()) == attention.get("affected_cases")
+        and (attention.get("status") == "clear")
+        == (attention.get("affected_cases") == 0)
+    )
+    if trusted_attention:
+        operations["failure_attention"] = attention
 
 
 def main(

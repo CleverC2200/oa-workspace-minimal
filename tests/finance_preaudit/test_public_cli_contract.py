@@ -99,7 +99,14 @@ def test_status_combines_fresh_live_queue_counts_without_identities(
             runtime_status=lambda _root: {
                 "schema_version": 1,
                 "kind": "preaudit_runtime_status",
-                "operations": {"remaining": 1},
+                "operations": {
+                    "remaining": 1,
+                    "failure_attention": {
+                        "scope": "local_open_history",
+                        "status": "attention_required",
+                        "affected_cases": 48,
+                    },
+                },
             },
             live_status=lambda: {
                 "schema_version": 1,
@@ -119,6 +126,17 @@ def test_status_combines_fresh_live_queue_counts_without_identities(
                     "pending_quarantined": 2,
                     "actionable_pending": 3,
                 },
+                "failure_attention": {
+                    "scope": "live_pending",
+                    "status": "attention_required",
+                    "affected_cases": 2,
+                    "repeated_failure_cases": 1,
+                    "long_wait_failure_cases": 1,
+                    "long_wait_threshold_seconds": 86400,
+                    "max_failure_attempts": 2,
+                    "oldest_wait_seconds": 172800,
+                    "failure_counts": {"material_collection_failed": 2},
+                },
             },
         )
 
@@ -130,6 +148,17 @@ def test_status_combines_fresh_live_queue_counts_without_identities(
         "actionable": 3,
         "quarantined": 2,
         "unsupported": 1,
+    }
+    assert payload["operations"]["failure_attention"] == {
+        "scope": "live_pending",
+        "status": "attention_required",
+        "affected_cases": 2,
+        "repeated_failure_cases": 1,
+        "long_wait_failure_cases": 1,
+        "long_wait_threshold_seconds": 86400,
+        "max_failure_attempts": 2,
+        "oldest_wait_seconds": 172800,
+        "failure_counts": {"material_collection_failed": 2},
     }
     assert "request_id" not in json.dumps(payload)
 
