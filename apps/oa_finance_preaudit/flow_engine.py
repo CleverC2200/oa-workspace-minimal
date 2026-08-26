@@ -825,6 +825,49 @@ def validate_frozen_evidence(
     return material
 
 
+def _validate_frozen_review_inputs(
+    *,
+    attempt_root: Path,
+    state: dict,
+    workflow_key: str,
+) -> None:
+    material_file = attempt_root / "material.json"
+    packet_file = attempt_root / "review-packet.json"
+    if (
+        state.get("material_file") != str(material_file)
+        or state.get("review_packet_file") != str(packet_file)
+        or packet_file.is_symlink()
+    ):
+        raise ValueError("frozen_packet_changed")
+    material = validate_frozen_evidence(
+        material_file=material_file,
+        request_id=str(state.get("request_id") or ""),
+        workflow_key=workflow_key,
+        attachment_root=attempt_root / "attachments",
+        prepared_root=attempt_root / "prepared",
+        material_fingerprint=str(state.get("material_fingerprint") or ""),
+        evidence_fingerprint=str(state.get("evidence_fingerprint") or ""),
+    )
+    packet = _read_object(packet_file, code="frozen_packet_changed")
+    expected_packet = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "preaudit_review_packet",
+        "workflow_key": workflow_key,
+        "rule_version": _FLOW_SPECS[workflow_key]["rule_version"],
+        "material_file": str(material_file),
+        "material_fingerprint": state.get("material_fingerprint"),
+        "items": _flow_items(workflow_key),
+        **_review_packet_constraints(workflow_key, material),
+        **(
+            {"page_routing": _review_packet_routing(workflow_key, material)}
+            if workflow_key == "travel_expense"
+            else {}
+        ),
+    }
+    if packet != expected_packet:
+        raise ValueError("frozen_packet_changed")
+
+
 def _packaging_page_refs(material: dict) -> tuple[str, ...]:
     resources = material.get("resources")
     prepared = material.get("prepared")
@@ -1968,6 +2011,14 @@ class FlowEngine:
                 }
                 packet_file = attempt_root / "review-packet.json"
                 json_artifact.write_json_atomic(packet_file, packet, indent=2)
+                claim = {
+                    **claim,
+                    "material_file": str(material_file),
+                    "review_packet_file": str(packet_file),
+                    "material_fingerprint": verified["material_fingerprint"],
+                    "evidence_fingerprint": evidence_fingerprint,
+                }
+                json_artifact.write_json_atomic(state_path, claim, indent=2)
             except Exception as error:
                 return self._persist_attempt_needs_admin(
                     attempt_root / "action.json",
@@ -2606,11 +2657,24 @@ class FlowEngine:
             reason
             in {
                 "material_collection_failed",
+                "write_authorization_invalid",
                 *writer_outcomes.CONFIRMED_NO_WRITE_CODES,
             }
             and action.get("write_state") == "not_requested"
             and state.get("write_state") == "not_requested"
         )
+        authorization_failure = reason == "write_authorization_invalid"
+        if authorization_failure:
+            if os.path.lexists(attempt_root / "writer-boundary.json"):
+                raise ValueError("recovery_not_safe")
+            try:
+                _validate_frozen_review_inputs(
+                    attempt_root=attempt_root,
+                    state=state,
+                    workflow_key=workflow_key,
+                )
+            except (OSError, ValueError) as error:
+                raise ValueError("recovery_not_safe") from error
         if (
             action.get("action") != "needs_admin"
             or state.get("action") != "needs_admin"
@@ -2621,9 +2685,9 @@ class FlowEngine:
             or not self._attempt_identity_matches(
                 attempt_root,
                 state,
-                require_material=False,
+                require_material=authorization_failure,
             )
-            or (attempt_root / "execution-receipt.json").exists()
+            or os.path.lexists(attempt_root / "execution-receipt.json")
         ):
             raise ValueError("recovery_not_safe")
         if reason == "material_collection_failed" and any(
