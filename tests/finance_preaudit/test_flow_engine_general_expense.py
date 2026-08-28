@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from apps import json_artifact
 from apps.oa_finance_preaudit import flow_engine
 
@@ -125,11 +127,18 @@ def test_general_expense_deferred_payment_can_close_as_needs_human(
             {
                 "item_key": item["item_key"],
                 "status": "fail" if index in {0, 3} else "pass",
-                "conclusion": (
-                    "实付0元，均为收到货后自动付款100.00元。"
-                    if index == 0
-                    else "当前证据符合该审核项。"
-                ),
+                    "conclusion": (
+                        "实付0元，均为收到货后自动付款100.00元。"
+                        if item["item_key"] == "attachment_payment_evidence"
+                        else "当前阶段按既定策略暂不校验部门年度预算。"
+                        if item["item_key"] == "budget"
+                        else (
+                            "报销公司、支付公司、购买方三者一致，"
+                            "应选择示例有限公司支付。"
+                        )
+                        if item["item_key"] == "payment_company_consistency"
+                        else "当前证据符合该审核项。"
+                    ),
                 "evidence_refs": ["material:prepared.images.payment.1"],
                 "missing_evidence": [],
             }
@@ -144,3 +153,49 @@ def test_general_expense_deferred_payment_can_close_as_needs_human(
 
     assert closed["business_state"] == "needs_human"
     assert "实付0元，均为收到货后自动付款100.00元" in remark
+
+
+@pytest.mark.parametrize(
+    "item_key,conclusion",
+    (
+        ("budget", "暂不校验预算。"),
+        (
+            "payment_company_consistency",
+            "报销公司、支付公司与购买方一致。",
+        ),
+        (
+            "attachment_payment_evidence",
+            "三笔先用后付页面显示实付0元，未形成已支付证据。",
+        ),
+    ),
+)
+def test_general_expense_rejects_confirmed_wording_drift(
+    item_key: str,
+    conclusion: str,
+) -> None:
+    items = [
+        {
+            "item_key": "attachment_payment_evidence",
+            "status": "pass",
+            "conclusion": "附件完整。",
+        },
+        {
+            "item_key": "budget",
+            "status": "pass",
+            "conclusion": "当前阶段按既定策略暂不校验部门年度预算。",
+        },
+        {
+            "item_key": "payment_company_consistency",
+            "status": "pass",
+            "conclusion": (
+                "报销公司、支付公司、购买方三者一致，应选择示例有限公司支付。"
+            ),
+        },
+    ]
+    target = next(item for item in items if item["item_key"] == item_key)
+    target["conclusion"] = conclusion
+    if item_key == "attachment_payment_evidence":
+        target["status"] = "fail"
+
+    with pytest.raises(ValueError, match="review_decision_invalid"):
+        flow_engine._validate_general_expense_conclusions(items)
