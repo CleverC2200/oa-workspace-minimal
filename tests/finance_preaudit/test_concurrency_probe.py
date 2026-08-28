@@ -1185,10 +1185,13 @@ def test_global_dispatcher_passes_frozen_unknown_snapshot(monkeypatch) -> None:
             "committed_received_at": None,
             "committed_request_id": None,
             "known_late_visible_keys": frozenset(),
-            "admission_cutoff": None,
-            "continuous_discovery": True,
-        }
-    ]
+                "admission_cutoff": None,
+                "continuous_discovery": True,
+                "allowed_workflows": (
+                    finance_preaudit_concurrency_probe.ROLLING_WORKFLOW_KEYS
+                ),
+            }
+        ]
 
 
 @pytest.mark.parametrize(
@@ -2876,6 +2879,7 @@ def test_rolling_scope_is_explicitly_limited_to_finance_worker_routes() -> None:
         "business_entertainment",
         "business_support_fee",
         "small_marketing_fee",
+        "general_expense",
     }
     assert (
         finance_preaudit_concurrency_probe.ROLLING_WORKFLOW_KEYS
@@ -3431,12 +3435,17 @@ def test_production_cli_defaults_to_rolling_and_rejects_legacy_drain(
     monkeypatch,
     capsys,
 ) -> None:
-    calls: list[tuple[int, bool, tuple[Path, ...]]] = []
+    calls: list[tuple[int, bool, tuple[Path, ...], frozenset[str]]] = []
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe,
         "run_rolling_drain",
-        lambda *, capacity, adaptive, recovery_action_files=(): calls.append(
-            (capacity, adaptive, tuple(recovery_action_files))
+        lambda *, capacity, adaptive, allowed_workflows, recovery_action_files=(): calls.append(
+            (
+                capacity,
+                adaptive,
+                tuple(recovery_action_files),
+                allowed_workflows,
+            )
         )
         or {"status": "completed"},
     )
@@ -3444,7 +3453,14 @@ def test_production_cli_defaults_to_rolling_and_rejects_legacy_drain(
     assert finance_preaudit_concurrency_probe.main(
         ["--capacity", "6", "--confirm-write", "YES"]
     ) == 0
-    assert calls == [(6, False, ())]
+    assert calls == [
+        (
+            6,
+            False,
+            (),
+            finance_preaudit_concurrency_probe.ROLLING_WORKFLOW_KEYS,
+        )
+    ]
     capsys.readouterr()
 
     recovery = Path("/safe/attempt-1/action.json")
@@ -3458,7 +3474,25 @@ def test_production_cli_defaults_to_rolling_and_rejects_legacy_drain(
             str(recovery),
         ]
     ) == 0
-    assert calls[-1] == (6, False, (recovery,))
+    assert calls[-1] == (
+        6,
+        False,
+        (recovery,),
+        finance_preaudit_concurrency_probe.ROLLING_WORKFLOW_KEYS,
+    )
+    capsys.readouterr()
+
+    assert finance_preaudit_concurrency_probe.main(
+        [
+            "--capacity",
+            "6",
+            "--confirm-write",
+            "YES",
+            "--workflow",
+            "general_expense",
+        ]
+    ) == 0
+    assert calls[-1] == (6, False, (), frozenset({"general_expense"}))
     capsys.readouterr()
 
     assert finance_preaudit_concurrency_probe.main(
@@ -3466,7 +3500,25 @@ def test_production_cli_defaults_to_rolling_and_rejects_legacy_drain(
     ) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["error_code"] == "production_legacy_scheduler_removed"
-    assert calls == [(6, False, ()), (6, False, (recovery,))]
+    assert len(calls) == 3
+
+
+def test_supported_pending_can_be_narrowed_to_one_workflow() -> None:
+    live = {
+        "credentials": {"status": "ok"},
+        "oa": {
+            "execution_identity": "verified",
+            "by_workflow": {
+                "travel_expense": 9,
+                "general_expense": 8,
+            },
+        },
+    }
+
+    assert finance_preaudit_concurrency_probe._supported_pending(
+        live,
+        frozenset({"general_expense"}),
+    ) == 8
 
 
 def test_dispatcher_assigns_each_open_action_once_with_rolling_capacity(

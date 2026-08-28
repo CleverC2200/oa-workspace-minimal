@@ -69,6 +69,7 @@ ROLLING_WORKFLOW_KEYS = frozenset(
         "business_entertainment",
         "business_support_fee",
         "small_marketing_fee",
+        "general_expense",
     }
 )
 _OA_TIMEZONE = ZoneInfo("Asia/Shanghai")
@@ -764,6 +765,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
     committed_request_id: str | None = None
     known_late_visible_keys: set[str] = set()
     admission_cutoff: datetime | None = None
+    allowed_workflows = ROLLING_WORKFLOW_KEYS
     if isinstance(selection, str):
         workflow_key = selection
     elif isinstance(selection, dict) and selection.get("workflow_key") == "*":
@@ -779,12 +781,21 @@ def _prepare_one(selection: PrepareSelection) -> dict:
         raw_committed_request_id = selection.get("committed_request_id")
         raw_late_visible_keys = selection.get("known_late_visible_keys", [])
         raw_admission_cutoff = selection.get("admission_cutoff")
+        raw_allowed_workflows = selection.get(
+            "allowed_workflows",
+            sorted(ROLLING_WORKFLOW_KEYS),
+        )
         if not isinstance(raw_assigned, list) or not isinstance(
             raw_historical_unknown,
             list,
         ) or not isinstance(raw_recovery_actions, list) or not isinstance(
             raw_late_visible_keys,
             list,
+        ) or not isinstance(raw_allowed_workflows, list) or not raw_allowed_workflows or (
+            len(set(raw_allowed_workflows)) != len(raw_allowed_workflows)
+        ) or any(
+            not isinstance(value, str) or value not in ROLLING_WORKFLOW_KEYS
+            for value in raw_allowed_workflows
         ) or any(
             not isinstance(path, str) or not path
             for path in raw_recovery_actions
@@ -798,6 +809,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 "action": "failed",
                 "error_code": "production_probe_prepare_failed",
             }
+        allowed_workflows = frozenset(raw_allowed_workflows)
         for identity in raw_assigned:
             if (
                 not isinstance(identity, list)
@@ -889,7 +901,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                         | historical_unknown_identities
                         | assigned_identities
                     ),
-                    allowed_workflows=ROLLING_WORKFLOW_KEYS,
+                    allowed_workflows=allowed_workflows,
                 )
             except (ValueError, OSError):
                 runtime_control.request_stop("production_probe_prepare_failed")
@@ -935,7 +947,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                         recovery_action_files,
                         assigned_identities=assigned_identities,
                     ),
-                    allowed_workflows=ROLLING_WORKFLOW_KEYS,
+                    allowed_workflows=allowed_workflows,
                 )
             except (ValueError, OSError):
                 runtime_control.request_stop("production_probe_prepare_failed")
@@ -945,7 +957,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 }
             candidates = production_pending.actionable_fifo(
                 [*live_candidates, *recovery_candidates],
-                allowed_workflows=ROLLING_WORKFLOW_KEYS,
+                allowed_workflows=allowed_workflows,
             )
             if not candidates:
                 return (
@@ -1783,6 +1795,7 @@ def _run_dispatched_tasks(
     known_late_visible_keys: frozenset[str] = frozenset(),
     admission_cutoff: str | None = None,
     continuous_discovery: bool = False,
+    allowed_workflows: frozenset[str] = ROLLING_WORKFLOW_KEYS,
 ) -> process_pool.PoolResult[dict]:
     maximum_capacity = capacity if max_capacity is None else max_capacity
     recovery_queue = tuple(
@@ -1797,6 +1810,8 @@ def _run_dispatched_tasks(
         or (recovery_queue and not strict_global_fifo)
         or len(recovery_queue) > count
         or len(set(recovery_queue)) != len(recovery_queue)
+        or not allowed_workflows
+        or not allowed_workflows.issubset(ROLLING_WORKFLOW_KEYS)
     ):
         raise ValueError("production_dispatcher_watchdog_invalid")
     if adaptive and (
@@ -2187,6 +2202,7 @@ def _run_dispatched_tasks(
             identities.append(list(identity))
         selection: dict[str, object] = {
             "workflow_key": "*",
+            "allowed_workflows": sorted(allowed_workflows),
             "assigned_identities": identities,
             "historical_unknown_identities": [
                 list(identity)
@@ -3010,6 +3026,7 @@ def _run_global_dispatched_tasks(
     committed_request_id: str | None = None,
     known_late_visible_keys: frozenset[str] = frozenset(),
     admission_cutoff: str | None = None,
+    allowed_workflows: frozenset[str] = ROLLING_WORKFLOW_KEYS,
 ) -> process_pool.PoolResult[dict]:
     codex_review_worker._reviewer_environment()
     frozen_unknown = (
@@ -3027,6 +3044,7 @@ def _run_global_dispatched_tasks(
         "known_late_visible_keys": known_late_visible_keys,
         "admission_cutoff": admission_cutoff,
         "continuous_discovery": True,
+        "allowed_workflows": allowed_workflows,
     }
     if recovery_action_files:
         dispatcher_args["recovery_action_files"] = recovery_action_files
@@ -3199,15 +3217,20 @@ def _travel_pending(live: dict) -> int:
     return pending
 
 
-def _production_reconciliation() -> dict:
+def _production_reconciliation(
+    workflow_keys: frozenset[str] = ROLLING_WORKFLOW_KEYS,
+) -> dict:
     root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
     return cli._live_reconciliation(
         root,
-        workflow_keys=ROLLING_WORKFLOW_KEYS,
+        workflow_keys=workflow_keys,
     )
 
 
-def _supported_pending(live: dict) -> int:
+def _supported_pending(
+    live: dict,
+    workflow_keys: frozenset[str] = ROLLING_WORKFLOW_KEYS,
+) -> int:
     credentials = live.get("credentials")
     oa = live.get("oa")
     if (
@@ -3221,7 +3244,7 @@ def _supported_pending(live: dict) -> int:
     if not isinstance(by_workflow, dict):
         raise ValueError("production_drain_live_status_invalid")
     pending = 0
-    for workflow_key in ROLLING_WORKFLOW_KEYS:
+    for workflow_key in workflow_keys:
         count = by_workflow.get(workflow_key, 0)
         if not isinstance(count, int) or isinstance(count, bool) or count < 0:
             raise ValueError("production_drain_live_status_invalid")
@@ -3234,9 +3257,10 @@ def _supported_pending(live: dict) -> int:
 def _rolling_snapshot(
     live_status: LiveStatus,
     reconcile_status: Callable[[], dict],
+    workflow_keys: frozenset[str] = ROLLING_WORKFLOW_KEYS,
 ) -> tuple[int, int, int, int]:
     live = live_status()
-    pending = _supported_pending(live)
+    pending = _supported_pending(live, workflow_keys)
     oa = live.get("oa")
     unauthorized = oa.get("unsupported", 0) if isinstance(oa, dict) else 0
     if (
@@ -3676,12 +3700,23 @@ def run_rolling_drain(
     reconcile_status: Callable[[], dict] = _production_reconciliation,
     max_waves: int = 10,
     recovery_action_files: Sequence[Path] = (),
+    allowed_workflows: frozenset[str] = ROLLING_WORKFLOW_KEYS,
 ) -> dict:
     recovery_queue = tuple(
         Path(path).expanduser().resolve() for path in recovery_action_files
     )
+    if (
+        not allowed_workflows
+        or not allowed_workflows.issubset(ROLLING_WORKFLOW_KEYS)
+    ):
+        raise ValueError("production_rolling_workflow_scope_invalid")
     if recovery_queue and pipeline_runner is not _run_global_dispatched_tasks:
         raise ValueError("production_rolling_recovery_runner_invalid")
+    scoped_reconcile_status = (
+        (lambda: _production_reconciliation(allowed_workflows))
+        if reconcile_status is _production_reconciliation
+        else reconcile_status
+    )
     controller_handoff.assert_ready_for_start()
     try:
         with runtime_control.global_controller_lease():
@@ -3737,6 +3772,7 @@ def run_rolling_drain(
                         committed_request_id=committed_request_id,
                         known_late_visible_keys=known_late_visible_keys,
                         admission_cutoff=admission_cutoff,
+                        allowed_workflows=allowed_workflows,
                     )
                     pending_recoveries = ()
                     committed_received_at = wave_result.committed_received_at
@@ -3756,9 +3792,10 @@ def run_rolling_drain(
                     max_capacity=max_capacity,
                     live_status=live_status,
                     pipeline_runner=tracked_pipeline_runner,
-                    reconcile_status=reconcile_status,
+                    reconcile_status=scoped_reconcile_status,
                     max_waves=max_waves,
                     recovery_count=len(recovery_queue),
+                    allowed_workflows=allowed_workflows,
                 )
                 if result["processes_reaped"] is not True:
                     children_reaped = False
@@ -3806,6 +3843,7 @@ def _run_rolling_drain_locked(
     reconcile_status: Callable[[], dict] = _production_reconciliation,
     max_waves: int = 10,
     recovery_count: int = 0,
+    allowed_workflows: frozenset[str] = ROLLING_WORKFLOW_KEYS,
 ) -> dict:
     if (
         not 1 <= capacity <= 6
@@ -3830,7 +3868,11 @@ def _run_rolling_drain_locked(
             initial_actionable,
             unauthorized_pending,
         ) = (
-            _rolling_snapshot(live_status, reconcile_status)
+            _rolling_snapshot(
+                live_status,
+                reconcile_status,
+                allowed_workflows,
+            )
         )
     except ValueError as error:
         if str(error) == "production_rolling_reconciliation_invalid":
@@ -3865,7 +3907,11 @@ def _run_rolling_drain_locked(
                     quarantined_pending,
                     actionable,
                     unauthorized_pending,
-                ) = _rolling_snapshot(live_status, reconcile_status)
+                ) = _rolling_snapshot(
+                    live_status,
+                    reconcile_status,
+                    allowed_workflows,
+                )
             except ValueError:
                 runtime_control.request_stop()
                 raise
@@ -3936,7 +3982,11 @@ def _run_rolling_drain_locked(
                 quarantined_pending,
                 actionable,
                 unauthorized_pending,
-            ) = _rolling_snapshot(live_status, reconcile_status)
+            ) = _rolling_snapshot(
+                live_status,
+                reconcile_status,
+                allowed_workflows,
+            )
         except ValueError:
             runtime_control.request_stop()
             raise
@@ -4218,6 +4268,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--drain", action="store_true")
     parser.add_argument("--rolling", action="store_true")
     parser.add_argument(
+        "--workflow",
+        action="append",
+        choices=sorted(ROLLING_WORKFLOW_KEYS),
+        default=[],
+    )
+    parser.add_argument(
         "--recover-action-file",
         action="append",
         type=Path,
@@ -4226,7 +4282,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.read_only:
-            if args.drain or args.rolling or args.recover_action_file:
+            if (
+                args.drain
+                or args.rolling
+                or args.recover_action_file
+                or args.workflow
+            ):
                 raise ValueError("read_only_probe_scheduler_invalid")
             payload = (
                 run_adaptive_read_only_probe(
@@ -4248,6 +4309,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             rolling_args = {
                 "capacity": args.capacity,
                 "adaptive": args.adaptive,
+                "allowed_workflows": (
+                    frozenset(args.workflow)
+                    if args.workflow
+                    else ROLLING_WORKFLOW_KEYS
+                ),
             }
             if args.recover_action_file:
                 rolling_args["recovery_action_files"] = tuple(

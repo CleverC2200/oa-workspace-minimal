@@ -92,6 +92,23 @@ _FLOW_SPECS = {
             "金额孰低核销",
         ),
     },
+    "general_expense": {
+        "rule_version": "general_expense:1",
+        "item_keys": (
+            "attachment_payment_evidence",
+            "invoice_linkage",
+            "budget",
+            "reimbursable_minimum",
+            "payment_company_consistency",
+        ),
+        "item_names": (
+            "附件完整性/支付证据",
+            "发票关联",
+            "预算",
+            "金额孰低核销",
+            "支付公司一致",
+        ),
+    },
     "packaging_layout_approval": {
         "rule_version": "packaging_layout_approval:1",
         "item_keys": (

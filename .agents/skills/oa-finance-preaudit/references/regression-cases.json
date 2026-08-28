@@ -235,6 +235,48 @@
             "expected_output": "逐项读取全部代表页并按实际事实形成结论；确实不确定时，在页面引用之外说明该项具体缺失的事实或关系",
             "failure_mode": "把页面全覆盖要求误解为全部页面缺少审核适用性",
             "rule_ref": "observation-contract.md#页面覆盖;flow-engine-contract.md#结构化审核决定"
+        },
+        {
+            "id": "RC-017-deferred-payment-counted-as-paid",
+            "scope": "general-expense",
+            "audit_item": "1-附件完整性/支付证据;4-金额孰低核销",
+            "status": "confirmed",
+            "input_facts": [
+                "先用后付页面显示实付0元",
+                "同一页面注明确认收货后自动付款某金额"
+            ],
+            "incorrect_output": "把收货后计划自动付款的金额当作当前已支付金额，或只写支付截图无效而省略页面上的两个金额",
+            "expected_output": "明确写出实付0元，并逐笔列出确认收货后自动付款金额；当前计划付款金额不计入可验证实付",
+            "failure_mode": "没有区分当前实付与未来自动付款承诺",
+            "rule_ref": "flows/general-expense.md#第-1-项附件完整性支付证据;flows/general-expense.md#第-4-项金额孰低核销"
+        },
+        {
+            "id": "RC-018-unknown-subject-left-without-fallback",
+            "scope": "general-expense",
+            "audit_item": "1-附件完整性/支付证据",
+            "status": "confirmed",
+            "input_facts": [
+                "预算科目不在附件规则表",
+                "当前流程能够读取发票和支付截图"
+            ],
+            "incorrect_output": "仅因科目不在附件规则表而输出附件要求无法判断",
+            "expected_output": "按发票加支付截图的兜底规则核验附件；两类材料齐全则通过，缺少任一类则明确指出",
+            "failure_mode": "缺少未配置科目的附件兜底规则",
+            "rule_ref": "flows/general-expense.md#第-1-项附件完整性支付证据"
+        },
+        {
+            "id": "RC-019-payment-company-check-omitted",
+            "scope": "general-expense",
+            "audit_item": "5-支付公司一致",
+            "status": "confirmed",
+            "input_facts": [
+                "表单同时提供报销公司和支付公司",
+                "关联发票提供购买方"
+            ],
+            "incorrect_output": "只输出附件、发票、预算和金额四项，未核对付款主体",
+            "expected_output": "增加支付公司一致项；逐字比较报销公司、支付公司和购买方，三者一致时明确应选择对应公司支付",
+            "failure_mode": "遗漏付款主体一致性检查",
+            "rule_ref": "flows/general-expense.md#第-5-项支付公司一致;result-contract.md#统一格式"
         }
   ]
 }

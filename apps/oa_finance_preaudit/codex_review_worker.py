@@ -38,6 +38,11 @@ _FINANCE_RULES = {
         "小额市场费",
         "references/flows/small-marketing-fee.md",
     ),
+    "general_expense": (
+        "general_expense:1",
+        "通用费用报销",
+        "references/flows/general-expense.md",
+    ),
 }
 _EVENT_TYPES = frozenset(
     {

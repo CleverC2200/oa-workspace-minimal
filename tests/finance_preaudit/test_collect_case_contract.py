@@ -39,6 +39,11 @@ FLOW_CONFIGS = (
         "workflow_name": "小额市场费用报销申请流程",
     },
     {
+        "flow_key": "general_expense",
+        "workflow_id": "195021",
+        "workflow_name": "通用费用报销申请流程",
+    },
+    {
         "flow_key": "packaging_layout_approval",
         "workflow_id": "198521",
         "workflow_name": "包装新制（更改）及包装版面审批流程",

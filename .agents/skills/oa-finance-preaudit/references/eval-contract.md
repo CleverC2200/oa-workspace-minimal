@@ -1,6 +1,6 @@
 # 离线 Golden Replay 合同
 
-质量基线固定为 `tests/finance_preaudit/fixtures/golden_replay.json`。五类流程各包含正常、业务异常、证据不足和技术失败四种场景，四类财务流程再增加材料采集降级场景，共 24 个纯脱敏合成样本；不保存 requestId、人员、公司、附件正文或原始业务附件。
+质量基线固定为 `tests/finance_preaudit/fixtures/golden_replay.json`。六类流程各包含正常、业务异常、证据不足和技术失败四种场景，五类财务流程再增加材料采集降级场景，共 29 个纯脱敏合成样本；不保存 requestId、人员、公司、附件正文或原始业务附件。
 
 每个样本必须固定：
 
