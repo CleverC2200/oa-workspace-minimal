@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "workflow_key": "packaging_layout_approval",
-  "rule_version": "packaging_layout_approval:1",
+  "rule_version": "packaging_layout_approval:2",
   "cases": [
     {"case_id":"packaging-normal-v1","material_workflow":"packaging_layout_approval","image_fixture":"packaging_sample.png","observations":{"ingredients":"小麦粉、白砂糖、植物油、食用盐","allergens":"本产品含有小麦制品","nutrition":"能量 1680 千焦；蛋白质 8.0 克","address":"示例市示例区测试路 100 号"},"regions":{"ingredients":"clear","allergens":"clear","nutrition":"clear","address":"clear"},"items":[
       {"status":"pass","conclusion":"配料关键文字未见异常。","evidence_refs":["material:prepared.images.page-1.page-1"],"missing_evidence":[]},

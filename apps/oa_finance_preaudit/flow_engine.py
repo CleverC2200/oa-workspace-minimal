@@ -110,7 +110,7 @@ _FLOW_SPECS = {
         ),
     },
     "packaging_layout_approval": {
-        "rule_version": "packaging_layout_approval:1",
+        "rule_version": "packaging_layout_approval:2",
         "item_keys": (
             "ingredients",
             "allergens",
@@ -125,6 +125,13 @@ _FLOW_SPECS = {
         ),
     },
 }
+_LEGACY_PACKAGING_RULE_VERSION = "packaging_layout_approval:1"
+_PACKAGING_RULE_VERSION = "packaging_layout_approval:2"
+_PACKAGING_SKIP_REMARK = "AI审核结论：非包装版面，跳过审核。"
+_PACKAGING_PAGE_CLASSIFICATIONS = frozenset(
+    {"packaging_layout", "non_packaging", "uncertain"}
+)
+_SAFE_PACKAGE_VERSION_ID = re.compile(r"^[0-9A-Za-z._-]{1,80}$")
 WORKFLOW_KEYS = tuple(_FLOW_SPECS)
 _FINANCE_WORKFLOW_KEYS = frozenset(WORKFLOW_KEYS) - {"packaging_layout_approval"}
 _GENERAL_EXPENSE_BUDGET_CONCLUSION = (
@@ -429,7 +436,15 @@ def _review_packet_constraints(workflow_key: str, material: dict) -> dict:
         ):
             raise ValueError("material_bundle_schema_invalid")
     if not raw_gaps:
-        return {"material_state": "complete", "required_uncertain_items": []}
+        constraints = {
+            "material_state": "complete",
+            "required_uncertain_items": [],
+        }
+        if workflow_key == "packaging_layout_approval":
+            constraints["packaging_visual_contract"] = (
+                _packaging_visual_contract(material)
+            )
+        return constraints
     if workflow_key not in _FINANCE_WORKFLOW_KEYS:
         raise ValueError("material_bundle_schema_invalid")
     prepared = material.get("prepared")
@@ -916,7 +931,10 @@ def _validate_frozen_review_inputs(
             else {}
         ),
     }
-    if packet != expected_packet:
+    accepted_packets = [expected_packet]
+    if workflow_key == "packaging_layout_approval":
+        accepted_packets = _accepted_packaging_packets(expected_packet, state)
+    if packet not in accepted_packets:
         raise ValueError("frozen_packet_changed")
 
 
@@ -945,6 +963,140 @@ def _packaging_page_refs(material: dict) -> tuple[str, ...]:
             for number, _image in enumerate(resource_images, start=1)
         )
     return tuple(refs)
+
+
+def _packaging_visual_contract(material: dict) -> dict:
+    return {
+        "page_refs": list(_packaging_page_refs(material)),
+        "classifications": sorted(_PACKAGING_PAGE_CLASSIFICATIONS),
+        "item_keys": list(_FLOW_SPECS["packaging_layout_approval"]["item_keys"]),
+        "skip_remark": _PACKAGING_SKIP_REMARK,
+    }
+
+
+def _legacy_packaging_packet(packet: dict) -> dict:
+    legacy = dict(packet)
+    legacy.pop("packaging_visual_contract", None)
+    legacy["rule_version"] = _LEGACY_PACKAGING_RULE_VERSION
+    return legacy
+
+
+def _accepted_packaging_packets(
+    expected_packet: dict,
+    state: dict,
+    *,
+    action: dict | None = None,
+) -> list[dict]:
+    frozen_version = state.get("rule_version")
+    if frozen_version is None:
+        if action is not None and action.get("rule_version") is not None:
+            raise ValueError("frozen_packet_changed")
+        return [_legacy_packaging_packet(expected_packet)]
+    if frozen_version == _PACKAGING_RULE_VERSION and (
+        action is None or action.get("rule_version") == _PACKAGING_RULE_VERSION
+    ):
+        return [expected_packet]
+    raise ValueError("frozen_packet_changed")
+
+
+def _validate_packaging_visual_review(
+    visual_review: object,
+    *,
+    page_refs: tuple[str, ...],
+    item_keys: tuple[str, ...],
+    items: list[dict],
+    overall: object,
+) -> str:
+    if (
+        not isinstance(visual_review, dict)
+        or set(visual_review) != {"outcome", "pages"}
+        or visual_review.get("outcome") not in {"reviewed", "all_non_packaging"}
+        or not isinstance(visual_review.get("pages"), list)
+        or len(visual_review["pages"]) != len(page_refs)
+    ):
+        raise ValueError("review_decision_invalid")
+    items_by_key = {item["item_key"]: item for item in items}
+    version_items: dict[str, set[str]] = {}
+    uncertain_refs: set[str] = set()
+    non_packaging_refs: set[str] = set()
+    classifications: list[str] = []
+    for expected_ref, page in zip(page_refs, visual_review["pages"], strict=True):
+        if not isinstance(page, dict) or set(page) != {
+            "page_ref",
+            "classification",
+            "package_version_id",
+            "item_keys",
+        }:
+            raise ValueError("review_decision_invalid")
+        classification = page.get("classification")
+        version_id = page.get("package_version_id")
+        reviewed_keys = page.get("item_keys")
+        if (
+            page.get("page_ref") != expected_ref
+            or classification not in _PACKAGING_PAGE_CLASSIFICATIONS
+            or not isinstance(reviewed_keys, list)
+            or not all(isinstance(key, str) for key in reviewed_keys)
+            or len(set(reviewed_keys)) != len(reviewed_keys)
+            or any(key not in item_keys for key in reviewed_keys)
+        ):
+            raise ValueError("review_decision_invalid")
+        classifications.append(classification)
+        if classification == "packaging_layout":
+            if (
+                not isinstance(version_id, str)
+                or _SAFE_PACKAGE_VERSION_ID.fullmatch(version_id) is None
+            ):
+                raise ValueError("review_decision_invalid")
+            version_items.setdefault(version_id, set()).update(reviewed_keys)
+            for item_key in reviewed_keys:
+                item = items_by_key[item_key]
+                if expected_ref not in {
+                    *item["evidence_refs"],
+                    *item["missing_evidence"],
+                }:
+                    raise ValueError("review_decision_invalid")
+        elif version_id is not None or reviewed_keys:
+            raise ValueError("review_decision_invalid")
+        elif classification == "uncertain":
+            uncertain_refs.add(expected_ref)
+        else:
+            non_packaging_refs.add(expected_ref)
+
+    referenced_item_pages = {
+        reference
+        for item in items
+        for reference in (*item["evidence_refs"], *item["missing_evidence"])
+    }
+    if non_packaging_refs & referenced_item_pages:
+        raise ValueError("review_decision_invalid")
+
+    outcome = visual_review["outcome"]
+    if outcome == "all_non_packaging":
+        if (
+            any(value != "non_packaging" for value in classifications)
+            or overall != "pass"
+            or any(item["status"] != "pass" for item in items)
+        ):
+            raise ValueError("review_decision_invalid")
+        return outcome
+
+    if all(value == "non_packaging" for value in classifications):
+        raise ValueError("review_decision_invalid")
+    expected_items = set(item_keys)
+    if any(covered != expected_items for covered in version_items.values()):
+        raise ValueError("review_decision_invalid")
+    if uncertain_refs:
+        covered_uncertain_refs = {
+            reference
+            for item in items
+            if item["status"] == "uncertain"
+            for reference in item["missing_evidence"]
+        }
+        if overall != "needs_human" or not uncertain_refs.issubset(
+            covered_uncertain_refs
+        ):
+            raise ValueError("review_decision_invalid")
+    return outcome
 
 
 def _packaging_excel_contents(material: dict) -> tuple[set[str], dict[str, list[str]]]:
@@ -1910,6 +2062,11 @@ class FlowEngine:
             "review_packet_file": str(packet_path),
             "events_file": str(action_path.with_name("observability.json")),
         }
+        if (
+            workflow_key == "packaging_layout_approval"
+            and state.get("rule_version") is not None
+        ):
+            required_action["rule_version"] = state["rule_version"]
         if any(action.get(key) != value for key, value in required_action.items()):
             raise ValueError("persistent_state_invalid")
         if (
@@ -1948,6 +2105,12 @@ class FlowEngine:
                     **expected_packet,
                     "page_routing": _review_packet_routing(workflow_key, material),
                 }
+            )
+        elif workflow_key == "packaging_layout_approval":
+            accepted_packets = _accepted_packaging_packets(
+                expected_packet,
+                state,
+                action=action,
             )
         if packet not in accepted_packets:
             raise ValueError("frozen_packet_changed")
@@ -2137,6 +2300,11 @@ class FlowEngine:
                 events_file=str(events_file),
                 case_key=claim["case_key"],
                 attempt=claim["attempt"],
+                **(
+                    {"rule_version": spec["rule_version"]}
+                    if workflow_key == "packaging_layout_approval"
+                    else {}
+                ),
                 **recovery_metadata,
             )
             state = {
@@ -2147,6 +2315,11 @@ class FlowEngine:
                 "material_file": str(material_file),
                 "material_fingerprint": verified["material_fingerprint"],
                 "evidence_fingerprint": evidence_fingerprint,
+                **(
+                    {"rule_version": spec["rule_version"]}
+                    if workflow_key == "packaging_layout_approval"
+                    else {}
+                ),
                 **(
                     {
                         "authorization_grant": authorization[
@@ -2973,6 +3146,10 @@ class FlowEngine:
                 "observability_incomplete",
             )
         decision = _read_object(decision_file, code="review_decision_unreadable")
+        packaging_v2 = (
+            action["workflow_key"] == "packaging_layout_approval"
+            and packet.get("rule_version") == _PACKAGING_RULE_VERSION
+        )
         expected_fields = {
             "schema_version",
             "kind",
@@ -2984,6 +3161,8 @@ class FlowEngine:
         }
         if action["workflow_key"] == "packaging_layout_approval":
             expected_fields.add("excel_comparison")
+            if packaging_v2:
+                expected_fields.add("visual_review")
         if (
             set(decision) != expected_fields
             or decision.get("schema_version") != SCHEMA_VERSION
@@ -3002,6 +3181,11 @@ class FlowEngine:
         packet_items = packet.get("items")
         if not isinstance(packet_items, list) or len(decision["items"]) != len(packet_items):
             raise ValueError("review_decision_invalid")
+        packaging_skip_declared = (
+            packaging_v2
+            and isinstance(decision.get("visual_review"), dict)
+            and decision["visual_review"].get("outcome") == "all_non_packaging"
+        )
         normalized_items: list[dict] = []
         for expected, item in zip(packet_items, decision["items"]):
             if not isinstance(item, dict) or set(item) != {
@@ -3027,7 +3211,11 @@ class FlowEngine:
                     isinstance(value, str) and value.strip()
                     for value in missing_evidence
                 )
-                or (status in {"pass", "fail"} and not evidence_refs)
+                or (
+                    status in {"pass", "fail"}
+                    and not evidence_refs
+                    and not packaging_skip_declared
+                )
                 or (status == "uncertain" and not missing_evidence)
             ):
                 raise ValueError("review_decision_invalid")
@@ -3057,9 +3245,23 @@ class FlowEngine:
         total_page_count = 0
         routed_resource_refs: set[str] = set()
         packaging_excel_notice: str | None = None
+        packaging_visual_outcome: str | None = None
         if action["workflow_key"] == "packaging_layout_approval":
-            page_refs = set(_packaging_page_refs(quality_material))
-            if not page_refs or not page_refs.issubset(covered_page_refs):
+            ordered_page_refs = _packaging_page_refs(quality_material)
+            page_refs = set(ordered_page_refs)
+            if not page_refs:
+                raise ValueError("review_decision_invalid")
+            if packaging_v2:
+                packaging_visual_outcome = _validate_packaging_visual_review(
+                    decision.get("visual_review"),
+                    page_refs=ordered_page_refs,
+                    item_keys=tuple(
+                        item["item_key"] for item in packet_items
+                    ),
+                    items=normalized_items,
+                    overall=decision.get("overall"),
+                )
+            elif not page_refs.issubset(covered_page_refs):
                 raise ValueError("review_decision_invalid")
             covered_page_count = len(page_refs)
             total_page_count = len(page_refs)
@@ -3074,7 +3276,14 @@ class FlowEngine:
             comparison_status = comparison.get("status")
             excel_resource_id = comparison.get("resource_id")
             mappings = comparison.get("mappings")
-            if comparison_status == "not_provided":
+            if packaging_visual_outcome == "all_non_packaging":
+                if (
+                    comparison_status != "not_applicable"
+                    or excel_resource_id is not None
+                    or mappings != []
+                ):
+                    raise ValueError("review_decision_invalid")
+            elif comparison_status == "not_provided":
                 if excel_ids or excel_resource_id is not None or mappings != []:
                     raise ValueError("review_decision_invalid")
                 packaging_excel_notice = (
@@ -3195,17 +3404,20 @@ class FlowEngine:
             if needs_human
             else "AI审核结论：可提交 ✅"
         )
-        lines = [first_line]
-        for number, (expected, item) in enumerate(
-            zip(packet_items, normalized_items),
-            start=1,
-        ):
-            lines.append(
-                f"{status_mark[item['status']]} {number}、{expected['name']}："
-                f"{item['conclusion'].strip()}"
-            )
-        if packaging_excel_notice is not None:
-            lines.append(packaging_excel_notice)
+        if packaging_visual_outcome == "all_non_packaging":
+            lines = [_PACKAGING_SKIP_REMARK]
+        else:
+            lines = [first_line]
+            for number, (expected, item) in enumerate(
+                zip(packet_items, normalized_items),
+                start=1,
+            ):
+                lines.append(
+                    f"{status_mark[item['status']]} {number}、{expected['name']}："
+                    f"{item['conclusion'].strip()}"
+                )
+            if packaging_excel_notice is not None:
+                lines.append(packaging_excel_notice)
         remark_file = action_path.with_name("remark.txt")
         remark_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

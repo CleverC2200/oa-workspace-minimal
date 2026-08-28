@@ -59,7 +59,7 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
 }
 ```
 
-- `pass` 和 `fail` 至少有一个 `evidence_refs`。
+- `pass` 和 `fail` 至少有一个 `evidence_refs`；唯一例外是 V2 包装流程确认全部页面均为 `non_packaging` 的跳过分支，内部四项不绑定图片证据。
 - `uncertain` 至少有一个 `missing_evidence`。
 - 差旅完整材料采用 `full_coverage_without_trusted_item_relation` 路由时，页面引用只记录覆盖范围；`uncertain` 的 `missing_evidence` 除页面引用外还必须包含当前审核项具体缺失的事实或关系，只有页面引用的决定无效。
 - 任一项目为 `fail` 或 `uncertain` 时，`overall` 必须为 `needs_human`；全部为 `pass` 时必须为 `pass`。
@@ -67,7 +67,30 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
 
 包装流程的决定还必须增加一个 `excel_comparison`。未提供 Excel 时固定为 `{"status":"not_provided","resource_id":null,"mappings":[]}`。存在 Excel 时，`mappings` 必须按四项顺序逐项给出 `item_key`、可解析到同一结构化 Excel `key_text` 索引的 `cell_refs`，以及 `match`、`different` 或 `uncertain` 比较结果；相同 cell ref 还要进入对应项目的 `evidence_refs`。脚本逐条验证资源、索引、项目状态和四项映射后才渲染 Excel 对照尾行，不根据附件存在自行推断完成。
 
-包装决定还必须用 `material:prepared.images.<resource_id>.page-<number>` 在 `evidence_refs` 或 `missing_evidence` 中覆盖审核包引用材料的每一页。脚本会先验证图片可读、manifest 页数与准备页一致，再验证决定的全页覆盖；采集脚本不得生成图片观察或校对结论。
+`packaging_layout_approval:2` 的包装决定还必须增加 `visual_review`：
+
+```json
+{
+  "outcome": "reviewed 或 all_non_packaging",
+  "pages": [
+    {
+      "page_ref": "原样复制 packaging_visual_contract.page_refs 中对应值",
+      "classification": "packaging_layout、non_packaging 或 uncertain",
+      "package_version_id": "仅包装页填写稳定、脱敏的版本 ID；其他页为 null",
+      "item_keys": ["该包装页实际覆盖的固定审核项 key；其他页为空数组"]
+    }
+  ]
+}
+```
+
+- `pages` 必须按 `packaging_visual_contract.page_refs` 顺序逐页覆盖且不得重复。
+- `packaging_layout` 页必须填写版本 ID；同一版本所有页面的 `item_keys` 并集必须精确覆盖四个固定项。页面声明覆盖某项时，该页引用必须进入对应项目的 `evidence_refs` 或 `missing_evidence`。
+- `non_packaging` 和 `uncertain` 页的版本 ID 必须为 `null`，`item_keys` 必须为空；`non_packaging` 页引用也不得进入任一固定项目的 `evidence_refs` 或 `missing_evidence`。
+- 只要存在 `packaging_layout` 就使用 `outcome=reviewed` 并审核包装页；存在 `uncertain` 时也必须使用 `reviewed`，整体结论为 `needs_human`，且不确定页引用必须进入至少一个 `uncertain` 项的 `missing_evidence`。
+- 只有全部页面均为 `non_packaging` 时允许 `outcome=all_non_packaging`。此时四项保留为内部 `pass` 结构以维持统一执行与回执合同，但 `evidence_refs` 和 `missing_evidence` 均为空；`excel_comparison.status` 使用 `not_applicable`，OA 意见只渲染 `AI审核结论：非包装版面，跳过审核。`。
+- V1 冻结包装审核包仍按原决定合同闭合；新审核包会在 action、state 和 review packet 中同时固定 V2 标记，任一标记缺失或不一致均停止，不能把 V2 决定降级成 V1 绕过视觉覆盖校验。
+
+V1 包装决定必须用 `material:prepared.images.<resource_id>.page-<number>` 在 `evidence_refs` 或 `missing_evidence` 中覆盖每一页；V2 改由 `visual_review.pages` 完成逐页分类覆盖，并把包装页声明的固定项逐项绑定到对应证据或缺口。脚本会先验证图片可读、manifest 页数与准备页一致，再验证视觉分类、版本四项矩阵和证据绑定；采集脚本不得生成图片观察、分类或校对结论。
 
 将决定写入新的本地文件后执行：
 
