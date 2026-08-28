@@ -96,6 +96,30 @@ def test_non_travel_schema_and_timing_follow_bound_action(tmp_path: Path) -> Non
     assert "page_routing" not in prompt
 
 
+def test_general_expense_worker_uses_bound_rule_pack(tmp_path: Path) -> None:
+    _task_payload, action_file = _task(
+        tmp_path,
+        workflow_key="general_expense",
+    )
+
+    schema = codex_review_worker._decision_schema(action_file)
+    prompt = codex_review_worker._prompt(action_file)
+
+    assert schema["properties"]["workflow_key"] == {
+        "type": "string",
+        "const": "general_expense",
+    }
+    assert schema["properties"]["rule_version"] == {
+        "type": "string",
+        "const": "general_expense:1",
+    }
+    assert "通用费用报销生产预审" in prompt
+    assert "general-expense.md" in prompt
+    assert "实付0元，均为收到货后自动付款" in prompt
+    assert "三者一致，应选择当前实际公司全称支付" in prompt
+    assert "page_routing" not in prompt
+
+
 def test_schema_uses_frozen_packet_rule_version(tmp_path: Path) -> None:
     _task_payload, action_file = _task(
         tmp_path,

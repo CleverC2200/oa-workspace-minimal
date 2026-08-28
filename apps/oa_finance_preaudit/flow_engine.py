@@ -92,6 +92,23 @@ _FLOW_SPECS = {
             "金额孰低核销",
         ),
     },
+    "general_expense": {
+        "rule_version": "general_expense:1",
+        "item_keys": (
+            "attachment_payment_evidence",
+            "invoice_linkage",
+            "budget",
+            "reimbursable_minimum",
+            "payment_company_consistency",
+        ),
+        "item_names": (
+            "附件完整性/支付证据",
+            "发票关联",
+            "预算",
+            "金额孰低核销",
+            "支付公司一致",
+        ),
+    },
     "packaging_layout_approval": {
         "rule_version": "packaging_layout_approval:1",
         "item_keys": (
@@ -110,6 +127,15 @@ _FLOW_SPECS = {
 }
 WORKFLOW_KEYS = tuple(_FLOW_SPECS)
 _FINANCE_WORKFLOW_KEYS = frozenset(WORKFLOW_KEYS) - {"packaging_layout_approval"}
+_GENERAL_EXPENSE_BUDGET_CONCLUSION = (
+    "当前阶段按既定策略暂不校验部门年度预算。"
+)
+_GENERAL_EXPENSE_COMPANY_PASS = re.compile(
+    r"^报销公司、支付公司、购买方三者一致，应选择.+支付。$"
+)
+_GENERAL_EXPENSE_DEFERRED_AMOUNT = re.compile(
+    r"均为收到货后自动付款.*[0-9]+(?:\.[0-9]+)?元"
+)
 _SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_MATERIAL_GAP_CODES = {
@@ -177,6 +203,32 @@ AuthorizationRenewer = submission.AuthorizationRenewer
 AuthorizationRefreshNeeded = submission.AuthorizationRefreshNeeded
 SubmitFrozen = submission.SubmitFrozen
 RecoverFrozen = submission.RecoverFrozen
+
+
+def _validate_general_expense_conclusions(items: list[dict]) -> None:
+    by_key = {str(item.get("item_key") or ""): item for item in items}
+    budget = by_key.get("budget", {})
+    if budget.get("status") == "pass" and (
+        str(budget.get("conclusion") or "").strip()
+        != _GENERAL_EXPENSE_BUDGET_CONCLUSION
+    ):
+        raise ValueError("review_decision_invalid")
+    company = by_key.get("payment_company_consistency", {})
+    if company.get("status") == "pass" and not _GENERAL_EXPENSE_COMPANY_PASS.fullmatch(
+        str(company.get("conclusion") or "").strip()
+    ):
+        raise ValueError("review_decision_invalid")
+    attachment = by_key.get("attachment_payment_evidence", {})
+    attachment_conclusion = str(attachment.get("conclusion") or "").strip()
+    if (
+        attachment.get("status") == "fail"
+        and ("实付0元" in attachment_conclusion or "先用后付" in attachment_conclusion)
+        and (
+            "实付0元" not in attachment_conclusion
+            or not _GENERAL_EXPENSE_DEFERRED_AMOUNT.search(attachment_conclusion)
+        )
+    ):
+        raise ValueError("review_decision_invalid")
 
 
 def _read_object(path: Path, *, code: str) -> dict:
@@ -2988,6 +3040,8 @@ class FlowEngine:
             for item in normalized_items
         ):
             raise ValueError("review_decision_invalid")
+        if action["workflow_key"] == "general_expense":
+            _validate_general_expense_conclusions(normalized_items)
 
         quality_material = _read_object(
             Path(state["material_file"]),

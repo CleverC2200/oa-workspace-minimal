@@ -21,6 +21,7 @@ FLOW_RULE_PACKS = {
     "business_entertainment": REFERENCE_ROOT / "flows" / "business-entertainment.md",
     "business_support_fee": REFERENCE_ROOT / "flows" / "business-support-fee.md",
     "small_marketing_fee": REFERENCE_ROOT / "flows" / "small-marketing-fee.md",
+    "general_expense": REFERENCE_ROOT / "flows" / "general-expense.md",
     "packaging_layout_approval": REFERENCE_ROOT / "flows" / "packaging-layout-approval.md",
 }
 
@@ -132,6 +133,15 @@ def test_confirmed_feedback_and_regressions_stay_sanitized() -> None:
             ),
         ),
         ("small_marketing_fee", ("SAP 客户编码匹配", "金额孰低核销")),
+        (
+            "general_expense",
+            (
+                "实付 0 元",
+                "发票+支付截图",
+                "当前阶段按既定策略暂不校验部门年度预算",
+                "报销公司、支付公司、购买方",
+            ),
+        ),
     ),
 )
 def test_high_impact_finance_rules_remain_explicit(

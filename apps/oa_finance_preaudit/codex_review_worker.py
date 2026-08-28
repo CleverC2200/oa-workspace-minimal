@@ -38,6 +38,11 @@ _FINANCE_RULES = {
         "小额市场费",
         "references/flows/small-marketing-fee.md",
     ),
+    "general_expense": (
+        "general_expense:1",
+        "通用费用报销",
+        "references/flows/general-expense.md",
+    ),
 }
 _EVENT_TYPES = frozenset(
     {
@@ -83,6 +88,13 @@ _TRAVEL_PAGE_ROUTING_REQUIREMENT = (
     "所有 `review_page_refs` 必须分别写入八个审核项各自的 `evidence_refs` "
     "或 `missing_evidence`；`uncertain` 的 `missing_evidence` 除页面引用外"
     "还必须写明具体缺失事实或关系；其余页面必须完整覆盖；"
+)
+_GENERAL_EXPENSE_REQUIREMENT = (
+    "五项必须逐项按通用费用规则包形成结论；预算通过结论必须逐字使用"
+    "“当前阶段按既定策略暂不校验部门年度预算。”；支付公司一致通过时"
+    "必须逐字使用“报销公司、支付公司、购买方三者一致，应选择当前"
+    "实际公司全称支付。”的句式并替换公司全称；先用后付页面必须写明"
+    "“实付0元，均为收到货后自动付款”及全部可读待付款金额；"
 )
 
 
@@ -192,9 +204,11 @@ def _prompt(action_file: Path) -> str:
         if workflow_key == "travel_expense"
         else ""
     )
-    travel_requirement = (
+    workflow_requirement = (
         _TRAVEL_PAGE_ROUTING_REQUIREMENT
         if workflow_key == "travel_expense"
+        else _GENERAL_EXPENSE_REQUIREMENT
+        if workflow_key == "general_expense"
         else "只按该流程固定审核项判断，不得读取其他流程规则或证据；"
     )
     return f"""你是{workflow_name}生产预审的单据工作进程。用户当前明确授权本轮真实审批提交；这是受控生产工作进程，不是手工 preview。
@@ -203,7 +217,7 @@ def _prompt(action_file: Path) -> str:
 {fallback_routing}
 
 要求：
-1. 完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由读取 `references/result-contract.md`、`references/observation-contract.md`、`{rule_reference}`、动作引用的审核包、材料和准备页；{travel_requirement}不得读取其他 attempt。
+1. 完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由读取 `references/result-contract.md`、`references/observation-contract.md`、`{rule_reference}`、动作引用的审核包、材料和准备页；{workflow_requirement}不得读取其他 attempt。
 2. 不修改任何文件、项目代码、Skill、配置、授权清单或冻结材料；不得调用 `next-action`、`complete-review` 或任何 OA 写入，不得领取其他单据。
 3. 根据审核包中的固定审核项动态形成结构化决定。证据不足使用 `uncertain` 交财务判断，不得因为材料缺口卡住业务流程；身份、归属、冻结或授权不可信时停止。
 4. 最终只输出符合 flow-engine-contract“结构化审核决定”的单个 JSON 对象，不添加 Markdown、解释、单号、人员、公司、附件原文、路径、意见正文、密钥或日志。宿主会校验并负责受控提交。

@@ -131,7 +131,7 @@ def _report(samples: list[dict], *, cli: list[dict] | None = None) -> dict:
 def test_report_has_case_flow_day_metrics_and_fixed_gates() -> None:
     report = _report(_samples())
 
-    assert len(report["cases"]) == 100
+    assert len(report["cases"]) == 20 * len(WORKFLOW_KEYS)
     assert set(report["by_flow"]) == set(WORKFLOW_KEYS)
     assert report["by_flow"]["travel_expense"]["closed_samples"] == 20
     assert report["by_flow"]["travel_expense"]["end_to_end_seconds"] == {
@@ -317,22 +317,22 @@ def test_single_variable_trial_can_be_kept_without_applying_changes() -> None:
             "end_to_end_seconds": {"p50": 1000, "p95": 1000},
             "token_usage": {
                 "status": "exact",
-                "exact_samples": 100,
+                "exact_samples": 20 * len(WORKFLOW_KEYS),
                 "unknown_samples": 0,
-                "input_tokens": 10000,
-                "output_tokens": 2000,
-                "total_tokens": 12000,
+                "input_tokens": 2000 * len(WORKFLOW_KEYS),
+                "output_tokens": 400 * len(WORKFLOW_KEYS),
+                "total_tokens": 2400 * len(WORKFLOW_KEYS),
             },
         },
         "after": {
             "end_to_end_seconds": {"p50": 700, "p95": 700},
             "token_usage": {
                 "status": "exact",
-                "exact_samples": 100,
+                "exact_samples": 20 * len(WORKFLOW_KEYS),
                 "unknown_samples": 0,
-                "input_tokens": 10000,
-                "output_tokens": 2000,
-                "total_tokens": 12000,
+                "input_tokens": 2000 * len(WORKFLOW_KEYS),
+                "output_tokens": 400 * len(WORKFLOW_KEYS),
+                "total_tokens": 2400 * len(WORKFLOW_KEYS),
             },
         },
     }
@@ -352,7 +352,7 @@ def test_experiment_does_not_estimate_incomplete_token_usage() -> None:
     assert result["performance"]["after"]["token_usage"] == {
         "status": "unknown",
         "exact_samples": 0,
-        "unknown_samples": 100,
+        "unknown_samples": 20 * len(WORKFLOW_KEYS),
     }
 
 
