@@ -29,12 +29,20 @@ def _material(
     excel: bool,
     image_fixture: str,
     excel_mismatch: bool,
+    page_count: int = 1,
 ) -> dict:
     attachment = attempt_root / "attachments" / "page-1.png"
-    prepared_image = attempt_root / "prepared" / "page-1.png"
     source_image = FIXTURE_ROOT / image_fixture
     shutil.copyfile(source_image, attachment)
-    shutil.copyfile(source_image, prepared_image)
+    prepared_images = []
+    for page_number in range(1, page_count + 1):
+        prepared_image = attempt_root / "prepared" / f"page-{page_number}.png"
+        shutil.copyfile(source_image, prepared_image)
+        prepared_images.append({
+            "resource_id": "page-1",
+            "path": str(prepared_image),
+            "kind": f"page-{page_number}",
+        })
     resources = [{
         "request_id": request_id,
         "resource_id": "page-1",
@@ -43,7 +51,11 @@ def _material(
         "review_role": "packaging_image",
         "local_readonly_path": str(attachment),
     }]
-    manifest = [{"resource_id": "page-1", "status": "image", "image_count": 1}]
+    manifest = [{
+        "resource_id": "page-1",
+        "status": "image",
+        "image_count": page_count,
+    }]
     structured = []
     if excel:
         from openpyxl import Workbook
@@ -101,11 +113,7 @@ def _material(
         "declared_fields": {},
         "resources": resources,
         "prepared": {
-            "images": [{
-                "resource_id": "page-1",
-                "path": str(prepared_image),
-                "kind": "image",
-            }],
+            "images": prepared_images,
             "structured_contents": structured,
             "manifest": manifest,
         },
@@ -135,6 +143,7 @@ def _engine(
     calls: list[dict] | None = None,
     image_fixture: str = "packaging_sample.png",
     excel_mismatch: bool = False,
+    page_count: int = 1,
 ) -> flow_engine.FlowEngine:
     current_regions = regions if regions is not None else dict.fromkeys(REGION_KEYS, "clear")
 
@@ -167,6 +176,7 @@ def _engine(
             excel=excel,
             image_fixture=image_fixture,
             excel_mismatch=excel_mismatch,
+            page_count=page_count,
         ),
         authorization_source=_grant if controlled else None,
         authorization_verifier=(
@@ -182,8 +192,18 @@ def _decision(
     *,
     excel: bool = False,
     excel_results: tuple[str, ...] = ("match", "match", "match", "match"),
+    visual_review: dict | None = None,
 ) -> dict:
     packet = json.loads(Path(action["review_packet_file"]).read_text(encoding="utf-8"))
+    current_visual_review = visual_review or {
+        "outcome": "reviewed",
+        "pages": [{
+            "page_ref": "material:prepared.images.page-1.page-1",
+            "classification": "packaging_layout",
+            "package_version_id": "version-1",
+            "item_keys": list(ITEM_KEYS),
+        }],
+    }
     return {
         "schema_version": 1,
         "kind": "preaudit_review_decision",
@@ -195,9 +215,18 @@ def _decision(
             if all(item["status"] == "pass" for item in reviewed_items)
             else "needs_human"
         ),
+        "visual_review": current_visual_review,
         "excel_comparison": {
-            "status": "completed" if excel else "not_provided",
-            "resource_id": "excel-1" if excel else None,
+            "status": (
+                "not_applicable"
+                if current_visual_review["outcome"] == "all_non_packaging"
+                else "completed" if excel else "not_provided"
+            ),
+            "resource_id": (
+                "excel-1"
+                if excel and current_visual_review["outcome"] != "all_non_packaging"
+                else None
+            ),
             "mappings": (
                 [
                     {
@@ -210,7 +239,7 @@ def _decision(
                     }
                     for index, item in enumerate(packet["items"])
                 ]
-                if excel
+                if excel and current_visual_review["outcome"] != "all_non_packaging"
                 else []
             ),
         },
@@ -249,6 +278,21 @@ def _passing_items() -> list[dict]:
     ]
 
 
+def _visual_page(
+    page_number: int,
+    *,
+    classification: str,
+    version: str | None = None,
+    item_keys: tuple[str, ...] = (),
+) -> dict:
+    return {
+        "page_ref": f"material:prepared.images.page-1.page-{page_number}",
+        "classification": classification,
+        "package_version_id": version,
+        "item_keys": list(item_keys),
+    }
+
+
 def test_packaging_preview_cli_requires_page_coverage_and_fixed_items(
     tmp_path: Path,
     capsys,
@@ -263,6 +307,20 @@ def test_packaging_preview_cli_requires_page_coverage_and_fixed_items(
     assert action["coordination_seconds"] == action["coordination_tokens"] == 0
     assert tuple(item["item_key"] for item in packet["items"]) == ITEM_KEYS
     assert tuple(item["name"] for item in packet["items"]) == ITEM_NAMES
+    assert action["rule_version"] == "packaging_layout_approval:2"
+    state = json.loads(Path(action["state_file"]).read_text(encoding="utf-8"))
+    assert state["rule_version"] == "packaging_layout_approval:2"
+    assert packet["rule_version"] == "packaging_layout_approval:2"
+    assert packet["packaging_visual_contract"] == {
+        "page_refs": ["material:prepared.images.page-1.page-1"],
+        "classifications": [
+            "non_packaging",
+            "packaging_layout",
+            "uncertain",
+        ],
+        "item_keys": list(ITEM_KEYS),
+        "skip_remark": "AI审核结论：非包装版面，跳过审核。",
+    }
     assert "金额孰低核销" not in str(packet)
 
     decision_file = tmp_path / "decision.json"
@@ -351,6 +409,326 @@ def test_packaging_decision_must_cover_every_page(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="review_decision_invalid"):
         engine.complete_review(Path(action["action_file"]), decision_file)
+
+
+def test_packaging_all_non_packaging_uses_single_line_remark(tmp_path: Path) -> None:
+    engine = _engine(tmp_path, page_count=2)
+    action = engine.next_action(WORKFLOW_KEY)
+    visual_review = {
+        "outcome": "all_non_packaging",
+        "pages": [
+            _visual_page(1, classification="non_packaging"),
+            _visual_page(2, classification="non_packaging"),
+        ],
+    }
+    reviewed = _passing_items()
+    for item in reviewed:
+        item["conclusion"] = "全部图片均为非包装版面，本项跳过。"
+        item["evidence_refs"] = []
+    decision_file = tmp_path / "all-non-packaging.json"
+    json_artifact.write_json_atomic(
+        decision_file,
+        _decision(action, reviewed, visual_review=visual_review),
+    )
+
+    closed = engine.complete_review(Path(action["action_file"]), decision_file)
+
+    assert closed["business_state"] == "pass"
+    assert Path(closed["remark_file"]).read_text(encoding="utf-8") == (
+        "AI审核结论：非包装版面，跳过审核。\n"
+    )
+
+
+def test_packaging_non_packaging_pages_cannot_enter_item_evidence(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path, page_count=2)
+    action = engine.next_action(WORKFLOW_KEY)
+    visual_review = {
+        "outcome": "reviewed",
+        "pages": [
+            _visual_page(
+                1,
+                classification="packaging_layout",
+                version="version-a",
+                item_keys=ITEM_KEYS,
+            ),
+            _visual_page(2, classification="non_packaging"),
+        ],
+    }
+    reviewed = _passing_items()
+    for item in reviewed:
+        item["evidence_refs"] = [
+            "material:prepared.images.page-1.page-1",
+            "material:prepared.images.page-1.page-2",
+        ]
+    decision_file = tmp_path / "non-packaging-item-evidence.json"
+    json_artifact.write_json_atomic(
+        decision_file,
+        _decision(action, reviewed, visual_review=visual_review),
+    )
+
+    with pytest.raises(ValueError, match="review_decision_invalid"):
+        engine.complete_review(Path(action["action_file"]), decision_file)
+
+
+def test_packaging_all_non_packaging_ignores_optional_excel(tmp_path: Path) -> None:
+    engine = _engine(tmp_path, excel=True)
+    action = engine.next_action(WORKFLOW_KEY)
+    visual_review = {
+        "outcome": "all_non_packaging",
+        "pages": [_visual_page(1, classification="non_packaging")],
+    }
+    reviewed = _passing_items()
+    for item in reviewed:
+        item["conclusion"] = "全部图片均为非包装版面，本项跳过。"
+        item["evidence_refs"] = []
+    decision_file = tmp_path / "all-non-packaging-with-excel.json"
+    json_artifact.write_json_atomic(
+        decision_file,
+        _decision(
+            action,
+            reviewed,
+            excel=True,
+            visual_review=visual_review,
+        ),
+    )
+
+    closed = engine.complete_review(Path(action["action_file"]), decision_file)
+
+    assert Path(closed["remark_file"]).read_text(encoding="utf-8") == (
+        "AI审核结论：非包装版面，跳过审核。\n"
+    )
+
+
+def test_packaging_mixed_pages_cannot_claim_all_non_packaging(tmp_path: Path) -> None:
+    engine = _engine(tmp_path, page_count=2)
+    action = engine.next_action(WORKFLOW_KEY)
+    visual_review = {
+        "outcome": "all_non_packaging",
+        "pages": [
+            _visual_page(
+                1,
+                classification="packaging_layout",
+                version="version-1",
+                item_keys=ITEM_KEYS,
+            ),
+            _visual_page(2, classification="non_packaging"),
+        ],
+    }
+    decision_file = tmp_path / "invalid-mixed-skip.json"
+    json_artifact.write_json_atomic(
+        decision_file,
+        _decision(action, _passing_items(), visual_review=visual_review),
+    )
+
+    with pytest.raises(ValueError, match="review_decision_invalid"):
+        engine.complete_review(Path(action["action_file"]), decision_file)
+
+
+def test_packaging_uncertain_page_cannot_be_skipped(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    action = engine.next_action(WORKFLOW_KEY)
+    visual_review = {
+        "outcome": "all_non_packaging",
+        "pages": [_visual_page(1, classification="uncertain")],
+    }
+    decision_file = tmp_path / "invalid-uncertain-skip.json"
+    json_artifact.write_json_atomic(
+        decision_file,
+        _decision(action, _passing_items(), visual_review=visual_review),
+    )
+
+    with pytest.raises(ValueError, match="review_decision_invalid"):
+        engine.complete_review(Path(action["action_file"]), decision_file)
+
+
+def test_packaging_uncertain_page_closes_as_needs_human(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    action = engine.next_action(WORKFLOW_KEY)
+    page_ref = "material:prepared.images.page-1.page-1"
+    reviewed = [
+        {
+            "status": "uncertain",
+            "conclusion": "当前图片无法确认是否属于包装版面。",
+            "evidence_refs": [],
+            "missing_evidence": [page_ref],
+        }
+        for _item_key in ITEM_KEYS
+    ]
+    visual_review = {
+        "outcome": "reviewed",
+        "pages": [_visual_page(1, classification="uncertain")],
+    }
+    decision_file = tmp_path / "uncertain-page.json"
+    json_artifact.write_json_atomic(
+        decision_file,
+        _decision(action, reviewed, visual_review=visual_review),
+    )
+
+    closed = engine.complete_review(Path(action["action_file"]), decision_file)
+
+    assert closed["business_state"] == "needs_human"
+
+
+def test_packaging_requires_four_items_for_every_version(tmp_path: Path) -> None:
+    engine = _engine(tmp_path, page_count=2)
+    action = engine.next_action(WORKFLOW_KEY)
+    visual_review = {
+        "outcome": "reviewed",
+        "pages": [
+            _visual_page(
+                1,
+                classification="packaging_layout",
+                version="version-a",
+                item_keys=ITEM_KEYS,
+            ),
+            _visual_page(
+                2,
+                classification="packaging_layout",
+                version="version-b",
+                item_keys=ITEM_KEYS[:-1],
+            ),
+        ],
+    }
+    reviewed = _passing_items()
+    for item in reviewed:
+        item["evidence_refs"] = [
+            "material:prepared.images.page-1.page-1",
+            "material:prepared.images.page-1.page-2",
+        ]
+    decision_file = tmp_path / "missing-version-item.json"
+    json_artifact.write_json_atomic(
+        decision_file,
+        _decision(action, reviewed, visual_review=visual_review),
+    )
+
+    with pytest.raises(ValueError, match="review_decision_invalid"):
+        engine.complete_review(Path(action["action_file"]), decision_file)
+
+
+def test_packaging_accepts_front_and_back_coverage_for_one_version(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path, page_count=2)
+    action = engine.next_action(WORKFLOW_KEY)
+    visual_review = {
+        "outcome": "reviewed",
+        "pages": [
+            _visual_page(
+                1,
+                classification="packaging_layout",
+                version="version-a",
+                item_keys=ITEM_KEYS[:2],
+            ),
+            _visual_page(
+                2,
+                classification="packaging_layout",
+                version="version-a",
+                item_keys=ITEM_KEYS[2:],
+            ),
+        ],
+    }
+    reviewed = _passing_items()
+    for index, item in enumerate(reviewed):
+        item["evidence_refs"] = [
+            "material:prepared.images.page-1.page-1"
+            if index < 2
+            else "material:prepared.images.page-1.page-2"
+        ]
+    decision_file = tmp_path / "front-back-version.json"
+    json_artifact.write_json_atomic(
+        decision_file,
+        _decision(action, reviewed, visual_review=visual_review),
+    )
+
+    closed = engine.complete_review(Path(action["action_file"]), decision_file)
+
+    assert closed["business_state"] == "pass"
+
+
+def test_packaging_rejects_item_evidence_bound_to_wrong_page(tmp_path: Path) -> None:
+    engine = _engine(tmp_path, page_count=2)
+    action = engine.next_action(WORKFLOW_KEY)
+    visual_review = {
+        "outcome": "reviewed",
+        "pages": [
+            _visual_page(
+                1,
+                classification="packaging_layout",
+                version="version-a",
+                item_keys=ITEM_KEYS[:2],
+            ),
+            _visual_page(
+                2,
+                classification="packaging_layout",
+                version="version-a",
+                item_keys=ITEM_KEYS[2:],
+            ),
+        ],
+    }
+    reviewed = _passing_items()
+    for item in reviewed:
+        item["evidence_refs"] = ["material:prepared.images.page-1.page-2"]
+    decision_file = tmp_path / "wrong-page-binding.json"
+    json_artifact.write_json_atomic(
+        decision_file,
+        _decision(action, reviewed, visual_review=visual_review),
+    )
+
+    with pytest.raises(ValueError, match="review_decision_invalid"):
+        engine.complete_review(Path(action["action_file"]), decision_file)
+
+
+def test_packaging_v1_frozen_packet_remains_compatible(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    action = engine.next_action(WORKFLOW_KEY)
+    packet_file = Path(action["review_packet_file"])
+    packet = json.loads(packet_file.read_text(encoding="utf-8"))
+    packet.pop("packaging_visual_contract")
+    packet["rule_version"] = "packaging_layout_approval:1"
+    json_artifact.write_json_atomic(packet_file, packet)
+    state_file = Path(action["state_file"])
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    state.pop("rule_version")
+    json_artifact.write_json_atomic(state_file, state)
+    action_file = Path(action["action_file"])
+    legacy_action = json.loads(action_file.read_text(encoding="utf-8"))
+    legacy_action.pop("rule_version")
+    json_artifact.write_json_atomic(action_file, legacy_action)
+    decision = _decision(action, _passing_items())
+    decision.pop("visual_review")
+    decision["rule_version"] = "packaging_layout_approval:1"
+    decision_file = tmp_path / "legacy-v1.json"
+    json_artifact.write_json_atomic(decision_file, decision)
+
+    closed = engine.complete_review(Path(action["action_file"]), decision_file)
+
+    assert closed["business_state"] == "pass"
+
+
+def test_packaging_v2_frozen_packet_cannot_downgrade_to_v1(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    action = engine.next_action(WORKFLOW_KEY)
+    packet_file = Path(action["review_packet_file"])
+    packet = json.loads(packet_file.read_text(encoding="utf-8"))
+    packet.pop("packaging_visual_contract")
+    packet["rule_version"] = "packaging_layout_approval:1"
+    json_artifact.write_json_atomic(packet_file, packet)
+    state_file = Path(action["state_file"])
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    state.pop("rule_version")
+    json_artifact.write_json_atomic(state_file, state)
+    decision = _decision(action, _passing_items())
+    decision.pop("visual_review")
+    decision["rule_version"] = "packaging_layout_approval:1"
+    decision_file = tmp_path / "downgraded-v1.json"
+    json_artifact.write_json_atomic(decision_file, decision)
+
+    result = engine.complete_review(Path(action["action_file"]), decision_file)
+
+    assert result["action"] == "needs_admin"
+    assert result["reason"] == "frozen_packet_changed"
 
 
 def test_packaging_excel_requires_explicit_per_item_comparison_evidence(

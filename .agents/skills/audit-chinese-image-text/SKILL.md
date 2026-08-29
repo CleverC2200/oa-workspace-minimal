@@ -9,6 +9,10 @@ description: 审计中文包装稿、标签、海报或截图中的关键文字�
 
 ### OA 包装版面流程
 
+- 先逐页目视分类为 `packaging_layout`、`non_packaging` 或 `uncertain`。承载拟审批印刷文字的包装袋、包装盒、标签、瓶贴、运输外箱版面属于 `packaging_layout`；空白包材、模具、尺寸确认照片及与版面无关的截图属于 `non_packaging`。分类由视觉模型查看原图形成，采集脚本不得按文件名、扩展名或字段位置代替视觉判断。
+- 同一单据只要存在一页 `packaging_layout` 就必须继续审核全部包装版面；`non_packaging` 页不进入固定四项。存在任一 `uncertain` 时不得整单跳过，应先用原图放大或方向辅助视图核验，仍不确定则进入人工判断。只有全部页面均明确为 `non_packaging` 时才跳过四项并输出唯一一句 `AI审核结论：非包装版面，跳过审核。`。
+- 全部页面均已明确为 `non_packaging` 时，逐页分类覆盖就是该单据的完整视觉证据；不建立四项关键文字区域，不进入 G1-G3，也不因固定四项不存在而输出 `❌/⚠️`。存在包装页或分类不确定页时才继续下列 G0-G4 关键文字路径。
+- 包装页按产品、口味、规格及正面/背面/局部图关系组成稳定 `package_version_id`。同一版本可以由多页共同闭合四项，不得跨版本拼接证据；每个版本的配料、过敏原、营养成分表、地址四项必须全部覆盖。
 - `workflow_key=packaging_layout_approval` 时，`review_role=packaging_image` 是必须逐页观察的包装图片；`review_role=excel_reference` 是存在时才使用的对照来源。
 - 逐个下载 `review_role=packaging_image` 的原始附件，并以 `local_readonly_path` 或 `prepared.images[*].path` 的原始文件建立 G0；OA 页面缩略图、附件列表截图和聊天预览都不能替代原图。缺少任一已声明原图属于技术失败，不生成四项业务意见。
 - 采集器只会按 Unicode 规范化后的完整附件名，删除“宣传附件”与“产品信息表”两个字段之间的同名副本；同一字段内的同名图片不得据此去重。审核时读取 `attachment_deduplication` 回查保留与删除关系，不能自行按附件顺序或相似画面继续去重。

@@ -277,6 +277,21 @@
             "expected_output": "增加支付公司一致项；逐字比较报销公司、支付公司和购买方，三者一致时明确应选择对应公司支付",
             "failure_mode": "遗漏付款主体一致性检查",
             "rule_ref": "flows/general-expense.md#第-5-项支付公司一致;result-contract.md#统一格式"
+        },
+        {
+            "id": "RC-020-packaging-mixed-images-skipped",
+            "scope": "packaging-layout-approval",
+            "audit_item": "page-classification;version-coverage;output-template",
+            "status": "confirmed",
+            "input_facts": [
+                "同一单据经常同时上传包装版面和非包装图片",
+                "只要存在一张包装版面就必须审核全部包装页",
+                "只有全部图片均明确不是包装版面时才允许整单跳过"
+            ],
+            "incorrect_output": "看到非包装图片后整单跳过，或把非包装图片按固定四项逐项判为缺失",
+            "expected_output": "逐页视觉分类；混合上传时审核全部包装版面并忽略非包装页；全部非包装时只输出AI审核结论：非包装版面，跳过审核。",
+            "failure_mode": "没有先做整单逐页分类和包装版本覆盖，导致漏审包装页或误报四项缺失",
+            "rule_ref": "flows/packaging-layout-approval.md#逐页视觉分流与版本关系;result-contract.md#统一格式"
         }
   ]
 }

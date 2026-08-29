@@ -163,3 +163,6 @@ def test_packaging_rule_keeps_text_scope_and_finite_escalation() -> None:
     assert "最多增加一次独立复核" in packaging_skill
     assert "最多执行一次定向重切" in packaging_skill
     assert "不得无限重切或无限等待" in flow_contract
+    assert "只有全部页面均明确为 `non_packaging`" in packaging_skill
+    assert "只要存在一页 `packaging_layout`" in flow_contract
+    assert "不得跨版本拼接证据" in flow_contract
