@@ -25,6 +25,7 @@ def _attempt(
     case_key: str,
     attempt: int,
     age_days: int,
+    workflow_key: str = "travel_expense",
     execution_state: str = "closed",
     business_state: str = "pass",
     write_state: str = "not_requested",
@@ -42,7 +43,7 @@ def _attempt(
     prefix = root / ".archive" if archived else root
     attempt_root = (
         prefix
-        / "travel_expense"
+        / workflow_key
         / "cases"
         / case_key
         / f"attempt-{attempt}"
@@ -51,7 +52,7 @@ def _attempt(
     state = {
         "schema_version": 1,
         "kind": "preaudit_action",
-        "workflow_key": "travel_expense",
+        "workflow_key": workflow_key,
         "case_key": case_key,
         "attempt": attempt,
         "request_id": request_id,
@@ -1114,6 +1115,43 @@ def test_prune_rejects_entire_plan_before_mutation(tmp_path: Path) -> None:
         runtime_maintenance.apply_prune_plan(root, plan, now=NOW)
 
     assert expired.is_dir()
+
+
+def test_prune_accepts_general_expense_managed_paths(tmp_path: Path) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    expired = _attempt(
+        root,
+        case_key="general-expired",
+        attempt=1,
+        age_days=31,
+        workflow_key="general_expense",
+    )
+    current = _attempt(
+        root,
+        case_key="general-current",
+        attempt=1,
+        age_days=1,
+        workflow_key="general_expense",
+    )
+    unknown = _attempt(
+        root,
+        case_key="general-unknown",
+        attempt=1,
+        age_days=31,
+        workflow_key="general_expense",
+        write_state="unknown",
+        archived=True,
+    )
+
+    plan = runtime_maintenance.build_prune_plan(root, now=NOW)
+    receipt = runtime_maintenance.apply_prune_plan(root, plan, now=NOW)
+
+    assert receipt["deleted"] == 1
+    assert not expired.exists()
+    assert current.is_dir()
+    assert unknown.is_dir()
 
 
 def test_prune_rejects_plan_when_attempt_appears_after_planning(
