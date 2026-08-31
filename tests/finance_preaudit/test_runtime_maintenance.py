@@ -725,6 +725,29 @@ def test_status_and_cli_never_echo_unknown_failure_text(tmp_path: Path) -> None:
     assert stderr.getvalue().strip() == "runtime_failed"
 
 
+def test_status_cli_reports_stable_execution_login_failure(tmp_path: Path) -> None:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        exit_code = cli.main(
+            ["status", "--root", str(tmp_path), "--check-live"],
+            runtime_status=lambda _root: {
+                "schema_version": 1,
+                "kind": "preaudit_runtime_status",
+            },
+            live_status=lambda: (_ for _ in ()).throw(
+                RuntimeError("oa_execution_identity_login_failed")
+            ),
+        )
+
+    assert exit_code == 1
+    assert (
+        json.loads(stdout.getvalue())["failure"]["code"]
+        == "oa_execution_identity_login_failed"
+    )
+    assert stderr.getvalue().strip() == "oa_execution_identity_login_failed"
+
+
 def test_status_counts_only_the_latest_attempt_per_case(tmp_path: Path) -> None:
     root = tmp_path / "runtime"
     _attempt(
