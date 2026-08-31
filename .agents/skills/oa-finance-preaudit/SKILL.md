@@ -22,7 +22,7 @@ python3 -m apps.oa_finance_preaudit.cli next-action \
 按返回动作处理：
 
 - `closed`：本轮完成。
-- `needs_admin`：报告脱敏 `reason` 后停止当前单据。
+- `needs_admin`：仅用于登录/会话/执行身份、冻结、授权、目标或写入结果等技术边界不可信；报告脱敏 `reason` 后停止当前执行，不生成财务意见。
 - `review_required`：继续下一步；只读取 `review_packet_file` 及其引用的 `material_file`。
 
 动作、材料和审核包均为只读。完整的动作字段、技术失败和闭合语义见[本地 FlowEngine 合同](references/flow-engine-contract.md)。
@@ -35,6 +35,7 @@ python3 -m apps.oa_finance_preaudit.cli next-action \
 - 每条采用的证据同时证明资源归属和审核项关系；
 - 权威字段优先，图片不可见或关系不明的事实保持未知；
 - 审核包为 `material_state=degraded` 时，不使用任何候选材料；按 `required_uncertain_items` 将缺口写成财务可理解的动态 `uncertain` 结论，继续完成预审。
+- 当前登录、会话和执行身份可信时，规则口径模糊、材料关系不明或证据不足只影响业务判断；使用 `uncertain` / `needs_human` 继续完成预审，不得升级为技术阻断。
 
 包装流程同时调用项目的中文图片文字校对 Skill，直接观察原图；存在 Excel 时逐字符对照。包装只校对关键文字，不扩展为法规审核。
 

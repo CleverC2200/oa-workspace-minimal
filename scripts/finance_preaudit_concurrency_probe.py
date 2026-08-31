@@ -63,6 +63,7 @@ ITEM_LOCAL_QUARANTINE_REASONS = {"material_collection_failed"}
 ITEM_LOCAL_MATERIAL_FAILURE_DETAILS = (
     runtime_maintenance.ITEM_LOCAL_MATERIAL_FAILURE_DETAILS
 )
+SESSION_BLOCKING_FAILURE_CODES = flow_engine.SESSION_BLOCKING_FAILURE_CODES
 ROLLING_WORKFLOW_KEYS = frozenset(
     {
         "travel_expense",
@@ -445,13 +446,15 @@ def _prepared_action_matches_selection(
     )
 
 
-def _quarantined_action_matches_selection(
+def _material_failure_action_matches_selection(
     action_path: Path,
     action: dict,
     state: dict,
     selected: dict,
     workflow_key: str,
     *,
+    allowed_failure_details: frozenset[str],
+    forbidden_names: tuple[str, ...],
     project_root: Path = PROJECT_ROOT,
 ) -> bool:
     request_id = str(selected.get("requestId") or "").strip()
@@ -465,8 +468,8 @@ def _quarantined_action_matches_selection(
         or not isinstance(attempt, int)
         or isinstance(attempt, bool)
         or attempt < 1
-        or reason not in ITEM_LOCAL_QUARANTINE_REASONS
-        or detail_code not in ITEM_LOCAL_MATERIAL_FAILURE_DETAILS
+        or reason != "material_collection_failed"
+        or detail_code not in allowed_failure_details
     ):
         return False
     case_key = hashlib.sha256(
@@ -501,16 +504,8 @@ def _quarantined_action_matches_selection(
     forbidden = [
         attempt_root / "writer-boundary.json",
         attempt_root / "execution-receipt.json",
+        *(attempt_root / name for name in forbidden_names),
     ]
-    if reason == "material_collection_failed":
-        forbidden.extend(
-            attempt_root / name
-            for name in (
-                "review-decision.json",
-                "remark.txt",
-                "submission-envelope.json",
-            )
-        )
     return (
         action_path == expected_action
         and state.get("request_id") == request_id
@@ -518,6 +513,31 @@ def _quarantined_action_matches_selection(
         and all(action.get(key) == value for key, value in shared.items())
         and all(state.get(key) == value for key, value in shared.items())
         and not any(path.is_symlink() or path.exists() for path in forbidden)
+    )
+
+
+def _quarantined_action_matches_selection(
+    action_path: Path,
+    action: dict,
+    state: dict,
+    selected: dict,
+    workflow_key: str,
+    *,
+    project_root: Path = PROJECT_ROOT,
+) -> bool:
+    return _material_failure_action_matches_selection(
+        action_path,
+        action,
+        state,
+        selected,
+        workflow_key,
+        allowed_failure_details=ITEM_LOCAL_MATERIAL_FAILURE_DETAILS,
+        forbidden_names=(
+            "review-decision.json",
+            "remark.txt",
+            "submission-envelope.json",
+        ),
+        project_root=project_root,
     )
 
 
@@ -903,11 +923,14 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                     ),
                     allowed_workflows=allowed_workflows,
                 )
-            except (ValueError, OSError):
+            except Exception as error:
                 runtime_control.request_cycle_stop()
                 return {
                     "action": "failed",
-                    "error_code": "production_probe_prepare_failed",
+                    "error_code": (
+                        flow_engine.session_blocking_failure_code(error)
+                        or "production_probe_prepare_failed"
+                    ),
                 }
             eligible_live_candidates: list[dict] = []
             for candidate in live_candidates:
@@ -985,18 +1008,28 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 and datetime.now(timezone.utc) > admission_cutoff
             ):
                 return {"action": "admission_closed"}
-        if selected is None:
-            engine = cli._live_flow_engine(controlled=True)
-        elif recovery_action_file is not None:
-            engine = cli._live_flow_engine(controlled=True)
-        else:
-            engine = cli._live_flow_engine(
-                controlled=True,
-                selected_identity=(
-                    str(selected["requestId"]),
-                    str(selected["received_at"]),
+        try:
+            if selected is None:
+                engine = cli._live_flow_engine(controlled=True)
+            elif recovery_action_file is not None:
+                engine = cli._live_flow_engine(controlled=True)
+            else:
+                engine = cli._live_flow_engine(
+                    controlled=True,
+                    selected_identity=(
+                        str(selected["requestId"]),
+                        str(selected["received_at"]),
+                    ),
+                )
+        except Exception as error:
+            runtime_control.request_cycle_stop()
+            return {
+                "action": "failed",
+                "error_code": (
+                    flow_engine.session_blocking_failure_code(error)
+                    or "production_probe_prepare_failed"
                 ),
-            )
+            }
         selected_workflow_root = (
             PROJECT_ROOT
             / "runtime"
@@ -1037,29 +1070,41 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                         }
                     time.sleep(0.05)
                     continue
-                if recovery_action_file is not None:
+                session_failure_code = (
+                    flow_engine.session_blocking_failure_code(error)
+                )
+                if recovery_action_file is not None and not session_failure_code:
                     runtime_control.request_stop("production_probe_prepare_failed")
                 else:
                     runtime_control.request_cycle_stop()
                 return {
                     "action": "failed",
                     "error_code": (
-                        "production_probe_recovery_failed"
-                        if recovery_action_file is not None
-                        else "production_probe_prepare_failed"
+                        session_failure_code
+                        or (
+                            "production_probe_recovery_failed"
+                            if recovery_action_file is not None
+                            else "production_probe_prepare_failed"
+                        )
                     ),
                 }
-            except Exception:
-                if recovery_action_file is not None:
+            except Exception as error:
+                session_failure_code = (
+                    flow_engine.session_blocking_failure_code(error)
+                )
+                if recovery_action_file is not None and not session_failure_code:
                     runtime_control.request_stop("production_probe_prepare_failed")
                 else:
                     runtime_control.request_cycle_stop()
                 return {
                     "action": "failed",
                     "error_code": (
-                        "production_probe_recovery_failed"
-                        if recovery_action_file is not None
-                        else "production_probe_prepare_failed"
+                        session_failure_code
+                        or (
+                            "production_probe_recovery_failed"
+                            if recovery_action_file is not None
+                            else "production_probe_prepare_failed"
+                        )
                     ),
                 }
             break
@@ -1128,6 +1173,9 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 action.get("reason") in QUARANTINED_REASONS
             )
         ):
+            session_failure_code = str(
+                action.get("failure_detail_code") or ""
+            )
             if selected is not None:
                 persisted_action: dict = {}
                 persisted: dict = {}
@@ -1145,6 +1193,37 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                         persisted = _read_object(state_path)
                 except (KeyError, OSError, ValueError):
                     pass
+                if session_failure_code in SESSION_BLOCKING_FAILURE_CODES:
+                    if not _material_failure_action_matches_selection(
+                        action_path,
+                        persisted_action,
+                        persisted,
+                        selected,
+                        selected_workflow,
+                        allowed_failure_details=(
+                            SESSION_BLOCKING_FAILURE_CODES
+                        ),
+                        forbidden_names=(
+                            "material.json",
+                            "review-packet.json",
+                            "review-decision.json",
+                            "remark.txt",
+                            "submission-envelope.json",
+                        ),
+                        project_root=PROJECT_ROOT,
+                    ):
+                        runtime_control.request_stop(
+                            "production_probe_prepare_failed"
+                        )
+                        return {
+                            "action": "failed",
+                            "error_code": "production_probe_fifo_mismatch",
+                        }
+                    runtime_control.request_cycle_stop()
+                    return {
+                        "action": "failed",
+                        "error_code": session_failure_code,
+                    }
                 if not _quarantined_action_matches_selection(
                     action_path,
                     persisted_action,
@@ -1178,6 +1257,12 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                         if global_selection and late_visible_pending_count
                         else {}
                     ),
+                }
+            if session_failure_code in SESSION_BLOCKING_FAILURE_CODES:
+                runtime_control.request_cycle_stop()
+                return {
+                    "action": "failed",
+                    "error_code": session_failure_code,
                 }
             quarantined += 1
             try:

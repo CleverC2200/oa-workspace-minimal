@@ -14,8 +14,8 @@ python3 -m apps.oa_finance_preaudit.cli next-action \
 stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSON：
 
 - `action=closed`：本轮结束，不取数、不等待。
-- `action=review_required`：只读取 `review_packet_file` 及审核包引用的 `material_file`，按审核包顺序完成当前流程的固定审核项。五类财务流程的材料采集不可信时仍返回该动作，但审核包标为 `material_state=degraded`，且 `required_uncertain_items` 列出必须交财务判断的项目。
-- `action=needs_admin`：当前单据身份、冻结 attempt、动作/状态、审核包完整性、写入授权或目标不再可信；这是退出码为 0 的正常动作结果。停止当前执行并报告 `reason`，不得自行修复或重取。
+- `action=review_required`：只读取 `review_packet_file` 及审核包引用的 `material_file`，按审核包顺序完成当前流程的固定审核项。当前登录、会话、执行身份和流程授权可信时，五类财务流程的材料关系、规则口径或业务证据不足仍返回该动作；审核包标为 `material_state=degraded`，且 `required_uncertain_items` 列出必须交财务判断的项目。
+- `action=needs_admin`：当前登录/会话、执行身份、流程授权、单据身份、冻结 attempt、动作/状态、审核包完整性、写入授权或目标不再可信；这是退出码为 0 的正常动作结果。停止当前执行并报告 `reason`，不得生成财务意见、自行修复或重取。
 
 默认命令返回的 preview 动作固化 `mode=preview`、`write_authorized=false` 和 `write_state=not_requested`。审核决定不包含运行模式或授权，不能在第二步切换写入。
 
@@ -29,7 +29,7 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
 
 审核者不得修改 `action_file`、审核包或材料，不得读取其他 attempt，不得自行组织路径、计算指纹、选择 requestId 或调用 OA 写入。
 
-降级审核包的 `material_file` 不引用采集失败前的任何候选字段或资源，只保留脱敏 `collection_gaps`。审核者必须根据缺口和当前流程审核项生成可读的自然语言结论；脚本验证所有 `required_uncertain_items` 均为 `uncertain` 后，仍可正常闭合为 `business_state=needs_human`。包装图片材料不可读时继续返回 `needs_admin`，不使用降级包。
+降级审核包的 `material_file` 不引用采集失败前的任何候选字段或资源，只保留脱敏 `collection_gaps`。审核者必须根据缺口和当前流程审核项生成可读的自然语言结论；脚本验证所有 `required_uncertain_items` 均为 `uncertain` 后，仍可正常闭合为 `business_state=needs_human`。OA 登录失败、OA 会话过期、当前 RPA/CDP 会话缺失/失效/不可用或执行身份不可信时，不使用降级包，直接返回 `needs_admin`，且不得生成材料、审核包、决定、意见或写入请求。包装图片材料不可读时也继续返回 `needs_admin`，不使用降级包。
 
 ## 结构化审核决定
 

@@ -292,6 +292,36 @@
             "expected_output": "逐页视觉分类；混合上传时审核全部包装版面并忽略非包装页；全部非包装时只输出AI审核结论：非包装版面，跳过审核。",
             "failure_mode": "没有先做整单逐页分类和包装版本覆盖，导致漏审包装页或误报四项缺失",
             "rule_ref": "flows/packaging-layout-approval.md#逐页视觉分流与版本关系;result-contract.md#统一格式"
+        },
+        {
+            "id": "RC-021-login-expiry-rendered-as-business-warning",
+            "scope": "all-finance",
+            "audit_item": "execution-boundary;all-items",
+            "status": "confirmed",
+            "input_facts": [
+                "当前 OA 登录或会话已经失效",
+                "本次无法可信确认执行身份和当前单据材料",
+                "尚未发出 OA 写入请求"
+            ],
+            "incorrect_output": "把会话失效转换成全部审核项的人工判断意见并写入 OA",
+            "expected_output": "立即按稳定技术错误码停止本轮，不生成材料、审核包、决定、财务意见或写入请求；历史失败保留人工对账，不自动重试",
+            "failure_mode": "把执行登录边界错误降级成业务证据缺口",
+            "rule_ref": "error-handling.md#停止规则;flow-engine-contract.md#两动作循环"
+        },
+        {
+            "id": "RC-022-business-uncertainty-stops-finance-round",
+            "scope": "all-finance",
+            "audit_item": "all-items;business-uncertainty",
+            "status": "confirmed",
+            "input_facts": [
+                "当前 OA 登录、会话、执行身份和流程授权均可信",
+                "审核标准口径不足、证据关系不明或现有材料无法支持准确结论",
+                "缺口能够脱敏关联到受影响审核项"
+            ],
+            "incorrect_output": "因无法准确作出业务判断而返回 needs_admin，并停止整轮继续处理",
+            "expected_output": "生成降级审核包，将受影响项目标为 uncertain，形成财务可读的 ⚠️ 意见并以 needs_human 正常闭合；不把业务不确定升级为技术失败",
+            "failure_mode": "混淆业务判断不确定与执行安全边界",
+            "rule_ref": "error-handling.md#停止规则;flow-engine-contract.md#结构化审核决定"
         }
   ]
 }

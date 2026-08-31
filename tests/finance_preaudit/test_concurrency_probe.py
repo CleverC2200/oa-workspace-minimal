@@ -816,7 +816,9 @@ def test_prepare_live_discovery_failure_requests_only_cycle_stop(
         finance_preaudit_concurrency_probe.cli,
         "_live_pending_identities",
         lambda: (_ for _ in ()).throw(
-            ValueError("oa_execution_identity_login_failed")
+            RuntimeError(
+                "oa_execution_identity_login_failed: redacted login detail"
+            )
         ),
     )
     monkeypatch.setattr(
@@ -852,7 +854,67 @@ def test_prepare_live_discovery_failure_requests_only_cycle_stop(
 
     assert finance_preaudit_concurrency_probe._prepare_one("*") == {
         "action": "failed",
-        "error_code": "production_probe_prepare_failed",
+        "error_code": "oa_execution_identity_login_failed",
+    }
+    assert cycle_stop_requests == [True]
+    assert persistent_stop_requests == []
+
+
+@pytest.mark.parametrize("failure_stage", ("engine", "next_action"))
+def test_prepare_propagates_session_failure_from_live_engine(
+    failure_stage: str,
+    monkeypatch,
+) -> None:
+    cycle_stop_requests: list[bool] = []
+    persistent_stop_requests: list[str | None] = []
+    error = RuntimeError("rpa_session_invalid: redacted session detail")
+
+    class Engine:
+        def next_action(self, *_args, **_kwargs) -> dict:
+            raise error
+
+    def live_engine(*, controlled: bool) -> Engine:
+        assert controlled is True
+        if failure_stage == "engine":
+            raise error
+        return Engine()
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.cli,
+        "_live_flow_engine",
+        live_engine,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_cycle_stop",
+        lambda: cycle_stop_requests.append(True),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda reason=None: persistent_stop_requests.append(reason),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantine_count",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_historical_write_authorization_failures",
+        frozenset,
+    )
+
+    assert finance_preaudit_concurrency_probe._prepare_one(
+        "travel_expense"
+    ) == {
+        "action": "failed",
+        "error_code": "rpa_session_invalid",
     }
     assert cycle_stop_requests == [True]
     assert persistent_stop_requests == []
@@ -2012,6 +2074,91 @@ def test_prepare_global_fifo_returns_trusted_zero_write_quarantine(
         "write_state": "not_requested",
     }
     assert stop_requests == []
+
+
+def test_prepare_global_fifo_stops_on_trusted_session_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    request_id = "session-failure-request"
+    received_at = "2026-08-31T08:00:00+08:00"
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    cycle_stop_requests: list[bool] = []
+    persistent_stop_requests: list[str | None] = []
+
+    class Engine:
+        def next_action(self, *_args, **_kwargs) -> dict:
+            action_file = _quarantined_action(
+                flow_root,
+                request_id=request_id,
+                received_at=received_at,
+                failure_detail_code="oa_session_expired",
+            )
+            return json.loads(action_file.read_text(encoding="utf-8"))
+
+    monkeypatch.setattr(finance_preaudit_concurrency_probe, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.cli,
+        "_live_pending_identities",
+        lambda: [
+            {
+                "requestId": request_id,
+                "received_at": received_at,
+                "flow_key": "travel_expense",
+                "support_status": "supported",
+                "can_submit": True,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.cli,
+        "_live_flow_engine",
+        lambda *, controlled, selected_identity: Engine(),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_cycle_stop",
+        lambda: cycle_stop_requests.append(True),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda reason=None: persistent_stop_requests.append(reason),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_historical_write_authorization_failures",
+        frozenset,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantine_count",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantined_identities",
+        frozenset,
+    )
+
+    assert finance_preaudit_concurrency_probe._prepare_one(
+        {
+            "workflow_key": "*",
+            "assigned_identities": [],
+            "historical_unknown_identities": [],
+            "recover_action_files": [],
+        }
+    ) == {
+        "action": "failed",
+        "error_code": "oa_session_expired",
+    }
+    assert cycle_stop_requests == [True]
+    assert persistent_stop_requests == []
 
 
 def test_prepare_global_fifo_stops_on_untrusted_zero_write_quarantine(
