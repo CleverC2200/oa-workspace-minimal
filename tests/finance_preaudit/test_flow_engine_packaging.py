@@ -411,6 +411,182 @@ def test_packaging_decision_must_cover_every_page(tmp_path: Path) -> None:
         engine.complete_review(Path(action["action_file"]), decision_file)
 
 
+def test_packaging_accepts_two_versions_observed_on_one_page(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    action = engine.next_action(WORKFLOW_KEY)
+    visual_review = {
+        "outcome": "reviewed",
+        "pages": [
+            _visual_page(
+                1,
+                classification="packaging_layout",
+                version="version-a",
+                item_keys=ITEM_KEYS,
+            ),
+            _visual_page(
+                1,
+                classification="packaging_layout",
+                version="version-b",
+                item_keys=ITEM_KEYS,
+            ),
+        ],
+    }
+    decision_file = tmp_path / "two-versions-one-page.json"
+    json_artifact.write_json_atomic(
+        decision_file,
+        _decision(action, _passing_items(), visual_review=visual_review),
+    )
+
+    closed = engine.complete_review(Path(action["action_file"]), decision_file)
+    receipt = json.loads(
+        Path(action["action_file"])
+        .with_name("execution-receipt.json")
+        .read_text(encoding="utf-8")
+    )
+
+    assert closed["business_state"] == "pass"
+    assert receipt["quality"]["page_coverage"] == {
+        "applicable": True,
+        "covered": 1,
+        "total": 1,
+    }
+
+
+def test_packaging_rejects_duplicate_version_observation_on_one_page(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path)
+    action = engine.next_action(WORKFLOW_KEY)
+    visual_review = {
+        "outcome": "reviewed",
+        "pages": [
+            _visual_page(
+                1,
+                classification="packaging_layout",
+                version="version-a",
+                item_keys=ITEM_KEYS,
+            ),
+            _visual_page(
+                1,
+                classification="packaging_layout",
+                version="version-a",
+                item_keys=ITEM_KEYS,
+            ),
+        ],
+    }
+    decision_file = tmp_path / "duplicate-page-version.json"
+    json_artifact.write_json_atomic(
+        decision_file,
+        _decision(action, _passing_items(), visual_review=visual_review),
+    )
+
+    with pytest.raises(ValueError, match="review_decision_invalid"):
+        engine.complete_review(Path(action["action_file"]), decision_file)
+
+
+def test_packaging_rejects_conflicting_classifications_for_one_page(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path)
+    action = engine.next_action(WORKFLOW_KEY)
+    visual_review = {
+        "outcome": "reviewed",
+        "pages": [
+            _visual_page(
+                1,
+                classification="packaging_layout",
+                version="version-a",
+                item_keys=ITEM_KEYS,
+            ),
+            _visual_page(1, classification="non_packaging"),
+        ],
+    }
+    decision_file = tmp_path / "conflicting-page-classifications.json"
+    json_artifact.write_json_atomic(
+        decision_file,
+        _decision(action, _passing_items(), visual_review=visual_review),
+    )
+
+    with pytest.raises(ValueError, match="review_decision_invalid"):
+        engine.complete_review(Path(action["action_file"]), decision_file)
+
+
+def test_packaging_duplicate_page_cannot_mask_missing_original_page(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path, page_count=2)
+    action = engine.next_action(WORKFLOW_KEY)
+    visual_review = {
+        "outcome": "reviewed",
+        "pages": [
+            _visual_page(
+                1,
+                classification="packaging_layout",
+                version="version-a",
+                item_keys=ITEM_KEYS,
+            ),
+            _visual_page(
+                1,
+                classification="packaging_layout",
+                version="version-b",
+                item_keys=ITEM_KEYS,
+            ),
+        ],
+    }
+    decision_file = tmp_path / "duplicate-masks-missing-page.json"
+    json_artifact.write_json_atomic(
+        decision_file,
+        _decision(action, _passing_items(), visual_review=visual_review),
+    )
+
+    with pytest.raises(ValueError, match="review_decision_invalid"):
+        engine.complete_review(Path(action["action_file"]), decision_file)
+
+
+def test_packaging_repeated_page_observations_must_remain_grouped(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path, page_count=2)
+    action = engine.next_action(WORKFLOW_KEY)
+    visual_review = {
+        "outcome": "reviewed",
+        "pages": [
+            _visual_page(
+                1,
+                classification="packaging_layout",
+                version="version-a",
+                item_keys=ITEM_KEYS,
+            ),
+            _visual_page(
+                2,
+                classification="packaging_layout",
+                version="version-b",
+                item_keys=ITEM_KEYS,
+            ),
+            _visual_page(
+                1,
+                classification="packaging_layout",
+                version="version-c",
+                item_keys=ITEM_KEYS,
+            ),
+        ],
+    }
+    reviewed = _passing_items()
+    for item in reviewed:
+        item["evidence_refs"] = [
+            "material:prepared.images.page-1.page-1",
+            "material:prepared.images.page-1.page-2",
+        ]
+    decision_file = tmp_path / "ungrouped-page-observations.json"
+    json_artifact.write_json_atomic(
+        decision_file,
+        _decision(action, reviewed, visual_review=visual_review),
+    )
+
+    with pytest.raises(ValueError, match="review_decision_invalid"):
+        engine.complete_review(Path(action["action_file"]), decision_file)
+
+
 def test_packaging_all_non_packaging_uses_single_line_remark(tmp_path: Path) -> None:
     engine = _engine(tmp_path, page_count=2)
     action = engine.next_action(WORKFLOW_KEY)

@@ -1012,15 +1012,20 @@ def _validate_packaging_visual_review(
         or set(visual_review) != {"outcome", "pages"}
         or visual_review.get("outcome") not in {"reviewed", "all_non_packaging"}
         or not isinstance(visual_review.get("pages"), list)
-        or len(visual_review["pages"]) != len(page_refs)
+        or len(visual_review["pages"]) < len(page_refs)
     ):
         raise ValueError("review_decision_invalid")
     items_by_key = {item["item_key"]: item for item in items}
+    page_positions = {page_ref: index for index, page_ref in enumerate(page_refs)}
+    if len(page_positions) != len(page_refs):
+        raise ValueError("review_decision_invalid")
     version_items: dict[str, set[str]] = {}
     uncertain_refs: set[str] = set()
     non_packaging_refs: set[str] = set()
-    classifications: list[str] = []
-    for expected_ref, page in zip(page_refs, visual_review["pages"], strict=True):
+    classifications_by_ref: dict[str, str] = {}
+    seen_page_versions: set[tuple[str, str]] = set()
+    observed_positions: list[int] = []
+    for page in visual_review["pages"]:
         if not isinstance(page, dict) or set(page) != {
             "page_ref",
             "classification",
@@ -1028,11 +1033,13 @@ def _validate_packaging_visual_review(
             "item_keys",
         }:
             raise ValueError("review_decision_invalid")
+        page_ref = page.get("page_ref")
         classification = page.get("classification")
         version_id = page.get("package_version_id")
         reviewed_keys = page.get("item_keys")
         if (
-            page.get("page_ref") != expected_ref
+            not isinstance(page_ref, str)
+            or page_ref not in page_positions
             or classification not in _PACKAGING_PAGE_CLASSIFICATIONS
             or not isinstance(reviewed_keys, list)
             or not all(isinstance(key, str) for key in reviewed_keys)
@@ -1040,17 +1047,27 @@ def _validate_packaging_visual_review(
             or any(key not in item_keys for key in reviewed_keys)
         ):
             raise ValueError("review_decision_invalid")
-        classifications.append(classification)
+        observed_positions.append(page_positions[page_ref])
+        previous_classification = classifications_by_ref.setdefault(
+            page_ref,
+            classification,
+        )
+        if previous_classification != classification:
+            raise ValueError("review_decision_invalid")
         if classification == "packaging_layout":
             if (
                 not isinstance(version_id, str)
                 or _SAFE_PACKAGE_VERSION_ID.fullmatch(version_id) is None
             ):
                 raise ValueError("review_decision_invalid")
+            page_version = (page_ref, version_id)
+            if page_version in seen_page_versions:
+                raise ValueError("review_decision_invalid")
+            seen_page_versions.add(page_version)
             version_items.setdefault(version_id, set()).update(reviewed_keys)
             for item_key in reviewed_keys:
                 item = items_by_key[item_key]
-                if expected_ref not in {
+                if page_ref not in {
                     *item["evidence_refs"],
                     *item["missing_evidence"],
                 }:
@@ -1058,9 +1075,20 @@ def _validate_packaging_visual_review(
         elif version_id is not None or reviewed_keys:
             raise ValueError("review_decision_invalid")
         elif classification == "uncertain":
-            uncertain_refs.add(expected_ref)
+            if page_ref in uncertain_refs:
+                raise ValueError("review_decision_invalid")
+            uncertain_refs.add(page_ref)
         else:
-            non_packaging_refs.add(expected_ref)
+            if page_ref in non_packaging_refs:
+                raise ValueError("review_decision_invalid")
+            non_packaging_refs.add(page_ref)
+
+    if (
+        set(classifications_by_ref) != set(page_refs)
+        or observed_positions != sorted(observed_positions)
+    ):
+        raise ValueError("review_decision_invalid")
+    classifications = [classifications_by_ref[page_ref] for page_ref in page_refs]
 
     referenced_item_pages = {
         reference
