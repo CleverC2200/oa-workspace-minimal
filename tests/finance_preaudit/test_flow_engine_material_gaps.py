@@ -16,6 +16,14 @@ FINANCE_WORKFLOWS = (
     "small_marketing_fee",
     "general_expense",
 )
+SESSION_BLOCKING_FAILURE_CODES = (
+    "oa_execution_identity_login_failed",
+    "oa_session_expired",
+    "rpa_cdp_timeout",
+    "rpa_cdp_unavailable",
+    "rpa_session_invalid",
+    "rpa_session_missing",
+)
 
 
 def _engine(
@@ -204,6 +212,47 @@ def test_explicit_runtime_stop_is_not_converted_to_a_material_gap(
     assert "unsafe_internal_counter" not in json.dumps(state, ensure_ascii=False)
 
 
+@pytest.mark.parametrize("failure_code", SESSION_BLOCKING_FAILURE_CODES)
+@pytest.mark.parametrize("with_detail", (False, True))
+def test_finance_login_or_session_failure_is_a_hard_stop(
+    tmp_path: Path,
+    failure_code: str,
+    with_detail: bool,
+) -> None:
+    submissions: list[dict] = []
+    error = RuntimeError(
+        f"{failure_code}: redacted login detail" if with_detail else failure_code
+    )
+    engine = _engine(
+        tmp_path,
+        "general_expense",
+        error,
+        controlled=True,
+        submissions=submissions,
+    )
+
+    action = engine.next_action("general_expense", mode="controlled_write")
+
+    assert action["action"] == "needs_admin"
+    assert action["execution_state"] == "needs_admin"
+    assert action["business_state"] == "not_available"
+    assert action["write_state"] == "not_requested"
+    assert action["reason"] == "material_collection_failed"
+    assert action["failure_detail_code"] == failure_code
+    assert submissions == []
+    attempt_root = Path(action["action_file"]).parent
+    assert not any(
+        (attempt_root / name).exists()
+        for name in (
+            "material.json",
+            "review-packet.json",
+            "review-decision.json",
+            "remark.txt",
+            "submission-envelope.json",
+        )
+    )
+
+
 def test_material_bundle_failure_persists_only_a_safe_detail_code(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -223,12 +272,19 @@ def test_material_bundle_failure_persists_only_a_safe_detail_code(
     assert "collector timeout" not in serialized
 
 
-def test_authorized_writer_can_submit_the_dynamic_gap_opinion(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "gap_code",
+    ("resource_ownership_untrusted", "workflow_ambiguous"),
+)
+def test_authorized_writer_can_submit_the_dynamic_gap_opinion(
+    tmp_path: Path,
+    gap_code: str,
+) -> None:
     submissions: list[dict] = []
     engine = _engine(
         tmp_path,
         "travel_expense",
-        RuntimeError("resource_ownership_untrusted"),
+        RuntimeError(gap_code),
         controlled=True,
         submissions=submissions,
     )

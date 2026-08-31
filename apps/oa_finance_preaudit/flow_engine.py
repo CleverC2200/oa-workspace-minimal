@@ -155,7 +155,6 @@ _SAFE_MATERIAL_GAP_CODES = {
     "invoice_buyer_read_failed",
     "material_collection_failed",
     "material_workflow_mismatch",
-    "oa_session_expired",
     "packaging_material_incomplete",
     "resource_ownership_untrusted",
     "travel_attachment_discovery_failed",
@@ -163,6 +162,16 @@ _SAFE_MATERIAL_GAP_CODES = {
     "travel_attachment_resources_incomplete",
     "workflow_ambiguous",
 }
+SESSION_BLOCKING_FAILURE_CODES = frozenset(
+    {
+        "oa_execution_identity_login_failed",
+        "oa_session_expired",
+        "rpa_cdp_timeout",
+        "rpa_cdp_unavailable",
+        "rpa_session_invalid",
+        "rpa_session_missing",
+    }
+)
 _SAFE_COLLECTION_COUNT_KEYS = {
     "declared_attachment_count",
     "discovered_resource_count",
@@ -170,7 +179,10 @@ _SAFE_COLLECTION_COUNT_KEYS = {
     "travel_resource_count",
     "trusted_source_sighting_count",
 }
-_HARD_COLLECTION_FAILURE_CODES = {"oa_run_stopped"}
+_HARD_COLLECTION_FAILURE_CODES = {
+    "oa_run_stopped",
+    *SESSION_BLOCKING_FAILURE_CODES,
+}
 _SAFE_MATERIAL_FAILURE_DETAIL_CODES = (
     _SAFE_MATERIAL_GAP_CODES
     | _HARD_COLLECTION_FAILURE_CODES
@@ -359,13 +371,9 @@ def _flow_items(workflow_key: str) -> list[dict]:
 
 
 def _material_gap(error: Exception) -> dict:
-    raw_code = str(error).strip()
+    raw_code = _stable_error_code(error, _SAFE_MATERIAL_GAP_CODES)
     gap = {
-        "code": (
-            raw_code
-            if raw_code in _SAFE_MATERIAL_GAP_CODES
-            else "material_collection_failed"
-        )
+        "code": raw_code or "material_collection_failed"
     }
     raw_counts = getattr(error, "counts", None)
     counts = {
@@ -382,14 +390,10 @@ def _material_gap(error: Exception) -> dict:
 
 
 def _material_failure_details(error: Exception) -> dict:
-    raw_code = str(error).strip()
+    raw_code = _stable_error_code(error, _SAFE_MATERIAL_FAILURE_DETAIL_CODES)
     gap = _material_gap(error)
     return {
-        "failure_detail_code": (
-            raw_code
-            if raw_code in _SAFE_MATERIAL_FAILURE_DETAIL_CODES
-            else "material_collection_failed"
-        ),
+        "failure_detail_code": raw_code or "material_collection_failed",
         **({"failure_counts": gap["counts"]} if "counts" in gap else {}),
     }
 
@@ -408,6 +412,22 @@ def _degraded_material(request_id: str, workflow_key: str, error: Exception) -> 
         "warnings": [],
         "collection_gaps": [_material_gap(error)],
     }
+
+
+def _stable_error_code(error: Exception, allowed: set[str] | frozenset[str]) -> str:
+    raw_values = (getattr(error, "code", None), str(error).strip())
+    for raw in raw_values:
+        value = str(raw or "").strip()
+        if value in allowed:
+            return value
+        prefix = value.partition(":")[0].strip()
+        if prefix in allowed:
+            return prefix
+    return ""
+
+
+def session_blocking_failure_code(error: Exception) -> str:
+    return _stable_error_code(error, SESSION_BLOCKING_FAILURE_CODES)
 
 
 def _review_packet_constraints(workflow_key: str, material: dict) -> dict:
@@ -2204,9 +2224,13 @@ class FlowEngine:
                     raise ValueError("material_workflow_mismatch")
                 _validate_flow_material(workflow_key, material)
             except Exception as error:
+                failure_code = _stable_error_code(
+                    error,
+                    _HARD_COLLECTION_FAILURE_CODES,
+                )
                 if (
                     workflow_key not in _FINANCE_WORKFLOW_KEYS
-                    or str(error).strip() in _HARD_COLLECTION_FAILURE_CODES
+                    or failure_code in _HARD_COLLECTION_FAILURE_CODES
                 ):
                     return self._persist_attempt_needs_admin(
                         attempt_root / "action.json",
