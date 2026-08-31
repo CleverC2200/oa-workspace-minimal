@@ -43,6 +43,7 @@ _RUNTIME_FAILURE_CODES = {
     "runtime_live_configuration_missing",
     "runtime_live_check_failed",
     "runtime_reconciliation_invalid",
+    "oa_execution_identity_login_failed",
     "oa_auth_file_permissions_invalid",
     "oa_auth_file_outside_worktree_required",
     "cache_clean_failed",

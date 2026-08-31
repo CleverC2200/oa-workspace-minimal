@@ -63,6 +63,13 @@ def _raise_on_readonly_error(payload: Any, *, code: str) -> None:
             raise RuntimeError(code)
     response_code = str(payload.get("code") or "").strip().upper()
     if response_code and response_code not in {"SUCCESS", "0", "200"}:
+        message = str(payload.get("msg") or payload.get("message") or "")
+        if (
+            response_code == "-1"
+            and "登录失败" in message
+            and any(marker in message for marker in ("账号", "密码", "用户名"))
+        ):
+            raise RuntimeError("oa_execution_identity_login_failed")
         raise RuntimeError(code)
     if payload.get("error") and not response_code:
         raise RuntimeError(code)

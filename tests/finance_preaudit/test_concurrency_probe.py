@@ -190,6 +190,17 @@ def _reconciliation_snapshot(pending: int, quarantined: int = 0) -> dict:
             "pending_quarantined": quarantined,
             "actionable_pending": pending - quarantined,
         },
+        "failure_attention": {
+            "scope": "live_pending",
+            "status": "clear",
+            "affected_cases": 0,
+            "repeated_failure_cases": 0,
+            "long_wait_failure_cases": 0,
+            "long_wait_threshold_seconds": 900,
+            "max_failure_attempts": 3,
+            "oldest_wait_seconds": 0,
+            "failure_counts": {},
+        },
     }
 
 
@@ -392,6 +403,44 @@ def test_probe_renews_oldest_open_actions_and_returns_only_sanitized_counts(
     encoded = json.dumps(result)
     assert str(older) not in encoded
     assert str(newer) not in encoded
+
+
+def test_renew_failure_requests_only_cycle_stop(tmp_path: Path, monkeypatch) -> None:
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    action_file = _open_action(
+        flow_root,
+        case_key="a" * 64,
+        created_at="2026-08-31T00:00:00+00:00",
+    )
+    cycle_stop_requests: list[bool] = []
+    persistent_stop_requests: list[str | None] = []
+
+    class Engine:
+        def _resume_active_action(self, *_args, **_kwargs) -> None:
+            return None
+
+    monkeypatch.setattr(finance_preaudit_concurrency_probe, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.cli,
+        "_live_flow_engine",
+        lambda *, controlled: Engine(),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_cycle_stop",
+        lambda: cycle_stop_requests.append(True),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda reason=None: persistent_stop_requests.append(reason),
+    )
+
+    with pytest.raises(ValueError, match="^production_probe_renew_failed$"):
+        finance_preaudit_concurrency_probe._renew_actions([action_file])
+
+    assert cycle_stop_requests == [True]
+    assert persistent_stop_requests == []
 
 
 def test_probe_prepares_missing_actions_before_review(
@@ -755,6 +804,58 @@ def test_prepare_global_fifo_stops_when_claimed_identity_changes(
         "error_code": "production_probe_fifo_mismatch",
     }
     assert stop_requests == ["production_probe_prepare_failed"]
+
+
+def test_prepare_live_discovery_failure_requests_only_cycle_stop(
+    monkeypatch,
+) -> None:
+    cycle_stop_requests: list[bool] = []
+    persistent_stop_requests: list[str | None] = []
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.cli,
+        "_live_pending_identities",
+        lambda: (_ for _ in ()).throw(
+            ValueError("oa_execution_identity_login_failed")
+        ),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_cycle_stop",
+        lambda: cycle_stop_requests.append(True),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda reason=None: persistent_stop_requests.append(reason),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantine_count",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_historical_write_authorization_failures",
+        frozenset,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_local_quarantined_identities",
+        frozenset,
+    )
+
+    assert finance_preaudit_concurrency_probe._prepare_one("*") == {
+        "action": "failed",
+        "error_code": "production_probe_prepare_failed",
+    }
+    assert cycle_stop_requests == [True]
+    assert persistent_stop_requests == []
 
 
 def test_prepare_global_fifo_skips_actions_already_claimed_by_controller(
@@ -2258,7 +2359,8 @@ def test_prepare_skips_exact_historical_write_authorization_failure(
 
 
 def test_prepare_requests_stop_when_next_action_raises(monkeypatch) -> None:
-    stop_requests: list[bool] = []
+    cycle_stop_requests: list[bool] = []
+    persistent_stop_requests: list[str | None] = []
 
     class Engine:
         def next_action(self, *_args, **_kwargs) -> dict:
@@ -2277,7 +2379,12 @@ def test_prepare_requests_stop_when_next_action_raises(monkeypatch) -> None:
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.runtime_control,
         "request_stop",
-        lambda _reason=None: stop_requests.append(True),
+        lambda reason=None: persistent_stop_requests.append(reason),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_cycle_stop",
+        lambda: cycle_stop_requests.append(True),
     )
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe,
@@ -2296,7 +2403,8 @@ def test_prepare_requests_stop_when_next_action_raises(monkeypatch) -> None:
         "action": "failed",
         "error_code": "production_probe_prepare_failed",
     }
-    assert stop_requests == [True]
+    assert cycle_stop_requests == [True]
+    assert persistent_stop_requests == []
 
 
 def test_prepare_waits_for_inflight_completion_without_requesting_stop(
@@ -2860,6 +2968,10 @@ def test_rolling_failure_retains_health_and_stable_reason(
     assert result["status"] == "failed"
     assert result["stop_reason"] == expected_reason
     assert result["last_capacity_decision"]["reason"] == expected_reason
+    assert (
+        finance_preaudit_concurrency_probe.runtime_control.stop_requested()
+        is False
+    )
     assert result["wave_runtime_health"] == [
         {
             "status": host_status,
@@ -2871,6 +2983,53 @@ def test_rolling_failure_retains_health_and_stable_reason(
             "maximum_oldest_task_seconds": 8.0,
         }
     ]
+
+
+def test_rolling_recovers_reaped_cycle_stop_after_live_gates_pass() -> None:
+    finance_preaudit_concurrency_probe.runtime_control.request_cycle_stop()
+
+    result = finance_preaudit_concurrency_probe.run_rolling_drain(
+        capacity=6,
+        live_status=lambda: {
+            "credentials": {"status": "ok"},
+            "oa": {
+                "execution_identity": "verified",
+                "unsupported": 0,
+                "by_workflow": {},
+            },
+        },
+        reconcile_status=lambda: _reconciliation_snapshot(0),
+        pipeline_runner=lambda *_args: pytest.fail("pipeline must remain idle"),
+    )
+
+    assert result["status"] == "completed"
+    assert result["recovered_cycle_stop"] is True
+    assert (
+        finance_preaudit_concurrency_probe.runtime_control.stop_requested()
+        is False
+    )
+
+
+def test_rolling_preserves_cycle_stop_when_live_gates_are_untrusted() -> None:
+    finance_preaudit_concurrency_probe.runtime_control.request_cycle_stop()
+
+    with pytest.raises(
+        ValueError,
+        match="production_cycle_stop_recovery_blocked",
+    ):
+        finance_preaudit_concurrency_probe.run_rolling_drain(
+            capacity=6,
+            live_status=lambda: (_ for _ in ()).throw(
+                RuntimeError("pending_queue_fetch_failed")
+            ),
+            reconcile_status=lambda: _reconciliation_snapshot(0),
+            pipeline_runner=lambda *_args: pytest.fail("pipeline must remain idle"),
+        )
+
+    assert (
+        finance_preaudit_concurrency_probe.runtime_control.stop_requested()
+        is True
+    )
 
 
 def test_rolling_scope_is_explicitly_limited_to_finance_worker_routes() -> None:

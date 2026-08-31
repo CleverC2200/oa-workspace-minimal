@@ -677,18 +677,21 @@ def _complete_decision(action_file: Path, decision: dict) -> str | None:
         except ValueError as error:
             if str(error) == "review_decision_invalid":
                 return "codex_decision_invalid"
-            runtime_control.request_stop()
+            runtime_control.request_stop("writer_result_unknown")
             return "codex_decision_submit_failed"
         except Exception:
-            runtime_control.request_stop()
+            runtime_control.request_stop("writer_result_unknown")
             return "codex_decision_submit_failed"
         if not (
             result.get("action") == "closed"
             and result.get("execution_state") == "closed"
             and result.get("write_state") == "submitted"
         ):
-            runtime_control.request_stop()
             reason = result.get("reason")
+            if reason in _UNKNOWN_WRITE_FAILURE_CODES:
+                runtime_control.request_stop("writer_result_unknown")
+            else:
+                runtime_control.request_cycle_stop()
             if reason in _COMPLETION_FAILURE_CODES:
                 return str(reason)
             return "codex_decision_submit_incomplete"
@@ -874,7 +877,7 @@ def _legacy_run_with_completion(
     *,
     executor: Executor = _execute_codex,
     completer: Completer = _complete_decision,
-    request_stop: StopRequester = runtime_control.request_stop,
+    request_stop: StopRequester = runtime_control.request_cycle_stop,
 ) -> dict:
     run_started = time.monotonic()
     try:
@@ -994,7 +997,7 @@ def complete_review_result(
     reviewed: dict,
     *,
     completer: Completer = _complete_decision,
-    request_stop: StopRequester = runtime_control.request_stop,
+    request_stop: StopRequester = runtime_control.request_cycle_stop,
     defer_invalid_stop: bool = False,
 ) -> dict:
     """Complete one reviewed action in the non-killable parent writer path."""

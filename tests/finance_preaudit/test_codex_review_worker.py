@@ -1072,6 +1072,35 @@ def test_global_stop_preserves_first_sanitized_reason(
     )
 
 
+def test_cycle_stop_is_cleared_after_controller_reaps_children(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stop_file = tmp_path / "control" / "stop.flag"
+    monkeypatch.setenv("OA_FINANCE_PREAUDIT_STOP_FILE", str(stop_file))
+
+    runtime_control.request_cycle_stop()
+
+    assert runtime_control.stop_requested() is True
+    assert runtime_control.stop_reason() == "controller_cycle_stop"
+    assert runtime_control.clear_cycle_stop() is True
+    assert runtime_control.stop_requested() is False
+
+
+def test_cycle_stop_clear_preserves_manual_reconciliation_stop(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stop_file = tmp_path / "control" / "stop.flag"
+    monkeypatch.setenv("OA_FINANCE_PREAUDIT_STOP_FILE", str(stop_file))
+
+    runtime_control.request_stop("writer_result_unknown")
+
+    assert runtime_control.clear_cycle_stop() is False
+    assert runtime_control.stop_requested() is True
+    assert runtime_control.stop_reason() == "writer_result_unknown"
+
+
 def test_global_stop_rejects_unlisted_reason(
     tmp_path: Path,
     monkeypatch,

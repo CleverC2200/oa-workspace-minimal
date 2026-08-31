@@ -586,7 +586,7 @@ def _renew_actions(action_files: list[Path]) -> list[Path]:
                     case_key=case_key,
                 )
         except Exception as error:
-            runtime_control.request_stop("production_probe_renew_failed")
+            runtime_control.request_cycle_stop()
             raise ValueError("production_probe_renew_failed") from error
         if (
             current is None
@@ -594,7 +594,7 @@ def _renew_actions(action_files: list[Path]) -> list[Path]:
             or current.get("action_file") != str(action_file)
             or current.get("write_state") != "authorized"
         ):
-            runtime_control.request_stop("production_probe_renew_failed")
+            runtime_control.request_cycle_stop()
             raise ValueError("production_probe_renew_failed")
         renewed.append(action_file)
     return renewed
@@ -904,7 +904,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                     allowed_workflows=allowed_workflows,
                 )
             except (ValueError, OSError):
-                runtime_control.request_stop("production_probe_prepare_failed")
+                runtime_control.request_cycle_stop()
                 return {
                     "action": "failed",
                     "error_code": "production_probe_prepare_failed",
@@ -1037,7 +1037,10 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                         }
                     time.sleep(0.05)
                     continue
-                runtime_control.request_stop("production_probe_prepare_failed")
+                if recovery_action_file is not None:
+                    runtime_control.request_stop("production_probe_prepare_failed")
+                else:
+                    runtime_control.request_cycle_stop()
                 return {
                     "action": "failed",
                     "error_code": (
@@ -1047,7 +1050,10 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                     ),
                 }
             except Exception:
-                runtime_control.request_stop("production_probe_prepare_failed")
+                if recovery_action_file is not None:
+                    runtime_control.request_stop("production_probe_prepare_failed")
+                else:
+                    runtime_control.request_cycle_stop()
                 return {
                     "action": "failed",
                     "error_code": (
@@ -1193,7 +1199,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
         try:
             runtime_control.request_stop(error_code)
         except ValueError:
-            runtime_control.request_stop()
+            runtime_control.request_cycle_stop()
         return {
             "action": str(action.get("action") or "failed"),
             "error_code": error_code,
@@ -2008,7 +2014,7 @@ def _run_dispatched_tasks(
     def request_pipeline_stop() -> None:
         nonlocal halted
         halted = True
-        runtime_control.request_stop()
+        runtime_control.request_cycle_stop()
         stop_reviews()
         stop_write_queue()
 
@@ -2390,7 +2396,7 @@ def _run_dispatched_tasks(
                     prepare_executor_terminated = True
                     preparation = None
                 halted = True
-                runtime_control.request_stop()
+                runtime_control.request_cycle_stop()
                 stop_write_queue()
                 if not force_terminated:
                     terminate_executor(executor)
@@ -2970,7 +2976,7 @@ def _run_dispatched_tasks(
         )
     )
     if halted and not force_terminated and not runtime_control.stop_requested():
-        runtime_control.request_stop()
+        runtime_control.request_cycle_stop()
     return process_pool.PoolResult(
         requested=len(completed_outcomes),
         started=started,
@@ -3085,7 +3091,7 @@ def _legacy_run_existing_batch(
                 for outcome in preparation.outcomes
             )
         ):
-            runtime_control.request_stop()
+            runtime_control.request_cycle_stop()
             raise ValueError("production_probe_prepare_failed")
         selected = _open_action_files(root)[:capacity]
     if len(selected) != capacity:
@@ -3143,7 +3149,7 @@ def _legacy_run_existing_batch(
             if isinstance(value_count, int) and not isinstance(value_count, bool):
                 token_totals[field] += value_count
     if failed or result.timed_out or result.stopped:
-        runtime_control.request_stop()
+        runtime_control.request_cycle_stop()
     return {
         "schema_version": 1,
         "kind": "preaudit_production_concurrency_probe",
@@ -3319,7 +3325,7 @@ def _legacy_run_drain(
     batches: list[dict] = []
     while pending:
         if len(batches) >= max_batches:
-            runtime_control.request_stop()
+            runtime_control.request_cycle_stop()
             raise ValueError("production_drain_batch_limit_reached")
         batch = batch_runner(capacity=min(max_capacity, pending))
         batches.append(batch)
@@ -3331,7 +3337,7 @@ def _legacy_run_drain(
             or batch.get("stopped")
             or batch.get("completed") != batch.get("selected")
         ):
-            runtime_control.request_stop()
+            runtime_control.request_cycle_stop()
             raise ValueError("production_drain_batch_failed")
         pending = _travel_pending(live_status())
 
@@ -3717,6 +3723,11 @@ def run_rolling_drain(
         if reconcile_status is _production_reconciliation
         else reconcile_status
     )
+    recovered_cycle_stop = _recover_stale_cycle_stop(
+        live_status=live_status,
+        reconcile_status=scoped_reconcile_status,
+        allowed_workflows=allowed_workflows,
+    )
     controller_handoff.assert_ready_for_start()
     try:
         with runtime_control.global_controller_lease():
@@ -3799,7 +3810,7 @@ def run_rolling_drain(
                 )
                 if result["processes_reaped"] is not True:
                     children_reaped = False
-                    runtime_control.request_stop()
+                    runtime_control.request_cycle_stop()
                     raise ValueError("production_controller_children_active")
             except Exception:
                 controller_handoff.finish(
@@ -3808,6 +3819,7 @@ def run_rolling_drain(
                     children_reaped=children_reaped,
                     health="degraded",
                 )
+                _clear_finished_cycle_stop(children_reaped=children_reaped)
                 raise
             handoff = controller_handoff.finish(
                 manifest,
@@ -3822,8 +3834,10 @@ def run_rolling_drain(
                     "healthy" if result["status"] == "completed" else "degraded"
                 ),
             )
+            _clear_finished_cycle_stop(children_reaped=True)
             return {
                 **result,
+                "recovered_cycle_stop": recovered_cycle_stop,
                 "cache_maintenance": cache_maintenance,
                 "controller_handoff": handoff,
             }
@@ -3831,6 +3845,101 @@ def run_rolling_drain(
         if str(error) == "controller_already_active":
             raise ValueError("production_rolling_controller_active") from error
         raise
+
+
+def _recover_stale_cycle_stop(
+    *,
+    live_status: LiveStatus,
+    reconcile_status: Callable[[], dict],
+    allowed_workflows: frozenset[str],
+) -> bool:
+    if not runtime_control.stop_requested():
+        return False
+    if runtime_control.stop_reason() != "controller_cycle_stop":
+        raise ValueError("production_probe_stopped")
+    handoff = controller_handoff.status()
+    if (
+        handoff.get("ready_for_start") is not True
+        or handoff.get("controller_active") is not False
+        or handoff.get("writer_active") is not False
+        or handoff.get("active_request_writers") != 0
+    ):
+        raise ValueError("production_cycle_stop_recovery_blocked")
+    try:
+        live = live_status()
+        reconciled = reconcile_status()
+        _pending, quarantined, _actionable, _unauthorized = _rolling_snapshot(
+            lambda: live,
+            lambda: reconciled,
+            allowed_workflows,
+        )
+        oa = live.get("oa")
+        if (
+            quarantined != 0
+            or not isinstance(oa, dict)
+            or oa.get("execution_identity") != "verified"
+            or not _failure_attention_is_clear(reconciled)
+        ):
+            raise ValueError("production_cycle_stop_recovery_blocked")
+    except (RuntimeError, ValueError) as error:
+        if str(error) == "production_cycle_stop_recovery_blocked":
+            raise
+        raise ValueError("production_cycle_stop_recovery_blocked") from error
+    try:
+        cleared = runtime_control.clear_cycle_stop()
+    except RuntimeError as error:
+        raise ValueError("production_cycle_stop_recovery_blocked") from error
+    if not cleared:
+        raise ValueError("production_cycle_stop_recovery_blocked")
+    return True
+
+
+def _failure_attention_is_clear(reconciled: dict) -> bool:
+    attention = reconciled.get("failure_attention")
+    expected_fields = {
+        "scope",
+        "status",
+        "affected_cases",
+        "repeated_failure_cases",
+        "long_wait_failure_cases",
+        "long_wait_threshold_seconds",
+        "max_failure_attempts",
+        "oldest_wait_seconds",
+        "failure_counts",
+    }
+    if not isinstance(attention, dict) or set(attention) != expected_fields:
+        return False
+    counts = attention.get("failure_counts")
+    numeric_fields = expected_fields - {"scope", "status", "failure_counts"}
+    return (
+        attention.get("scope") == "live_pending"
+        and attention.get("status") == "clear"
+        and all(
+            isinstance(attention.get(field), int)
+            and not isinstance(attention.get(field), bool)
+            and attention[field] >= 0
+            for field in numeric_fields
+        )
+        and attention.get("affected_cases") == 0
+        and attention.get("repeated_failure_cases") == 0
+        and attention.get("long_wait_failure_cases") == 0
+        and attention.get("oldest_wait_seconds") == 0
+        and isinstance(counts, dict)
+        and not counts
+    )
+
+
+def _clear_finished_cycle_stop(*, children_reaped: bool) -> None:
+    if (
+        not children_reaped
+        or runtime_control.writer_active()
+        or runtime_control.active_request_writers() != 0
+    ):
+        return
+    try:
+        runtime_control.clear_cycle_stop()
+    except RuntimeError as error:
+        raise ValueError("production_cycle_stop_cleanup_failed") from error
 
 
 def _run_rolling_drain_locked(
@@ -3913,11 +4022,11 @@ def _run_rolling_drain_locked(
                     allowed_workflows,
                 )
             except ValueError:
-                runtime_control.request_stop()
+                runtime_control.request_cycle_stop()
                 raise
             discovery_refreshes += 1
             if quarantined_pending > quarantined_before_refresh:
-                runtime_control.request_stop()
+                runtime_control.request_cycle_stop()
                 status = "failed"
                 stop_reason = "quarantine_increased"
                 break
@@ -3927,7 +4036,7 @@ def _run_rolling_drain_locked(
             empty_snapshots += 1
             continue
         if len(waves) >= max_waves:
-            runtime_control.request_stop()
+            runtime_control.request_cycle_stop()
             raise ValueError("production_rolling_wave_limit_reached")
         cache_maintenance_waves.append(attachment_cache.prune_expired())
         # A health window observes the continuous drain; it never caps claims.
@@ -3952,7 +4061,7 @@ def _run_rolling_drain_locked(
             or wave["stopped"]
             or wave["completed"] != wave["requested"]
         ):
-            runtime_control.request_stop()
+            runtime_control.request_cycle_stop()
             status = "failed"
             internal_stops = [
                 decision
@@ -3988,7 +4097,7 @@ def _run_rolling_drain_locked(
                 allowed_workflows,
             )
         except ValueError:
-            runtime_control.request_stop()
+            runtime_control.request_cycle_stop()
             raise
         discovery_refreshes += 1
         quarantine_growth = max(
@@ -3996,7 +4105,7 @@ def _run_rolling_drain_locked(
             quarantined_pending - quarantined_before_wave,
         )
         if quarantine_growth > int(wave.get("isolated_quarantines") or 0):
-            runtime_control.request_stop()
+            runtime_control.request_cycle_stop()
             status = "failed"
             stop_reason = "quarantine_increased"
             break
@@ -4042,7 +4151,7 @@ def _run_rolling_drain_locked(
                 )
             healthy_windows = int(last_decision["healthy_windows"])
             if last_decision["action"] == "stop":
-                runtime_control.request_stop()
+                runtime_control.request_cycle_stop()
                 status = "failed"
                 stop_reason = str(last_decision["reason"])
                 break

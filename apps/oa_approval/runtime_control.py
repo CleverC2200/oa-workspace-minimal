@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 import fcntl
 import hashlib
 import os
@@ -18,10 +19,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _STOP_REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _ALLOWED_STOP_REASONS = frozenset(
     {
+        "controller_cycle_stop",
         "production_probe_prepare_failed",
         "production_probe_renew_failed",
         "write_authorization_invalid",
+        "writer_result_unknown",
     }
+)
+_CYCLE_STOP_PAYLOAD = b"stop_requested:controller_cycle_stop\n"
+_CYCLE_STOP_CONTEXT: ContextVar[bool] = ContextVar(
+    "oa_finance_preaudit_cycle_stop",
+    default=False,
 )
 
 
@@ -37,12 +45,7 @@ def stop_requested() -> bool:
     return raw in {"1", "true", "yes", "y", "on"} or stop_file().exists()
 
 
-def request_stop(reason: str | None = None) -> None:
-    if reason is not None and (
-        _STOP_REASON.fullmatch(reason) is None
-        or reason not in _ALLOWED_STOP_REASONS
-    ):
-        raise ValueError("stop_reason_invalid")
+def _write_stop(reason: str | None) -> None:
     target = stop_file().expanduser()
     if not target.is_absolute():
         target = PROJECT_ROOT / target
@@ -63,6 +66,25 @@ def request_stop(reason: str | None = None) -> None:
         os.write(descriptor, payload.encode("ascii"))
     finally:
         os.close(descriptor)
+
+
+def request_stop(reason: str | None = None) -> None:
+    if reason is None and _CYCLE_STOP_CONTEXT.get():
+        reason = "controller_cycle_stop"
+    if reason is not None and (
+        _STOP_REASON.fullmatch(reason) is None
+        or reason not in _ALLOWED_STOP_REASONS
+    ):
+        raise ValueError("stop_reason_invalid")
+    _write_stop(reason)
+
+
+def request_cycle_stop() -> None:
+    token = _CYCLE_STOP_CONTEXT.set(True)
+    try:
+        request_stop()
+    finally:
+        _CYCLE_STOP_CONTEXT.reset(token)
 
 
 def stop_reason() -> str | None:
@@ -285,6 +307,67 @@ def write_control_bytes_atomic(path: Path, payload: bytes) -> None:
                 os.unlink(temporary_name, dir_fd=parent_descriptor)
             except FileNotFoundError:
                 pass
+        os.close(parent_descriptor)
+
+
+def clear_cycle_stop() -> bool:
+    """Remove only the controller-owned, recoverable cycle stop marker."""
+    raw = str(
+        os.environ.get("OA_FINANCE_PREAUDIT_STOP_REQUESTED") or ""
+    ).strip().lower()
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return False
+    target = stop_file().expanduser()
+    if not target.is_absolute():
+        target = PROJECT_ROOT / target
+    target = Path(os.path.abspath(target))
+    if not target.name or target.name in {".", ".."} or not target.parent.exists():
+        return False
+    try:
+        parent_descriptor = _open_directory_nofollow(target.parent, create=False)
+    except RuntimeError as error:
+        raise RuntimeError("control_file_unsafe") from error
+    file_descriptor: int | None = None
+    try:
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            file_descriptor = os.open(
+                target.name,
+                flags,
+                dir_fd=parent_descriptor,
+            )
+        except FileNotFoundError:
+            return False
+        pinned = os.fstat(file_descriptor)
+        if (
+            not stat.S_ISREG(pinned.st_mode)
+            or pinned.st_uid != os.getuid()
+            or pinned.st_mode & 0o077
+        ):
+            raise RuntimeError("control_file_unsafe")
+        payload = os.read(file_descriptor, len(_CYCLE_STOP_PAYLOAD) + 1)
+        if payload != _CYCLE_STOP_PAYLOAD:
+            return False
+        current = os.stat(
+            target.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino) != (pinned.st_dev, pinned.st_ino)
+        ):
+            raise RuntimeError("control_file_unsafe")
+        os.unlink(target.name, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+        return True
+    except OSError as error:
+        raise RuntimeError("control_file_unsafe") from error
+    finally:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
         os.close(parent_descriptor)
 
 

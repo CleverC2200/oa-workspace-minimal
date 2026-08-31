@@ -299,6 +299,25 @@ class TestReadAdaptersContract:
             with pytest.raises(RuntimeError, match="pending_queue_fetch_failed"):
                 client.pending_rows(page_size=3, max_pages=2)
 
+    def test_pending_rows_reports_stable_execution_login_failure(self) -> None:
+        client = api.OaApi(
+            "recorded-token",
+            "recorded-user",
+            base_url="https://oa.invalid",
+        )
+        payload = {
+            "code": "-1",
+            "msg": "登录失败，用户名或密码错误",
+            "status": False,
+        }
+
+        with patch.object(client, "_post_readonly", return_value=payload):
+            with pytest.raises(
+                RuntimeError,
+                match="oa_execution_identity_login_failed",
+            ):
+                client.pending_rows(page_size=3, max_pages=2)
+
     def test_pdf_material_exposes_page_text_and_duplicate_hash_without_merging(
         self,
     ) -> None:
