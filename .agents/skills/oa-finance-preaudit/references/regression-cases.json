@@ -322,6 +322,49 @@
             "expected_output": "生成降级审核包，将受影响项目标为 uncertain，形成财务可读的 ⚠️ 意见并以 needs_human 正常闭合；不把业务不确定升级为技术失败",
             "failure_mode": "混淆业务判断不确定与执行安全边界",
             "rule_ref": "error-handling.md#停止规则;flow-engine-contract.md#结构化审核决定"
+        },
+        {
+            "id": "RC-023-packaging-storage-carton-four-item-warning",
+            "scope": "packaging-layout-approval",
+            "audit_item": "page-classification;output-template",
+            "status": "confirmed",
+            "input_facts": [
+                "全部原图均为储运外箱版面",
+                "页面只承载品名、规格、储存条件、运输或堆码信息及生产日期填写位",
+                "页面不承载配料、过敏原、营养成分表、生产经销单位名称或地址等固定项内容"
+            ],
+            "incorrect_output": "把每张储运外箱建立为包装版本，并因四项不适用而统一输出人工判断",
+            "expected_output": "AI审核结论：非包装版面，跳过审核。",
+            "failure_mode": "把仅含储运信息的外箱误当作消费者标签版面，继而把不适用项目误报为材料缺失",
+            "rule_ref": "flows/packaging-layout-approval.md#逐页视觉分流与版本关系;result-contract.md#统一格式"
+        },
+        {
+            "id": "RC-024-packaging-retail-layout-missing-items-skipped",
+            "scope": "packaging-layout-approval",
+            "audit_item": "page-classification;missing-content",
+            "status": "confirmed",
+            "input_facts": [
+                "原图明确为零售或消费者包装版面",
+                "固定四项存在缺项"
+            ],
+            "incorrect_output": "因固定四项缺失而把零售包装归为非包装版面并跳过审核",
+            "expected_output": "保持 packaging_layout 分类，按实际缺项形成固定四项意见",
+            "failure_mode": "把包装内容缺失误当作不适用，导致真实包装漏审",
+            "rule_ref": "flows/packaging-layout-approval.md#逐页视觉分流与版本关系"
+        },
+        {
+            "id": "RC-025-packaging-carton-fixed-item-content-skipped",
+            "scope": "packaging-layout-approval",
+            "audit_item": "page-classification;fixed-item-coverage",
+            "status": "confirmed",
+            "input_facts": [
+                "原图为运输外箱版面",
+                "页面承载配料、过敏原、营养成分表、生产经销单位名称或地址中的至少一项"
+            ],
+            "incorrect_output": "仅因版面是运输外箱而归为非包装版面并跳过审核",
+            "expected_output": "使用 packaging_layout 分类并进入固定四项审核",
+            "failure_mode": "忽略外箱已承载的消费者标签固定项内容",
+            "rule_ref": "flows/packaging-layout-approval.md#逐页视觉分流与版本关系"
         }
   ]
 }

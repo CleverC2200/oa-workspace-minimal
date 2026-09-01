@@ -36,6 +36,7 @@
 | F-022 | 通用费用/支付公司一致 | 固定审核项由四项增为五项；新增“支付公司一致”，逐字比较报销公司、支付公司和购买方，三者一致时明确应选择对应公司支付 | 已采纳 | `flows/general-expense.md` 第 5 项；`result-contract.md` 统一格式 |
 | F-023 | 包装版面/混合图片分流 | 包装图和非包装图经常混合上传；只要存在包装版面就必须审核全部包装页，只有全部图片均明确不是包装版面时才整单跳过，并且跳过意见只保留约定的一句 | 已采纳 | `flows/packaging-layout-approval.md` 逐页视觉分流；`audit-chinese-image-text/SKILL.md` OA 包装版面流程；`output-contract.md` 全部非包装版面 |
 | F-024 | 五类财务/停止边界 | OA 登录、会话或执行身份失效允许技术阻断且不生成财务意见；登录与身份可信时，标准模糊、证据关系不明或无法准确判断必须使用 `⚠️/needs_human` 继续交财务审核，不得阻断整轮 | 已采纳 | `error-handling.md` 停止规则；`flow-engine-contract.md` 两动作循环与降级审核包；FlowEngine 聚焦回归 |
+| F-025 | 包装版面/储运外箱分流 | 仅含品名、规格、储存条件、运输/堆码信息或生产日期填写位，且不承载固定四项内容的储运外箱不进入四项审核；整单均为此类页面时只输出约定的一句跳过。零售包装缺项不能据此跳过 | 已采纳 | `flows/packaging-layout-approval.md` 逐页视觉分流；`audit-chinese-image-text/SKILL.md` OA 包装版面流程；`result-contract.md` 统一格式 |
 
 ## 新反馈记录规则
 

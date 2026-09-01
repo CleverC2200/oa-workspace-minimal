@@ -159,10 +159,40 @@ def test_packaging_rule_keeps_text_scope_and_finite_escalation() -> None:
     flow_contract = FLOW_RULE_PACKS["packaging_layout_approval"].read_text(
         encoding="utf-8"
     )
+    result_contract = RESULT_CONTRACT.read_text(encoding="utf-8")
+    regression_cases = {
+        case["id"]: case
+        for case in json.loads(REGRESSION_CASES.read_text(encoding="utf-8"))["cases"]
+    }
     assert "关键文字范围" in packaging_skill
     assert "最多增加一次独立复核" in packaging_skill
     assert "最多执行一次定向重切" in packaging_skill
     assert "不得无限重切或无限等待" in flow_contract
     assert "只有全部页面均明确为 `non_packaging`" in packaging_skill
+    assert "仅含品名、规格、储存条件、运输/堆码信息或生产日期填写位" in packaging_skill
+    assert "不得仅因零售包装缺少固定四项" in packaging_skill
+    assert "不承载固定四项内容的储运外箱版面使用 `non_packaging`" in flow_contract
+    assert "生产/经销单位名称或地址等固定项内容" in flow_contract
     assert "只要存在一页 `packaging_layout`" in flow_contract
     assert "不得跨版本拼接证据" in flow_contract
+    assert "全部图片的视觉分类均为 `non_packaging`" in result_contract
+    assert {
+        "RC-023-packaging-storage-carton-four-item-warning",
+        "RC-024-packaging-retail-layout-missing-items-skipped",
+        "RC-025-packaging-carton-fixed-item-content-skipped",
+    }.issubset(regression_cases)
+    assert (
+        "页面不承载配料、过敏原、营养成分表、生产经销单位名称或地址等固定项内容"
+        in regression_cases["RC-023-packaging-storage-carton-four-item-warning"][
+            "input_facts"
+        ]
+    )
+    assert "固定四项存在缺项" in regression_cases[
+        "RC-024-packaging-retail-layout-missing-items-skipped"
+    ]["input_facts"]
+    assert any(
+        "至少一项" in fact
+        for fact in regression_cases[
+            "RC-025-packaging-carton-fixed-item-content-skipped"
+        ]["input_facts"]
+    )
