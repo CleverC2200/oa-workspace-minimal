@@ -132,7 +132,18 @@ def test_confirmed_feedback_and_regressions_stay_sanitized() -> None:
                 "该支付事实只计一次",
             ),
         ),
-        ("small_marketing_fee", ("SAP 客户编码匹配", "金额孰低核销")),
+        (
+            "small_marketing_fee",
+            (
+                "SAP 客户编码匹配",
+                "金额孰低核销",
+                "支付截图",
+                "发票",
+                "报销公司、支付公司、购买方",
+                "small_marketing_fee:1",
+                "small_marketing_fee:2",
+            ),
+        ),
         (
             "general_expense",
             (

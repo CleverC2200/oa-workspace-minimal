@@ -76,13 +76,14 @@ _FLOW_SPECS = {
         ),
     },
     "small_marketing_fee": {
-        "rule_version": "small_marketing_fee:1",
+        "rule_version": "small_marketing_fee:2",
         "item_keys": (
             "budget_account",
             "attachment_completeness",
             "cost_bearer",
             "sap_customer_code_match",
             "reimbursable_minimum",
+            "payment_company_consistency",
         ),
         "item_names": (
             "预算科目",
@@ -90,6 +91,7 @@ _FLOW_SPECS = {
             "费用承担主体",
             "SAP 客户编码匹配",
             "金额孰低核销",
+            "支付公司一致",
         ),
     },
     "general_expense": {
@@ -127,6 +129,11 @@ _FLOW_SPECS = {
 }
 _LEGACY_PACKAGING_RULE_VERSION = "packaging_layout_approval:1"
 _PACKAGING_RULE_VERSION = "packaging_layout_approval:2"
+_LEGACY_SMALL_MARKETING_RULE_VERSION = "small_marketing_fee:1"
+_SMALL_MARKETING_RULE_VERSION = "small_marketing_fee:2"
+_EXPLICIT_RULE_VERSION_WORKFLOWS = frozenset(
+    {"packaging_layout_approval", "small_marketing_fee"}
+)
 _PACKAGING_SKIP_REMARK = "AI审核结论：非包装版面，跳过审核。"
 _PACKAGING_PAGE_CLASSIFICATIONS = frozenset(
     {"packaging_layout", "non_packaging", "uncertain"}
@@ -137,9 +144,10 @@ _FINANCE_WORKFLOW_KEYS = frozenset(WORKFLOW_KEYS) - {"packaging_layout_approval"
 _GENERAL_EXPENSE_BUDGET_CONCLUSION = (
     "当前阶段按既定策略暂不校验部门年度预算。"
 )
-_GENERAL_EXPENSE_COMPANY_PASS = re.compile(
+_PAYMENT_COMPANY_PASS = re.compile(
     r"^报销公司、支付公司、购买方三者一致，应选择.+支付。$"
 )
+_SMALL_MARKETING_SPECIAL_SUBJECT = "配送费-自提/租车费"
 _GENERAL_EXPENSE_DEFERRED_AMOUNT = re.compile(
     r"均为收到货后自动付款.*[0-9]+(?:\.[0-9]+)?元"
 )
@@ -233,7 +241,7 @@ def _validate_general_expense_conclusions(items: list[dict]) -> None:
     ):
         raise ValueError("review_decision_invalid")
     company = by_key.get("payment_company_consistency", {})
-    if company.get("status") == "pass" and not _GENERAL_EXPENSE_COMPANY_PASS.fullmatch(
+    if company.get("status") == "pass" and not _PAYMENT_COMPANY_PASS.fullmatch(
         str(company.get("conclusion") or "").strip()
     ):
         raise ValueError("review_decision_invalid")
@@ -247,6 +255,45 @@ def _validate_general_expense_conclusions(items: list[dict]) -> None:
             or not _GENERAL_EXPENSE_DEFERRED_AMOUNT.search(attachment_conclusion)
         )
     ):
+        raise ValueError("review_decision_invalid")
+
+
+def _small_marketing_budget_subjects(material: dict) -> tuple[str, ...]:
+    declared = material.get("declared_fields")
+    if isinstance(declared, dict):
+        value = str(declared.get("budget_account") or "").strip()
+        return (value,) if value else ()
+    if not isinstance(declared, list):
+        return ()
+    values = []
+    for field in declared:
+        if (
+            isinstance(field, dict)
+            and str(field.get("name") or "").strip() == "预算科目"
+            and str(field.get("value") or "").strip()
+        ):
+            values.append(str(field["value"]).strip())
+    return tuple(values)
+
+
+def _validate_small_marketing_conclusions(
+    items: list[dict],
+    material: dict,
+) -> None:
+    by_key = {str(item.get("item_key") or ""): item for item in items}
+    company = by_key.get("payment_company_consistency", {})
+    if company.get("status") == "pass" and not _PAYMENT_COMPANY_PASS.fullmatch(
+        str(company.get("conclusion") or "").strip()
+    ):
+        raise ValueError("review_decision_invalid")
+    subjects = _small_marketing_budget_subjects(material)
+    if not subjects or all(
+        subject == _SMALL_MARKETING_SPECIAL_SUBJECT for subject in subjects
+    ):
+        return
+    attachment = by_key.get("attachment_completeness", {})
+    conclusion = str(attachment.get("conclusion") or "")
+    if "支付截图" not in conclusion or "发票" not in conclusion:
         raise ValueError("review_decision_invalid")
 
 
@@ -954,6 +1001,8 @@ def _validate_frozen_review_inputs(
     accepted_packets = [expected_packet]
     if workflow_key == "packaging_layout_approval":
         accepted_packets = _accepted_packaging_packets(expected_packet, state)
+    elif workflow_key == "small_marketing_fee":
+        accepted_packets = _accepted_small_marketing_packets(expected_packet, state)
     if packet not in accepted_packets:
         raise ValueError("frozen_packet_changed")
 
@@ -1014,6 +1063,40 @@ def _accepted_packaging_packets(
         return [_legacy_packaging_packet(expected_packet)]
     if frozen_version == _PACKAGING_RULE_VERSION and (
         action is None or action.get("rule_version") == _PACKAGING_RULE_VERSION
+    ):
+        return [expected_packet]
+    raise ValueError("frozen_packet_changed")
+
+
+def _legacy_small_marketing_packet(packet: dict) -> dict:
+    legacy = dict(packet)
+    legacy["rule_version"] = _LEGACY_SMALL_MARKETING_RULE_VERSION
+    legacy["items"] = [
+        item
+        for item in packet["items"]
+        if item.get("item_key") != "payment_company_consistency"
+    ]
+    legacy["required_uncertain_items"] = [
+        item_key
+        for item_key in packet["required_uncertain_items"]
+        if item_key != "payment_company_consistency"
+    ]
+    return legacy
+
+
+def _accepted_small_marketing_packets(
+    expected_packet: dict,
+    state: dict,
+    *,
+    action: dict | None = None,
+) -> list[dict]:
+    frozen_version = state.get("rule_version")
+    if frozen_version is None:
+        if action is not None and action.get("rule_version") is not None:
+            raise ValueError("frozen_packet_changed")
+        return [_legacy_small_marketing_packet(expected_packet)]
+    if frozen_version == _SMALL_MARKETING_RULE_VERSION and (
+        action is None or action.get("rule_version") == _SMALL_MARKETING_RULE_VERSION
     ):
         return [expected_packet]
     raise ValueError("frozen_packet_changed")
@@ -2111,7 +2194,7 @@ class FlowEngine:
             "events_file": str(action_path.with_name("observability.json")),
         }
         if (
-            workflow_key == "packaging_layout_approval"
+            workflow_key in _EXPLICIT_RULE_VERSION_WORKFLOWS
             and state.get("rule_version") is not None
         ):
             required_action["rule_version"] = state["rule_version"]
@@ -2156,6 +2239,12 @@ class FlowEngine:
             )
         elif workflow_key == "packaging_layout_approval":
             accepted_packets = _accepted_packaging_packets(
+                expected_packet,
+                state,
+                action=action,
+            )
+        elif workflow_key == "small_marketing_fee":
+            accepted_packets = _accepted_small_marketing_packets(
                 expected_packet,
                 state,
                 action=action,
@@ -2354,7 +2443,7 @@ class FlowEngine:
                 attempt=claim["attempt"],
                 **(
                     {"rule_version": spec["rule_version"]}
-                    if workflow_key == "packaging_layout_approval"
+                    if workflow_key in _EXPLICIT_RULE_VERSION_WORKFLOWS
                     else {}
                 ),
                 **recovery_metadata,
@@ -2369,7 +2458,7 @@ class FlowEngine:
                 "evidence_fingerprint": evidence_fingerprint,
                 **(
                     {"rule_version": spec["rule_version"]}
-                    if workflow_key == "packaging_layout_approval"
+                    if workflow_key in _EXPLICIT_RULE_VERSION_WORKFLOWS
                     else {}
                 ),
                 **(
@@ -3287,6 +3376,14 @@ class FlowEngine:
             Path(state["material_file"]),
             code="frozen_material_changed",
         )
+        if (
+            action["workflow_key"] == "small_marketing_fee"
+            and packet.get("rule_version") == _SMALL_MARKETING_RULE_VERSION
+        ):
+            _validate_small_marketing_conclusions(
+                normalized_items,
+                quality_material,
+            )
         covered_page_refs = {
             value
             for item in normalized_items

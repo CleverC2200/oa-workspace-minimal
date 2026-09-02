@@ -365,6 +365,34 @@
             "expected_output": "使用 packaging_layout 分类并进入固定四项审核",
             "failure_mode": "忽略外箱已承载的消费者标签固定项内容",
             "rule_ref": "flows/packaging-layout-approval.md#逐页视觉分流与版本关系"
+        },
+        {
+            "id": "RC-026-small-marketing-nonspecial-subject-attachment-fallback",
+            "scope": "small-marketing-fee",
+            "audit_item": "1-预算科目;2-附件完整性",
+            "status": "confirmed",
+            "input_facts": [
+                "预算科目不等于配送费-自提/租车费",
+                "当前明细能够稳定识别支付截图和发票"
+            ],
+            "incorrect_output": "仅核对配送费-自提/租车费科目的附件，其他科目不判断附件要求",
+            "expected_output": "其他预算科目按支付截图加发票核验；两类齐全才通过，缺少任一类时明确指出",
+            "failure_mode": "小额市场费没有为非特殊科目提供附件要求",
+            "rule_ref": "flows/small-marketing-fee.md#第-12-项预算科目与附件完整性"
+        },
+        {
+            "id": "RC-027-small-marketing-payment-company-check-omitted",
+            "scope": "small-marketing-fee",
+            "audit_item": "6-支付公司一致",
+            "status": "confirmed",
+            "input_facts": [
+                "表单能够读取报销公司和支付公司",
+                "关联发票能够读取购买方"
+            ],
+            "incorrect_output": "小额市场费只输出原五项，未核对支付主体",
+            "expected_output": "增加支付公司一致项；逐字比较报销公司、支付公司和购买方，一致时明确应选择对应公司支付",
+            "failure_mode": "遗漏小额市场费的付款主体一致性检查",
+            "rule_ref": "flows/small-marketing-fee.md#第-6-项支付公司一致"
         }
   ]
 }
