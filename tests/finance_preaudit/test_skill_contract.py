@@ -148,6 +148,8 @@ def test_confirmed_feedback_and_regressions_stay_sanitized() -> None:
             "general_expense",
             (
                 "实付 0 元",
+                "“先乘车后付款”不等于“先用后付”",
+                "当前状态明确为“支付成功”",
                 "发票+支付截图",
                 "当前阶段按既定策略暂不校验部门年度预算",
                 "报销公司、支付公司、购买方",
@@ -161,6 +163,19 @@ def test_high_impact_finance_rules_remain_explicit(
 ) -> None:
     contract = FLOW_RULE_PACKS[workflow_key].read_text(encoding="utf-8")
     assert all(marker in contract for marker in markers)
+
+
+def test_general_expense_paid_ride_receipt_regression_is_confirmed() -> None:
+    regression_cases = {
+        case["id"]: case
+        for case in json.loads(REGRESSION_CASES.read_text(encoding="utf-8"))["cases"]
+    }
+    case = regression_cases["RC-028-paid-ride-receipt-treated-as-deferred"]
+
+    assert case["scope"] == "general-expense"
+    assert "同一页面当前状态明确显示支付成功" in case["input_facts"]
+    assert "实际扣款金额" in case["expected_output"]
+    assert "实付0元" in case["incorrect_output"]
 
 
 def test_packaging_rule_keeps_text_scope_and_finite_escalation() -> None:
