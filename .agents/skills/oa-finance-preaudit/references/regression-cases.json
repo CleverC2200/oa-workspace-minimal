@@ -393,6 +393,21 @@
             "expected_output": "增加支付公司一致项；逐字比较报销公司、支付公司和购买方，一致时明确应选择对应公司支付",
             "failure_mode": "遗漏小额市场费的付款主体一致性检查",
             "rule_ref": "flows/small-marketing-fee.md#第-6-项支付公司一致"
+        },
+        {
+            "id": "RC-028-paid-ride-receipt-treated-as-deferred",
+            "scope": "general-expense",
+            "audit_item": "1-附件完整性/支付证据;4-金额孰低核销",
+            "status": "confirmed",
+            "input_facts": [
+                "出行支付凭证的商品或服务名称包含先乘车后付款",
+                "同一页面当前状态明确显示支付成功",
+                "同一页面显示实际扣款金额且不显示实付0元或未来自动付款承诺"
+            ],
+            "incorrect_output": "把先乘车后付款误认成先用后付，改写为实付0元和收到货后自动付款，并从可验证实付中扣除该金额",
+            "expected_output": "按页面显示的支付成功状态和实际扣款金额认定已支付，并将该金额计入金额孰低核销",
+            "failure_mode": "只按后付款字样做语义联想，忽略同页明确的支付终态和扣款金额",
+            "rule_ref": "flows/general-expense.md#第-1-项附件完整性支付证据;flows/general-expense.md#第-4-项金额孰低核销"
         }
   ]
 }

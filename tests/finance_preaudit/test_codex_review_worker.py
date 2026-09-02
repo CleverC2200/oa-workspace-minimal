@@ -116,6 +116,8 @@ def test_general_expense_worker_uses_bound_rule_pack(tmp_path: Path) -> None:
     assert "通用费用报销生产预审" in prompt
     assert "general-expense.md" in prompt
     assert "实付0元，均为收到货后自动付款" in prompt
+    assert "“先乘车后付款”不等于“先用后付”" in prompt
+    assert "当前状态明确为支付成功" in prompt
     assert "三者一致，应选择当前实际公司全称支付" in prompt
     assert "page_routing" not in prompt
 
