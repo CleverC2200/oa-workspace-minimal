@@ -55,7 +55,8 @@ ITEM_LOCAL_MATERIAL_FAILURE_DETAILS = frozenset(
 )
 _MANAGED_PATH = re.compile(
     r"^(?:(?:\.archive/)?(?:travel_expense|business_entertainment|"
-    r"business_support_fee|small_marketing_fee|packaging_layout_approval)/"
+    r"business_support_fee|small_marketing_fee|general_expense|"
+    r"packaging_layout_approval)/"
     r"cases/[0-9a-f]{64}/attempt-[1-9][0-9]*|"
     r"\.metrics/daily/[0-9]{4}-[0-9]{2}-[0-9]{2}\.json)$"
 )
