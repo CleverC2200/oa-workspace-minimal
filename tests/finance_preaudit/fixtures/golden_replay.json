@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "suite_version": "1.2.0",
+  "suite_version": "1.3.0",
   "flows": {
     "travel_expense": ["报销周期", "出差与住宿天数", "公共交通", "住宿与考勤", "跨区域带车", "油补", "个人垫付车票", "发票购买方"],
     "business_entertainment": ["附件完整性/支付证据", "发票关联", "预算", "金额孰低核销"],
     "business_support_fee": ["附件完整性", "业务事项合规性", "预算校验", "金额孰低核销"],
-    "small_marketing_fee": ["预算科目", "附件完整性", "费用承担主体", "SAP 客户编码匹配", "金额孰低核销"],
+    "small_marketing_fee": ["预算科目", "附件完整性", "费用承担主体", "SAP 客户编码匹配", "金额孰低核销", "支付公司一致"],
     "general_expense": ["附件完整性/支付证据", "发票关联", "预算", "金额孰低核销", "支付公司一致"],
     "packaging_layout_approval": ["配料信息", "过敏原信息", "营养成分表信息", "地址信息"]
   },
@@ -28,10 +28,10 @@
     {"case_id":"support-collection-gap-v1","workflow_key":"business_support_fee","scenario":"evidence_insufficient","source":{"kind":"contract_case","reference":"degraded-material","version":"1.1.0"},"expected":{"outcome":"evidence_insufficient","statuses":["⚠️","⚠️","⚠️","⚠️"],"stop_code":null},"baseline":{"duration_ms":650,"tokens":900}},
     {"case_id":"support-technical-v1","workflow_key":"business_support_fee","scenario":"technical_failure","source":{"kind":"contract_case","reference":"frozen-attempt-integrity","version":"1.1.0"},"expected":{"outcome":"technical_failure","statuses":[],"stop_code":"frozen_material_changed"},"baseline":{"duration_ms":240,"tokens":160}},
 
-    {"case_id":"marketing-normal-v1","workflow_key":"small_marketing_fee","scenario":"normal","source":{"kind":"synthetic_baseline","reference":"flow-rule-pack","version":"1.0.0"},"expected":{"outcome":"evidence_insufficient","statuses":["✅","✅","✅","⚠️","✅"],"stop_code":null},"baseline":{"duration_ms":900,"tokens":1200}},
-    {"case_id":"marketing-warning-v1","workflow_key":"small_marketing_fee","scenario":"business_warning","source":{"kind":"contract_case","reference":"small-marketing-rule-pack","version":"1.0.0"},"expected":{"outcome":"business_warning","statuses":["✅","✅","❌","⚠️","✅"],"stop_code":null},"baseline":{"duration_ms":1000,"tokens":1300}},
-    {"case_id":"marketing-insufficient-v1","workflow_key":"small_marketing_fee","scenario":"evidence_insufficient","source":{"kind":"confirmed_feedback","reference":"F-003","version":"1.0.0"},"expected":{"outcome":"evidence_insufficient","statuses":["✅","⚠️","⚠️","⚠️","✅"],"stop_code":null},"baseline":{"duration_ms":1100,"tokens":1400}},
-    {"case_id":"marketing-collection-gap-v1","workflow_key":"small_marketing_fee","scenario":"evidence_insufficient","source":{"kind":"contract_case","reference":"degraded-material","version":"1.1.0"},"expected":{"outcome":"evidence_insufficient","statuses":["⚠️","⚠️","⚠️","⚠️","⚠️"],"stop_code":null},"baseline":{"duration_ms":700,"tokens":1000}},
+    {"case_id":"marketing-normal-v2","workflow_key":"small_marketing_fee","scenario":"normal","source":{"kind":"synthetic_baseline","reference":"flow-rule-pack","version":"2.0.0"},"expected":{"outcome":"evidence_insufficient","statuses":["✅","✅","✅","⚠️","✅","✅"],"stop_code":null},"baseline":{"duration_ms":900,"tokens":1200}},
+    {"case_id":"marketing-warning-v2","workflow_key":"small_marketing_fee","scenario":"business_warning","source":{"kind":"confirmed_feedback","reference":"F-026","version":"2.0.0"},"expected":{"outcome":"business_warning","statuses":["✅","❌","✅","⚠️","✅","❌"],"stop_code":null},"baseline":{"duration_ms":1000,"tokens":1300}},
+    {"case_id":"marketing-insufficient-v2","workflow_key":"small_marketing_fee","scenario":"evidence_insufficient","source":{"kind":"contract_case","reference":"small-marketing-rule-pack","version":"2.0.0"},"expected":{"outcome":"evidence_insufficient","statuses":["✅","⚠️","⚠️","⚠️","✅","⚠️"],"stop_code":null},"baseline":{"duration_ms":1100,"tokens":1400}},
+    {"case_id":"marketing-collection-gap-v2","workflow_key":"small_marketing_fee","scenario":"evidence_insufficient","source":{"kind":"contract_case","reference":"degraded-material","version":"2.0.0"},"expected":{"outcome":"evidence_insufficient","statuses":["⚠️","⚠️","⚠️","⚠️","⚠️","⚠️"],"stop_code":null},"baseline":{"duration_ms":700,"tokens":1000}},
     {"case_id":"marketing-technical-v1","workflow_key":"small_marketing_fee","scenario":"technical_failure","source":{"kind":"contract_case","reference":"frozen-attempt-integrity","version":"1.1.0"},"expected":{"outcome":"technical_failure","statuses":[],"stop_code":"frozen_material_changed"},"baseline":{"duration_ms":280,"tokens":200}},
 
     {"case_id":"general-normal-v1","workflow_key":"general_expense","scenario":"normal","source":{"kind":"synthetic_baseline","reference":"flow-rule-pack","version":"1.0.0"},"expected":{"outcome":"pass","statuses":["✅","✅","✅","✅","✅"],"stop_code":null},"baseline":{"duration_ms":950,"tokens":1350}},

@@ -34,7 +34,7 @@ _FINANCE_RULES = {
         "references/flows/business-support-fee.md",
     ),
     "small_marketing_fee": (
-        "small_marketing_fee:1",
+        "small_marketing_fee:2",
         "小额市场费",
         "references/flows/small-marketing-fee.md",
     ),
@@ -95,6 +95,15 @@ _GENERAL_EXPENSE_REQUIREMENT = (
     "必须逐字使用“报销公司、支付公司、购买方三者一致，应选择当前"
     "实际公司全称支付。”的句式并替换公司全称；先用后付页面必须写明"
     "“实付0元，均为收到货后自动付款”及全部可读待付款金额；"
+)
+_SMALL_MARKETING_V1_REQUIREMENT = (
+    "冻结审核包为 V1，只按包内原五项形成决定，不得增加支付公司一致项；"
+)
+_SMALL_MARKETING_V2_REQUIREMENT = (
+    "六项必须逐项按小额市场费规则包形成结论；预算科目不是"
+    "“配送费-自提/租车费”时，附件完整性结论必须明确核对支付截图和"
+    "发票；支付公司一致通过时必须逐字使用“报销公司、支付公司、购买方"
+    "三者一致，应选择当前实际公司全称支付。”的句式并替换公司全称；"
 )
 
 
@@ -199,18 +208,24 @@ def _frozen_rule_version(action_file: Path, workflow_key: str) -> str | None:
 def _prompt(action_file: Path) -> str:
     workflow_key = _action_workflow(action_file) or "travel_expense"
     _rule_version, workflow_name, rule_reference = _FINANCE_RULES[workflow_key]
+    frozen_rule_version = _frozen_rule_version(action_file, workflow_key)
     fallback_routing = (
         _page_routing_instruction(action_file)
         if workflow_key == "travel_expense"
         else ""
     )
-    workflow_requirement = (
-        _TRAVEL_PAGE_ROUTING_REQUIREMENT
-        if workflow_key == "travel_expense"
-        else _GENERAL_EXPENSE_REQUIREMENT
-        if workflow_key == "general_expense"
-        else "只按该流程固定审核项判断，不得读取其他流程规则或证据；"
-    )
+    if workflow_key == "travel_expense":
+        workflow_requirement = _TRAVEL_PAGE_ROUTING_REQUIREMENT
+    elif workflow_key == "general_expense":
+        workflow_requirement = _GENERAL_EXPENSE_REQUIREMENT
+    elif workflow_key == "small_marketing_fee":
+        workflow_requirement = (
+            _SMALL_MARKETING_V2_REQUIREMENT
+            if frozen_rule_version == "small_marketing_fee:2"
+            else _SMALL_MARKETING_V1_REQUIREMENT
+        )
+    else:
+        workflow_requirement = "只按该流程固定审核项判断，不得读取其他流程规则或证据；"
     return f"""你是{workflow_name}生产预审的单据工作进程。用户当前明确授权本轮真实审批提交；这是受控生产工作进程，不是手工 preview。
 
 只处理这个已冻结动作：{action_file}
