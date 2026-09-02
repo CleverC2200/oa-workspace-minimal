@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from apps import json_artifact
 from apps.oa_finance_preaudit import cli, flow_engine, flow_evals
 
@@ -14,6 +16,7 @@ ITEM_KEYS = (
     "cost_bearer",
     "sap_customer_code_match",
     "reimbursable_minimum",
+    "payment_company_consistency",
 )
 ITEM_NAMES = (
     "预算科目",
@@ -21,8 +24,16 @@ ITEM_NAMES = (
     "费用承担主体",
     "SAP 客户编码匹配",
     "金额孰低核销",
+    "支付公司一致",
 )
-FACT_KEYS = ("budget_account", "attachment", "cost_bearer", None, "amount")
+FACT_KEYS = (
+    "budget_account",
+    "attachment",
+    "cost_bearer",
+    None,
+    "amount",
+    "payment_company",
+)
 FIXTURE_ROOT = Path(__file__).parent / "fixtures"
 REPLAY = json.loads(
     (FIXTURE_ROOT / "small_marketing_reviewer_replay.json").read_text(
@@ -31,14 +42,14 @@ REPLAY = json.loads(
 )
 
 
-def _material(request_id: str, workflow_key: str, facts: dict) -> dict:
+def _material(request_id: str, workflow_key: str, facts: dict | list) -> dict:
     return {
         "schema_version": 1,
         "kind": "preaudit_material",
         "request_id": request_id,
         "workflow_key": workflow_key,
         "workflow_name": "小额市场费报销流程",
-        "declared_fields": dict(facts),
+        "declared_fields": facts.copy(),
         "resources": [],
         "prepared": {"images": [], "structured_contents": [], "manifest": []},
         "authority_facts": [],
@@ -62,7 +73,7 @@ def _engine(
     root: Path,
     *,
     material_workflow: str = WORKFLOW_KEY,
-    facts: dict | None = None,
+    facts: dict | list | None = None,
     calls: list[dict] | None = None,
 ) -> flow_engine.FlowEngine:
     current_facts = facts if facts is not None else {
@@ -102,27 +113,52 @@ def _engine(
 
 
 def _reviewed_items(statuses: list[str]) -> list[dict]:
-    return [
-        {
-            "status": status,
-            "conclusion": (
-                "SAP 主数据接口未接入，无法核验。"
-                if fact_key is None
-                else "当前审核项已按脱敏冻结事实判断。"
-            ),
-            "evidence_refs": (
-                []
-                if status == "uncertain"
-                else [f"material:declared_fields.{fact_key}"]
-            ),
-            "missing_evidence": (
-                ["SAP 主数据"]
-                if fact_key is None
-                else ["当前审核项证据不足"] if status == "uncertain" else []
-            ),
-        }
-        for fact_key, status in zip(FACT_KEYS, statuses, strict=True)
-    ]
+    reviewed = []
+    for item_key, fact_key, status in zip(
+        ITEM_KEYS,
+        FACT_KEYS,
+        statuses,
+        strict=True,
+    ):
+        if item_key == "sap_customer_code_match":
+            conclusion = "SAP 主数据接口未接入，无法核验。"
+        elif item_key == "attachment_completeness":
+            conclusion = (
+                "支付截图和发票均完整。"
+                if status == "pass"
+                else "支付截图或发票不完整。"
+                if status == "fail"
+                else "支付截图和发票的完整性证据不足。"
+            )
+        elif item_key == "payment_company_consistency":
+            conclusion = (
+                "报销公司、支付公司、购买方三者一致，应选择示例有限公司支付。"
+                if status == "pass"
+                else "报销公司、支付公司与购买方不一致。"
+                if status == "fail"
+                else "报销公司、支付公司或购买方证据不足。"
+            )
+        else:
+            conclusion = "当前审核项已按脱敏冻结事实判断。"
+        reviewed.append(
+            {
+                "status": status,
+                "conclusion": conclusion,
+                "evidence_refs": (
+                    []
+                    if status == "uncertain"
+                    else [f"material:declared_fields.{fact_key}"]
+                ),
+                "missing_evidence": (
+                    ["SAP 主数据"]
+                    if fact_key is None
+                    else ["当前审核项证据不足"]
+                    if status == "uncertain"
+                    else []
+                ),
+            }
+        )
+    return reviewed
 
 
 def _decision(action: dict, reviewed_items: list[dict]) -> dict:
@@ -157,7 +193,9 @@ def test_marketing_preview_cli_and_items_are_isolated(tmp_path: Path, capsys) ->
     action = json.loads(capsys.readouterr().out)
     packet = json.loads(Path(action["review_packet_file"]).read_text(encoding="utf-8"))
     assert action["coordination_seconds"] == action["coordination_tokens"] == 0
-    assert packet["rule_version"] == "small_marketing_fee:1"
+    state = json.loads(Path(action["state_file"]).read_text(encoding="utf-8"))
+    assert action["rule_version"] == packet["rule_version"] == state["rule_version"]
+    assert packet["rule_version"] == "small_marketing_fee:2"
     assert tuple(item["item_key"] for item in packet["items"]) == ITEM_KEYS
     assert tuple(item["name"] for item in packet["items"]) == ITEM_NAMES
     assert "业务事项合规性" not in str(packet)
@@ -165,12 +203,146 @@ def test_marketing_preview_cli_and_items_are_isolated(tmp_path: Path, capsys) ->
     decision_file = tmp_path / "decision.json"
     json_artifact.write_json_atomic(
         decision_file,
-        _decision(action, _reviewed_items(["pass", "pass", "pass", "uncertain", "pass"])),
+        _decision(
+            action,
+            _reviewed_items(
+                ["pass", "pass", "pass", "uncertain", "pass", "pass"]
+            ),
+        ),
     )
     closed = engine.complete_review(Path(action["action_file"]), decision_file)
     assert (closed["business_state"], closed["write_state"]) == (
         "needs_human", "not_requested"
     )
+
+
+def test_marketing_legacy_v1_packet_can_finish_original_five_items(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path)
+    action = engine.next_action(WORKFLOW_KEY)
+    action_file = Path(action["action_file"])
+    state_file = Path(action["state_file"])
+    packet_file = Path(action["review_packet_file"])
+    legacy_action = json.loads(action_file.read_text(encoding="utf-8"))
+    legacy_state = json.loads(state_file.read_text(encoding="utf-8"))
+    legacy_packet = json.loads(packet_file.read_text(encoding="utf-8"))
+    legacy_action.pop("rule_version")
+    legacy_state.pop("rule_version")
+    legacy_packet["rule_version"] = "small_marketing_fee:1"
+    legacy_packet["items"] = legacy_packet["items"][:-1]
+    legacy_packet["required_uncertain_items"] = [
+        item_key
+        for item_key in legacy_packet["required_uncertain_items"]
+        if item_key != "payment_company_consistency"
+    ]
+    json_artifact.write_json_atomic(action_file, legacy_action)
+    json_artifact.write_json_atomic(state_file, legacy_state)
+    json_artifact.write_json_atomic(packet_file, legacy_packet)
+
+    decision_file = tmp_path / "legacy-v1.json"
+    json_artifact.write_json_atomic(
+        decision_file,
+        _decision(
+            legacy_action,
+            _reviewed_items(
+                ["pass", "pass", "pass", "uncertain", "pass", "pass"]
+            )[:-1],
+        ),
+    )
+
+    closed = engine.complete_review(action_file, decision_file)
+
+    assert closed["business_state"] == "needs_human"
+
+
+def test_marketing_v2_requires_payment_and_invoice_in_fallback_conclusion(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(
+        tmp_path,
+        facts={
+            "budget_account": "市场物料费",
+            "attachment": "complete",
+            "cost_bearer": "matched",
+            "amount": "within_limit",
+            "payment_company": "matched",
+        },
+    )
+    action = engine.next_action(WORKFLOW_KEY)
+    reviewed = _reviewed_items(
+        ["pass", "pass", "pass", "uncertain", "pass", "pass"]
+    )
+    reviewed[1]["conclusion"] = "附件完整。"
+    decision_file = tmp_path / "missing-fallback-terms.json"
+    json_artifact.write_json_atomic(decision_file, _decision(action, reviewed))
+
+    with pytest.raises(ValueError, match="review_decision_invalid"):
+        engine.complete_review(Path(action["action_file"]), decision_file)
+
+
+def test_marketing_real_field_rows_require_fallback_terms(tmp_path: Path) -> None:
+    engine = _engine(
+        tmp_path,
+        facts=[
+            {
+                "path": "detail[1].row[1].budget",
+                "name": "预算科目",
+                "code": "budget",
+                "value": "市场物料费",
+            }
+        ],
+    )
+    action = engine.next_action(WORKFLOW_KEY)
+    reviewed = _reviewed_items(
+        ["pass", "pass", "pass", "uncertain", "pass", "pass"]
+    )
+    reviewed[1]["conclusion"] = "附件完整。"
+    decision_file = tmp_path / "real-fields-missing-fallback-terms.json"
+    json_artifact.write_json_atomic(decision_file, _decision(action, reviewed))
+
+    with pytest.raises(ValueError, match="review_decision_invalid"):
+        engine.complete_review(Path(action["action_file"]), decision_file)
+
+
+def test_marketing_special_subject_keeps_existing_attachment_conclusion(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(
+        tmp_path,
+        facts={
+            "budget_account": "配送费-自提/租车费",
+            "attachment": "complete",
+            "cost_bearer": "matched",
+            "amount": "within_limit",
+            "payment_company": "matched",
+        },
+    )
+    action = engine.next_action(WORKFLOW_KEY)
+    reviewed = _reviewed_items(
+        ["pass", "pass", "pass", "uncertain", "pass", "pass"]
+    )
+    reviewed[1]["conclusion"] = "附件已按现有科目规则核对。"
+    decision_file = tmp_path / "special-subject.json"
+    json_artifact.write_json_atomic(decision_file, _decision(action, reviewed))
+
+    closed = engine.complete_review(Path(action["action_file"]), decision_file)
+
+    assert closed["business_state"] == "needs_human"
+
+
+def test_marketing_company_pass_requires_prescribed_conclusion(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    action = engine.next_action(WORKFLOW_KEY)
+    reviewed = _reviewed_items(
+        ["pass", "pass", "pass", "uncertain", "pass", "pass"]
+    )
+    reviewed[-1]["conclusion"] = "报销公司、支付公司与购买方一致。"
+    decision_file = tmp_path / "invalid-company-pass.json"
+    json_artifact.write_json_atomic(decision_file, _decision(action, reviewed))
+
+    with pytest.raises(ValueError, match="review_decision_invalid"):
+        engine.complete_review(Path(action["action_file"]), decision_file)
 
 
 def test_marketing_controlled_substitute_is_bound_and_idempotent(tmp_path: Path) -> None:
@@ -180,7 +352,12 @@ def test_marketing_controlled_substitute_is_bound_and_idempotent(tmp_path: Path)
     decision_file = tmp_path / "controlled.json"
     json_artifact.write_json_atomic(
         decision_file,
-        _decision(action, _reviewed_items(["pass", "pass", "pass", "uncertain", "pass"])),
+        _decision(
+            action,
+            _reviewed_items(
+                ["pass", "pass", "pass", "uncertain", "pass", "pass"]
+            ),
+        ),
     )
     closed = engine.complete_review(Path(action["action_file"]), decision_file)
     replayed = engine.complete_review(Path(action["action_file"]), decision_file)

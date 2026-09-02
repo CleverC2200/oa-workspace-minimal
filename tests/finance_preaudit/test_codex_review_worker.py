@@ -120,6 +120,51 @@ def test_general_expense_worker_uses_bound_rule_pack(tmp_path: Path) -> None:
     assert "page_routing" not in prompt
 
 
+def test_small_marketing_v2_worker_uses_six_item_requirements(
+    tmp_path: Path,
+) -> None:
+    _task_payload, action_file = _task(
+        tmp_path,
+        workflow_key="small_marketing_fee",
+    )
+    packet_file = action_file.with_name("review-packet.json")
+    packet = json.loads(packet_file.read_text(encoding="utf-8"))
+    json_artifact.write_json_atomic(
+        packet_file,
+        {**packet, "rule_version": "small_marketing_fee:2"},
+    )
+
+    schema = codex_review_worker._decision_schema(action_file)
+    prompt = codex_review_worker._prompt(action_file)
+
+    assert schema["properties"]["rule_version"] == {
+        "type": "string",
+        "const": "small_marketing_fee:2",
+    }
+    assert "小额市场费生产预审" in prompt
+    assert "small-marketing-fee.md" in prompt
+    assert "六项必须逐项" in prompt
+    assert "支付截图和发票" in prompt
+    assert "三者一致，应选择当前实际公司全称支付" in prompt
+    assert "不得增加支付公司一致项" not in prompt
+
+
+def test_small_marketing_v1_worker_keeps_original_five_items(
+    tmp_path: Path,
+) -> None:
+    _task_payload, action_file = _task(
+        tmp_path,
+        workflow_key="small_marketing_fee",
+    )
+
+    prompt = codex_review_worker._prompt(action_file)
+
+    assert "冻结审核包为 V1" in prompt
+    assert "只按包内原五项" in prompt
+    assert "不得增加支付公司一致项" in prompt
+    assert "六项必须逐项" not in prompt
+
+
 def test_schema_uses_frozen_packet_rule_version(tmp_path: Path) -> None:
     _task_payload, action_file = _task(
         tmp_path,

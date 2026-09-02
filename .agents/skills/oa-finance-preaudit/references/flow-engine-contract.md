@@ -92,6 +92,8 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
 
 V1 包装决定必须用 `material:prepared.images.<resource_id>.page-<number>` 在 `evidence_refs` 或 `missing_evidence` 中覆盖每一页；V2 改由 `visual_review.pages` 完成逐页分类覆盖，并把包装页声明的固定项逐项绑定到对应证据或缺口。脚本会先验证图片可读、manifest 页数与准备页一致，再验证视觉分类、版本四项矩阵和证据绑定；采集脚本不得生成图片观察、分类或校对结论。
 
+`small_marketing_fee:2` 在原五项末尾增加“支付公司一致”，并在 action、state 和审核包中显式冻结规则版本。发布前未带显式版本的 V1 冻结包只接受原五项决定；V2 只接受六项决定。两版兼容只用于完成各自已经冻结的审核包，不得删改版本字段把 V2 决定降级为 V1。
+
 将决定写入新的本地文件后执行：
 
 ```bash
