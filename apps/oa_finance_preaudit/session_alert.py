@@ -30,6 +30,7 @@ SESSION_ERROR_CODES = frozenset(
 STATE_NAME = "oa-session-alert.json"
 LOCK_NAME = "oa-session-alert.lock"
 SEND_TIMEOUT_SECONDS = 15
+MAX_ALERT_ATTEMPTS = 3
 
 
 def _timestamp(value: datetime | None = None) -> str:
@@ -151,6 +152,24 @@ def _public_receipt(error_code: str, delivery_state: str) -> dict[str, str | int
     }
 
 
+def _current_session_failure_code(error: Exception) -> str:
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while isinstance(current, Exception) and id(current) not in seen:
+        seen.add(id(current))
+        value = str(current).strip().partition(":")[0].strip()
+        if value in SESSION_ERROR_CODES:
+            return value
+        current = current.__cause__ or current.__context__
+    return ""
+
+
+def _live_status() -> dict:
+    from .runtime_doctor import status
+
+    return status()
+
+
 def alert_once(
     error_code: str,
     *,
@@ -165,24 +184,42 @@ def alert_once(
     with _locked(control_root) as root:
         state_path = root / STATE_NAME
         existing = _read_state(state_path)
-        if existing.get("status") == "active" and existing.get(
+        active = existing.get("status") == "active" and existing.get(
             "delivery_state"
-        ) in {"started", "sent", "unknown"}:
+        ) in {"started", "sent", "unknown"}
+        attempt_count = 0
+        first_seen = occurred
+        if active:
             state = str(existing["delivery_state"])
-            return _public_receipt(
-                code,
-                "deduplicated" if state == "sent" else state,
-            )
+            raw_attempt_count = existing.get("attempt_count", 1)
+            if (
+                not isinstance(raw_attempt_count, int)
+                or isinstance(raw_attempt_count, bool)
+                or not 1 <= raw_attempt_count <= MAX_ALERT_ATTEMPTS
+            ):
+                raise RuntimeError("session_alert_state_invalid")
+            attempt_count = raw_attempt_count
+            first_seen = str(existing.get("first_seen_at") or "").strip()
+            if not first_seen:
+                raise RuntimeError("session_alert_state_invalid")
+            if state != "sent" or attempt_count >= MAX_ALERT_ATTEMPTS:
+                return _public_receipt(
+                    code,
+                    "deduplicated" if state == "sent" else state,
+                )
+
+        attempt_count += 1
 
         key = "oa-alert-" + hashlib.sha256(
-            f"{code}|{occurred}".encode()
+            f"{code}|{first_seen}|{attempt_count}".encode()
         ).hexdigest()[:24]
         base = {
             "schema_version": 1,
             "kind": "oa_session_alert_state",
             "status": "active",
             "error_code": code,
-            "first_seen_at": occurred,
+            "first_seen_at": first_seen,
+            "attempt_count": attempt_count,
             "idempotency_key": key,
             "delivery_state": "started",
         }
@@ -224,10 +261,21 @@ def alert_from_environment(
     error_code: str,
     *,
     control_root: Path = Path("runtime/control"),
+    live_status_provider: Callable[[], dict] | None = None,
 ) -> dict[str, str | int]:
     code = str(error_code or "").strip()
     if code not in SESSION_ERROR_CODES:
         raise ValueError("session_alert_error_code_invalid")
+    try:
+        (live_status_provider or _live_status)()
+    except Exception as error:
+        current_code = _current_session_failure_code(error)
+        if not current_code:
+            return _public_receipt(code, "not_required")
+        code = current_code
+    else:
+        clear_active_alert(control_root=control_root)
+        return _public_receipt(code, "not_required")
     try:
         auth.load_local_env()
         chat_id = str(os.environ.get("OA_FEISHU_ALERT_CHAT_ID") or "").strip()
