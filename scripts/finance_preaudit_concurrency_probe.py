@@ -35,6 +35,7 @@ from apps.oa_finance_preaudit import (
     production_pending,
     reconciliation,
     runtime_maintenance,
+    session_alert,
 )
 from apps.oa_finance_preaudit import runtime_doctor
 
@@ -74,6 +75,26 @@ ROLLING_WORKFLOW_KEYS = frozenset(
     }
 )
 _OA_TIMEZONE = ZoneInfo("Asia/Shanghai")
+_SESSION_ALERT_PRIORITY = (
+    "oa_execution_identity_login_failed",
+    "oa_session_expired",
+    "rpa_cdp_timeout",
+    "rpa_cdp_unavailable",
+    "rpa_session_invalid",
+    "rpa_session_missing",
+)
+
+
+def _session_error_code(error: Exception) -> str:
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while isinstance(current, Exception) and id(current) not in seen:
+        seen.add(id(current))
+        code = flow_engine.session_blocking_failure_code(current)
+        if code:
+            return code
+        current = current.__cause__ or current.__context__
+    return ""
 
 
 def _received_at_utc(value: str) -> datetime:
@@ -4514,7 +4535,30 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.recover_action_file
                 )
             payload = run_rolling_drain(**rolling_args)
-    except ValueError as error:
+            counts = payload.get("error_counts")
+            session_code = next(
+                (
+                    code
+                    for code in _SESSION_ALERT_PRIORITY
+                    if isinstance(counts, dict)
+                    and isinstance(counts.get(code), int)
+                    and not isinstance(counts.get(code), bool)
+                    and counts[code] > 0
+                ),
+                "",
+            )
+            if session_code:
+                payload["notification"] = session_alert.alert_from_environment(
+                    session_code
+                )
+            else:
+                reset = session_alert.clear_active_alert()
+                if reset and reset.get("status") == "unknown":
+                    payload["notification_reset"] = reset
+    except (RuntimeError, ValueError) as error:
+        session_code = (
+            "" if args.read_only else _session_error_code(error)
+        )
         payload = {
             "schema_version": 1,
             "kind": (
@@ -4522,8 +4566,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.read_only
                 else "preaudit_production_concurrency_probe_failed"
             ),
-            "error_code": str(error),
+            "error_code": session_code or str(error),
         }
+        if session_code:
+            payload["notification"] = session_alert.alert_from_environment(
+                session_code
+            )
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return 1
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))

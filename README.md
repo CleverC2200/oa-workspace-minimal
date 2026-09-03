@@ -49,6 +49,8 @@ chmod 600 ~/.config/oa-workspace-minimal/oa-auth.env
 
 只在工作树外的 `~/.config/oa-workspace-minimal/oa-auth.env` 填写真实 OA 配置；可用进程环境变量 `OA_AUTH_ENV_FILE` 指向另一个绝对位置。运行时优先使用进程环境和稳定配置文件，仓库内被忽略的 `.env`、`.env.oa-auth` 仅作兼容回退。所有配置文件必须是普通文件且禁止组或其他用户访问，否则安全失败。OA 执行人标识只允许通过本地 `OA_UID` 提供，流程 JSON 明确拒绝内嵌账号。数据库连接没有仓库内默认账号或地址；如需从 macOS Keychain 读取密码，需同时配置 `OA_DB_USER` 和 `OA_DB_KEYCHAIN_SERVICE`。完整的数据与凭据边界见[安全说明](SECURITY.md)。
 
+可选的 OA 网页会话告警使用飞书机器人发送。目标会话只配置在上述工作树外的私有环境文件中，通过 `OA_FEISHU_ALERT_CHAT_ID` 指定，仓库不保存真实会话 ID；`OA_FEISHU_ALERT_PROFILE` 默认使用 `default`。机器人必须已加入目标会话并具有发送消息权限。
+
 ## 只读 preview
 
 五类财务流程和包装版面校对已经提供同一个本地深模块两动作接口。先取得指定流程的下一个动作：
@@ -163,11 +165,27 @@ python3 -m apps.oa_finance_preaudit.cli status \
   --root /absolute/path/to/finance_preaudit_flows
 ```
 
-需要同时核验稳定凭据、OA 认证、执行身份绑定和实时待办映射时，在同一命令增加 `--check-live`。它只返回配置来源、健康状态和按流程聚合的数量，不输出配置值、账号、单号或附件内容，也不领取、冻结或提交单据：
+需要同时核验稳定凭据、OA API 认证、RPA 专用浏览器当前可见登录状态、服务端网页会话、执行身份绑定和实时待办映射时，在同一命令增加 `--check-live`。浏览器探针检查当前 OA 页面，并调用同源、只读、需要登录的菜单接口确认服务端会话；它不刷新页面、不调用 OA heartbeat，也不输出 Cookie、页面正文或地址，只返回脱敏健康状态。页面、CDP、网络或服务端结果无法确认时均硬停止。命令不领取、冻结或提交单据：
 
 ```bash
 python3 -m apps.oa_finance_preaudit.cli status --check-live
 ```
+
+状态入口本身保持只读，不发送消息。外部定时任务在 `--check-live` 返回会话类稳定错误码时，调用独立告警入口；生产滚动入口直接遇到同类错误时也调用该入口。同一故障窗口即使错误码变化也只尝试发送一次，单次发送最多等待 15 秒，发送结果不确定时不自动重试。真实发送必须显式确认：
+
+```bash
+python3 -m apps.oa_finance_preaudit.session_alert \
+  --error-code oa_session_expired \
+  --confirm-send YES
+```
+
+人工重新登录且下一次 `--check-live` 成功后，外部定时任务仅清除告警去重状态，为下一次独立故障重新布防：
+
+```bash
+python3 -m apps.oa_finance_preaudit.session_alert --clear
+```
+
+飞书发送失败或结果不确定只影响告警回执，不得覆盖原始 OA 会话错误、放宽停止门禁或触发审批重试。入口不会自动登录、处理验证码，也不会恢复历史 `needs_admin` 或未知写入。
 
 启动或恢复前可在同一只读命令增加 `--reconcile`。它将本地最新 attempt 与实时待办、已办对账，区分 `handled_not_pending`、`pending_not_handled`、双边冲突、身份冲突和不可见，只生成脱敏建议，不领取或重提：
 

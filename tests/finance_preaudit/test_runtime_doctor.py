@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from apps.oa_finance_preaudit import runtime_doctor
 
 
@@ -42,6 +44,11 @@ def test_live_status_reports_only_sanitized_health_and_counts() -> None:
         configs_loader=lambda: [TRAVEL_CONFIG],
         api_factory=lambda _config: Client(),
         identity_provider=lambda: "recorded-user",
+        web_session_provider=lambda: {
+            "status": "ok",
+            "authentication": "ok",
+            "source": "rpa_page",
+        },
     )
 
     assert result == {
@@ -61,6 +68,11 @@ def test_live_status_reports_only_sanitized_health_and_counts() -> None:
             "supported": 1,
             "unsupported": 1,
             "by_workflow": {"travel_expense": 1},
+        },
+        "web_session": {
+            "status": "ok",
+            "authentication": "ok",
+            "source": "rpa_page",
         },
         "write_state": "not_requested",
     }
@@ -92,6 +104,11 @@ def test_live_status_degrades_when_pending_identity_does_not_match() -> None:
         configs_loader=lambda: [TRAVEL_CONFIG],
         api_factory=lambda _config: Client(),
         identity_provider=lambda: "recorded-user",
+        web_session_provider=lambda: {
+            "status": "ok",
+            "authentication": "ok",
+            "source": "rpa_page",
+        },
     )
 
     assert result["status"] == "degraded"
@@ -129,7 +146,34 @@ def test_live_status_degrades_when_any_pending_identity_is_missing() -> None:
         configs_loader=lambda: [TRAVEL_CONFIG],
         api_factory=lambda _config: Client(),
         identity_provider=lambda: "recorded-user",
+        web_session_provider=lambda: {
+            "status": "ok",
+            "authentication": "ok",
+            "source": "rpa_page",
+        },
     )
 
     assert result["status"] == "degraded"
     assert result["oa"]["execution_identity"] == "mismatch"
+
+
+def test_live_status_stops_before_queue_read_when_web_session_expired() -> None:
+    class Client:
+        def pending_rows(self, **_kwargs) -> list[dict]:
+            raise AssertionError("queue must not be read after web session expiry")
+
+    with pytest.raises(RuntimeError, match="^oa_session_expired$"):
+        runtime_doctor.status(
+            configuration_status=lambda: {
+                "status": "ok",
+                "configured": 4,
+                "required": 4,
+                "source": "stable",
+            },
+            configs_loader=lambda: [TRAVEL_CONFIG],
+            api_factory=lambda _config: Client(),
+            identity_provider=lambda: "recorded-user",
+            web_session_provider=lambda: (_ for _ in ()).throw(
+                RuntimeError("oa_session_expired")
+            ),
+        )

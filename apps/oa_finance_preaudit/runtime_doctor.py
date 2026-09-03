@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Callable
 
-from apps.oa_approval import api, auth, flow
+from apps.oa_approval import api, attachments, auth, flow
 
 from . import production_pending
 
@@ -14,10 +14,22 @@ def status(
     configs_loader: Callable[[], list[dict]] | None = None,
     api_factory: Callable[[dict], object] | None = None,
     identity_provider: Callable[[], str] | None = None,
+    web_session_provider: Callable[[], dict] | None = None,
 ) -> dict:
     credential_check = (configuration_status or auth.configuration_status)()
     if credential_check.get("status") != "ok":
         raise RuntimeError("runtime_live_configuration_missing")
+
+    web_session = (
+        web_session_provider or attachments.rpa_web_session_status
+    )()
+    if (
+        not isinstance(web_session, dict)
+        or web_session.get("status") != "ok"
+        or web_session.get("authentication") != "ok"
+        or web_session.get("source") != "rpa_page"
+    ):
+        raise RuntimeError("rpa_session_invalid")
 
     configs = (configs_loader or flow.load_all_configs)()
     client = (api_factory or api.build_api)(configs[0])
@@ -58,5 +70,6 @@ def status(
             "unsupported": unsupported,
             "by_workflow": dict(sorted(by_workflow.items())),
         },
+        "web_session": web_session,
         "write_state": "not_requested",
     }
