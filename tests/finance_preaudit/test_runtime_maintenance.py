@@ -749,6 +749,39 @@ def test_status_cli_reports_stable_execution_login_failure(tmp_path: Path) -> No
     assert stderr.getvalue().strip() == "oa_execution_identity_login_failed"
 
 
+@pytest.mark.parametrize(
+    "error_code",
+    (
+        "oa_session_expired",
+        "rpa_cdp_timeout",
+        "rpa_cdp_unavailable",
+        "rpa_session_invalid",
+        "rpa_session_missing",
+    ),
+)
+def test_status_cli_preserves_web_session_failure_codes(
+    tmp_path: Path,
+    error_code: str,
+) -> None:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        exit_code = cli.main(
+            ["status", "--root", str(tmp_path), "--check-live"],
+            runtime_status=lambda _root: {
+                "schema_version": 1,
+                "kind": "preaudit_runtime_status",
+            },
+            live_status=lambda: (_ for _ in ()).throw(
+                RuntimeError(error_code)
+            ),
+        )
+
+    assert exit_code == 1
+    assert json.loads(stdout.getvalue())["failure"]["code"] == error_code
+    assert stderr.getvalue().strip() == error_code
+
+
 def test_status_counts_only_the_latest_attempt_per_case(tmp_path: Path) -> None:
     root = tmp_path / "runtime"
     _attempt(

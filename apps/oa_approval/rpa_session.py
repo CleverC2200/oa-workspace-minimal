@@ -21,6 +21,7 @@ FATAL_SESSION_CODES = {
     RPA_SESSION_INVALID_CODE,
 }
 CDP_HELPER = Path(__file__).with_name("rpa_cdp_session.js")
+PAGE_PROBE_HELPER = Path(__file__).with_name("rpa_cdp_page_probe.js")
 
 
 class RpaSessionError(RuntimeError):
@@ -124,6 +125,59 @@ def capture_storage_state(
     if not any(_domain_matches(required_host, str(item.get("domain") or "")) for item in cookies):
         raise RpaSessionError(RPA_SESSION_MISSING_CODE, "RPA Chrome 未发现 OA 登录 Cookie")
     return {"cookies": cookies, "origins": []}
+
+
+def probe_page_session(
+    endpoint: str,
+    *,
+    required_host: str,
+    timeout_sec: int | float = 5,
+) -> Dict[str, str]:
+    cdp_endpoint = _validate_endpoint(endpoint)
+    host = str(required_host or "").strip().lower()
+    node = shutil.which(os.environ.get("OA_NODE_BIN", "node"))
+    if not host or not node or not PAGE_PROBE_HELPER.is_file():
+        raise RpaSessionError(RPA_CDP_UNAVAILABLE_CODE, "RPA 页面探针不可用")
+    timeout = max(1.0, float(timeout_sec))
+    try:
+        proc = subprocess.run(
+            [
+                node,
+                str(PAGE_PROBE_HELPER),
+                cdp_endpoint,
+                str(int(timeout * 1000)),
+                host,
+            ],
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            capture_output=True,
+            timeout=timeout + 2,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as err:
+        raise RpaSessionError(RPA_CDP_TIMEOUT_CODE, "RPA 页面探针超时") from err
+    except Exception as err:
+        raise RpaSessionError(RPA_CDP_UNAVAILABLE_CODE, "RPA 页面探针不可连接") from err
+
+    try:
+        payload = json.loads(proc.stdout or "{}")
+    except Exception as err:
+        raise RpaSessionError(RPA_SESSION_INVALID_CODE, "RPA 页面探针返回无效结果") from err
+    if proc.returncode != 0 or not isinstance(payload, dict) or payload.get("ok") is not True:
+        code = str(payload.get("code") or RPA_CDP_UNAVAILABLE_CODE)
+        if code not in FATAL_SESSION_CODES:
+            code = RPA_CDP_UNAVAILABLE_CODE
+        raise RpaSessionError(code, "RPA 页面探针失败")
+    status = str(payload.get("status") or "")
+    if status == "unknown":
+        raise RpaSessionError(
+            RPA_SESSION_INVALID_CODE,
+            "RPA 页面服务端会话状态无法确认",
+        )
+    if status not in {"authenticated", "expired"}:
+        raise RpaSessionError(RPA_SESSION_INVALID_CODE, "RPA 页面探针返回无效状态")
+    return {"status": status}
 
 
 def list_tab_urls(endpoint: str, *, timeout_sec: int | float = 2) -> List[str]:

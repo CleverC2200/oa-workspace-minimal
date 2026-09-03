@@ -3809,6 +3809,144 @@ def test_production_cli_defaults_to_rolling_and_rejects_legacy_drain(
     assert len(calls) == 3
 
 
+def test_production_cli_alerts_on_session_failure_without_masking_it(
+    monkeypatch,
+    capsys,
+) -> None:
+    alerts: list[str] = []
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "run_rolling_drain",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("oa_session_expired: redacted")
+        ),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.session_alert,
+        "alert_from_environment",
+        lambda code: alerts.append(code)
+        or {
+            "schema_version": 1,
+            "kind": "oa_session_alert_receipt",
+            "error_code": code,
+            "delivery_state": "unknown",
+        },
+    )
+
+    assert finance_preaudit_concurrency_probe.main(
+        ["--capacity", "6", "--confirm-write", "YES"]
+    ) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error_code"] == "oa_session_expired"
+    assert payload["notification"]["delivery_state"] == "unknown"
+    assert alerts == ["oa_session_expired"]
+
+
+def test_production_cli_alerts_on_pipeline_session_failure_without_clearing(
+    monkeypatch,
+    capsys,
+) -> None:
+    alerts: list[str] = []
+    clears: list[bool] = []
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "run_rolling_drain",
+        lambda **_kwargs: {
+            "status": "failed",
+            "error_counts": {"oa_session_expired": 1},
+        },
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.session_alert,
+        "alert_from_environment",
+        lambda code: alerts.append(code)
+        or {
+            "schema_version": 1,
+            "kind": "oa_session_alert_receipt",
+            "error_code": code,
+            "delivery_state": "sent",
+        },
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.session_alert,
+        "clear_active_alert",
+        lambda: clears.append(True),
+    )
+
+    assert finance_preaudit_concurrency_probe.main(
+        ["--capacity", "6", "--confirm-write", "YES"]
+    ) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error_counts"] == {"oa_session_expired": 1}
+    assert payload["notification"]["delivery_state"] == "sent"
+    assert alerts == ["oa_session_expired"]
+    assert clears == []
+
+
+def test_production_cli_finds_session_failure_in_exception_chain(
+    monkeypatch,
+    capsys,
+) -> None:
+    alerts: list[str] = []
+
+    def fail(**_kwargs) -> dict:
+        try:
+            raise RuntimeError("rpa_cdp_timeout")
+        except RuntimeError as cause:
+            raise ValueError("production_cycle_stop_recovery_blocked") from cause
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "run_rolling_drain",
+        fail,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.session_alert,
+        "alert_from_environment",
+        lambda code: alerts.append(code)
+        or {
+            "schema_version": 1,
+            "kind": "oa_session_alert_receipt",
+            "error_code": code,
+            "delivery_state": "sent",
+        },
+    )
+
+    assert finance_preaudit_concurrency_probe.main(
+        ["--capacity", "6", "--confirm-write", "YES"]
+    ) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error_code"] == "rpa_cdp_timeout"
+    assert alerts == ["rpa_cdp_timeout"]
+
+
+def test_production_cli_does_not_mask_success_when_alert_reset_is_unknown(
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "run_rolling_drain",
+        lambda **_kwargs: {"status": "completed"},
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.session_alert,
+        "clear_active_alert",
+        lambda: {
+            "schema_version": 1,
+            "kind": "oa_session_alert_receipt",
+            "status": "unknown",
+        },
+    )
+
+    assert finance_preaudit_concurrency_probe.main(
+        ["--capacity", "6", "--confirm-write", "YES"]
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "completed"
+    assert payload["notification_reset"]["status"] == "unknown"
+
+
 def test_supported_pending_can_be_narrowed_to_one_workflow() -> None:
     live = {
         "credentials": {"status": "ok"},

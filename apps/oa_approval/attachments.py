@@ -588,6 +588,33 @@ def rpa_storage_state_error_message() -> str:
     return f"{_RPA_STORAGE_STATE_ERROR.code}: {_RPA_STORAGE_STATE_ERROR}"
 
 
+def rpa_web_session_status(*, timeout_sec: int = 5) -> Dict[str, str]:
+    state = rpa_storage_state(timeout_sec=timeout_sec)
+    if not state:
+        code = (
+            _RPA_STORAGE_STATE_ERROR.code
+            if _RPA_STORAGE_STATE_ERROR is not None
+            else rpa_session.RPA_SESSION_MISSING_CODE
+        )
+        raise RuntimeError(code)
+    host = urllib.parse.urlparse(OA_HOST).hostname or ""
+    try:
+        page = rpa_session.probe_page_session(
+            _cdp_endpoint(),
+            required_host=host,
+            timeout_sec=timeout_sec,
+        )
+    except rpa_session.RpaSessionError as error:
+        raise RuntimeError(error.code) from error
+    if page["status"] == "expired":
+        raise RuntimeError(OA_SESSION_EXPIRED_CODE)
+    return {
+        "status": "ok",
+        "authentication": "ok",
+        "source": "rpa_page",
+    }
+
+
 def _unique_download_path(filename: str) -> Path:
     DOWNLOADS.mkdir(parents=True, exist_ok=True)
     name = safe_filename(filename, "download.bin")
