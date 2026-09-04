@@ -472,7 +472,7 @@ def test_status_keeps_each_missing_phase_unknown(tmp_path: Path) -> None:
     }
 
 
-def test_status_only_counts_allowlisted_material_failures_as_local_quarantine(
+def test_status_classifies_allowlisted_item_local_quarantines(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "runtime"
