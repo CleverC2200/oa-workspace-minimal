@@ -19,6 +19,7 @@ _FINGERPRINT = re.compile(r"^sha256:[0-9a-f]{64}$")
 _RUN_ID = re.compile(r"^[0-9a-f]{32}$")
 _STATES = {"running", "completed", "failed"}
 _HEALTH = {"healthy", "degraded", "unknown"}
+_RECOVERY_MIN_AGE_SECONDS = 30
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONTROLLER_INSTANCE_ID = secrets.token_hex(16)
 
@@ -188,6 +189,54 @@ def assert_ready_for_start() -> None:
         or manifest["controller_instance_id"] == CONTROLLER_INSTANCE_ID
     ):
         raise ValueError("controller_handoff_untrusted")
+
+
+def _process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def recover_confirmed_children_reaped(*, confirmed: bool) -> dict:
+    """Repair one stale terminal handoff after an operator verified reaping."""
+    manifest = _read_manifest()
+    revision, dirty = _code_state()
+    now = datetime.now(timezone.utc)
+    try:
+        completed_at = datetime.fromisoformat(
+            str(manifest["completed_at"] if manifest else "")
+        )
+    except ValueError as error:
+        raise ValueError("controller_handoff_recovery_blocked") from error
+    if (
+        confirmed is not True
+        or manifest is None
+        or runtime_control.stop_reason() != "controller_cycle_stop"
+        or manifest["state"] != "failed"
+        or manifest["children_reaped"] is not False
+        or manifest["controller_instance_id"] == CONTROLLER_INSTANCE_ID
+        or completed_at.tzinfo is None
+        or (now - completed_at).total_seconds() < _RECOVERY_MIN_AGE_SECONDS
+        or _process_alive(manifest["controller_pid"])
+        or runtime_control.controller_active()
+        or runtime_control.writer_active()
+        or runtime_control.active_request_writers() != 0
+        or revision == "unknown"
+        or dirty is not False
+    ):
+        raise ValueError("controller_handoff_recovery_blocked")
+    recovered = {**manifest, "children_reaped": True}
+    _write_manifest(recovered)
+    return {
+        "status": "recovered",
+        "manifest_state": recovered["state"],
+        "children_reaped": True,
+        "health": recovered["health"],
+    }
 
 
 def _write_manifest(manifest: Mapping[str, object]) -> None:

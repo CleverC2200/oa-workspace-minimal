@@ -52,6 +52,14 @@ PipelineRunner = Callable[[int, int], process_pool.PoolResult[dict]]
 ReviewWorker = Callable[[dict], dict]
 ReviewCompleter = Callable[[Path, dict], dict]
 ExecutorFactory = Callable[[int], object]
+
+
+class ControllerChildrenActiveError(ValueError):
+    def __init__(self, primary_error_code: str | None = None) -> None:
+        super().__init__("production_controller_children_active")
+        self.primary_error_code = primary_error_code
+
+
 QUARANTINED_REASONS = {
     "material_collection_failed",
     *writer_outcomes.CONFIRMED_NO_WRITE_CODES,
@@ -1880,7 +1888,24 @@ def _terminate_executor(
             process.kill()
         process.join(timeout=1)
     executor.shutdown(wait=False, cancel_futures=True)
-    return all(not process.is_alive() for process in processes)
+    return _processes_reaped(processes, timeout_seconds=5)
+
+
+def _processes_reaped(
+    processes: Sequence[object],
+    *,
+    timeout_seconds: float,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        alive = [process for process in processes if process.is_alive()]
+        if not alive:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        for process in alive:
+            process.join(timeout=min(0.1, remaining))
 
 
 def _run_dispatched_tasks(
@@ -1999,6 +2024,7 @@ def _run_dispatched_tasks(
     started = 0
     peak_active = 0
     halted = False
+    primary_error_code: str | None = None
     force_terminated = False
     runtime_samples: list[dict] = []
     max_task_elapsed_seconds = 0.0
@@ -2017,7 +2043,6 @@ def _run_dispatched_tasks(
     prepare_executor = _preparation_executor()
     prepare_executor_terminated = False
     executor = executor_factory(maximum_capacity)
-    reaping_succeeded = True
     writer_executor = ThreadPoolExecutor(
         max_workers=1,
         thread_name_prefix="oa-global-writer",
@@ -2028,12 +2053,10 @@ def _run_dispatched_tasks(
         *,
         owned_process_groups: bool = False,
     ) -> None:
-        nonlocal reaping_succeeded
-        reaped = _terminate_executor(
+        _terminate_executor(
             target,
             owned_process_groups=owned_process_groups,
         )
-        reaping_succeeded = reaping_succeeded and reaped
 
     def stopped_review(
         index: int,
@@ -2117,8 +2140,10 @@ def _run_dispatched_tasks(
             stopped_review(index, prepare_elapsed, reviewed)
         write_ready.clear()
 
-    def request_pipeline_stop() -> None:
-        nonlocal halted
+    def request_pipeline_stop(error_code: str | None = None) -> None:
+        nonlocal halted, primary_error_code
+        if primary_error_code is None and error_code:
+            primary_error_code = error_code
         halted = True
         runtime_control.request_cycle_stop()
         stop_reviews()
@@ -2217,7 +2242,7 @@ def _run_dispatched_tasks(
         adaptive_window_hosts.clear()
         adaptive_window_target = current_review_capacity * 2
         if decision["action"] == "stop":
-            request_pipeline_stop()
+            request_pipeline_stop(str(decision["reason"]))
 
     def apply_immediate_host_pressure(host: dict) -> None:
         nonlocal adaptive_healthy_windows
@@ -2421,7 +2446,7 @@ def _run_dispatched_tasks(
                     )
                     review_histories.pop(index, None)
                     if value.get("status") != "completed":
-                        request_pipeline_stop()
+                        request_pipeline_stop(value.get("error_code"))
                     else:
                         if strict_global_fifo:
                             pending_write_indices.remove(index)
@@ -2501,12 +2526,11 @@ def _run_dispatched_tasks(
                     )
                     prepare_executor_terminated = True
                     preparation = None
-                halted = True
-                runtime_control.request_cycle_stop()
-                stop_write_queue()
-                if not force_terminated:
-                    terminate_executor(executor)
-                    force_terminated = True
+                request_pipeline_stop(
+                    "production_probe_prepare_timeout"
+                    if prepare_timed_out
+                    else "worker_task_timeout"
+                )
                 continue
 
             if now >= next_heartbeat:
@@ -2544,7 +2568,7 @@ def _run_dispatched_tasks(
                     adaptive_window_hosts.append(host)
                 next_heartbeat = now + heartbeat_interval_sec
                 if host.get("status") == "critical" and not halted:
-                    request_pipeline_stop()
+                    request_pipeline_stop("host_critical")
 
             if (
                 halted
@@ -2695,7 +2719,12 @@ def _run_dispatched_tasks(
                             "token_usage": {"status": "unknown"},
                         },
                     )
-                    request_pipeline_stop()
+                    request_pipeline_stop(
+                        str(
+                            prepared.get("error_code")
+                            or "production_probe_prepare_failed"
+                        )
+                    )
                     if not prepare_executor_terminated:
                         terminate_executor(
                             prepare_executor,
@@ -2727,7 +2756,9 @@ def _run_dispatched_tasks(
                                         "token_usage": {"status": "unknown"},
                                     },
                                 )
-                                request_pipeline_stop()
+                                request_pipeline_stop(
+                                    "production_probe_duplicate_action"
+                                )
                     elif halted or runtime_control.stop_requested():
                         stopped_review(index, prepare_elapsed, None)
                         halted = True
@@ -2766,7 +2797,9 @@ def _run_dispatched_tasks(
                                         "token_usage": {"status": "unknown"},
                                     },
                                 )
-                                request_pipeline_stop()
+                                request_pipeline_stop(
+                                    "production_probe_prepare_failed"
+                                )
                                 continue
                         assigned.add(action_file)
                         advance_write_head()
@@ -2780,6 +2813,7 @@ def _run_dispatched_tasks(
             done = {future for future in futures if future.done()}
             reviewed_now: list[tuple[int, float, Path, dict]] = []
             failed_now = False
+            first_review_error_code: str | None = None
             for future in sorted(done, key=lambda item: futures[item][0]):
                 index, prepare_elapsed, _started_at, action_file = futures.pop(
                     future
@@ -2794,6 +2828,8 @@ def _run_dispatched_tasks(
                         error_code="worker_process_failed",
                     )
                     failed_now = True
+                    if first_review_error_code is None:
+                        first_review_error_code = "worker_process_failed"
                     continue
                 if value.get("status") != "reviewed":
                     outcomes[index] = process_pool.TaskOutcome(
@@ -2805,6 +2841,10 @@ def _run_dispatched_tasks(
                         },
                     )
                     failed_now = True
+                    if first_review_error_code is None:
+                        first_review_error_code = str(
+                            value.get("error_code") or "worker_process_failed"
+                        )
                     continue
                 reviewed_now.append(
                     (index, prepare_elapsed, action_file, value)
@@ -2812,7 +2852,7 @@ def _run_dispatched_tasks(
             if failed_now:
                 for index, prepare_elapsed, _action, reviewed in reviewed_now:
                     stopped_review(index, prepare_elapsed, reviewed)
-                request_pipeline_stop()
+                request_pipeline_stop(first_review_error_code)
             elif halted:
                 for index, prepare_elapsed, _action, reviewed in reviewed_now:
                     stopped_review(index, prepare_elapsed, reviewed)
@@ -2881,7 +2921,7 @@ def _run_dispatched_tasks(
                             "prepare_elapsed_seconds": prepare_elapsed,
                         },
                     )
-                    request_pipeline_stop()
+                    request_pipeline_stop("observability_write_failed")
                     continue
                 if strict_global_fifo:
                     order_key = assigned_order_keys[index]
@@ -2901,7 +2941,7 @@ def _run_dispatched_tasks(
                                 "prepare_elapsed_seconds": prepare_elapsed,
                             },
                         )
-                        request_pipeline_stop()
+                        request_pipeline_stop("production_probe_fifo_mismatch")
                         continue
                     committed_order_key = order_key
                 writer = (
@@ -2971,7 +3011,7 @@ def _run_dispatched_tasks(
                             },
                         )
                         next_index += 1
-                        request_pipeline_stop()
+                        request_pipeline_stop("production_probe_prepare_failed")
                         break
                     preparation = (
                         prepare_executor.submit(
@@ -3001,7 +3041,7 @@ def _run_dispatched_tasks(
                         },
                     )
                     next_index += 1
-                    request_pipeline_stop()
+                    request_pipeline_stop("production_probe_renew_failed")
                     break
                 action_file = available[0]
                 assigned.add(action_file)
@@ -3060,8 +3100,9 @@ def _run_dispatched_tasks(
         if not force_terminated:
             executor.shutdown(wait=True)
         writer_executor.shutdown(wait=True)
-    processes_reaped = reaping_succeeded and all(
-        not process.is_alive() for process in known_processes
+    processes_reaped = _processes_reaped(
+        known_processes,
+        timeout_seconds=5,
     )
 
     for index, outcome in enumerate(outcomes):
@@ -3102,6 +3143,7 @@ def _run_dispatched_tasks(
         runtime_samples=tuple(runtime_samples),
         max_task_elapsed_seconds=round(max_task_elapsed_seconds, 3),
         processes_reaped=processes_reaped,
+        primary_error_code=primary_error_code,
         recommended_capacity=current_review_capacity,
         capacity_decisions=tuple(capacity_decisions),
         discovery_refreshes=(next_index if strict_global_fifo else 0),
@@ -3591,6 +3633,7 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
     writer_seconds: list[float] = []
     write_wait_samples: list[dict] = []
     queue_depths: list[int] = []
+    primary_error_code = result.primary_error_code
     for outcome in result.outcomes:
         value = outcome.value if isinstance(outcome.value, dict) else {}
         worker_values.append(value)
@@ -3616,6 +3659,12 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
         error_code = value.get("error_code") or outcome.error_code
         if isinstance(error_code, str):
             error_counts[error_code] += 1
+            if (
+                primary_error_code is None
+                and error_code
+                not in {"stop_requested", "worker_cancelled_after_timeout"}
+            ):
+                primary_error_code = error_code
         process_attempts += int(value.get("process_attempts") or 0)
         process_retries += int(value.get("process_retries") or 0)
         prepare_active_seconds += float(value.get("prepare_elapsed_seconds") or 0)
@@ -3773,6 +3822,7 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
         },
         "business_results": dict(sorted(business_results.items())),
         "error_counts": dict(sorted(error_counts.items())),
+        "primary_error_code": primary_error_code,
         "codex_events": codex_events,
         "transient_error_events": transient_error_events,
         "pipeline": pipeline,
@@ -3813,6 +3863,7 @@ def run_rolling_drain(
     max_waves: int = 10,
     recovery_action_files: Sequence[Path] = (),
     allowed_workflows: frozenset[str] = ROLLING_WORKFLOW_KEYS,
+    confirm_stale_children_reaped: bool = False,
 ) -> dict:
     recovery_queue = tuple(
         Path(path).expanduser().resolve() for path in recovery_action_files
@@ -3833,6 +3884,7 @@ def run_rolling_drain(
         live_status=live_status,
         reconcile_status=scoped_reconcile_status,
         allowed_workflows=allowed_workflows,
+        confirm_stale_children_reaped=confirm_stale_children_reaped,
     )
     controller_handoff.assert_ready_for_start()
     try:
@@ -3917,7 +3969,9 @@ def run_rolling_drain(
                 if result["processes_reaped"] is not True:
                     children_reaped = False
                     runtime_control.request_cycle_stop()
-                    raise ValueError("production_controller_children_active")
+                    raise ControllerChildrenActiveError(
+                        result.get("primary_error_code")
+                    )
             except Exception:
                 controller_handoff.finish(
                     manifest,
@@ -3958,15 +4012,22 @@ def _recover_stale_cycle_stop(
     live_status: LiveStatus,
     reconcile_status: Callable[[], dict],
     allowed_workflows: frozenset[str],
+    confirm_stale_children_reaped: bool = False,
 ) -> bool:
     if not runtime_control.stop_requested():
+        if confirm_stale_children_reaped:
+            raise ValueError("production_cycle_stop_recovery_not_required")
         return False
     if runtime_control.stop_reason() != "controller_cycle_stop":
         raise ValueError("production_probe_stopped")
     handoff = controller_handoff.status()
     if (
-        handoff.get("ready_for_start") is not True
-        or handoff.get("controller_active") is not False
+        confirm_stale_children_reaped
+        and handoff.get("ready_for_start") is True
+    ):
+        raise ValueError("production_cycle_stop_recovery_not_required")
+    if (
+        handoff.get("controller_active") is not False
         or handoff.get("writer_active") is not False
         or handoff.get("active_request_writers") != 0
     ):
@@ -3991,6 +4052,18 @@ def _recover_stale_cycle_stop(
         if str(error) == "production_cycle_stop_recovery_blocked":
             raise
         raise ValueError("production_cycle_stop_recovery_blocked") from error
+    if handoff.get("ready_for_start") is not True:
+        if confirm_stale_children_reaped is not True:
+            raise ValueError("production_cycle_stop_recovery_blocked")
+        try:
+            controller_handoff.recover_confirmed_children_reaped(
+                confirmed=True
+            )
+        except ValueError as error:
+            raise ValueError("production_cycle_stop_recovery_blocked") from error
+        handoff = controller_handoff.status()
+        if handoff.get("ready_for_start") is not True:
+            raise ValueError("production_cycle_stop_recovery_blocked")
     try:
         cleared = runtime_control.clear_cycle_stop()
     except RuntimeError as error:
@@ -4274,9 +4347,15 @@ def _run_rolling_drain_locked(
     error_counts: Counter[str] = Counter()
     usage_workers: Counter[str] = Counter()
     token_totals: Counter[str] = Counter()
+    primary_error_code: str | None = None
     for wave in waves:
         business_results.update(wave["business_results"])
         error_counts.update(wave["error_counts"])
+        if primary_error_code is None and isinstance(
+            wave.get("primary_error_code"),
+            str,
+        ):
+            primary_error_code = wave["primary_error_code"]
         usage = wave["token_usage"]
         for field in ("recorded_workers", "partial_workers", "unknown_workers"):
             usage_workers[field] += int(usage.get(field) or 0)
@@ -4454,6 +4533,7 @@ def _run_rolling_drain_locked(
         "process_retries": sum(wave["process_retries"] for wave in waves),
         "business_results": dict(sorted(business_results.items())),
         "error_counts": dict(sorted(error_counts.items())),
+        "primary_error_code": primary_error_code,
         "codex_events": codex_events,
         "transient_error_events": transient_error_events,
         "pipeline": pipeline,
@@ -4494,6 +4574,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         default=[],
     )
+    parser.add_argument(
+        "--confirm-stale-children-reaped",
+        choices=("YES",),
+    )
     args = parser.parse_args(argv)
     try:
         if args.read_only:
@@ -4502,6 +4586,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 or args.rolling
                 or args.recover_action_file
                 or args.workflow
+                or args.confirm_stale_children_reaped
             ):
                 raise ValueError("read_only_probe_scheduler_invalid")
             payload = (
@@ -4534,6 +4619,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 rolling_args["recovery_action_files"] = tuple(
                     args.recover_action_file
                 )
+            if args.confirm_stale_children_reaped == "YES":
+                rolling_args["confirm_stale_children_reaped"] = True
             payload = run_rolling_drain(**rolling_args)
             counts = payload.get("error_counts")
             session_code = next(
@@ -4568,6 +4655,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             "error_code": session_code or str(error),
         }
+        if (
+            isinstance(error, ControllerChildrenActiveError)
+            and error.primary_error_code
+        ):
+            payload["primary_error_code"] = error.primary_error_code
         if session_code:
             payload["notification"] = session_alert.alert_from_environment(
                 session_code

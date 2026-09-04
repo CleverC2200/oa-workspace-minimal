@@ -36,6 +36,7 @@ class PoolResult(Generic[Output]):
     runtime_samples: tuple[dict, ...] = ()
     max_task_elapsed_seconds: float = 0.0
     processes_reaped: bool = True
+    primary_error_code: str | None = None
     recommended_capacity: int | None = None
     capacity_decisions: tuple[dict, ...] = ()
     discovery_refreshes: int = 0
