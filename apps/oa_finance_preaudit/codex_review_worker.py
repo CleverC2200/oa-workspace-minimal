@@ -14,9 +14,11 @@ from typing import Callable, TextIO
 from apps import json_artifact
 from apps.oa_approval import runtime_control, writer_outcomes
 
+from . import review_failure_evidence
 
-MODEL = "gpt-5.6-terra"
-REASONING_EFFORT = "high"
+
+MODEL = review_failure_evidence.MODEL
+REASONING_EFFORT = review_failure_evidence.REASONING_EFFORT
 _FINANCE_RULES = {
     "travel_expense": (
         "travel_expense:1",
@@ -61,6 +63,7 @@ _COMPLETION_FAILURE_CODES = writer_outcomes.FAILURE_CODES | {
 _UNKNOWN_WRITE_FAILURE_CODES = (
     _COMPLETION_FAILURE_CODES - writer_outcomes.CONFIRMED_NO_WRITE_CODES
 )
+_BOUNDED_PREWRITE_FAILURE_CODES = review_failure_evidence.PROCESS_FAILURE_CODES
 _REVIEWER_ENVIRONMENT_KEYS = frozenset(
     {
         "CODEX_API_KEY",
@@ -790,6 +793,129 @@ def _base_result(*, attempts: int, usages: list[dict]) -> dict:
     }
 
 
+def _valid_token_usage(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    status = value.get("status")
+    if status == "unknown":
+        return set(value) == {"status"}
+    if status not in {"recorded", "partial"} or set(value) != {
+        "status",
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "total_tokens",
+    }:
+        return False
+    counts = [
+        value[field]
+        for field in (
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "total_tokens",
+        )
+    ]
+    return (
+        all(
+            isinstance(count, int)
+            and not isinstance(count, bool)
+            and count >= 0
+            for count in counts
+        )
+        and value["cached_input_tokens"] <= value["input_tokens"]
+        and value["total_tokens"]
+        == value["input_tokens"] + value["output_tokens"]
+    )
+
+
+def is_bounded_prewrite_failure(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "kind",
+        "model",
+        "reasoning_effort",
+        "process_attempts",
+        "process_retries",
+        "token_usage",
+        "codex_events",
+        "status",
+        "business_state",
+        "write_state",
+        "error_code",
+    }:
+        return False
+    return (
+        value.get("schema_version") == 1
+        and value.get("kind") == "preaudit_review_worker_result"
+        and value.get("model") == MODEL
+        and value.get("reasoning_effort") == REASONING_EFFORT
+        and value.get("process_attempts") == 2
+        and value.get("process_retries") == 1
+        and _valid_token_usage(value.get("token_usage"))
+        and _valid_events(value.get("codex_events"), attempts=2)
+        and value.get("status") == "failed"
+        and value.get("business_state") == "not_available"
+        and value.get("write_state") == "not_requested"
+        and value.get("error_code") in _BOUNDED_PREWRITE_FAILURE_CODES
+    )
+
+
+def _write_review_failure_receipt(
+    action_file: Path,
+    reviewed: dict,
+    *,
+    attempt_error_codes: list[str],
+) -> bool:
+    if (
+        not is_bounded_prewrite_failure(reviewed)
+        or len(attempt_error_codes) != 2
+        or any(
+            code not in _BOUNDED_PREWRITE_FAILURE_CODES
+            for code in attempt_error_codes
+        )
+        or attempt_error_codes[-1] != reviewed["error_code"]
+    ):
+        return False
+    receipt_file = action_file.with_name("review-failure.json")
+    if not _safe_to_retry(action_file):
+        return False
+    try:
+        action = json.loads(action_file.read_text(encoding="utf-8"))
+        state = json.loads(
+            action_file.with_name("state.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return False
+    action_token = action.get("action_token")
+    if (
+        not isinstance(action_token, str)
+        or not action_token
+        or state.get("action_token") != action_token
+        or state.get("workflow_key") != action.get("workflow_key")
+    ):
+        return False
+    payload = review_failure_evidence.receipt_payload(
+        action_token=action_token,
+        workflow_key=action["workflow_key"],
+        failure_code=reviewed["error_code"],
+        attempt_error_codes=attempt_error_codes,
+    )
+    if os.path.lexists(receipt_file):
+        return review_failure_evidence.receipt_matches(
+            review_failure_evidence.read_receipt(receipt_file),
+            action_token=action_token,
+            workflow_key=action["workflow_key"],
+            failure_code=reviewed["error_code"],
+            attempt_error_codes=attempt_error_codes,
+        )
+    try:
+        json_artifact.write_json_atomic(receipt_file, payload, indent=2)
+    except OSError:
+        return False
+    return True
+
+
 def _write_agent_timing(
     action_file: Path,
     *,
@@ -1042,7 +1168,7 @@ def review(
             and _safe_to_retry(action_file)
         ):
             continue
-        return {
+        result = {
             **_base_result(attempts=attempt, usages=usages),
             "codex_events": _merge_events(executions),
             "status": "failed",
@@ -1050,6 +1176,20 @@ def review(
             "write_state": "not_requested",
             "error_code": error_code,
         }
+        attempt_error_codes = [
+            execution.error_code or "codex_process_incomplete"
+            for execution in executions
+        ]
+        if is_bounded_prewrite_failure(result) and not _write_review_failure_receipt(
+            action_file,
+            result,
+            attempt_error_codes=attempt_error_codes,
+        ):
+            return {
+                **result,
+                "error_code": "codex_review_failure_evidence_invalid",
+            }
+        return result
     raise AssertionError("unreachable")
 
 
@@ -1172,12 +1312,17 @@ def complete_review_attempt(action_file: Path, reviewed: dict) -> dict:
     )
 
 
-def quarantine_invalid_decision(action_file: Path) -> dict:
+def quarantine_review_failure(action_file: Path, failure_code: str) -> dict:
     from apps.oa_finance_preaudit import cli
 
-    return cli._live_flow_engine(controlled=True).quarantine_invalid_review(
-        action_file
+    return cli._live_flow_engine(controlled=True).quarantine_review_failure(
+        action_file,
+        failure_code,
     )
+
+
+def quarantine_invalid_decision(action_file: Path) -> dict:
+    return quarantine_review_failure(action_file, "codex_decision_invalid")
 
 
 def run_read_only(

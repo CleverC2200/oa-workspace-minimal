@@ -15,7 +15,12 @@ import time
 import pytest
 
 from apps import json_artifact
-from apps.oa_finance_preaudit import concurrency_control, observability, process_pool
+from apps.oa_finance_preaudit import (
+    codex_review_worker,
+    concurrency_control,
+    observability,
+    process_pool,
+)
 from scripts import finance_preaudit_concurrency_probe
 
 
@@ -179,6 +184,29 @@ def _quarantined_action(
         ),
     }
     attempt_root.mkdir(parents=True)
+    if reason == "codex_review_failed":
+        receipt_file = attempt_root / "review-failure.json"
+        json_artifact.write_json_atomic(
+            receipt_file,
+            {
+                "schema_version": 1,
+                "kind": "preaudit_review_failure",
+                "action_token": "historical-action-token",
+                "workflow_key": "travel_expense",
+                "model": codex_review_worker.MODEL,
+                "reasoning_effort": codex_review_worker.REASONING_EFFORT,
+                "process_attempts": 2,
+                "process_retries": 1,
+                "failure_code": "codex_process_failed",
+                "attempt_error_codes": [
+                    "codex_process_failed",
+                    "codex_process_failed",
+                ],
+            },
+        )
+        payload["review_failure_fingerprint"] = (
+            finance_preaudit_concurrency_probe._file_fingerprint(receipt_file)
+        )
     json_artifact.write_json_atomic(action_file, payload)
     json_artifact.write_json_atomic(state_file, payload)
     return action_file
@@ -2007,6 +2035,7 @@ def test_prepare_extends_skip_budget_when_new_item_is_quarantined(
     [
         ("material_collection_failed", "attachment_download_failed"),
         ("codex_decision_invalid", None),
+        ("codex_review_failed", None),
     ],
 )
 def test_prepare_global_fifo_returns_trusted_zero_write_quarantine(
@@ -5347,7 +5376,8 @@ def test_dispatcher_quarantines_second_prewrite_invalid_decision(
             "error_code": "codex_decision_invalid",
         }
 
-    def quarantine(action_file: Path) -> dict:
+    def quarantine(action_file: Path, reason: str) -> dict:
+        assert reason == "codex_decision_invalid"
         quarantine_calls.append(action_file)
         return {
             "action": "needs_admin",
@@ -5464,7 +5494,8 @@ def test_dispatcher_continues_fifo_after_invalid_decision_quarantine(
             "error_code": None,
         }
 
-    def quarantine(action_file: Path) -> dict:
+    def quarantine(action_file: Path, reason: str) -> dict:
+        assert reason == "codex_decision_invalid"
         quarantined.append(action_file.parent.parent.name)
         return {
             "action": "needs_admin",
@@ -5496,6 +5527,129 @@ def test_dispatcher_continues_fifo_after_invalid_decision_quarantine(
         stop_requests,
         result.primary_error_code,
     )
+    assert result.outcomes[0].value["status"] == "quarantined"
+    assert result.outcomes[1].value["status"] == "completed"
+    assert stop_requests == []
+
+
+def test_dispatcher_continues_fifo_after_bounded_prewrite_review_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stop_requests: list[bool] = []
+    submitted: list[str] = []
+    quarantined: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda: stop_requests.append(True),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_preparation_executor",
+        lambda: ThreadPoolExecutor(max_workers=1),
+    )
+    project_root = tmp_path.resolve()
+    flow_root = project_root / "runtime" / "finance_preaudit_flows"
+    first_action = _open_action(
+        flow_root,
+        case_key="c" * 64,
+        created_at="2026-08-24T12:00:00+00:00",
+    )
+    second_action = _open_action(
+        flow_root,
+        case_key="d" * 64,
+        created_at="2026-08-24T12:00:01+00:00",
+    )
+    prepared_actions = iter((first_action, second_action))
+
+    def prepare(_selection: dict) -> dict:
+        return {
+            "action": "review_required",
+            "action_file": str(next(prepared_actions)),
+        }
+
+    def review(task: dict) -> dict:
+        action_file = Path(task["action_file"])
+        if action_file == first_action:
+            return {
+                "schema_version": 1,
+                "kind": "preaudit_review_worker_result",
+                "model": codex_review_worker.MODEL,
+                "reasoning_effort": codex_review_worker.REASONING_EFFORT,
+                "status": "failed",
+                "business_state": "not_available",
+                "write_state": "not_requested",
+                "error_code": "codex_process_failed",
+                "process_attempts": 2,
+                "process_retries": 1,
+                "token_usage": {"status": "unknown"},
+                "codex_events": {
+                    "status": "unknown",
+                    "attempts": 2,
+                    "recorded_attempts": 0,
+                    "unknown_attempts": 2,
+                    "counts": {},
+                },
+            }
+        return {
+            "status": "reviewed",
+            "process_attempts": 1,
+            "process_retries": 0,
+            "token_usage": {"status": "unknown"},
+            "codex_events": {
+                "status": "unknown",
+                "attempts": 1,
+                "recorded_attempts": 0,
+                "unknown_attempts": 1,
+                "counts": {},
+            },
+            "agent_wall_seconds": 1,
+            "decision": {"overall": "needs_human"},
+        }
+
+    def complete(action_file: Path, reviewed: dict) -> dict:
+        submitted.append(action_file.parent.parent.name)
+        return {
+            **reviewed,
+            "status": "completed",
+            "business_state": "needs_human",
+            "write_state": "submitted",
+            "error_code": None,
+        }
+
+    def quarantine(action_file: Path, reason: str = "") -> dict:
+        quarantined.append((action_file.parent.parent.name, reason))
+        return {
+            "action": "needs_admin",
+            "execution_state": "needs_admin",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "reason": "codex_review_failed",
+        }
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        2,
+        2,
+        project_root=project_root,
+        prepare_action=prepare,
+        review_worker=review,
+        complete_review=complete,
+        quarantine_review=quarantine,
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        runtime_status=lambda: {"status": "healthy"},
+        strict_global_fifo=True,
+    )
+
+    assert quarantined == [
+        (first_action.parent.parent.name, "codex_process_failed")
+    ]
+    assert submitted == [second_action.parent.parent.name]
     assert result.outcomes[0].value["status"] == "quarantined"
     assert result.outcomes[1].value["status"] == "completed"
     assert stop_requests == []
@@ -5550,7 +5704,7 @@ def test_dispatcher_stops_when_invalid_decision_quarantine_is_untrusted(
         renew_actions=lambda paths: paths,
         review_worker=review,
         complete_review=complete,
-        quarantine_review=lambda _path: {
+        quarantine_review=lambda _path, _reason: {
             "action": "needs_admin",
             "execution_state": "needs_admin",
             "business_state": "not_available",

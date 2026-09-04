@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 
 import pytest
 
 from apps import json_artifact
-from apps.oa_finance_preaudit import cli, flow_engine, flow_evals
+from apps.oa_finance_preaudit import (
+    cli,
+    codex_review_worker,
+    flow_engine,
+    flow_evals,
+    reconciliation,
+    runtime_maintenance,
+)
 
 
 WORKFLOW_KEY = "small_marketing_fee"
@@ -395,6 +403,130 @@ def test_invalid_review_quarantine_rejects_write_artifact(tmp_path: Path) -> Non
     assert calls == []
     assert state["execution_state"] == "review_required"
     assert state["write_state"] == "authorized"
+
+
+def _write_process_failure_receipt(action_file: Path) -> None:
+    reviewed = {
+        "schema_version": 1,
+        "kind": "preaudit_review_worker_result",
+        "model": codex_review_worker.MODEL,
+        "reasoning_effort": codex_review_worker.REASONING_EFFORT,
+        "process_attempts": 2,
+        "process_retries": 1,
+        "token_usage": {"status": "unknown"},
+        "codex_events": {
+            "status": "unknown",
+            "attempts": 2,
+            "recorded_attempts": 0,
+            "unknown_attempts": 2,
+            "counts": {},
+        },
+        "status": "failed",
+        "business_state": "not_available",
+        "write_state": "not_requested",
+        "error_code": "codex_process_failed",
+    }
+    assert codex_review_worker._write_review_failure_receipt(
+        action_file,
+        reviewed,
+        attempt_error_codes=["codex_process_failed", "codex_process_failed"],
+    )
+
+
+def test_process_review_quarantine_persists_confirmed_no_write(
+    tmp_path: Path,
+) -> None:
+    calls: list[dict] = []
+    engine = _engine(tmp_path, calls=calls)
+    action = engine.next_action(WORKFLOW_KEY)
+    action_file = Path(action["action_file"])
+    _write_process_failure_receipt(action_file)
+
+    quarantined = engine.quarantine_review_failure(
+        action_file,
+        "codex_process_failed",
+    )
+    state = json.loads(
+        action_file.with_name("state.json").read_text(encoding="utf-8")
+    )
+
+    assert calls == []
+    assert quarantined["action"] == state["action"] == "needs_admin"
+    assert quarantined["reason"] == state["reason"] == "codex_review_failed"
+    assert quarantined["write_state"] == state["write_state"] == "not_requested"
+    assert quarantined["review_failure_fingerprint"] == state[
+        "review_failure_fingerprint"
+    ]
+    assert reconciliation.quarantine_summary(
+        tmp_path,
+        pending_rows=[
+            {
+                "request_id": "marketing-request",
+                "received_at": "2026-08-22T09:00:00+08:00",
+            }
+        ],
+    ) == {
+        "local_quarantined": 1,
+        "pending_quarantined": 1,
+        "actionable_pending": 0,
+    }
+    status = runtime_maintenance.status(
+        tmp_path,
+        now=datetime.now(timezone.utc),
+    )
+    assert status["operations"]["item_local_quarantined"] == 1
+    assert status["operations"]["technical_failures"] == 0
+
+
+def test_process_review_quarantine_requires_bounded_failure_receipt(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path, calls=[])
+    action = engine.next_action(WORKFLOW_KEY)
+
+    with pytest.raises(ValueError, match="review_quarantine_invalid"):
+        engine.quarantine_review_failure(
+            Path(action["action_file"]),
+            "codex_process_failed",
+        )
+
+
+def test_process_review_quarantine_rejects_write_artifact(tmp_path: Path) -> None:
+    calls: list[dict] = []
+    engine = _engine(tmp_path, calls=calls)
+    action = engine.next_action(WORKFLOW_KEY)
+    action_file = Path(action["action_file"])
+    _write_process_failure_receipt(action_file)
+    json_artifact.write_json_atomic(
+        action_file.with_name("writer-boundary.json"),
+        {"unexpected": True},
+    )
+
+    with pytest.raises(ValueError, match="review_quarantine_invalid"):
+        engine.quarantine_review_failure(
+            action_file,
+            "codex_process_failed",
+        )
+
+    state = json.loads(
+        action_file.with_name("state.json").read_text(encoding="utf-8")
+    )
+    assert calls == []
+    assert state["execution_state"] == "review_required"
+    assert state["write_state"] == "authorized"
+
+
+def test_process_review_quarantine_rejects_unclassified_failure(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path)
+    action = engine.next_action(WORKFLOW_KEY)
+
+    with pytest.raises(ValueError, match="review_quarantine_invalid"):
+        engine.quarantine_review_failure(
+            Path(action["action_file"]),
+            "codex_process_timeout",
+        )
 
 
 def test_marketing_controlled_substitute_is_bound_and_idempotent(tmp_path: Path) -> None:
