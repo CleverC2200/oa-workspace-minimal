@@ -216,6 +216,7 @@ SHARED_FAILURE_CODES = {
 }
 _WRITER_FAILURE_CODES = writer_outcomes.FAILURE_CODES
 _CONTINUABLE_QUARANTINE_CODES = {
+    "codex_decision_invalid",
     "material_collection_failed",
     *writer_outcomes.CONFIRMED_NO_WRITE_CODES,
 }
@@ -3142,6 +3143,53 @@ class FlowEngine:
             json_artifact.write_json_atomic(action_file_next, claim, indent=2)
             json_artifact.write_json_atomic(state_file_next, claim, indent=2)
         return self._prepare_attempt(prepare_root)
+
+    def quarantine_invalid_review(self, action_file: Path) -> dict:
+        action_path = Path(action_file).expanduser().resolve()
+        if (
+            not action_path.is_relative_to(self._root)
+            or not _is_attempt_action_path(action_path, self._root)
+            or action_path.is_symlink()
+        ):
+            raise ValueError("review_quarantine_invalid")
+        state_path = action_path.with_name("state.json")
+        if state_path.is_symlink():
+            raise ValueError("review_quarantine_invalid")
+        with _exclusive_lock(action_path.parent / "complete.lock"):
+            try:
+                action, state, _packet = self._open_attempt(action_path)
+            except ValueError as error:
+                raise ValueError("review_quarantine_invalid") from error
+            required = {
+                "action": "review_required",
+                "execution_state": "review_required",
+                "business_state": "not_available",
+                "write_state": "authorized",
+                "mode": "controlled_write",
+                "write_authorized": True,
+            }
+            if any(
+                action.get(field) != value or state.get(field) != value
+                for field, value in required.items()
+            ):
+                raise ValueError("review_quarantine_invalid")
+            forbidden = (
+                "writer-boundary.json",
+                "execution-receipt.json",
+                "review-decision.json",
+                "remark.txt",
+                "submission-envelope.json",
+            )
+            if any(
+                (artifact := action_path.with_name(name)).is_symlink()
+                or artifact.exists()
+                for name in forbidden
+            ):
+                raise ValueError("review_quarantine_invalid")
+            return self._persist_attempt_needs_admin(
+                action_path,
+                "codex_decision_invalid",
+            )
 
     def complete_review(self, action_file: Path, decision_file: Path) -> dict:
         action_path = Path(action_file).expanduser().resolve()

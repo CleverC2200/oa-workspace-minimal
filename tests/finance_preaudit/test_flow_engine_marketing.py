@@ -357,6 +357,46 @@ def test_marketing_company_pass_requires_prescribed_conclusion(tmp_path: Path) -
         engine.complete_review(Path(action["action_file"]), decision_file)
 
 
+def test_invalid_review_quarantine_persists_confirmed_no_write(
+    tmp_path: Path,
+) -> None:
+    calls: list[dict] = []
+    engine = _engine(tmp_path, calls=calls)
+    action = engine.next_action(WORKFLOW_KEY)
+    action_file = Path(action["action_file"])
+
+    quarantined = engine.quarantine_invalid_review(action_file)
+    state = json.loads(
+        action_file.with_name("state.json").read_text(encoding="utf-8")
+    )
+
+    assert calls == []
+    assert quarantined["action"] == state["action"] == "needs_admin"
+    assert quarantined["reason"] == state["reason"] == "codex_decision_invalid"
+    assert quarantined["write_state"] == state["write_state"] == "not_requested"
+
+
+def test_invalid_review_quarantine_rejects_write_artifact(tmp_path: Path) -> None:
+    calls: list[dict] = []
+    engine = _engine(tmp_path, calls=calls)
+    action = engine.next_action(WORKFLOW_KEY)
+    action_file = Path(action["action_file"])
+    json_artifact.write_json_atomic(
+        action_file.with_name("review-decision.json"),
+        {"unexpected": True},
+    )
+
+    with pytest.raises(ValueError, match="review_quarantine_invalid"):
+        engine.quarantine_invalid_review(action_file)
+
+    state = json.loads(
+        action_file.with_name("state.json").read_text(encoding="utf-8")
+    )
+    assert calls == []
+    assert state["execution_state"] == "review_required"
+    assert state["write_state"] == "authorized"
+
+
 def test_marketing_controlled_substitute_is_bound_and_idempotent(tmp_path: Path) -> None:
     calls: list[dict] = []
     engine = _engine(tmp_path, calls=calls)

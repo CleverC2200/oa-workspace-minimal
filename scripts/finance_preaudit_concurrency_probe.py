@@ -51,6 +51,7 @@ LiveStatus = Callable[[], dict]
 PipelineRunner = Callable[[int, int], process_pool.PoolResult[dict]]
 ReviewWorker = Callable[[dict], dict]
 ReviewCompleter = Callable[[Path, dict], dict]
+ReviewQuarantine = Callable[[Path], dict]
 ExecutorFactory = Callable[[int], object]
 
 
@@ -61,6 +62,7 @@ class ControllerChildrenActiveError(ValueError):
 
 
 QUARANTINED_REASONS = {
+    "codex_decision_invalid",
     "material_collection_failed",
     *writer_outcomes.CONFIRMED_NO_WRITE_CODES,
 }
@@ -68,7 +70,10 @@ RECOVERABLE_NO_WRITE_REASONS = {
     "write_authorization_invalid",
     *QUARANTINED_REASONS,
 }
-ITEM_LOCAL_QUARANTINE_REASONS = {"material_collection_failed"}
+ITEM_LOCAL_QUARANTINE_REASONS = {
+    "codex_decision_invalid",
+    "material_collection_failed",
+}
 ITEM_LOCAL_MATERIAL_FAILURE_DETAILS = (
     runtime_maintenance.ITEM_LOCAL_MATERIAL_FAILURE_DETAILS
 )
@@ -484,6 +489,7 @@ def _material_failure_action_matches_selection(
     *,
     allowed_failure_details: frozenset[str],
     forbidden_names: tuple[str, ...],
+    expected_reason: str = "material_collection_failed",
     project_root: Path = PROJECT_ROOT,
 ) -> bool:
     request_id = str(selected.get("requestId") or "").strip()
@@ -491,14 +497,16 @@ def _material_failure_action_matches_selection(
     attempt = state.get("attempt")
     reason = str(state.get("reason") or "")
     detail_code = str(state.get("failure_detail_code") or "")
+    action_detail_code = str(action.get("failure_detail_code") or "")
     if (
         not request_id
         or not received_at
         or not isinstance(attempt, int)
         or isinstance(attempt, bool)
         or attempt < 1
-        or reason != "material_collection_failed"
+        or reason != expected_reason
         or detail_code not in allowed_failure_details
+        or action_detail_code != detail_code
     ):
         return False
     case_key = hashlib.sha256(
@@ -523,11 +531,15 @@ def _material_failure_action_matches_selection(
         "write_state": "not_requested",
         "workflow_key": workflow_key,
         "reason": reason,
-        "failure_detail_code": detail_code,
         "case_key": case_key,
         "attempt": attempt,
         "action_file": str(expected_action),
         "state_file": str(expected_state),
+        **(
+            {"failure_detail_code": detail_code}
+            if detail_code
+            else {}
+        ),
     }
     attempt_root = expected_action.parent
     forbidden = [
@@ -554,6 +566,22 @@ def _quarantined_action_matches_selection(
     *,
     project_root: Path = PROJECT_ROOT,
 ) -> bool:
+    if state.get("reason") == "codex_decision_invalid":
+        return _material_failure_action_matches_selection(
+            action_path,
+            action,
+            state,
+            selected,
+            workflow_key,
+            allowed_failure_details=frozenset({""}),
+            forbidden_names=(
+                "review-decision.json",
+                "remark.txt",
+                "submission-envelope.json",
+            ),
+            expected_reason="codex_decision_invalid",
+            project_root=project_root,
+        )
     return _material_failure_action_matches_selection(
         action_path,
         action,
@@ -1917,6 +1945,9 @@ def _run_dispatched_tasks(
     prepare_action: PrepareAction | None = None,
     review_worker: ReviewWorker = _review_only,
     complete_review: ReviewCompleter = codex_review_worker.complete_review_attempt,
+    quarantine_review: ReviewQuarantine = (
+        codex_review_worker.quarantine_invalid_decision
+    ),
     executor_factory: ExecutorFactory = _process_executor,
     task_timeout_sec: float = 960,
     prepare_timeout_sec: float = 300,
@@ -2437,6 +2468,42 @@ def _run_dispatched_tasks(
                         first_attempt=False,
                     )
                 else:
+                    if (
+                        value.get("status") == "retry_required"
+                        and value.get("error_code") == "codex_decision_invalid"
+                        and index in decision_retries
+                        and not halted
+                    ):
+                        try:
+                            quarantine = quarantine_review(action_file)
+                        except Exception:
+                            quarantine = {}
+                        if all(
+                            quarantine.get(field) == expected
+                            for field, expected in {
+                                "action": "needs_admin",
+                                "execution_state": "needs_admin",
+                                "business_state": "not_available",
+                                "write_state": "not_requested",
+                                "reason": "codex_decision_invalid",
+                            }.items()
+                        ):
+                            value = {
+                                **value,
+                                "status": "quarantined",
+                                "execution_state": "needs_admin",
+                                "business_state": "not_available",
+                                "write_state": "not_requested",
+                                "error_code": "codex_decision_invalid",
+                            }
+                        else:
+                            value = {
+                                **value,
+                                "status": "failed",
+                                "error_code": (
+                                    "codex_decision_quarantine_failed"
+                                ),
+                            }
                     if value.get("status") == "retry_required":
                         value = {**value, "status": "failed"}
                     outcomes[index] = process_pool.TaskOutcome(
@@ -2445,7 +2512,10 @@ def _run_dispatched_tasks(
                         value=value,
                     )
                     review_histories.pop(index, None)
-                    if value.get("status") != "completed":
+                    if value.get("status") not in {
+                        "completed",
+                        "quarantined",
+                    }:
                         request_pipeline_stop(value.get("error_code"))
                     else:
                         if strict_global_fifo:
