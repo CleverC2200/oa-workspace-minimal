@@ -51,7 +51,7 @@ LiveStatus = Callable[[], dict]
 PipelineRunner = Callable[[int, int], process_pool.PoolResult[dict]]
 ReviewWorker = Callable[[dict], dict]
 ReviewCompleter = Callable[[Path, dict], dict]
-ReviewQuarantine = Callable[[Path], dict]
+ReviewQuarantine = Callable[[Path, str], dict]
 ExecutorFactory = Callable[[int], object]
 
 
@@ -63,6 +63,7 @@ class ControllerChildrenActiveError(ValueError):
 
 QUARANTINED_REASONS = {
     "codex_decision_invalid",
+    "codex_review_failed",
     "material_collection_failed",
     *writer_outcomes.CONFIRMED_NO_WRITE_CODES,
 }
@@ -72,8 +73,14 @@ RECOVERABLE_NO_WRITE_REASONS = {
 }
 ITEM_LOCAL_QUARANTINE_REASONS = {
     "codex_decision_invalid",
+    "codex_review_failed",
+    "codex_process_failed",
+    "codex_process_incomplete",
     "material_collection_failed",
 }
+ITEM_LOCAL_REVIEW_FAILURE_REASONS = frozenset(
+    {"codex_process_failed", "codex_process_incomplete"}
+)
 ITEM_LOCAL_MATERIAL_FAILURE_DETAILS = (
     runtime_maintenance.ITEM_LOCAL_MATERIAL_FAILURE_DETAILS
 )
@@ -134,6 +141,14 @@ def _read_object(path: Path) -> dict:
     if not isinstance(value, dict):
         raise ValueError("production_probe_state_invalid")
     return value
+
+
+def _file_fingerprint(path: Path) -> str:
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as error:
+        raise ValueError("production_probe_state_invalid") from error
+    return f"sha256:{hashlib.sha256(raw).hexdigest()}"
 
 
 def _persist_write_wait_evidence(
@@ -566,8 +581,11 @@ def _quarantined_action_matches_selection(
     *,
     project_root: Path = PROJECT_ROOT,
 ) -> bool:
-    if state.get("reason") == "codex_decision_invalid":
-        return _material_failure_action_matches_selection(
+    if state.get("reason") in {
+        "codex_decision_invalid",
+        "codex_review_failed",
+    }:
+        trusted = _material_failure_action_matches_selection(
             action_path,
             action,
             state,
@@ -579,8 +597,22 @@ def _quarantined_action_matches_selection(
                 "remark.txt",
                 "submission-envelope.json",
             ),
-            expected_reason="codex_decision_invalid",
+            expected_reason=str(state["reason"]),
             project_root=project_root,
+        )
+        if state.get("reason") != "codex_review_failed":
+            return trusted
+        receipt_path = action_path.with_name("review-failure.json")
+        try:
+            receipt_fingerprint = _file_fingerprint(receipt_path)
+        except ValueError:
+            return False
+        return (
+            trusted
+            and not receipt_path.is_symlink()
+            and action.get("review_failure_fingerprint")
+            == state.get("review_failure_fingerprint")
+            == receipt_fingerprint
         )
     return _material_failure_action_matches_selection(
         action_path,
@@ -1946,7 +1978,7 @@ def _run_dispatched_tasks(
     review_worker: ReviewWorker = _review_only,
     complete_review: ReviewCompleter = codex_review_worker.complete_review_attempt,
     quarantine_review: ReviewQuarantine = (
-        codex_review_worker.quarantine_invalid_decision
+        codex_review_worker.quarantine_review_failure
     ),
     executor_factory: ExecutorFactory = _process_executor,
     task_timeout_sec: float = 960,
@@ -2475,7 +2507,10 @@ def _run_dispatched_tasks(
                         and not halted
                     ):
                         try:
-                            quarantine = quarantine_review(action_file)
+                            quarantine = quarantine_review(
+                                action_file,
+                                "codex_decision_invalid",
+                            )
                         except Exception:
                             quarantine = {}
                         if all(
@@ -2902,6 +2937,56 @@ def _run_dispatched_tasks(
                         first_review_error_code = "worker_process_failed"
                     continue
                 if value.get("status") != "reviewed":
+                    error_code = str(
+                        value.get("error_code") or "worker_process_failed"
+                    )
+                    if (
+                        error_code in ITEM_LOCAL_REVIEW_FAILURE_REASONS
+                        and codex_review_worker.is_bounded_prewrite_failure(value)
+                    ):
+                        try:
+                            quarantine = quarantine_review(
+                                action_file,
+                                error_code,
+                            )
+                        except Exception:
+                            quarantine = {}
+                        if all(
+                            quarantine.get(field) == expected
+                            for field, expected in {
+                                "action": "needs_admin",
+                                "execution_state": "needs_admin",
+                                "business_state": "not_available",
+                                "write_state": "not_requested",
+                                "reason": "codex_review_failed",
+                            }.items()
+                        ):
+                            quarantined_value = {
+                                **value,
+                                "status": "quarantined",
+                                "execution_state": "needs_admin",
+                                "business_state": "not_available",
+                                "write_state": "not_requested",
+                                "error_code": error_code,
+                                "prepare_elapsed_seconds": prepare_elapsed,
+                            }
+                            outcomes[index] = process_pool.TaskOutcome(
+                                index=index,
+                                status="completed",
+                                value=quarantined_value,
+                            )
+                            if strict_global_fifo:
+                                pending_write_indices.remove(index)
+                            else:
+                                skipped_write_indices.add(index)
+                            advance_write_head()
+                            observe_adaptive_window(quarantined_value)
+                            continue
+                        value = {
+                            **value,
+                            "status": "failed",
+                            "error_code": "codex_review_quarantine_failed",
+                        }
                     outcomes[index] = process_pool.TaskOutcome(
                         index=index,
                         status="completed",
@@ -3522,6 +3607,7 @@ def _quarantined_pending_count() -> int:
 
 def _local_quarantine_count() -> int:
     return reconciliation._quarantine_summary(
+        PROJECT_ROOT / "runtime" / "finance_preaudit_flows",
         _latest_local_states(),
         [],
     )["local_quarantined"]

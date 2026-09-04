@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from apps.oa_approval import writer_outcomes
 
-from . import observability, retention
+from . import observability, retention, review_failure_evidence
 
 
 SCHEMA_VERSION = 1
@@ -29,12 +29,14 @@ _WORKFLOW_KEYS = {
 _FAILURE_CODES = {
     "agent_timing_invalid",
     "codex_decision_invalid",
+    "codex_review_failed",
     "frozen_material_changed",
     "frozen_packet_changed",
     "material_collection_failed",
     "observability_incomplete",
     "observability_write_failed",
     "persistent_state_invalid",
+    "review_quarantine_invalid",
     "state_invalid",
     "submission_adapter_unavailable",
     "write_authorization_invalid",
@@ -444,7 +446,8 @@ def _operation_projection(items: list[dict]) -> dict:
         if item["execution_state"] == "needs_admin"
         and item["write_state"] == "not_requested"
         and (
-            item["failure_code"] == "codex_decision_invalid"
+            item["failure_code"]
+            in {"codex_decision_invalid", "codex_review_failed"}
             or (
                 item["failure_code"] == "material_collection_failed"
                 and item["failure_detail_code"]
@@ -962,11 +965,16 @@ def status(root: Path, *, now: datetime | None = None) -> dict:
             created_at = _timestamp(state["created_at"])
         received_at = _received_at(state) or created_at
         reason = str(state.get("reason") or "")
-        failure_code = (
-            reason
-            if reason in _FAILURE_CODES
-            else ("unknown_failure" if reason else None)
-        )
+        if reason == "codex_review_failed" and not (
+            review_failure_evidence.trusted_quarantine(attempt_root, state)
+        ):
+            failure_code = "review_quarantine_invalid"
+        else:
+            failure_code = (
+                reason
+                if reason in _FAILURE_CODES
+                else ("unknown_failure" if reason else None)
+            )
         raw_failure_detail = str(state.get("failure_detail_code") or "")
         failure_detail_code = (
             raw_failure_detail

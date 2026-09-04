@@ -17,7 +17,7 @@ import fitz
 from apps import json_artifact
 from apps.oa_approval import writer_outcomes
 
-from . import observability, submission
+from . import observability, review_failure_evidence, submission
 
 
 SCHEMA_VERSION = 1
@@ -217,8 +217,14 @@ SHARED_FAILURE_CODES = {
 _WRITER_FAILURE_CODES = writer_outcomes.FAILURE_CODES
 _CONTINUABLE_QUARANTINE_CODES = {
     "codex_decision_invalid",
+    "codex_review_failed",
     "material_collection_failed",
     *writer_outcomes.CONFIRMED_NO_WRITE_CODES,
+}
+_REVIEW_QUARANTINE_REASONS = {
+    "codex_decision_invalid": "codex_decision_invalid",
+    "codex_process_failed": "codex_review_failed",
+    "codex_process_incomplete": "codex_review_failed",
 }
 
 
@@ -323,6 +329,25 @@ def _file_fingerprint(path: Path) -> str:
     except OSError as error:
         raise ValueError("frozen_file_unreadable") from error
     return f"sha256:{hashlib.sha256(raw).hexdigest()}"
+
+
+def _review_failure_fingerprint(
+    action_path: Path,
+    action: dict,
+    failure_code: str,
+) -> str:
+    receipt_path = action_path.with_name("review-failure.json")
+    if receipt_path.is_symlink():
+        raise ValueError("review_quarantine_invalid")
+    receipt = review_failure_evidence.read_receipt(receipt_path)
+    if not review_failure_evidence.receipt_matches(
+        receipt,
+        action_token=str(action.get("action_token") or ""),
+        workflow_key=str(action.get("workflow_key") or ""),
+        failure_code=failure_code,
+    ):
+        raise ValueError("review_quarantine_invalid")
+    return _file_fingerprint(receipt_path)
 
 
 def _evidence_fingerprint(material: dict) -> str:
@@ -3144,7 +3169,14 @@ class FlowEngine:
             json_artifact.write_json_atomic(state_file_next, claim, indent=2)
         return self._prepare_attempt(prepare_root)
 
-    def quarantine_invalid_review(self, action_file: Path) -> dict:
+    def quarantine_review_failure(
+        self,
+        action_file: Path,
+        failure_code: str,
+    ) -> dict:
+        reason = _REVIEW_QUARANTINE_REASONS.get(failure_code)
+        if reason is None:
+            raise ValueError("review_quarantine_invalid")
         action_path = Path(action_file).expanduser().resolve()
         if (
             not action_path.is_relative_to(self._root)
@@ -3173,6 +3205,15 @@ class FlowEngine:
                 for field, value in required.items()
             ):
                 raise ValueError("review_quarantine_invalid")
+            review_failure_fingerprint: str | None = None
+            if reason == "codex_review_failed":
+                review_failure_fingerprint = _review_failure_fingerprint(
+                    action_path,
+                    action,
+                    failure_code,
+                )
+            elif os.path.lexists(action_path.with_name("review-failure.json")):
+                raise ValueError("review_quarantine_invalid")
             forbidden = (
                 "writer-boundary.json",
                 "execution-receipt.json",
@@ -3188,8 +3229,23 @@ class FlowEngine:
                 raise ValueError("review_quarantine_invalid")
             return self._persist_attempt_needs_admin(
                 action_path,
-                "codex_decision_invalid",
+                reason,
+                failure_details=(
+                    {
+                        "review_failure_fingerprint": (
+                            review_failure_fingerprint
+                        )
+                    }
+                    if review_failure_fingerprint is not None
+                    else None
+                ),
             )
+
+    def quarantine_invalid_review(self, action_file: Path) -> dict:
+        return self.quarantine_review_failure(
+            action_file,
+            "codex_decision_invalid",
+        )
 
     def complete_review(self, action_file: Path, decision_file: Path) -> dict:
         action_path = Path(action_file).expanduser().resolve()

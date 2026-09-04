@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from apps.oa_finance_preaudit import reconciliation
+from apps.oa_finance_preaudit import reconciliation, review_failure_evidence
 
 
 def _state(
@@ -19,6 +19,7 @@ def _state(
     write_state: str = "not_requested",
     reason: str = "material_collection_failed",
     created_at: str = "2026-08-24T00:00:00+00:00",
+    include_review_failure_receipt: bool = True,
 ) -> None:
     import hashlib
 
@@ -27,9 +28,9 @@ def _state(
     ).hexdigest()
     attempt_root = root / "travel_expense" / "cases" / case_key / f"attempt-{attempt}"
     attempt_root.mkdir(parents=True)
-    (attempt_root / "state.json").write_text(
-        json.dumps(
-            {
+    action_file = attempt_root / "action.json"
+    state_file = attempt_root / "state.json"
+    state = {
                 "schema_version": 1,
                 "kind": "preaudit_action",
                 "workflow_key": "travel_expense",
@@ -42,10 +43,55 @@ def _state(
                 "business_state": "not_available",
                 "write_state": write_state,
                 "reason": reason,
+    }
+    if reason == "codex_review_failed" and include_review_failure_receipt:
+        receipt_file = attempt_root / "review-failure.json"
+        receipt = review_failure_evidence.receipt_payload(
+            action_token="test-action-token",
+            workflow_key="travel_expense",
+            failure_code="codex_process_failed",
+            attempt_error_codes=["codex_process_failed", "codex_process_failed"],
+        )
+        receipt_file.write_text(json.dumps(receipt), encoding="utf-8")
+        state.update(
+            {
+                "action": "needs_admin",
+                "action_token": "test-action-token",
+                "mode": "preview",
+                "write_authorized": False,
+                "action_file": str(action_file),
+                "state_file": str(state_file),
+                "review_failure_fingerprint": (
+                    review_failure_evidence.file_fingerprint(receipt_file)
+                ),
             }
-        ),
-        encoding="utf-8",
-    )
+        )
+        action_file.write_text(
+            json.dumps(
+                {
+                    key: state[key]
+                    for key in (
+                        "schema_version",
+                        "kind",
+                        "action",
+                        "execution_state",
+                        "business_state",
+                        "write_state",
+                        "workflow_key",
+                        "mode",
+                        "write_authorized",
+                        "reason",
+                        "action_file",
+                        "state_file",
+                        "case_key",
+                        "attempt",
+                        "review_failure_fingerprint",
+                    )
+                }
+            ),
+            encoding="utf-8",
+        )
+    state_file.write_text(json.dumps(state), encoding="utf-8")
 
 
 def test_reconciliation_classifies_live_state_without_exposing_request_ids(
@@ -288,6 +334,65 @@ def test_quarantine_counts_each_latest_case_identity_once(tmp_path: Path) -> Non
     assert summary == {
         "local_quarantined": 1,
         "pending_quarantined": 1,
+        "actionable_pending": 1,
+    }
+
+
+def test_quarantine_counts_confirmed_prewrite_review_failure(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "flows"
+    received_at = "2026-08-24 11:03:00"
+    _state(
+        root,
+        "3004",
+        received_at,
+        reason="codex_review_failed",
+    )
+
+    summary = reconciliation.quarantine_summary(
+        root,
+        pending_rows=[{"request_id": "3004", "received_at": received_at}],
+    )
+
+    assert summary == {
+        "local_quarantined": 1,
+        "pending_quarantined": 1,
+        "actionable_pending": 0,
+    }
+
+
+@pytest.mark.parametrize("tamper", ("missing", "changed", "action_kind"))
+def test_quarantine_rejects_untrusted_prewrite_review_failure(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    root = tmp_path / "flows"
+    received_at = "2026-08-24 11:04:00"
+    _state(
+        root,
+        "3005",
+        received_at,
+        reason="codex_review_failed",
+        include_review_failure_receipt=tamper != "missing",
+    )
+    if tamper == "changed":
+        receipt_file = next(root.glob("*/cases/*/attempt-1/review-failure.json"))
+        receipt_file.write_text("{}", encoding="utf-8")
+    elif tamper == "action_kind":
+        action_file = next(root.glob("*/cases/*/attempt-1/action.json"))
+        action = json.loads(action_file.read_text(encoding="utf-8"))
+        action["kind"] = "invalid"
+        action_file.write_text(json.dumps(action), encoding="utf-8")
+
+    summary = reconciliation.quarantine_summary(
+        root,
+        pending_rows=[{"request_id": "3005", "received_at": received_at}],
+    )
+
+    assert summary == {
+        "local_quarantined": 0,
+        "pending_quarantined": 0,
         "actionable_pending": 1,
     }
 

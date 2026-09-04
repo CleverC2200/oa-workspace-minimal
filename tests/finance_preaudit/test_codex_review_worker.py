@@ -774,6 +774,89 @@ def test_production_review_accumulates_retry_events_and_tokens(
     }
 
 
+def test_bounded_prewrite_failure_persists_bound_receipt(tmp_path: Path) -> None:
+    task, action_file = _task(tmp_path)
+
+    result = codex_review_worker.review(
+        task,
+        executor=lambda *_args: codex_review_worker.CodexExecution(
+            error_code="codex_process_failed",
+            token_usage={"status": "unknown"},
+        ),
+    )
+
+    assert codex_review_worker.is_bounded_prewrite_failure(result)
+    receipt = json.loads(
+        action_file.with_name("review-failure.json").read_text(encoding="utf-8")
+    )
+    assert receipt == {
+        "schema_version": 1,
+        "kind": "preaudit_review_failure",
+        "action_token": "test-action-token",
+        "workflow_key": "travel_expense",
+        "model": codex_review_worker.MODEL,
+        "reasoning_effort": codex_review_worker.REASONING_EFFORT,
+        "process_attempts": 2,
+        "process_retries": 1,
+        "failure_code": "codex_process_failed",
+        "attempt_error_codes": [
+            "codex_process_failed",
+            "codex_process_failed",
+        ],
+    }
+
+
+def test_bounded_prewrite_failure_reuses_matching_receipt_after_stop(
+    tmp_path: Path,
+) -> None:
+    task, action_file = _task(tmp_path)
+
+    def fail(*_args) -> codex_review_worker.CodexExecution:
+        return codex_review_worker.CodexExecution(
+            error_code="codex_process_failed",
+            token_usage={"status": "unknown"},
+        )
+
+    first = codex_review_worker.review(task, executor=fail)
+    receipt_file = action_file.with_name("review-failure.json")
+    first_receipt = receipt_file.read_bytes()
+    second = codex_review_worker.review(task, executor=fail)
+
+    assert codex_review_worker.is_bounded_prewrite_failure(first)
+    assert codex_review_worker.is_bounded_prewrite_failure(second)
+    assert receipt_file.read_bytes() == first_receipt
+
+
+def test_bounded_prewrite_failure_rejects_conflicting_receipt(
+    tmp_path: Path,
+) -> None:
+    task, action_file = _task(tmp_path)
+    action_file.with_name("review-failure.json").write_text("{}", encoding="utf-8")
+
+    result = codex_review_worker.review(
+        task,
+        executor=lambda *_args: codex_review_worker.CodexExecution(
+            error_code="codex_process_failed",
+            token_usage={"status": "unknown"},
+        ),
+    )
+
+    assert result["error_code"] == "codex_review_failure_evidence_invalid"
+
+
+def test_bounded_prewrite_failure_rejects_incomplete_worker_contract() -> None:
+    assert not codex_review_worker.is_bounded_prewrite_failure(
+        {
+            "status": "failed",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "error_code": "codex_process_failed",
+            "process_attempts": 2,
+            "process_retries": 1,
+        }
+    )
+
+
 def test_parent_completion_persists_timing_and_bound_receipt(
     tmp_path: Path,
 ) -> None:

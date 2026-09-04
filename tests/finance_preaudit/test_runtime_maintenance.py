@@ -13,7 +13,13 @@ from pathlib import Path
 import pytest
 
 from apps import json_artifact
-from apps.oa_finance_preaudit import cli, observability, retention, runtime_maintenance
+from apps.oa_finance_preaudit import (
+    cli,
+    observability,
+    retention,
+    review_failure_evidence,
+    runtime_maintenance,
+)
 
 
 NOW = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
@@ -66,6 +72,58 @@ def _attempt(
         state["reason"] = reason
     if failure_detail_code is not None:
         state["failure_detail_code"] = failure_detail_code
+    if reason == "codex_review_failed":
+        action_file = attempt_root / "action.json"
+        state_file = attempt_root / "state.json"
+        receipt_file = attempt_root / "review-failure.json"
+        json_artifact.write_json_atomic(
+            receipt_file,
+            review_failure_evidence.receipt_payload(
+                action_token="test-action-token",
+                workflow_key=workflow_key,
+                failure_code="codex_process_failed",
+                attempt_error_codes=[
+                    "codex_process_failed",
+                    "codex_process_failed",
+                ],
+            ),
+        )
+        state.update(
+            {
+                "action": "needs_admin",
+                "action_token": "test-action-token",
+                "mode": "preview",
+                "write_authorized": False,
+                "action_file": str(action_file),
+                "state_file": str(state_file),
+                "review_failure_fingerprint": (
+                    review_failure_evidence.file_fingerprint(receipt_file)
+                ),
+            }
+        )
+        json_artifact.write_json_atomic(
+            action_file,
+            {
+                key: state[key]
+                for key in (
+                    "schema_version",
+                    "kind",
+                    "action",
+                    "execution_state",
+                    "business_state",
+                    "write_state",
+                    "workflow_key",
+                    "mode",
+                    "write_authorized",
+                    "reason",
+                    "action_file",
+                    "state_file",
+                    "case_key",
+                    "attempt",
+                    "review_failure_fingerprint",
+                )
+            },
+        )
     json_artifact.write_json_atomic(attempt_root / "state.json", state)
     (attempt_root / "material.json").write_text(
         '{"sensitive":"must-not-appear"}',
@@ -508,10 +566,20 @@ def test_status_classifies_allowlisted_item_local_quarantines(
         write_state="not_requested",
         reason="codex_decision_invalid",
     )
+    _attempt(
+        root,
+        case_key="failed-codex-review",
+        attempt=1,
+        age_days=0,
+        execution_state="needs_admin",
+        business_state="not_available",
+        write_state="not_requested",
+        reason="codex_review_failed",
+    )
 
     status = runtime_maintenance.status(root, now=NOW)
 
-    assert status["operations"]["item_local_quarantined"] == 2
+    assert status["operations"]["item_local_quarantined"] == 3
     assert status["operations"]["technical_failures"] == 1
     assert status["operations"]["current_bottleneck"] == {
         "evidence_status": "exact",
@@ -520,9 +588,35 @@ def test_status_classifies_allowlisted_item_local_quarantines(
     }
     assert status["workflows"][0]["failure_counts"] == {
         "codex_decision_invalid": 1,
+        "codex_review_failed": 1,
         "material_collection_failed": 2,
     }
     assert "frozen_material_changed" not in json.dumps(status)
+
+
+def test_status_treats_tampered_review_quarantine_as_technical(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    attempt_root = _attempt(
+        root,
+        case_key="tampered-codex-review",
+        attempt=1,
+        age_days=0,
+        execution_state="needs_admin",
+        business_state="not_available",
+        write_state="not_requested",
+        reason="codex_review_failed",
+    )
+    (attempt_root / "review-failure.json").write_text("{}", encoding="utf-8")
+
+    status = runtime_maintenance.status(root, now=NOW)
+
+    assert status["operations"]["item_local_quarantined"] == 0
+    assert status["operations"]["technical_failures"] == 1
+    assert status["workflows"][0]["failure_counts"] == {
+        "review_quarantine_invalid": 1,
+    }
 
 
 def test_status_highlights_repeated_and_long_lived_failed_backlog(
