@@ -140,6 +140,13 @@ python3 -m scripts.finance_preaudit_concurrency_probe \
   --confirm-write YES
 ```
 
+若上轮控制器已失败且终态清单仅因瞬时回收误报保留
+`children_reaped=false`，不得自动改写或清除止损。操作人必须先用只读状态与系统进程核实：
+停止原因为 `controller_cycle_stop`，原控制器 PID、全局 Writer、请求 Writer 和全部子进程均已退出，
+实时身份、授权、冻结与对账门禁可信，且当前代码工作树干净；随后才能在同一次受控滚动入口增加
+`--confirm-stale-children-reaped YES`。入口只修复这一份过期终态交接记录并继续正常门禁，
+不会恢复 `needs_admin`、历史技术失败或任何 `write_state=unknown` 项；条件不完整时仍返回稳定阻断码。
+
 差旅历史 `material_collection_failed` 等已确认未写入的隔离项，只能把精确旧
 `action.json` 交给同一个滚动控制器恢复；参数可重复。恢复仍在容量为 1、300 秒
 硬超时且可回收的 prepare 进程中完成，只创建新 attempt，后续审核和提交继续经过

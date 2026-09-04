@@ -3371,6 +3371,47 @@ def test_rolling_wave_preserves_transient_codex_error_counts() -> None:
     }
 
 
+def test_rolling_wave_preserves_first_non_cancellation_error() -> None:
+    metrics = finance_preaudit_concurrency_probe._rolling_wave_metrics(
+        process_pool.PoolResult(
+            requested=3,
+            started=3,
+            completed=1,
+            failed=1,
+            timed_out=0,
+            stopped=1,
+            peak_active=3,
+            elapsed_seconds=1.0,
+            outcomes=(
+                process_pool.TaskOutcome(
+                    index=0,
+                    status="stopped",
+                    value=None,
+                    error_code="stop_requested",
+                ),
+                process_pool.TaskOutcome(
+                    index=1,
+                    status="completed",
+                    value={
+                        "status": "failed",
+                        "error_code": "writer_result_unknown",
+                        "token_usage": {"status": "unknown"},
+                    },
+                ),
+                process_pool.TaskOutcome(
+                    index=2,
+                    status="failed",
+                    value=None,
+                    error_code="codex_decision_invalid",
+                ),
+            ),
+            primary_error_code="codex_decision_invalid",
+        )
+    )
+
+    assert metrics["primary_error_code"] == "codex_decision_invalid"
+
+
 def test_rolling_drain_excludes_quarantined_unknown_writes() -> None:
     calls: list[tuple[int, int]] = []
 
@@ -3920,6 +3961,28 @@ def test_production_cli_finds_session_failure_in_exception_chain(
     assert alerts == ["rpa_cdp_timeout"]
 
 
+def test_production_cli_preserves_primary_error_when_reaping_fails(
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "run_rolling_drain",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            finance_preaudit_concurrency_probe.ControllerChildrenActiveError(
+                "codex_decision_invalid"
+            )
+        ),
+    )
+
+    assert finance_preaudit_concurrency_probe.main(
+        ["--capacity", "6", "--confirm-write", "YES"]
+    ) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error_code"] == "production_controller_children_active"
+    assert payload["primary_error_code"] == "codex_decision_invalid"
+
+
 def test_production_cli_does_not_mask_success_when_alert_reset_is_unknown(
     monkeypatch,
     capsys,
@@ -4070,7 +4133,7 @@ def test_dispatcher_times_out_stuck_task_and_stops_new_work(
     assert stop_requests == [True]
 
 
-def test_dispatcher_reports_failed_executor_reaping(
+def test_dispatcher_uses_final_process_state_after_transient_reaping_failure(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -4114,7 +4177,7 @@ def test_dispatcher_reports_failed_executor_reaping(
         runtime_status=lambda: {"status": "healthy"},
     )
 
-    assert result.processes_reaped is False
+    assert result.processes_reaped is True
 
 
 def test_dispatcher_times_out_stuck_recovery_before_review(

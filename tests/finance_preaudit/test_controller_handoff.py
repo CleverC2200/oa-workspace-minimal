@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 import re
 
@@ -32,6 +33,23 @@ def _reconciliation(pending: int = 0) -> dict:
         "quarantine": {
             "pending_quarantined": 0,
             "actionable_pending": pending,
+        },
+    }
+
+
+def _clear_reconciliation(pending: int = 0) -> dict:
+    return {
+        **_reconciliation(pending),
+        "failure_attention": {
+            "scope": "live_pending",
+            "status": "clear",
+            "affected_cases": 0,
+            "repeated_failure_cases": 0,
+            "long_wait_failure_cases": 0,
+            "long_wait_threshold_seconds": 86400,
+            "max_failure_attempts": 0,
+            "oldest_wait_seconds": 0,
+            "failure_counts": {},
         },
     }
 
@@ -199,6 +217,198 @@ def test_unreaped_pipeline_blocks_terminal_handoff(
         )
 
     assert runtime_control.stop_requested() is True
+
+
+def _write_failed_unreaped_manifest(
+    path: Path,
+    *,
+    controller_pid: int = 999999,
+) -> None:
+    path.parent.mkdir(parents=True)
+    json_artifact.write_json_atomic(
+        path,
+        {
+            "schema_version": 1,
+            "kind": "preaudit_controller_run_manifest",
+            "state": "failed",
+            "run_id": "0" * 32,
+            "started_at": "2026-08-25T00:00:00+00:00",
+            "completed_at": "2026-08-25T00:10:00+00:00",
+            "controller_pid": controller_pid,
+            "controller_instance_id": "1" * 32,
+            "previous_run_id": None,
+            "previous_controller_instance_id": None,
+            "code_revision": "0" * 40,
+            "code_dirty": False,
+            "config_fingerprint": "sha256:" + "0" * 64,
+            "restart_mode": "fresh_process",
+            "controller_lock_verified": True,
+            "writer_inactive_at_start": True,
+            "children_reaped": False,
+            "restart_verified": True,
+            "health": "degraded",
+        },
+    )
+
+
+def test_confirmed_stale_handoff_recovery_runs_only_after_live_gates(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    lock_file = tmp_path / "control" / "rolling-controller.lock"
+    stop_file = tmp_path / "stop-preaudit.flag"
+    monkeypatch.setenv(
+        "OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE",
+        str(lock_file),
+    )
+    monkeypatch.setenv("OA_FINANCE_PREAUDIT_STOP_FILE", str(stop_file))
+    monkeypatch.setenv("OA_FINANCE_PREAUDIT_CACHE_DB", "0")
+    monkeypatch.setattr(
+        controller_handoff,
+        "_code_state",
+        lambda: ("f" * 40, False),
+    )
+    _write_failed_unreaped_manifest(
+        lock_file.with_name("rolling-controller-manifest.json")
+    )
+    runtime_control.request_cycle_stop()
+
+    result = finance_preaudit_concurrency_probe.run_rolling_drain(
+        capacity=6,
+        confirm_stale_children_reaped=True,
+        live_status=_live_status,
+        reconcile_status=_clear_reconciliation,
+    )
+
+    assert result["status"] == "completed"
+    assert result["recovered_cycle_stop"] is True
+    assert runtime_control.stop_requested() is False
+    assert controller_handoff.status()["children_reaped"] is True
+
+
+def test_unconfirmed_stale_handoff_recovery_remains_blocked(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    lock_file = tmp_path / "control" / "rolling-controller.lock"
+    stop_file = tmp_path / "stop-preaudit.flag"
+    monkeypatch.setenv(
+        "OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE",
+        str(lock_file),
+    )
+    monkeypatch.setenv("OA_FINANCE_PREAUDIT_STOP_FILE", str(stop_file))
+    monkeypatch.setattr(
+        controller_handoff,
+        "_code_state",
+        lambda: ("f" * 40, False),
+    )
+    _write_failed_unreaped_manifest(
+        lock_file.with_name("rolling-controller-manifest.json")
+    )
+    runtime_control.request_cycle_stop()
+
+    with pytest.raises(
+        ValueError,
+        match="production_cycle_stop_recovery_blocked",
+    ):
+        finance_preaudit_concurrency_probe.run_rolling_drain(
+            capacity=6,
+            live_status=_live_status,
+            reconcile_status=_reconciliation,
+        )
+
+    assert runtime_control.stop_requested() is True
+    assert controller_handoff.status()["children_reaped"] is False
+
+
+def test_confirmed_stale_handoff_recovery_rejects_when_not_required(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE",
+        str(tmp_path / "control" / "rolling-controller.lock"),
+    )
+    monkeypatch.setenv(
+        "OA_FINANCE_PREAUDIT_STOP_FILE",
+        str(tmp_path / "stop-preaudit.flag"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="production_cycle_stop_recovery_not_required",
+    ):
+        finance_preaudit_concurrency_probe.run_rolling_drain(
+            capacity=6,
+            confirm_stale_children_reaped=True,
+            live_status=_live_status,
+            reconcile_status=_clear_reconciliation,
+        )
+
+
+def test_confirmed_stale_handoff_recovery_blocks_a_live_controller_pid(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    lock_file = tmp_path / "control" / "rolling-controller.lock"
+    monkeypatch.setenv(
+        "OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE",
+        str(lock_file),
+    )
+    monkeypatch.setenv(
+        "OA_FINANCE_PREAUDIT_STOP_FILE",
+        str(tmp_path / "stop-preaudit.flag"),
+    )
+    monkeypatch.setattr(
+        controller_handoff,
+        "_code_state",
+        lambda: ("f" * 40, False),
+    )
+    _write_failed_unreaped_manifest(
+        lock_file.with_name("rolling-controller-manifest.json"),
+        controller_pid=os.getpid(),
+    )
+    runtime_control.request_cycle_stop()
+
+    with pytest.raises(
+        ValueError,
+        match="controller_handoff_recovery_blocked",
+    ):
+        controller_handoff.recover_confirmed_children_reaped(confirmed=True)
+
+    assert controller_handoff.status()["children_reaped"] is False
+
+
+def test_confirmed_stale_handoff_recovery_rejects_a_different_stop_reason(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    lock_file = tmp_path / "control" / "rolling-controller.lock"
+    monkeypatch.setenv(
+        "OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE",
+        str(lock_file),
+    )
+    monkeypatch.setenv(
+        "OA_FINANCE_PREAUDIT_STOP_FILE",
+        str(tmp_path / "stop-preaudit.flag"),
+    )
+    monkeypatch.setattr(
+        controller_handoff,
+        "_code_state",
+        lambda: ("f" * 40, False),
+    )
+    _write_failed_unreaped_manifest(
+        lock_file.with_name("rolling-controller-manifest.json")
+    )
+    runtime_control.request_stop("writer_result_unknown")
+
+    with pytest.raises(
+        ValueError,
+        match="controller_handoff_recovery_blocked",
+    ):
+        controller_handoff.recover_confirmed_children_reaped(confirmed=True)
+
+    assert controller_handoff.status()["children_reaped"] is False
 
 
 def test_terminal_handoff_requires_a_fresh_controller_process(
