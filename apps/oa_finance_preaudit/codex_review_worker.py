@@ -211,6 +211,38 @@ def _frozen_rule_version(action_file: Path, workflow_key: str) -> str | None:
     return rule_version
 
 
+def _frozen_item_keys(action_file: Path, workflow_key: str) -> tuple[str, ...]:
+    from apps.oa_finance_preaudit import flow_engine
+
+    flow_root = action_file.parents[4]
+    validator = flow_engine.FlowEngine(
+        root=flow_root,
+        discover_candidates=lambda _workflow_key: (),
+        collect_material=lambda _request_id, _attempt_root: {},
+    )
+    try:
+        _action, _state, packet = validator._open_attempt(action_file)
+    except (IndexError, OSError, ValueError):
+        return ()
+    if packet.get("workflow_key") != workflow_key:
+        return ()
+    expected_item_keys = tuple(flow_engine._FLOW_SPECS[workflow_key]["item_keys"])
+    items = packet.get("items")
+    if not isinstance(items, list):
+        return ()
+    item_keys = tuple(
+        str(item.get("item_key") or "").strip()
+        for item in items
+        if isinstance(item, dict)
+    )
+    if (
+        packet.get("rule_version") != "small_marketing_fee:2"
+        or item_keys != expected_item_keys
+    ):
+        return ()
+    return item_keys
+
+
 def _small_marketing_attachment_terms_required(action_file: Path) -> bool:
     material_file = action_file.with_name("material.json")
     if material_file.is_symlink() or not material_file.is_file():
@@ -230,6 +262,19 @@ def _prompt(action_file: Path) -> str:
     workflow_key = _action_workflow(action_file) or "travel_expense"
     _rule_version, workflow_name, rule_reference = _FINANCE_RULES[workflow_key]
     frozen_rule_version = _frozen_rule_version(action_file, workflow_key)
+    frozen_item_keys = (
+        _frozen_item_keys(action_file, workflow_key)
+        if workflow_key == "small_marketing_fee"
+        and frozen_rule_version == "small_marketing_fee:2"
+        else ()
+    )
+    frozen_item_requirement = (
+        "审核项必须严格按以下规范键名和顺序输出："
+        + " → ".join(frozen_item_keys)
+        + "；不得重复、遗漏或调换顺序；"
+        if frozen_item_keys
+        else ""
+    )
     fallback_routing = (
         _page_routing_instruction(action_file)
         if workflow_key == "travel_expense"
@@ -247,16 +292,24 @@ def _prompt(action_file: Path) -> str:
         )
     else:
         workflow_requirement = "只按该流程固定审核项判断，不得读取其他流程规则或证据；"
+    output_requirement = (
+        "最终只输出符合本次宿主 JSON schema 的单个 JSON 对象；`items` "
+        "必须是以上六个规范键组成的对象，各键的值不包含 `item_key`；"
+        "宿主会按冻结顺序补回 `item_key` 并转换为 FlowEngine 决定数组。"
+        if workflow_key == "small_marketing_fee"
+        and frozen_rule_version == "small_marketing_fee:2"
+        else "最终只输出符合 flow-engine-contract“结构化审核决定”的单个 JSON 对象。"
+    )
     return f"""你是{workflow_name}生产预审的单据工作进程。用户当前明确授权本轮真实审批提交；这是受控生产工作进程，不是手工 preview。
 
 只处理这个已冻结动作：{action_file}
 {fallback_routing}
 
 要求：
-1. 完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由读取 `references/result-contract.md`、`references/observation-contract.md`、`{rule_reference}`、动作引用的审核包、材料和准备页；{workflow_requirement}不得读取其他 attempt。
+1. 完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由读取 `references/result-contract.md`、`references/observation-contract.md`、`{rule_reference}`、动作引用的审核包、材料和准备页；{workflow_requirement}{frozen_item_requirement}不得读取其他 attempt。
 2. 不修改任何文件、项目代码、Skill、配置、授权清单或冻结材料；不得调用 `next-action`、`complete-review` 或任何 OA 写入，不得领取其他单据。
 3. 根据审核包中的固定审核项动态形成结构化决定。证据不足使用 `uncertain` 交财务判断，不得因为材料缺口卡住业务流程；身份、归属、冻结或授权不可信时停止。
-4. 最终只输出符合 flow-engine-contract“结构化审核决定”的单个 JSON 对象，不添加 Markdown、解释、单号、人员、公司、附件原文、路径、意见正文、密钥或日志。宿主会校验并负责受控提交。
+4. {output_requirement}不添加 Markdown、解释、单号、人员、公司、附件原文、路径、意见正文、密钥或日志。宿主会校验并负责受控提交。
 """
 
 
@@ -321,6 +374,11 @@ def _decision_schema(action_file: Path | None = None) -> dict:
     )
     if rule_version is None:
         raise ValueError("codex_review_task_invalid")
+    frozen_item_keys = (
+        _frozen_item_keys(action_file, workflow_key)
+        if action_file is not None
+        else ()
+    )
     item_schema = {
         "type": "object",
         "additionalProperties": False,
@@ -345,34 +403,37 @@ def _decision_schema(action_file: Path | None = None) -> dict:
             },
         },
     }
-    if (
-        workflow_key == "small_marketing_fee"
-        and rule_version == "small_marketing_fee:2"
-        and action_file is not None
-        and _small_marketing_attachment_terms_required(action_file)
+    items_schema = {"type": "array", "items": item_schema}
+    if workflow_key == "small_marketing_fee" and rule_version == (
+        "small_marketing_fee:2"
     ):
-        attachment_schema = json.loads(json.dumps(item_schema))
-        attachment_schema["properties"]["item_key"] = {
-            "type": "string",
-            "const": "attachment_completeness",
+        if not frozen_item_keys:
+            raise ValueError("codex_review_task_invalid")
+        item_value_schema = json.loads(json.dumps(item_schema))
+        item_value_schema["required"].remove("item_key")
+        item_value_schema["properties"].pop("item_key")
+        item_schemas = {
+            item_key: json.loads(json.dumps(item_value_schema))
+            for item_key in frozen_item_keys
         }
-        attachment_schema["properties"]["conclusion"] = {
-            "type": "string",
-            "minLength": 1,
-            "pattern": "^(?:.*支付截图.*发票.*|.*发票.*支付截图.*)$",
+        if (
+            action_file is not None
+            and _small_marketing_attachment_terms_required(action_file)
+        ):
+            attachment_schema = item_schemas.get("attachment_completeness")
+            if attachment_schema is None:
+                raise ValueError("codex_review_task_invalid")
+            attachment_schema["properties"]["conclusion"] = {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^(?:.*支付截图.*发票.*|.*发票.*支付截图.*)$",
+            }
+        items_schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": list(frozen_item_keys),
+            "properties": item_schemas,
         }
-        other_schema = json.loads(json.dumps(item_schema))
-        other_schema["properties"]["item_key"] = {
-            "type": "string",
-            "enum": [
-                "budget_subject",
-                "cost_bearer",
-                "sap_customer_code",
-                "amount_reconciliation",
-                "payment_company_consistency",
-            ],
-        }
-        item_schema = {"anyOf": [attachment_schema, other_schema]}
     return {
         "type": "object",
         "additionalProperties": False,
@@ -392,8 +453,34 @@ def _decision_schema(action_file: Path | None = None) -> dict:
             "workflow_key": {"type": "string", "const": workflow_key},
             "rule_version": {"type": "string", "const": rule_version},
             "overall": {"type": "string", "enum": ["pass", "needs_human"]},
-            "items": {"type": "array", "items": item_schema},
+            "items": items_schema,
         },
+    }
+
+
+def _normalize_decision(action_file: Path, decision: dict) -> dict:
+    workflow_key = _action_workflow(action_file)
+    if (
+        workflow_key != "small_marketing_fee"
+        or _frozen_rule_version(action_file, workflow_key)
+        != "small_marketing_fee:2"
+    ):
+        return decision
+    item_keys = _frozen_item_keys(action_file, workflow_key)
+    keyed_items = decision.get("items")
+    if (
+        not item_keys
+        or not isinstance(keyed_items, dict)
+        or set(keyed_items) != set(item_keys)
+        or not all(isinstance(keyed_items[item_key], dict) for item_key in item_keys)
+    ):
+        return decision
+    return {
+        **decision,
+        "items": [
+            {**keyed_items[item_key], "item_key": item_key}
+            for item_key in item_keys
+        ],
     }
 
 
@@ -695,7 +782,7 @@ def _execute_codex(
                 candidate = None
                 decision_state = "unreadable"
             if isinstance(candidate, dict):
-                decision = candidate
+                decision = _normalize_decision(action_file, candidate)
                 decision_state = "valid_object"
             elif candidate is not None:
                 decision_state = "not_object"
@@ -989,6 +1076,12 @@ def _validated_task(task: dict) -> tuple[Path, Path, int]:
     action_file = Path(str(task["action_file"])).expanduser().resolve()
     timeout_seconds = task["timeout_seconds"]
     expected_root = project_root / "runtime" / "finance_preaudit_flows"
+    workflow_key = _action_workflow(action_file)
+    rule_version = (
+        _frozen_rule_version(action_file, workflow_key)
+        if workflow_key is not None
+        else None
+    )
     if (
         not project_root.is_dir()
         or not action_file.is_file()
@@ -998,12 +1091,13 @@ def _validated_task(task: dict) -> tuple[Path, Path, int]:
         or not isinstance(timeout_seconds, int)
         or isinstance(timeout_seconds, bool)
         or not 60 <= timeout_seconds <= 3600
-        or _action_workflow(action_file) is None
-        or _frozen_rule_version(
-            action_file,
-            _action_workflow(action_file) or "",
+        or workflow_key is None
+        or rule_version is None
+        or (
+            workflow_key == "small_marketing_fee"
+            and rule_version == "small_marketing_fee:2"
+            and not _frozen_item_keys(action_file, workflow_key)
         )
-        is None
     ):
         raise ValueError("codex_review_task_invalid")
     return project_root, action_file, timeout_seconds
