@@ -276,6 +276,13 @@ def _small_marketing_budget_subjects(material: dict) -> tuple[str, ...]:
     return tuple(values)
 
 
+def small_marketing_requires_payment_attachments(material: dict) -> bool:
+    subjects = _small_marketing_budget_subjects(material)
+    return bool(subjects) and any(
+        subject != _SMALL_MARKETING_SPECIAL_SUBJECT for subject in subjects
+    )
+
+
 def _validate_small_marketing_conclusions(
     items: list[dict],
     material: dict,
@@ -286,10 +293,7 @@ def _validate_small_marketing_conclusions(
         str(company.get("conclusion") or "").strip()
     ):
         raise ValueError("review_decision_invalid")
-    subjects = _small_marketing_budget_subjects(material)
-    if not subjects or all(
-        subject == _SMALL_MARKETING_SPECIAL_SUBJECT for subject in subjects
-    ):
+    if not small_marketing_requires_payment_attachments(material):
         return
     attachment = by_key.get("attachment_completeness", {})
     conclusion = str(attachment.get("conclusion") or "")

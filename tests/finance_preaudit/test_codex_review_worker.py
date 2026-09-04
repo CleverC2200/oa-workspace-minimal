@@ -135,6 +135,10 @@ def test_small_marketing_v2_worker_uses_six_item_requirements(
         packet_file,
         {**packet, "rule_version": "small_marketing_fee:2"},
     )
+    json_artifact.write_json_atomic(
+        action_file.with_name("material.json"),
+        {"declared_fields": {"budget_account": "市场活动费"}},
+    )
 
     schema = codex_review_worker._decision_schema(action_file)
     prompt = codex_review_worker._prompt(action_file)
@@ -143,12 +147,50 @@ def test_small_marketing_v2_worker_uses_six_item_requirements(
         "type": "string",
         "const": "small_marketing_fee:2",
     }
+    attachment_schema, other_schema = schema["properties"]["items"]["items"][
+        "anyOf"
+    ]
+    assert attachment_schema["properties"]["item_key"] == {
+        "type": "string",
+        "const": "attachment_completeness",
+    }
+    assert attachment_schema["properties"]["conclusion"]["pattern"] == (
+        "^(?:.*支付截图.*发票.*|.*发票.*支付截图.*)$"
+    )
+    assert "attachment_completeness" not in other_schema["properties"][
+        "item_key"
+    ]["enum"]
     assert "小额市场费生产预审" in prompt
     assert "small-marketing-fee.md" in prompt
     assert "六项必须逐项" in prompt
+    assert "逐字同时包含“支付截图”和“发票”" in prompt
+    assert "不得使用“支付凭证”等近义词替代" in prompt
     assert "支付截图和发票" in prompt
     assert "三者一致，应选择当前实际公司全称支付" in prompt
     assert "不得增加支付公司一致项" not in prompt
+
+
+def test_small_marketing_v2_special_subject_keeps_general_item_schema(
+    tmp_path: Path,
+) -> None:
+    _task_payload, action_file = _task(
+        tmp_path,
+        workflow_key="small_marketing_fee",
+    )
+    packet_file = action_file.with_name("review-packet.json")
+    packet = json.loads(packet_file.read_text(encoding="utf-8"))
+    json_artifact.write_json_atomic(
+        packet_file,
+        {**packet, "rule_version": "small_marketing_fee:2"},
+    )
+    json_artifact.write_json_atomic(
+        action_file.with_name("material.json"),
+        {"declared_fields": {"budget_account": "配送费-自提/租车费"}},
+    )
+
+    schema = codex_review_worker._decision_schema(action_file)
+
+    assert "anyOf" not in schema["properties"]["items"]["items"]
 
 
 def test_small_marketing_v1_worker_keeps_original_five_items(

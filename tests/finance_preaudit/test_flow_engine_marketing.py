@@ -184,6 +184,18 @@ def _decision(action: dict, reviewed_items: list[dict]) -> dict:
     }
 
 
+def test_payment_attachment_requirement_follows_budget_subject() -> None:
+    assert flow_engine.small_marketing_requires_payment_attachments(
+        {"declared_fields": {"budget_account": "市场活动费"}}
+    )
+    assert not flow_engine.small_marketing_requires_payment_attachments(
+        {"declared_fields": {"budget_account": "配送费-自提/租车费"}}
+    )
+    assert not flow_engine.small_marketing_requires_payment_attachments(
+        {"declared_fields": {}}
+    )
+
+
 def test_marketing_preview_cli_and_items_are_isolated(tmp_path: Path, capsys) -> None:
     engine = _engine(tmp_path)
     assert cli.main(
