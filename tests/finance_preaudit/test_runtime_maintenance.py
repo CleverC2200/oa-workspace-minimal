@@ -498,15 +498,29 @@ def test_status_only_counts_allowlisted_material_failures_as_local_quarantine(
         reason="material_collection_failed",
         failure_detail_code="frozen_material_changed",
     )
+    _attempt(
+        root,
+        case_key="invalid-codex-decision",
+        attempt=1,
+        age_days=0,
+        execution_state="needs_admin",
+        business_state="not_available",
+        write_state="not_requested",
+        reason="codex_decision_invalid",
+    )
 
     status = runtime_maintenance.status(root, now=NOW)
 
-    assert status["operations"]["item_local_quarantined"] == 1
+    assert status["operations"]["item_local_quarantined"] == 2
     assert status["operations"]["technical_failures"] == 1
     assert status["operations"]["current_bottleneck"] == {
         "evidence_status": "exact",
         "kind": "technical_failure",
         "affected_cases": 1,
+    }
+    assert status["workflows"][0]["failure_counts"] == {
+        "codex_decision_invalid": 1,
+        "material_collection_failed": 2,
     }
     assert "frozen_material_changed" not in json.dumps(status)
 
