@@ -104,12 +104,12 @@ _SMALL_MARKETING_V1_REQUIREMENT = (
 )
 _SMALL_MARKETING_V2_REQUIREMENT = (
     "六项必须逐项按小额市场费规则包形成结论；预算科目不是"
-    "“配送费-自提/租车费”时，附件完整性结论必须明确核对支付截图和"
-    "发票；支付公司一致通过时必须逐字使用“报销公司、支付公司、购买方"
-    "三者一致，应选择当前实际公司全称支付。”的句式并替换公司全称；"
+    "“配送费-自提/租车费”时，无论附件完整性结论为通过、不通过还是"
+    "不确定，结论都必须逐字同时包含“支付截图”和“发票”（例如“已核对"
+    "支付截图和发票”），不得使用“支付凭证”等近义词替代；支付公司一致"
+    "通过时必须逐字使用“报销公司、支付公司、购买方三者一致，应选择"
+    "当前实际公司全称支付。”的句式并替换公司全称；"
 )
-
-
 @dataclass(frozen=True)
 class CodexExecution:
     error_code: str | None
@@ -206,6 +206,21 @@ def _frozen_rule_version(action_file: Path, workflow_key: str) -> str | None:
     ):
         return None
     return rule_version
+
+
+def _small_marketing_attachment_terms_required(action_file: Path) -> bool:
+    material_file = action_file.with_name("material.json")
+    if material_file.is_symlink() or not material_file.is_file():
+        return False
+    try:
+        material = json.loads(material_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(material, dict):
+        return False
+    from apps.oa_finance_preaudit import flow_engine
+
+    return flow_engine.small_marketing_requires_payment_attachments(material)
 
 
 def _prompt(action_file: Path) -> str:
@@ -327,6 +342,34 @@ def _decision_schema(action_file: Path | None = None) -> dict:
             },
         },
     }
+    if (
+        workflow_key == "small_marketing_fee"
+        and rule_version == "small_marketing_fee:2"
+        and action_file is not None
+        and _small_marketing_attachment_terms_required(action_file)
+    ):
+        attachment_schema = json.loads(json.dumps(item_schema))
+        attachment_schema["properties"]["item_key"] = {
+            "type": "string",
+            "const": "attachment_completeness",
+        }
+        attachment_schema["properties"]["conclusion"] = {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^(?:.*支付截图.*发票.*|.*发票.*支付截图.*)$",
+        }
+        other_schema = json.loads(json.dumps(item_schema))
+        other_schema["properties"]["item_key"] = {
+            "type": "string",
+            "enum": [
+                "budget_subject",
+                "cost_bearer",
+                "sap_customer_code",
+                "amount_reconciliation",
+                "payment_company_consistency",
+            ],
+        }
+        item_schema = {"anyOf": [attachment_schema, other_schema]}
     return {
         "type": "object",
         "additionalProperties": False,
