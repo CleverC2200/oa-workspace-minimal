@@ -1172,6 +1172,14 @@ def complete_review_attempt(action_file: Path, reviewed: dict) -> dict:
     )
 
 
+def quarantine_invalid_decision(action_file: Path) -> dict:
+    from apps.oa_finance_preaudit import cli
+
+    return cli._live_flow_engine(controlled=True).quarantine_invalid_review(
+        action_file
+    )
+
+
 def run_read_only(
     task: dict,
     *,

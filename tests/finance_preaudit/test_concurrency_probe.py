@@ -142,7 +142,7 @@ def _quarantined_action(
     *,
     request_id: str,
     received_at: str,
-    failure_detail_code: str = "attachment_download_failed",
+    failure_detail_code: str | None = "attachment_download_failed",
     reason: str = "material_collection_failed",
 ) -> Path:
     case_key = hashlib.sha256(
@@ -166,13 +166,17 @@ def _quarantined_action(
         "write_state": "not_requested",
         "workflow_key": "travel_expense",
         "reason": reason,
-        "failure_detail_code": failure_detail_code,
         "request_id": request_id,
         "received_at": received_at,
         "case_key": case_key,
         "attempt": 1,
         "action_file": str(action_file),
         "state_file": str(state_file),
+        **(
+            {"failure_detail_code": failure_detail_code}
+            if failure_detail_code is not None
+            else {}
+        ),
     }
     attempt_root.mkdir(parents=True)
     json_artifact.write_json_atomic(action_file, payload)
@@ -1998,9 +2002,18 @@ def test_prepare_extends_skip_budget_when_new_item_is_quarantined(
     assert stop_requests == []
 
 
+@pytest.mark.parametrize(
+    ("reason", "failure_detail_code"),
+    [
+        ("material_collection_failed", "attachment_download_failed"),
+        ("codex_decision_invalid", None),
+    ],
+)
 def test_prepare_global_fifo_returns_trusted_zero_write_quarantine(
     tmp_path: Path,
     monkeypatch,
+    reason: str,
+    failure_detail_code: str | None,
 ) -> None:
     request_id = "quarantined-request"
     received_at = "2026-08-25T08:00:00+08:00"
@@ -2013,6 +2026,8 @@ def test_prepare_global_fifo_returns_trusted_zero_write_quarantine(
                 flow_root,
                 request_id=request_id,
                 received_at=received_at,
+                reason=reason,
+                failure_detail_code=failure_detail_code,
             )
             return json.loads(action_file.read_text(encoding="utf-8"))
 
@@ -2070,7 +2085,7 @@ def test_prepare_global_fifo_returns_trusted_zero_write_quarantine(
         }
     ) == {
         "action": "quarantined",
-        "error_code": "material_collection_failed",
+        "error_code": reason,
         "write_state": "not_requested",
     }
     assert stop_requests == []
@@ -5279,13 +5294,14 @@ def test_dispatcher_retries_one_prewrite_invalid_decision_with_merged_usage(
     assert stop_requests == []
 
 
-def test_dispatcher_stops_after_second_prewrite_invalid_decision(
+def test_dispatcher_quarantines_second_prewrite_invalid_decision(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     stop_requests: list[bool] = []
     review_calls: list[bool] = []
     completion_calls: list[bool] = []
+    quarantine_calls: list[Path] = []
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.runtime_control,
         "stop_requested",
@@ -5331,6 +5347,16 @@ def test_dispatcher_stops_after_second_prewrite_invalid_decision(
             "error_code": "codex_decision_invalid",
         }
 
+    def quarantine(action_file: Path) -> dict:
+        quarantine_calls.append(action_file)
+        return {
+            "action": "needs_admin",
+            "execution_state": "needs_admin",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "reason": "codex_decision_invalid",
+        }
+
     result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
         1,
         1,
@@ -5338,6 +5364,7 @@ def test_dispatcher_stops_after_second_prewrite_invalid_decision(
         renew_actions=lambda paths: paths,
         review_worker=review,
         complete_review=complete,
+        quarantine_review=quarantine,
         executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
         runtime_status=lambda: {"status": "healthy"},
     )
@@ -5345,11 +5372,198 @@ def test_dispatcher_stops_after_second_prewrite_invalid_decision(
     value = result.outcomes[0].value
     assert review_calls == [True, True]
     assert completion_calls == [True, True]
-    assert value["status"] == "failed"
+    assert len(quarantine_calls) == 1
+    assert value["status"] == "quarantined"
     assert value["write_state"] == "not_requested"
     assert value["error_code"] == "codex_decision_invalid"
     assert value["process_attempts"] == 2
     assert value["process_retries"] == 1
+    assert stop_requests == []
+
+
+def test_dispatcher_continues_fifo_after_invalid_decision_quarantine(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stop_requests: list[bool] = []
+    submitted: list[str] = []
+    quarantined: list[str] = []
+    blocked_key: list[str] = []
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda: stop_requests.append(True),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_preparation_executor",
+        lambda: ThreadPoolExecutor(max_workers=1),
+    )
+    project_root = tmp_path.resolve()
+    flow_root = project_root / "runtime" / "finance_preaudit_flows"
+    first_action = _open_action(
+        flow_root,
+        case_key="a" * 64,
+        created_at="2026-08-24T12:00:00+00:00",
+    )
+    second_action = _open_action(
+        flow_root,
+        case_key="b" * 64,
+        created_at="2026-08-24T12:00:01+00:00",
+    )
+    first_key = first_action.parent.parent.name
+    second_key = second_action.parent.parent.name
+    prepared_actions = iter((first_action, second_action))
+
+    def prepare(_selection: dict) -> dict:
+        return {
+            "action": "review_required",
+            "action_file": str(next(prepared_actions)),
+        }
+
+    def review(_task: dict) -> dict:
+        return {
+            "status": "reviewed",
+            "process_attempts": 1,
+            "process_retries": 0,
+            "token_usage": {"status": "unknown"},
+            "codex_events": {
+                "status": "unknown",
+                "attempts": 1,
+                "recorded_attempts": 0,
+                "unknown_attempts": 1,
+                "counts": {},
+            },
+            "agent_wall_seconds": 1,
+            "decision": {"overall": "needs_human"},
+        }
+
+    def complete(action_file: Path, reviewed: dict) -> dict:
+        case_key = action_file.parent.parent.name
+        if not blocked_key:
+            blocked_key.append(case_key)
+        if case_key == blocked_key[0]:
+            return {
+                **reviewed,
+                "status": "retry_required",
+                "business_state": "not_available",
+                "write_state": "not_requested",
+                "error_code": "codex_decision_invalid",
+            }
+        submitted.append(case_key)
+        return {
+            **reviewed,
+            "status": "completed",
+            "business_state": "needs_human",
+            "write_state": "submitted",
+            "error_code": None,
+        }
+
+    def quarantine(action_file: Path) -> dict:
+        quarantined.append(action_file.parent.parent.name)
+        return {
+            "action": "needs_admin",
+            "execution_state": "needs_admin",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "reason": "codex_decision_invalid",
+        }
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        2,
+        2,
+        project_root=project_root,
+        prepare_action=prepare,
+        review_worker=review,
+        complete_review=complete,
+        quarantine_review=quarantine,
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        runtime_status=lambda: {"status": "healthy"},
+        strict_global_fifo=True,
+    )
+
+    expected_submitted = second_key if blocked_key == [first_key] else first_key
+    assert quarantined == blocked_key
+    assert submitted == [expected_submitted], (
+        submitted,
+        quarantined,
+        [(outcome.status, outcome.value) for outcome in result.outcomes],
+        stop_requests,
+        result.primary_error_code,
+    )
+    assert result.outcomes[0].value["status"] == "quarantined"
+    assert result.outcomes[1].value["status"] == "completed"
+    assert stop_requests == []
+
+
+def test_dispatcher_stops_when_invalid_decision_quarantine_is_untrusted(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stop_requests: list[bool] = []
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda: stop_requests.append(True),
+    )
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    _open_action(
+        flow_root,
+        case_key="a" * 64,
+        created_at="2026-08-24T12:00:00+00:00",
+    )
+
+    def review(_task: dict) -> dict:
+        return {
+            "status": "reviewed",
+            "process_attempts": 1,
+            "process_retries": 0,
+            "token_usage": {"status": "unknown"},
+            "codex_events": {"status": "unknown"},
+            "agent_wall_seconds": 1,
+            "decision": {"overall": "needs_human"},
+        }
+
+    def complete(_action: Path, reviewed: dict) -> dict:
+        return {
+            **reviewed,
+            "status": "retry_required",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "error_code": "codex_decision_invalid",
+        }
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        1,
+        1,
+        project_root=tmp_path,
+        renew_actions=lambda paths: paths,
+        review_worker=review,
+        complete_review=complete,
+        quarantine_review=lambda _path: {
+            "action": "needs_admin",
+            "execution_state": "needs_admin",
+            "business_state": "not_available",
+            "write_state": "unknown",
+            "reason": "codex_decision_invalid",
+        },
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        runtime_status=lambda: {"status": "healthy"},
+    )
+
+    value = result.outcomes[0].value
+    assert value["status"] == "failed"
+    assert value["error_code"] == "codex_decision_quarantine_failed"
     assert stop_requests == [True]
 
 

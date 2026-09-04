@@ -28,6 +28,7 @@ _WORKFLOW_KEYS = {
 }
 _FAILURE_CODES = {
     "agent_timing_invalid",
+    "codex_decision_invalid",
     "frozen_material_changed",
     "frozen_packet_changed",
     "material_collection_failed",
@@ -442,9 +443,14 @@ def _operation_projection(items: list[dict]) -> dict:
         for item in open_items
         if item["execution_state"] == "needs_admin"
         and item["write_state"] == "not_requested"
-        and item["failure_code"] == "material_collection_failed"
-        and item["failure_detail_code"]
-        in ITEM_LOCAL_MATERIAL_FAILURE_DETAILS
+        and (
+            item["failure_code"] == "codex_decision_invalid"
+            or (
+                item["failure_code"] == "material_collection_failed"
+                and item["failure_detail_code"]
+                in ITEM_LOCAL_MATERIAL_FAILURE_DETAILS
+            )
+        )
     ]
     technical = [
         item
