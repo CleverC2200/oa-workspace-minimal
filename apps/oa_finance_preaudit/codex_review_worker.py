@@ -138,6 +138,8 @@ def _reviewer_environment() -> dict[str, str]:
     }
     if not environment.get("HOME") or not environment.get("PATH"):
         raise ValueError("codex_reviewer_environment_invalid")
+    # The host CLI shim must not start shared services inside a bounded review.
+    environment["OCX_SHIM_BYPASS"] = "1"
     return environment
 
 

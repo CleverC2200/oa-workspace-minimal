@@ -833,6 +833,7 @@ def test_codex_process_receives_only_reviewer_runtime_environment(
     monkeypatch.setenv("OA_UID", "must-not-reach-reviewer")
     monkeypatch.setenv("UNRELATED_SECRET", "must-not-reach-reviewer")
     monkeypatch.setenv("OPENAI_API_KEY", "reviewer-auth")
+    monkeypatch.setenv("OCX_SHIM_BYPASS", "0")
 
     class Process:
         pid = 12345
@@ -860,6 +861,7 @@ def test_codex_process_receives_only_reviewer_runtime_environment(
     assert captured_environment["HOME"]
     assert captured_environment["PATH"]
     assert captured_environment["OPENAI_API_KEY"] == "reviewer-auth"
+    assert captured_environment["OCX_SHIM_BYPASS"] == "1"
     assert "OA_APP_SECRET" not in captured_environment
     assert "OA_DB_PASSWORD" not in captured_environment
     assert "OA_BASE_URL" not in captured_environment
