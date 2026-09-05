@@ -9,9 +9,8 @@
 
 ## 工作约束
 
-- 编程前明确目标、假设和成功标准；简单优先，只做必要的小范围改动，保留已有未提交内容。
 - 开发固定在已保存的独立克隆 `oa-workspace-dev` 内使用 `codex/<slug>` 分支；生产项目 `oa-workspace-prd` 对应 `oa-workspace-minimal`，只保留干净 `main` 供生产审批，不在其中开发、创建开发工作树或切换功能分支。
-- 涉及开发环境、发布、合并或生产同步时，先读 [开发与生产隔离及发布](CONTRIBUTING.md#开发与生产隔离及发布)。远端合并不等于生产生效；生产同步与核验完成后，下一轮新进程才加载新版本。
+- 建立开发环境、发布、合并或生产同步时，先读 [开发与生产隔离及发布](CONTRIBUTING.md#开发与生产隔离及发布)。远端合并不等于生产生效；生产同步与核验完成后，下一轮新进程才加载新版本。
 - 手工调用默认只读 preview。任何 OA 写入、自动化启停或外部发布都必须有当前明确授权。
 - 不提交密钥、token、Cookie、账号、内部地址、数据库、附件正文、运行目录或未脱敏日志；真实配置只放 `.env`、Keychain 或本地运行环境。
 - 附件只有在归属当前流程且能关联具体审核项时才是证据；不得用文件名、顺序、相似金额或日期补猜事实。
@@ -19,7 +18,7 @@
 
 ## 按需读取
 
-- 修改财务预审、测试或规则：先读 `.agents/skills/oa-finance-preaudit/SKILL.md`，再按其路由读取对应 reference。
+- 实际单据预审使用 `.agents/skills/oa-finance-preaudit/SKILL.md`。开发结果结构读 [.agents/skills/oa-finance-preaudit/references/flow-engine-contract.md](.agents/skills/oa-finance-preaudit/references/flow-engine-contract.md)；证据规则读 [.agents/skills/oa-finance-preaudit/references/observation-contract.md](.agents/skills/oa-finance-preaudit/references/observation-contract.md)；流程规则经 [result-contract.md](.agents/skills/oa-finance-preaudit/references/result-contract.md) 只选择匹配流程。开发和测试不执行真实单据 next-action 或 complete-review。
 - 修改 GitHub Issue、PR 或交付规则：读 `CONTRIBUTING.md`、`docs/agents/issue-tracker.md` 和 `docs/agents/triage-labels.md`。
 - 统一领域词汇或记录架构决定：读 `CONTEXT.md` 和 `docs/agents/domain.md`。
 - `README.md` 只维护当前可验证事实、入口和验证命令；未实现设计放 GitHub Issues，不写成现状。
@@ -28,11 +27,11 @@
 
 - 非琐碎改动先关联 Issue；一个 PR 只解决一个可独立验收的问题，使用 `Closes #<issue>`。
 - 分支默认使用 `codex/<slug>`；提交使用英文 Conventional Commits，正文说明原因和验证，不添加 AI 签名。
-- 默认交付停在验证通过的本地提交；用户只说“提交”时仅创建本地 commit。只有用户当轮明确要求时，才执行 `git push`、创建或更新 PR、转 Ready、合并或清理远端分支；否则汇报待发布分支和提交，等待用户统一推送。
+- 默认交付停在验证通过的本地提交；用户只说“提交”时仅创建本地 commit。只有用户明确授权对应动作和范围时，才执行 `git push`、创建或更新 PR、转 Ready、合并或清理远端分支；否则汇报待发布分支和提交，等待用户统一推送。
 - PR 未完成时保持 Draft；聚焦测试、必要的完整测试和文档检查通过后再转 Ready。合并后核对关联 Issue 已关闭。
 
 ## 验证
 
-- 非琐碎代码改动使用快速质量门：先跑聚焦测试，再并行执行静态检查与 Standards/Spec 审查；汇总修复后只复审增量，最终完整测试原则上只跑一次。具体顺序读 `CONTRIBUTING.md` 的“验证层级”。
-- 只改文档：运行 Skill 校验、AGENTS 指令审计和 `git diff --check`。
+- 局部代码改动采用聚焦测试、受影响静态检查和一次聚焦审查。写入、授权、幂等、进程回收、跨模块契约或发布改动保留 Standards/Spec 双路审查及必要完整验收；细则读 `CONTRIBUTING.md` 的“验证层级”。
+- 文档改动检查受影响链接和 `git diff --check`；修改 Skill 时校验对应 Skill，修改 AGENTS 或指令路由时执行指令审计。
 - 无法验证时明确说明未验证项，不把 mock、preview 或计划描述为生产事实。
