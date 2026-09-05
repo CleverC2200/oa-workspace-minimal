@@ -25,6 +25,8 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
 
 滚动控制器不得把单个 AI 进程的普通写前失败扩大为长期全局阻断。`codex_process_failed` 或 `codex_process_incomplete` 只有在同一单据已完成两次安全尝试、结果明确为 `write_state=not_requested`，且存在绑定当前 action token、模型、推理档位和两次逐次错误码的原子 `review-failure.json` 时，才进入隔离检查。FlowEngine 在完成锁内复核该凭据、动作仍为 `review_required / authorized`，且不存在 Writer 边界、执行回执、审核决定、签字意见和提交信封后，持久化凭据指纹与 `codex_review_failed / needs_admin / not_requested` 并继续全局 FIFO。收据已写但父控制器在隔离前停止时，后续运行可以复用完全相同且仍绑定当前 action 的收据；内容冲突必须停止。任一条件不满足、隔离落盘失败、进程超时/卡死、宿主 critical 或出现未列入白名单的新错误码时，仍立即停止整轮。历史 `codex_review_failed` 只有在 action/state、收据指纹和零 Writer 痕迹全部复核通过后才计入隔离并参与人工对账；损坏现场按 `review_quarantine_invalid` 技术失败处理，不自动重试。
 
+人工明确授权后，滚动入口可通过精确的 `--recover-action-file` 恢复 `codex_decision_invalid` 或 `codex_review_failed`。恢复前必须核对 action/state 均为 `needs_admin / not_requested`、冻结身份与材料完整、最新 attempt、实时待办身份一致且无已办命中，并确认不存在 Writer 边界、执行回执、审核决定、意见或提交信封；进程失败还必须通过原始失败凭据与指纹校验。只创建新的冻结 attempt，保留原隔离证据，不直接写 OA；不带显式恢复参数时仍跳过历史隔离，不自动重试，未知写入规则不变。
+
 每个 attempt 只有一个当前动作；同一候选重复调用时返回原动作和 token，不重复取数。积压中还存在未打开候选时，后续 `next-action` 可以打开另一单据，供独立审核调用处理。`current-action.json` 只是最近一次返回动作的投影，不是全局锁或事实源。
 
 同一 attempt 的完成转换使用 attempt 锁单飞，后到的重复决定不能覆盖已闭合结果；不同 case 不共享提交锁。完成旧动作时，若投影已指向另一单据，不得回写覆盖该投影。

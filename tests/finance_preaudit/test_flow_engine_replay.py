@@ -8,6 +8,7 @@ import pytest
 
 from apps import json_artifact
 from apps.oa_finance_preaudit import cli, flow_engine
+from apps.oa_finance_preaudit import review_failure_evidence
 
 
 RECEIVED_AT = "2026-08-22T09:00:00+08:00"
@@ -138,6 +139,102 @@ def test_confirmed_material_failure_creates_fresh_attempt_only_after_live_check(
     assert Path(failed["state_file"]).read_bytes() == old_state
     new_state = json.loads(Path(recovered["state_file"]).read_text(encoding="utf-8"))
     assert new_state["attempt"] == 2
+
+
+def _quarantined_review(
+    engine: flow_engine.FlowEngine,
+    failure_code: str,
+    workflow_key: str = "travel_expense",
+) -> dict:
+    action = engine.next_action(workflow_key, mode="controlled_write")
+    path = Path(action["action_file"])
+    if failure_code == "codex_process_failed":
+        json_artifact.write_json_atomic(
+            path.with_name("review-failure.json"),
+            review_failure_evidence.receipt_payload(
+                action_token=action["action_token"],
+                workflow_key=action["workflow_key"],
+                failure_code=failure_code,
+                attempt_error_codes=[failure_code, failure_code],
+            ),
+        )
+    return engine.quarantine_review_failure(path, failure_code)
+
+
+@pytest.mark.parametrize("failure_code", ["codex_decision_invalid", "codex_process_failed"])
+@pytest.mark.parametrize("workflow_key", ["travel_expense", "small_marketing_fee"])
+def test_confirmed_review_failure_recovers_without_writing(
+    tmp_path: Path, failure_code: str, workflow_key: str,
+) -> None:
+    calls = []
+    engine = _engine(
+        tmp_path, authorization_source=_grant,
+        submit_frozen=lambda job: calls.append(job) or _success(job),
+        candidates=[{**_candidates()[0], "workflow_key": workflow_key}],
+        collect_material=lambda request_id, _root: {
+            **_material(request_id), "workflow_key": workflow_key,
+        },
+    )
+    failed = _quarantined_review(engine, failure_code, workflow_key)
+    path = Path(failed["action_file"])
+    original = path.read_bytes()
+    with pytest.raises(ValueError, match="recovery_confirmation_required"):
+        engine.recover_confirmed_no_write(path)
+    recovered = engine.recover_confirmed_no_write(
+        path, confirmed=True, mode="controlled_write",
+    )
+    assert recovered["action"] == "review_required"
+    assert recovered["attempt"] == 2
+    assert path.read_bytes() == original
+    assert calls == []
+    with pytest.raises(ValueError, match="recovery_not_safe"):
+        engine.recover_confirmed_no_write(path, confirmed=True)
+
+
+@pytest.mark.parametrize("failure_code", ["codex_decision_invalid", "codex_process_failed"])
+@pytest.mark.parametrize("artifact", [
+    "writer-boundary.json", "execution-receipt.json", "review-decision.json",
+    "remark.txt", "submission-envelope.json", "material.json", "review-packet.json",
+])
+def test_review_recovery_rejects_writer_or_changed_evidence(tmp_path, failure_code, artifact):
+    engine = _engine(tmp_path, authorization_source=_grant, submit_frozen=_success)
+    failed = _quarantined_review(engine, failure_code)
+    path = Path(failed["action_file"])
+    json_artifact.write_json_atomic(path.with_name(artifact), {})
+    with pytest.raises(ValueError, match="recovery_not_safe"):
+        engine.recover_confirmed_no_write(path, confirmed=True)
+    assert not path.parent.with_name("attempt-2").exists()
+
+
+def test_review_recovery_rejects_changed_failure_receipt(tmp_path):
+    engine = _engine(tmp_path, authorization_source=_grant, submit_frozen=_success)
+    failed = _quarantined_review(engine, "codex_process_failed")
+    path = Path(failed["action_file"])
+    json_artifact.write_json_atomic(path.with_name("review-failure.json"), {})
+    with pytest.raises(ValueError, match="recovery_not_safe"):
+        engine.recover_confirmed_no_write(path, confirmed=True)
+
+
+@pytest.mark.parametrize("failure_code", ["codex_decision_invalid", "codex_process_failed"])
+@pytest.mark.parametrize("conflict", ["handled", "not_pending", "unknown", "action_identity", "dangling_writer"])
+def test_review_recovery_rejects_conflicting_state(tmp_path, failure_code, conflict):
+    engine = _engine(tmp_path, authorization_source=_grant, submit_frozen=_success)
+    failed = _quarantined_review(engine, failure_code)
+    path = Path(failed["action_file"])
+    if conflict == "handled":
+        engine._discover_handled = lambda: [{"request_id": "recorded-request"}]
+    elif conflict == "not_pending":
+        engine._discover_candidates = lambda _workflow: []
+    elif conflict == "unknown":
+        _mark_unknown(failed)
+    elif conflict == "action_identity":
+        failed["case_key"] = "different-case"
+        json_artifact.write_json_atomic(path, failed)
+    else:
+        path.with_name("writer-boundary.json").symlink_to(path.with_name("missing"))
+    with pytest.raises(ValueError, match="recovery_(not_safe|live_state_conflict)"):
+        engine.recover_confirmed_no_write(path, confirmed=True)
+    assert not path.parent.with_name("attempt-2").exists()
 
 
 def test_quarantined_candidate_does_not_mask_later_review_required(

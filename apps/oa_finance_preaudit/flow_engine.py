@@ -3054,13 +3054,56 @@ class FlowEngine:
             in {
                 "material_collection_failed",
                 "write_authorization_invalid",
+                "codex_decision_invalid",
+                "codex_review_failed",
                 *writer_outcomes.CONFIRMED_NO_WRITE_CODES,
             }
             and action.get("write_state") == "not_requested"
             and state.get("write_state") == "not_requested"
         )
         authorization_failure = reason == "write_authorization_invalid"
-        if authorization_failure:
+        review_failure = reason in {"codex_decision_invalid", "codex_review_failed"}
+        if review_failure:
+            shared = (
+                "workflow_key",
+                "case_key",
+                "attempt",
+                "action_file",
+                "state_file",
+            )
+            if (
+                not isinstance(state.get("action_token"), str)
+                or not state["action_token"]
+                or any(action.get(key) != state.get(key) for key in shared)
+                or any(
+                    payload.get("mode") != "preview"
+                    or payload.get("write_authorized") is not False
+                    or payload.get("business_state") != "not_available"
+                    for payload in (action, state)
+                )
+                or any(
+                    os.path.lexists(attempt_root / name)
+                    for name in (
+                        "writer-boundary.json",
+                        "execution-receipt.json",
+                        "review-decision.json",
+                        "remark.txt",
+                        "submission-envelope.json",
+                    )
+                )
+                or (
+                    reason == "codex_review_failed"
+                    and not review_failure_evidence.trusted_quarantine(
+                        attempt_root, state
+                    )
+                )
+                or (
+                    reason == "codex_decision_invalid"
+                    and os.path.lexists(attempt_root / "review-failure.json")
+                )
+            ):
+                raise ValueError("recovery_not_safe")
+        if authorization_failure or review_failure:
             if os.path.lexists(attempt_root / "writer-boundary.json"):
                 raise ValueError("recovery_not_safe")
             try:
@@ -3081,7 +3124,7 @@ class FlowEngine:
             or not self._attempt_identity_matches(
                 attempt_root,
                 state,
-                require_material=authorization_failure,
+                require_material=authorization_failure or review_failure,
             )
             or os.path.lexists(attempt_root / "execution-receipt.json")
         ):
