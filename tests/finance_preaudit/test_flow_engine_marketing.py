@@ -405,46 +405,49 @@ def test_invalid_review_quarantine_rejects_write_artifact(tmp_path: Path) -> Non
     assert state["write_state"] == "authorized"
 
 
-def _write_process_failure_receipt(action_file: Path) -> None:
+def _write_process_failure_receipt(action_file: Path, code: str = "codex_process_failed") -> None:
+    count = 1 if code == "codex_process_timeout" else 2
     reviewed = {
         "schema_version": 1,
         "kind": "preaudit_review_worker_result",
         "model": codex_review_worker.MODEL,
         "reasoning_effort": codex_review_worker.REASONING_EFFORT,
-        "process_attempts": 2,
-        "process_retries": 1,
+        "process_attempts": count,
+        "process_retries": count - 1,
         "token_usage": {"status": "unknown"},
         "codex_events": {
             "status": "unknown",
-            "attempts": 2,
+            "attempts": count,
             "recorded_attempts": 0,
-            "unknown_attempts": 2,
+            "unknown_attempts": count,
             "counts": {},
         },
         "status": "failed",
         "business_state": "not_available",
         "write_state": "not_requested",
-        "error_code": "codex_process_failed",
+        "error_code": code,
     }
     assert codex_review_worker._write_review_failure_receipt(
         action_file,
         reviewed,
-        attempt_error_codes=["codex_process_failed", "codex_process_failed"],
+        attempt_error_codes=[code] * count,
     )
 
 
+@pytest.mark.parametrize("code", ["codex_process_failed", "codex_process_timeout"])
 def test_process_review_quarantine_persists_confirmed_no_write(
     tmp_path: Path,
+    code: str,
 ) -> None:
     calls: list[dict] = []
     engine = _engine(tmp_path, calls=calls)
     action = engine.next_action(WORKFLOW_KEY)
     action_file = Path(action["action_file"])
-    _write_process_failure_receipt(action_file)
+    _write_process_failure_receipt(action_file, code)
 
     quarantined = engine.quarantine_review_failure(
         action_file,
-        "codex_process_failed",
+        code,
     )
     state = json.loads(
         action_file.with_name("state.json").read_text(encoding="utf-8")

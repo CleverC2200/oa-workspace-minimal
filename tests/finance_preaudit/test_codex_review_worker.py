@@ -646,6 +646,7 @@ def test_execute_codex_normalizes_small_marketing_transport_schema(
     class Process:
         pid = 12345
         returncode = 0
+        stderr = io.StringIO()
 
         def __init__(self, command: list[str]) -> None:
             self.decision_file = Path(
@@ -787,6 +788,7 @@ def test_codex_start_blocks_sigterm_until_process_group_is_registered(
     class Process:
         pid = 12345
         returncode = 1
+        stderr = io.StringIO()
 
         def communicate(self, *, input: str, timeout: int) -> None:
             del input, timeout
@@ -838,6 +840,7 @@ def test_codex_process_receives_only_reviewer_runtime_environment(
     class Process:
         pid = 12345
         returncode = 1
+        stderr = io.StringIO()
 
         def communicate(self, *, input: str, timeout: int) -> None:
             del input, timeout
@@ -1019,13 +1022,14 @@ def test_production_review_accumulates_retry_events_and_tokens(
     }
 
 
-def test_bounded_prewrite_failure_persists_bound_receipt(tmp_path: Path) -> None:
+@pytest.mark.parametrize("code,count", [("codex_process_failed", 2), ("codex_process_timeout", 1)])
+def test_bounded_prewrite_failure_persists_bound_receipt(tmp_path: Path, code: str, count: int) -> None:
     task, action_file = _task(tmp_path)
 
     result = codex_review_worker.review(
         task,
         executor=lambda *_args: codex_review_worker.CodexExecution(
-            error_code="codex_process_failed",
+            error_code=code,
             token_usage={"status": "unknown"},
         ),
     )
@@ -1041,13 +1045,10 @@ def test_bounded_prewrite_failure_persists_bound_receipt(tmp_path: Path) -> None
         "workflow_key": "travel_expense",
         "model": codex_review_worker.MODEL,
         "reasoning_effort": codex_review_worker.REASONING_EFFORT,
-        "process_attempts": 2,
-        "process_retries": 1,
-        "failure_code": "codex_process_failed",
-        "attempt_error_codes": [
-            "codex_process_failed",
-            "codex_process_failed",
-        ],
+        "process_attempts": count,
+        "process_retries": count - 1,
+        "failure_code": code,
+        "attempt_error_codes": [code] * count,
     }
 
 

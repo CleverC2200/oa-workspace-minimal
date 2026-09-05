@@ -225,6 +225,7 @@ _REVIEW_QUARANTINE_REASONS = {
     "codex_decision_invalid": "codex_decision_invalid",
     "codex_process_failed": "codex_review_failed",
     "codex_process_incomplete": "codex_review_failed",
+    "codex_process_timeout": "codex_review_failed",
 }
 
 

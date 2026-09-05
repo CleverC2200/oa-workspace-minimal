@@ -5323,6 +5323,63 @@ def test_dispatcher_retries_one_prewrite_invalid_decision_with_merged_usage(
     assert stop_requests == []
 
 
+def test_timeout_is_quarantined_but_still_stops_pipeline(tmp_path: Path, monkeypatch) -> None:
+    from apps.oa_finance_preaudit import codex_review_worker as worker
+
+    stopped, quarantined, submitted = [], [], []
+    monkeypatch.setattr(finance_preaudit_concurrency_probe.runtime_control, "stop_requested", lambda: False)
+    monkeypatch.setattr(finance_preaudit_concurrency_probe.runtime_control, "request_stop", lambda: stopped.append(True))
+    _open_action(tmp_path / "runtime" / "finance_preaudit_flows",
+                 case_key="8" * 64, created_at="2026-08-24T12:00:00+00:00")
+    value = {
+        **worker._base_result(attempts=1, usages=[{"status": "unknown"}]),
+        "codex_events": worker._unknown_events(1), "status": "failed",
+        "business_state": "not_available", "write_state": "not_requested",
+        "error_code": "codex_process_timeout",
+    }
+
+    def quarantine(path, reason):
+        quarantined.append(reason)
+        return {"action": "needs_admin", "execution_state": "needs_admin",
+                "business_state": "not_available", "write_state": "not_requested",
+                "reason": "codex_review_failed"}
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        1, 1, project_root=tmp_path, renew_actions=lambda paths: paths,
+        review_worker=lambda task: value,
+        complete_review=lambda *args: submitted.append(True),
+        quarantine_review=quarantine,
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        runtime_status=lambda: {"status": "healthy"},
+    )
+    assert quarantined == ["codex_process_timeout"]
+    assert stopped and submitted == []
+    assert result.outcomes[0].value["execution_state"] == "needs_admin"
+    assert result.outcomes[0].value["status"] == "failed"
+
+
+def test_rolling_timeout_keeps_token_usage_unknown() -> None:
+    result = finance_preaudit_concurrency_probe.run_rolling_drain(
+        capacity=6, adaptive=True,
+        live_status=lambda: {"credentials": {"status": "ok"}, "oa": {
+            "execution_identity": "verified", "by_workflow": {"travel_expense": 1}}},
+        reconcile_status=lambda: _reconciliation_snapshot(1),
+        pipeline_runner=lambda count, capacity: process_pool.PoolResult(
+            requested=1, started=1, completed=1, failed=0, timed_out=0, stopped=0,
+            peak_active=1, elapsed_seconds=1,
+            outcomes=(process_pool.TaskOutcome(index=0, status="completed", value={
+                "status": "failed", "error_code": "codex_process_timeout",
+                "business_state": "not_available", "write_state": "not_requested",
+                "process_attempts": 1, "process_retries": 0,
+                "token_usage": {"status": "unknown"},
+            }),),
+        ),
+    )
+    assert result["failed"] == 1
+    assert result["token_usage"]["unknown_workers"] == 1
+    assert result["token_usage"]["status"] == "unknown"
+
+
 def test_dispatcher_quarantines_second_prewrite_invalid_decision(
     tmp_path: Path,
     monkeypatch,

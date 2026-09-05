@@ -14,7 +14,7 @@ from typing import Callable, TextIO
 from apps import json_artifact
 from apps.oa_approval import runtime_control, writer_outcomes
 
-from . import decision_validation, review_failure_evidence
+from . import decision_validation, process_diagnostics, review_failure_evidence
 
 
 MODEL = review_failure_evidence.MODEL
@@ -682,6 +682,36 @@ def _execute_codex(
     *,
     prompt_builder: Callable[[Path], str] = _prompt,
 ) -> CodexExecution:
+    started = time.monotonic()
+    stderr: dict = {}
+    execution = _execute_codex_raw(
+        project_root, action_file, timeout_seconds,
+        prompt_builder=prompt_builder, stderr_summary=stderr,
+    )
+    try:
+        if stderr.get("collection_failed"):
+            raise ValueError("process_diagnostic_invalid")
+        process_diagnostics.record(
+            action_file, execution=execution,
+            elapsed_seconds=time.monotonic() - started, stderr=stderr,
+        )
+    except (OSError, ValueError, TypeError):
+        return CodexExecution(
+            "codex_process_diagnostic_failed", execution.token_usage,
+            process_state=execution.process_state, event_counts=execution.event_counts,
+            event_status=execution.event_status, exit_code=execution.exit_code,
+        )
+    return execution
+
+
+def _execute_codex_raw(
+    project_root: Path,
+    action_file: Path,
+    timeout_seconds: int,
+    *,
+    prompt_builder: Callable[[Path], str] = _prompt,
+    stderr_summary: dict,
+) -> CodexExecution:
     output = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
     with tempfile.TemporaryDirectory(prefix="oa-preaudit-codex-") as temporary:
         temporary_root = Path(temporary)
@@ -732,8 +762,9 @@ def _execute_codex(
                 env=_reviewer_environment(),
                 stdin=subprocess.PIPE,
                 stdout=output,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
+                errors="replace",
                 start_new_session=True,
             )
         except OSError:
@@ -748,6 +779,19 @@ def _execute_codex(
             )
         finally:
             restore_sigterm_mask()
+        errors = process.stderr
+        process.stderr = None  # The bounded reader owns this pipe, not communicate().
+        stderr_failed: list[bool] = []
+
+        def collect_stderr() -> None:
+            try:
+                with errors:
+                    stderr_summary.update(process_diagnostics.stderr_summary(errors))
+            except (OSError, ValueError):
+                stderr_failed.append(True)
+
+        stderr_reader = threading.Thread(target=collect_stderr, daemon=True)
+        stderr_reader.start()
         try:
             process.communicate(
                 input=prompt_builder(action_file),
@@ -758,6 +802,7 @@ def _execute_codex(
             usage = _parse_token_usage(output)
             event_counts = _parse_event_counts(output)
             event_status = _event_status(output, event_counts)
+            stderr_summary["last_observed_stage"] = process_diagnostics.last_stage(output)
             output.close()
             return CodexExecution(
                 "codex_process_timeout",
@@ -770,9 +815,16 @@ def _execute_codex(
             )
         finally:
             restore_sigterm()
+            stderr_reader.join(timeout=5)
+            if stderr_reader.is_alive():
+                _terminate_process_group(process, grace_seconds=0.2)
+                stderr_reader.join(timeout=1)
+            if stderr_reader.is_alive() or stderr_failed:
+                stderr_summary["collection_failed"] = True
         usage = _parse_token_usage(output)
         event_counts = _parse_event_counts(output)
         event_status = _event_status(output, event_counts)
+        stderr_summary["last_observed_stage"] = process_diagnostics.last_stage(output)
         decision: dict | None = None
         decision_state = "not_written"
         if process.returncode == 0:
@@ -943,10 +995,14 @@ def is_bounded_prewrite_failure(value: object) -> bool:
         and value.get("kind") == "preaudit_review_worker_result"
         and value.get("model") == MODEL
         and value.get("reasoning_effort") == REASONING_EFFORT
-        and value.get("process_attempts") == 2
-        and value.get("process_retries") == 1
+        and type(value.get("process_attempts")) is int
+        and value.get("process_attempts") in (
+            {1, 2} if value.get("error_code") == "codex_process_timeout" else {2}
+        )
+        and type(value.get("process_retries")) is int
+        and value.get("process_retries") == value["process_attempts"] - 1
         and _valid_token_usage(value.get("token_usage"))
-        and _valid_events(value.get("codex_events"), attempts=2)
+        and _valid_events(value.get("codex_events"), attempts=value["process_attempts"])
         and value.get("status") == "failed"
         and value.get("business_state") == "not_available"
         and value.get("write_state") == "not_requested"
@@ -962,11 +1018,8 @@ def _write_review_failure_receipt(
 ) -> bool:
     if (
         not is_bounded_prewrite_failure(reviewed)
-        or len(attempt_error_codes) != 2
-        or any(
-            code not in _BOUNDED_PREWRITE_FAILURE_CODES
-            for code in attempt_error_codes
-        )
+        or not review_failure_evidence.valid_attempt_codes(attempt_error_codes)
+        or len(attempt_error_codes) != reviewed["process_attempts"]
         or attempt_error_codes[-1] != reviewed["error_code"]
     ):
         return False
