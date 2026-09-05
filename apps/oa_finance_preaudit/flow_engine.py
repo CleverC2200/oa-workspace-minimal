@@ -17,7 +17,7 @@ import fitz
 from apps import json_artifact
 from apps.oa_approval import writer_outcomes
 
-from . import observability, review_failure_evidence, submission
+from . import decision_validation, observability, review_failure_evidence, submission
 
 
 SCHEMA_VERSION = 1
@@ -246,12 +246,12 @@ def _validate_general_expense_conclusions(items: list[dict]) -> None:
         str(budget.get("conclusion") or "").strip()
         != _GENERAL_EXPENSE_BUDGET_CONCLUSION
     ):
-        raise ValueError("review_decision_invalid")
+        raise decision_validation.InvalidDecision("budget_conclusion")
     company = by_key.get("payment_company_consistency", {})
     if company.get("status") == "pass" and not _PAYMENT_COMPANY_PASS.fullmatch(
         str(company.get("conclusion") or "").strip()
     ):
-        raise ValueError("review_decision_invalid")
+        raise decision_validation.InvalidDecision("payment_company_conclusion")
     attachment = by_key.get("attachment_payment_evidence", {})
     attachment_conclusion = str(attachment.get("conclusion") or "").strip()
     if (
@@ -262,7 +262,7 @@ def _validate_general_expense_conclusions(items: list[dict]) -> None:
             or not _GENERAL_EXPENSE_DEFERRED_AMOUNT.search(attachment_conclusion)
         )
     ):
-        raise ValueError("review_decision_invalid")
+        raise decision_validation.InvalidDecision("deferred_payment_conclusion")
 
 
 def _small_marketing_budget_subjects(material: dict) -> tuple[str, ...]:
@@ -299,13 +299,13 @@ def _validate_small_marketing_conclusions(
     if company.get("status") == "pass" and not _PAYMENT_COMPANY_PASS.fullmatch(
         str(company.get("conclusion") or "").strip()
     ):
-        raise ValueError("review_decision_invalid")
+        raise decision_validation.InvalidDecision("payment_company_conclusion")
     if not small_marketing_requires_payment_attachments(material):
         return
     attachment = by_key.get("attachment_completeness", {})
     conclusion = str(attachment.get("conclusion") or "")
     if "支付截图" not in conclusion or "发票" not in conclusion:
-        raise ValueError("review_decision_invalid")
+        raise decision_validation.InvalidDecision("payment_attachment_terms")
 
 
 def _read_object(path: Path, *, code: str) -> dict:
@@ -3468,11 +3468,11 @@ class FlowEngine:
             or decision.get("overall") not in {"pass", "needs_human"}
             or not isinstance(decision.get("items"), list)
         ):
-            raise ValueError("review_decision_invalid")
+            raise decision_validation.InvalidDecision("decision_contract")
 
         packet_items = packet.get("items")
         if not isinstance(packet_items, list) or len(decision["items"]) != len(packet_items):
-            raise ValueError("review_decision_invalid")
+            raise decision_validation.InvalidDecision("item_count")
         packaging_skip_declared = (
             packaging_v2
             and isinstance(decision.get("visual_review"), dict)
@@ -3487,7 +3487,7 @@ class FlowEngine:
                 "evidence_refs",
                 "missing_evidence",
             }:
-                raise ValueError("review_decision_invalid")
+                raise decision_validation.InvalidDecision("item_fields")
             status = item.get("status")
             evidence_refs = item.get("evidence_refs")
             missing_evidence = item.get("missing_evidence")
@@ -3510,7 +3510,7 @@ class FlowEngine:
                 )
                 or (status == "uncertain" and not missing_evidence)
             ):
-                raise ValueError("review_decision_invalid")
+                raise decision_validation.InvalidDecision("item_values")
             normalized_items.append(dict(item))
 
         required_uncertain_items = set(packet["required_uncertain_items"])
@@ -3519,7 +3519,7 @@ class FlowEngine:
             and item["status"] != "uncertain"
             for item in normalized_items
         ):
-            raise ValueError("review_decision_invalid")
+            raise decision_validation.InvalidDecision("required_uncertain")
         if action["workflow_key"] == "general_expense":
             _validate_general_expense_conclusions(normalized_items)
 
@@ -3690,7 +3690,7 @@ class FlowEngine:
         needs_human = any(item["status"] != "pass" for item in normalized_items)
         expected_overall = "needs_human" if needs_human else "pass"
         if decision["overall"] != expected_overall:
-            raise ValueError("review_decision_invalid")
+            raise decision_validation.InvalidDecision("overall_mismatch")
 
         stored_decision = action_path.with_name("review-decision.json")
         if stored_decision.exists():
