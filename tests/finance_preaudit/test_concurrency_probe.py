@@ -6916,12 +6916,13 @@ def test_dispatcher_adaptive_window_keeps_worst_heartbeat_health(
     assert result.capacity_decisions[0]["action"] == "decrease"
     assert result.capacity_decisions[0]["next_capacity"] == 6
     assert result.capacity_decisions[0]["reason"] == "host_pressure"
-    assert sum(
-        decision["reason"] == "host_pressure"
+    assert [
+        decision["next_capacity"]
         for decision in result.capacity_decisions
-    ) == 1
+        if decision["reason"] == "host_pressure"
+    ] == [6, 2, 1]
     assert result.capacity_decisions[-1]["reason"] == "host_pressure_active"
-    assert result.recommended_capacity == 6
+    assert result.recommended_capacity == 1
 
 
 def test_strict_global_fifo_merges_recovered_open_and_live_claim_order(

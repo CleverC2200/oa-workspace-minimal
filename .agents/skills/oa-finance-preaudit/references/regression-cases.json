@@ -3,6 +3,17 @@
   "description": "人工确认的脱敏财务预审错误案例。仅在盲测结果冻结后用于对照和回归，不作为观察子 Agent 的当前答案。",
   "cases": [
     {
+      "id": "RC-029-resource-pressure-keeps-ai-review",
+      "scope": "five-finance-workflows",
+      "audit_item": "resource-pressure",
+      "status": "confirmed",
+      "input_facts": ["CPU 持续高负载但内存充足，身份、冻结和授权可信", "AI 审核尚未发生实际超时或格式失败"],
+      "incorrect_output": "因资源繁忙停止整轮或跳过 AI 转财务人工审核",
+      "expected_output": "降审核并发至 2、1 槽，保留队列；健康未知时等待复测，资源等待不生成转人工意见",
+      "failure_mode": "把宿主 CPU 压力当作审批技术失败或财务人工交接理由",
+      "rule_ref": "flow-engine-contract.md#审核未完成的人工交接"
+    },
+    {
       "id": "RC-028-bounded-ai-failure-handoff",
       "scope": "five-finance-workflows",
       "audit_item": "manual-handoff",
