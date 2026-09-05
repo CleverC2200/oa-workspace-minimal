@@ -17,7 +17,7 @@ import fitz
 from apps import json_artifact
 from apps.oa_approval import writer_outcomes
 
-from . import decision_validation, observability, review_failure_evidence, submission
+from . import decision_validation, manual_handoff, observability, review_failure_evidence, submission
 
 
 SCHEMA_VERSION = 1
@@ -1713,11 +1713,13 @@ class FlowEngine:
             "needs_human": "needs_human",
         }.get(decision.get("overall"))
         if (
-            decision.get("kind") != "preaudit_review_decision"
+            decision.get("kind") not in {"preaudit_review_decision", manual_handoff.KIND}
             or expected_business_state is None
             or receipt.get("business_state") != expected_business_state
         ):
             raise ValueError("execution_receipt_invalid")
+        if decision.get("kind") == manual_handoff.KIND:
+            manual_handoff.validate(decision, attempt_root, state)
         if state.get("execution_state") == "closed":
             try:
                 receipt_fingerprint = _file_fingerprint(receipt_file)
@@ -3291,7 +3293,10 @@ class FlowEngine:
             "codex_decision_invalid",
         )
 
-    def complete_review(self, action_file: Path, decision_file: Path) -> dict:
+    def complete_manual_handoff(self, action_file: Path, decision_file: Path) -> dict:
+        return self.complete_review(action_file, decision_file, _allow_manual_handoff=True)
+
+    def complete_review(self, action_file: Path, decision_file: Path, *, _allow_manual_handoff: bool = False) -> dict:
         action_path = Path(action_file).expanduser().resolve()
         lock_path = (
             action_path.parent / "complete.lock"
@@ -3300,7 +3305,7 @@ class FlowEngine:
             else self._root / "invalid-action.lock"
         )
         with _exclusive_lock(lock_path):
-            return self._complete_review_locked(action_path, Path(decision_file))
+            return self._complete_review_locked(action_path, Path(decision_file), allow_manual_handoff=_allow_manual_handoff)
 
     def _complete_review_locked(
         self,
@@ -3308,6 +3313,7 @@ class FlowEngine:
         decision_file: Path,
         *,
         recovered_submission_result: dict | None = None,
+        allow_manual_handoff: bool = False,
     ) -> dict:
         review_started = time.monotonic()
         try:
@@ -3439,265 +3445,285 @@ class FlowEngine:
                 "observability_incomplete",
             )
         decision = _read_object(decision_file, code="review_decision_unreadable")
-        packaging_v2 = (
-            action["workflow_key"] == "packaging_layout_approval"
-            and packet.get("rule_version") == _PACKAGING_RULE_VERSION
-        )
-        expected_fields = {
-            "schema_version",
-            "kind",
-            "action_token",
-            "workflow_key",
-            "rule_version",
-            "overall",
-            "items",
-        }
-        if action["workflow_key"] == "packaging_layout_approval":
-            expected_fields.add("excel_comparison")
-            if packaging_v2:
-                expected_fields.add("visual_review")
-        # Keep the original short-circuit order; record only fixed reason codes.
-        if set(decision) != expected_fields:
-            raise decision_validation.InvalidDecision("decision_fields")
-        if decision.get("schema_version") != SCHEMA_VERSION:
-            raise decision_validation.InvalidDecision("decision_schema_version")
-        if decision.get("kind") != "preaudit_review_decision":
-            raise decision_validation.InvalidDecision("decision_kind")
-        if not secrets.compare_digest(
-            str(decision.get("action_token") or ""),
-            str(action.get("action_token") or ""),
-        ):
-            raise decision_validation.InvalidDecision("decision_action_token")
-        if decision.get("workflow_key") != action["workflow_key"]:
-            raise decision_validation.InvalidDecision("decision_workflow")
-        if decision.get("rule_version") != packet.get("rule_version"):
-            raise decision_validation.InvalidDecision("decision_rule_version")
-        if decision.get("overall") not in {"pass", "needs_human"}:
-            raise decision_validation.InvalidDecision("decision_overall")
-        if not isinstance(decision.get("items"), list):
-            raise decision_validation.InvalidDecision("decision_items_type")
-
-        packet_items = packet.get("items")
-        if not isinstance(packet_items, list) or len(decision["items"]) != len(packet_items):
-            raise decision_validation.InvalidDecision("item_count")
-        packaging_skip_declared = (
-            packaging_v2
-            and isinstance(decision.get("visual_review"), dict)
-            and decision["visual_review"].get("outcome") == "all_non_packaging"
-        )
-        normalized_items: list[dict] = []
-        for expected, item in zip(packet_items, decision["items"]):
-            if not isinstance(item, dict) or set(item) != {
-                "item_key",
-                "status",
-                "conclusion",
-                "evidence_refs",
-                "missing_evidence",
-            }:
-                raise decision_validation.InvalidDecision("item_fields")
-            status = item.get("status")
-            evidence_refs = item.get("evidence_refs")
-            missing_evidence = item.get("missing_evidence")
-            if (
-                item.get("item_key") != expected.get("item_key")
-                or status not in {"pass", "fail", "uncertain"}
-                or not isinstance(item.get("conclusion"), str)
-                or not item["conclusion"].strip()
-                or not isinstance(evidence_refs, list)
-                or not all(isinstance(value, str) and value.strip() for value in evidence_refs)
-                or not isinstance(missing_evidence, list)
-                or not all(
-                    isinstance(value, str) and value.strip()
-                    for value in missing_evidence
-                )
-                or (
-                    status in {"pass", "fail"}
-                    and not evidence_refs
-                    and not packaging_skip_declared
-                )
-                or (status == "uncertain" and not missing_evidence)
-            ):
-                raise decision_validation.InvalidDecision("item_values")
-            normalized_items.append(dict(item))
-
-        required_uncertain_items = set(packet["required_uncertain_items"])
-        if any(
-            item["item_key"] in required_uncertain_items
-            and item["status"] != "uncertain"
-            for item in normalized_items
-        ):
-            raise decision_validation.InvalidDecision("required_uncertain")
-        if action["workflow_key"] == "general_expense":
-            _validate_general_expense_conclusions(normalized_items)
-
-        quality_material = _read_object(
-            Path(state["material_file"]),
-            code="frozen_material_changed",
-        )
-        if (
-            action["workflow_key"] == "small_marketing_fee"
-            and packet.get("rule_version") == _SMALL_MARKETING_RULE_VERSION
-        ):
-            _validate_small_marketing_conclusions(
-                normalized_items,
-                quality_material,
+        is_handoff = decision.get("kind") == manual_handoff.KIND
+        if is_handoff:
+            if not allow_manual_handoff and recovered_submission_result is None:
+                raise decision_validation.InvalidDecision("decision_kind")
+            manual_handoff.validate(decision, action_path.parent, action)
+            if recovered_submission_result is None:
+                manual_handoff.require_unwritten(action, state, action_path.parent)
+            normalized_items = []
+            packet_items = packet["items"]
+            needs_human = True
+            quality_material = _read_object(Path(state["material_file"]), code="frozen_material_changed")
+            covered_page_count = total_page_count = 0
+            if action["workflow_key"] == "travel_expense":
+                routing = packet.get("page_routing")
+                if not isinstance(routing, dict):
+                    routing = _full_travel_page_routing(quality_material)
+                total_page_count = int(routing["before_page_count"])
+            routed_resource_refs = set()
+            packaging_excel_notice = packaging_visual_outcome = None
+        else:
+            packaging_v2 = (
+                action["workflow_key"] == "packaging_layout_approval"
+                and packet.get("rule_version") == _PACKAGING_RULE_VERSION
             )
-        covered_page_refs = {
-            value
-            for item in normalized_items
-            for field in ("evidence_refs", "missing_evidence")
-            for value in item[field]
-        }
-        covered_page_count = 0
-        total_page_count = 0
-        routed_resource_refs: set[str] = set()
-        packaging_excel_notice: str | None = None
-        packaging_visual_outcome: str | None = None
-        if action["workflow_key"] == "packaging_layout_approval":
-            ordered_page_refs = _packaging_page_refs(quality_material)
-            page_refs = set(ordered_page_refs)
-            if not page_refs:
-                raise ValueError("review_decision_invalid")
-            if packaging_v2:
-                packaging_visual_outcome = _validate_packaging_visual_review(
-                    decision.get("visual_review"),
-                    page_refs=ordered_page_refs,
-                    item_keys=tuple(
-                        item["item_key"] for item in packet_items
-                    ),
-                    items=normalized_items,
-                    overall=decision.get("overall"),
-                )
-            elif not page_refs.issubset(covered_page_refs):
-                raise ValueError("review_decision_invalid")
-            covered_page_count = len(page_refs)
-            total_page_count = len(page_refs)
-            comparison = decision.get("excel_comparison")
-            if not isinstance(comparison, dict) or set(comparison) != {
-                "status",
-                "resource_id",
-                "mappings",
-            }:
-                raise ValueError("review_decision_invalid")
-            excel_ids, readable_excel = _packaging_excel_contents(quality_material)
-            comparison_status = comparison.get("status")
-            excel_resource_id = comparison.get("resource_id")
-            mappings = comparison.get("mappings")
-            if packaging_visual_outcome == "all_non_packaging":
-                if (
-                    comparison_status != "not_applicable"
-                    or excel_resource_id is not None
-                    or mappings != []
-                ):
-                    raise ValueError("review_decision_invalid")
-            elif comparison_status == "not_provided":
-                if excel_ids or excel_resource_id is not None or mappings != []:
-                    raise ValueError("review_decision_invalid")
-                packaging_excel_notice = (
-                    "Excel 对照：本次未提供 Excel，未执行 Excel 对照。"
-                )
-            elif comparison_status == "completed":
-                if (
-                    excel_resource_id not in readable_excel
-                    or not isinstance(mappings, list)
-                    or len(mappings) != len(packet_items)
-                ):
-                    raise ValueError("review_decision_invalid")
-                key_text = readable_excel[excel_resource_id]
-                ref_prefix = (
-                    "material:prepared.structured_contents."
-                    f"{excel_resource_id}.key_text."
-                )
-                for expected, item, mapping in zip(
-                    packet_items,
-                    normalized_items,
-                    mappings,
-                    strict=True,
-                ):
-                    if not isinstance(mapping, dict) or set(mapping) != {
-                        "item_key",
-                        "cell_refs",
-                        "result",
-                    }:
-                        raise ValueError("review_decision_invalid")
-                    cell_refs = mapping.get("cell_refs")
-                    result = mapping.get("result")
-                    if (
-                        mapping.get("item_key") != expected.get("item_key")
-                        or not isinstance(cell_refs, list)
-                        or not cell_refs
-                        or result not in {"match", "different", "uncertain"}
-                        or (result == "different" and item["status"] == "pass")
-                        or (result == "uncertain" and item["status"] != "uncertain")
-                    ):
-                        raise ValueError("review_decision_invalid")
-                    for cell_ref in cell_refs:
-                        if (
-                            not isinstance(cell_ref, str)
-                            or not cell_ref.startswith(ref_prefix)
-                            or cell_ref not in item["evidence_refs"]
-                        ):
-                            raise ValueError("review_decision_invalid")
-                        try:
-                            index = int(cell_ref.removeprefix(ref_prefix))
-                        except ValueError as error:
-                            raise ValueError("review_decision_invalid") from error
-                        if index < 0 or index >= len(key_text):
-                            raise ValueError("review_decision_invalid")
-                    if not all(key_text[index].strip() for index in [
-                        int(cell_ref.removeprefix(ref_prefix)) for cell_ref in cell_refs
-                    ]):
-                        raise ValueError("review_decision_invalid")
-                packaging_excel_notice = (
-                    "Excel 对照：上述四项已与同一 Excel 逐字符对照；"
-                    "具体差异已写入对应项目。"
-                )
-            else:
-                raise ValueError("review_decision_invalid")
-        elif action["workflow_key"] == "travel_expense":
-            routing = packet.get("page_routing")
-            if not isinstance(routing, dict):
-                routing = _full_travel_page_routing(quality_material)
-            review_page_refs = set(routing["review_page_refs"])
-            applicable_item_keys = set(routing["applicability"]["item_keys"])
-            if (
-                packet.get("material_state") == "complete"
-                and routing["applicability"].get("basis")
-                == "full_coverage_without_trusted_item_relation"
-                and any(
-                    item["item_key"] in applicable_item_keys
-                    and item["status"] == "uncertain"
-                    and set(item["missing_evidence"]).issubset(review_page_refs)
-                    for item in normalized_items
-                )
+            expected_fields = {
+                "schema_version",
+                "kind",
+                "action_token",
+                "workflow_key",
+                "rule_version",
+                "overall",
+                "items",
+            }
+            if action["workflow_key"] == "packaging_layout_approval":
+                expected_fields.add("excel_comparison")
+                if packaging_v2:
+                    expected_fields.add("visual_review")
+            # Keep the original short-circuit order; record only fixed reason codes.
+            if set(decision) != expected_fields:
+                raise decision_validation.InvalidDecision("decision_fields")
+            if decision.get("schema_version") != SCHEMA_VERSION:
+                raise decision_validation.InvalidDecision("decision_schema_version")
+            if decision.get("kind") != "preaudit_review_decision":
+                raise decision_validation.InvalidDecision("decision_kind")
+            if not secrets.compare_digest(
+                str(decision.get("action_token") or ""),
+                str(action.get("action_token") or ""),
             ):
-                raise ValueError("review_decision_invalid")
+                raise decision_validation.InvalidDecision("decision_action_token")
+            if decision.get("workflow_key") != action["workflow_key"]:
+                raise decision_validation.InvalidDecision("decision_workflow")
+            if decision.get("rule_version") != packet.get("rule_version"):
+                raise decision_validation.InvalidDecision("decision_rule_version")
+            if decision.get("overall") not in {"pass", "needs_human"}:
+                raise decision_validation.InvalidDecision("decision_overall")
+            if not isinstance(decision.get("items"), list):
+                raise decision_validation.InvalidDecision("decision_items_type")
+
+            packet_items = packet.get("items")
+            if not isinstance(packet_items, list) or len(decision["items"]) != len(packet_items):
+                raise decision_validation.InvalidDecision("item_count")
+            packaging_skip_declared = (
+                packaging_v2
+                and isinstance(decision.get("visual_review"), dict)
+                and decision["visual_review"].get("outcome") == "all_non_packaging"
+            )
+            normalized_items: list[dict] = []
+            for expected, item in zip(packet_items, decision["items"]):
+                if not isinstance(item, dict) or set(item) != {
+                    "item_key",
+                    "status",
+                    "conclusion",
+                    "evidence_refs",
+                    "missing_evidence",
+                }:
+                    raise decision_validation.InvalidDecision("item_fields")
+                status = item.get("status")
+                evidence_refs = item.get("evidence_refs")
+                missing_evidence = item.get("missing_evidence")
+                if (
+                    item.get("item_key") != expected.get("item_key")
+                    or status not in {"pass", "fail", "uncertain"}
+                    or not isinstance(item.get("conclusion"), str)
+                    or not item["conclusion"].strip()
+                    or not isinstance(evidence_refs, list)
+                    or not all(isinstance(value, str) and value.strip() for value in evidence_refs)
+                    or not isinstance(missing_evidence, list)
+                    or not all(
+                        isinstance(value, str) and value.strip()
+                        for value in missing_evidence
+                    )
+                    or (
+                        status in {"pass", "fail"}
+                        and not evidence_refs
+                        and not packaging_skip_declared
+                    )
+                    or (status == "uncertain" and not missing_evidence)
+                ):
+                    raise decision_validation.InvalidDecision("item_values")
+                normalized_items.append(dict(item))
+
+            required_uncertain_items = set(packet["required_uncertain_items"])
             if any(
-                item["item_key"] in applicable_item_keys
-                and not review_page_refs.issubset(
-                    set(item["evidence_refs"]).union(item["missing_evidence"])
-                )
+                item["item_key"] in required_uncertain_items
+                and item["status"] != "uncertain"
                 for item in normalized_items
             ):
-                raise ValueError("review_decision_invalid")
-            covered_pages = review_page_refs.intersection(covered_page_refs)
-            covered_pages.update(
-                str(reused["page_ref"])
-                for reused in routing["reused_pages"]
-                if reused["representative_page_ref"] in covered_page_refs
-            )
-            routed_resource_refs.update(
-                f"material:resources.{reused['resource_id']}"
-                for reused in routing["reused_pages"]
-                if reused["representative_page_ref"] in covered_page_refs
-            )
-            covered_page_count = len(covered_pages)
-            total_page_count = int(routing["before_page_count"])
+                raise decision_validation.InvalidDecision("required_uncertain")
+            if action["workflow_key"] == "general_expense":
+                _validate_general_expense_conclusions(normalized_items)
 
-        needs_human = any(item["status"] != "pass" for item in normalized_items)
-        expected_overall = "needs_human" if needs_human else "pass"
-        if decision["overall"] != expected_overall:
-            raise decision_validation.InvalidDecision("overall_mismatch")
+            quality_material = _read_object(
+                Path(state["material_file"]),
+                code="frozen_material_changed",
+            )
+            if (
+                action["workflow_key"] == "small_marketing_fee"
+                and packet.get("rule_version") == _SMALL_MARKETING_RULE_VERSION
+            ):
+                _validate_small_marketing_conclusions(
+                    normalized_items,
+                    quality_material,
+                )
+            covered_page_refs = {
+                value
+                for item in normalized_items
+                for field in ("evidence_refs", "missing_evidence")
+                for value in item[field]
+            }
+            covered_page_count = 0
+            total_page_count = 0
+            routed_resource_refs: set[str] = set()
+            packaging_excel_notice: str | None = None
+            packaging_visual_outcome: str | None = None
+            if action["workflow_key"] == "packaging_layout_approval":
+                ordered_page_refs = _packaging_page_refs(quality_material)
+                page_refs = set(ordered_page_refs)
+                if not page_refs:
+                    raise ValueError("review_decision_invalid")
+                if packaging_v2:
+                    packaging_visual_outcome = _validate_packaging_visual_review(
+                        decision.get("visual_review"),
+                        page_refs=ordered_page_refs,
+                        item_keys=tuple(
+                            item["item_key"] for item in packet_items
+                        ),
+                        items=normalized_items,
+                        overall=decision.get("overall"),
+                    )
+                elif not page_refs.issubset(covered_page_refs):
+                    raise ValueError("review_decision_invalid")
+                covered_page_count = len(page_refs)
+                total_page_count = len(page_refs)
+                comparison = decision.get("excel_comparison")
+                if not isinstance(comparison, dict) or set(comparison) != {
+                    "status",
+                    "resource_id",
+                    "mappings",
+                }:
+                    raise ValueError("review_decision_invalid")
+                excel_ids, readable_excel = _packaging_excel_contents(quality_material)
+                comparison_status = comparison.get("status")
+                excel_resource_id = comparison.get("resource_id")
+                mappings = comparison.get("mappings")
+                if packaging_visual_outcome == "all_non_packaging":
+                    if (
+                        comparison_status != "not_applicable"
+                        or excel_resource_id is not None
+                        or mappings != []
+                    ):
+                        raise ValueError("review_decision_invalid")
+                elif comparison_status == "not_provided":
+                    if excel_ids or excel_resource_id is not None or mappings != []:
+                        raise ValueError("review_decision_invalid")
+                    packaging_excel_notice = (
+                        "Excel 对照：本次未提供 Excel，未执行 Excel 对照。"
+                    )
+                elif comparison_status == "completed":
+                    if (
+                        excel_resource_id not in readable_excel
+                        or not isinstance(mappings, list)
+                        or len(mappings) != len(packet_items)
+                    ):
+                        raise ValueError("review_decision_invalid")
+                    key_text = readable_excel[excel_resource_id]
+                    ref_prefix = (
+                        "material:prepared.structured_contents."
+                        f"{excel_resource_id}.key_text."
+                    )
+                    for expected, item, mapping in zip(
+                        packet_items,
+                        normalized_items,
+                        mappings,
+                        strict=True,
+                    ):
+                        if not isinstance(mapping, dict) or set(mapping) != {
+                            "item_key",
+                            "cell_refs",
+                            "result",
+                        }:
+                            raise ValueError("review_decision_invalid")
+                        cell_refs = mapping.get("cell_refs")
+                        result = mapping.get("result")
+                        if (
+                            mapping.get("item_key") != expected.get("item_key")
+                            or not isinstance(cell_refs, list)
+                            or not cell_refs
+                            or result not in {"match", "different", "uncertain"}
+                            or (result == "different" and item["status"] == "pass")
+                            or (result == "uncertain" and item["status"] != "uncertain")
+                        ):
+                            raise ValueError("review_decision_invalid")
+                        for cell_ref in cell_refs:
+                            if (
+                                not isinstance(cell_ref, str)
+                                or not cell_ref.startswith(ref_prefix)
+                                or cell_ref not in item["evidence_refs"]
+                            ):
+                                raise ValueError("review_decision_invalid")
+                            try:
+                                index = int(cell_ref.removeprefix(ref_prefix))
+                            except ValueError as error:
+                                raise ValueError("review_decision_invalid") from error
+                            if index < 0 or index >= len(key_text):
+                                raise ValueError("review_decision_invalid")
+                        if not all(key_text[index].strip() for index in [
+                            int(cell_ref.removeprefix(ref_prefix)) for cell_ref in cell_refs
+                        ]):
+                            raise ValueError("review_decision_invalid")
+                    packaging_excel_notice = (
+                        "Excel 对照：上述四项已与同一 Excel 逐字符对照；"
+                        "具体差异已写入对应项目。"
+                    )
+                else:
+                    raise ValueError("review_decision_invalid")
+            elif action["workflow_key"] == "travel_expense":
+                routing = packet.get("page_routing")
+                if not isinstance(routing, dict):
+                    routing = _full_travel_page_routing(quality_material)
+                review_page_refs = set(routing["review_page_refs"])
+                applicable_item_keys = set(routing["applicability"]["item_keys"])
+                if (
+                    packet.get("material_state") == "complete"
+                    and routing["applicability"].get("basis")
+                    == "full_coverage_without_trusted_item_relation"
+                    and any(
+                        item["item_key"] in applicable_item_keys
+                        and item["status"] == "uncertain"
+                        and set(item["missing_evidence"]).issubset(review_page_refs)
+                        for item in normalized_items
+                    )
+                ):
+                    raise ValueError("review_decision_invalid")
+                if any(
+                    item["item_key"] in applicable_item_keys
+                    and not review_page_refs.issubset(
+                        set(item["evidence_refs"]).union(item["missing_evidence"])
+                    )
+                    for item in normalized_items
+                ):
+                    raise ValueError("review_decision_invalid")
+                covered_pages = review_page_refs.intersection(covered_page_refs)
+                covered_pages.update(
+                    str(reused["page_ref"])
+                    for reused in routing["reused_pages"]
+                    if reused["representative_page_ref"] in covered_page_refs
+                )
+                routed_resource_refs.update(
+                    f"material:resources.{reused['resource_id']}"
+                    for reused in routing["reused_pages"]
+                    if reused["representative_page_ref"] in covered_page_refs
+                )
+                covered_page_count = len(covered_pages)
+                total_page_count = int(routing["before_page_count"])
+
+            needs_human = any(item["status"] != "pass" for item in normalized_items)
+            expected_overall = "needs_human" if needs_human else "pass"
+            if decision["overall"] != expected_overall:
+                raise decision_validation.InvalidDecision("overall_mismatch")
 
         stored_decision = action_path.with_name("review-decision.json")
         if stored_decision.exists():
@@ -3711,7 +3737,9 @@ class FlowEngine:
             if needs_human
             else "AI审核结论：可提交 ✅"
         )
-        if packaging_visual_outcome == "all_non_packaging":
+        if is_handoff:
+            lines = [manual_handoff.remark(decision)]
+        elif packaging_visual_outcome == "all_non_packaging":
             lines = [_PACKAGING_SKIP_REMARK]
         else:
             lines = [first_line]
@@ -3867,6 +3895,8 @@ class FlowEngine:
             covered_page_count=covered_page_count,
             total_page_count=total_page_count,
         )
+        if is_handoff:
+            quality["item_coverage"] = _coverage(covered=0, total=len(packet_items), applicable=True)
         receipt = submission.build_receipt(
             action=action,
             state=state,

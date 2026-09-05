@@ -23,7 +23,7 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
 
 控制器领取已打开动作时，若 capability 已过期或剩余有效期不超过 20 分钟，必须先在原身份、材料和 evidence 指纹绑定下刷新 capability 与提交 token，再开始最长 15 分钟的审核；剩余有效期超过该窗口时保持原 token，不因重复读取破坏幂等。完成宿主在提交前再次执行同一刷新判断；此时保留审核决定绑定的 action token，只轮换 capability 和 submission token。
 
-滚动控制器不得把单个 AI 进程的普通写前失败扩大为长期全局阻断。`codex_process_failed` 或 `codex_process_incomplete` 只有在同一单据已完成两次安全尝试、结果明确为 `write_state=not_requested`，且存在绑定当前 action token、模型、推理档位和两次逐次错误码的原子 `review-failure.json` 时，才进入隔离检查。FlowEngine 在完成锁内复核该凭据、动作仍为 `review_required / authorized`，且不存在 Writer 边界、执行回执、审核决定、签字意见和提交信封后，持久化凭据指纹与 `codex_review_failed / needs_admin / not_requested` 并继续全局 FIFO。收据已写但父控制器在隔离前停止时，后续运行可以复用完全相同且仍绑定当前 action 的收据；内容冲突必须停止。任一条件不满足、隔离落盘失败、进程超时/卡死、宿主 critical 或出现未列入白名单的新错误码时，仍立即停止整轮。历史 `codex_review_failed` 只有在 action/state、收据指纹和零 Writer 痕迹全部复核通过后才计入隔离并参与人工对账；损坏现场按 `review_quarantine_invalid` 技术失败处理，不自动重试。
+滚动控制器不得把单个 AI 进程的普通写前失败扩大为长期全局阻断。`codex_process_failed` 或 `codex_process_incomplete` 只有在同一单据已完成两次安全尝试、结果明确为 `write_state=not_requested`，且存在绑定当前 action token、模型、推理档位和两次逐次错误码的原子 `review-failure.json` 时，才进入隔离检查。FlowEngine 在完成锁内复核该凭据、动作仍为 `review_required / authorized`，且不存在 Writer 边界、执行回执、审核决定、签字意见和提交信封后，持久化凭据指纹与 `codex_review_failed / needs_admin / not_requested` 并继续全局 FIFO。收据已写但父控制器在隔离前停止时，后续运行可以复用完全相同且仍绑定当前 action 的收据；内容冲突必须停止。任一条件不满足、隔离落盘失败、未满足下述人工交接条件的进程超时/卡死、宿主 critical 或出现未列入白名单的新错误码时，仍立即停止整轮。历史 `codex_review_failed` 只有在 action/state、收据指纹和零 Writer 痕迹全部复核通过后才计入隔离并参与人工对账；损坏现场按 `review_quarantine_invalid` 技术失败处理，不自动重试。
 
 人工明确授权后，滚动入口可通过精确的 `--recover-action-file` 恢复 `codex_decision_invalid` 或 `codex_review_failed`。恢复前必须核对 action/state 均为 `needs_admin / not_requested`、冻结身份与材料完整、最新 attempt、实时待办身份一致且无已办命中，并确认不存在 Writer 边界、执行回执、审核决定、意见或提交信封；进程失败还必须通过原始失败凭据与指纹校验。只创建新的冻结 attempt，保留原隔离证据，不直接写 OA；不带显式恢复参数时仍跳过历史隔离，不自动重试，未知写入规则不变。
 
@@ -35,9 +35,13 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
 
 降级审核包的 `material_file` 不引用采集失败前的任何候选字段或资源，只保留脱敏 `collection_gaps`。审核者必须根据缺口和当前流程审核项生成可读的自然语言结论；脚本验证所有 `required_uncertain_items` 均为 `uncertain` 后，仍可正常闭合为 `business_state=needs_human`。OA 登录失败、OA 会话过期、当前 RPA/CDP 会话缺失/失效/不可用或执行身份不可信时，不使用降级包，直接返回 `needs_admin`，且不得生成材料、审核包、决定、意见或写入请求。包装图片材料不可读时也继续返回 `needs_admin`，不使用降级包。
 
-### 审核进程超时收尾
+### 审核未完成的人工交接
 
-`codex_process_timeout` 不自动重试。子进程确认退出后，保存绑定当前动作的失败凭据；首次超时记录一次尝试，普通失败后的第二次超时记录两次尝试。宿主经同一完成锁、冻结输入和零 Writer 痕迹校验，将单据收尾为 `codex_review_failed / needs_admin / not_requested`，随后仍停止整轮，不继续 FIFO。下轮跳过该隔离项；恢复仍需人工明确授权。凭据或隔离失败继续按技术失败停止，不伪造未写入状态。
+五类财务当前受控 attempt 遇到 `codex_process_timeout` 或 `codex_decision_invalid` 时，宿主可生成 `preaudit_manual_handoff` 行政交接记录，说明 AI 未形成有效业务结论，请财务人工审核。它不是 `preaudit_review_decision`，不含 `items`，不计为完成业务审核覆盖；原固定项目规则只适用于有效业务决定。包装与手工 preview 不使用此分支。
+
+超时须确认审核进程组退出并保存绑定当前 action token 的失败凭据；结构校验失败须保存当前决定摘要和固定校验码的拒绝凭据。宿主在同一完成锁内复核动作仍为 `review_required / authorized`、冻结输入、当前授权及零 Writer 痕迹，再将特别说明交给唯一串行 Writer；身份、待办、begin-submit、终态回执与后置校验仍全部执行。此分支不再请求 AI 重试，成功闭合为 `needs_human / submitted` 后继续 FIFO。意见只说明超时或结果格式异常，不包含原始错误内容，也不生成业务通过/不通过结论。
+
+登录失效、身份/材料/授权不可信、未知写入、当前停止门、本机 critical 或健康状态未知仍停止；进程回收未确认时不得转交接。历史隔离项不自动重试，已办意见不追改。普通进程失败和无有效对象的进程未完成仍按原隔离合同处理。
 
 审核子进程另保存脱敏阶段诊断：动作令牌摘要、固定事件计数、最后观察阶段、耗时、退出码和标准错误固定信号。不保存标准错误原文、事件正文或审核决定。固定信号只表示观察到相关关键字，不单独证明网络或服务故障根因。无完成用量事件时，汇总状态为 `unknown`，数值累计字段不代表实际消耗为零。
 

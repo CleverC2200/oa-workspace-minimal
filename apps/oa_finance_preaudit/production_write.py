@@ -14,7 +14,7 @@ from typing import Callable
 from apps import json_artifact
 from apps.oa_approval import auth, runtime_control, writer_api, writer_outcomes
 
-from . import flow_engine, submission
+from . import concurrency_control, flow_engine, manual_handoff, submission
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -420,7 +420,7 @@ def _validate_job(job: dict, root: Path) -> tuple[str, dict[str, Path]]:
         or str(material.get("request_id") or "") != job["request_id"]
         or material.get("workflow_key") != job["workflow_key"]
         or decision.get("schema_version") != 1
-        or decision.get("kind") != "preaudit_review_decision"
+        or decision.get("kind") not in {"preaudit_review_decision", manual_handoff.KIND}
         or decision.get("workflow_key") != job["workflow_key"]
         or envelope.get("schema_version") != 1
         or envelope.get("kind") != "preaudit_submission_envelope"
@@ -450,6 +450,11 @@ def _validate_job(job: dict, root: Path) -> tuple[str, dict[str, Path]]:
         raise ValueError("submission_job_invalid") from error
     if not remark.strip() or _UNRESOLVED.search(remark):
         raise ValueError("submission_job_invalid")
+    if decision.get("kind") == manual_handoff.KIND:
+        state = _read_object(paths["material_file"].with_name("state.json"), code="submission_job_invalid")
+        manual_handoff.validate(decision, paths["material_file"].parent, state)
+        if remark != manual_handoff.remark(decision) + "\n":
+            raise ValueError("submission_job_invalid")
     return remark, paths
 
 
@@ -459,6 +464,9 @@ def _verify_submit_gate(
     authorization_verifier: submission.AuthorizationVerifier,
 ) -> tuple[str, dict[str, Path]]:
     remark, paths = _validate_job(job, root)
+    decision = _read_object(paths["decision_file"], code="submission_job_invalid")
+    if decision.get("kind") == manual_handoff.KIND and concurrency_control.sample_local_health().get("status") not in {"healthy", "pressure"}:
+        raise ValueError("submission_job_invalid")
     attempt_root = paths["material_file"].parent
     state_path = attempt_root / "state.json"
     if state_path.is_symlink():

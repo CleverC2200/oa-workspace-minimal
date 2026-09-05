@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import dataclass, field
@@ -14,7 +15,7 @@ from typing import Callable, TextIO
 from apps import json_artifact
 from apps.oa_approval import runtime_control, writer_outcomes
 
-from . import decision_validation, process_diagnostics, review_failure_evidence
+from . import concurrency_control, decision_validation, manual_handoff, process_diagnostics, review_failure_evidence
 
 
 MODEL = review_failure_evidence.MODEL
@@ -799,6 +800,15 @@ def _execute_codex_raw(
             )
         except subprocess.TimeoutExpired:
             _terminate_process_group(process, grace_seconds=5)
+            process.poll()
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                process_reaped = process.returncode is not None
+            except PermissionError:
+                process_reaped = False
+            else:
+                process_reaped = False
             usage = _parse_token_usage(output)
             event_counts = _parse_event_counts(output)
             event_status = _event_status(output, event_counts)
@@ -807,7 +817,7 @@ def _execute_codex_raw(
             return CodexExecution(
                 "codex_process_timeout",
                 usage,
-                process_state="timed_out",
+                process_state="timed_out" if process_reaped else "cleanup_failed",
                 decision_state="not_attempted",
                 event_counts=event_counts,
                 event_status=event_status,
@@ -827,9 +837,12 @@ def _execute_codex_raw(
         stderr_summary["last_observed_stage"] = process_diagnostics.last_stage(output)
         decision: dict | None = None
         decision_state = "not_written"
+        output_error = None
         if process.returncode == 0:
             try:
-                candidate = json.loads(decision_file.read_text(encoding="utf-8"))
+                raw_decision = decision_file.read_text(encoding="utf-8")
+                candidate = json.loads(raw_decision)
+                decision_state = "not_object"
             except OSError:
                 candidate = None
             except json.JSONDecodeError:
@@ -840,9 +853,19 @@ def _execute_codex_raw(
                 decision_state = "valid_object"
             elif candidate is not None:
                 decision_state = "not_object"
+            if decision_state in {"unreadable", "not_object"}:
+                try:
+                    decision_validation.record_rejection(
+                        action_file,
+                        {"raw_output_sha256": hashlib.sha256(raw_decision.encode("utf-8")).hexdigest()},
+                        decision_validation.InvalidDecision("decision_json" if decision_state == "unreadable" else "decision_object"),
+                    )
+                    output_error = "codex_decision_invalid"
+                except (OSError, ValueError, TypeError):
+                    output_error = "codex_decision_diagnostic_failed"
     output.close()
     return CodexExecution(
-        None if process.returncode == 0 else "codex_process_failed",
+        output_error if process.returncode == 0 else "codex_process_failed",
         usage,
         decision,
         process_state="exited",
@@ -875,17 +898,29 @@ def _complete_decision(action_file: Path, decision: dict) -> str | None:
         if runtime_control.stop_requested():
             return "stop_requested"
         try:
-            result = cli._live_flow_engine(controlled=True).complete_review(
-                action_file,
-                decision_file,
-            )
+            engine = cli._live_flow_engine(controlled=True)
+            if decision.get("kind") == manual_handoff.KIND:
+                if concurrency_control.sample_local_health().get("status") not in {"healthy", "pressure"}:
+                    runtime_control.request_cycle_stop()
+                    return "stop_requested"
+                result = engine.complete_manual_handoff(action_file, decision_file)
+            else:
+                result = engine.complete_review(action_file, decision_file)
         except ValueError as error:
             if str(error) == "review_decision_invalid":
                 try:
                     decision_validation.record_rejection(action_file, decision, error)
                 except (OSError, ValueError, TypeError):
                     return "codex_decision_diagnostic_failed"
-                return "codex_decision_invalid"
+                if not _safe_to_retry(action_file):
+                    return "codex_decision_invalid"
+                try:
+                    handoff = manual_handoff.build(action_file, "codex_decision_invalid")
+                    # Re-enter the same parent Writer, never launch another model.
+                    return _complete_decision(action_file, handoff)
+                except (OSError, ValueError, TypeError):
+                    runtime_control.request_cycle_stop()
+                    return "codex_decision_diagnostic_failed"
             runtime_control.request_stop("writer_result_unknown")
             return "codex_decision_submit_failed"
         except Exception:
@@ -1316,6 +1351,26 @@ def review(
             }
         error_code = execution.error_code or "codex_process_incomplete"
         if (
+            error_code == "codex_decision_invalid"
+            and execution.process_state == "exited"
+            and execution.exit_code == 0
+            and _safe_to_retry(action_file)
+            and not runtime_control.stop_requested()
+        ):
+            try:
+                handoff = manual_handoff.build(action_file, error_code)
+            except (OSError, ValueError, TypeError):
+                error_code = "codex_decision_diagnostic_failed"
+            else:
+                return {
+                    **_base_result(attempts=attempt, usages=usages),
+                    "codex_events": _merge_events(executions),
+                    "status": "reviewed", "business_state": "not_available",
+                    "write_state": "not_requested", "error_code": None,
+                    "agent_wall_seconds": max(0, int(time.monotonic() - run_started)),
+                    "decision": handoff,
+                }
+        if (
             attempt == 1
             and error_code in {"codex_process_failed", "codex_process_incomplete"}
             and _safe_to_retry(action_file)
@@ -1341,6 +1396,22 @@ def review(
             return {
                 **result,
                 "error_code": "codex_review_failure_evidence_invalid",
+            }
+        if (
+            error_code == "codex_process_timeout"
+            and execution.process_state == "timed_out"
+            and execution.exit_code is not None
+            and _safe_to_retry(action_file)
+            and not runtime_control.stop_requested()
+        ):
+            try:
+                handoff = manual_handoff.build(action_file, error_code)
+            except (OSError, ValueError, TypeError):
+                return {**result, "error_code": "codex_review_failure_evidence_invalid"}
+            return {
+                **result, "status": "reviewed", "error_code": None,
+                "decision": handoff,
+                "agent_wall_seconds": max(0, int(time.monotonic() - run_started)),
             }
         return result
     raise AssertionError("unreachable")

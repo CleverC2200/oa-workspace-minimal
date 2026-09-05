@@ -6070,9 +6070,11 @@ def test_global_dispatcher_validates_reviewer_environment_before_prepare(
     assert dispatched == []
 
 
+@pytest.mark.parametrize("handoff", [False, True])
 def test_dispatcher_single_writer_is_fifo_and_never_concurrent(
     tmp_path: Path,
     monkeypatch,
+    handoff: bool,
 ) -> None:
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.runtime_control,
@@ -6092,10 +6094,12 @@ def test_dispatcher_single_writer_is_fifo_and_never_concurrent(
     writer_active = 0
     writer_peak = 0
     writer_order: list[Path] = []
+    reviewed_order: list[Path] = []
     guard = threading.Lock()
     def review(task: dict) -> dict:
         action = Path(task["action_file"])
         index = action_files.index(action)
+        reviewed_order.append(action)
         if index == 0:
             assert release_reviews.wait(timeout=1)
         elif index == 2:
@@ -6108,7 +6112,7 @@ def test_dispatcher_single_writer_is_fifo_and_never_concurrent(
             "process_retries": 0,
             "token_usage": {"status": "unknown"},
             "agent_wall_seconds": 1,
-            "decision": {"overall": "needs_human"},
+            "decision": {"overall": "needs_human", "kind": "preaudit_manual_handoff" if handoff and index == 0 else "preaudit_review_decision"},
         }
 
     def complete(action: Path, reviewed: dict) -> dict:
@@ -6144,6 +6148,7 @@ def test_dispatcher_single_writer_is_fifo_and_never_concurrent(
     assert result.completed == 3
     assert writer_peak == 1
     assert writer_order == action_files
+    assert sorted(reviewed_order) == sorted(action_files)
 
 
 def test_prepare_excludes_late_visible_item_before_claim(
