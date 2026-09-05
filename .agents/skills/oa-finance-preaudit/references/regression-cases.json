@@ -3,6 +3,17 @@
   "description": "人工确认的脱敏财务预审错误案例。仅在盲测结果冻结后用于对照和回归，不作为观察子 Agent 的当前答案。",
   "cases": [
     {
+      "id": "RC-028-bounded-ai-failure-handoff",
+      "scope": "five-finance-workflows",
+      "audit_item": "manual-handoff",
+      "status": "confirmed",
+      "input_facts": ["当前受控审核超时且进程已退出，或结构校验失败", "登录身份、冻结、授权可信且尚未写入"],
+      "incorrect_output": "隔离当前单据，等待再次 AI 审核",
+      "expected_output": "AI审核结论：需人工审核 ⚠️；特别说明 AI 未形成有效业务审核结论，请财务人工核对材料并审核",
+      "failure_mode": "把可安全交接的 AI 审核失败扩大为财务流程阻断",
+      "rule_ref": "flow-engine-contract.md#审核未完成的人工交接"
+    },
+    {
       "id": "RC-001-status-marker-position",
       "scope": "all-workflows",
       "audit_item": "output-format",
