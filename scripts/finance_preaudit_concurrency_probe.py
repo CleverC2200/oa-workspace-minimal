@@ -2049,6 +2049,7 @@ def _run_dispatched_tasks(
     assigned_order_keys: dict[int, tuple[datetime, str]] = {}
     pending_write_indices: set[int] = set()
     futures: dict[object, tuple[int, float, float, Path]] = {}
+    pending_reviews: dict[int, tuple[float, Path, bool]] = {}
     write_ready: dict[
         int,
         tuple[float, Path, dict, float, int, float | None],
@@ -2084,6 +2085,7 @@ def _run_dispatched_tasks(
     adaptive_window_hosts: list[dict] = []
     capacity_decisions: list[dict] = []
     adaptive_pressure_active = False
+    resource_paused = False
     started = 0
     peak_active = 0
     halted = False
@@ -2312,7 +2314,7 @@ def _run_dispatched_tasks(
         nonlocal adaptive_pressure_active
         nonlocal adaptive_window_target
         nonlocal current_review_capacity
-        if not adaptive or adaptive_pressure_active:
+        if not adaptive or (adaptive_pressure_active and current_review_capacity == concurrency_control.CAPACITY_STEPS[0]):
             return
         decision = concurrency_control.decide_capacity(
             current_capacity=current_review_capacity,
@@ -2430,6 +2432,7 @@ def _run_dispatched_tasks(
             or preparation is not None
             or writer is not None
             or write_ready
+            or (pending_reviews and not halted)
             or (
                 (
                     next_index < len(outcomes)
@@ -2493,12 +2496,7 @@ def _run_dispatched_tasks(
                 ):
                     decision_retries.add(index)
                     review_histories[index] = [submitted_review]
-                    submit_review(
-                        index,
-                        prepare_elapsed,
-                        action_file,
-                        first_attempt=False,
-                    )
+                    pending_reviews[index] = (prepare_elapsed, action_file, False)
                 else:
                     if (
                         value.get("status") == "retry_required"
@@ -2643,6 +2641,7 @@ def _run_dispatched_tasks(
                     host = runtime_status()
                 except Exception:
                     host = {"status": "unknown"}
+                resource_paused = host.get("status") not in {"healthy", "pressure", "critical"}
                 runtime_samples.append(
                     {
                         "elapsed_seconds": round(now - started_at, 3),
@@ -2651,6 +2650,8 @@ def _run_dispatched_tasks(
                         + int(preparation is not None),
                         "active_reviews": len(futures),
                         "review_capacity": current_review_capacity,
+                        "resource_paused": resource_paused,
+                        "pending_reviews": len(pending_reviews),
                         "writer_active": writer is not None,
                         "write_queue_depth": len(write_ready),
                         "write_queue_capacity": write_queue_capacity,
@@ -2908,12 +2909,7 @@ def _run_dispatched_tasks(
                                 continue
                         assigned.add(action_file)
                         advance_write_head()
-                        submit_review(
-                            index,
-                            prepare_elapsed,
-                            action_file,
-                            first_attempt=True,
-                        )
+                        pending_reviews[index] = (prepare_elapsed, action_file, True)
 
             done = {future for future in futures if future.done()}
             reviewed_now: list[tuple[int, float, Path, dict]] = []
@@ -3037,9 +3033,15 @@ def _run_dispatched_tasks(
                     )
                 advance_write_head()
 
+            while pending_reviews and not halted and not resource_paused and len(futures) < current_review_capacity:
+                index = min(pending_reviews)
+                prepare_elapsed, action_file, first_attempt = pending_reviews.pop(index)
+                submit_review(index, prepare_elapsed, action_file, first_attempt=first_attempt)
+
             write_head = current_write_head()
             if (
                 not halted
+                and not resource_paused
                 and writer is None
                 and (preparation is None or not strict_global_fifo)
                 and write_head is not None
@@ -3123,15 +3125,17 @@ def _run_dispatched_tasks(
 
             while (
                 not halted
+                and not resource_paused
                 and preparation is None
                 and (
                     next_index < len(outcomes)
                     or (continuous_discovery and not discovery_closed)
                 )
                 and time.monotonic() >= next_discovery_at
-                and len(futures) < current_review_capacity
+                and len(futures) + len(pending_reviews) < current_review_capacity
                 and (
                     len(futures)
+                    + len(pending_reviews)
                     + len(write_ready)
                     + int(preparation is not None)
                     < write_queue_capacity
@@ -3219,6 +3223,7 @@ def _run_dispatched_tasks(
                 and preparation is None
                 and writer is None
                 and not write_ready
+                and (not pending_reviews or halted)
                 and (
                     halted
                     or (
@@ -3233,7 +3238,9 @@ def _run_dispatched_tasks(
                 waitables.append(preparation[0])
             if writer is not None:
                 waitables.append(writer[0])
-            if waitables:
+            if resource_paused and not halted:
+                time.sleep(min(0.25, heartbeat_interval_sec))
+            elif waitables:
                 wait(
                     waitables,
                     timeout=min(

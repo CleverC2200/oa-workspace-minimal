@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import os
+import math
 import re
 import subprocess
 import threading
 from typing import Callable
 
 
-CAPACITY_STEPS = (6, 8, 10, 12)
+CAPACITY_STEPS = (1, 2, 6, 8, 10, 12)
 _MEMORY_PERCENT = re.compile(r"free percentage:\s*([0-9]{1,3})%")
 
 
@@ -43,6 +44,8 @@ def sample_local_health(
     try:
         cpu_count = int(cpu_reader() or 0)
         one_minute_load = float(load_reader()[0])
+        if cpu_count <= 0 or not math.isfinite(one_minute_load) or one_minute_load < 0:
+            raise ValueError("host_sample_invalid")
     except Exception:
         cpu_count = 0
         one_minute_load = 0.0
@@ -51,16 +54,16 @@ def sample_local_health(
     except Exception:
         active_threads = 0
     load_per_cpu = round(one_minute_load / cpu_count, 3) if cpu_count else None
-    if memory_free is None or load_per_cpu is None:
+    if memory_free is None:
         status = "unknown"
-    elif memory_free < 12 or load_per_cpu >= 2.0:
+    elif memory_free < 12:
         status = "critical"
-    elif memory_free < 25 or load_per_cpu >= 1.25:
-        status = "pressure"
+    elif load_per_cpu is None:
+        status = "unknown"
     elif memory_free >= 30 and load_per_cpu < 1.0:
         status = "healthy"
     else:
-        status = "unknown"
+        status = "pressure"
     return {
         "status": status,
         "memory_free_percent": memory_free,

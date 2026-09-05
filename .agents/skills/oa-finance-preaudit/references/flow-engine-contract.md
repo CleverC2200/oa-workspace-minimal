@@ -37,6 +37,10 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
 
 ### 审核未完成的人工交接
 
+资源等待与 AI 审核失败分开处理。CPU 高负载本身属于 `pressure`，不再单独触发 `critical`；弹性审核默认从 6 槽开始，持续压力按每次心跳逐级降到 2、1 槽，保留在途审核，不为降档杀进程。恢复后仍需连续两个完整健康窗口才按 `1 → 2 → 6 → 8 → 10 → 12` 升一级。材料准备及 Writer 均保持 1 槽，原全局 FIFO 不变。
+
+宿主健康采样未知时，控制器标记 `resource_paused=true`，暂停新领取、准备完成后的审核派发及排队 Writer；已在途操作仍受原超时和安全校验约束。周期性复测恢复可信后继续原队列，排队等待不启动 AI 审核计时。等待期间仍响应显式停止，已进入 Writer 的操作不能被重放。可用内存低于 12% 仍为 `critical`，即使 CPU 采样缺失也立即停止。资源繁忙或等待绝不生成下述人工交接意见；实际 AI 超时或结果格式失败继续按下述独立规则处理。
+
 五类财务当前受控 attempt 遇到 `codex_process_timeout` 或 `codex_decision_invalid` 时，宿主可生成 `preaudit_manual_handoff` 行政交接记录，说明 AI 未形成有效业务结论，请财务人工审核。它不是 `preaudit_review_decision`，不含 `items`，不计为完成业务审核覆盖；原固定项目规则只适用于有效业务决定。包装与手工 preview 不使用此分支。
 
 超时须确认审核进程组退出并保存绑定当前 action token 的失败凭据；结构校验失败须保存当前决定摘要和固定校验码的拒绝凭据。宿主在同一完成锁内复核动作仍为 `review_required / authorized`、冻结输入、当前授权及零 Writer 痕迹，再将特别说明交给唯一串行 Writer；身份、待办、begin-submit、终态回执与后置校验仍全部执行。此分支不再请求 AI 重试，成功闭合为 `needs_human / submitted` 后继续 FIFO。意见只说明超时或结果格式异常，不包含原始错误内容，也不生成业务通过/不通过结论。
