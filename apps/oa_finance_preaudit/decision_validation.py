@@ -10,6 +10,9 @@ from apps import json_artifact
 
 CODES = frozenset({
     "decision_contract", "item_count", "item_fields", "item_values",
+    "decision_fields", "decision_schema_version", "decision_kind",
+    "decision_action_token", "decision_workflow", "decision_rule_version",
+    "decision_overall", "decision_items_type",
     "required_uncertain", "payment_company_conclusion", "payment_attachment_terms",
     "budget_conclusion", "deferred_payment_conclusion", "overall_mismatch",
     "unspecified",

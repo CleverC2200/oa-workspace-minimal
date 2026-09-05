@@ -104,7 +104,12 @@ def test_parent_does_not_retry_diagnostic_failure(tmp_path: Path, monkeypatch) -
 
 
 @pytest.mark.parametrize("mutation,code", [
-    ("token", "decision_contract"), ("count", "item_count"),
+    ("token", "decision_action_token"), ("count", "item_count"),
+    ("top_fields", "decision_fields"),
+    ("missing_field", "decision_fields"), ("multiple", "decision_fields"),
+    ("version", "decision_schema_version"), ("kind", "decision_kind"),
+    ("workflow", "decision_workflow"), ("rule", "decision_rule_version"),
+    ("overall_invalid", "decision_overall"), ("items_type", "decision_items_type"),
     ("fields", "item_fields"), ("values", "item_values"),
     ("overall", "overall_mismatch"),
 ])
@@ -137,6 +142,26 @@ def test_real_completion_validator_keeps_rejections_classified(
     }
     if mutation == "token":
         decision["action_token"] = "wrong-token"
+    elif mutation == "top_fields":
+        decision["private-field"] = "private-value"
+    elif mutation == "missing_field":
+        del decision["rule_version"]
+    elif mutation == "multiple":
+        decision["private-field"] = "private-value"
+        decision["action_token"] = "wrong-token"
+        decision["items"] = None
+    elif mutation == "version":
+        decision["schema_version"] = 99
+    elif mutation == "kind":
+        decision["kind"] = "private-kind"
+    elif mutation == "workflow":
+        decision["workflow_key"] = "private-workflow"
+    elif mutation == "rule":
+        decision["rule_version"] = "private-rule"
+    elif mutation == "overall_invalid":
+        decision["overall"] = "private-overall"
+    elif mutation == "items_type":
+        decision["items"] = {"private-item": {}}
     elif mutation == "count":
         decision["items"].pop()
     elif mutation == "fields":
@@ -152,3 +177,10 @@ def test_real_completion_validator_keeps_rejections_classified(
     assert str(rejected.value) == "review_decision_invalid"
     assert rejected.value.validation_code == code
     assert not Path(action["action_file"]).with_name("writer-boundary.json").exists()
+    decision_validation.record_rejection(Path(action["action_file"]), decision, rejected.value)
+    receipt_path = next(Path(action["action_file"]).parent.glob("review-rejection-*.json"))
+    receipt_text = receipt_path.read_text()
+    assert json.loads(receipt_text)["validation_code"] == code
+    assert "private" not in receipt_text
+    assert "wrong-token" not in receipt_text
+    assert action["action_token"] not in receipt_text
