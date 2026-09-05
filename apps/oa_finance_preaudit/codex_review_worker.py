@@ -14,7 +14,7 @@ from typing import Callable, TextIO
 from apps import json_artifact
 from apps.oa_approval import runtime_control, writer_outcomes
 
-from . import review_failure_evidence
+from . import decision_validation, review_failure_evidence
 
 
 MODEL = review_failure_evidence.MODEL
@@ -829,6 +829,10 @@ def _complete_decision(action_file: Path, decision: dict) -> str | None:
             )
         except ValueError as error:
             if str(error) == "review_decision_invalid":
+                try:
+                    decision_validation.record_rejection(action_file, decision, error)
+                except (OSError, ValueError, TypeError):
+                    return "codex_decision_diagnostic_failed"
                 return "codex_decision_invalid"
             runtime_control.request_stop("writer_result_unknown")
             return "codex_decision_submit_failed"
