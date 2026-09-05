@@ -404,6 +404,10 @@ def test_inner_codex_timeout_reaps_process_group_and_grandchild(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     task, action_file = _codex_task(tmp_path)
+    json_artifact.write_json_atomic(
+        action_file.with_name("state.json"),
+        json.loads(action_file.read_text(encoding="utf-8")),
+    )
     pid_file, fake_codex, marker = _install_fake_codex_tree(
         tmp_path,
         monkeypatch,
@@ -417,6 +421,7 @@ def test_inner_codex_timeout_reaps_process_group_and_grandchild(
     )
 
     assert result.error_code == "codex_process_timeout"
+    assert len(list(action_file.parent.glob("review-process-*.json"))) == 1
     _assert_fake_codex_tree_reaped(pid_file, fake_codex, marker)
 
 

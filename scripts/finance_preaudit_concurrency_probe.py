@@ -2941,7 +2941,8 @@ def _run_dispatched_tasks(
                         value.get("error_code") or "worker_process_failed"
                     )
                     if (
-                        error_code in ITEM_LOCAL_REVIEW_FAILURE_REASONS
+                        (error_code in ITEM_LOCAL_REVIEW_FAILURE_REASONS
+                         or error_code == "codex_process_timeout")
                         and codex_review_worker.is_bounded_prewrite_failure(value)
                     ):
                         try:
@@ -2973,8 +2974,13 @@ def _run_dispatched_tasks(
                             outcomes[index] = process_pool.TaskOutcome(
                                 index=index,
                                 status="completed",
-                                value=quarantined_value,
+                                value={**quarantined_value, "status": "failed"}
+                                if error_code == "codex_process_timeout" else quarantined_value,
                             )
+                            if error_code == "codex_process_timeout":
+                                failed_now = True
+                                first_review_error_code = first_review_error_code or error_code
+                                continue
                             if strict_global_fifo:
                                 pending_write_indices.remove(index)
                             else:
@@ -4697,7 +4703,9 @@ def _run_rolling_drain_locked(
         "token_usage": {
             "status": (
                 "recorded"
-                if usage_workers["recorded_workers"] == completed
+                if usage_workers["recorded_workers"] > 0
+                and not usage_workers["unknown_workers"]
+                and not usage_workers["partial_workers"]
                 else "partial"
                 if usage_workers["recorded_workers"] or usage_workers["partial_workers"]
                 else "unknown"

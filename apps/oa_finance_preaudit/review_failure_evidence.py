@@ -9,8 +9,18 @@ from pathlib import Path
 MODEL = "gpt-5.6-terra"
 REASONING_EFFORT = "high"
 PROCESS_FAILURE_CODES = frozenset(
-    {"codex_process_failed", "codex_process_incomplete"}
+    {"codex_process_failed", "codex_process_incomplete", "codex_process_timeout"}
 )
+
+
+def valid_attempt_codes(codes: object) -> bool:
+    if not isinstance(codes, list) or not codes:
+        return False
+    if any(not isinstance(code, str) or code not in PROCESS_FAILURE_CODES for code in codes):
+        return False
+    if codes[-1] == "codex_process_timeout":
+        return len(codes) in {1, 2} and "codex_process_timeout" not in codes[:-1]
+    return len(codes) == 2 and "codex_process_timeout" not in codes
 
 
 def receipt_payload(
@@ -27,8 +37,8 @@ def receipt_payload(
         "workflow_key": workflow_key,
         "model": MODEL,
         "reasoning_effort": REASONING_EFFORT,
-        "process_attempts": 2,
-        "process_retries": 1,
+        "process_attempts": len(attempt_error_codes),
+        "process_retries": len(attempt_error_codes) - 1,
         "failure_code": failure_code,
         "attempt_error_codes": attempt_error_codes,
     }
@@ -49,9 +59,7 @@ def receipt_matches(
     if (
         not isinstance(actual_failure_code, str)
         or actual_failure_code not in PROCESS_FAILURE_CODES
-        or not isinstance(actual_attempt_codes, list)
-        or len(actual_attempt_codes) != 2
-        or any(code not in PROCESS_FAILURE_CODES for code in actual_attempt_codes)
+        or not valid_attempt_codes(actual_attempt_codes)
         or actual_attempt_codes[-1] != actual_failure_code
         or (failure_code is not None and actual_failure_code != failure_code)
         or (
