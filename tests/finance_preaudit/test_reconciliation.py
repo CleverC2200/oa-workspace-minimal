@@ -98,17 +98,22 @@ def test_reconciliation_classifies_live_state_without_exposing_request_ids(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "flows"
-    _state(root, "1001", "2026-08-24 09:00:00")
+    request_ids = (
+        "sensitive-request-alpha",
+        "sensitive-request-beta",
+        "sensitive-request-gamma",
+    )
+    _state(root, request_ids[0], "2026-08-24 09:00:00")
     _state(
         root,
-        "1002",
+        request_ids[1],
         "2026-08-24 09:01:00",
         write_state="unknown",
         reason="writer_transport_unknown",
     )
     _state(
         root,
-        "1003",
+        request_ids[2],
         "2026-08-24 09:02:00",
         execution_state="closed",
         write_state="submitted",
@@ -118,10 +123,10 @@ def test_reconciliation_classifies_live_state_without_exposing_request_ids(
     result = reconciliation.reconcile(
         root,
         pending_rows=[
-            {"request_id": "1001", "received_at": "2026-08-24 09:00:00"},
-            {"request_id": "1002", "received_at": "2026-08-24 09:01:00"},
+            {"request_id": request_ids[0], "received_at": "2026-08-24 09:00:00"},
+            {"request_id": request_ids[1], "received_at": "2026-08-24 09:01:00"},
         ],
-        handled_rows=[{"request_id": "1003"}],
+        handled_rows=[{"request_id": request_ids[2]}],
     )
 
     assert result["counts"] == {
@@ -133,10 +138,22 @@ def test_reconciliation_classifies_live_state_without_exposing_request_ids(
         "manual_write_state_verification": 1,
         "none": 1,
     }
-    serialized = json.dumps(result)
-    assert "1001" not in serialized
-    assert "1002" not in serialized
-    assert "1003" not in serialized
+    def string_values(value: object) -> list[str]:
+        if isinstance(value, dict):
+            return [
+                text
+                for key, nested in value.items()
+                for text in [str(key), *string_values(nested)]
+            ]
+        if isinstance(value, list):
+            return [text for nested in value for text in string_values(nested)]
+        return [value] if isinstance(value, str) else []
+
+    assert all(
+        request_id not in text
+        for text in string_values(result)
+        for request_id in request_ids
+    )
 
 
 def test_reconciliation_highlights_only_failures_still_live_pending(

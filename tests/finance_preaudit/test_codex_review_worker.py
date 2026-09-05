@@ -10,8 +10,18 @@ import time
 import pytest
 
 from apps import json_artifact
-from apps.oa_finance_preaudit import codex_review_worker
+from apps.oa_finance_preaudit import codex_review_worker, flow_engine
 from apps.oa_approval import runtime_control
+
+
+_SMALL_MARKETING_V2_ITEM_KEYS = [
+    "budget_account",
+    "attachment_completeness",
+    "cost_bearer",
+    "sap_customer_code_match",
+    "reimbursable_minimum",
+    "payment_company_consistency",
+]
 
 
 def _task(
@@ -57,6 +67,47 @@ def _task(
             "rule_version": f"{workflow_key}:1",
         },
     )
+    return {
+        "project_root": str(project_root),
+        "action_file": str(action_file),
+        "timeout_seconds": 900,
+    }, action_file
+
+
+def _small_marketing_v2_task(
+    tmp_path: Path,
+    *,
+    budget_account: str,
+) -> tuple[dict, Path]:
+    project_root = tmp_path / "project"
+    engine = flow_engine.FlowEngine(
+        root=project_root / "runtime" / "finance_preaudit_flows",
+        discover_candidates=lambda workflow_key: [
+            {
+                "request_id": "marketing-request",
+                "received_at": "2026-09-04T09:00:00+08:00",
+                "workflow_key": workflow_key,
+            }
+        ],
+        collect_material=lambda request_id, _attempt_root: {
+            "schema_version": 1,
+            "kind": "preaudit_material",
+            "request_id": request_id,
+            "workflow_key": "small_marketing_fee",
+            "workflow_name": "小额市场费报销流程",
+            "declared_fields": {"budget_account": budget_account},
+            "resources": [],
+            "prepared": {
+                "images": [],
+                "structured_contents": [],
+                "manifest": [],
+            },
+            "authority_facts": [],
+            "warnings": [],
+        },
+    )
+    action = engine.next_action("small_marketing_fee")
+    action_file = Path(action["action_file"])
     return {
         "project_root": str(project_root),
         "action_file": str(action_file),
@@ -125,20 +176,11 @@ def test_general_expense_worker_uses_bound_rule_pack(tmp_path: Path) -> None:
 def test_small_marketing_v2_worker_uses_six_item_requirements(
     tmp_path: Path,
 ) -> None:
-    _task_payload, action_file = _task(
+    _task_payload, action_file = _small_marketing_v2_task(
         tmp_path,
-        workflow_key="small_marketing_fee",
+        budget_account="市场活动费",
     )
-    packet_file = action_file.with_name("review-packet.json")
-    packet = json.loads(packet_file.read_text(encoding="utf-8"))
-    json_artifact.write_json_atomic(
-        packet_file,
-        {**packet, "rule_version": "small_marketing_fee:2"},
-    )
-    json_artifact.write_json_atomic(
-        action_file.with_name("material.json"),
-        {"declared_fields": {"budget_account": "市场活动费"}},
-    )
+    item_keys = _SMALL_MARKETING_V2_ITEM_KEYS
 
     schema = codex_review_worker._decision_schema(action_file)
     prompt = codex_review_worker._prompt(action_file)
@@ -147,19 +189,17 @@ def test_small_marketing_v2_worker_uses_six_item_requirements(
         "type": "string",
         "const": "small_marketing_fee:2",
     }
-    attachment_schema, other_schema = schema["properties"]["items"]["items"][
-        "anyOf"
-    ]
-    assert attachment_schema["properties"]["item_key"] == {
-        "type": "string",
-        "const": "attachment_completeness",
-    }
+    items_schema = schema["properties"]["items"]
+    assert items_schema["type"] == "object"
+    assert items_schema["additionalProperties"] is False
+    assert items_schema["required"] == item_keys
+    assert list(items_schema["properties"]) == item_keys
+    attachment_schema = items_schema["properties"]["attachment_completeness"]
     assert attachment_schema["properties"]["conclusion"]["pattern"] == (
         "^(?:.*支付截图.*发票.*|.*发票.*支付截图.*)$"
     )
-    assert "attachment_completeness" not in other_schema["properties"][
-        "item_key"
-    ]["enum"]
+    assert "item_key" not in attachment_schema["properties"]
+    assert "item_key" not in attachment_schema["required"]
     assert "小额市场费生产预审" in prompt
     assert "small-marketing-fee.md" in prompt
     assert "六项必须逐项" in prompt
@@ -167,30 +207,171 @@ def test_small_marketing_v2_worker_uses_six_item_requirements(
     assert "不得使用“支付凭证”等近义词替代" in prompt
     assert "支付截图和发票" in prompt
     assert "三者一致，应选择当前实际公司全称支付" in prompt
+    assert (
+        "budget_account → attachment_completeness → cost_bearer → "
+        "sap_customer_code_match → reimbursable_minimum → "
+        "payment_company_consistency"
+    ) in prompt
+    assert "不得重复、遗漏或调换顺序" in prompt
+    assert "`items` 必须是以上六个规范键组成的对象" in prompt
+    assert "各键的值不包含 `item_key`" in prompt
+    assert "转换为 FlowEngine 决定数组" in prompt
+    assert "符合 flow-engine-contract“结构化审核决定”" not in prompt
     assert "不得增加支付公司一致项" not in prompt
 
 
 def test_small_marketing_v2_special_subject_keeps_general_item_schema(
     tmp_path: Path,
 ) -> None:
-    _task_payload, action_file = _task(
+    _task_payload, action_file = _small_marketing_v2_task(
         tmp_path,
-        workflow_key="small_marketing_fee",
+        budget_account="配送费-自提/租车费",
+    )
+
+    schema = codex_review_worker._decision_schema(action_file)
+
+    item_schemas = schema["properties"]["items"]["properties"]
+    assert list(item_schemas) == [
+        "budget_account",
+        "attachment_completeness",
+        "cost_bearer",
+        "sap_customer_code_match",
+        "reimbursable_minimum",
+        "payment_company_consistency",
+    ]
+    assert "pattern" not in item_schemas["attachment_completeness"]["properties"][
+        "conclusion"
+    ]
+
+
+def test_small_marketing_v2_normalizes_keyed_items_in_frozen_order(
+    tmp_path: Path,
+) -> None:
+    _task_payload, action_file = _small_marketing_v2_task(
+        tmp_path,
+        budget_account="市场活动费",
+    )
+    item_keys = _SMALL_MARKETING_V2_ITEM_KEYS
+    keyed_items = {
+        item_key: {
+            "status": "uncertain",
+            "conclusion": item_key,
+            "evidence_refs": [],
+            "missing_evidence": ["待确认"],
+        }
+        for item_key in reversed(item_keys)
+    }
+
+    normalized = codex_review_worker._normalize_decision(
+        action_file,
+        {"items": keyed_items},
+    )
+
+    assert [item["item_key"] for item in normalized["items"]] == item_keys
+
+
+@pytest.mark.parametrize(
+    "item_keys",
+    [
+        ["renamed", *_SMALL_MARKETING_V2_ITEM_KEYS[1:]],
+        [*_SMALL_MARKETING_V2_ITEM_KEYS, "extra"],
+        list(reversed(_SMALL_MARKETING_V2_ITEM_KEYS)),
+        [
+            _SMALL_MARKETING_V2_ITEM_KEYS[1],
+            *_SMALL_MARKETING_V2_ITEM_KEYS[1:],
+        ],
+        _SMALL_MARKETING_V2_ITEM_KEYS[:-1],
+    ],
+    ids=["renamed", "extra", "reordered", "duplicate", "missing"],
+)
+def test_small_marketing_v2_rejects_noncanonical_packet_before_review(
+    tmp_path: Path,
+    item_keys: list[str],
+) -> None:
+    task, action_file = _small_marketing_v2_task(
+        tmp_path,
+        budget_account="市场活动费",
     )
     packet_file = action_file.with_name("review-packet.json")
     packet = json.loads(packet_file.read_text(encoding="utf-8"))
     json_artifact.write_json_atomic(
         packet_file,
-        {**packet, "rule_version": "small_marketing_fee:2"},
+        {**packet, "items": [{"item_key": item_key} for item_key in item_keys]},
+    )
+
+    result = codex_review_worker.review(
+        task,
+        executor=lambda *_args: pytest.fail("executor must not start"),
+    )
+
+    assert result["status"] == "failed"
+    assert result["write_state"] == "not_requested"
+    assert result["process_attempts"] == 0
+    assert result["error_code"] == "codex_review_task_invalid"
+
+
+def test_small_marketing_v2_rejects_changed_frozen_material_before_review(
+    tmp_path: Path,
+) -> None:
+    task, action_file = _small_marketing_v2_task(
+        tmp_path,
+        budget_account="市场活动费",
     )
     json_artifact.write_json_atomic(
         action_file.with_name("material.json"),
-        {"declared_fields": {"budget_account": "配送费-自提/租车费"}},
+        {"declared_fields": {"budget_account": "changed"}},
     )
 
-    schema = codex_review_worker._decision_schema(action_file)
+    result = codex_review_worker.review(
+        task,
+        executor=lambda *_args: pytest.fail("executor must not start"),
+    )
 
-    assert "anyOf" not in schema["properties"]["items"]["items"]
+    assert result["status"] == "failed"
+    assert result["write_state"] == "not_requested"
+    assert result["process_attempts"] == 0
+    assert result["error_code"] == "codex_review_task_invalid"
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["item_metadata", "packet_extra", "action_packet_path", "state_token"],
+)
+def test_small_marketing_v2_reuses_full_frozen_attempt_validation(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    task, action_file = _small_marketing_v2_task(
+        tmp_path,
+        budget_account="市场活动费",
+    )
+    packet_file = action_file.with_name("review-packet.json")
+    state_file = action_file.with_name("state.json")
+    if tamper in {"item_metadata", "packet_extra"}:
+        packet = json.loads(packet_file.read_text(encoding="utf-8"))
+        if tamper == "item_metadata":
+            packet["items"][0]["name"] = "changed"
+        else:
+            packet["unexpected"] = "changed"
+        json_artifact.write_json_atomic(packet_file, packet)
+    elif tamper == "action_packet_path":
+        action = json.loads(action_file.read_text(encoding="utf-8"))
+        action["review_packet_file"] = str(action_file.with_name("other.json"))
+        json_artifact.write_json_atomic(action_file, action)
+    else:
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state["action_token"] = "changed"
+        json_artifact.write_json_atomic(state_file, state)
+
+    result = codex_review_worker.review(
+        task,
+        executor=lambda *_args: pytest.fail("executor must not start"),
+    )
+
+    assert result["status"] == "failed"
+    assert result["write_state"] == "not_requested"
+    assert result["process_attempts"] == 0
+    assert result["error_code"] == "codex_review_task_invalid"
 
 
 def test_small_marketing_v1_worker_keeps_original_five_items(
@@ -450,6 +631,68 @@ def test_codex_command_pins_terra_high_and_json_output(tmp_path: Path) -> None:
     assert command[command.index("--output-last-message") + 1].endswith(
         "decision.json"
     )
+
+
+def test_execute_codex_normalizes_small_marketing_transport_schema(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    task, action_file = _small_marketing_v2_task(
+        tmp_path,
+        budget_account="市场活动费",
+    )
+    item_keys = _SMALL_MARKETING_V2_ITEM_KEYS
+
+    class Process:
+        pid = 12345
+        returncode = 0
+
+        def __init__(self, command: list[str]) -> None:
+            self.decision_file = Path(
+                command[command.index("--output-last-message") + 1]
+            )
+
+        def communicate(self, *, input: str, timeout: int) -> None:
+            del input, timeout
+            json_artifact.write_json_atomic(
+                self.decision_file,
+                {
+                    "schema_version": 1,
+                    "kind": "preaudit_review_decision",
+                    "action_token": "test-action-token",
+                    "workflow_key": "small_marketing_fee",
+                    "rule_version": "small_marketing_fee:2",
+                    "overall": "needs_human",
+                    "items": {
+                        item_key: {
+                            "status": "uncertain",
+                            "conclusion": item_key,
+                            "evidence_refs": [],
+                            "missing_evidence": ["待确认"],
+                        }
+                        for item_key in reversed(item_keys)
+                    },
+                },
+            )
+
+        def poll(self) -> int:
+            return self.returncode
+
+    monkeypatch.setattr(
+        codex_review_worker.subprocess,
+        "Popen",
+        lambda command, **_kwargs: Process(command),
+    )
+
+    result = codex_review_worker._execute_codex(
+        Path(task["project_root"]),
+        action_file,
+        60,
+    )
+
+    assert result.error_code is None
+    assert result.decision is not None
+    assert [item["item_key"] for item in result.decision["items"]] == item_keys
 
 
 def test_prompt_exposes_flow_engine_fallback_routing_for_legacy_packet(
