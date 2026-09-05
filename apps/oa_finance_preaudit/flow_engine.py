@@ -3456,20 +3456,26 @@ class FlowEngine:
             expected_fields.add("excel_comparison")
             if packaging_v2:
                 expected_fields.add("visual_review")
-        if (
-            set(decision) != expected_fields
-            or decision.get("schema_version") != SCHEMA_VERSION
-            or decision.get("kind") != "preaudit_review_decision"
-            or not secrets.compare_digest(
-                str(decision.get("action_token") or ""),
-                str(action.get("action_token") or ""),
-            )
-            or decision.get("workflow_key") != action["workflow_key"]
-            or decision.get("rule_version") != packet.get("rule_version")
-            or decision.get("overall") not in {"pass", "needs_human"}
-            or not isinstance(decision.get("items"), list)
+        # Keep the original short-circuit order; record only fixed reason codes.
+        if set(decision) != expected_fields:
+            raise decision_validation.InvalidDecision("decision_fields")
+        if decision.get("schema_version") != SCHEMA_VERSION:
+            raise decision_validation.InvalidDecision("decision_schema_version")
+        if decision.get("kind") != "preaudit_review_decision":
+            raise decision_validation.InvalidDecision("decision_kind")
+        if not secrets.compare_digest(
+            str(decision.get("action_token") or ""),
+            str(action.get("action_token") or ""),
         ):
-            raise decision_validation.InvalidDecision("decision_contract")
+            raise decision_validation.InvalidDecision("decision_action_token")
+        if decision.get("workflow_key") != action["workflow_key"]:
+            raise decision_validation.InvalidDecision("decision_workflow")
+        if decision.get("rule_version") != packet.get("rule_version"):
+            raise decision_validation.InvalidDecision("decision_rule_version")
+        if decision.get("overall") not in {"pass", "needs_human"}:
+            raise decision_validation.InvalidDecision("decision_overall")
+        if not isinstance(decision.get("items"), list):
+            raise decision_validation.InvalidDecision("decision_items_type")
 
         packet_items = packet.get("items")
         if not isinstance(packet_items, list) or len(decision["items"]) != len(packet_items):
