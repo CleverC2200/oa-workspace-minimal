@@ -19,7 +19,8 @@
 ## 按需读取
 
 - 实际单据预审使用 `.agents/skills/oa-finance-preaudit/SKILL.md`。开发结果结构读 [.agents/skills/oa-finance-preaudit/references/flow-engine-contract.md](.agents/skills/oa-finance-preaudit/references/flow-engine-contract.md)；证据规则读 [.agents/skills/oa-finance-preaudit/references/observation-contract.md](.agents/skills/oa-finance-preaudit/references/observation-contract.md)；流程规则经 [result-contract.md](.agents/skills/oa-finance-preaudit/references/result-contract.md) 只选择匹配流程。开发和测试不执行真实单据 next-action 或 complete-review。
-- 修改 GitHub Issue、PR 或交付规则：读 `CONTRIBUTING.md`、`docs/agents/issue-tracker.md` 和 `docs/agents/triage-labels.md`。
+- 创建、更新 GitHub Issue 或拆分需求、依赖与验收：读 [Issue 追踪](docs/agents/issue-tracker.md)；设置工作状态或分类标签时再读 [标签规范](docs/agents/triage-labels.md)。
+- 准备提交、PR 或调整交付规则：读 `CONTRIBUTING.md` 中对应的“分支与提交”“Pull Request”或“验证层级”；涉及发布或生产同步时按上方发布入口读取。
 - 统一领域词汇或记录架构决定：读 `CONTEXT.md` 和 `docs/agents/domain.md`。
 - `README.md` 只维护当前可验证事实、入口和验证命令；未实现设计放 GitHub Issues，不写成现状。
 
