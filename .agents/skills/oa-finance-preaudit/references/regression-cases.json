@@ -3,6 +3,34 @@
   "description": "人工确认的脱敏财务预审错误案例。仅在盲测结果冻结后用于对照和回归，不作为观察子 Agent 的当前答案。",
   "cases": [
     {
+      "id": "RC-030-lodging-partial-evidence-summary",
+      "scope": "travel-expense",
+      "audit_item": "4-住宿与考勤",
+      "status": "confirmed",
+      "input_facts": [
+        "当前住宿明细稳定关联一张甲酒店付款凭证，未提供入住及离店日期",
+        "全部相关考勤中，第2日和第3日完整地址含同名甲酒店附近，但没有独立可关联的酒店完整地址"
+      ],
+      "incorrect_output": "缺少酒店详情完整地址及实际入住证据，无法逐日与考勤地点比对。",
+      "expected_output": "⚠️ 4、住宿与考勤：已见甲酒店付款凭证，第2、3日考勤均在同名酒店附近；但缺少入住／离店日期及可关联的酒店完整地址，尚不能完成逐晚比对，请财务核实。",
+      "failure_mode": "只报告缺口，省略已经核实的付款事实和考勤相符线索；或将这些线索过度认定为实际入住",
+      "rule_ref": "flows/travel-expense.md#第-4-项同时说明已核实线索与剩余缺口"
+    },
+    {
+      "id": "RC-031-lodging-complete-evidence-comparison",
+      "scope": "travel-expense",
+      "audit_item": "4-住宿与考勤",
+      "status": "confirmed",
+      "input_facts": [
+        "入住结算单已稳定关联当前住宿明细，明确入住第1日至第3日离店、酒店完整地址",
+        "逐晚对应考勤完整地址与酒店地址归一后的城市和区县一致，无冲突或未覆盖日期"
+      ],
+      "incorrect_output": "缺少酒店详情完整地址及实际入住证据，无法逐日与考勤地点比对。",
+      "expected_output": "✅ 4、住宿与考勤：已根据入住结算单核对第1、2晚住宿，酒店完整地址与对应日期考勤的城市、区县一致。",
+      "failure_mode": "把证据不足时的结论固定套用于证据完整的单据，重复索要已提供依据",
+      "rule_ref": "flows/travel-expense.md#第-4-项同时说明已核实线索与剩余缺口"
+    },
+    {
       "id": "RC-029-resource-pressure-keeps-ai-review",
       "scope": "five-finance-workflows",
       "audit_item": "resource-pressure",
