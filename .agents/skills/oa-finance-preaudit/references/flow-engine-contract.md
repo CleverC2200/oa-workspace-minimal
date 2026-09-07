@@ -104,7 +104,7 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
 - `pages` 是按 `packaging_visual_contract.page_refs` 原始顺序排列的页面-版本观察列表，必须覆盖每个原始页面。一个原图同时承载多个包装版本时，可为不同 `package_version_id` 连续重复该 `page_ref`；同页同版本不得重复，同页分类必须一致，`non_packaging` 或 `uncertain` 页不得重复。重复观察不能替代其他原始页面，页面覆盖计数仍按唯一原始页计算。
 - `packaging_layout` 观察必须填写版本 ID；同一版本所有页面观察的 `item_keys` 并集必须精确覆盖四个固定项。观察声明覆盖某项时，该页引用必须进入对应项目的 `evidence_refs` 或 `missing_evidence`。
 - `non_packaging` 和 `uncertain` 页的版本 ID 必须为 `null`，`item_keys` 必须为空；`non_packaging` 页引用也不得进入任一固定项目的 `evidence_refs` 或 `missing_evidence`。
-- `non_packaging` 的业务语义包括仅含储运信息、且不承载固定四项内容的运输外箱版面；不得仅因零售包装缺少固定四项就归入该类。此语义由审核 Agent 直接观察原图判断，FlowEngine 只验证分类后的结构与输出分支。
+- `non_packaging` 的业务语义包括仅含储运信息、且不承载固定四项内容的运输外箱版面，以及包装规则包中已确认的“正面展示标签例外”；除此例外，不得仅因零售包装缺少固定四项就归入该类。此语义由审核 Agent 直接观察原图判断，FlowEngine 只验证分类后的结构与输出分支。
 - 只要存在 `packaging_layout` 就使用 `outcome=reviewed` 并审核包装页；存在 `uncertain` 时也必须使用 `reviewed`，整体结论为 `needs_human`，且不确定页引用必须进入至少一个 `uncertain` 项的 `missing_evidence`。
 - 只有全部页面均为 `non_packaging` 时允许 `outcome=all_non_packaging`。此时四项保留为内部 `pass` 结构以维持统一执行与回执合同，但 `evidence_refs` 和 `missing_evidence` 均为空；`excel_comparison.status` 使用 `not_applicable`，OA 意见只渲染 `AI审核结论：非包装版面，跳过审核。`。
 - V1 冻结包装审核包仍按原决定合同闭合；新审核包会在 action、state 和 review packet 中同时固定 V2 标记，任一标记缺失或不一致均停止，不能把 V2 决定降级成 V1 绕过视觉覆盖校验。

@@ -3,6 +3,28 @@
   "description": "人工确认的脱敏财务预审错误案例。仅在盲测结果冻结后用于对照和回归，不作为观察子 Agent 的当前答案。",
   "cases": [
     {
+      "id": "RC-032-front-display-label-skipped",
+      "scope": "packaging-layout-approval",
+      "audit_item": "page-classification",
+      "status": "confirmed",
+      "input_facts": ["全部原图均为清晰正面展示标签，仅有品牌、品名、净含量、卖点和工艺", "含孤立的原料宣传徽章，无实际配料段、过敏原、营养表或生产经销单位名称地址"],
+      "incorrect_output": "输出四项缺少背面的人工判断并追加 Excel 说明",
+      "expected_output": "AI审核结论：非包装版面，跳过审核。",
+      "failure_mode": "把正面展示稿当作完整标签，索要本次未审核的背面资料",
+      "rule_ref": "flows/packaging-layout-approval.md#正面展示标签例外"
+    },
+    {
+      "id": "RC-033-front-label-mixed-pages",
+      "scope": "packaging-layout-approval",
+      "audit_item": "page-classification",
+      "status": "confirmed",
+      "input_facts": ["一页符合正面展示标签例外", "另一页承载实际配料段，或原图不足以可靠分类"],
+      "incorrect_output": "因存在展示标签而整单跳过",
+      "expected_output": "不得整单跳过；展示页不进入四项，实际固定项页和不确定页继续按既有规则审核",
+      "failure_mode": "把单页不适用扩大为整单不适用",
+      "rule_ref": "flows/packaging-layout-approval.md#正面展示标签例外"
+    },
+    {
       "id": "RC-030-lodging-partial-evidence-summary",
       "scope": "travel-expense",
       "audit_item": "4-住宿与考勤",
@@ -395,7 +417,8 @@
             "status": "confirmed",
             "input_facts": [
                 "原图明确为零售或消费者包装版面",
-                "固定四项存在缺项"
+                "固定四项存在缺项",
+                "页面已承载实际配料段，不属于仅有品牌品名规格卖点的正面展示标签"
             ],
             "incorrect_output": "因固定四项缺失而把零售包装归为非包装版面并跳过审核",
             "expected_output": "保持 packaging_layout 分类，按实际缺项形成固定四项意见",
