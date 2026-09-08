@@ -373,7 +373,11 @@ def test_outer_stop_reaps_codex_process_group_and_grandchild(
     expected_status: str,
     expected_error: str,
 ) -> None:
-    task, _action_file = _codex_task(tmp_path)
+    task, action_file = _codex_task(tmp_path)
+    json_artifact.write_json_atomic(
+        action_file.with_name("state.json"),
+        json.loads(action_file.read_text(encoding="utf-8")),
+    )
     pid_file, fake_codex, marker = _install_fake_codex_tree(
         tmp_path,
         monkeypatch,

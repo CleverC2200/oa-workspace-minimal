@@ -1630,3 +1630,86 @@ def test_read_only_worker_classifies_zero_exit_without_decision() -> None:
     assert result["status"] == "failed"
     assert result["write_state"] == "not_requested"
     assert result["error_code"] == "codex_review_task_invalid"
+
+
+@pytest.mark.parametrize("workflow", list(codex_review_worker._FINANCE_RULES))
+def test_output_schema_binds_current_action_token(tmp_path: Path, workflow: str) -> None:
+    _, action_file = _task(tmp_path, workflow_key=workflow)
+    schema = codex_review_worker._decision_schema(action_file)
+    assert schema["properties"]["action_token"] == {
+        "type": "string", "const": "test-action-token",
+    }
+
+
+def test_v2_output_schema_binds_real_frozen_token(tmp_path: Path) -> None:
+    _, action_file = _small_marketing_v2_task(tmp_path, budget_account="市场费用")
+    token = json.loads(action_file.read_text())["action_token"]
+    schema = codex_review_worker._decision_schema(action_file)
+    assert schema["properties"]["action_token"] == {"type": "string", "const": token}
+    wrong = {"action_token": "wrong-token"}
+    assert codex_review_worker._normalize_decision(action_file, wrong)["action_token"] == "wrong-token"
+
+
+@pytest.mark.parametrize("token", [None, "", 123, "different-token"])
+def test_output_schema_rejects_invalid_or_unbound_token(tmp_path: Path, token) -> None:
+    _, action_file = _task(tmp_path)
+    action = json.loads(action_file.read_text())
+    action["action_token"] = token
+    json_artifact.write_json_atomic(action_file, action)
+    with pytest.raises(ValueError, match="codex_review_task_invalid"):
+        codex_review_worker._decision_schema(action_file)
+
+
+def test_read_only_schema_keeps_probe_token(tmp_path: Path) -> None:
+    _, action_file = _task(tmp_path)
+    schema = codex_review_worker._decision_schema(action_file, read_only=True)
+    assert schema["properties"]["action_token"] == {"type": "string", "const": "capacity-probe"}
+
+
+@pytest.mark.parametrize("read_only", [False, True])
+def test_process_receives_bound_token_schema(tmp_path: Path, monkeypatch, read_only: bool) -> None:
+    task, action_file = _task(tmp_path)
+    seen = []
+
+    class Process:
+        pid = 12345
+        returncode = 1
+        stderr = io.StringIO()
+
+        def communicate(self, *, input: str, timeout: int) -> None:
+            expected = "capacity-probe" if read_only else "test-action-token"
+            if read_only:
+                assert expected in input
+
+        def poll(self) -> int:
+            return self.returncode
+
+    def popen(command, **_kwargs):
+        schema = json.loads(Path(command[command.index("--output-schema") + 1]).read_text())
+        seen.append(schema["properties"]["action_token"])
+        return Process()
+
+    monkeypatch.setattr(codex_review_worker.subprocess, "Popen", popen)
+    executor = (codex_review_worker._execute_read_only_codex if read_only
+                else codex_review_worker._execute_codex)
+    executor(Path(task["project_root"]), action_file, 60)
+    expected = "capacity-probe" if read_only else "test-action-token"
+    assert seen == [{"type": "string", "const": expected}]
+
+
+def test_invalid_bound_token_fails_before_process_start(tmp_path: Path, monkeypatch) -> None:
+    task, action_file = _task(tmp_path)
+    state_file = action_file.with_name("state.json")
+    state = json.loads(state_file.read_text())
+    state["action_token"] = "other-action"
+    json_artifact.write_json_atomic(state_file, state)
+
+    def unexpected_start(*_args, **_kwargs):
+        pytest.fail("invalid token must not start a reviewer")
+
+    monkeypatch.setattr(codex_review_worker.subprocess, "Popen", unexpected_start)
+    result = codex_review_worker.review(task)
+    assert result["status"] == "failed"
+    assert result["error_code"] == "codex_review_task_invalid"
+    assert result["write_state"] == "not_requested"
+    assert not action_file.with_name("review-decision.json").exists()
