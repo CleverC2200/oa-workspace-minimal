@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from datetime import date, datetime
 import hashlib
+import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
+import sys
+from tempfile import TemporaryDirectory
 from typing import Any, Dict, List, Tuple
 import xml.etree.ElementTree as ET
 import zipfile
@@ -19,6 +23,7 @@ PDF_EXTS = {".pdf"}
 SPREADSHEET_EXTS = {".xlsx", ".xlsm"}
 LEGACY_SPREADSHEET_EXTS = {".xls"}
 DOCX_EXTS = {".docx"}
+LEGACY_DOC_TIMEOUT_SECONDS = 60
 XML_EXTS = {".xml"}
 OFD_EXTS = {".ofd"}
 RAR_EXTS = {".rar"}
@@ -67,6 +72,67 @@ def render_pdf(
     finally:
         doc.close()
     return out, page_count, page_texts
+
+
+def render_legacy_doc(
+    path: Path, *, out_dir: Path, resource_id: str,
+) -> tuple[List[Tuple[Path, str, str]], int, List[str]]:
+    converter = shutil.which(os.environ.get("OA_LIBREOFFICE_BIN") or "soffice")
+    if converter is None:
+        raise RuntimeError("legacy_doc_converter_unavailable")
+    with TemporaryDirectory(prefix="legacy-doc-", dir=out_dir) as temporary:
+        work = Path(temporary).resolve()
+        source = work / "source.doc"
+        shutil.copyfile(path, source)
+        profile = work / "profile"
+        profile.mkdir()
+        # Use a private profile and disable document macros for each conversion.
+        (profile / "registrymodifications.xcu").write_text(
+            '<?xml version="1.0"?><oor:items xmlns:oor="http://openoffice.org/2001/registry">'
+            '<item oor:path="/org.openoffice.Office.Common/Security/Scripting">'
+            '<prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop>'
+            '</item></oor:items>', encoding="utf-8",
+        )
+        environment = os.environ.copy()
+        # Headless macOS builds may not discover system CJK fallback fonts.
+        mac_fonts = Path("/System/Library/Fonts/Supplemental")
+        if (sys.platform == "darwin" and mac_fonts.is_dir()
+                and not environment.get("FONTCONFIG_FILE")):
+            fontconfig = ET.Element("fontconfig")
+            ET.SubElement(fontconfig, "dir").text = str(mac_fonts)
+            ET.SubElement(fontconfig, "cachedir").text = str(work / "font-cache")
+            fontconfig_path = work / "fonts.conf"
+            ET.ElementTree(fontconfig).write(fontconfig_path, encoding="utf-8")
+            environment["FONTCONFIG_FILE"] = str(fontconfig_path)
+        try:
+            process = subprocess.Popen(
+                [converter, f"-env:UserInstallation={profile.as_uri()}",
+                 "--headless", "--nologo", "--nodefault", "--norestore",
+                 "--convert-to", "pdf:writer_pdf_Export", "--outdir", str(work), str(source)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True, env=environment,
+            )
+        except OSError:
+            raise RuntimeError("legacy_doc_converter_unavailable") from None
+        try:
+            returncode = process.wait(timeout=LEGACY_DOC_TIMEOUT_SECONDS)
+        finally:
+            # Include converter children; never signal another conversion/profile.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+        pdf = work / "source.pdf"
+        if returncode != 0 or not pdf.is_file():
+            raise RuntimeError("legacy_doc_conversion_failed")
+        try:
+            rendered = render_pdf(pdf, out_dir=out_dir, resource_id=resource_id)
+        except Exception:
+            raise RuntimeError("legacy_doc_conversion_failed") from None
+        if rendered[1] < 1 or len(rendered[0]) != rendered[1]:
+            raise RuntimeError("legacy_doc_conversion_failed")
+        return rendered
 
 
 def _file_sha256(path: Path) -> str:
@@ -607,12 +673,14 @@ def _prepare_one_attachment(
                 "image_count": 1,
             }
         )
-    elif suffix in PDF_EXTS:
-        rendered, page_count, page_texts = render_pdf(
-            path,
-            out_dir=out_dir,
-            resource_id=resource_id or path.stem,
-        )
+    elif suffix in PDF_EXTS or suffix == ".doc":
+        renderer = render_legacy_doc if suffix == ".doc" else render_pdf
+        try:
+            rendered, page_count, page_texts = renderer(
+                path, out_dir=out_dir, resource_id=resource_id or path.stem,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("legacy_doc_conversion_timeout") from None
         for rendered_path, kind, page_sha256 in rendered:
             images.append(
                 {
