@@ -37,7 +37,7 @@ def test_diagnostic_retains_only_fixed_signals(tmp_path: Path) -> None:
 
 def test_real_child_timeout_records_stage_and_reaps(tmp_path: Path, monkeypatch) -> None:
     path = _action(tmp_path)
-    monkeypatch.setattr(worker, "_decision_schema", lambda _: {})
+    monkeypatch.setattr(worker, "_decision_schema", lambda _, **_kwargs: {})
     monkeypatch.setattr(worker, "_codex_command", lambda *_: [sys.executable, "-c",
         'import sys,time; print(\'{"type":"turn.started"}\',flush=True); '
         'print("private retry connection",file=sys.stderr,flush=True); time.sleep(30)'])

@@ -362,7 +362,21 @@ def _codex_command(
     ]
 
 
-def _decision_schema(action_file: Path | None = None) -> dict:
+def _decision_schema(action_file: Path | None = None, *, read_only: bool = False) -> dict:
+    action_token = "capacity-probe"
+    if action_file is not None and not read_only:
+        state_file = action_file.with_name("state.json")
+        try:
+            if action_file.is_symlink() or state_file.is_symlink():
+                raise ValueError("codex_review_task_invalid")
+            action = json.loads(action_file.read_text(encoding="utf-8"))
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+            action_token = action.get("action_token") if isinstance(action, dict) else None
+            if (not isinstance(action_token, str) or not action_token
+                    or not isinstance(state, dict) or state.get("action_token") != action_token):
+                raise ValueError("codex_review_task_invalid")
+        except (OSError, ValueError):
+            raise ValueError("codex_review_task_invalid") from None
     workflow_key = (
         _action_workflow(action_file)
         if action_file is not None
@@ -452,7 +466,7 @@ def _decision_schema(action_file: Path | None = None) -> dict:
         "properties": {
             "schema_version": {"type": "integer", "const": 1},
             "kind": {"type": "string", "const": "preaudit_review_decision"},
-            "action_token": {"type": "string", "minLength": 1},
+            "action_token": {"type": "string", "const": action_token},
             "workflow_key": {"type": "string", "const": workflow_key},
             "rule_version": {"type": "string", "const": rule_version},
             "overall": {"type": "string", "enum": ["pass", "needs_human"]},
@@ -682,13 +696,16 @@ def _execute_codex(
     timeout_seconds: int,
     *,
     prompt_builder: Callable[[Path], str] = _prompt,
+    read_only: bool = False,
 ) -> CodexExecution:
     started = time.monotonic()
     stderr: dict = {}
     execution = _execute_codex_raw(
         project_root, action_file, timeout_seconds,
-        prompt_builder=prompt_builder, stderr_summary=stderr,
+        prompt_builder=prompt_builder, stderr_summary=stderr, read_only=read_only,
     )
+    if execution.error_code == "codex_review_task_invalid":
+        return execution
     try:
         if stderr.get("collection_failed"):
             raise ValueError("process_diagnostic_invalid")
@@ -712,13 +729,23 @@ def _execute_codex_raw(
     *,
     prompt_builder: Callable[[Path], str] = _prompt,
     stderr_summary: dict,
+    read_only: bool = False,
 ) -> CodexExecution:
+    try:
+        schema = _decision_schema(action_file, read_only=read_only)
+    except ValueError:
+        return CodexExecution(
+            "codex_review_task_invalid", _unknown_usage(),
+            process_state="not_started", decision_state="not_attempted",
+        )
     output = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
     with tempfile.TemporaryDirectory(prefix="oa-preaudit-codex-") as temporary:
         temporary_root = Path(temporary)
         schema_file = temporary_root / "decision-schema.json"
         decision_file = temporary_root / "decision.json"
-        json_artifact.write_json_atomic(schema_file, _decision_schema(action_file))
+        json_artifact.write_json_atomic(
+            schema_file, schema,
+        )
         command = _codex_command(project_root, schema_file, decision_file)
         process: subprocess.Popen | None = None
         previous_sigterm: object | None = None
@@ -886,6 +913,7 @@ def _execute_read_only_codex(
         action_file,
         timeout_seconds,
         prompt_builder=_read_only_prompt,
+        read_only=True,
     )
 
 
