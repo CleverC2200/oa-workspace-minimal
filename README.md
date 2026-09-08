@@ -53,6 +53,8 @@ chmod 600 ~/.config/oa-workspace-minimal/oa-auth.env
 
 ## 只读 preview
 
+旧版 Word `.doc` 附件需要本机 LibreOffice（`soffice` 位于 PATH，或通过 `OA_LIBREOFFICE_BIN` 指定可执行文件）。采集器在独立临时配置中禁用宏、转换为 PDF 并逐页准备图片和确定性文本，保留原附件身份及哈希；单文件转换最多等待 60 秒，结束或超时时回收该转换进程组。转换器不可用、转换失败或超时分别保留 `legacy_doc_converter_unavailable`、`legacy_doc_conversion_failed`、`legacy_doc_conversion_timeout`。失败仍按现有材料降级路径处理，不把未读内容当作已审核；通用内容准备失败保留 `attachment_content_incomplete`。发布涉及此能力时须在生产执行环境核实转换器可用；仅安装 Python 依赖不能提供 LibreOffice。
+
 五类财务流程和包装版面校对已经提供同一个本地深模块两动作接口。先取得指定流程的下一个动作：
 
 ```bash
