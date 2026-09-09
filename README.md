@@ -262,3 +262,8 @@ git diff --check
 ```
 
 贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。V1.2 的流程拆分、并发提交、监控、留存与代码质量工程在 GitHub Issues 中分票推进；已合并能力只代表代码和测试完成，不代表生产已经启用。
+
+
+生产启动门禁失败也使用 `apps.oa_finance_preaudit.session_alert` 的有限稳定错误码：代码基线、流程授权、运行环境、实时对账、控制器交接、运行记忆路径和本机 critical。正常已有控制器运行只跳过重复启动，不当作故障。提醒保持同一窗口最多三次，发送不确定保留本地回执且不自动重试。
+
+`python3 -m apps.oa_finance_preaudit.session_alert --status` 只读查询脱敏发送结果；不访问飞书、不发送、不重置窗口。身份恢复仍只清登录故障。所有生产门禁重新可信、无当前隔离或未决写入后，可显式调用 `--clear-production --confirm-recovered YES` 结束生产故障窗口，保留最近发送状态、次数和时间；这不会恢复任何单据。定时任务的启动前触发路径由独立授权的调度提示词使用这些入口，代码发布本身不修改自动化。

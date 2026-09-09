@@ -27,8 +27,14 @@ SESSION_ERROR_CODES = frozenset(
         "rpa_session_missing",
     }
 )
+STARTUP_ERROR_CODES = frozenset({
+    "production_baseline_invalid", "production_authorization_invalid",
+    "production_runtime_unavailable", "production_reconciliation_blocked",
+    "production_handoff_blocked", "automation_memory_path_invalid", "production_health_critical",
+})
 PRODUCTION_ERROR_CODES = frozenset(
     {
+        *STARTUP_ERROR_CODES,
         "material_collection_failed",
         "codex_review_failed",
         "codex_decision_invalid",
@@ -63,7 +69,10 @@ def build_message(error_code: str, *, occurred_at: datetime | None = None) -> st
             f"时间：{_timestamp(occurred_at)}",
             f"稳定错误码：{code}",
             "原因：OA 网页登录状态不可用，请人工重新登录 RPA 专用浏览器。"
-            if code in SESSION_ERROR_CODES else "原因：本轮出现失败或隔离项，请查看本地控制器回执和人工核对清单。",
+            if code in SESSION_ERROR_CODES else (
+                "原因：生产启动门禁未通过，请查看本地任务回执。"
+                if code in STARTUP_ERROR_CODES else "原因：本轮出现失败或隔离项，请查看本地控制器回执和人工核对清单。"
+            ),
             "安全动作：已停止新领取，后续不再发出新的 OA 写请求；不会自动登录或重试历史隔离项。"
             if code in SESSION_ERROR_CODES else "本提醒不重试单据、不清除未知写入保护；影响范围以本地回执为准。",
         )
@@ -331,11 +340,47 @@ def clear_active_alert(
         }
 
 
+def status(*, control_root: Path = Path("runtime/control")) -> dict:
+    """Read only the sanitized delivery receipt; never contact the provider."""
+    base = {"schema_version": 1, "kind": "preaudit_alert_status", "read_only": True}
+    root = Path(control_root).expanduser()
+    path = root / STATE_NAME
+    try:
+        if root.is_symlink() or path.is_symlink():
+            raise RuntimeError("session_alert_state_invalid")
+        state = _read_state(path)
+        if not state:
+            return {**base, "status": "absent", "delivery_state": "not_recorded"}
+        if state.get("status") == "ready" and "error_code" not in state and "attempt_count" not in state:
+            return {**base, "status": "ready", "delivery_state": "not_recorded"}
+        code, attempts = state.get("error_code"), state.get("attempt_count")
+        if (state.get("status") not in {"active", "ready"}
+                or code not in ALERT_ERROR_CODES
+                or type(attempts) is not int or not 1 <= attempts <= MAX_ALERT_ATTEMPTS
+                or state.get("delivery_state") not in {"started", "sent", "unknown"}):
+            raise RuntimeError("session_alert_state_invalid")
+        timestamps = {}
+        for name in ("first_seen_at", "delivered_at", "recovered_at"):
+            if name in state:
+                value = datetime.fromisoformat(state[name])
+                if value.tzinfo is None:
+                    raise ValueError("invalid_timestamp")
+                timestamps[name] = value.isoformat()
+        return {**base, "status": state["status"], "error_code": code,
+                "delivery_state": state["delivery_state"], "attempt_count": attempts, **timestamps}
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return {**base, "status": "unknown", "delivery_state": "unknown",
+                "error_code": "session_alert_state_invalid"}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="oa-session-alert")
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--error-code", choices=sorted(ALERT_ERROR_CODES))
     action.add_argument("--clear", action="store_true")
+    action.add_argument("--clear-production", action="store_true")
+    action.add_argument("--status", action="store_true")
+    parser.add_argument("--confirm-recovered", default="")
     parser.add_argument("--control-root", type=Path, default=Path("runtime/control"))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--confirm-send", default="")
@@ -344,6 +389,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if getattr(args, "status", False):
+        print(json.dumps(status(control_root=args.control_root), ensure_ascii=False))
+        return 0
+    if getattr(args, "clear_production", False):
+        if args.confirm_recovered != "YES":
+            print(json.dumps({"error_code": "production_recovery_confirmation_missing"}))
+            return 1
+        print(json.dumps(clear_alert(control_root=args.control_root), ensure_ascii=False))
+        return 0
     if args.clear:
         print(json.dumps(clear_alert(control_root=args.control_root, session_only=True), ensure_ascii=False))
         return 0
