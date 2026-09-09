@@ -19,7 +19,7 @@ from pathlib import Path
 import signal
 import sys
 import time
-from typing import Callable, Sequence
+from typing import Callable, Dict, Sequence, Union
 from zoneinfo import ZoneInfo
 
 from apps import json_artifact
@@ -44,7 +44,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RenewActions = Callable[[list[Path]], list[Path]]
 ReviewRunner = Callable[[list[dict], int], process_pool.PoolResult[dict]]
 PrepareRunner = Callable[[int], process_pool.PoolResult[dict]]
-PrepareSelection = str | dict[str, object]
+PrepareSelection = Union[str, Dict[str, object]]
 PrepareAction = Callable[[PrepareSelection], dict]
 BatchRunner = Callable[..., dict]
 LiveStatus = Callable[[], dict]

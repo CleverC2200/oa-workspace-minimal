@@ -446,7 +446,7 @@ def _flow_items(workflow_key: str) -> list[dict]:
     return [
         {"item_key": item_key, "number": number, "name": name}
         for number, (item_key, name) in enumerate(
-            zip(spec["item_keys"], spec["item_names"], strict=True),
+            zip(spec["item_keys"], spec["item_names"]),
             start=1,
         )
     ]
@@ -1578,6 +1578,12 @@ class FlowEngine:
             workflow_key,
             reason,
             write_state=write_state,
+            action_token=(
+                state.get("action_token")
+                if isinstance(state.get("action_token"), str)
+                and state.get("action_token")
+                else secrets.token_urlsafe(32)
+            ),
             action_file=str(action_path),
             state_file=str(state_path),
             case_key=attempt_root.parent.name,

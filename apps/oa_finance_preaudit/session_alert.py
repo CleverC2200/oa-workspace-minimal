@@ -25,6 +25,11 @@ SESSION_ERROR_CODES = frozenset(
         "rpa_cdp_unavailable",
         "rpa_session_invalid",
         "rpa_session_missing",
+        "material_collection_failed",
+        "codex_review_failed",
+        "writer_result_unknown",
+        "controller_cycle_stop",
+        "controller_failed",
     }
 )
 STATE_NAME = "oa-session-alert.json"
@@ -49,7 +54,7 @@ def build_message(error_code: str, *, occurred_at: datetime | None = None) -> st
             "OA 财务预审已安全停止",
             f"时间：{_timestamp(occurred_at)}",
             f"稳定错误码：{code}",
-            "原因：OA 网页登录状态不可用，请人工重新登录 RPA 专用浏览器。",
+            "原因：当前预审出现生产阻断或不可确认状态；如为登录问题，请人工重新登录 RPA 专用浏览器。",
             "安全动作：已停止新领取，后续不再发出新的 OA 写请求；不会自动登录或重试历史隔离项。",
         )
     )

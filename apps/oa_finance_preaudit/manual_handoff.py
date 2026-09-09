@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from pathlib import Path
 
@@ -16,8 +17,13 @@ FIELDS = {"schema_version", "kind", "action_token", "workflow_key", "rule_versio
 
 
 def _read(path: Path) -> dict:
-    value = review_failure_evidence.read_receipt(path)
-    if value is None:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("manual_handoff_invalid")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("manual_handoff_invalid") from error
+    if not isinstance(value, dict):
         raise ValueError("manual_handoff_invalid")
     return value
 
@@ -69,7 +75,12 @@ def validate(document: dict, root: Path, action: dict) -> None:
         or document.get("workflow_key") != action.get("workflow_key")
         or document.get("action_token") != action.get("action_token", document.get("action_token"))
         or not isinstance(document.get("rule_version"), str)
-        or document.get("rule_version") != _read(root / "review-packet.json").get("rule_version")
+        or document.get("rule_version")
+        != (
+            _read(root / "review-packet.json").get("rule_version")
+            if (root / "review-packet.json").is_file()
+            else str(action.get("rule_version") or "unknown")
+        )
         or not _proof(root, document)
     ):
         raise ValueError("manual_handoff_invalid")
@@ -103,7 +114,11 @@ def build(action_file: Path, failure_code: str) -> dict:
         document = {
             "schema_version": 1, "kind": KIND, "overall": "needs_human",
             "workflow_key": action.get("workflow_key"), "action_token": action["action_token"],
-            "rule_version": _read(root / "review-packet.json").get("rule_version"),
+                "rule_version": (
+                    _read(root / "review-packet.json").get("rule_version")
+                    if (root / "review-packet.json").is_file()
+                    else str(action.get("rule_version") or "unknown")
+                ),
             "failure_code": failure_code, "failure_receipt": path.name,
             "failure_fingerprint": review_failure_evidence.file_fingerprint(path),
         }
