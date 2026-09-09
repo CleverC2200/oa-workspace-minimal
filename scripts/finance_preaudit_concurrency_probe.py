@@ -102,6 +102,11 @@ _SESSION_ALERT_PRIORITY = (
     "rpa_cdp_unavailable",
     "rpa_session_invalid",
     "rpa_session_missing",
+    "writer_result_unknown",
+    "material_collection_failed",
+    "codex_review_failed",
+    "controller_failed",
+    "controller_cycle_stop",
 )
 
 
@@ -113,6 +118,9 @@ def _session_error_code(error: Exception) -> str:
         code = flow_engine.session_blocking_failure_code(current)
         if code:
             return code
+        candidate = str(current).partition(":")[0].strip()
+        if candidate in _SESSION_ALERT_PRIORITY:
+            return candidate
         current = current.__cause__ or current.__context__
     return ""
 
