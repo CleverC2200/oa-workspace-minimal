@@ -4866,7 +4866,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     session_code
                 )
             else:
-                reset = session_alert.clear_active_alert()
+                reset = session_alert.clear_active_alert(session_only=True)
                 if reset and reset.get("status") == "unknown":
                     payload["notification_reset"] = reset
     except Exception as error:

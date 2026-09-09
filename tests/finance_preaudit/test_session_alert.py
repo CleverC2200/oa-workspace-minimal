@@ -429,3 +429,49 @@ def test_session_recovery_does_not_reset_active_production_fault(tmp_path):
     state = json.loads((tmp_path / session_alert.STATE_NAME).read_text())
     assert state["status"] == "active"
     assert state["error_code"] == "writer_result_unknown"
+
+
+@pytest.mark.parametrize("code", [
+    "production_baseline_invalid", "production_authorization_invalid",
+    "production_runtime_unavailable", "production_reconciliation_blocked",
+    "production_handoff_blocked", "automation_memory_path_invalid", "production_health_critical",
+])
+def test_startup_blockers_send_and_remain_queryable_after_recovery(tmp_path, monkeypatch, code):
+    sent = []
+    monkeypatch.setattr(session_alert.auth, "load_local_env", lambda: None)
+    monkeypatch.setenv("OA_FEISHU_ALERT_CHAT_ID", "oc_recorded")
+    monkeypatch.setattr(session_alert, "send_message", lambda *a, **kw: sent.append(a))
+    result = session_alert.alert_from_environment(code, control_root=tmp_path)
+    assert result["delivery_state"] == "sent"
+    assert code in sent[0][1]
+    before = (tmp_path / session_alert.STATE_NAME).read_bytes()
+    status = session_alert.status(control_root=tmp_path)
+    assert status["status"] == "active" and status["delivery_state"] == "sent"
+    assert before == (tmp_path / session_alert.STATE_NAME).read_bytes()
+    assert session_alert.main(["--clear-production", "--control-root", str(tmp_path)]) == 1
+    assert session_alert.main(["--clear-production", "--confirm-recovered", "YES", "--control-root", str(tmp_path)]) == 0
+    status = session_alert.status(control_root=tmp_path)
+    assert status["status"] == "ready" and status["delivery_state"] == "sent"
+    assert status["attempt_count"] == 1
+
+
+def test_alert_status_is_read_only_and_redacts_corrupt_state(tmp_path):
+    root = tmp_path / "missing"
+    assert session_alert.status(control_root=root)["status"] == "absent"
+    assert not root.exists()
+    root.mkdir()
+    path = root / session_alert.STATE_NAME
+    path.write_text('{"status":"active","error_code":"private secret","attempt_count":1}')
+    before = path.read_bytes()
+    report = session_alert.status(control_root=root)
+    assert report["status"] == "unknown"
+    assert "private secret" not in json.dumps(report)
+    assert before == path.read_bytes()
+
+
+def test_clearing_an_empty_window_does_not_invent_a_delivery(tmp_path):
+    session_alert.clear_alert(control_root=tmp_path)
+    assert session_alert.status(control_root=tmp_path) == {
+        "schema_version": 1, "kind": "preaudit_alert_status", "read_only": True,
+        "status": "ready", "delivery_state": "not_recorded",
+    }

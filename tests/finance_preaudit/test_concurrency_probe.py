@@ -4055,7 +4055,7 @@ def test_production_cli_does_not_mask_success_when_alert_reset_is_unknown(
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.session_alert,
         "clear_active_alert",
-        lambda: {
+        lambda **kwargs: {
             "schema_version": 1,
             "kind": "oa_session_alert_receipt",
             "status": "unknown",
@@ -7664,3 +7664,18 @@ def test_explicit_recovery_gate_uses_real_reconciliation(tmp_path, monkeypatch, 
     assert not probe._continuation_is_ready(report)
     assert probe._continuation_is_ready(report, recovery_action_files=(action,)) is (not extra_blocker and artifact is None)
     assert before == {p: p.read_bytes() for p in root.rglob("*.json")}
+
+
+def test_finance_success_does_not_clear_whole_task_production_fault(tmp_path, monkeypatch, capsys):
+    probe = finance_preaudit_concurrency_probe
+    alert = probe.session_alert
+    alert.alert_once("controller_failed", chat_id="oc_recorded", control_root=tmp_path,
+                     sender=lambda *args: None)
+    original_clear = alert.clear_active_alert
+    monkeypatch.setattr(alert, "clear_active_alert", lambda **kw: original_clear(control_root=tmp_path / "alerts", **kw))
+    monkeypatch.setattr(probe, "run_rolling_drain", lambda **kw: {"status": "completed"})
+    assert probe.main(["--rolling", "--capacity", "6", "--confirm-write", "YES"]) == 0
+    capsys.readouterr()
+    state = alert.status(control_root=tmp_path / "alerts")
+    assert state["status"] == "active"
+    assert state["attempt_count"] == 1
