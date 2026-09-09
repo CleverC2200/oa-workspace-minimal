@@ -4857,7 +4857,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "",
             )
             if not session_code and (
-                payload.get("status") != "completed"
+                payload.get("status") not in {"completed", "completed_with_quarantine"}
                 or any(isinstance(n, int) and n > 0 for n in (counts or {}).values())
             ):
                 session_code = "controller_failed"
@@ -4865,7 +4865,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 payload["notification"] = session_alert.alert_from_environment(
                     session_code
                 )
-            else:
+            elif payload.get("status") == "completed":
                 reset = session_alert.clear_active_alert(session_only=True)
                 if reset and reset.get("status") == "unknown":
                     payload["notification_reset"] = reset
