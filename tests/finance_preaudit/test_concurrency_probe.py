@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -4418,6 +4419,34 @@ def test_dispatcher_harvests_review_while_preparation_is_running(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    preparation_future = Future()
+    clock = [0.0]
+    wall_deadline = time.monotonic() + 5
+
+    class PendingPreparationExecutor:
+        _processes: dict = {}
+
+        def submit(self, _action, *_args) -> Future:
+            assert preparation_future.set_running_or_notify_cancel()
+            return preparation_future
+
+        def shutdown(self, **_kwargs) -> None:
+            return None
+
+    def monotonic() -> float:
+        assert time.monotonic() < wall_deadline, "dispatcher did not finish"
+        return clock[0]
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_preparation_executor",
+        PendingPreparationExecutor,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "time",
+        SimpleNamespace(monotonic=monotonic, sleep=time.sleep),
+    )
     stop_requests: list[bool] = []
     completions: list[Path] = []
     monkeypatch.setattr(
@@ -4437,6 +4466,17 @@ def test_dispatcher_harvests_review_while_preparation_is_running(
         created_at="2026-08-24T08:00:00+00:00",
     )
 
+    def complete_review(action, _reviewed):
+        assert preparation_future.running()
+        completions.append(action)
+        # Expire preparation only after the independently ready review closes.
+        clock[0] = 1.0
+        return {
+            "status": "completed",
+            "business_state": "needs_human",
+            "write_state": "submitted",
+        }
+
     result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
         2,
         2,
@@ -4451,12 +4491,7 @@ def test_dispatcher_harvests_review_while_preparation_is_running(
             "process_retries": 0,
             "token_usage": {"status": "unknown"},
         },
-        complete_review=lambda action, _reviewed: completions.append(action)
-        or {
-            "status": "completed",
-            "business_state": "needs_human",
-            "write_state": "submitted",
-        },
+        complete_review=complete_review,
         executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
         prepare_timeout_sec=0.02,
         heartbeat_interval_sec=0.005,
