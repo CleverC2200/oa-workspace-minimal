@@ -307,7 +307,11 @@ def reconcile(
         elif exact_pending and state.get("write_state") in {
             "unknown", "submitting", "authorized", "submitted"
         }:
-            blocking_reasons["pending_write_state_unresolved"] += 1
+            from .flow_engine import FlowEngine
+
+            if not (state.get("write_state") == "authorized"
+                    and FlowEngine.resumable_review(root, state)):
+                blocking_reasons["pending_write_state_unresolved"] += 1
         elif exact_pending and state.get("execution_state") == "needs_admin":
             if (
                 state.get("write_state") == "not_requested"

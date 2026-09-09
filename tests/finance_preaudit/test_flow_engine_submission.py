@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
+import pytest
 from pathlib import Path
 import threading
 
@@ -728,3 +729,28 @@ def test_missing_required_events_block_submit(tmp_path: Path) -> None:
     assert blocked["action"] == "needs_admin"
     assert blocked["reason"] == "observability_incomplete"
     assert calls == []
+
+
+@pytest.mark.parametrize("mutation", [None, "material", "writer", "unknown", "action"])
+def test_reconciliation_only_resumes_valid_unsubmitted_review(tmp_path: Path, mutation) -> None:
+    from apps.oa_finance_preaudit import reconciliation
+    engine = _engine(tmp_path, "resume-case", authorization_source=_grant,
+                     authorization_verifier=_verify_grant, submit_frozen=lambda job: _success(job))
+    action = engine.next_action("travel_expense")
+    root = Path(action["action_file"]).parent
+    if mutation == "material":
+        (root / "material.json").write_text("{}")
+    elif mutation == "writer":
+        (root / "writer-boundary.json").write_text("{}")
+    elif mutation == "unknown":
+        state = json.loads((root / "state.json").read_text())
+        state["write_state"] = "unknown"
+        (root / "state.json").write_text(json.dumps(state))
+    elif mutation == "action":
+        (root / "action.json").write_text("{}")
+    before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    report = reconciliation.reconcile(tmp_path, pending_rows=[{
+        "request_id": "resume-case", "received_at": "2026-08-22T09:00:00+08:00",
+    }], handled_rows=[])
+    assert report["continuation"]["status"] == ("ready" if mutation is None else "blocked")
+    assert before == {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}

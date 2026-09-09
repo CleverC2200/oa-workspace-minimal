@@ -282,6 +282,7 @@ def test_rolling_controller_prunes_only_expired_cache_entries_at_startup(
         reconcile_status=lambda: {
             "schema_version": 1,
             "kind": "preaudit_reconciliation",
+            "continuation": {"status": "ready", "scope": "none", "isolated_pending": 0, "blocking_reasons": {}},
             "read_only": True,
             "quarantine": {
                 "pending_quarantined": 0,
@@ -366,6 +367,7 @@ def test_rolling_controller_runs_cache_maintenance_at_startup_and_each_wave(
         reconcile_status=lambda: {
             "schema_version": 1,
             "kind": "preaudit_reconciliation",
+            "continuation": {"status": "ready", "scope": "none", "isolated_pending": 0, "blocking_reasons": {}},
             "read_only": True,
             "quarantine": {
                 "pending_quarantined": 0,

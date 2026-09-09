@@ -29,6 +29,7 @@ def _reconciliation(pending: int = 0) -> dict:
     return {
         "schema_version": 1,
         "kind": "preaudit_reconciliation",
+            "continuation": {"status": "ready", "scope": "none", "isolated_pending": 0, "blocking_reasons": {}},
         "read_only": True,
         "quarantine": {
             "pending_quarantined": 0,

@@ -3591,6 +3591,7 @@ def _rolling_snapshot(
     live_status: LiveStatus,
     reconcile_status: Callable[[], dict],
     workflow_keys: frozenset[str] = ROLLING_WORKFLOW_KEYS,
+    *, recovery_action_files: Sequence[Path] = (),
 ) -> tuple[int, int, int, int]:
     live = live_status()
     pending = _supported_pending(live, workflow_keys)
@@ -3620,7 +3621,7 @@ def _rolling_snapshot(
         or quarantined < 0
         or actionable < 0
         or quarantined + actionable != pending
-        or not _continuation_is_ready(reconciled)
+        or not _continuation_is_ready(reconciled, recovery_action_files=recovery_action_files)
     ):
         raise ValueError("production_rolling_reconciliation_invalid")
     return pending, quarantined, actionable, unauthorized
@@ -4066,6 +4067,7 @@ def run_rolling_drain(
         reconcile_status=scoped_reconcile_status,
         allowed_workflows=allowed_workflows,
         confirm_stale_children_reaped=confirm_stale_children_reaped,
+        recovery_action_files=recovery_queue,
     )
     controller_handoff.assert_ready_for_start()
     try:
@@ -4145,6 +4147,7 @@ def run_rolling_drain(
                     reconcile_status=scoped_reconcile_status,
                     max_waves=max_waves,
                     recovery_count=len(recovery_queue),
+                    recovery_action_files=recovery_queue,
                     allowed_workflows=allowed_workflows,
                 )
                 if result["processes_reaped"] is not True:
@@ -4194,6 +4197,7 @@ def _recover_stale_cycle_stop(
     reconcile_status: Callable[[], dict],
     allowed_workflows: frozenset[str],
     confirm_stale_children_reaped: bool = False,
+    recovery_action_files: Sequence[Path] = (),
 ) -> bool:
     if not runtime_control.stop_requested():
         if confirm_stale_children_reaped:
@@ -4220,12 +4224,13 @@ def _recover_stale_cycle_stop(
             lambda: live,
             lambda: reconciled,
             allowed_workflows,
+            recovery_action_files=recovery_action_files,
         )
         oa = live.get("oa")
         if (
             not isinstance(oa, dict)
             or oa.get("execution_identity") != "verified"
-            or not _continuation_is_ready(reconciled)
+            or not _continuation_is_ready(reconciled, recovery_action_files=recovery_action_files)
         ):
             raise ValueError("production_cycle_stop_recovery_blocked")
     except (RuntimeError, ValueError) as error:
@@ -4253,7 +4258,9 @@ def _recover_stale_cycle_stop(
     return True
 
 
-def _continuation_is_ready(reconciled: dict) -> bool:
+def _continuation_is_ready(
+    reconciled: dict, *, recovery_action_files: Sequence[Path] = (),
+) -> bool:
     continuation = reconciled.get("continuation")
     quarantine = reconciled.get("quarantine")
     if (
@@ -4265,7 +4272,7 @@ def _continuation_is_ready(reconciled: dict) -> bool:
     ):
         return False
     isolated = continuation.get("isolated_pending")
-    return (
+    ready = (
         continuation.get("status") == "ready"
         and isinstance(isolated, int)
         and not isinstance(isolated, bool)
@@ -4274,6 +4281,47 @@ def _continuation_is_ready(reconciled: dict) -> bool:
         and continuation.get("scope") == ("item" if isolated else "none")
         and continuation.get("blocking_reasons") == {}
     )
+
+    if ready or not recovery_action_files:
+        return ready
+    # This admits only explicitly selected preparation work; FlowEngine still
+    # revalidates live identity and no-write evidence before creating a new attempt.
+    reasons = continuation.get("blocking_reasons")
+    if (continuation.get("status") != "blocked" or continuation.get("scope") != "controller"
+            or not isinstance(reasons, dict) or set(reasons) != {"pending_failure_not_isolated"}
+            or not isinstance(isolated, int) or isinstance(isolated, bool) or isolated < 0):
+        return False
+    root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
+    try:
+        candidates = _recovery_candidates(recovery_action_files, assigned_identities=set())
+        latest = {state["action_file"]: state for state in reconciliation.latest_states(root)}
+        selected = set()
+        for candidate in candidates:
+            path = Path(candidate["recovery_action_file"])
+            state = latest.get(str(path))
+            action = _read_object(path)
+            if not isinstance(state, dict) or any(action.get(key) != state.get(key) for key in (
+                "action_file", "state_file", "workflow_key", "case_key", "attempt",
+                "execution_state", "write_state", "reason",
+            )) or action.get("action") != "needs_admin":
+                return False
+            if not flow_engine.FlowEngine.recoverable_no_write(root, path):
+                return False
+            selected.add((state["case_key"], state["workflow_key"], state["attempt"]))
+        items = reconciled["manual_review"]["items"]
+        recovered = sum(
+            (item["item_key"], item["workflow_key"], item["attempt"]) in selected
+            and item["category"] == "pending_not_handled"
+            and item["write_state"] == "not_requested"
+            and item["failure_code"] in RECOVERABLE_NO_WRITE_REASONS
+            and item["scope"] != "item"
+            for item in items
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return (type(reasons["pending_failure_not_isolated"]) is int
+            and recovered == reasons["pending_failure_not_isolated"]
+            and isolated + recovered == quarantine.get("pending_quarantined"))
 
 
 def _clear_finished_cycle_stop(*, children_reaped: bool) -> None:
@@ -4299,6 +4347,7 @@ def _run_rolling_drain_locked(
     reconcile_status: Callable[[], dict] = _production_reconciliation,
     max_waves: int = 10,
     recovery_count: int = 0,
+    recovery_action_files: Sequence[Path] = (),
     allowed_workflows: frozenset[str] = ROLLING_WORKFLOW_KEYS,
 ) -> dict:
     if (
@@ -4328,6 +4377,7 @@ def _run_rolling_drain_locked(
                 live_status,
                 reconcile_status,
                 allowed_workflows,
+                recovery_action_files=recovery_action_files,
             )
         )
     except ValueError as error:

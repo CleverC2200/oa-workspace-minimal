@@ -7631,3 +7631,36 @@ def test_rolling_snapshot_rejects_blocker_without_existing_stop(blocker) -> None
                 "execution_identity": "verified", "by_workflow": {"travel_expense": 1},
             }}, lambda: snapshot,
         )
+
+
+@pytest.mark.parametrize("extra_blocker", [False, True])
+@pytest.mark.parametrize("artifact", [None, "execution-receipt.json", "writer-boundary.json"])
+def test_explicit_recovery_gate_uses_real_reconciliation(tmp_path, monkeypatch, extra_blocker, artifact):
+    probe = finance_preaudit_concurrency_probe
+    monkeypatch.setattr(probe, "PROJECT_ROOT", tmp_path)
+    root = tmp_path / "runtime" / "finance_preaudit_flows"
+    received = "2026-09-09T09:00:00+08:00"
+    action = _quarantined_action(root, request_id="recover", received_at=received,
+                                 failure_detail_code=None)
+    for name in ("action.json", "state.json"):
+        path = action.with_name(name)
+        payload = json.loads(path.read_text())
+        payload["created_at"] = received
+        path.write_text(json.dumps(payload))
+    if artifact:
+        action.with_name(artifact).write_text("{}")
+    rows = [{"request_id": "recover", "received_at": received},
+            {"request_id": "earlier-fresh", "received_at": "2026-09-09T08:00:00+08:00"}]
+    if extra_blocker:
+        blocked = _quarantined_action(root, request_id="blocked", received_at=received)
+        for name in ("action.json", "state.json"):
+            path = blocked.with_name(name)
+            payload = json.loads(path.read_text())
+            payload.update(created_at=received, write_state="unknown", reason="writer_result_unknown")
+            path.write_text(json.dumps(payload))
+        rows.append({"request_id": "blocked", "received_at": received})
+    report = probe.reconciliation.reconcile(root, pending_rows=rows, handled_rows=[])
+    before = {p: p.read_bytes() for p in root.rglob("*.json")}
+    assert not probe._continuation_is_ready(report)
+    assert probe._continuation_is_ready(report, recovery_action_files=(action,)) is (not extra_blocker and artifact is None)
+    assert before == {p: p.read_bytes() for p in root.rglob("*.json")}
