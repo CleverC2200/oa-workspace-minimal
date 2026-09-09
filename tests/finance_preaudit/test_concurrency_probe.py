@@ -3984,6 +3984,43 @@ def test_production_cli_alerts_on_pipeline_session_failure_without_clearing(
     assert clears == []
 
 
+@pytest.mark.parametrize("status,error_counts,expected_alert", [
+    ("completed_with_quarantine", {}, None),
+    ("completed_with_quarantine", {"codex_review_failed": 0}, None),
+    ("completed_with_quarantine", {"codex_review_failed": 1}, "codex_review_failed"),
+    ("completed_with_quarantine", {"unmapped_failure": 1}, "controller_failed"),
+    ("completed", {"writer_result_unknown": 1}, "writer_result_unknown"),
+    ("failed", {}, "controller_failed"),
+    ("unrecognized", {}, "controller_failed"),
+])
+def test_production_cli_alerts_only_on_current_failures(
+    monkeypatch, capsys, status, error_counts, expected_alert,
+) -> None:
+    probe = finance_preaudit_concurrency_probe
+    alerts = []
+    clears = []
+    monkeypatch.setattr(probe, "run_rolling_drain", lambda **kw: {
+        "status": status, "error_counts": error_counts, "quarantined_pending": 1,
+    })
+    monkeypatch.setattr(probe.session_alert, "alert_from_environment", lambda code: (
+        alerts.append(code) or {"error_code": code, "delivery_state": "sent"}
+    ))
+    monkeypatch.setattr(probe.session_alert, "clear_active_alert", lambda **kw: clears.append(kw))
+
+    exit_code = probe.main(["--rolling", "--capacity", "6", "--confirm-write", "YES"])
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == (1 if status == "failed" else 0)
+    assert payload["status"] == status
+    assert payload["quarantined_pending"] == 1
+    assert alerts == ([] if expected_alert is None else [expected_alert])
+    assert clears == []
+    if expected_alert is None:
+        assert "notification" not in payload
+        assert "notification_reset" not in payload
+    else:
+        assert payload["notification"]["error_code"] == expected_alert
+
+
 def test_production_cli_finds_session_failure_in_exception_chain(
     monkeypatch,
     capsys,
@@ -7523,12 +7560,12 @@ def test_adaptive_read_only_probe_requires_two_healthy_waves_per_upgrade() -> No
 @pytest.mark.parametrize("outcome", [
     {"status": "failed", "error_counts": {"codex_decision_invalid": 1}},
     {"status": "failed", "error_counts": {}, "stop_reason": "host_critical"},
-    {"status": "completed_with_quarantine", "error_counts": {}},
+    {"status": "completed_with_quarantine", "error_counts": {"codex_decision_invalid": 1}},
     RuntimeError("production_controller_children_active"),
     OSError("private path failure"),
     {"status": "failed", "error_counts": {"oa_session_expired": 1, "writer_result_unknown": 1}},
 ])
-def test_controller_failures_and_degradation_notify_without_session_failure(tmp_path, monkeypatch, capsys, outcome):
+def test_controller_current_failures_notify_without_session_failure(tmp_path, monkeypatch, capsys, outcome):
     from apps.oa_finance_preaudit import session_alert
     monkeypatch.chdir(tmp_path)
     def run(**kwargs):
