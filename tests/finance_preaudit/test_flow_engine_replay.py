@@ -139,6 +139,18 @@ def test_confirmed_material_failure_creates_fresh_attempt_only_after_live_check(
     assert Path(failed["state_file"]).read_bytes() == old_state
     new_state = json.loads(Path(recovered["state_file"]).read_text(encoding="utf-8"))
     assert new_state["attempt"] == 2
+    from apps.oa_finance_preaudit import reconciliation
+    root = Path(recovered["action_file"]).parent
+    receipt = json.loads((root / "recovery-receipt.json").read_text())
+    assert receipt["from_attempt"] == 1 and receipt["to_attempt"] == 2
+    assert receipt["status"] == "prepared"
+    assert receipt["no_write_evidence"] == "confirmed_no_write"
+    report = reconciliation.reconcile(tmp_path, pending_rows=[], handled_rows=[])
+    assert report["recoveries"]["items"][0]["receipt_status"] == "verified"
+    assert "request_id" not in json.dumps(report["recoveries"])
+    (root / "recovery-receipt.json").write_text("{}")
+    report = reconciliation.reconcile(tmp_path, pending_rows=[], handled_rows=[])
+    assert report["recoveries"]["items"][0]["receipt_status"] == "missing_or_invalid"
 
 
 def _quarantined_review(
@@ -796,7 +808,7 @@ def test_human_confirmed_unknown_keeps_live_and_receipt_gates(
         "submission_target_changed",
     ),
 )
-def test_confirmed_no_write_failure_creates_a_new_review_attempt(
+def test_writer_failure_label_without_signed_boundary_cannot_be_recovered(
     tmp_path: Path,
     reason: str,
 ) -> None:
@@ -817,14 +829,10 @@ def test_confirmed_no_write_failure_creates_a_new_review_attempt(
         path.write_text(json.dumps(payload), encoding="utf-8")
     old_state = state_path.read_bytes()
 
-    recovered = engine.recover_confirmed_no_write(
-        action_path,
-        confirmed=True,
-    )
-
-    assert recovered["action"] == "review_required"
-    assert recovered["attempt"] == 2
+    with pytest.raises(ValueError, match="recovery_not_safe"):
+        engine.recover_confirmed_no_write(action_path, confirmed=True)
     assert state_path.read_bytes() == old_state
+    assert not action_path.parent.with_name("attempt-2").exists()
 
 
 def test_controlled_authorization_failure_creates_fresh_review_attempt(
@@ -1638,3 +1646,34 @@ def test_discovery_failure_prefers_open_attempt_over_older_closed_attempt(
     recovered = restarted.next_action("travel_expense")
 
     assert recovered == open_action
+
+
+@pytest.mark.parametrize("mutation", [None, "status_list", "status_dict", "result", "writer_symlink", "receipt_dir"])
+def test_failed_recovery_preparation_keeps_a_complete_no_write_receipt(tmp_path, mutation):
+    from apps.oa_finance_preaudit import reconciliation
+    engine = _engine(tmp_path, collect_material=lambda *args: (_ for _ in ()).throw(ValueError("oa_run_stopped")))
+    first = engine.next_action("travel_expense")
+    result = engine.recover_confirmed_no_write(Path(first["action_file"]), confirmed=True)
+    assert result["action"] == "needs_admin"
+    report = reconciliation.reconcile(tmp_path, pending_rows=[], handled_rows=[])
+    receipt = report["recoveries"]["items"][0]
+    assert receipt["receipt_status"] == "verified"
+    assert receipt["status"] == "preparation_failed"
+    assert receipt["result_action"] == "needs_admin"
+    assert receipt["automatic_retry"] is False
+    if mutation:
+        target = Path(result["action_file"]).parent
+        source = Path(first["action_file"]).parent
+        if mutation in {"status_list", "status_dict", "result"}:
+            path = target / "recovery-receipt.json"
+            data = json.loads(path.read_text())
+            data["status"] = [] if mutation == "status_list" else {} if mutation == "status_dict" else "prepared"
+            if mutation == "result":
+                data["result_action"] = "review_required"
+            path.write_text(json.dumps(data))
+        elif mutation == "writer_symlink":
+            (source / "writer-boundary.json").symlink_to(tmp_path / "missing")
+        else:
+            (source / "execution-receipt.json").mkdir()
+        report = reconciliation.reconcile(tmp_path, pending_rows=[], handled_rows=[])
+        assert report["recoveries"]["items"][0]["receipt_status"] == "missing_or_invalid"

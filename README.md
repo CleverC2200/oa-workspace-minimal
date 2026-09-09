@@ -267,3 +267,8 @@ git diff --check
 生产启动门禁失败也使用 `apps.oa_finance_preaudit.session_alert` 的有限稳定错误码：代码基线、流程授权、运行环境、实时对账、控制器交接、运行记忆路径和本机 critical。正常已有控制器运行只跳过重复启动，不当作故障。提醒保持同一窗口最多三次，发送不确定保留本地回执且不自动重试。
 
 `python3 -m apps.oa_finance_preaudit.session_alert --status` 只读查询脱敏发送结果；不访问飞书、不发送、不重置窗口。身份恢复仍只清登录故障。本轮财务与包装处理均成功、结束对账及所有生产门禁重新可信、无当前隔离或未决写入后，可显式调用 `--clear-production --confirm-recovered YES` 结束生产故障窗口，保留最近发送状态、次数和时间；这不会恢复任何单据。定时任务的启动前触发路径由独立授权的调度提示词使用这些入口，代码发布本身不修改自动化。
+
+
+统一查询使用 `apps.oa_finance_preaudit.cli status --check-live --reconcile`：`workflows[].write_states` 显示本地提交状态，`reconciliation.manual_review` 列出人工核对项，`continuation` 与 `controller_handoff` 显示整轮阻断，`notification` 显示最近发送结果。`recoveries.items` 显示显式恢复的来源/目标 attempt、未写入依据、准备结果和证据校验状态；缺失或被改动的历史回执标为 `missing_or_invalid`，不补造证明。
+
+恢复仍复用 `next-action --recover-action-file` 的明确确认、实时待办/已办与精确身份门，Writer 类未写入标签还必须有匹配冻结 job 的签名边界。新 attempt 的 `recovery-receipt.json` 在准备前记为 started，准备后记为 prepared 或 preparation_failed；恢复准备不代表已提交 OA。历史未知写入不自动重试，人工确认未知写入未发生的既有入口仍要求逐单明确确认。旧 attempt 保持不变，查询不会触发恢复、发送或写入。
