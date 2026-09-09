@@ -14,7 +14,7 @@ import subprocess
 import sys
 from typing import Any
 
-from apps.oa_approval import auth, runtime_control
+from apps.oa_approval import auth, runtime_control, writer_outcomes
 
 
 SESSION_ERROR_CODES = frozenset(
@@ -27,6 +27,19 @@ SESSION_ERROR_CODES = frozenset(
         "rpa_session_missing",
     }
 )
+PRODUCTION_ERROR_CODES = frozenset(
+    {
+        "material_collection_failed",
+        "codex_review_failed",
+        "codex_decision_invalid",
+        "write_authorization_invalid",
+        *writer_outcomes.FAILURE_CODES,
+        "writer_result_unknown",
+        "controller_cycle_stop",
+        "controller_failed",
+    }
+)
+ALERT_ERROR_CODES = SESSION_ERROR_CODES | PRODUCTION_ERROR_CODES
 STATE_NAME = "oa-session-alert.json"
 LOCK_NAME = "oa-session-alert.lock"
 SEND_TIMEOUT_SECONDS = 15
@@ -42,15 +55,17 @@ def _timestamp(value: datetime | None = None) -> str:
 
 def build_message(error_code: str, *, occurred_at: datetime | None = None) -> str:
     code = str(error_code or "").strip()
-    if code not in SESSION_ERROR_CODES:
+    if code not in ALERT_ERROR_CODES:
         raise ValueError("session_alert_error_code_invalid")
     return "\n".join(
         (
-            "OA 财务预审已安全停止",
+            "OA 财务预审已安全停止" if code in SESSION_ERROR_CODES else "OA 财务预审异常提醒",
             f"时间：{_timestamp(occurred_at)}",
             f"稳定错误码：{code}",
-            "原因：OA 网页登录状态不可用，请人工重新登录 RPA 专用浏览器。",
-            "安全动作：已停止新领取，后续不再发出新的 OA 写请求；不会自动登录或重试历史隔离项。",
+            "原因：OA 网页登录状态不可用，请人工重新登录 RPA 专用浏览器。"
+            if code in SESSION_ERROR_CODES else "原因：本轮出现失败或隔离项，请查看本地控制器回执和人工核对清单。",
+            "安全动作：已停止新领取，后续不再发出新的 OA 写请求；不会自动登录或重试历史隔离项。"
+            if code in SESSION_ERROR_CODES else "本提醒不重试单据、不清除未知写入保护；影响范围以本地回执为准。",
         )
     )
 
@@ -237,13 +252,17 @@ def alert_once(
 
 
 def clear_alert(
-    *, control_root: Path, occurred_at: datetime | None = None
+    *, control_root: Path, occurred_at: datetime | None = None, session_only: bool = False
 ) -> dict[str, str | int]:
     with _locked(control_root) as root:
         state_path = root / STATE_NAME
+        existing = _read_state(state_path)
+        if session_only and existing.get("status") == "active" and existing.get("error_code") not in SESSION_ERROR_CODES:
+            return {"schema_version": 1, "kind": "oa_session_alert_receipt", "status": "active"}
         _write_state(
             state_path,
             {
+                **existing,
                 "schema_version": 1,
                 "kind": "oa_session_alert_state",
                 "status": "ready",
@@ -264,34 +283,28 @@ def alert_from_environment(
     live_status_provider: Callable[[], dict] | None = None,
 ) -> dict[str, str | int]:
     code = str(error_code or "").strip()
-    if code not in SESSION_ERROR_CODES:
+    if code not in ALERT_ERROR_CODES:
         raise ValueError("session_alert_error_code_invalid")
-    try:
-        (live_status_provider or _live_status)()
-    except Exception as error:
-        current_code = _current_session_failure_code(error)
-        if not current_code:
+    if code in SESSION_ERROR_CODES:
+        try:
+            (live_status_provider or _live_status)()
+        except Exception as error:
+            current_code = _current_session_failure_code(error)
+            if not current_code:
+                return _public_receipt(code, "not_required")
+            code = current_code
+        else:
+            clear_active_alert(control_root=control_root, session_only=True)
             return _public_receipt(code, "not_required")
-        code = current_code
-    else:
-        clear_active_alert(control_root=control_root)
-        return _public_receipt(code, "not_required")
-    try:
+    def configured_sender(_target: str, text: str, key: str) -> None:
         auth.load_local_env()
         chat_id = str(os.environ.get("OA_FEISHU_ALERT_CHAT_ID") or "").strip()
-        profile = str(
-            os.environ.get("OA_FEISHU_ALERT_PROFILE") or "default"
-        ).strip()
+        profile = str(os.environ.get("OA_FEISHU_ALERT_PROFILE") or "default").strip()
+        send_message(chat_id, text, key, profile=profile)
+
+    try:
         return alert_once(
-            code,
-            chat_id=chat_id,
-            control_root=control_root,
-            sender=lambda target, text, key: send_message(
-                target,
-                text,
-                key,
-                profile=profile,
-            ),
+            code, chat_id="", control_root=control_root, sender=configured_sender,
         )
     except Exception:
         return _public_receipt(code, "unknown")
@@ -300,6 +313,7 @@ def alert_from_environment(
 def clear_active_alert(
     *,
     control_root: Path = Path("runtime/control"),
+    session_only: bool = False,
 ) -> dict[str, str | int] | None:
     try:
         state_path = Path(control_root).expanduser().resolve() / STATE_NAME
@@ -308,7 +322,7 @@ def clear_active_alert(
         state = _read_state(state_path)
         if state.get("status") != "active":
             return None
-        return clear_alert(control_root=control_root)
+        return clear_alert(control_root=control_root, session_only=session_only)
     except Exception:
         return {
             "schema_version": 1,
@@ -320,7 +334,7 @@ def clear_active_alert(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="oa-session-alert")
     action = parser.add_mutually_exclusive_group(required=True)
-    action.add_argument("--error-code", choices=sorted(SESSION_ERROR_CODES))
+    action.add_argument("--error-code", choices=sorted(ALERT_ERROR_CODES))
     action.add_argument("--clear", action="store_true")
     parser.add_argument("--control-root", type=Path, default=Path("runtime/control"))
     parser.add_argument("--dry-run", action="store_true")
@@ -331,7 +345,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.clear:
-        print(json.dumps(clear_alert(control_root=args.control_root), ensure_ascii=False))
+        print(json.dumps(clear_alert(control_root=args.control_root, session_only=True), ensure_ascii=False))
         return 0
     if not args.dry_run and args.confirm_send != "YES":
         print(json.dumps({"error_code": "feishu_alert_confirmation_missing"}))

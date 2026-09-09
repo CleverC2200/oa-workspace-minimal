@@ -180,7 +180,7 @@ python3 -m apps.oa_finance_preaudit.cli status \
 python3 -m apps.oa_finance_preaudit.cli status --check-live
 ```
 
-状态入口本身保持只读，不发送消息。外部定时任务在 `--check-live` 返回会话类稳定错误码时，调用独立告警入口；生产滚动入口直接遇到同类错误时也调用该入口。告警入口在发送前重新执行当前实时会话检查，只有当前检查仍返回会话类稳定错误码才发送；历史隔离动作或旧汇总中的错误不会触发新提醒，也不会因此自动恢复。同一连续故障窗口即使错误码变化也最多尝试提醒三次，实时会话恢复后重新计数；单次发送最多等待 15 秒，发送结果不确定时不自动重试。真实发送必须显式确认：
+状态入口本身保持只读，不发送消息。生产滚动入口会对本轮材料失败、审核失败、未知写入、授权失败、控制器失败及降级结果发出脱敏提醒；其他未识别的控制器失败使用 `controller_failed` 汇总，不发送原始异常正文。登录类告警在发送前复查当前会话，避免历史登录错误误报；其他故障不以登录正常作为恢复依据。同一连续故障窗口最多尝试提醒三次，单次最多等待 15 秒；发送结果不确定时不自动重试。配置或发送失败保留本地 `runtime/control/oa-session-alert.json` 回执，恢复清除去重窗口时仍保留上次发送状态和次数，供查询送达情况。只有无错误且完成的控制器轮次才自动清除告警窗口；提醒不改变审批、停止门或未知写入保护。真实发送必须显式确认：
 
 ```bash
 python3 -m apps.oa_finance_preaudit.session_alert \
@@ -188,7 +188,7 @@ python3 -m apps.oa_finance_preaudit.session_alert \
   --confirm-send YES
 ```
 
-人工重新登录且下一次 `--check-live` 成功后，外部定时任务仅清除告警去重状态，为下一次独立故障重新布防：
+人工重新登录且下一次 `--check-live` 成功后，外部定时任务使用 `--clear` 仅清除会话类告警窗口；仍生效的生产故障窗口保留，待无错误完成轮次再清除：
 
 ```bash
 python3 -m apps.oa_finance_preaudit.session_alert --clear

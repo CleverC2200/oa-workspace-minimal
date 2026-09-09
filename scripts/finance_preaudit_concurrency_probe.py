@@ -4750,6 +4750,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=("YES",),
     )
     args = parser.parse_args(argv)
+    controller_started = False
     try:
         if args.read_only:
             if (
@@ -4792,12 +4793,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             if args.confirm_stale_children_reaped == "YES":
                 rolling_args["confirm_stale_children_reaped"] = True
+            controller_started = True
             payload = run_rolling_drain(**rolling_args)
             counts = payload.get("error_counts")
             session_code = next(
                 (
                     code
-                    for code in _SESSION_ALERT_PRIORITY
+                    for code in (*sorted(session_alert.PRODUCTION_ERROR_CODES), *_SESSION_ALERT_PRIORITY)
                     if isinstance(counts, dict)
                     and isinstance(counts.get(code), int)
                     and not isinstance(counts.get(code), bool)
@@ -4805,6 +4807,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
                 "",
             )
+            if not session_code and (
+                payload.get("status") != "completed"
+                or any(isinstance(n, int) and n > 0 for n in (counts or {}).values())
+            ):
+                session_code = "controller_failed"
             if session_code:
                 payload["notification"] = session_alert.alert_from_environment(
                     session_code
@@ -4813,10 +4820,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 reset = session_alert.clear_active_alert()
                 if reset and reset.get("status") == "unknown":
                     payload["notification_reset"] = reset
-    except (RuntimeError, ValueError) as error:
+    except Exception as error:
         session_code = (
             "" if args.read_only else _session_error_code(error)
         )
+        error_code = session_code or str(error)
+        if not error_code.replace("_", "").isalnum() or not error_code.isascii():
+            error_code = "controller_failed" if controller_started else "production_probe_failed"
         payload = {
             "schema_version": 1,
             "kind": (
@@ -4824,17 +4834,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.read_only
                 else "preaudit_production_concurrency_probe_failed"
             ),
-            "error_code": session_code or str(error),
+            "error_code": error_code,
         }
         if (
             isinstance(error, ControllerChildrenActiveError)
             and error.primary_error_code
         ):
             payload["primary_error_code"] = error.primary_error_code
-        if session_code:
-            payload["notification"] = session_alert.alert_from_environment(
-                session_code
+        if controller_started:
+            failure_code = str(error).partition(":")[0].strip()
+            alert_code = session_code or (
+                failure_code if failure_code in session_alert.PRODUCTION_ERROR_CODES
+                else "controller_failed"
             )
+            payload["notification"] = session_alert.alert_from_environment(alert_code)
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return 1
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
