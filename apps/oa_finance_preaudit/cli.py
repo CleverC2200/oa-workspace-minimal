@@ -523,6 +523,8 @@ def main(
                 payload["reconciliation"] = reconcile_operation(root)
             _attach_live_queue_projection(payload)
             payload["controller_handoff"] = controller_handoff.status()
+            from . import session_alert
+            payload["notification"] = session_alert.status()
         elif args.command == "prune":
             operation = runtime_prune or runtime_maintenance.prune
             payload = operation(_runtime_root(args.root))

@@ -856,3 +856,19 @@ def test_controlled_complete_review_requires_confirmation(tmp_path: Path) -> Non
         "production_rolling_controller_required"
     )
     assert calls == []
+
+
+def test_status_includes_read_only_delivery_without_sending(tmp_path, monkeypatch, capsys):
+    from apps.oa_finance_preaudit import session_alert
+    calls = []
+    monkeypatch.setattr(session_alert, "status", lambda **kw: calls.append(kw) or {
+        "schema_version": 1, "kind": "preaudit_alert_status", "read_only": True,
+        "status": "active", "delivery_state": "unknown",
+    })
+    monkeypatch.setattr(session_alert, "send_message", lambda *a, **kw: pytest.fail("status sent a message"))
+    assert cli.main(["status", "--root", str(tmp_path)], runtime_status=lambda root: {
+        "schema_version": 1, "kind": "preaudit_runtime_status",
+    }) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["notification"]["delivery_state"] == "unknown"
+    assert calls

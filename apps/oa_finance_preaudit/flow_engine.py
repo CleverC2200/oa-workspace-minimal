@@ -3198,6 +3198,8 @@ class FlowEngine:
             action_file, mode=mode, confirmed_unknown_no_write=confirmed_unknown_no_write,
             confirmed_request_id=confirmed_request_id,
         )
+        if not human_confirmed_unknown and not self.recoverable_no_write(self._root, action_path):
+            raise ValueError("recovery_not_safe")
 
         discovery_started = time.monotonic()
         try:
@@ -3270,7 +3272,15 @@ class FlowEngine:
             prepare_root.mkdir(parents=True)
             json_artifact.write_json_atomic(action_file_next, claim, indent=2)
             json_artifact.write_json_atomic(state_file_next, claim, indent=2)
-        return self._prepare_attempt(prepare_root)
+            from . import recovery_receipt
+            recovery_receipt.begin(prepare_root, attempt_root, state, human_confirmed=human_confirmed_unknown)
+        try:
+            result = self._prepare_attempt(prepare_root)
+        except Exception:
+            recovery_receipt.finish(prepare_root, result_action="not_available")
+            raise
+        recovery_receipt.finish(prepare_root, result_action=str(result.get("action") or ""))
+        return result
 
     def quarantine_review_failure(
         self,

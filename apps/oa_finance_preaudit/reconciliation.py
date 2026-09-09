@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from apps.oa_approval import writer_outcomes
 
-from . import item_failure, review_failure_evidence
+from . import item_failure, review_failure_evidence, recovery_receipt
 
 
 _WORKFLOW_KEYS = {
@@ -420,6 +420,13 @@ def reconcile(
                 default=0,
             ),
             "failure_counts": dict(sorted(failure_counts.items())),
+        },
+        "recoveries": {
+            "read_only": True,
+            "items": [recovery_receipt.projection(
+                Path(root) / str(state["workflow_key"]) / "cases" / str(state["case_key"])
+                / f"attempt-{state['attempt']}", state,
+            ) for state in states if "recovered_from_attempt" in state],
         },
         "manual_review": {
             "read_only": True, "total": len(manual_items),

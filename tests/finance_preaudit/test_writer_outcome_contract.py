@@ -206,6 +206,7 @@ def test_controlled_write_preserves_writer_failure_classification(
                 "workflow_key": workflow_key,
             }
         ],
+        discover_handled=lambda: [],
         collect_material=lambda request_id, _root: _material(request_id),
         **ports,
     )
@@ -234,6 +235,11 @@ def test_controlled_write_preserves_writer_failure_classification(
     assert report["continuation"]["status"] == ("ready" if failure_code == "writer_submit_rejected" else "blocked")
     assert len(api.calls) == 1
     if failure_code == "writer_submit_rejected":
+        old_bytes = Path(result["state_file"]).read_bytes()
+        recovered = engine.recover_confirmed_no_write(Path(result["action_file"]), confirmed=True)
+        assert recovered["action"] == "review_required" and recovered["attempt"] == 2
+        assert Path(result["state_file"]).read_bytes() == old_bytes
+        assert len(api.calls) == 1
         attempt = receipt_file.parent
         state = json.loads((attempt / "state.json").read_text())
         boundary_file = attempt / "writer-boundary.json"
