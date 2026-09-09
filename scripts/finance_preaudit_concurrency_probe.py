@@ -4204,17 +4204,16 @@ def _recover_stale_cycle_stop(
     try:
         live = live_status()
         reconciled = reconcile_status()
-        _pending, quarantined, _actionable, _unauthorized = _rolling_snapshot(
+        _pending, _quarantined, _actionable, _unauthorized = _rolling_snapshot(
             lambda: live,
             lambda: reconciled,
             allowed_workflows,
         )
         oa = live.get("oa")
         if (
-            quarantined != 0
-            or not isinstance(oa, dict)
+            not isinstance(oa, dict)
             or oa.get("execution_identity") != "verified"
-            or not _failure_attention_is_clear(reconciled)
+            or not _continuation_is_ready(reconciled)
         ):
             raise ValueError("production_cycle_stop_recovery_blocked")
     except (RuntimeError, ValueError) as error:
@@ -4242,38 +4241,26 @@ def _recover_stale_cycle_stop(
     return True
 
 
-def _failure_attention_is_clear(reconciled: dict) -> bool:
-    attention = reconciled.get("failure_attention")
-    expected_fields = {
-        "scope",
-        "status",
-        "affected_cases",
-        "repeated_failure_cases",
-        "long_wait_failure_cases",
-        "long_wait_threshold_seconds",
-        "max_failure_attempts",
-        "oldest_wait_seconds",
-        "failure_counts",
-    }
-    if not isinstance(attention, dict) or set(attention) != expected_fields:
+def _continuation_is_ready(reconciled: dict) -> bool:
+    continuation = reconciled.get("continuation")
+    quarantine = reconciled.get("quarantine")
+    if (
+        not isinstance(continuation, dict)
+        or set(continuation) != {
+            "status", "scope", "isolated_pending", "blocking_reasons"
+        }
+        or not isinstance(quarantine, dict)
+    ):
         return False
-    counts = attention.get("failure_counts")
-    numeric_fields = expected_fields - {"scope", "status", "failure_counts"}
+    isolated = continuation.get("isolated_pending")
     return (
-        attention.get("scope") == "live_pending"
-        and attention.get("status") == "clear"
-        and all(
-            isinstance(attention.get(field), int)
-            and not isinstance(attention.get(field), bool)
-            and attention[field] >= 0
-            for field in numeric_fields
-        )
-        and attention.get("affected_cases") == 0
-        and attention.get("repeated_failure_cases") == 0
-        and attention.get("long_wait_failure_cases") == 0
-        and attention.get("oldest_wait_seconds") == 0
-        and isinstance(counts, dict)
-        and not counts
+        continuation.get("status") == "ready"
+        and isinstance(isolated, int)
+        and not isinstance(isolated, bool)
+        and isolated >= 0
+        and isolated == quarantine.get("pending_quarantined")
+        and continuation.get("scope") == ("item" if isolated else "none")
+        and continuation.get("blocking_reasons") == {}
     )
 
 

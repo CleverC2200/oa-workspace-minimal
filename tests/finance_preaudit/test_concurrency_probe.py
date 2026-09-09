@@ -233,6 +233,10 @@ def _reconciliation_snapshot(pending: int, quarantined: int = 0) -> dict:
             "pending_quarantined": quarantined,
             "actionable_pending": pending - quarantined,
         },
+        "continuation": {
+            "status": "ready", "scope": "none", "isolated_pending": 0,
+            "blocking_reasons": {},
+        },
         "failure_attention": {
             "scope": "live_pending",
             "status": "clear",
@@ -7506,3 +7510,72 @@ def test_controller_failures_and_degradation_notify_without_session_failure(tmp_
     payload = json.loads(capsys.readouterr().out)
     assert payload["notification"]["delivery_state"] == "sent"
     assert len(sent) == 1
+
+
+def test_rolling_recovers_cycle_stop_with_trusted_review_isolation() -> None:
+    finance_preaudit_concurrency_probe.runtime_control.request_cycle_stop()
+    pending = [2]
+    calls = []
+
+    def reconcile_status() -> dict:
+        snapshot = _reconciliation_snapshot(pending[0], 1)
+        snapshot["continuation"] = {
+            "status": "ready", "scope": "item", "isolated_pending": 1,
+            "blocking_reasons": {},
+        }
+        snapshot["failure_attention"]["status"] = "attention_required"
+        return snapshot
+
+    def pipeline(count, capacity):
+        calls.append((count, capacity))
+        pending[0] = 1
+        return process_pool.PoolResult(
+            requested=1, started=1, completed=1, failed=0, timed_out=0,
+            stopped=0, peak_active=1, elapsed_seconds=1,
+            outcomes=(process_pool.TaskOutcome(
+                index=0, status="completed",
+                value={"status": "completed", "business_state": "needs_human",
+                       "token_usage": {"status": "unknown"}},
+            ),),
+        )
+
+    result = finance_preaudit_concurrency_probe.run_rolling_drain(
+        capacity=6,
+        live_status=lambda: {
+            "credentials": {"status": "ok"},
+            "oa": {"execution_identity": "verified", "by_workflow": {"travel_expense": pending[0]}},
+        },
+        reconcile_status=reconcile_status,
+        pipeline_runner=pipeline,
+    )
+    assert calls == [(1, 6)]
+    assert result["status"] == "completed_with_quarantine"
+    assert result["recovered_cycle_stop"] is True
+    assert result["final_pending"] == 1
+    assert not finance_preaudit_concurrency_probe.runtime_control.stop_requested()
+
+
+@pytest.mark.parametrize("continuation", [
+    None,
+    {"status": "blocked", "scope": "controller", "isolated_pending": 0,
+     "blocking_reasons": {"pending_write_state_unresolved": 1}},
+    {"status": "ready", "scope": "none", "isolated_pending": 0,
+     "blocking_reasons": {}},
+    {"status": "ready", "scope": "item", "isolated_pending": True,
+     "blocking_reasons": {}},
+])
+def test_cycle_recovery_preserves_stop_for_unresolved_or_invalid_isolation(continuation) -> None:
+    finance_preaudit_concurrency_probe.runtime_control.request_cycle_stop()
+    snapshot = _reconciliation_snapshot(1, 1)
+    snapshot["continuation"] = continuation
+    with pytest.raises(ValueError, match="production_cycle_stop_recovery_blocked"):
+        finance_preaudit_concurrency_probe.run_rolling_drain(
+            capacity=6,
+            live_status=lambda: {
+                "credentials": {"status": "ok"},
+                "oa": {"execution_identity": "verified", "by_workflow": {"travel_expense": 1}},
+            },
+            reconcile_status=lambda: snapshot,
+            pipeline_runner=lambda *_args: pytest.fail("blocked round must remain idle"),
+        )
+    assert finance_preaudit_concurrency_probe.runtime_control.stop_requested()

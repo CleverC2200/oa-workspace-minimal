@@ -507,3 +507,69 @@ def test_reconciliation_rejects_managed_symlink_components(
 
     with pytest.raises(ValueError, match="runtime_reconciliation_invalid"):
         reconciliation.latest_states(root)
+
+
+def test_trusted_review_quarantine_does_not_block_other_live_cases(tmp_path: Path) -> None:
+    root = tmp_path / "flows"
+    received = "2026-08-24 09:00:00"
+    _state(root, "isolated", received, reason="codex_review_failed")
+    result = reconciliation.reconcile(
+        root,
+        pending_rows=[
+            {"request_id": "isolated", "received_at": received},
+            {"request_id": "fresh", "received_at": received},
+        ],
+        handled_rows=[],
+    )
+    assert result["failure_attention"]["status"] == "attention_required"
+    assert result["continuation"] == {
+        "status": "ready",
+        "scope": "item",
+        "isolated_pending": 1,
+        "blocking_reasons": {},
+    }
+    assert result["quarantine"]["actionable_pending"] == 1
+
+
+@pytest.mark.parametrize(
+    ("write_state", "reason", "receipt", "live_received", "handled", "error"),
+    [
+        ("unknown", "writer_result_unknown", False, "2026-08-24 09:00:00", False, "pending_write_state_unresolved"),
+        ("submitting", "codex_review_failed", False, "2026-08-24 09:00:00", False, "pending_write_state_unresolved"),
+        ("not_requested", "codex_review_failed", False, "2026-08-24 09:00:00", False, "pending_failure_not_isolated"),
+        ("not_requested", "write_authorization_invalid", False, "2026-08-24 09:00:00", False, "pending_failure_not_isolated"),
+        ("not_requested", "codex_review_failed", True, "2026-08-24 10:00:00", False, "identity_conflict"),
+        ("not_requested", "codex_review_failed", True, "2026-08-24 09:00:00", True, "pending_handled_conflict"),
+    ],
+)
+def test_continuation_preserves_unresolved_current_state_gate(
+    tmp_path: Path, write_state, reason, receipt, live_received, handled, error,
+) -> None:
+    root = tmp_path / "flows"
+    _state(root, "blocked", "2026-08-24 09:00:00", write_state=write_state,
+           reason=reason, include_review_failure_receipt=receipt)
+    result = reconciliation.reconcile(
+        root,
+        pending_rows=[{"request_id": "blocked", "received_at": live_received}],
+        handled_rows=[{"request_id": "blocked"}] if handled else [],
+    )
+    assert result["continuation"] == {
+        "status": "blocked", "scope": "controller", "isolated_pending": 0,
+        "blocking_reasons": {error: 1},
+    }
+
+
+def test_historical_unknown_is_preserved_without_blocking_fresh_identity(tmp_path: Path) -> None:
+    root = tmp_path / "flows"
+    _state(root, "historical", "2026-08-24 09:00:00", write_state="unknown",
+           reason="writer_result_unknown")
+    before = {path: path.read_bytes() for path in root.rglob("*.json")}
+    result = reconciliation.reconcile(
+        root,
+        pending_rows=[{"request_id": "fresh", "received_at": "2026-09-09 09:00:00"}],
+        handled_rows=[],
+    )
+    assert result["continuation"]["status"] == "ready"
+    assert result["quarantine"]["actionable_pending"] == 1
+    assert result["findings"][0]["recommendation"] == "manual_write_state_verification"
+    assert before == {path: path.read_bytes() for path in root.rglob("*.json")}
