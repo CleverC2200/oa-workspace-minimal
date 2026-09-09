@@ -231,6 +231,7 @@ def test_controlled_write_preserves_writer_failure_classification(
     )
     assert report["manual_review"]["items"][0]["receipt_status"] == "verified"
     assert report["manual_review"]["items"][0]["automatic_retry"] is False
+    assert report["continuation"]["status"] == ("ready" if failure_code == "writer_submit_rejected" else "blocked")
     assert len(api.calls) == 1
     if failure_code == "writer_submit_rejected":
         attempt = receipt_file.parent

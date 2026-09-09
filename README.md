@@ -200,7 +200,7 @@ python3 -m apps.oa_finance_preaudit.session_alert --clear
 
 启动或恢复前可在同一只读命令增加 `--reconcile`。它将本地最新 attempt 与实时待办、已办对账，区分 `handled_not_pending`、`pending_not_handled`、双边冲突、身份冲突和不可见，只生成脱敏建议，不领取或重提：
 
-对账结果的 `manual_review.items` 提供脱敏人工核对清单，包含单据摘要键、流程、失败码、写入状态及回执验证状态。新失败在原 attempt 中保留 `manual-review-receipt.json`；历史缺失回执显示 `missing_or_invalid`，不补造证明。明确提交拒绝须经现有签名边界本地核实才可隔离并继续同轮其他单据；未知写入仍停止并保留人工核对，不自动重试。清单可供财务查看，不代表已发送通知或已完成业务审核。
+对账结果的 `manual_review.items` 提供脱敏人工核对清单，包含单据摘要键、流程、失败码、写入状态及回执验证状态。新失败在原 attempt 中保留 `manual-review-receipt.json`；历史缺失回执显示 `missing_or_invalid`，不补造证明。明确提交拒绝须经现有签名边界本地核实才可隔离并继续同轮其他单据；未知写入仍停止并保留人工核对，不自动重试。清单可供财务查看，不代表已发送通知或已完成业务审核。 每轮控制器的实时快照都校验 `continuation`，无停止标记也不能绕过未知写入、身份冲突或不可信隔离。可信材料失败、无效审核结果和签名验证通过的提交拒绝与既有可信审核进程失败共同纳入单据隔离；只读对账保留人工关注信息。
 
 
 ```bash

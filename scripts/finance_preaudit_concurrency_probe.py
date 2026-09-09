@@ -30,6 +30,7 @@ from apps.oa_finance_preaudit import (
     concurrency_control,
     controller_handoff,
     flow_engine,
+    item_failure,
     observability,
     process_pool,
     production_pending,
@@ -582,6 +583,15 @@ def _quarantined_action_matches_selection(
     *,
     project_root: Path = PROJECT_ROOT,
 ) -> bool:
+    if state.get("reason") == "writer_submit_rejected":
+        expected_root = Path(project_root).expanduser().resolve() / "runtime" / "finance_preaudit_flows"
+        return (
+            action_path == expected_root / workflow_key / "cases"
+            / str(state.get("case_key")) / f"attempt-{state.get('attempt')}" / "action.json"
+            and state.get("request_id") == str(selected.get("requestId") or "").strip()
+            and state.get("received_at") == str(selected.get("received_at") or "").strip()
+            and item_failure.isolated(action_path.parent, state)
+        )
     if state.get("reason") in {
         "codex_decision_invalid",
         "codex_review_failed",
@@ -3610,6 +3620,7 @@ def _rolling_snapshot(
         or quarantined < 0
         or actionable < 0
         or quarantined + actionable != pending
+        or not _continuation_is_ready(reconciled)
     ):
         raise ValueError("production_rolling_reconciliation_invalid")
     return pending, quarantined, actionable, unauthorized
