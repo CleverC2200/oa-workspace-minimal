@@ -383,3 +383,41 @@ def test_clear_active_alert_failure_is_reported_without_raising(
 
     assert result is not None
     assert result["status"] == "unknown"
+
+
+@pytest.mark.parametrize("code", ["material_collection_failed", "codex_review_failed", "writer_result_unknown", "controller_failed"])
+def test_non_session_failure_alerts_even_when_session_is_healthy(tmp_path, monkeypatch, code):
+    sent = []
+    monkeypatch.setattr(session_alert.auth, "load_local_env", lambda: None)
+    monkeypatch.setenv("OA_FEISHU_ALERT_CHAT_ID", "oc_recorded")
+    monkeypatch.setattr(session_alert, "send_message", lambda *args, **kwargs: sent.append(args))
+    result = session_alert.alert_from_environment(
+        code, control_root=tmp_path, live_status_provider=lambda: {"status": "ok"},
+    )
+    assert result["delivery_state"] == "sent"
+    assert code in sent[0][1]
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_recovery_preserves_delivery_evidence(tmp_path, failed):
+    def sender(*args):
+        if failed:
+            raise RuntimeError("send failed")
+    session_alert.alert_once("oa_session_expired", chat_id="oc_recorded", control_root=tmp_path, occurred_at=NOW, sender=sender)
+    session_alert.clear_alert(control_root=tmp_path, occurred_at=NOW)
+    state = json.loads((tmp_path / session_alert.STATE_NAME).read_text())
+    assert state["status"] == "ready"
+    assert state["delivery_state"] == ("unknown" if failed else "sent")
+    assert state["attempt_count"] == 1
+    assert state["error_code"] == "oa_session_expired"
+
+
+def test_configuration_failure_leaves_local_alert_receipt(tmp_path, monkeypatch):
+    def fail():
+        raise RuntimeError("private configuration failure")
+    monkeypatch.setattr(session_alert.auth, "load_local_env", fail)
+    result = session_alert.alert_from_environment("controller_failed", control_root=tmp_path)
+    assert result["delivery_state"] == "unknown"
+    stored = (tmp_path / session_alert.STATE_NAME).read_text()
+    assert json.loads(stored)["delivery_state"] == "unknown"
+    assert "private configuration" not in stored

@@ -24,6 +24,17 @@ from apps.oa_finance_preaudit import (
 from scripts import finance_preaudit_concurrency_probe
 
 
+@pytest.fixture(autouse=True)
+def isolate_alert_delivery(tmp_path, monkeypatch):
+    alert = finance_preaudit_concurrency_probe.session_alert
+    original = alert.alert_once
+    def local_alert(code, **kwargs):
+        kwargs["control_root"] = tmp_path / "alerts"
+        return original(code, **kwargs)
+    monkeypatch.setattr(alert, "alert_once", local_alert)
+    monkeypatch.setattr(alert, "send_message", lambda *args, **kwargs: None)
+
+
 def _slow_failed_prepare(_workflow: str) -> dict:
     time.sleep(0.05)
     return {"action": "failed", "error_code": "late_prepare_result"}
@@ -7468,3 +7479,28 @@ def test_adaptive_read_only_probe_requires_two_healthy_waves_per_upgrade() -> No
         "healthy_windows": 0,
         "reason": "healthy_window_threshold",
     }
+
+
+@pytest.mark.parametrize("outcome", [
+    {"status": "failed", "error_counts": {"codex_decision_invalid": 1}},
+    {"status": "failed", "error_counts": {}, "stop_reason": "host_critical"},
+    {"status": "completed_with_quarantine", "error_counts": {}},
+    RuntimeError("production_controller_children_active"),
+])
+def test_controller_failures_and_degradation_notify_without_session_failure(tmp_path, monkeypatch, capsys, outcome):
+    from apps.oa_finance_preaudit import session_alert
+    monkeypatch.chdir(tmp_path)
+    def run(**kwargs):
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+    sent = []
+    monkeypatch.setattr(finance_preaudit_concurrency_probe, "run_rolling_drain", run)
+    monkeypatch.setattr(session_alert.auth, "load_local_env", lambda: None)
+    monkeypatch.setenv("OA_FEISHU_ALERT_CHAT_ID", "oc_recorded")
+    monkeypatch.setattr(session_alert, "_live_status", lambda: {"status": "ok"})
+    monkeypatch.setattr(session_alert, "send_message", lambda *args, **kwargs: sent.append(args))
+    finance_preaudit_concurrency_probe.main(["--capacity", "6", "--confirm-write", "YES"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["notification"]["delivery_state"] == "sent"
+    assert len(sent) == 1

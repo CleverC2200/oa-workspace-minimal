@@ -19,7 +19,7 @@ from pathlib import Path
 import signal
 import sys
 import time
-from typing import Callable, Dict, Sequence, Union
+from typing import Callable, Sequence
 from zoneinfo import ZoneInfo
 
 from apps import json_artifact
@@ -44,7 +44,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RenewActions = Callable[[list[Path]], list[Path]]
 ReviewRunner = Callable[[list[dict], int], process_pool.PoolResult[dict]]
 PrepareRunner = Callable[[int], process_pool.PoolResult[dict]]
-PrepareSelection = Union[str, Dict[str, object]]
+PrepareSelection = str | dict[str, object]
 PrepareAction = Callable[[PrepareSelection], dict]
 BatchRunner = Callable[..., dict]
 LiveStatus = Callable[[], dict]
@@ -102,11 +102,6 @@ _SESSION_ALERT_PRIORITY = (
     "rpa_cdp_unavailable",
     "rpa_session_invalid",
     "rpa_session_missing",
-    "writer_result_unknown",
-    "material_collection_failed",
-    "codex_review_failed",
-    "controller_failed",
-    "controller_cycle_stop",
 )
 
 
@@ -118,9 +113,6 @@ def _session_error_code(error: Exception) -> str:
         code = flow_engine.session_blocking_failure_code(current)
         if code:
             return code
-        candidate = str(current).partition(":")[0].strip()
-        if candidate in _SESSION_ALERT_PRIORITY:
-            return candidate
         current = current.__cause__ or current.__context__
     return ""
 
@@ -4758,6 +4750,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=("YES",),
     )
     args = parser.parse_args(argv)
+    controller_started = False
     try:
         if args.read_only:
             if (
@@ -4800,12 +4793,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             if args.confirm_stale_children_reaped == "YES":
                 rolling_args["confirm_stale_children_reaped"] = True
+            controller_started = True
             payload = run_rolling_drain(**rolling_args)
             counts = payload.get("error_counts")
             session_code = next(
                 (
                     code
-                    for code in _SESSION_ALERT_PRIORITY
+                    for code in (*_SESSION_ALERT_PRIORITY, *sorted(session_alert.PRODUCTION_ERROR_CODES))
                     if isinstance(counts, dict)
                     and isinstance(counts.get(code), int)
                     and not isinstance(counts.get(code), bool)
@@ -4813,6 +4807,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
                 "",
             )
+            if not session_code and (
+                payload.get("status") != "completed"
+                or any(isinstance(n, int) and n > 0 for n in (counts or {}).values())
+            ):
+                session_code = "controller_failed"
             if session_code:
                 payload["notification"] = session_alert.alert_from_environment(
                     session_code
@@ -4839,10 +4838,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             and error.primary_error_code
         ):
             payload["primary_error_code"] = error.primary_error_code
-        if session_code:
-            payload["notification"] = session_alert.alert_from_environment(
-                session_code
+        if controller_started:
+            failure_code = str(error).partition(":")[0].strip()
+            alert_code = session_code or (
+                failure_code if failure_code in session_alert.PRODUCTION_ERROR_CODES
+                else "controller_failed"
             )
+            payload["notification"] = session_alert.alert_from_environment(alert_code)
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return 1
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))

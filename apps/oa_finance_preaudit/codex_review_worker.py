@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import Callable, Optional, TextIO
+from typing import Callable, TextIO
 
 from apps import json_artifact
 from apps.oa_approval import runtime_control, writer_outcomes
@@ -127,7 +127,7 @@ class CodexExecution:
 
 
 Executor = Callable[[Path, Path, int], CodexExecution]
-Completer = Callable[[Path, dict], Optional[str]]
+Completer = Callable[[Path, dict], str | None]
 StopRequester = Callable[[], None]
 
 
