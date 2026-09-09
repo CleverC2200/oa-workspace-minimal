@@ -10,7 +10,7 @@ import pytest
 
 from apps import json_artifact
 from apps.oa_approval import frozen_writer
-from apps.oa_finance_preaudit import flow_engine, production_write, reconciliation
+from apps.oa_finance_preaudit import flow_engine, production_write, reconciliation, item_failure
 
 
 NOW = datetime(2026, 8, 23, 1, 0, tzinfo=timezone.utc)
@@ -169,7 +169,9 @@ def test_controlled_write_preserves_writer_failure_classification(
     failure_code: str,
     submit_ok: bool,
     expected_write_state: str,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setenv("OA_APP_SECRET", "local-test-secret")
     root = tmp_path / "flows"
     policy_file = tmp_path / "write-policy.json"
     json_artifact.write_json_atomic(
@@ -230,6 +232,22 @@ def test_controlled_write_preserves_writer_failure_classification(
     assert report["manual_review"]["items"][0]["receipt_status"] == "verified"
     assert report["manual_review"]["items"][0]["automatic_retry"] is False
     assert len(api.calls) == 1
+    if failure_code == "writer_submit_rejected":
+        attempt = receipt_file.parent
+        state = json.loads((attempt / "state.json").read_text())
+        boundary_file = attempt / "writer-boundary.json"
+        boundary = json.loads(boundary_file.read_text())
+        boundary["proof"] = "hmac-sha256:" + "0" * 64
+        json_artifact.write_json_atomic(boundary_file, boundary)
+        item_failure.persist(attempt, state)
+        forged = json.loads(receipt_file.read_text())
+        assert forged["scope"] == "controller"
+        forged["scope"] = "item"
+        json_artifact.write_json_atomic(receipt_file, forged)
+        assert not item_failure.isolated(attempt, state)
+        boundary_file.unlink()
+        assert not item_failure.isolated(attempt, state)
+        assert len(api.calls) == 1
 
 
 def test_controlled_write_serializes_different_requests_at_writer_boundary(
@@ -443,6 +461,7 @@ def test_mixed_batch_continues_after_verified_rejection(tmp_path: Path, monkeypa
     from apps.oa_finance_preaudit import cli, codex_review_worker
     from scripts import finance_preaudit_concurrency_probe as probe
 
+    monkeypatch.setenv("OA_APP_SECRET", "local-test-secret")
     project = tmp_path.resolve()
     root = project / "runtime" / "finance_preaudit_flows"
     policy = project / "policy.json"

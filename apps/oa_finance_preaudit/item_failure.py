@@ -115,8 +115,9 @@ def verified_receipt(root: Path, state: dict) -> dict | None:
     if receipt != _payload(root, state, scope=scope):
         return None
     if state.get("reason") == writer_outcomes.SUBMIT_REJECTED and scope == "item":
-        boundary = evidence.read_receipt(root / "writer-boundary.json")
-        if not boundary or boundary.get("failure_code") != writer_outcomes.SUBMIT_REJECTED:
+        from . import production_write
+
+        if not production_write.verified_submit_rejection(root, state):
             return None
     return receipt
 

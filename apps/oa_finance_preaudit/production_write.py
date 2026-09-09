@@ -242,6 +242,36 @@ def _read_boundary(path: Path, job: dict, secret: str) -> dict | None:
     return boundary
 
 
+def verified_submit_rejection(attempt_root: Path, state: dict) -> bool:
+    """Recheck the exact signed local Writer boundary without contacting OA."""
+    try:
+        secret = auth.env("OA_APP_SECRET")
+        if not secret:
+            return False
+        files = {
+            "decision_file": attempt_root / "review-decision.json",
+            "remark_file": attempt_root / "remark.txt",
+            "envelope_file": attempt_root / "submission-envelope.json",
+        }
+        job = submission.build_job(
+            action=state, state=state,
+            **{key: str(path) for key, path in files.items()},
+            decision_fingerprint=_file_fingerprint(files["decision_file"]),
+            remark_fingerprint=_file_fingerprint(files["remark_file"]),
+            envelope_fingerprint=_file_fingerprint(files["envelope_file"]),
+        )
+        _validate_job(job, attempt_root.parents[3])
+        boundary = _read_boundary(attempt_root / _BOUNDARY_FILE, job, secret)
+        return (
+            boundary is not None
+            and boundary["failure_code"] == writer_outcomes.SUBMIT_REJECTED
+            and boundary["stages"][-1] == "submit_rejected"
+            and not os.path.lexists(attempt_root / "execution-receipt.json")
+        )
+    except (OSError, KeyError, TypeError, ValueError, RuntimeError):
+        return False
+
+
 def _record_boundary(
     path: Path,
     job: dict,
