@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from apps.oa_approval import writer_outcomes
 
-from . import observability, retention, review_failure_evidence
+from . import item_failure, observability, retention, review_failure_evidence
 
 
 SCHEMA_VERSION = 1
@@ -43,19 +43,7 @@ _FAILURE_CODES = {
     "writer_result_unknown",
     *writer_outcomes.FAILURE_CODES,
 }
-ITEM_LOCAL_MATERIAL_FAILURE_DETAILS = frozenset(
-    {
-        "attachment_download_capacity_timeout",
-        "attachment_download_failed",
-        "attachment_download_incomplete",
-        "attachment_download_launch_timeout",
-        "attachment_download_timeout",
-        "invoice_buyer_read_failed",
-        "travel_attachment_discovery_failed",
-        "travel_attachment_failed",
-        "travel_attachment_resources_incomplete",
-    }
-)
+ITEM_LOCAL_MATERIAL_FAILURE_DETAILS = item_failure.ITEM_LOCAL_MATERIAL_FAILURE_DETAILS
 _MANAGED_PATH = re.compile(
     r"^(?:(?:\.archive/)?(?:travel_expense|business_entertainment|"
     r"business_support_fee|small_marketing_fee|general_expense|"

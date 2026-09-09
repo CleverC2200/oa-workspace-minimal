@@ -917,6 +917,17 @@ def _execute_read_only_codex(
     )
 
 
+def _isolated_writer_failure(action_file: Path) -> bool:
+    from . import item_failure
+
+    state = item_failure.evidence.read_receipt(action_file.with_name("state.json"))
+    return (
+        isinstance(state, dict)
+        and state.get("reason") == "writer_submit_rejected"
+        and item_failure.isolated(action_file.parent, state)
+    )
+
+
 def _complete_decision(action_file: Path, decision: dict) -> str | None:
     from apps.oa_finance_preaudit import cli
 
@@ -960,6 +971,8 @@ def _complete_decision(action_file: Path, decision: dict) -> str | None:
             and result.get("write_state") == "submitted"
         ):
             reason = result.get("reason")
+            if reason == "writer_submit_rejected" and _isolated_writer_failure(action_file):
+                return str(reason)
             if reason in _UNKNOWN_WRITE_FAILURE_CODES:
                 runtime_control.request_stop("writer_result_unknown")
             else:
@@ -1543,6 +1556,12 @@ def complete_review_result(
             "business_state": business_state,
             "write_state": "submitted",
             "error_code": None,
+        }
+    if completion_error == "writer_submit_rejected" and _isolated_writer_failure(action_file):
+        return {
+            **base, "status": "quarantined", "execution_state": "needs_admin",
+            "business_state": "not_available", "write_state": "not_requested",
+            "error_code": completion_error,
         }
     if completion_error == "codex_decision_invalid" and defer_invalid_stop:
         return {

@@ -10,7 +10,7 @@ import pytest
 
 from apps import json_artifact
 from apps.oa_approval import frozen_writer
-from apps.oa_finance_preaudit import flow_engine, production_write
+from apps.oa_finance_preaudit import flow_engine, production_write, reconciliation
 
 
 NOW = datetime(2026, 8, 23, 1, 0, tzinfo=timezone.utc)
@@ -217,6 +217,19 @@ def test_controlled_write_preserves_writer_failure_classification(
     assert result["reason"] == failure_code
     assert result["write_state"] == expected_write_state
     assert len(api.calls) == 1
+    receipt_file = Path(result["action_file"]).with_name("manual-review-receipt.json")
+    receipt = json.loads(receipt_file.read_text(encoding="utf-8"))
+    assert receipt["failure_code"] == failure_code
+    assert receipt["scope"] == ("item" if failure_code == "writer_submit_rejected" else "controller")
+    assert "live-request" not in json.dumps(receipt)
+    report = reconciliation.reconcile(
+        root,
+        pending_rows=api.pending_rows(),
+        handled_rows=[],
+    )
+    assert report["manual_review"]["items"][0]["receipt_status"] == "verified"
+    assert report["manual_review"]["items"][0]["automatic_retry"] is False
+    assert len(api.calls) == 1
 
 
 def test_controlled_write_serializes_different_requests_at_writer_boundary(
@@ -422,3 +435,77 @@ def test_flow_and_legacy_writer_share_the_same_global_lock(
     assert errors == []
     assert overlapped is False
     assert max_active == 1
+
+
+def test_mixed_batch_continues_after_verified_rejection(tmp_path: Path, monkeypatch) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from apps.oa_approval import runtime_control
+    from apps.oa_finance_preaudit import cli, codex_review_worker
+    from scripts import finance_preaudit_concurrency_probe as probe
+
+    project = tmp_path.resolve()
+    root = project / "runtime" / "finance_preaudit_flows"
+    policy = project / "policy.json"
+    json_artifact.write_json_atomic(policy, {
+        "schema_version": 1, "kind": "preaudit_write_policy",
+        "authorized_workflows": ["travel_expense"],
+    })
+    rows = [{
+        "request_id": name, "received_at": f"2026-08-23T08:3{i}:00+08:00",
+        "workflow_key": "travel_expense",
+    } for i, name in enumerate(("rejected-case", "good-case"))]
+    calls = []
+    stops = []
+
+    class Api:
+        def pending_rows(self, **_kwargs):
+            return rows
+
+        def submit_and_verify(self, request_id, _remark):
+            calls.append(request_id)
+            rejected = request_id == "rejected-case"
+            return {
+                "submit_ok": not rejected, "done_hit": not rejected,
+                "postcheck_done_hit": not rejected,
+                "failure_code": "writer_submit_rejected" if rejected else None,
+            }
+
+    engine = flow_engine.FlowEngine(
+        root=root, discover_candidates=lambda _key: rows,
+        collect_material=lambda request_id, _root: _material(request_id),
+        **production_write.build_ports(root=root, policy_file=policy,
+            signing_secret="local-test-secret", api_factory=Api, now=lambda: NOW),
+    )
+    actions = [engine.next_action("travel_expense", mode="controlled_write") for _ in rows]
+    pending_actions = iter(actions)
+    monkeypatch.setattr(cli, "_live_flow_engine", lambda **_kwargs: engine)
+    monkeypatch.setattr(runtime_control, "stop_requested", lambda: False)
+    monkeypatch.setattr(runtime_control, "request_stop", lambda *args: stops.append(args))
+    monkeypatch.setattr(runtime_control, "request_cycle_stop", lambda *args: stops.append(args))
+    monkeypatch.setattr(probe, "_preparation_executor", lambda: ThreadPoolExecutor(max_workers=1))
+
+    def review(task):
+        action = json.loads(Path(task["action_file"]).read_text())
+        return {
+            "status": "reviewed", "decision": _decision(action),
+            "process_attempts": 1, "process_retries": 0, "agent_wall_seconds": 1,
+            "token_usage": {"status": "unknown"},
+            "codex_events": {"status": "unknown", "attempts": 1,
+                "recorded_attempts": 0, "unknown_attempts": 1, "counts": {}},
+        }
+
+    result = probe._run_dispatched_tasks(
+        2, 2, project_root=project,
+        prepare_action=lambda _selection: next(pending_actions), review_worker=review,
+        complete_review=lambda action, reviewed: codex_review_worker.complete_review_result(
+            action, reviewed, request_stop=lambda: stops.append("worker")),
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        runtime_status=lambda: {"status": "healthy"}, strict_global_fifo=True,
+    )
+    assert calls == ["rejected-case", "good-case"]
+    assert [outcome.value["status"] for outcome in result.outcomes] == ["quarantined", "completed"]
+    assert stops == []
+    assert probe._rolling_wave_metrics(result)["isolated_quarantines"] == 1
+    failed_root = Path(actions[0]["action_file"]).parent
+    assert (failed_root / "writer-boundary.json").is_file()
+    assert (failed_root / "review-decision.json").is_file()
