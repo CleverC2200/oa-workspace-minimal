@@ -421,3 +421,11 @@ def test_configuration_failure_leaves_local_alert_receipt(tmp_path, monkeypatch)
     stored = (tmp_path / session_alert.STATE_NAME).read_text()
     assert json.loads(stored)["delivery_state"] == "unknown"
     assert "private configuration" not in stored
+
+
+def test_session_recovery_does_not_reset_active_production_fault(tmp_path):
+    session_alert.alert_once("writer_result_unknown", chat_id="oc_recorded", control_root=tmp_path, sender=lambda *args: None)
+    session_alert.alert_from_environment("oa_session_expired", control_root=tmp_path, live_status_provider=lambda: {"status": "ok"})
+    state = json.loads((tmp_path / session_alert.STATE_NAME).read_text())
+    assert state["status"] == "active"
+    assert state["error_code"] == "writer_result_unknown"

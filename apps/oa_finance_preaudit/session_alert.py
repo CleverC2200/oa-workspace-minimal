@@ -252,11 +252,13 @@ def alert_once(
 
 
 def clear_alert(
-    *, control_root: Path, occurred_at: datetime | None = None
+    *, control_root: Path, occurred_at: datetime | None = None, session_only: bool = False
 ) -> dict[str, str | int]:
     with _locked(control_root) as root:
         state_path = root / STATE_NAME
         existing = _read_state(state_path)
+        if session_only and existing.get("status") == "active" and existing.get("error_code") not in SESSION_ERROR_CODES:
+            return {"schema_version": 1, "kind": "oa_session_alert_receipt", "status": "active"}
         _write_state(
             state_path,
             {
@@ -292,7 +294,7 @@ def alert_from_environment(
                 return _public_receipt(code, "not_required")
             code = current_code
         else:
-            clear_active_alert(control_root=control_root)
+            clear_active_alert(control_root=control_root, session_only=True)
             return _public_receipt(code, "not_required")
     def configured_sender(_target: str, text: str, key: str) -> None:
         auth.load_local_env()
@@ -311,6 +313,7 @@ def alert_from_environment(
 def clear_active_alert(
     *,
     control_root: Path = Path("runtime/control"),
+    session_only: bool = False,
 ) -> dict[str, str | int] | None:
     try:
         state_path = Path(control_root).expanduser().resolve() / STATE_NAME
@@ -319,7 +322,7 @@ def clear_active_alert(
         state = _read_state(state_path)
         if state.get("status") != "active":
             return None
-        return clear_alert(control_root=control_root)
+        return clear_alert(control_root=control_root, session_only=session_only)
     except Exception:
         return {
             "schema_version": 1,
@@ -342,7 +345,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.clear:
-        print(json.dumps(clear_alert(control_root=args.control_root), ensure_ascii=False))
+        print(json.dumps(clear_alert(control_root=args.control_root, session_only=True), ensure_ascii=False))
         return 0
     if not args.dry_run and args.confirm_send != "YES":
         print(json.dumps({"error_code": "feishu_alert_confirmation_missing"}))

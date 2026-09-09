@@ -4799,7 +4799,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             session_code = next(
                 (
                     code
-                    for code in (*_SESSION_ALERT_PRIORITY, *sorted(session_alert.PRODUCTION_ERROR_CODES))
+                    for code in (*sorted(session_alert.PRODUCTION_ERROR_CODES), *_SESSION_ALERT_PRIORITY)
                     if isinstance(counts, dict)
                     and isinstance(counts.get(code), int)
                     and not isinstance(counts.get(code), bool)
@@ -4820,10 +4820,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 reset = session_alert.clear_active_alert()
                 if reset and reset.get("status") == "unknown":
                     payload["notification_reset"] = reset
-    except (RuntimeError, ValueError) as error:
+    except Exception as error:
         session_code = (
             "" if args.read_only else _session_error_code(error)
         )
+        error_code = session_code or str(error)
+        if not error_code.replace("_", "").isalnum() or not error_code.isascii():
+            error_code = "controller_failed" if controller_started else "production_probe_failed"
         payload = {
             "schema_version": 1,
             "kind": (
@@ -4831,7 +4834,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.read_only
                 else "preaudit_production_concurrency_probe_failed"
             ),
-            "error_code": session_code or str(error),
+            "error_code": error_code,
         }
         if (
             isinstance(error, ControllerChildrenActiveError)

@@ -7486,6 +7486,8 @@ def test_adaptive_read_only_probe_requires_two_healthy_waves_per_upgrade() -> No
     {"status": "failed", "error_counts": {}, "stop_reason": "host_critical"},
     {"status": "completed_with_quarantine", "error_counts": {}},
     RuntimeError("production_controller_children_active"),
+    OSError("private path failure"),
+    {"status": "failed", "error_counts": {"oa_session_expired": 1, "writer_result_unknown": 1}},
 ])
 def test_controller_failures_and_degradation_notify_without_session_failure(tmp_path, monkeypatch, capsys, outcome):
     from apps.oa_finance_preaudit import session_alert

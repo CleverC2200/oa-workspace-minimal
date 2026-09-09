@@ -188,7 +188,7 @@ python3 -m apps.oa_finance_preaudit.session_alert \
   --confirm-send YES
 ```
 
-人工重新登录且下一次 `--check-live` 成功后，外部定时任务仅清除告警去重状态，为下一次独立故障重新布防：
+人工重新登录且下一次 `--check-live` 成功后，外部定时任务使用 `--clear` 仅清除会话类告警窗口；仍生效的生产故障窗口保留，待无错误完成轮次再清除：
 
 ```bash
 python3 -m apps.oa_finance_preaudit.session_alert --clear
