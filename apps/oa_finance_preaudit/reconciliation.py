@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from apps.oa_approval import writer_outcomes
 
-from . import review_failure_evidence
+from . import item_failure, review_failure_evidence
 
 
 _WORKFLOW_KEYS = {
@@ -254,6 +254,7 @@ def reconcile(
     if current_time.tzinfo is None:
         raise ValueError("runtime_reconciliation_invalid")
     live_failed: list[dict] = []
+    manual_items: list[dict] = []
     blocking_reasons: Counter[str] = Counter()
     isolated_pending: set[tuple[str, str]] = set()
 
@@ -316,6 +317,19 @@ def reconcile(
                 isolated_pending.add((request_id, received_at))
             else:
                 blocking_reasons["pending_failure_not_isolated"] += 1
+
+        if state.get("execution_state") == "needs_admin":
+            attempt_root = Path(root) / str(state["workflow_key"]) / "cases" / str(state["case_key"]) / f"attempt-{state['attempt']}"
+            receipt = item_failure.verified_receipt(attempt_root, state)
+            manual_items.append({
+                "item_key": state["case_key"], "workflow_key": state["workflow_key"],
+                "attempt": state["attempt"], "category": category,
+                "failure_code": state["reason"] if state.get("reason") in QUARANTINED_REASONS else "unknown_failure",
+                "write_state": state["write_state"], "automatic_retry": False,
+                "scope": receipt["scope"] if receipt else "unverified",
+                "receipt_status": "verified" if receipt else "missing_or_invalid",
+                "recommendation": "manual_write_state_verification" if state["write_state"] == "unknown" else "manual_state_review",
+            })
 
         counts[category] += 1
         recommendations[recommendation] += 1
@@ -393,6 +407,10 @@ def reconcile(
                 default=0,
             ),
             "failure_counts": dict(sorted(failure_counts.items())),
+        },
+        "manual_review": {
+            "read_only": True, "total": len(manual_items),
+            "items": sorted(manual_items, key=lambda item: item["item_key"]),
         },
         "findings": sorted(findings, key=lambda item: item["item_key"]),
     }

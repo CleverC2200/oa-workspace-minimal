@@ -17,7 +17,7 @@ import fitz
 from apps import json_artifact
 from apps.oa_approval import writer_outcomes
 
-from . import decision_validation, manual_handoff, observability, review_failure_evidence, submission
+from . import decision_validation, item_failure, manual_handoff, observability, review_failure_evidence, submission
 
 
 SCHEMA_VERSION = 1
@@ -1552,6 +1552,7 @@ class FlowEngine:
         reason: str,
         *,
         failure_details: dict | None = None,
+        confirmed_rejection: bool = False,
     ) -> dict:
         attempt_root = action_path.parent
         workflow_key = _attempt_workflow_key(attempt_root, self._root)
@@ -1589,6 +1590,9 @@ class FlowEngine:
             state_path,
             {**state, **action},
             indent=2,
+        )
+        item_failure.persist(
+            attempt_root, {**state, **action}, confirmed_rejection=confirmed_rejection,
         )
         return self._persist_current_action(
             workflow_root,
@@ -3841,9 +3845,19 @@ class FlowEngine:
                         wall_seconds=max(0, int(time.monotonic() - submit_started)),
                         required=False,
                     )
+                    confirmed_rejection = False
+                    if reason == writer_outcomes.SUBMIT_REJECTED and self._recover_frozen is not None:
+                        # This port validates the signed boundary locally and never posts.
+                        try:
+                            self._recover_frozen(dict(job))
+                        except ValueError as recovery_error:
+                            confirmed_rejection = str(recovery_error) == reason
+                        except Exception:
+                            pass
                     return self._persist_attempt_needs_admin(
                         action_path,
                         reason,
+                        confirmed_rejection=confirmed_rejection,
                     )
             write_state = "submitted"
             if recovered_submission_result is None:

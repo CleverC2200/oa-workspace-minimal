@@ -72,6 +72,7 @@ RECOVERABLE_NO_WRITE_REASONS = {
     *QUARANTINED_REASONS,
 }
 ITEM_LOCAL_QUARANTINE_REASONS = {
+    "writer_submit_rejected",
     "codex_decision_invalid",
     "codex_review_failed",
     "codex_process_failed",
