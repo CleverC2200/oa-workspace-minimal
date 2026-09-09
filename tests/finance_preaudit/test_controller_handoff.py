@@ -40,6 +40,10 @@ def _reconciliation(pending: int = 0) -> dict:
 def _clear_reconciliation(pending: int = 0) -> dict:
     return {
         **_reconciliation(pending),
+        "continuation": {
+            "status": "ready", "scope": "none", "isolated_pending": 0,
+            "blocking_reasons": {},
+        },
         "failure_attention": {
             "scope": "live_pending",
             "status": "clear",

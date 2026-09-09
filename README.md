@@ -149,6 +149,8 @@ python3 -m scripts.finance_preaudit_concurrency_probe \
 `--confirm-stale-children-reaped YES`。入口只修复这一份过期终态交接记录并继续正常门禁，
 不会恢复 `needs_admin`、历史技术失败或任何 `write_state=unknown` 项；条件不完整时仍返回稳定阻断码。
 
+只读对账的 `continuation` 将继续条件与 `failure_attention` 分开：有可信失败回执、无写入边界且未请求写入的 `codex_review_failed` 仅列为 `scope=item`，继续精确排除该单据版本；人工关注状态仍保留。`status=ready` 且 `isolated_pending == quarantine.pending_quarantined` 才可通过隔离门。当前未知或未闭合写入、身份/待办已办冲突以及未经验证的其他失败返回 `scope=controller` 和脱敏 `blocking_reasons`。普通周期停止恢复使用这一门禁，仍核验身份、锁和进程回收；不会重试隔离项或清除未知写入证据。当前仅覆盖已验证的审核进程失败，其他单据级失败分流仍由 #186/#187 后续完成。调度必须采用相同字段；仅发布代码不会改写工作树外的自动化提示词。
+
 差旅历史 `material_collection_failed` 等已确认未写入的隔离项，只能把精确旧
 `action.json` 交给同一个滚动控制器恢复；参数可重复。恢复仍在容量为 1、300 秒
 硬超时且可回收的 prepare 进程中完成，只创建新 attempt，后续审核和提交继续经过

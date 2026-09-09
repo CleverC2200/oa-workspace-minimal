@@ -189,25 +189,9 @@ def _quarantine_summary(
 ) -> dict[str, int]:
     pending = {_identity(row) for row in pending_rows if isinstance(row, dict)}
     pending = {identity for identity in pending if identity[0] and identity[1]}
-    quarantined: set[tuple[str, str]] = set()
-    for state in states:
-        if (
-            state.get("execution_state") != "needs_admin"
-            or state.get("reason") not in QUARANTINED_REASONS
-        ):
-            continue
-        if state.get("reason") == "codex_review_failed" and not (
-            review_failure_evidence.trusted_quarantine(
-                Path(root)
-                / str(state["workflow_key"])
-                / "cases"
-                / str(state["case_key"])
-                / f"attempt-{state['attempt']}",
-                state,
-            )
-        ):
-            continue
-        quarantined.add(_identity(state))
+    quarantined = {
+        _identity(state) for state in states if _trusted_quarantine(root, state)
+    }
     quarantined.discard(("", ""))
     quarantined_pending = len(quarantined & pending)
     return {
@@ -215,6 +199,24 @@ def _quarantine_summary(
         "pending_quarantined": quarantined_pending,
         "actionable_pending": len(pending) - quarantined_pending,
     }
+
+
+def _trusted_quarantine(root: Path, state: dict) -> bool:
+    if (
+        state.get("execution_state") != "needs_admin"
+        or state.get("reason") not in QUARANTINED_REASONS
+    ):
+        return False
+    if state.get("reason") != "codex_review_failed":
+        return True
+    return review_failure_evidence.trusted_quarantine(
+        Path(root)
+        / str(state["workflow_key"])
+        / "cases"
+        / str(state["case_key"])
+        / f"attempt-{state['attempt']}",
+        state,
+    )
 
 
 def quarantine_summary(
@@ -252,6 +254,8 @@ def reconcile(
     if current_time.tzinfo is None:
         raise ValueError("runtime_reconciliation_invalid")
     live_failed: list[dict] = []
+    blocking_reasons: Counter[str] = Counter()
+    isolated_pending: set[tuple[str, str]] = set()
 
     states = [
         state
@@ -296,6 +300,22 @@ def reconcile(
             recommendation = "none"
         else:
             recommendation = "manual_state_review"
+
+        if category in {"identity_conflict", "pending_handled_conflict"}:
+            blocking_reasons[category] += 1
+        elif exact_pending and state.get("write_state") in {
+            "unknown", "submitting", "authorized", "submitted"
+        }:
+            blocking_reasons["pending_write_state_unresolved"] += 1
+        elif exact_pending and state.get("execution_state") == "needs_admin":
+            if (
+                state.get("write_state") == "not_requested"
+                and state.get("reason") == "codex_review_failed"
+                and _trusted_quarantine(root, state)
+            ):
+                isolated_pending.add((request_id, received_at))
+            else:
+                blocking_reasons["pending_failure_not_isolated"] += 1
 
         counts[category] += 1
         recommendations[recommendation] += 1
@@ -344,6 +364,14 @@ def reconcile(
         "quarantine": _quarantine_summary(root, states, pending_input),
         "counts": dict(sorted(counts.items())),
         "recommendations": dict(sorted(recommendations.items())),
+        "continuation": {
+            "status": "blocked" if blocking_reasons else "ready",
+            "scope": "controller" if blocking_reasons else (
+                "item" if isolated_pending else "none"
+            ),
+            "isolated_pending": len(isolated_pending),
+            "blocking_reasons": dict(sorted(blocking_reasons.items())),
+        },
         "failure_attention": {
             "scope": "live_pending",
             "status": "attention_required" if attention else "clear",
