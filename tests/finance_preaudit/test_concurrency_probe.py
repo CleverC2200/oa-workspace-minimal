@@ -235,8 +235,8 @@ def _reconciliation_snapshot(pending: int, quarantined: int = 0) -> dict:
             "actionable_pending": pending - quarantined,
         },
         "continuation": {
-            "status": "ready", "scope": "none", "isolated_pending": 0,
-            "blocking_reasons": {},
+            "status": "ready", "scope": "item" if quarantined else "none",
+            "isolated_pending": quarantined, "blocking_reasons": {},
         },
         "failure_attention": {
             "scope": "live_pending",
@@ -3472,7 +3472,7 @@ def test_rolling_wave_preserves_first_non_cancellation_error() -> None:
     assert metrics["primary_error_code"] == "codex_decision_invalid"
 
 
-def test_rolling_drain_excludes_quarantined_unknown_writes() -> None:
+def test_rolling_drain_excludes_trusted_isolated_items() -> None:
     calls: list[tuple[int, int]] = []
 
     result = finance_preaudit_concurrency_probe.run_rolling_drain(
@@ -7614,3 +7614,53 @@ def test_cycle_recovery_preserves_stop_for_unresolved_or_invalid_isolation(conti
             pipeline_runner=lambda *_args: pytest.fail("blocked round must remain idle"),
         )
     assert finance_preaudit_concurrency_probe.runtime_control.stop_requested()
+
+
+@pytest.mark.parametrize("blocker", [
+    "pending_write_state_unresolved", "identity_conflict", "pending_failure_not_isolated",
+])
+def test_rolling_snapshot_rejects_blocker_without_existing_stop(blocker) -> None:
+    snapshot = _reconciliation_snapshot(1)
+    snapshot["continuation"] = {
+        "status": "blocked", "scope": "controller", "isolated_pending": 0,
+        "blocking_reasons": {blocker: 1},
+    }
+    with pytest.raises(ValueError, match="production_rolling_reconciliation_invalid"):
+        finance_preaudit_concurrency_probe._rolling_snapshot(
+            lambda: {"credentials": {"status": "ok"}, "oa": {
+                "execution_identity": "verified", "by_workflow": {"travel_expense": 1},
+            }}, lambda: snapshot,
+        )
+
+
+@pytest.mark.parametrize("extra_blocker", [False, True])
+@pytest.mark.parametrize("artifact", [None, "execution-receipt.json", "writer-boundary.json"])
+def test_explicit_recovery_gate_uses_real_reconciliation(tmp_path, monkeypatch, extra_blocker, artifact):
+    probe = finance_preaudit_concurrency_probe
+    monkeypatch.setattr(probe, "PROJECT_ROOT", tmp_path)
+    root = tmp_path / "runtime" / "finance_preaudit_flows"
+    received = "2026-09-09T09:00:00+08:00"
+    action = _quarantined_action(root, request_id="recover", received_at=received,
+                                 failure_detail_code=None)
+    for name in ("action.json", "state.json"):
+        path = action.with_name(name)
+        payload = json.loads(path.read_text())
+        payload["created_at"] = received
+        path.write_text(json.dumps(payload))
+    if artifact:
+        action.with_name(artifact).write_text("{}")
+    rows = [{"request_id": "recover", "received_at": received},
+            {"request_id": "earlier-fresh", "received_at": "2026-09-09T08:00:00+08:00"}]
+    if extra_blocker:
+        blocked = _quarantined_action(root, request_id="blocked", received_at=received)
+        for name in ("action.json", "state.json"):
+            path = blocked.with_name(name)
+            payload = json.loads(path.read_text())
+            payload.update(created_at=received, write_state="unknown", reason="writer_result_unknown")
+            path.write_text(json.dumps(payload))
+        rows.append({"request_id": "blocked", "received_at": received})
+    report = probe.reconciliation.reconcile(root, pending_rows=rows, handled_rows=[])
+    before = {p: p.read_bytes() for p in root.rglob("*.json")}
+    assert not probe._continuation_is_ready(report)
+    assert probe._continuation_is_ready(report, recovery_action_files=(action,)) is (not extra_blocker and artifact is None)
+    assert before == {p: p.read_bytes() for p in root.rglob("*.json")}

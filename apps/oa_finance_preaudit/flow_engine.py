@@ -2170,6 +2170,26 @@ class FlowEngine:
             return self._persist_attempt_needs_admin(action_path, str(error))
         return self._persist_current_action(workflow_root, action)
 
+    @classmethod
+    def resumable_review(cls, root: Path, state: dict) -> bool:
+        """Validate frozen pre-submit state locally; do not renew or authorize writes."""
+        def unavailable(*_args, **_kwargs):
+            raise ValueError("read_only_port_unavailable")
+
+        action_path = Path(str(state.get("action_file") or ""))
+        if not action_path.is_absolute() or not action_path.name:
+            return False
+        if any(os.path.lexists(action_path.with_name(name)) for name in (
+            "writer-boundary.json", "execution-receipt.json",
+        )):
+            return False
+        reader = cls(root=root, discover_candidates=unavailable, collect_material=unavailable)
+        try:
+            _action, persisted, _packet = reader._open_attempt(action_path)
+        except (OSError, ValueError):
+            return False
+        return persisted == state
+
     def _open_attempt(self, action_path: Path) -> tuple[dict, dict, dict]:
         action_path = action_path.expanduser().resolve()
         if (
@@ -3015,28 +3035,10 @@ class FlowEngine:
             raise ValueError("persistent_state_invalid")
         return self._prepare_attempt(prepare_root)
 
-    def recover_confirmed_no_write(
-        self,
-        action_file: Path,
-        *,
-        mode: str = "preview",
-        confirmed: bool = False,
-        confirmed_unknown_no_write: bool = False,
-        confirmed_request_id: str | None = None,
-    ) -> dict:
-        if confirmed is not True:
-            raise ValueError("recovery_confirmation_required")
-        if mode not in {"preview", "controlled_write"}:
-            raise ValueError("run_mode_unauthorized")
-        if mode == "controlled_write" and (
-            self._authorization_source is None
-            or self._authorization_verifier is None
-            or self._submit_frozen is None
-        ):
-            raise ValueError("run_mode_unauthorized")
-        if self._discover_handled is None:
-            raise ValueError("recovery_live_state_unavailable")
-
+    def _inspect_recovery(
+        self, action_file: Path, *, mode: str,
+        confirmed_unknown_no_write: bool = False, confirmed_request_id: str | None = None,
+    ) -> tuple[Path, Path, str, dict, str, bool]:
         action_path = Path(action_file).expanduser().resolve()
         if (
             not action_path.is_relative_to(self._root)
@@ -3149,6 +3151,53 @@ class FlowEngine:
             )
         ):
             raise ValueError("recovery_not_safe")
+
+        return action_path, attempt_root, workflow_key, state, reason, human_confirmed_unknown
+
+    @classmethod
+    def recoverable_no_write(cls, root: Path, action_file: Path) -> bool:
+        """Inspect existing recovery evidence without clearing stops or creating attempts."""
+        def unavailable(*_args, **_kwargs):
+            raise ValueError("read_only_port_unavailable")
+
+        reader = cls(root=root, discover_candidates=unavailable, collect_material=unavailable)
+        try:
+            _action, attempt, _workflow, state, reason, _human = reader._inspect_recovery(
+                action_file, mode="preview",
+            )
+            if os.path.lexists(attempt / "writer-boundary.json"):
+                from .production_write import verified_no_write_failure
+                return verified_no_write_failure(attempt, state, reason)
+        except (OSError, ValueError):
+            return False
+        return reason not in writer_outcomes.CONFIRMED_NO_WRITE_CODES
+
+    def recover_confirmed_no_write(
+        self,
+        action_file: Path,
+        *,
+        mode: str = "preview",
+        confirmed: bool = False,
+        confirmed_unknown_no_write: bool = False,
+        confirmed_request_id: str | None = None,
+    ) -> dict:
+        if confirmed is not True:
+            raise ValueError("recovery_confirmation_required")
+        if mode not in {"preview", "controlled_write"}:
+            raise ValueError("run_mode_unauthorized")
+        if mode == "controlled_write" and (
+            self._authorization_source is None
+            or self._authorization_verifier is None
+            or self._submit_frozen is None
+        ):
+            raise ValueError("run_mode_unauthorized")
+        if self._discover_handled is None:
+            raise ValueError("recovery_live_state_unavailable")
+
+        action_path, attempt_root, workflow_key, state, reason, human_confirmed_unknown = self._inspect_recovery(
+            action_file, mode=mode, confirmed_unknown_no_write=confirmed_unknown_no_write,
+            confirmed_request_id=confirmed_request_id,
+        )
 
         discovery_started = time.monotonic()
         try:

@@ -243,8 +243,19 @@ def _read_boundary(path: Path, job: dict, secret: str) -> dict | None:
 
 
 def verified_submit_rejection(attempt_root: Path, state: dict) -> bool:
+    return verified_no_write_failure(attempt_root, state, writer_outcomes.SUBMIT_REJECTED)
+
+
+def verified_no_write_failure(attempt_root: Path, state: dict, code: str) -> bool:
     """Recheck the exact signed local Writer boundary without contacting OA."""
     try:
+        stages = {
+            writer_outcomes.SUBMIT_REJECTED: "submit_rejected",
+            writer_outcomes.PREFLIGHT_FAILED: "preflight_failed",
+            writer_outcomes.TARGET_CHANGED: "preflight_failed",
+        }
+        if code not in stages:
+            return False
         secret = auth.env("OA_APP_SECRET")
         if not secret:
             return False
@@ -264,8 +275,8 @@ def verified_submit_rejection(attempt_root: Path, state: dict) -> bool:
         boundary = _read_boundary(attempt_root / _BOUNDARY_FILE, job, secret)
         return (
             boundary is not None
-            and boundary["failure_code"] == writer_outcomes.SUBMIT_REJECTED
-            and boundary["stages"][-1] == "submit_rejected"
+            and boundary["failure_code"] == code
+            and boundary["stages"][-1] == stages[code]
             and not os.path.lexists(attempt_root / "execution-receipt.json")
         )
     except (OSError, KeyError, TypeError, ValueError, RuntimeError):

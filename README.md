@@ -149,7 +149,7 @@ python3 -m scripts.finance_preaudit_concurrency_probe \
 `--confirm-stale-children-reaped YES`。入口只修复这一份过期终态交接记录并继续正常门禁，
 不会恢复 `needs_admin`、历史技术失败或任何 `write_state=unknown` 项；条件不完整时仍返回稳定阻断码。
 
-只读对账的 `continuation` 将继续条件与 `failure_attention` 分开：有可信失败回执、无写入边界且未请求写入的 `codex_review_failed` 仅列为 `scope=item`，继续精确排除该单据版本；人工关注状态仍保留。`status=ready` 且 `isolated_pending == quarantine.pending_quarantined` 才可通过隔离门。当前未知或未闭合写入、身份/待办已办冲突以及未经验证的其他失败返回 `scope=controller` 和脱敏 `blocking_reasons`。普通周期停止恢复使用这一门禁，仍核验身份、锁和进程回收；不会重试隔离项或清除未知写入证据。当前仅覆盖已验证的审核进程失败，其他单据级失败分流仍由 #186/#187 后续完成。调度必须采用相同字段；仅发布代码不会改写工作树外的自动化提示词。
+只读对账的 `continuation` 将继续条件与 `failure_attention` 分开：有可信失败回执、无写入边界且未请求写入的 `codex_review_failed` 仅列为 `scope=item`，继续精确排除该单据版本；人工关注状态仍保留。`status=ready` 且 `isolated_pending == quarantine.pending_quarantined` 才可通过隔离门。当前未知或未闭合写入、身份/待办已办冲突以及未经验证的其他失败返回 `scope=controller` 和脱敏 `blocking_reasons`。普通周期停止恢复使用这一门禁，仍核验身份、锁和进程回收；不会重试隔离项或清除未知写入证据。统一失败回执也支持经过允许列表验证的材料失败、无效审核决定和经签名边界确认的提交拒绝。已打开且冻结证据完整、尚未进入 Writer 的审核动作可继续由 FlowEngine 重新核验授权；明确指定的未写入恢复项只在首轮门禁按精确身份匹配，其他阻塞项仍停止整轮。调度必须采用相同字段；仅发布代码不会改写工作树外的自动化提示词。
 
 差旅历史 `material_collection_failed` 等已确认未写入的隔离项，只能把精确旧
 `action.json` 交给同一个滚动控制器恢复；参数可重复。恢复仍在容量为 1、300 秒
@@ -200,7 +200,7 @@ python3 -m apps.oa_finance_preaudit.session_alert --clear
 
 启动或恢复前可在同一只读命令增加 `--reconcile`。它将本地最新 attempt 与实时待办、已办对账，区分 `handled_not_pending`、`pending_not_handled`、双边冲突、身份冲突和不可见，只生成脱敏建议，不领取或重提：
 
-对账结果的 `manual_review.items` 提供脱敏人工核对清单，包含单据摘要键、流程、失败码、写入状态及回执验证状态。新失败在原 attempt 中保留 `manual-review-receipt.json`；历史缺失回执显示 `missing_or_invalid`，不补造证明。明确提交拒绝须经现有签名边界本地核实才可隔离并继续同轮其他单据；未知写入仍停止并保留人工核对，不自动重试。清单可供财务查看，不代表已发送通知或已完成业务审核。
+对账结果的 `manual_review.items` 提供脱敏人工核对清单，包含单据摘要键、流程、失败码、写入状态及回执验证状态。新失败在原 attempt 中保留 `manual-review-receipt.json`；历史缺失回执显示 `missing_or_invalid`，不补造证明。明确提交拒绝须经现有签名边界本地核实才可隔离并继续同轮其他单据；未知写入仍停止并保留人工核对，不自动重试。清单可供财务查看，不代表已发送通知或已完成业务审核。 每轮控制器的实时快照都校验 `continuation`，无停止标记也不能绕过未知写入、身份冲突或不可信隔离。可信材料失败、无效审核结果和签名验证通过的提交拒绝与既有可信审核进程失败共同纳入单据隔离；只读对账保留人工关注信息。
 
 
 ```bash

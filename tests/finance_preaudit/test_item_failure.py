@@ -62,3 +62,22 @@ def test_changed_failure_evidence_never_authorizes_continuation(tmp_path: Path, 
     else:
         (attempt / "remark.txt").symlink_to(root / "missing")
     assert not item_failure.isolated(attempt, state)
+
+
+def test_trusted_material_failure_does_not_block_fresh_case(tmp_path: Path) -> None:
+    def collect(_request_id, _root):
+        raise ValueError("attachment_download_failed")
+
+    root = tmp_path.resolve()
+    failed = {"request_id": "bad-case", "received_at": "2026-09-09T09:00:00+08:00"}
+    engine = flow_engine.FlowEngine(root=root, discover_candidates=lambda key: [{
+        **failed, "workflow_key": key,
+    }], collect_material=collect)
+    engine.next_action("packaging_layout_approval")
+    result = reconciliation.reconcile(root, pending_rows=[failed, {
+        "request_id": "new-case", "received_at": "2026-09-09T09:01:00+08:00",
+    }], handled_rows=[])
+    assert result["continuation"] == {
+        "status": "ready", "scope": "item", "isolated_pending": 1, "blocking_reasons": {},
+    }
+    assert result["quarantine"]["actionable_pending"] == 1
