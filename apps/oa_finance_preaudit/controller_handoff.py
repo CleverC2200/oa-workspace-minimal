@@ -401,7 +401,9 @@ def status() -> dict:
         "manifest_state": manifest["state"],
         "lock_owner_consistent": lock_owner_consistent,
         "code_matches_current": (
-            revision == manifest["code_revision"]
+            _REVISION.fullmatch(revision) is not None
+            and isinstance(dirty, bool)
+            and revision == manifest["code_revision"]
             and dirty == manifest["code_dirty"]
         ),
         "code_revision": manifest["code_revision"],
