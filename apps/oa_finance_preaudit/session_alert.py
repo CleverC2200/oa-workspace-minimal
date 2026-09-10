@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import json
@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 from typing import Any
+from uuid import uuid4
 
 from apps.oa_approval import auth, runtime_control, writer_outcomes
 
@@ -50,6 +51,7 @@ STATE_NAME = "oa-session-alert.json"
 LOCK_NAME = "oa-session-alert.lock"
 SEND_TIMEOUT_SECONDS = 15
 MAX_ALERT_ATTEMPTS = 3
+ALERT_REMINDER_INTERVAL = timedelta(hours=6)
 
 
 def _timestamp(value: datetime | None = None) -> str:
@@ -213,6 +215,7 @@ def alert_once(
         ) in {"started", "sent", "unknown"}
         attempt_count = 0
         first_seen = occurred
+        window_id = uuid4().hex
         if active:
             state = str(existing["delivery_state"])
             raw_attempt_count = existing.get("attempt_count", 1)
@@ -222,20 +225,42 @@ def alert_once(
                 or not 1 <= raw_attempt_count <= MAX_ALERT_ATTEMPTS
             ):
                 raise RuntimeError("session_alert_state_invalid")
-            attempt_count = raw_attempt_count
-            first_seen = str(existing.get("first_seen_at") or "").strip()
-            if not first_seen:
+            # An uncertain provider result requires explicit reconciliation, even
+            # when the error changes or the reminder interval has elapsed.
+            if state != "sent":
+                return _public_receipt(code, state)
+            try:
+                first = datetime.fromisoformat(existing["first_seen_at"])
+                delivered = datetime.fromisoformat(existing["delivered_at"])
+                current = datetime.fromisoformat(occurred)
+                if first.tzinfo is None or delivered.tzinfo is None or not first <= delivered <= current:
+                    raise ValueError("invalid_timestamp")
+            except (KeyError, TypeError, ValueError) as error:
+                raise RuntimeError("session_alert_state_invalid") from error
+            if existing.get("error_code") not in ALERT_ERROR_CODES:
                 raise RuntimeError("session_alert_state_invalid")
-            if state != "sent" or attempt_count >= MAX_ALERT_ATTEMPTS:
-                return _public_receipt(
-                    code,
-                    "deduplicated" if state == "sent" else state,
-                )
+            changed = existing["error_code"] != code
+            expired = (
+                raw_attempt_count >= MAX_ALERT_ATTEMPTS
+                and current - delivered >= ALERT_REMINDER_INTERVAL
+            )
+            if not changed and not expired:
+                if raw_attempt_count >= MAX_ALERT_ATTEMPTS:
+                    return _public_receipt(code, "deduplicated")
+                attempt_count = raw_attempt_count
+                first_seen = existing["first_seen_at"]
+                window_id = existing.get("window_id") or window_id
 
+        history = existing.get("history", [])
+        if not isinstance(history, list) or any(not isinstance(item, dict) for item in history):
+            raise RuntimeError("session_alert_state_invalid")
+        # Keep each prior receipt, including legacy evidence and explicit recovery,
+        # without recursively nesting the accumulated history.
+        if existing.get("delivery_state") in {"started", "sent", "unknown"}:
+            history = [*history, {key: value for key, value in existing.items() if key != "history"}]
         attempt_count += 1
-
         key = "oa-alert-" + hashlib.sha256(
-            f"{code}|{first_seen}|{attempt_count}".encode()
+            f"{window_id}|{code}|{first_seen}|{attempt_count}".encode()
         ).hexdigest()[:24]
         base = {
             "schema_version": 1,
@@ -245,6 +270,8 @@ def alert_once(
             "first_seen_at": first_seen,
             "attempt_count": attempt_count,
             "idempotency_key": key,
+            "window_id": window_id,
+            "history": history,
             "delivery_state": "started",
         }
         _write_state(state_path, base)

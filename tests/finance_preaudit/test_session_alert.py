@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -96,21 +96,21 @@ def test_alert_once_limits_continuous_failure_window_to_three_attempts(
         sender=sender,
     )
     second = session_alert.alert_once(
-        "rpa_session_invalid",
+        "oa_session_expired",
         chat_id="oc_recorded",
         control_root=tmp_path,
         occurred_at=NOW,
         sender=sender,
     )
     third = session_alert.alert_once(
-        "rpa_cdp_timeout",
+        "oa_session_expired",
         chat_id="oc_recorded",
         control_root=tmp_path,
         occurred_at=NOW,
         sender=sender,
     )
     duplicate = session_alert.alert_once(
-        "rpa_cdp_unavailable",
+        "oa_session_expired",
         chat_id="oc_recorded",
         control_root=tmp_path,
         occurred_at=NOW,
@@ -137,6 +137,7 @@ def test_alert_once_limits_continuous_failure_window_to_three_attempts(
     )
     assert after_recovery["delivery_state"] == "sent"
     assert len(sent) == 4
+    assert len({key for _chat_id, _text, key in sent}) == 4
 
 
 def test_alert_once_counts_legacy_active_state_as_first_attempt(
@@ -475,3 +476,90 @@ def test_clearing_an_empty_window_does_not_invent_a_delivery(tmp_path):
         "schema_version": 1, "kind": "preaudit_alert_status", "read_only": True,
         "status": "ready", "delivery_state": "not_recorded",
     }
+
+
+def _alert(tmp_path, code="controller_failed", at=NOW, sender=lambda *args: None):
+    return session_alert.alert_once(code, chat_id="oc_recorded", control_root=tmp_path,
+                                   occurred_at=at, sender=sender)
+
+
+def test_error_change_reopens_exhausted_window_and_preserves_receipts(tmp_path):
+    sent = []
+    sender = lambda _target, _text, key: sent.append(key)
+    for _ in range(3):
+        _alert(tmp_path, sender=sender)
+    assert _alert(tmp_path)["delivery_state"] == "deduplicated"
+    assert _alert(tmp_path, "production_reconciliation_blocked", sender=sender)["delivery_state"] == "sent"
+    assert _alert(tmp_path, sender=sender)["delivery_state"] == "sent"
+    assert len(set(sent)) == 5
+    stored = json.loads((tmp_path / session_alert.STATE_NAME).read_text())
+    assert stored["attempt_count"] == 1
+    assert [record["idempotency_key"] for record in stored["history"]] == sent[:-1]
+    assert all(record["delivery_state"] == "sent" for record in stored["history"])
+
+
+def test_exhausted_window_reopens_six_hours_after_latest_confirmed_send(tmp_path):
+    _alert(tmp_path)
+    _alert(tmp_path, at=NOW + timedelta(hours=1))
+    _alert(tmp_path, at=NOW + timedelta(hours=2))
+    path = tmp_path / session_alert.STATE_NAME
+    before = path.read_bytes()
+    assert _alert(tmp_path, at=NOW + timedelta(hours=8, seconds=-1))["delivery_state"] == "deduplicated"
+    assert path.read_bytes() == before
+    assert _alert(tmp_path, at=NOW + timedelta(hours=8))["delivery_state"] == "sent"
+    stored = json.loads(path.read_text())
+    assert stored["attempt_count"] == 1
+    assert len(stored["history"]) == 3
+
+
+@pytest.mark.parametrize("delivery", ["unknown", "started"])
+def test_uncertain_delivery_never_reopens_for_time_or_different_error(tmp_path, delivery):
+    _alert(tmp_path)
+    path = tmp_path / session_alert.STATE_NAME
+    state = json.loads(path.read_text())
+    state["delivery_state"] = delivery
+    path.write_text(json.dumps(state))
+    before = path.read_bytes()
+    assert _alert(tmp_path, "production_reconciliation_blocked", NOW + timedelta(days=2))["delivery_state"] == delivery
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("bad_time", [None, "broken", "2026-09-03T08:00:00", "2026-09-04T08:00:00+00:00", "2026-09-02T08:00:00+00:00"])
+def test_invalid_or_backward_delivery_clock_does_not_send_or_overwrite(tmp_path, bad_time):
+    _alert(tmp_path)
+    path = tmp_path / session_alert.STATE_NAME
+    state = json.loads(path.read_text())
+    state["delivered_at"] = bad_time
+    path.write_text(json.dumps(state))
+    before = path.read_bytes()
+    with pytest.raises(RuntimeError, match="session_alert_state_invalid"):
+        _alert(tmp_path, "production_reconciliation_blocked", sender=lambda *args: pytest.fail("sent"))
+    assert path.read_bytes() == before
+
+
+def test_legacy_exhausted_window_rollover_preserves_original_receipt(tmp_path):
+    path = tmp_path / session_alert.STATE_NAME
+    legacy = {"schema_version": 1, "kind": "oa_session_alert_state", "status": "active",
+              "error_code": "controller_failed", "first_seen_at": NOW.isoformat(),
+              "delivered_at": NOW.isoformat(), "attempt_count": 3,
+              "idempotency_key": "legacy-key", "delivery_state": "sent"}
+    path.write_text(json.dumps(legacy))
+    assert _alert(tmp_path, at=NOW + timedelta(hours=6))["delivery_state"] == "sent"
+    stored = json.loads(path.read_text())
+    assert stored["history"] == [legacy]
+    assert stored["idempotency_key"] != "legacy-key"
+
+
+def test_new_window_uncertain_send_keeps_previous_delivery_evidence(tmp_path):
+    _alert(tmp_path)
+    path = tmp_path / session_alert.STATE_NAME
+    previous = json.loads(path.read_text())
+
+    def fail(*args):
+        raise RuntimeError("provider result unknown")
+
+    assert _alert(tmp_path, "production_reconciliation_blocked", sender=fail)["delivery_state"] == "unknown"
+    stored = json.loads(path.read_text())
+    assert stored["history"] == [{key: value for key, value in previous.items() if key != "history"}]
+    assert stored["window_id"] != previous["window_id"]
+    assert _alert(tmp_path, at=NOW + timedelta(days=2))["delivery_state"] == "unknown"
