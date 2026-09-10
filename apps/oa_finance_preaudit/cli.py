@@ -220,6 +220,7 @@ def _live_reconciliation(
             {
                 "request_id": item["requestId"],
                 "received_at": item["received_at"],
+                "workflow_key": item["flow_key"],
             }
             for item in selected
         ],
