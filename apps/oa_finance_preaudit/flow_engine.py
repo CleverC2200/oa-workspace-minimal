@@ -2220,7 +2220,23 @@ class FlowEngine:
                 if action.get("action") != "closed" or action.get("write_state") != "submitted":
                     return False
                 reader._completion_receipt(attempt_root, state)
-                _validate_frozen_review_inputs(attempt_root=attempt_root, state=state, workflow_key=state["workflow_key"])
+                # Closed states omit rule_version; the receipt binds the saved decision.
+                decision = _read_object(attempt_root / "review-decision.json", code="execution_receipt_invalid")
+                packet = _read_object(attempt_root / "review-packet.json", code="frozen_packet_changed")
+                rule_version = decision.get("rule_version")
+                if (
+                    not isinstance(rule_version, str)
+                    or packet.get("rule_version") != rule_version
+                    or state.get("rule_version") not in (None, rule_version)
+                ):
+                    return False
+                validation_state = state
+                if rule_version in {_PACKAGING_RULE_VERSION, _SMALL_MARKETING_RULE_VERSION}:
+                    validation_state = {**state, "rule_version": rule_version}
+                _validate_frozen_review_inputs(
+                    attempt_root=attempt_root, state=validation_state,
+                    workflow_key=state["workflow_key"],
+                )
                 return True
         except (OSError, ValueError):
             return False

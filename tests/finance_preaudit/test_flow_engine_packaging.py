@@ -950,6 +950,41 @@ def test_packaging_excel_notice_and_controlled_substitute_are_bound(tmp_path: Pa
     )
 
 
+@pytest.mark.parametrize("version", [1, 2])
+def test_submitted_packaging_is_a_confirmed_previous_round(tmp_path: Path, version: int) -> None:
+    from datetime import datetime, timedelta
+    from apps.oa_finance_preaudit import reconciliation
+
+    engine = _engine(tmp_path, calls=[])
+    action = engine.next_action(WORKFLOW_KEY)
+    payload = _decision(action, _passing_items())
+    if version == 1:
+        for name in ("action_file", "state_file"):
+            path = Path(action[name])
+            legacy = json.loads(path.read_text())
+            legacy.pop("rule_version")
+            json_artifact.write_json_atomic(path, legacy)
+        packet_file = Path(action["review_packet_file"])
+        packet = json.loads(packet_file.read_text())
+        packet.pop("packaging_visual_contract")
+        packet["rule_version"] = "packaging_layout_approval:1"
+        json_artifact.write_json_atomic(packet_file, packet)
+        payload.pop("visual_review")
+        payload["rule_version"] = "packaging_layout_approval:1"
+    decision = tmp_path / "decision.json"
+    json_artifact.write_json_atomic(decision, payload)
+    closed = engine.complete_review(Path(action["action_file"]), decision)
+    state = json.loads(Path(closed["state_file"]).read_text())
+    assert "rule_version" not in state
+    assert closed["write_state"] == "submitted"
+    received = datetime.fromisoformat(state["created_at"]) + timedelta(seconds=1)
+    report = reconciliation.reconcile(tmp_path, pending_rows=[{
+        "request_id": state["request_id"], "received_at": received.isoformat(), "workflow_key": WORKFLOW_KEY,
+    }], handled_rows=[], now=received + timedelta(seconds=1))
+    assert report["continuation"]["status"] == "ready"
+    assert report["findings"][0]["category"] == "prior_round_submitted"
+
+
 def test_packaging_excel_character_differences_are_not_marked_as_match(
     tmp_path: Path,
 ) -> None:

@@ -225,6 +225,7 @@ def test_live_global_reconciliation_excludes_unsupported_pending(
             {
                 "request_id": "supported-request",
                 "received_at": "2026-08-25T08:00:00+08:00",
+                "workflow_key": "travel_expense",
             }
         ]
     ]
