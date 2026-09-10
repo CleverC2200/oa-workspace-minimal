@@ -81,3 +81,14 @@ def test_active_error_without_current_lock_is_not_silenced(notifications, monkey
     assert result == 1
     assert payload["error_code"] == "production_rolling_controller_active"
     assert notifications == (["controller_failed"], [])
+
+
+@pytest.mark.parametrize("code_state", [("unknown", "unknown"), ("a" * 40, "unknown")])
+def test_unknown_code_state_cannot_verify_active_controller(code_state, notifications, monkeypatch, capsys):
+    monkeypatch.setattr(controller_handoff, "_code_state", lambda: code_state)
+    with runtime_control.global_controller_lease():
+        controller_handoff.begin({"capacity": 6})
+        result, payload = _call(capsys)
+        assert result == 1
+        assert payload["error_code"] == "production_rolling_controller_active"
+        assert notifications == (["controller_failed"], [])
