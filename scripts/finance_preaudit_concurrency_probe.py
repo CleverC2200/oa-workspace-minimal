@@ -4772,6 +4772,26 @@ def _run_rolling_drain_locked(
     }
 
 
+def _verified_active_controller() -> dict | None:
+    try:
+        if runtime_control.stop_requested():
+            return None
+        handoff = controller_handoff.status()
+    except Exception:
+        # An unreadable status must retain the original failure and alert.
+        return None
+    if (
+        handoff.get("status") == "active"
+        and handoff.get("controller_active") is True
+        and handoff.get("manifest_state") == "running"
+        and handoff.get("lock_owner_consistent") is True
+        and handoff.get("restart_verified") is True
+        and handoff.get("code_matches_current") is True
+    ):
+        return handoff
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="finance-preaudit-concurrency-probe")
     parser.add_argument("--capacity", type=int, required=True)
@@ -4873,6 +4893,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         session_code = (
             "" if args.read_only else _session_error_code(error)
         )
+        if (
+            controller_started
+            and not session_code
+            and str(error) == "production_rolling_controller_active"
+        ):
+            handoff = _verified_active_controller()
+            if handoff is not None:
+                print(json.dumps({
+                    "schema_version": 1,
+                    "kind": "preaudit_production_rolling_drain",
+                    "status": "skipped",
+                    "reason": "production_rolling_controller_active",
+                    "controller_handoff": handoff,
+                }, ensure_ascii=False, sort_keys=True))
+                return 0
         error_code = session_code or str(error)
         if not error_code.replace("_", "").isalnum() or not error_code.isascii():
             error_code = "controller_failed" if controller_started else "production_probe_failed"
