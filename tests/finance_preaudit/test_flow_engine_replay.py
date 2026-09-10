@@ -203,6 +203,7 @@ def test_reconciliation_routes_review_quarantine_to_explicit_recovery(
 @pytest.mark.parametrize("conflict", [
     "handled", "invisible", "received_at", "unknown", "writer_boundary",
     "missing_action", "failure_receipt", "frozen_material",
+    "workflow", "missing_workflow", "duplicate_pending", "identity_alias",
 ])
 def test_reconciliation_does_not_offer_unsafe_review_recovery(tmp_path: Path, conflict: str) -> None:
     from apps.oa_finance_preaudit import reconciliation
@@ -218,6 +219,14 @@ def test_reconciliation_does_not_offer_unsafe_review_recovery(tmp_path: Path, co
         pending = []
     elif conflict == "received_at":
         pending[0]["received_at"] = "2026-08-22T10:00:00+08:00"
+    elif conflict == "workflow":
+        pending[0]["workflow_key"] = "general_expense"
+    elif conflict == "missing_workflow":
+        pending[0].pop("workflow_key")
+    elif conflict == "duplicate_pending":
+        pending.append(dict(pending[0]))
+    elif conflict == "identity_alias":
+        pending[0]["requestId"] = "conflicting-request"
     elif conflict == "unknown":
         _mark_unknown(failed)
     elif conflict == "missing_action":

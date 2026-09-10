@@ -296,8 +296,8 @@ def reconcile(
         exact_pending = (request_id, received_at) in pending
         request_pending = request_id in pending_ids
         handled = request_id in handled_ids
+        current_rows = [row for row in pending_input if _identity(row)[0] == request_id]
         if request_pending and not exact_pending:
-            current_rows = [row for row in pending_input if _identity(row)[0] == request_id]
             category = (
                 "prior_round_submitted"
                 if not handled and _confirmed_prior_round(root, state, current_rows, current_time)
@@ -318,6 +318,12 @@ def reconcile(
             category == "pending_not_handled"
             and state.get("execution_state") == "needs_admin"
             and state.get("write_state") == "not_requested"
+            and len(current_rows) == 1
+            and current_rows[0].get("workflow_key") == state["workflow_key"]
+            and not (
+                current_rows[0].get("request_id") and current_rows[0].get("requestId")
+                and current_rows[0]["request_id"] != current_rows[0]["requestId"]
+            )
             and FlowEngine.recoverable_no_write(root, attempt_root / "action.json")
         ):
             recommendation = "confirmed_no_write_recovery_candidate"
