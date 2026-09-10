@@ -257,6 +257,8 @@ def reconcile(
     workflow_key: str | None = None,
     now: datetime | None = None,
 ) -> dict:
+    from .flow_engine import FlowEngine
+
     if workflow_key is not None and workflow_key not in _WORKFLOW_KEYS:
         raise ValueError("runtime_reconciliation_invalid")
     pending_input = [row for row in pending_rows if isinstance(row, dict)]
@@ -286,6 +288,7 @@ def reconcile(
         if workflow_key is None or state.get("workflow_key") == workflow_key
     ]
     for state in states:
+        attempt_root = Path(root) / str(state["workflow_key"]) / "cases" / str(state["case_key"]) / f"attempt-{state['attempt']}"
         request_id = str(state.get("request_id") or "").strip()
         received_at = str(state.get("received_at") or "").strip()
         if not request_id or not received_at:
@@ -293,8 +296,8 @@ def reconcile(
         exact_pending = (request_id, received_at) in pending
         request_pending = request_id in pending_ids
         handled = request_id in handled_ids
+        current_rows = [row for row in pending_input if _identity(row)[0] == request_id]
         if request_pending and not exact_pending:
-            current_rows = [row for row in pending_input if _identity(row)[0] == request_id]
             category = (
                 "prior_round_submitted"
                 if not handled and _confirmed_prior_round(root, state, current_rows, current_time)
@@ -314,11 +317,14 @@ def reconcile(
         elif (
             category == "pending_not_handled"
             and state.get("execution_state") == "needs_admin"
-            and state.get("reason") in {
-                "material_collection_failed",
-                *writer_outcomes.CONFIRMED_NO_WRITE_CODES,
-            }
             and state.get("write_state") == "not_requested"
+            and len(current_rows) == 1
+            and current_rows[0].get("workflow_key") == state["workflow_key"]
+            and not (
+                current_rows[0].get("request_id") and current_rows[0].get("requestId")
+                and current_rows[0]["request_id"] != current_rows[0]["requestId"]
+            )
+            and FlowEngine.recoverable_no_write(root, attempt_root / "action.json")
         ):
             recommendation = "confirmed_no_write_recovery_candidate"
         elif (
@@ -334,8 +340,6 @@ def reconcile(
         elif exact_pending and state.get("write_state") in {
             "unknown", "submitting", "authorized", "submitted"
         }:
-            from .flow_engine import FlowEngine
-
             if not (state.get("write_state") == "authorized"
                     and FlowEngine.resumable_review(root, state)):
                 blocking_reasons["pending_write_state_unresolved"] += 1
@@ -359,7 +363,6 @@ def reconcile(
                 blocking_reasons["pending_failure_not_isolated"] += 1
 
         if state.get("execution_state") == "needs_admin":
-            attempt_root = Path(root) / str(state["workflow_key"]) / "cases" / str(state["case_key"]) / f"attempt-{state['attempt']}"
             receipt = item_failure.verified_receipt(attempt_root, state)
             manual_items.append({
                 "item_key": state["case_key"], "workflow_key": state["workflow_key"],
@@ -368,7 +371,7 @@ def reconcile(
                 "write_state": state["write_state"], "automatic_retry": False,
                 "scope": receipt["scope"] if receipt else "unverified",
                 "receipt_status": "verified" if receipt else "missing_or_invalid",
-                "recommendation": "manual_write_state_verification" if state["write_state"] == "unknown" else "manual_state_review",
+                "recommendation": recommendation,
             })
 
         counts[category] += 1

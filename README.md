@@ -151,7 +151,11 @@ python3 -m scripts.finance_preaudit_concurrency_probe \
 
 只读对账的 `continuation` 将继续条件与 `failure_attention` 分开：有可信失败回执、无写入边界且未请求写入的 `codex_review_failed` 仅列为 `scope=item`，继续精确排除该单据版本；人工关注状态仍保留。`status=ready` 且 `isolated_pending == quarantine.pending_quarantined` 才可通过隔离门。当前未知或未闭合写入、身份/待办已办冲突以及未经验证的其他失败返回 `scope=controller` 和脱敏 `blocking_reasons`。普通周期停止恢复使用这一门禁，仍核验身份、锁和进程回收；不会重试隔离项或清除未知写入证据。统一失败回执也支持经过允许列表验证的材料失败、无效审核决定和经签名边界确认的提交拒绝。已打开且冻结证据完整、尚未进入 Writer 的审核动作可继续由 FlowEngine 重新核验授权；明确指定的未写入恢复项只在首轮门禁按精确身份匹配，其他阻塞项仍停止整轮。调度必须采用相同字段；仅发布代码不会改写工作树外的自动化提示词。
 
-差旅历史 `material_collection_failed` 等已确认未写入的隔离项，只能把精确旧
+### 滚动恢复隔离项
+
+开发隔离排障按[隔离排障与恢复](docs/agents/quarantine-repair.md)继续诊断、回测和显式恢复，不能以生产已隔离或普通队列为空作为修复完成。只读对账的 `findings` 与 `manual_review.items` 对通过现有未写入证据校验、精确仍在待办且未命中已办的项统一给出 `confirmed_no_write_recovery_candidate`，覆盖审核进程失败和无效审核决定；缺少有效证据时保留核对建议。候选不是写入授权，查询和普通调度均不会自动恢复。
+
+五类财务历史 `material_collection_failed`、`codex_review_failed` 等已确认未写入的隔离项，只能把精确旧
 `action.json` 交给同一个滚动控制器恢复；参数可重复。恢复仍在容量为 1、300 秒
 硬超时且可回收的 prepare 进程中完成，只创建新 attempt，后续审核和提交继续经过
 同一 FIFO 与唯一 Writer：

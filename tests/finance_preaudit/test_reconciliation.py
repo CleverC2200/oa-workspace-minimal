@@ -134,7 +134,7 @@ def test_reconciliation_classifies_live_state_without_exposing_request_ids(
         "pending_not_handled": 2,
     }
     assert result["recommendations"] == {
-        "confirmed_no_write_recovery_candidate": 1,
+        "manual_state_review": 1,
         "manual_write_state_verification": 1,
         "none": 1,
     }
@@ -252,7 +252,7 @@ def test_reconciliation_highlights_only_failures_still_live_pending(
     "reason",
     ("writer_preflight_failed", "submission_target_changed"),
 )
-def test_reconciliation_marks_preflight_no_write_as_recoverable(
+def test_reconciliation_does_not_treat_preflight_label_as_no_write_evidence(
     tmp_path: Path,
     reason: str,
 ) -> None:
@@ -268,7 +268,7 @@ def test_reconciliation_marks_preflight_no_write_as_recoverable(
     )
 
     assert result["recommendations"] == {
-        "confirmed_no_write_recovery_candidate": 1
+        "manual_state_review": 1
     }
 
 
