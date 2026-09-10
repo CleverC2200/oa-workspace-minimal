@@ -2177,6 +2177,71 @@ class FlowEngine:
         return self._persist_current_action(workflow_root, action)
 
     @classmethod
+    def confirmed_submission(cls, root: Path, state: dict) -> bool:
+        """Read and verify a closed submission; never recover or persist an attempt."""
+        def unavailable(*_args, **_kwargs):
+            raise ValueError("read_only_port_unavailable")
+
+        reader = cls(root=root, discover_candidates=unavailable, collect_material=unavailable)
+        action_path = Path(str(state.get("action_file") or ""))
+        attempt_root = action_path.parent
+        try:
+            if (
+                Path(root).is_symlink()
+                or state.get("action") != "closed"
+                or state.get("execution_state") != "closed"
+                or state.get("write_state") != "submitted"
+                or state.get("mode") != "controlled_write"
+                or state.get("write_authorized") is not True
+                or not reader._attempt_identity_matches(attempt_root, state, require_material=True)
+            ):
+                return False
+            for name in (
+                "action.json", "state.json", "execution-receipt.json", "review-decision.json",
+                "remark.txt", "submission-envelope.json", "material.json", "review-packet.json", "complete.lock",
+            ):
+                path = attempt_root / name
+                if not _managed_existing_path(path, reader._root) or not path.is_file():
+                    return False
+            descriptor = os.open(attempt_root / "complete.lock", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(descriptor, "rb") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                persisted = review_failure_evidence.read_receipt(attempt_root / "state.json")
+                action = review_failure_evidence.read_receipt(action_path)
+                if persisted != state or not action or any(state.get(k) != v for k, v in action.items()):
+                    return False
+                if not {
+                    "schema_version", "kind", "action", "execution_state", "business_state", "write_state",
+                    "workflow_key", "case_key", "attempt", "mode", "write_authorized", "authorization_fingerprint",
+                    "action_file", "state_file", "review_packet_file", "decision_file", "remark_file",
+                    "envelope_file", "receipt_file", "events_file", "observability_state", "no_write_evidence",
+                }.issubset(action):
+                    return False
+                if action.get("action") != "closed" or action.get("write_state") != "submitted":
+                    return False
+                reader._completion_receipt(attempt_root, state)
+                # Closed states omit rule_version; the receipt binds the saved decision.
+                decision = _read_object(attempt_root / "review-decision.json", code="execution_receipt_invalid")
+                packet = _read_object(attempt_root / "review-packet.json", code="frozen_packet_changed")
+                rule_version = decision.get("rule_version")
+                if (
+                    not isinstance(rule_version, str)
+                    or packet.get("rule_version") != rule_version
+                    or state.get("rule_version") not in (None, rule_version)
+                ):
+                    return False
+                validation_state = state
+                if rule_version in {_PACKAGING_RULE_VERSION, _SMALL_MARKETING_RULE_VERSION}:
+                    validation_state = {**state, "rule_version": rule_version}
+                _validate_frozen_review_inputs(
+                    attempt_root=attempt_root, state=validation_state,
+                    workflow_key=state["workflow_key"],
+                )
+                return True
+        except (OSError, ValueError):
+            return False
+
+    @classmethod
     def resumable_review(cls, root: Path, state: dict) -> bool:
         """Validate frozen pre-submit state locally; do not renew or authorize writes."""
         def unavailable(*_args, **_kwargs):

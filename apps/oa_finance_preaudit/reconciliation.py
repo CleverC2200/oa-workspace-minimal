@@ -227,6 +227,28 @@ def quarantine_summary(
     return _quarantine_summary(root, latest_states(root), pending_rows)
 
 
+def _confirmed_prior_round(root: Path, state: dict, rows: list[dict], now: datetime) -> bool:
+    from .flow_engine import FlowEngine
+
+    if len(rows) != 1 or rows[0].get("workflow_key") != state.get("workflow_key"):
+        return False
+    row = rows[0]
+    if row.get("request_id") and row.get("requestId") and row["request_id"] != row["requestId"]:
+        return False
+    old_time, new_time = str(state.get("received_at") or ""), _identity(row)[1]
+    timestamp = r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?"
+    if re.fullmatch(timestamp, old_time) is None or re.fullmatch(timestamp, new_time) is None:
+        return False
+    try:
+        previous, current = _received_at_utc(old_time), _received_at_utc(new_time)
+        created = datetime.fromisoformat(str(state["created_at"]).replace("Z", "+00:00"))
+        if not previous < current <= now or not created < current:
+            return False
+    except (ValueError, TypeError):
+        return False
+    return FlowEngine.confirmed_submission(root, state)
+
+
 def reconcile(
     root: Path,
     *,
@@ -272,7 +294,12 @@ def reconcile(
         request_pending = request_id in pending_ids
         handled = request_id in handled_ids
         if request_pending and not exact_pending:
-            category = "identity_conflict"
+            current_rows = [row for row in pending_input if _identity(row)[0] == request_id]
+            category = (
+                "prior_round_submitted"
+                if not handled and _confirmed_prior_round(root, state, current_rows, current_time)
+                else "identity_conflict"
+            )
         elif exact_pending and handled:
             category = "pending_handled_conflict"
         elif handled:
@@ -296,7 +323,7 @@ def reconcile(
             recommendation = "confirmed_no_write_recovery_candidate"
         elif (
             state.get("write_state") == "submitted"
-            and category == "handled_not_pending"
+            and category in {"handled_not_pending", "prior_round_submitted"}
         ):
             recommendation = "none"
         else:
@@ -372,6 +399,8 @@ def reconcile(
                 "local_write_state": state.get("write_state"),
                 "category": category,
                 "recommendation": recommendation,
+                **({"current_item_key": _item_key(*_identity(current_rows[0]))}
+                   if category == "prior_round_submitted" else {}),
             }
         )
 

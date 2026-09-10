@@ -120,6 +120,43 @@ def _engine(
     )
 
 
+@pytest.mark.parametrize("version", [1, 2])
+def test_submitted_marketing_is_a_confirmed_previous_round(tmp_path: Path, version: int) -> None:
+    from datetime import timedelta
+
+    engine = _engine(tmp_path, calls=[])
+    action = engine.next_action(WORKFLOW_KEY)
+    reviewed = _reviewed_items(["pass"] * len(ITEM_KEYS))
+    if version == 1:
+        for name in ("action_file", "state_file"):
+            path = Path(action[name])
+            legacy = json.loads(path.read_text())
+            legacy.pop("rule_version")
+            json_artifact.write_json_atomic(path, legacy)
+        packet_file = Path(action["review_packet_file"])
+        packet = json.loads(packet_file.read_text())
+        packet["rule_version"] = "small_marketing_fee:1"
+        packet["items"] = packet["items"][:-1]
+        packet["required_uncertain_items"] = [
+            key for key in packet["required_uncertain_items"] if key != "payment_company_consistency"
+        ]
+        json_artifact.write_json_atomic(packet_file, packet)
+        action = json.loads(Path(action["action_file"]).read_text())
+        reviewed = reviewed[:-1]
+    decision = tmp_path / "decision.json"
+    json_artifact.write_json_atomic(decision, _decision(action, reviewed))
+    closed = engine.complete_review(Path(action["action_file"]), decision)
+    state = json.loads(Path(closed["state_file"]).read_text())
+    assert "rule_version" not in state
+    assert closed["write_state"] == "submitted"
+    received = datetime.fromisoformat(state["created_at"]) + timedelta(seconds=1)
+    report = reconciliation.reconcile(tmp_path, pending_rows=[{
+        "request_id": state["request_id"], "received_at": received.isoformat(), "workflow_key": WORKFLOW_KEY,
+    }], handled_rows=[], now=received + timedelta(seconds=1))
+    assert report["continuation"]["status"] == "ready"
+    assert report["findings"][0]["category"] == "prior_round_submitted"
+
+
 def _reviewed_items(statuses: list[str]) -> list[dict]:
     reviewed = []
     for item_key, fact_key, status in zip(
