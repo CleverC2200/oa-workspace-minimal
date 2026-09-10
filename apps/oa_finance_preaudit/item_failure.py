@@ -77,6 +77,17 @@ def _scope(root: Path, state: dict, *, confirmed_rejection: bool) -> str:
     return "controller"
 
 
+def material_failure_without_write(root: Path, state: dict) -> bool:
+    """Validate an unwritten material failure, including legacy attempts without receipts."""
+    return (
+        state.get("reason") == "material_collection_failed"
+        and state.get("write_state") == "not_requested"
+        and evidence.read_receipt(root / "state.json") == state
+        and _bound_state(root, state)
+        and not any(os.path.lexists(root / name) for name in _ARTIFACTS[3:])
+    )
+
+
 def _payload(root: Path, state: dict, *, scope: str) -> dict:
     code = state.get("reason")
     return {

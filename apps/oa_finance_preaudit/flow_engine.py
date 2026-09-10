@@ -2101,6 +2101,7 @@ class FlowEngine:
         workflow_root: Path,
         *,
         case_key: str | None = None,
+        handled_material_request_ids: frozenset[str] = frozenset(),
     ) -> dict | None:
         active: list[tuple[Path, dict]] = []
         for attempt_root in self._latest_case_attempts(workflow_root):
@@ -2123,6 +2124,11 @@ class FlowEngine:
                 raise ValueError("completion_in_progress")
             if state.get("write_state") in {"submitting", "unknown"}:
                 return self._recover_completion(attempt_root, state)
+            if (
+                str(state.get("request_id") or "") in handled_material_request_ids
+                and item_failure.material_failure_without_write(attempt_root, state)
+            ):
+                continue
             if state.get("execution_state") in {"review_required", "needs_admin"}:
                 active.append((attempt_root, state))
             elif state.get("execution_state") != "closed":
@@ -2791,6 +2797,28 @@ class FlowEngine:
             )
         candidates.sort(key=lambda item: (item["received_at"], item["request_id"]))
 
+        handled_material_request_ids: frozenset[str] = frozenset()
+        if (
+            workflow_key == "packaging_layout_approval"
+            and not candidates
+            and self._discover_handled is not None
+        ):
+            try:
+                handled_rows = list(self._discover_handled())
+                request_ids = [
+                    str(row.get("request_id") or row.get("requestId") or "")
+                    for row in handled_rows
+                ]
+                if all(_SAFE_REQUEST_ID.fullmatch(value) for value in request_ids) and not any(
+                    row.get("request_id") and row.get("requestId")
+                    and str(row["request_id"]) != str(row["requestId"])
+                    for row in handled_rows
+                ):
+                    handled_material_request_ids = frozenset(request_ids)
+            except Exception:
+                # Unavailable or malformed handled evidence cannot dismiss a failure.
+                pass
+
         prepare_root: Path | None = None
         with _exclusive_lock(workflow_root / "flow.lock"):
             skipped_unknown_failures = self._validate_skipped_unknown_failures(
@@ -2929,6 +2957,13 @@ class FlowEngine:
                                 latest / "action.json",
                                 "persistent_state_invalid",
                             )
+                        if (
+                            str(state.get("request_id") or "") in handled_material_request_ids
+                            and item_failure.material_failure_without_write(latest, state)
+                        ):
+                            if _exclusive_lock_active(latest / "complete.lock"):
+                                raise ValueError("completion_in_progress")
+                            continue
                         if state.get("execution_state") in {
                             "collecting",
                             "review_required",
@@ -2978,7 +3013,10 @@ class FlowEngine:
                         )
                     return self._persist_current_action(workflow_root, closed)
                 elif not candidates:
-                    active_action = self._resume_active_action(workflow_root)
+                    active_action = self._resume_active_action(
+                        workflow_root,
+                        handled_material_request_ids=handled_material_request_ids,
+                    )
                     if active_action is not None and Path(
                         str(active_action.get("action_file") or "")
                     ) not in (

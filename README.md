@@ -190,6 +190,10 @@ python3 -m apps.oa_finance_preaudit.session_alert \
   --confirm-send YES
 ```
 
+材料失败动作必须保留 `failure_detail_code`。细码为六类会话错误时，已授权告警调用增加 `--failure-detail-code <会话细码>`，例如 `--error-code material_collection_failed --failure-detail-code oa_session_expired --confirm-send YES`；入口复核当前会话，正常时不发送旧会话故障提醒。其他材料故障继续使用通用码，不能用会话细码覆盖 Writer 故障。旧调用不自动获得细码，生产调用方需按更新后的[错误处理合同](.agents/skills/oa-finance-preaudit/references/error-handling.md)传递，发布不会更改定时配置。
+
+包装实时待办为空时，入口只对已办命中、身份一致且无写入痕迹的历史材料失败停止重复返回；旧记录保持不变。不可见或已办读取失败、未知写入及未完成审核继续保留原保护，具体见[FlowEngine 合同](.agents/skills/oa-finance-preaudit/references/flow-engine-contract.md)。
+
 人工重新登录且下一次 `--check-live` 成功后，外部定时任务使用 `--clear` 仅清除会话类告警窗口；仍生效的生产故障窗口保留，待无错误完成轮次再清除：
 
 ```bash

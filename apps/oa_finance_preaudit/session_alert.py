@@ -61,6 +61,17 @@ def _timestamp(value: datetime | None = None) -> str:
     return current.astimezone().isoformat(timespec="seconds")
 
 
+def _alert_error_code(error_code: str, failure_detail_code: str | None = None) -> str:
+    code = str(error_code or "").strip()
+    if failure_detail_code is not None:
+        if code != "material_collection_failed" or failure_detail_code not in SESSION_ERROR_CODES:
+            raise ValueError("session_alert_error_code_invalid")
+        code = failure_detail_code
+    if code not in ALERT_ERROR_CODES:
+        raise ValueError("session_alert_error_code_invalid")
+    return code
+
+
 def build_message(error_code: str, *, occurred_at: datetime | None = None) -> str:
     code = str(error_code or "").strip()
     if code not in ALERT_ERROR_CODES:
@@ -315,12 +326,11 @@ def clear_alert(
 def alert_from_environment(
     error_code: str,
     *,
+    failure_detail_code: str | None = None,
     control_root: Path = Path("runtime/control"),
     live_status_provider: Callable[[], dict] | None = None,
 ) -> dict[str, str | int]:
-    code = str(error_code or "").strip()
-    if code not in ALERT_ERROR_CODES:
-        raise ValueError("session_alert_error_code_invalid")
+    code = _alert_error_code(error_code, failure_detail_code)
     if code in SESSION_ERROR_CODES:
         try:
             (live_status_provider or _live_status)()
@@ -407,6 +417,7 @@ def build_parser() -> argparse.ArgumentParser:
     action.add_argument("--clear", action="store_true")
     action.add_argument("--clear-production", action="store_true")
     action.add_argument("--status", action="store_true")
+    parser.add_argument("--failure-detail-code", choices=sorted(SESSION_ERROR_CODES))
     parser.add_argument("--confirm-recovered", default="")
     parser.add_argument("--control-root", type=Path, default=Path("runtime/control"))
     parser.add_argument("--dry-run", action="store_true")
@@ -432,6 +443,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps({"error_code": "feishu_alert_confirmation_missing"}))
         return 1
     try:
+        error_code = _alert_error_code(args.error_code, args.failure_detail_code)
         if args.dry_run:
             auth.load_local_env()
             chat_id = str(
@@ -442,15 +454,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             ).strip()
             send_message(
                 chat_id,
-                build_message(args.error_code),
+                build_message(error_code),
                 "oa-alert-dry-run",
                 profile=profile,
                 dry_run=True,
             )
-            receipt = _public_receipt(args.error_code, "not_sent")
+            receipt = _public_receipt(error_code, "not_sent")
         else:
             receipt = alert_from_environment(
-                args.error_code,
+                error_code,
                 control_root=args.control_root,
             )
     except (RuntimeError, ValueError):

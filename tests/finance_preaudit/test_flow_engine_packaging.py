@@ -359,6 +359,18 @@ def test_packaging_without_packaging_image_stops_current_case(tmp_path: Path) ->
     assert action["reason"] == "material_collection_failed"
 
 
+def test_empty_packaging_snapshot_does_not_discard_open_review(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    action = engine.next_action(WORKFLOW_KEY)
+    engine._discover_candidates = lambda _key: []
+    engine._discover_handled = lambda: [{"requestId": "packaging-request"}]
+
+    resumed = engine.next_action(WORKFLOW_KEY)
+
+    assert resumed["action"] == "review_required"
+    assert resumed["action_file"] == action["action_file"]
+
+
 @pytest.mark.parametrize("failure", ["invalid_image", "page_count_mismatch"])
 def test_packaging_rejects_invalid_or_incomplete_pages(
     tmp_path: Path,

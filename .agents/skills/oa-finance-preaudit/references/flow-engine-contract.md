@@ -17,6 +17,10 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
 - `action=review_required`：只读取 `review_packet_file` 及审核包引用的 `material_file`，按审核包顺序完成当前流程的固定审核项。当前登录、会话、执行身份和流程授权可信时，五类财务流程的材料关系、规则口径或业务证据不足仍返回该动作；审核包标为 `material_state=degraded`，且 `required_uncertain_items` 列出必须交财务判断的项目。
 - `action=needs_admin`：当前登录/会话、执行身份、流程授权、单据身份、冻结 attempt、动作/状态、审核包完整性、写入授权或目标不再可信；这是退出码为 0 的正常动作结果。停止当前执行并报告 `reason`，不得生成财务意见、自行修复或重取。
 
+包装待办成功读取且为空时，入口另以只读已办结果核对历史材料失败。只有已办命中同一请求、action/state 身份及失败字段一致、`write_state=not_requested`，且无活动完成锁、Writer 边界、执行回执、审核决定、意见或提交信封时，才不再返回该旧失败。旧 attempt 和隔离证据保持不变，不创建新 attempt、不重新采集；没有其他动作时返回无工作 `closed`。已办不可读、未命中、身份冲突、未知写入和其他失败仍保留原阻断，已打开审核动作继续按原合同处理。其他五类财务流程不使用这一包装空队列规则。
+
+失败动作的 `reason` 与 `failure_detail_code` 必须一并保留，输出筛选不得丢弃细码。已授权告警遇到 `material_collection_failed` 且细码属于六类会话错误时，按[错误处理合同](error-handling.md)传递细码，由告警入口复核当前会话；不得把历史细码直接描述为当前登录故障。
+
 默认命令返回的 preview 动作固化 `mode=preview`、`write_authorized=false` 和 `write_state=not_requested`。审核决定不包含运行模式或授权，不能在第二步切换写入。
 
 手工 Skill 任务固定使用默认 preview，不得把已有 preview attempt 提升为写入。滚动生产控制器在五类财务流程中按 `received_at + requestId` 选取全局 FIFO；准备容量恒为 1，审核可并发，Writer 严格等待认领序号并保持全局单写。包装不进入该滚动池，继续走单据级图片文字校对路径。该入口校验当前显式确认、本地流程授权清单、停止状态、OA 身份和只读对账后才准备单据；健康窗口只调节并发，不改变提交次序。准备动作生成绑定当前单据和冻结证据的一小时 capability，完成动作再次验签并复核实时待办；任一边界验证失败均不写 OA。手工 `next-action --mode controlled-write` 和受控差旅 `complete-review` 明确拒绝，不能绕过控制器。唯一例外是人工已在 OA 核实未写入的 `writer_result_unknown`：独立确认必须绑定精确 requestId，action/state 均为 `needs_admin + write_state=unknown`，且控制器和所有 Writer 均不活动；入口重新核验实时待办、已办、最新 attempt、身份和执行回执后，仅创建新的受控冻结 attempt，不直接提交 OA，后续仍由滚动控制器和唯一 Writer 处理。
