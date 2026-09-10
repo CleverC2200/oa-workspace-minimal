@@ -174,6 +174,72 @@ def _quarantined_review(
 
 
 @pytest.mark.parametrize("failure_code", ["codex_decision_invalid", "codex_process_failed"])
+def test_reconciliation_routes_review_quarantine_to_explicit_recovery(
+    tmp_path: Path, failure_code: str,
+) -> None:
+    from apps.oa_finance_preaudit import reconciliation
+
+    calls = []
+    engine = _engine(
+        tmp_path, authorization_source=_grant,
+        submit_frozen=lambda job: calls.append(job) or _success(job),
+    )
+    failed = _quarantined_review(engine, failure_code)
+    original = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+
+    report = reconciliation.reconcile(
+        tmp_path, pending_rows=_candidates(), handled_rows=[],
+    )
+
+    assert report["findings"][0]["recommendation"] == "confirmed_no_write_recovery_candidate"
+    assert report["manual_review"]["items"][0]["recommendation"] == "confirmed_no_write_recovery_candidate"
+    assert report["manual_review"]["items"][0]["automatic_retry"] is False
+    assert report["continuation"]["isolated_pending"] == 1
+    assert {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == original
+    assert not Path(failed["action_file"]).parent.with_name("attempt-2").exists()
+    assert calls == []
+
+
+@pytest.mark.parametrize("conflict", [
+    "handled", "invisible", "received_at", "unknown", "writer_boundary",
+    "missing_action", "failure_receipt", "frozen_material",
+])
+def test_reconciliation_does_not_offer_unsafe_review_recovery(tmp_path: Path, conflict: str) -> None:
+    from apps.oa_finance_preaudit import reconciliation
+
+    engine = _engine(tmp_path, authorization_source=_grant, submit_frozen=_success)
+    failed = _quarantined_review(engine, "codex_process_failed")
+    path = Path(failed["action_file"])
+    pending = _candidates()
+    handled = []
+    if conflict == "handled":
+        handled = [{"request_id": pending[0]["request_id"]}]
+    elif conflict == "invisible":
+        pending = []
+    elif conflict == "received_at":
+        pending[0]["received_at"] = "2026-08-22T10:00:00+08:00"
+    elif conflict == "unknown":
+        _mark_unknown(failed)
+    elif conflict == "missing_action":
+        path.unlink()
+    else:
+        artifact = {
+            "writer_boundary": "writer-boundary.json",
+            "failure_receipt": "review-failure.json",
+            "frozen_material": "material.json",
+        }[conflict]
+        json_artifact.write_json_atomic(path.with_name(artifact), {})
+
+    report = reconciliation.reconcile(tmp_path, pending_rows=pending, handled_rows=handled)
+
+    expected = "manual_write_state_verification" if conflict == "unknown" else "manual_state_review"
+    assert report["findings"][0]["recommendation"] == expected
+    assert report["manual_review"]["items"][0]["recommendation"] == expected
+    assert report["manual_review"]["items"][0]["automatic_retry"] is False
+    assert not path.parent.with_name("attempt-2").exists()
+
+
+@pytest.mark.parametrize("failure_code", ["codex_decision_invalid", "codex_process_failed"])
 @pytest.mark.parametrize("workflow_key", ["travel_expense", "small_marketing_fee"])
 def test_confirmed_review_failure_recovers_without_writing(
     tmp_path: Path, failure_code: str, workflow_key: str,
