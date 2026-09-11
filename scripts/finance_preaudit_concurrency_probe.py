@@ -4156,7 +4156,9 @@ def run_rolling_drain(
                     raise ControllerChildrenActiveError(
                         result.get("primary_error_code")
                     )
-            except Exception:
+            except BaseException:
+                if not children_reaped:
+                    runtime_control.request_cycle_stop()
                 controller_handoff.finish(
                     manifest,
                     status="failed",
