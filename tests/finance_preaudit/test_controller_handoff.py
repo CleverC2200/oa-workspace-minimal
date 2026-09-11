@@ -486,3 +486,104 @@ def test_manifest_write_rejects_a_symlink_inserted_after_parent_pin(
 
     assert inserted is True
     assert sentinel.read_text(encoding="utf-8") == '{"sentinel":true}'
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+def test_interrupted_pipeline_closes_manifest_without_claiming_reaped(monkeypatch, interrupt):
+    def interrupted(count, capacity):
+        raise interrupt()
+
+    with pytest.raises(interrupt):
+        finance_preaudit_concurrency_probe.run_rolling_drain(
+            capacity=1,
+            live_status=lambda: _live_status(1),
+            reconcile_status=lambda: _reconciliation(1),
+            pipeline_runner=interrupted,
+        )
+    state = controller_handoff.status()
+    assert state["manifest_state"] == "failed"
+    assert state["children_reaped"] is False
+    assert state["ready_for_start"] is False
+    assert runtime_control.controller_active() is False
+    assert runtime_control.stop_reason() == "controller_cycle_stop"
+
+
+def _orphan(monkeypatch):
+    path = controller_handoff.manifest_file()
+    _write_failed_unreaped_manifest(path)
+    value = json.loads(path.read_text())
+    value.update(state="running", completed_at=None, health="unknown")
+    json_artifact.write_json_atomic(path, value)
+    monkeypatch.setattr(controller_handoff, "_code_state", lambda: ("0" * 40, False))
+    monkeypatch.setattr(controller_handoff, "_process_alive", lambda pid: False)
+    return value
+
+
+def test_orphan_recovery_preserves_original_and_requires_locked_live_gates(monkeypatch):
+    original = _orphan(monkeypatch)
+    def check():
+        assert runtime_control.controller_active()
+        assert runtime_control.active_request_writers() == 1
+        return {"live_check": _live_status(), "reconciliation": _clear_reconciliation()}
+    result = controller_handoff.recover_orphaned_run(
+        confirmed_children_reaped=True, check_live=check,
+    )
+    assert result["status"] == "recovered"
+    assert json.loads(Path(result["evidence_file"]).read_text()) == original
+    manifest = json.loads(controller_handoff.manifest_file().read_text())
+    assert manifest["state"] == "failed"
+    assert manifest["children_reaped"] is True
+    assert manifest["health"] == "degraded"
+
+
+@pytest.mark.parametrize("gate", ["confirmation", "pid", "identity", "reconciliation", "dirty"])
+def test_orphan_recovery_keeps_manifest_when_gate_fails(monkeypatch, gate):
+    original = _orphan(monkeypatch)
+    if gate == "pid": monkeypatch.setattr(controller_handoff, "_process_alive", lambda pid: True)
+    if gate == "dirty": monkeypatch.setattr(controller_handoff, "_code_state", lambda: ("0" * 40, True))
+    live = _live_status()
+    reconciled = _clear_reconciliation()
+    if gate == "identity": live["oa"]["execution_identity"] = "unknown"
+    if gate == "reconciliation": reconciled["continuation"]["status"] = "blocked"
+    with pytest.raises(ValueError, match="controller_handoff_recovery_blocked"):
+        controller_handoff.recover_orphaned_run(
+            confirmed_children_reaped=gate != "confirmation",
+            check_live=lambda: {"live_check": live, "reconciliation": reconciled},
+        )
+    assert json.loads(controller_handoff.manifest_file().read_text()) == original
+
+
+def test_orphan_recovery_rechecks_stop_after_live_read(monkeypatch):
+    original = _orphan(monkeypatch)
+    def check():
+        runtime_control.request_cycle_stop()
+        return {"live_check": _live_status(), "reconciliation": _clear_reconciliation()}
+    with pytest.raises(ValueError, match="controller_handoff_recovery_blocked"):
+        controller_handoff.recover_orphaned_run(confirmed_children_reaped=True, check_live=check)
+    assert json.loads(controller_handoff.manifest_file().read_text()) == original
+
+
+@pytest.mark.parametrize("owner", ["controller", "global", "request"])
+def test_orphan_recovery_rejects_active_leases(monkeypatch, owner):
+    original = _orphan(monkeypatch)
+    lease = (runtime_control.global_controller_lease() if owner == "controller" else
+             runtime_control.request_writer_lease(
+                 runtime_control.GLOBAL_WRITER_KEY if owner == "global" else "example-request",
+                 runtime_control.writer_lock_file(), blocking=False))
+    with lease, pytest.raises(ValueError, match="controller_handoff_recovery_blocked"):
+        controller_handoff.recover_orphaned_run(
+            confirmed_children_reaped=True,
+            check_live=lambda: {"live_check": _live_status(), "reconciliation": _clear_reconciliation()},
+        )
+    assert json.loads(controller_handoff.manifest_file().read_text()) == original
+
+
+def test_recovery_cli_uses_live_sources_and_does_not_start_controller(monkeypatch, capsys):
+    from apps.oa_finance_preaudit import controller_recovery
+    _orphan(monkeypatch)
+    monkeypatch.setattr(controller_recovery.runtime_doctor, "status", _live_status)
+    monkeypatch.setattr(cli, "_live_reconciliation", lambda root: _clear_reconciliation())
+    assert controller_recovery.main(["--confirm-children-reaped", "YES"]) == 0
+    assert json.loads(capsys.readouterr().out)["write_state"] == "not_requested"
+    assert not runtime_control.controller_active()
+    assert controller_handoff.status()["manifest_state"] == "failed"

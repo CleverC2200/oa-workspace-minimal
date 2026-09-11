@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import secrets
 import subprocess
-from typing import Mapping
+from typing import Callable, Mapping
 
 from apps.oa_approval import runtime_control
 
@@ -237,6 +237,68 @@ def recover_confirmed_children_reaped(*, confirmed: bool) -> dict:
         "children_reaped": True,
         "health": recovered["health"],
     }
+
+
+def recover_orphaned_run(
+    *, confirmed_children_reaped: bool, check_live: Callable[[], dict],
+) -> dict:
+    """Close an abandoned run as failed, never resume its business attempts.
+
+    The operator must verify the original process tree has been reaped. A dead
+    controller PID alone cannot establish that detached children have exited.
+    """
+    blocked = "controller_handoff_recovery_blocked"
+    if confirmed_children_reaped is not True:
+        raise ValueError(blocked)
+    try:
+        with runtime_control.global_controller_lease():
+            with runtime_control.request_writer_lease(
+                runtime_control.GLOBAL_WRITER_KEY,
+                runtime_control.writer_lock_file(), blocking=False,
+            ):
+                manifest = _read_manifest()
+                revision, dirty = _code_state()
+                if (manifest is None or manifest["state"] != "running"
+                    or manifest["controller_instance_id"] == CONTROLLER_INSTANCE_ID
+                    or _process_alive(manifest["controller_pid"])
+                    or revision == "unknown" or dirty is not False
+                    or runtime_control.writer_active()
+                    or runtime_control.active_request_writers() != 1
+                    or runtime_control.stop_requested()):
+                    raise ValueError(blocked)
+                started = datetime.fromisoformat(manifest["started_at"])
+                if (started.tzinfo is None or
+                    (datetime.now(timezone.utc) - started).total_seconds() < _RECOVERY_MIN_AGE_SECONDS):
+                    raise ValueError(blocked)
+                snapshot = check_live()
+                live = snapshot.get("live_check", {})
+                reconciled = snapshot.get("reconciliation", {})
+                continuation = reconciled.get("continuation", {})
+                if (live.get("credentials", {}).get("status") != "ok"
+                    or live.get("oa", {}).get("execution_identity") != "verified"
+                    or continuation != {"status": "ready", "scope": "none",
+                                        "isolated_pending": 0, "blocking_reasons": {}}
+                    or reconciled.get("quarantine", {}).get("pending_quarantined") != 0
+                    or _read_manifest() != manifest
+                    or runtime_control.stop_requested()
+                    or _code_state() != (revision, False)
+                    or _process_alive(manifest["controller_pid"])
+                    or runtime_control.writer_active()
+                    or runtime_control.active_request_writers() != 1):
+                    raise ValueError(blocked)
+                evidence = manifest_file().with_name(
+                    f"orphan-controller-{manifest['run_id']}.json"
+                )
+                raw = (json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
+                existing = runtime_control.read_control_bytes(evidence)
+                if existing is not None and existing != raw:
+                    raise ValueError(blocked)
+                runtime_control.write_control_bytes_atomic(evidence, raw)
+                result = finish(manifest, status="failed", children_reaped=True, health="degraded")
+                return {**result, "status": "recovered", "evidence_file": str(evidence),
+                        "write_state": "not_requested"}
+    except (RuntimeError, TypeError, KeyError, AttributeError) as error:
+        raise ValueError(blocked) from error
 
 
 def _write_manifest(manifest: Mapping[str, object]) -> None:
