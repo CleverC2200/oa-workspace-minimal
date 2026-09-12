@@ -241,6 +241,7 @@ def recover_confirmed_children_reaped(*, confirmed: bool) -> dict:
 
 def recover_orphaned_run(
     *, confirmed_children_reaped: bool, check_live: Callable[[], dict],
+    mode: str = "orphaned",
 ) -> dict:
     """Close an abandoned run as failed, never resume its business attempts.
 
@@ -248,8 +249,26 @@ def recover_orphaned_run(
     controller PID alone cannot establish that detached children have exited.
     """
     blocked = "controller_handoff_recovery_blocked"
-    if confirmed_children_reaped is not True:
+    if confirmed_children_reaped is not True or mode not in {"orphaned", "failed"}:
         raise ValueError(blocked)
+    expected_state = "failed" if mode == "failed" else "running"
+
+    def stop_snapshot() -> tuple | None:
+        if mode == "orphaned":
+            if runtime_control.stop_requested():
+                raise ValueError(blocked)
+            return None
+        if (runtime_control.stop_reason() != "controller_cycle_stop"
+            or str(os.environ.get("OA_FINANCE_PREAUDIT_STOP_REQUESTED", "")).strip().lower()
+            in {"1", "true", "yes", "y", "on"}):
+            raise ValueError(blocked)
+        path = runtime_control.stop_file()
+        pinned = path.lstat()
+        raw = runtime_control.read_control_bytes(path)
+        if raw != b"stop_requested:controller_cycle_stop\n":
+            raise ValueError(blocked)
+        return pinned.st_dev, pinned.st_ino, pinned.st_mtime_ns, raw
+
     try:
         with runtime_control.global_controller_lease():
             with runtime_control.request_writer_lease(
@@ -258,15 +277,18 @@ def recover_orphaned_run(
             ):
                 manifest = _read_manifest()
                 revision, dirty = _code_state()
-                if (manifest is None or manifest["state"] != "running"
+                original_stop = stop_snapshot()
+                if (manifest is None or manifest["state"] != expected_state
+                    or manifest["children_reaped"] is not False
                     or manifest["controller_instance_id"] == CONTROLLER_INSTANCE_ID
                     or _process_alive(manifest["controller_pid"])
                     or revision == "unknown" or dirty is not False
                     or runtime_control.writer_active()
-                    or runtime_control.active_request_writers() != 1
-                    or runtime_control.stop_requested()):
+                    or runtime_control.active_request_writers() != 1):
                     raise ValueError(blocked)
-                started = datetime.fromisoformat(manifest["started_at"])
+                started = datetime.fromisoformat(manifest[
+                    "completed_at" if mode == "failed" else "started_at"
+                ])
                 if (started.tzinfo is None or
                     (datetime.now(timezone.utc) - started).total_seconds() < _RECOVERY_MIN_AGE_SECONDS):
                     raise ValueError(blocked)
@@ -280,7 +302,7 @@ def recover_orphaned_run(
                                         "isolated_pending": 0, "blocking_reasons": {}}
                     or reconciled.get("quarantine", {}).get("pending_quarantined") != 0
                     or _read_manifest() != manifest
-                    or runtime_control.stop_requested()
+                    or stop_snapshot() != original_stop
                     or _code_state() != (revision, False)
                     or _process_alive(manifest["controller_pid"])
                     or runtime_control.writer_active()
@@ -294,8 +316,19 @@ def recover_orphaned_run(
                 if existing is not None and existing != raw:
                     raise ValueError(blocked)
                 runtime_control.write_control_bytes_atomic(evidence, raw)
+                stop_evidence = evidence.with_suffix(".stop.flag")
+                if original_stop is not None:
+                    existing_stop = runtime_control.read_control_bytes(stop_evidence)
+                    if existing_stop not in {None, original_stop[3]}:
+                        raise ValueError(blocked)
+                    runtime_control.write_control_bytes_atomic(stop_evidence, original_stop[3])
+                if stop_snapshot() != original_stop:
+                    raise ValueError(blocked)
                 result = finish(manifest, status="failed", children_reaped=True, health="degraded")
+                if original_stop is not None and not runtime_control.clear_cycle_stop():
+                    raise ValueError(blocked)
                 return {**result, "status": "recovered", "evidence_file": str(evidence),
+                        **({"stop_evidence_file": str(stop_evidence)} if original_stop else {}),
                         "write_state": "not_requested"}
     except (RuntimeError, TypeError, KeyError, AttributeError) as error:
         raise ValueError(blocked) from error
@@ -434,6 +467,8 @@ def status() -> dict:
             "children_reaped": "unknown",
             "restart_verified": "unknown",
             "health": "unknown",
+            "health_scope": "run_result",
+            "monitoring_action": "check_start_gates" if ready else "investigate_handoff",
         }
     revision, dirty = _code_state()
     owner = runtime_control.controller_owner_pid() if controller_active else None
@@ -451,10 +486,13 @@ def status() -> dict:
         and active_request_writers == 0
         and lock_owner_consistent
     )
+    active_consistent = (
+        controller_active and lock_owner_consistent and manifest["state"] == "running"
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": "preaudit_controller_handoff_status",
-        "status": "active" if controller_active else "ready" if ready else "blocked",
+        "status": "active" if active_consistent else "ready" if ready else "blocked",
         "ready_for_start": ready,
         "controller_active": controller_active,
         "writer_active": writer_active,
@@ -474,4 +512,9 @@ def status() -> dict:
         "children_reaped": manifest["children_reaped"],
         "restart_verified": manifest["restart_verified"],
         "health": manifest["health"],
+        "health_scope": "run_result",
+        "monitoring_action": (
+            "wait_for_current_run" if active_consistent else
+            "check_start_gates" if ready else "investigate_handoff"
+        ),
     }
