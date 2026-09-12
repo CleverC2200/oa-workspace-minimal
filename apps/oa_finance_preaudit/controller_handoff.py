@@ -324,9 +324,23 @@ def recover_orphaned_run(
                     runtime_control.write_control_bytes_atomic(stop_evidence, original_stop[3])
                 if stop_snapshot() != original_stop:
                     raise ValueError(blocked)
-                result = finish(manifest, status="failed", children_reaped=True, health="degraded")
-                if original_stop is not None and not runtime_control.clear_cycle_stop():
-                    raise ValueError(blocked)
+                if original_stop is None:
+                    result = finish(manifest, status="failed", children_reaped=True, health="degraded")
+                else:
+                    recovered = {**manifest, "children_reaped": True}
+                    try:
+                        _write_manifest(recovered)
+                        if not runtime_control.clear_cycle_stop(expected_identity=original_stop[:3]):
+                            raise ValueError(blocked)
+                    except BaseException:
+                        # Keep a failed maintenance attempt retryable, without
+                        # overwriting a concurrently replaced manifest or stop.
+                        if _read_manifest() == recovered:
+                            _write_manifest(manifest)
+                        runtime_control.request_cycle_stop()
+                        raise
+                    result = {"manifest_state": "failed", "children_reaped": True,
+                              "health": manifest["health"]}
                 return {**result, "status": "recovered", "evidence_file": str(evidence),
                         **({"stop_evidence_file": str(stop_evidence)} if original_stop else {}),
                         "write_state": "not_requested"}

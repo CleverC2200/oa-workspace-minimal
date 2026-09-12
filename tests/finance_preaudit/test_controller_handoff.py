@@ -668,3 +668,33 @@ def test_failed_recovery_rejects_untrusted_gates(monkeypatch, gate):
         )
     assert json.loads(controller_handoff.manifest_file().read_bytes()) == value
     assert runtime_control.stop_requested() is (gate != "missing_stop")
+
+
+@pytest.mark.parametrize("failure", ["clear_refused", "clear_raises", "replaced_stop"])
+def test_failed_recovery_preserves_retry_after_finalization_failure(monkeypatch, failure):
+    value = _orphan(monkeypatch)
+    value.update(state="failed", completed_at="2026-08-25T00:01:00+00:00", health="degraded")
+    json_artifact.write_json_atomic(controller_handoff.manifest_file(), value)
+    runtime_control.request_cycle_stop()
+    write = controller_handoff._write_manifest
+    clear = runtime_control.clear_cycle_stop
+    def failed_clear(**kwargs):
+        if failure == "clear_refused": return False
+        raise OSError("simulated clear failure")
+    def replacing_write(manifest):
+        write(manifest)
+        if manifest["children_reaped"]:
+            runtime_control.stop_file().unlink()
+            runtime_control.request_cycle_stop()
+    if failure == "replaced_stop": monkeypatch.setattr(controller_handoff, "_write_manifest", replacing_write)
+    else: monkeypatch.setattr(runtime_control, "clear_cycle_stop", failed_clear)
+    check = lambda: {"live_check": _live_status(), "reconciliation": _clear_reconciliation()}
+    with pytest.raises((OSError, ValueError), match="failure|blocked"):
+        controller_handoff.recover_orphaned_run(confirmed_children_reaped=True, mode="failed", check_live=check)
+    assert runtime_control.stop_reason() == "controller_cycle_stop"
+    assert json.loads(controller_handoff.manifest_file().read_bytes()) == value
+    monkeypatch.setattr(controller_handoff, "_write_manifest", write)
+    monkeypatch.setattr(runtime_control, "clear_cycle_stop", clear)
+    assert controller_handoff.recover_orphaned_run(
+        confirmed_children_reaped=True, mode="failed", check_live=check,
+    )["status"] == "recovered"
