@@ -310,7 +310,7 @@ def write_control_bytes_atomic(path: Path, payload: bytes) -> None:
         os.close(parent_descriptor)
 
 
-def clear_cycle_stop() -> bool:
+def clear_cycle_stop(*, expected_identity: tuple[int, int, int] | None = None) -> bool:
     """Remove only the controller-owned, recoverable cycle stop marker."""
     raw = str(
         os.environ.get("OA_FINANCE_PREAUDIT_STOP_REQUESTED") or ""
@@ -341,6 +341,10 @@ def clear_cycle_stop() -> bool:
         except FileNotFoundError:
             return False
         pinned = os.fstat(file_descriptor)
+        if expected_identity is not None and (
+            pinned.st_dev, pinned.st_ino, pinned.st_mtime_ns
+        ) != expected_identity:
+            return False
         if (
             not stat.S_ISREG(pinned.st_mode)
             or pinned.st_uid != os.getuid()
@@ -358,6 +362,7 @@ def clear_cycle_stop() -> bool:
         if (
             not stat.S_ISREG(current.st_mode)
             or (current.st_dev, current.st_ino) != (pinned.st_dev, pinned.st_ino)
+            or current.st_mtime_ns != pinned.st_mtime_ns
         ):
             raise RuntimeError("control_file_unsafe")
         os.unlink(target.name, dir_fd=parent_descriptor)

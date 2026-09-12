@@ -115,6 +115,8 @@ def test_completed_controller_run_publishes_sanitized_handoff_status(
         "controller_active": False,
         "kind": "preaudit_controller_handoff_status",
         "health": "healthy",
+        "health_scope": "run_result",
+        "monitoring_action": "investigate_handoff",
         "lock_owner_consistent": True,
         "manifest_state": "completed",
         "ready_for_start": False,
@@ -587,3 +589,112 @@ def test_recovery_cli_uses_live_sources_and_does_not_start_controller(monkeypatc
     assert json.loads(capsys.readouterr().out)["write_state"] == "not_requested"
     assert not runtime_control.controller_active()
     assert controller_handoff.status()["manifest_state"] == "failed"
+
+
+def test_running_unknown_result_instructs_wait_without_claiming_host_failure(monkeypatch):
+    monkeypatch.setattr(controller_handoff, "_code_state", lambda: ("0" * 40, False))
+    with runtime_control.global_controller_lease():
+        controller_handoff.begin({"capacity": 1})
+        result = controller_handoff.status()
+        assert result["health"] == "unknown"
+        assert result["health_scope"] == "run_result"
+        assert result["monitoring_action"] == "wait_for_current_run"
+        assert not result["ready_for_start"]
+        monkeypatch.setattr(runtime_control, "controller_owner_pid", lambda: -1)
+        result = controller_handoff.status()
+        assert result["status"] == "blocked"
+        assert result["monitoring_action"] == "investigate_handoff"
+
+
+def test_failed_recovery_cli_preserves_evidence_without_starting_approval(monkeypatch, capsys):
+    from apps.oa_finance_preaudit import controller_recovery
+    value = _orphan(monkeypatch)
+    value.update(state="failed", completed_at="2026-08-25T00:01:00+00:00", health="degraded")
+    json_artifact.write_json_atomic(controller_handoff.manifest_file(), value)
+    original = controller_handoff.manifest_file().read_bytes()
+    runtime_control.request_cycle_stop()
+    monkeypatch.setattr(controller_recovery.runtime_doctor, "status", _live_status)
+    monkeypatch.setattr(cli, "_live_reconciliation", lambda root: _clear_reconciliation())
+    assert controller_recovery.main([
+        "--confirm-children-reaped", "YES", "--mode", "failed",
+    ]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["write_state"] == "not_requested"
+    assert json.loads(Path(result["evidence_file"]).read_bytes()) == json.loads(original)
+    assert Path(result["stop_evidence_file"]).read_bytes() == b"stop_requested:controller_cycle_stop\n"
+    assert controller_handoff.status()["ready_for_start"]
+    assert not runtime_control.stop_requested()
+
+
+@pytest.mark.parametrize("gate", [
+    "confirmation", "pid", "dirty", "identity", "reconciliation", "quarantine",
+    "missing_stop", "manual_stop", "environment_stop", "changed_stop", "changed_manifest",
+    "recent", "controller", "global", "request",
+])
+def test_failed_recovery_rejects_untrusted_gates(monkeypatch, gate):
+    from contextlib import nullcontext
+    from datetime import datetime, timezone
+    value = _orphan(monkeypatch)
+    value.update(state="failed", completed_at="2026-08-25T00:01:00+00:00", health="degraded")
+    if gate == "recent":
+        value["completed_at"] = datetime.now(timezone.utc).isoformat()
+    json_artifact.write_json_atomic(controller_handoff.manifest_file(), value)
+    runtime_control.request_cycle_stop()
+    if gate == "missing_stop": runtime_control.stop_file().unlink()
+    if gate == "manual_stop": runtime_control.stop_file().write_text("stop_requested\n")
+    if gate == "environment_stop": monkeypatch.setenv("OA_FINANCE_PREAUDIT_STOP_REQUESTED", "YES")
+    if gate == "pid": monkeypatch.setattr(controller_handoff, "_process_alive", lambda pid: True)
+    if gate == "dirty": monkeypatch.setattr(controller_handoff, "_code_state", lambda: ("0" * 40, True))
+    live, reconciled = _live_status(), _clear_reconciliation()
+    if gate == "identity": live["oa"]["execution_identity"] = "unknown"
+    if gate == "reconciliation": reconciled["continuation"]["status"] = "blocked"
+    if gate == "quarantine": reconciled["quarantine"]["pending_quarantined"] = 1
+    def check():
+        if gate == "changed_stop": runtime_control.stop_file().write_text("stop_requested\n")
+        if gate == "changed_manifest":
+            value["run_id"] = "2" * 32
+            json_artifact.write_json_atomic(controller_handoff.manifest_file(), value)
+        return {"live_check": live, "reconciliation": reconciled}
+    lease = nullcontext()
+    if gate == "controller": lease = runtime_control.global_controller_lease()
+    if gate in {"global", "request"}:
+        lease = runtime_control.request_writer_lease(
+            runtime_control.GLOBAL_WRITER_KEY if gate == "global" else "test-request",
+            runtime_control.writer_lock_file(), blocking=False,
+        )
+    with lease, pytest.raises(ValueError, match="controller_handoff_recovery_blocked"):
+        controller_handoff.recover_orphaned_run(
+            confirmed_children_reaped=gate != "confirmation", mode="failed", check_live=check,
+        )
+    assert json.loads(controller_handoff.manifest_file().read_bytes()) == value
+    assert runtime_control.stop_requested() is (gate != "missing_stop")
+
+
+@pytest.mark.parametrize("failure", ["clear_refused", "clear_raises", "replaced_stop"])
+def test_failed_recovery_preserves_retry_after_finalization_failure(monkeypatch, failure):
+    value = _orphan(monkeypatch)
+    value.update(state="failed", completed_at="2026-08-25T00:01:00+00:00", health="degraded")
+    json_artifact.write_json_atomic(controller_handoff.manifest_file(), value)
+    runtime_control.request_cycle_stop()
+    write = controller_handoff._write_manifest
+    clear = runtime_control.clear_cycle_stop
+    def failed_clear(**kwargs):
+        if failure == "clear_refused": return False
+        raise OSError("simulated clear failure")
+    def replacing_write(manifest):
+        write(manifest)
+        if manifest["children_reaped"]:
+            runtime_control.stop_file().unlink()
+            runtime_control.request_cycle_stop()
+    if failure == "replaced_stop": monkeypatch.setattr(controller_handoff, "_write_manifest", replacing_write)
+    else: monkeypatch.setattr(runtime_control, "clear_cycle_stop", failed_clear)
+    check = lambda: {"live_check": _live_status(), "reconciliation": _clear_reconciliation()}
+    with pytest.raises((OSError, ValueError), match="failure|blocked"):
+        controller_handoff.recover_orphaned_run(confirmed_children_reaped=True, mode="failed", check_live=check)
+    assert runtime_control.stop_reason() == "controller_cycle_stop"
+    assert json.loads(controller_handoff.manifest_file().read_bytes()) == value
+    monkeypatch.setattr(controller_handoff, "_write_manifest", write)
+    monkeypatch.setattr(runtime_control, "clear_cycle_stop", clear)
+    assert controller_handoff.recover_orphaned_run(
+        confirmed_children_reaped=True, mode="failed", check_live=check,
+    )["status"] == "recovered"

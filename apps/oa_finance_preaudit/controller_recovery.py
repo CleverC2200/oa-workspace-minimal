@@ -12,6 +12,7 @@ from . import cli, controller_handoff, runtime_doctor
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--confirm-children-reaped", choices=("YES",), required=True)
+    parser.add_argument("--mode", choices=("orphaned", "failed"), default="orphaned")
     args = parser.parse_args(argv)
     root = Path(os.environ.get("OA_FINANCE_PREAUDIT_FLOW_ROOT") or
                 controller_handoff.PROJECT_ROOT / "runtime" / "finance_preaudit_flows")
@@ -24,6 +25,7 @@ def main(argv: list[str] | None = None) -> int:
         result = controller_handoff.recover_orphaned_run(
             confirmed_children_reaped=args.confirm_children_reaped == "YES",
             check_live=check_live,
+            mode=args.mode,
         )
     except (OSError, ValueError, RuntimeError):
         print(json.dumps({"status": "blocked", "error_code": "controller_handoff_recovery_blocked"}))

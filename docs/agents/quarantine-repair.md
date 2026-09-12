@@ -46,3 +46,11 @@
 控制器收尾捕获 Python 中断和退出异常，记录 failed 并保留实际回收状态；进程被强制终止仍可能遗留 running。不能仅凭无标准输出、CPU 空闲或某一刻没有子进程判断卡死；采集和线程内等待可能没有子进程，先检查阶段进度、超时边界和原调用回执。
 
 发布后可在已授权的生产维护范围使用 `python -m apps.oa_finance_preaudit.controller_recovery --confirm-children-reaped YES`。执行前必须核对原控制器进程树（包括独立进程组）已全部退出；死 PID 本身不足以确认子进程回收。入口持有控制器与全局请求 Writer 租约，重查身份和对账，拒绝存活 PID、脏代码、停止标记、活跃请求 Writer、隔离及未决写入。原清单保存为同目录 `orphan-controller-<run_id>.json`，当前清单仅闭合为 failed/degraded，不恢复单据、不启动审批、不清除告警。执行后复核生产交接状态；发布和生产操作仍需当前授权。
+
+### 运行中监测与失败清单恢复
+
+`status` 的 `controller_handoff.health` 是清单记录的运行结果，`health_scope=run_result`；运行期间 `unknown` 仅表示尚未收尾，不是实时主机健康。锁与运行清单一致时 `monitoring_action=wait_for_current_run`，继续等待原调用；`children_reaped=false` 和 `ready_for_start=false` 在此时也是预期值。锁身份不一致返回 blocked，必须调查。`check_start_gates` 只是进入完整启动核验的提示，不是 OA 写入授权。
+
+实时主机数据来自 `apps.oa_finance_preaudit.concurrency_control.sample_local_health()`；滚动控制器每个心跳自行采样，未知采样暂停新增领取，critical 走受控停止，准备与审核各有超时 watchdog。不得因交接 health=unknown、无标准输出或单次无子进程快照发送 Ctrl-C/kill。故障判断先核对实际主机数据、阶段证据、超时与原调用回执；确有停止条件时使用现有停止门让控制器停止领取并完成 Writer/子进程收尾，保留原进程等待其终态，不用中断代替有序停止。
+
+已发生中断且清单为 failed、children_reaped=false 时，完成原进程树及独立进程组退出确认后，使用 `python -m apps.oa_finance_preaudit.controller_recovery --mode failed --confirm-children-reaped YES`。该模式要求已知 `controller_cycle_stop`，拒绝手工停止、环境停止、变更中的停止标记及不可信实时对账；控制器和 Writer 租约覆盖全部核验、原清单与停止证据留存及恢复操作。只将失败清单标记为已确认回收，清理本次已知周期停止门；保留失败状态、告警和业务证据，不创建 attempt 或执行审批。默认 orphaned 模式仍只处理无停止门的 running 孤立清单。
