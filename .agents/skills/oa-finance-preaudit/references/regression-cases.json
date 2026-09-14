@@ -3,6 +3,61 @@
   "description": "人工确认的脱敏财务预审错误案例。仅在盲测结果冻结后用于对照和回归，不作为观察子 Agent 的当前答案。",
   "cases": [
     {
+      "id": "RC-034-fuel-wrong-difference",
+      "scope": "travel-expense",
+      "audit_item": "6-油补",
+      "status": "confirmed",
+      "input_facts": [
+        "合成单一区间：起始照片清晰显示 45123.4 km，结束照片显示 46357.9 km，申报 1234.5 km；归属和配对均明确",
+        "首次计算错误地得到 1254.4 km，重新打开两张原图读数一致，工具验算得到 1234.5 km"
+      ],
+      "incorrect_output": "只输出差值 1254.4 km 并判不一致",
+      "expected_output": "pass；记录起始 45123.4 km、结束 46357.9 km、差值 46357.9−45123.4=1234.5 km、申报 1234.5 km；记录首次差值异常、复读一致及实际工具验算结果",
+      "failure_mode": "遗漏原值及判错前验算",
+      "rule_ref": "flows/travel-expense.md#油补记录随审核决定归档"
+    },
+    {
+      "id": "RC-035-fuel-confirmed-mismatch",
+      "scope": "travel-expense",
+      "audit_item": "6-油补",
+      "status": "confirmed",
+      "input_facts": [
+        "合成单一区间：起始 20100.1 km，结束 20230.4 km，申报 120.3 km，归属和配对明确",
+        "重新打开原图复读一致，工具验算差值 130.3 km"
+      ],
+      "incorrect_output": "遇到真实差额仍按申报值反推原值或统一转 uncertain",
+      "expected_output": "fail；记录起止读数、20230.4−20100.1=130.3 km、申报 120.3 km，以及不一致触发的复读和实际工具验算结果",
+      "failure_mode": "只纠正误报却漏掉真实不一致",
+      "rule_ref": "flows/travel-expense.md#油补记录随审核决定归档"
+    },
+    {
+      "id": "RC-036-fuel-unresolved-reading",
+      "scope": "travel-expense",
+      "audit_item": "6-油补",
+      "status": "confirmed",
+      "input_facts": [
+        "一张原图末位或小数点无法稳定辨认，首次与一次复读冲突仍无法消解；另张读数清晰"
+      ],
+      "incorrect_output": "猜出起始读数并写已复核一致后判 fail",
+      "expected_output": "uncertain；保留已确认原值和未知项，在 conclusion 记录复读冲突，missing_evidence 指明疑点；不计算未知读数、不虚构工具记录、不再重复复核",
+      "failure_mode": "将读图不确定伪装为已确认差额",
+      "rule_ref": "flows/travel-expense.md#油补记录随审核决定归档"
+    },
+    {
+      "id": "RC-037-fuel-multiple-intervals",
+      "scope": "travel-expense",
+      "audit_item": "6-油补",
+      "status": "confirmed",
+      "input_facts": [
+        "合成材料已稳定绑定两组明细：第一组 1000.1 至 1010.3 km，第二组 5000.2 至 5020.5 km，申报总里程 30.5 km",
+        "另设配对关系缺失的变体"
+      ],
+      "incorrect_output": "以全部照片最大读数减最小读数，或只留总差值",
+      "expected_output": "配对明确时 pass，逐组列 1010.3−1000.1=10.2 km、5020.5−5000.2=20.3 km，汇总 30.5 km 并关联明细与页面；配对缺失变体 uncertain，不按顺序猜配对",
+      "failure_mode": "多组里程关系和分组计算不可追溯",
+      "rule_ref": "flows/travel-expense.md#油补记录随审核决定归档"
+    },
+    {
       "id": "RC-032-front-display-label-skipped",
       "scope": "packaging-layout-approval",
       "audit_item": "page-classification",
