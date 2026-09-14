@@ -54,3 +54,9 @@
 实时主机数据来自 `apps.oa_finance_preaudit.concurrency_control.sample_local_health()`；滚动控制器每个心跳自行采样，未知采样暂停新增领取，critical 走受控停止，准备与审核各有超时 watchdog。不得因交接 health=unknown、无标准输出或单次无子进程快照发送 Ctrl-C/kill。故障判断先核对实际主机数据、阶段证据、超时与原调用回执；确有停止条件时使用现有停止门让控制器停止领取并完成 Writer/子进程收尾，保留原进程等待其终态，不用中断代替有序停止。
 
 已发生中断且清单为 failed、children_reaped=false 时，完成原进程树及独立进程组退出确认后，使用 `python -m apps.oa_finance_preaudit.controller_recovery --mode failed --confirm-children-reaped YES`。该模式要求已知 `controller_cycle_stop`，拒绝手工停止、环境停止、变更中的停止标记及不可信实时对账；控制器和 Writer 租约覆盖全部核验、原清单与停止证据留存及恢复操作。只将失败清单标记为已确认回收，清理本次已知周期停止门；保留失败状态、告警和业务证据，不创建 attempt 或执行审批。默认 orphaned 模式仍只处理无停止门的 running 孤立清单。
+
+### 原调用归属与准备进程父生命周期
+
+调度调用滚动入口时必须单独执行，完整保留 `exec_command` 的 `session_id`、`exit_code` 和输出；不要只传递 `output`。存在 `session_id` 就通过同一个 `write_stdin` 会话等待至终态，不再调用滚动入口。当前任务已经启动的控制器即使在另一次状态查询中显示 active，也仍归当前任务收尾；只有启动前确认由其他任务拥有的活动控制器，才可直接跳过本轮。原调用尚未终态时不得结束或归档任务，也不执行结束后的 prune。
+
+材料准备进程是独立进程组，初始化时监听原父进程的 multiprocessing sentinel。父进程已退出时，准备进程回收自身只读进程组；该保护不覆盖 Writer、不将清单改成成功，也不替代有序停止。被强制终止的主控制器仍可能留下 running 清单，必须走现有显式孤立运行恢复门。排查此类故障时同时记录原工具调用终态与进程组证据；工具 exit_code=-1 不能独自证明操作系统终止信号或发起者。

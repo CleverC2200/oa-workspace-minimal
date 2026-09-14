@@ -14,10 +14,12 @@ import hashlib
 import json
 import math
 import multiprocessing
+from multiprocessing.connection import wait as wait_for_process
 import os
 from pathlib import Path
 import signal
 import sys
+import threading
 import time
 from typing import Callable, Sequence
 from zoneinfo import ZoneInfo
@@ -1843,11 +1845,31 @@ def _process_executor(capacity: int) -> ProcessPoolExecutor:
     )
 
 
+def _initialize_preparation_worker() -> None:
+    os.setsid()
+    parent = multiprocessing.parent_process()
+    if parent is None:
+        raise RuntimeError("preparation_parent_missing")
+
+    def reap_after_parent_exit() -> None:
+        # The sentinel identifies the original parent without PID reuse races.
+        # Only this read-only preparation group is owned here, never the Writer.
+        wait_for_process([parent.sentinel])
+        if os.getpgrp() == os.getpid():
+            os.killpg(os.getpgrp(), signal.SIGKILL)
+
+    threading.Thread(
+        target=reap_after_parent_exit,
+        name="oa-preparation-parent-watch",
+        daemon=True,
+    ).start()
+
+
 def _preparation_executor() -> ProcessPoolExecutor:
     return ProcessPoolExecutor(
         max_workers=1,
         mp_context=multiprocessing.get_context("spawn"),
-        initializer=os.setsid,
+        initializer=_initialize_preparation_worker,
     )
 
 
