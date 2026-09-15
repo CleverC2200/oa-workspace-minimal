@@ -24,6 +24,48 @@ _TRUSTED_SOURCE_FIELD_PATH_KEY = "_trusted_source_field_path"
 _TRUSTED_SOURCE_FIELD_NAME_KEY = "_trusted_source_field_name"
 
 
+def _raw_field_is_business_value(field: dict[str, Any], value: str) -> bool:
+    name = str(field.get("fieldShowName") or "").strip()
+    code = str(field.get("fieldName") or "").strip()
+    html_type = str(field.get("fieldHtmlType") or "")
+    db_type = str(field.get("fieldDBType") or "")
+    # Invoice raw values are resource references, never invoice numbers.
+    if name in {"发票号码", "关联发票"}:
+        return False
+    if html_type == "3" or db_type.startswith("browser."):
+        # These confirmed custom browsers return business text/codes in fieldValue.
+        # Other browser values need a display name or an authoritative lookup.
+        if str(field.get("fieldType") or "") != "226":
+            return False
+        if (code, name, db_type) == ("sapkhbm", "SAP客户编码", "browser.6003"):
+            return bool(re.fullmatch(r"[0-9]+", value))
+        return (
+            (code, name, db_type) == ("bxgs", "报销公司", "browser.5534")
+            and value.endswith("公司")
+        )
+    if html_type in {"1", "2"}:
+        return True
+    if html_type:
+        return False
+    # Legacy responses may omit type metadata. Do not guess what a numeric ID means.
+    return not re.fullmatch(r"[0-9,]+", value)
+
+
+def _field_reading(field: dict[str, Any]) -> tuple[str, str, str]:
+    display = flow.clean_field_text(field.get("fieldShowValue"))
+    raw = flow.clean_field_text(field.get("fieldValue"))
+    if display:
+        return display, "display", "present"
+    if raw and _raw_field_is_business_value(field, raw):
+        return raw, "raw", "present"
+    # A display placeholder or unresolved reference is not evidence of a blank form.
+    placeholder = any(
+        marker in str(field.get("fieldShowValue") or "")
+        for marker in ("[该字段暂不支持]", "[该字段仅支持显示]")
+    )
+    return "", "none", "unresolved" if raw or placeholder else "empty"
+
+
 def _field_entry(
     field: dict[str, Any],
     *,
@@ -31,13 +73,15 @@ def _field_entry(
     row: int,
     path: str,
 ) -> dict[str, Any]:
-    raw_show = field.get("fieldShowValue")
     raw_value = field.get("fieldValue")
+    value, value_source, read_status = _field_reading(field)
     return {
         "name": str(field.get("fieldShowName") or field.get("fieldName") or "").strip(),
         "field_name": str(field.get("fieldName") or "").strip(),
         "path": path,
-        "value": flow.clean_field_text(raw_show if raw_show is not None else raw_value),
+        "value": value,
+        "value_source": value_source,
+        "read_status": read_status,
         "raw_value": "" if raw_value is None else str(raw_value),
         "table": table,
         "row": row,

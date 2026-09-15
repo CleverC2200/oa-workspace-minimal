@@ -715,12 +715,16 @@ class TestCollectCaseContract:
                 "name": "报销金额",
                 "code": "amount",
                 "value": "100.00",
+                "value_source": "display",
+                "read_status": "present",
             },
             {
                 "path": "detail[0].row[0].field[0]",
                 "name": "费用类型",
                 "code": "expense_type",
                 "value": "酒店",
+                "value_source": "display",
+                "read_status": "present",
             },
         ]
         assert materials[0]["resources"] == []
@@ -1420,3 +1424,79 @@ class TestCollectCaseContract:
                     configs=FLOW_CONFIGS,
                     allow_browser_download=False,
                 )
+
+
+@pytest.mark.parametrize("config", FLOW_CONFIGS)
+def test_collection_preserves_populated_fields_and_reading_state(config: dict) -> None:
+    class FieldApi(RecordedOaApi):
+        def request_context(self, request_id: str) -> tuple[dict, list]:
+            workflow, resources = super().request_context(request_id)
+            workflow["workflowMainTableInfo"]["requestRecords"][0][
+                "workflowRequestTableFields"
+            ] = [{
+                "fieldName": "bxgs", "fieldShowName": "报销公司",
+                "fieldHtmlType": "3", "fieldType": "226",
+                "fieldDBType": "browser.5534", "fieldValue": "示例食品有限公司",
+                "fieldShowValue": "",
+            }, {
+                "fieldName": "zfgs", "fieldShowName": "支付公司",
+                "fieldHtmlType": "3", "fieldType": "161", "fieldValue": "11",
+                "fieldShowValue": "<a>示例食品有限公司</a>&nbsp;",
+            }]
+            workflow["workflowDetailTableInfos"][0]["workflowRequestTableRecords"][0][
+                "workflowRequestTableFields"
+            ] = [{
+                "fieldName": "sapkhbm", "fieldShowName": "SAP客户编码",
+                "fieldHtmlType": "3", "fieldType": "226",
+                "fieldDBType": "browser.6003", "fieldValue": "0000123456",
+                "fieldShowValue": "<span>[该字段暂不支持]</span>",
+            }, {
+                "fieldName": "fycdzt", "fieldShowName": "费用承担主体",
+                "fieldHtmlType": "3", "fieldType": "4", "fieldValue": "1794",
+                "fieldShowValue": "",
+            }]
+            return workflow, resources
+
+    with (
+        patch.object(case_bundle.official_sql, "travel_extra_fields", return_value=[]),
+        patch.object(invoice_buyers, "read_invoice_buyers", return_value={
+            "read_status": "not_applicable", "invoices": [],
+        }),
+        patch.object(travel_orders, "collect_evidence", return_value={
+            "fields": [], "resources": [], "errors": [],
+        }),
+    ):
+        material = collect_case(
+            "recorded-request", oa_api=FieldApi(config["workflow_id"], config["workflow_name"]),
+            configs=FLOW_CONFIGS, allow_browser_download=False,
+        )
+    fields = material["declared_fields"]
+    assert [item["value"] for item in fields] == [
+        "示例食品有限公司", "示例食品有限公司", "0000123456", "",
+    ]
+    assert [item["value_source"] for item in fields] == ["raw", "display", "raw", "none"]
+    assert [item["read_status"] for item in fields] == ["present", "present", "present", "unresolved"]
+    assert fields[2]["path"] == "detail[0].row[0].field[0]"
+
+
+@pytest.mark.parametrize(("field", "value", "status", "source"), [
+    ({"fieldHtmlType": "1", "fieldValue": 0, "fieldShowValue": ""}, "0", "present", "raw"),
+    ({"fieldHtmlType": "1", "fieldValue": "2026-01-02", "fieldShowValue": "&nbsp;"}, "2026-01-02", "present", "raw"),
+    ({"fieldValue": "", "fieldShowValue": ""}, "", "empty", "none"),
+    ({"fieldValue": None, "fieldShowValue": "<span>[该字段暂不支持]</span>"}, "", "unresolved", "none"),
+    ({"fieldHtmlType": "3", "fieldValue": "11", "fieldShowValue": None}, "", "unresolved", "none"),
+    ({"fieldHtmlType": "5", "fieldValue": "0", "fieldShowValue": ""}, "", "unresolved", "none"),
+    ({"fieldName": "bxgs", "fieldShowName": "报销公司", "fieldHtmlType": "3", "fieldType": "226", "fieldValue": "11", "fieldShowValue": ""}, "", "unresolved", "none"),
+    ({"fieldName": "sapkhbm", "fieldShowName": "SAP客户编码", "fieldHtmlType": "3", "fieldType": "161", "fieldValue": "11", "fieldShowValue": ""}, "", "unresolved", "none"),
+    ({"fieldShowName": "发票号码", "fieldValue": "12345", "fieldShowValue": ""}, "", "unresolved", "none"),
+    ({"fieldShowName": "关联发票", "fieldValue": "12345", "fieldShowValue": ""}, "", "unresolved", "none"),
+    ({"fieldHtmlType": "3", "fieldValue": "11", "fieldShowValue": "<a>示例公司</a>&nbsp"}, "示例公司", "present", "display"),
+    ({"fieldValue": "001", "fieldShowValue": "000045[该字段仅支持显示]"}, "000045", "present", "display"),
+])
+def test_field_resolution_does_not_confuse_missing_values_and_internal_ids(
+    field: dict, value: str, status: str, source: str,
+) -> None:
+    workflow = {"workflowMainTableInfo": {"requestRecords": [{"workflowRequestTableFields": [field]}]}}
+    entry = evidence_packet.extract_fields(workflow)[0]
+    assert (entry["value"], entry["read_status"], entry["value_source"]) == (value, status, source)
+    assert entry["raw_value"] == ("" if field.get("fieldValue") is None else str(field["fieldValue"]))

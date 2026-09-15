@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import json
 from pathlib import Path
 import re
@@ -145,7 +146,7 @@ def select_config_for_workflow(
 
 
 def clean_field_text(value: Any) -> str:
-    text = re.sub(r"<[^>]+>", "", str(value or "")).strip()
+    text = html.unescape(re.sub(r"<[^>]+>", "", "" if value is None else str(value)))
     return (
         text.replace("[该字段暂不支持]", "")
         .replace("[该字段仅支持显示]", "")
