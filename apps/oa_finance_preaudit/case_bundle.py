@@ -56,6 +56,8 @@ def _field_rows(workflow: dict[str, Any]) -> list[dict[str, str]]:
             "name": str(item.get("name") or ""),
             "code": str(item.get("field_name") or ""),
             "value": str(item.get("value") or ""),
+            "value_source": item["value_source"],
+            "read_status": item["read_status"],
         }
         for item in evidence_packet.extract_fields(workflow)
     ]
