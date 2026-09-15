@@ -3,6 +3,62 @@
   "description": "人工确认的脱敏财务预审错误案例。仅在盲测结果冻结后用于对照和回归，不作为观察子 Agent 的当前答案。",
   "cases": [
     {
+      "id": "RC-038-payee-seller-exact-match",
+      "scope": "general-expense",
+      "audit_item": "1-附件完整性/支付证据",
+      "status": "confirmed",
+      "input_facts": [
+        "科目要求支付截图但未提供；收款人员字段为空，收款人员名称有值",
+        "可归属当前明细的发票销售方与收款人员名称逐字一致；其他必需附件齐全"
+      ],
+      "incorrect_output": "因收款人员字段为空或缺支付截图判 fail",
+      "expected_output": "pass；说明收款人与发票销售方逐字一致，对公付款免支付截图，并引用双方名称证据",
+      "failure_mode": "未区分对公付款豁免的适用性、证据缺口与其他附件要求",
+      "rule_ref": "flows/general-expense.md#缺支付截图时先核对对公付款豁免"
+    },
+    {
+      "id": "RC-039-payee-seller-unknown",
+      "scope": "general-expense",
+      "audit_item": "1-附件完整性/支付证据",
+      "status": "confirmed",
+      "input_facts": [
+        "科目要求支付截图但未提供；收款人员名称可读",
+        "仅有发票关联信息和合同；未取得发票销售方；其他必需附件无已确认缺失"
+      ],
+      "incorrect_output": "未核对豁免便因缺截图判 fail，或用合同乙方或购买方推定销售方一致而 pass",
+      "expected_output": "uncertain；说明发票销售方未读到，无法确认对公付款豁免，在 missing_evidence 记录缺口",
+      "failure_mode": "未区分对公付款豁免的适用性、证据缺口与其他附件要求",
+      "rule_ref": "flows/general-expense.md#缺支付截图时先核对对公付款豁免"
+    },
+    {
+      "id": "RC-040-payee-seller-mismatch",
+      "scope": "general-expense",
+      "audit_item": "1-附件完整性/支付证据",
+      "status": "confirmed",
+      "input_facts": [
+        "科目要求支付截图但未提供；收款人与关联发票销售方均可读且名称不一致",
+        "员工主数据确认收款人为内部人员；确认缺少委托代付款截图"
+      ],
+      "incorrect_output": "名称不一致仍免截图，或未核对补充材料直接判错",
+      "expected_output": "fail；确认不一致后按人员关系检查补充材料，指出缺少委托代付款截图；材料或人员关系未知时保持 uncertain",
+      "failure_mode": "未区分对公付款豁免的适用性、证据缺口与其他附件要求",
+      "rule_ref": "flows/general-expense.md#缺支付截图时先核对对公付款豁免"
+    },
+    {
+      "id": "RC-041-payee-exemption-other-attachment",
+      "scope": "general-expense",
+      "audit_item": "1-附件完整性/支付证据",
+      "status": "confirmed",
+      "input_facts": [
+        "科目要求支付截图但未提供；收款人与关联发票销售方逐字一致且关系可信",
+        "科目要求消费清单，确认缺少该清单"
+      ],
+      "incorrect_output": "因同名免支付截图而把第 1 项全部判 pass",
+      "expected_output": "fail；只豁免支付截图，明确缺少消费清单",
+      "failure_mode": "未区分对公付款豁免的适用性、证据缺口与其他附件要求",
+      "rule_ref": "flows/general-expense.md#缺支付截图时先核对对公付款豁免"
+    },
+    {
       "id": "RC-034-fuel-wrong-difference",
       "scope": "travel-expense",
       "audit_item": "6-油补",
