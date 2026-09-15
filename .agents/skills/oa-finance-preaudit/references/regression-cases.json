@@ -3,6 +3,119 @@
   "description": "人工确认的脱敏财务预审错误案例。仅在盲测结果冻结后用于对照和回归，不作为观察子 Agent 的当前答案。",
   "cases": [
     {
+      "id": "RC-042-lodging-concise-mixed",
+      "scope": "travel-expense",
+      "audit_item": "4-住宿与考勤",
+      "status": "confirmed",
+      "input_facts": [
+        "第1晚实际入住和地点核验一致",
+        "第2晚实际入住已确认，住宿甲市、考勤乙市",
+        "第3晚地点已核对相符，但实际入住未确认"
+      ],
+      "incorrect_output": "部分住宿相符，但全部夜次无法核验。",
+      "expected_output": "❌ 4、住宿与考勤：第1晚一致；第2晚住宿甲市、考勤乙市，不一致；第3晚地点一致，入住待核实。",
+      "failure_mode": "混合结果被整体降级，或简短意见遗漏异常与缺口",
+      "rule_ref": "flows/travel-expense.md#第-4-项签字意见保持简短"
+    },
+    {
+      "id": "RC-043-lodging-refund-replacement",
+      "scope": "travel-expense",
+      "audit_item": "4-住宿与考勤",
+      "status": "confirmed",
+      "input_facts": [
+        "旧订单第1、2晚已唯一配对全额冲销",
+        "同区间新订单仍有效，地点相符但入住未确认"
+      ],
+      "incorrect_output": "第1、2晚全部冲销，不再审核。",
+      "expected_output": "⚠️ 4、住宿与考勤：已排除第1、2晚旧订单；同区间新订单地点一致，入住待核实。",
+      "failure_mode": "将旧订单退款扩大为排除新订单",
+      "rule_ref": "flows/travel-expense.md#第-4-项签字意见保持简短"
+    },
+    {
+      "id": "RC-044-lodging-unknown-partial-refund",
+      "scope": "travel-expense",
+      "audit_item": "4-住宿与考勤",
+      "status": "confirmed",
+      "input_facts": [
+        "明细甲只有付款凭证，入住日期未知",
+        "明细乙第1至第3日原预订部分退款，退掉哪晚无法确认"
+      ],
+      "incorrect_output": "全部缺少入住证据，请财务判断。",
+      "expected_output": "⚠️ 4、住宿与考勤：明细甲已见付款，入住日期待核实；明细乙原订第1、2晚，实际保留晚次待核实。",
+      "failure_mode": "日期未知时编造日期，部分退款时排除全部原区间",
+      "rule_ref": "flows/travel-expense.md#第-4-项签字意见保持简短"
+    },
+    {
+      "id": "RC-045-lodging-known-attendance",
+      "scope": "travel-expense",
+      "audit_item": "4-住宿与考勤",
+      "status": "confirmed",
+      "input_facts": [
+        "第1晚甲县酒店预订和地址可信，实际入住未确认",
+        "同日已有乙县考勤，没有甲县当晚地点证明"
+      ],
+      "incorrect_output": "❌ 第1晚住宿与考勤不一致；或称当天无考勤。",
+      "expected_output": "⚠️ 4、住宿与考勤：第1晚申报住宿甲县、考勤乙县，当晚甲县入住及地点证明待核实。",
+      "failure_mode": "将预订当作入住，或把缺当地证明说成完全无考勤",
+      "rule_ref": "flows/travel-expense.md#第-4-项签字意见保持简短"
+    },
+    {
+      "id": "RC-046-lodging-continue-known-evidence",
+      "scope": "travel-expense",
+      "audit_item": "4-住宿与考勤",
+      "status": "confirmed",
+      "input_facts": [
+        "第1、2晚均有可归属的结算及完整酒店地址，同日考勤一致",
+        "第3晚材料没有实际入住状态"
+      ],
+      "incorrect_output": "三晚实际入住均待核实。",
+      "expected_output": "⚠️ 4、住宿与考勤：第1、2晚一致；第3晚入住待核实。",
+      "failure_mode": "已有材料能核实却未继续核对，重复要求人工核实",
+      "rule_ref": "flows/travel-expense.md#第-4-项签字意见保持简短"
+    },
+    {
+      "id": "RC-047-marketing-readable-findings",
+      "scope": "small-marketing-fee",
+      "audit_item": "output-format",
+      "status": "confirmed",
+      "input_facts": [
+        "第2笔关联发票号码与车票不一致，导致该笔核销金额未定",
+        "客户编码和报销公司未填写，其他字段无法补足这些缺口"
+      ],
+      "incorrect_output": "第2条明细关联行权威字段无法稳定绑定，无法逐字比对，请财务判断。",
+      "expected_output": "保留六项及真实状态；相关项分别写：第2笔关联发票号码与车票不一致，需核实正确发票；客户编码未填写；第2笔发票关系待核实，核销金额暂不能确定；报销公司未填写。",
+      "failure_mode": "公开签字意见堆砌内部处理术语并重复套话",
+      "rule_ref": "result-contract.md#表达要求"
+    },
+    {
+      "id": "RC-048-concise-retains-required-values",
+      "scope": "five-finance-workflows",
+      "audit_item": "output-format",
+      "status": "confirmed",
+      "input_facts": [
+        "差旅油补已记录起止原值、申报值，实际复读和工具验算仍有差异",
+        "另一审核项按既定政策暂不校验预算"
+      ],
+      "incorrect_output": "油补有问题，预算符合。",
+      "expected_output": "保留起止读数、单位、算式、申报值和实际复核结果；预算保留适用流程指定的暂不校验说明，不为简短删掉必要原值或改称符合。",
+      "failure_mode": "简短意见删除关键证据或掩盖未执行核验",
+      "rule_ref": "result-contract.md#表达要求"
+    },
+    {
+      "id": "RC-049-packaging-concise-keeps-coverage",
+      "scope": "packaging-layout-approval",
+      "audit_item": "output-format",
+      "status": "confirmed",
+      "input_facts": [
+        "两个包装版本中有明确错字及一个无法辨清区域",
+        "未提供可选 Excel"
+      ],
+      "incorrect_output": "包装有问题，待核实。",
+      "expected_output": "仍保留固定四项，在受影响项简列版本或区域及原字／疑点，未提供 Excel 的说明只在末尾一次，不省略任何已确认问题。",
+      "failure_mode": "过度简化丢失固定项、版本定位、差异或 Excel 说明",
+      "rule_ref": "result-contract.md#表达要求"
+    },
+    {
       "id": "RC-038-payee-seller-exact-match",
       "scope": "general-expense",
       "audit_item": "1-附件完整性/支付证据",
@@ -145,7 +258,7 @@
         "全部相关考勤中，第2日和第3日完整地址含同名甲酒店附近，但没有独立可关联的酒店完整地址"
       ],
       "incorrect_output": "缺少酒店详情完整地址及实际入住证据，无法逐日与考勤地点比对。",
-      "expected_output": "⚠️ 4、住宿与考勤：已见甲酒店付款凭证，第2、3日考勤均在同名酒店附近；但缺少入住／离店日期及可关联的酒店完整地址，尚不能完成逐晚比对，请财务核实。",
+      "expected_output": "⚠️ 4、住宿与考勤：已见甲酒店付款及第2、3日同名酒店附近考勤，入住日期和酒店完整地址待核实。",
       "failure_mode": "只报告缺口，省略已经核实的付款事实和考勤相符线索；或将这些线索过度认定为实际入住",
       "rule_ref": "flows/travel-expense.md#第-4-项同时说明已核实线索与剩余缺口"
     },
@@ -159,7 +272,7 @@
         "逐晚对应考勤完整地址与酒店地址归一后的城市和区县一致，无冲突或未覆盖日期"
       ],
       "incorrect_output": "缺少酒店详情完整地址及实际入住证据，无法逐日与考勤地点比对。",
-      "expected_output": "✅ 4、住宿与考勤：已根据入住结算单核对第1、2晚住宿，酒店完整地址与对应日期考勤的城市、区县一致。",
+      "expected_output": "✅ 4、住宿与考勤：已核对住宿与考勤地点，一致。",
       "failure_mode": "把证据不足时的结论固定套用于证据完整的单据，重复索要已提供依据",
       "rule_ref": "flows/travel-expense.md#第-4-项同时说明已核实线索与剩余缺口"
     },
