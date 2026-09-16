@@ -1,7 +1,7 @@
 interface:
   display_name: "OA 预审"
   short_description: "读取可信证据，审核财务单据或校对包装版面文字"
-  default_prompt: "使用 $oa-finance-preaudit 按 requestId、业务流程编号或已授权单流程入口执行 OA 预审：五类财务流程按固定项目核实证据；包装版面流程校对图片文字，存在 Excel 时逐字符对照。输出前置 ✅/❌/⚠️。六类流程入口相互隔离，每个 requestId 使用全新隔离原生子 Agent，默认 Terra high、疑难单最多升级一次 Sol high；异常只上报用户指定的 Admin。OA 提交按 requestId 冻结、幂等和回执隔离，不同 requestId 可在有界池内并发。"
+  default_prompt: "使用 $oa-finance-preaudit 按 requestId、业务流程编号或已授权单流程入口执行 OA 预审：六类财务流程按固定项目核实证据；包装版面流程校对图片文字，存在 Excel 时逐字符对照。输出前置 ✅/❌/⚠️。七类流程入口相互隔离，每个 requestId 使用全新隔离原生子 Agent，默认 Terra high、疑难单最多升级一次 Sol high；异常只上报用户指定的 Admin。OA 提交按 requestId 冻结、幂等和回执隔离，不同 requestId 可在有界池内并发。"
 
 policy:
   allow_implicit_invocation: false

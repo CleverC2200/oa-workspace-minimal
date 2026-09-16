@@ -27,7 +27,7 @@
 
 修复验证通过且已有本次范围内的恢复/OA 写入授权时，继续完成恢复；不要再次询问用户是否处理已明确要求处理的隔离项。仅要求只读排查、代码修复或发布，不自行扩展为 OA 写入授权。缺少执行授权时先完成可独立进行的诊断、回归和精确恢复清单，再说明缺少的具体授权。
 
-五类财务使用生产同一个滚动入口，逐项传入精确旧 `action.json` 的 `--recover-action-file`；命令及门禁见 [README 恢复入口](../../README.md#滚动恢复隔离项)和[FlowEngine 合同](../../.agents/skills/oa-finance-preaudit/references/flow-engine-contract.md)。包装使用其现有单据入口和图片审核规则，不能塞入财务滚动队列。
+六类财务使用生产同一个滚动入口，逐项传入精确旧 `action.json` 的 `--recover-action-file`；命令及门禁见 [README 恢复入口](../../README.md#滚动恢复隔离项)和[FlowEngine 合同](../../.agents/skills/oa-finance-preaudit/references/flow-engine-contract.md)。包装使用其现有单据入口和图片审核规则，不能塞入财务滚动队列。
 
 恢复创建新 attempt，重新采集、审核和受控提交，原 attempt 保持不变。缺少显式恢复参数的普通控制器仍跳过隔离项。不要通过删除隔离、清除告警、改冻结状态、重复启动控制器或使用未知写入确认参数代替修复。正在执行时等待同一会话终态；滚动入口也可能接收新待办，须把指定恢复项与正常新增项分别核算。
 

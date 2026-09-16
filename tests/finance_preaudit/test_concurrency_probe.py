@@ -5556,6 +5556,166 @@ def test_dispatcher_quarantines_second_prewrite_invalid_decision(
     assert stop_requests == []
 
 
+def test_dispatcher_quarantines_malformed_review_without_writing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from apps.oa_finance_preaudit import codex_review_worker as worker
+
+    stop_requests: list[bool] = []
+    quarantine_calls: list[str] = []
+    submitted: list[bool] = []
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda: stop_requests.append(True),
+    )
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    _open_action(
+        flow_root,
+        case_key="8" * 64,
+        created_at="2026-08-24T12:00:00+00:00",
+    )
+    value = {
+        **worker._base_result(
+            attempts=1,
+            usages=[{"status": "unknown"}],
+        ),
+        "codex_events": worker._unknown_events(1),
+        "status": "failed",
+        "business_state": "not_available",
+        "write_state": "not_requested",
+        "error_code": "codex_decision_invalid",
+    }
+
+    def quarantine(_action_file: Path, reason: str) -> dict:
+        quarantine_calls.append(reason)
+        return {
+            "action": "needs_admin",
+            "execution_state": "needs_admin",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "reason": "codex_decision_invalid",
+        }
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        1,
+        1,
+        project_root=tmp_path,
+        renew_actions=lambda paths: paths,
+        review_worker=lambda _task: value,
+        complete_review=lambda *_args: submitted.append(True),
+        quarantine_review=quarantine,
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        runtime_status=lambda: {"status": "healthy"},
+    )
+
+    assert quarantine_calls == ["codex_decision_invalid"]
+    assert submitted == []
+    assert result.outcomes[0].value["status"] == "quarantined"
+    assert result.outcomes[0].value["write_state"] == "not_requested"
+    assert stop_requests == []
+
+
+def test_dispatcher_preserves_retry_history_when_retry_is_malformed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from apps.oa_finance_preaudit import codex_review_worker as worker
+
+    stop_requests: list[bool] = []
+    quarantine_calls: list[str] = []
+    completion_calls: list[bool] = []
+    review_calls: list[bool] = []
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda: stop_requests.append(True),
+    )
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    _open_action(
+        flow_root,
+        case_key="9" * 64,
+        created_at="2026-08-24T12:00:00+00:00",
+    )
+    reviewed = {
+        **worker._base_result(attempts=1, usages=[{"status": "unknown"}]),
+        "codex_events": worker._unknown_events(1),
+        "status": "reviewed",
+        "business_state": "not_available",
+        "write_state": "not_requested",
+        "error_code": None,
+        "agent_wall_seconds": 1,
+        "decision": {"overall": "needs_human"},
+    }
+    malformed = {
+        **worker._base_result(attempts=1, usages=[{"status": "unknown"}]),
+        "codex_events": worker._unknown_events(1),
+        "status": "failed",
+        "business_state": "not_available",
+        "write_state": "not_requested",
+        "error_code": "codex_decision_invalid",
+    }
+
+    def review(_task: dict) -> dict:
+        review_calls.append(True)
+        return reviewed if len(review_calls) == 1 else malformed
+
+    def complete(_action_file: Path, value: dict) -> dict:
+        completion_calls.append(True)
+        return {
+            **value,
+            "status": "retry_required",
+            "error_code": "codex_decision_invalid",
+        }
+
+    def quarantine(_action_file: Path, reason: str) -> dict:
+        quarantine_calls.append(reason)
+        return {
+            "action": "needs_admin",
+            "execution_state": "needs_admin",
+            "business_state": "not_available",
+            "write_state": "not_requested",
+            "reason": "codex_decision_invalid",
+        }
+
+    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        1,
+        1,
+        project_root=tmp_path,
+        renew_actions=lambda paths: paths,
+        review_worker=review,
+        complete_review=complete,
+        quarantine_review=quarantine,
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        runtime_status=lambda: {"status": "healthy"},
+    )
+
+    value = result.outcomes[0].value
+    assert review_calls == [True, True]
+    assert completion_calls == [True]
+    assert quarantine_calls == ["codex_decision_invalid"], (
+        value,
+        result.primary_error_code,
+        stop_requests,
+    )
+    assert value["status"] == "quarantined"
+    assert value["process_attempts"] == 2
+    assert value["process_retries"] == 1
+    assert value["write_state"] == "not_requested"
+    assert stop_requests == []
+
+
 def test_dispatcher_continues_fifo_after_invalid_decision_quarantine(
     tmp_path: Path,
     monkeypatch,
