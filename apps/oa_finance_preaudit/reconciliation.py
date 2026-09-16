@@ -249,6 +249,35 @@ def _confirmed_prior_round(root: Path, state: dict, rows: list[dict], now: datet
     return FlowEngine.confirmed_submission(root, state)
 
 
+def _deferred_historical_no_write_round(
+    root: Path, state: dict, rows: list[dict], now: datetime,
+) -> bool:
+    """Defer a superseded failed round only when its no-write proof is complete."""
+    if (
+        state.get("execution_state") != "needs_admin"
+        or state.get("write_state") != "not_requested"
+        or not _trusted_quarantine(root, state)
+        or len(rows) != 1
+        or rows[0].get("workflow_key") != state.get("workflow_key")
+    ):
+        return False
+    row = rows[0]
+    if row.get("request_id") and row.get("requestId") and row["request_id"] != row["requestId"]:
+        return False
+    old_time, new_time = str(state.get("received_at") or ""), _identity(row)[1]
+    timestamp = r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?"
+    if re.fullmatch(timestamp, old_time) is None or re.fullmatch(timestamp, new_time) is None:
+        return False
+    try:
+        previous, current = _received_at_utc(old_time), _received_at_utc(new_time)
+        created = datetime.fromisoformat(str(state["created_at"]).replace("Z", "+00:00"))
+        if not previous < current <= now or not created < current:
+            return False
+    except (ValueError, TypeError, KeyError):
+        return False
+    return True
+
+
 def reconcile(
     root: Path,
     *,
@@ -332,11 +361,17 @@ def reconcile(
             and category in {"handled_not_pending", "prior_round_submitted"}
         ):
             recommendation = "none"
+        elif (
+            category == "identity_conflict"
+            and _deferred_historical_no_write_round(root, state, current_rows, current_time)
+        ):
+            recommendation = "deferred_historical_cleanup"
         else:
             recommendation = "manual_state_review"
 
         if category in {"identity_conflict", "pending_handled_conflict"}:
-            blocking_reasons[category] += 1
+            if recommendation != "deferred_historical_cleanup":
+                blocking_reasons[category] += 1
         elif exact_pending and state.get("write_state") in {
             "unknown", "submitting", "authorized", "submitted"
         }:
