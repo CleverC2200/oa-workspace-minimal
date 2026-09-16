@@ -172,6 +172,12 @@ def test_tpm_worker_uses_only_the_tpm_rule_pack(tmp_path: Path) -> None:
         "无法识别票据",
         "凭证异常",
         "信息不清",
+        "不能建立",
+        "不能建立对应关系",
+        "无法建立金额",
+        "未能建立对应关系，请财务确认",
+        "待财务确认",
+        "对应关系待确认",
         "附件不完整",
         "附件不完整，请补充附件",
     ),
@@ -197,6 +203,8 @@ def test_tpm_rejects_vague_issue_conclusions(tmp_path: Path, vague: str) -> None
         "无法识别发票销售方",
         "发票金额与支付金额相差 100 元",
         "费用科目原值“渠道促销费”不在 10 类规则表",
+        "支付截图仅能证明一笔支付，尚不能建立其与关联发票的直接对应关系",
+        "关联发票与支付事实的对应关系尚不能建立，孰低核销金额待财务确认",
     ),
 )
 def test_tpm_accepts_a_specific_actionable_issue(
