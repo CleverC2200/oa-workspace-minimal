@@ -7,8 +7,8 @@ from apps import json_artifact
 from apps.oa_finance_preaudit import decision_validation, manual_handoff, review_failure_evidence
 
 
-@pytest.mark.parametrize("code", ["codex_process_timeout", "codex_decision_invalid"])
-def test_handoff_requires_bound_failure_and_contains_no_business_items(tmp_path: Path, code: str) -> None:
+def test_handoff_requires_bound_failure_and_contains_no_business_items(tmp_path: Path) -> None:
+    code = "codex_process_timeout"
     action = {"workflow_key": "small_marketing_fee", "action_token": "test-token"}
     path = tmp_path / "action.json"
     json_artifact.write_json_atomic(path, action)
@@ -16,16 +16,11 @@ def test_handoff_requires_bound_failure_and_contains_no_business_items(tmp_path:
     json_artifact.write_json_atomic(tmp_path / "review-packet.json", {"rule_version": "small_marketing_fee:2"})
     with pytest.raises(ValueError, match="manual_handoff_invalid"):
         manual_handoff.build(path, code)
-    if code == "codex_process_timeout":
-        receipt = tmp_path / "review-failure.json"
-        json_artifact.write_json_atomic(receipt, review_failure_evidence.receipt_payload(
-            action_token="test-token", workflow_key="small_marketing_fee",
-            failure_code=code, attempt_error_codes=[code],
-        ))
-    else:
-        decision_validation.record_rejection(path, {"secret": "private-value"},
-                                             decision_validation.InvalidDecision("decision_action_token"))
-        receipt = next(tmp_path.glob("review-rejection-*.json"))
+    receipt = tmp_path / "review-failure.json"
+    json_artifact.write_json_atomic(receipt, review_failure_evidence.receipt_payload(
+        action_token="test-token", workflow_key="small_marketing_fee",
+        failure_code=code, attempt_error_codes=[code],
+    ))
     document = manual_handoff.build(path, code)
     assert document["kind"] == "preaudit_manual_handoff"
     assert document["overall"] == "needs_human"
@@ -38,15 +33,33 @@ def test_handoff_requires_bound_failure_and_contains_no_business_items(tmp_path:
         manual_handoff.validate(document, tmp_path, action)
 
 
+def test_invalid_decision_cannot_build_manual_handoff(tmp_path: Path) -> None:
+    action = {"workflow_key": "small_marketing_fee", "action_token": "test-token"}
+    path = tmp_path / "action.json"
+    json_artifact.write_json_atomic(path, action)
+    json_artifact.write_json_atomic(tmp_path / "state.json", action)
+    json_artifact.write_json_atomic(
+        tmp_path / "review-packet.json",
+        {"rule_version": "small_marketing_fee:2"},
+    )
+    decision_validation.record_rejection(
+        path,
+        {},
+        decision_validation.InvalidDecision("decision_fields"),
+    )
+
+    with pytest.raises(ValueError, match="manual_handoff_invalid"):
+        manual_handoff.build(path, "codex_decision_invalid")
+
+
 @pytest.mark.parametrize("code", ["host_critical", "oa_session_expired", "writer_result_unknown", "codex_process_failed"])
 def test_unsafe_or_unapproved_failures_cannot_handoff(tmp_path: Path, code: str) -> None:
     with pytest.raises(ValueError, match="manual_handoff_invalid"):
         manual_handoff.build(tmp_path / "action.json", code)
 
 
-@pytest.mark.parametrize("code", ["codex_process_timeout", "codex_decision_invalid"])
 @pytest.mark.parametrize("workflow", sorted(manual_handoff.WORKFLOWS))
-def test_real_completion_notice_receipt_and_idempotence(tmp_path: Path, code: str, workflow: str) -> None:
+def test_real_completion_notice_receipt_and_idempotence(tmp_path: Path, workflow: str) -> None:
     from apps.oa_finance_preaudit import flow_engine
     from tests.finance_preaudit.test_flow_engine_submission import _material, _grant, _verify_grant, _success
 
@@ -60,13 +73,11 @@ def test_real_completion_notice_receipt_and_idempotence(tmp_path: Path, code: st
         collect_material=lambda request, _: {**_material(request), "workflow_key": workflow})
     action = engine.next_action(workflow)
     path = Path(action["action_file"])
-    if code == "codex_process_timeout":
-        json_artifact.write_json_atomic(path.with_name("review-failure.json"), review_failure_evidence.receipt_payload(
-            action_token=action["action_token"], workflow_key=workflow,
-            failure_code=code, attempt_error_codes=[code],
-        ))
-    else:
-        decision_validation.record_rejection(path, {}, decision_validation.InvalidDecision("decision_fields"))
+    code = "codex_process_timeout"
+    json_artifact.write_json_atomic(path.with_name("review-failure.json"), review_failure_evidence.receipt_payload(
+        action_token=action["action_token"], workflow_key=workflow,
+        failure_code=code, attempt_error_codes=[code],
+    ))
     document = manual_handoff.build(path, code)
     decision_path = tmp_path / "handoff.json"
     json_artifact.write_json_atomic(decision_path, document)
@@ -127,7 +138,11 @@ def test_timeout_without_reap_proof_stays_failed(tmp_path: Path, monkeypatch, st
 
 
 @pytest.mark.parametrize("health", ["healthy", "critical", "unknown"])
-def test_invalid_decision_hands_off_in_real_parent_completion(tmp_path: Path, monkeypatch, health: str) -> None:
+def test_invalid_decision_never_writes_a_manual_handoff(
+    tmp_path: Path,
+    monkeypatch,
+    health: str,
+) -> None:
     from apps.oa_finance_preaudit import codex_review_worker as worker, cli
     from tests.finance_preaudit.test_flow_engine_submission import _engine, _grant, _verify_grant, _success
     calls = []
@@ -144,15 +159,65 @@ def test_invalid_decision_hands_off_in_real_parent_completion(tmp_path: Path, mo
     monkeypatch.setattr(worker.runtime_control, "request_cycle_stop", lambda: stops.append(True))
     monkeypatch.setattr(worker.concurrency_control, "sample_local_health", lambda: {"status": health})
     result = worker._complete_decision(path, {})
-    if health == "healthy":
-        assert result is None
-        assert len(calls) == 1
-        assert "审核结果格式异常" in path.with_name("remark.txt").read_text()
-        assert not stops
-    else:
-        assert result == "stop_requested"
-        assert not calls
-        assert stops
+    assert result == "codex_decision_invalid"
+    assert not calls
+    assert not path.with_name("remark.txt").exists()
+    assert not path.with_name("execution-receipt.json").exists()
+    assert not stops
+
+
+def test_legacy_invalid_decision_handoff_is_rejected_at_writer_boundary(
+    tmp_path: Path,
+) -> None:
+    from tests.finance_preaudit.test_flow_engine_submission import (
+        _engine,
+        _grant,
+        _success,
+        _verify_grant,
+    )
+
+    calls = []
+
+    def submit(job):
+        calls.append(job)
+        return _success(job)
+
+    engine = _engine(
+        tmp_path,
+        "synthetic",
+        authorization_source=_grant,
+        authorization_verifier=_verify_grant,
+        submit_frozen=submit,
+    )
+    action = engine.next_action("travel_expense")
+    path = Path(action["action_file"])
+    decision_validation.record_rejection(
+        path,
+        {},
+        decision_validation.InvalidDecision("decision_fields"),
+    )
+    rejection = next(path.parent.glob("review-rejection-*.json"))
+    packet = json.loads(path.with_name("review-packet.json").read_text())
+    document = {
+        "schema_version": 1,
+        "kind": manual_handoff.KIND,
+        "action_token": action["action_token"],
+        "workflow_key": "travel_expense",
+        "rule_version": packet["rule_version"],
+        "overall": "needs_human",
+        "failure_code": "codex_decision_invalid",
+        "failure_receipt": rejection.name,
+        "failure_fingerprint": review_failure_evidence.file_fingerprint(rejection),
+    }
+    decision_path = tmp_path / "legacy-invalid-handoff.json"
+    json_artifact.write_json_atomic(decision_path, document)
+
+    with pytest.raises(ValueError, match="manual_handoff_invalid"):
+        engine.complete_manual_handoff(path, decision_path)
+
+    assert calls == []
+    assert not path.with_name("writer-boundary.json").exists()
+    assert not path.with_name("remark.txt").exists()
 
 
 @pytest.mark.parametrize("fault", [None, "host_critical", "target_changed", "proof_changed", "material_changed", "unknown"])
@@ -173,8 +238,16 @@ def test_handoff_through_production_adapter_boundaries(tmp_path: Path, monkeypat
         collect_material=lambda request, _: _material(request), **ports)
     action = engine.next_action("travel_expense", mode="controlled_write")
     path = Path(action["action_file"])
-    decision_validation.record_rejection(path, {}, decision_validation.InvalidDecision("decision_fields"))
-    document = manual_handoff.build(path, "codex_decision_invalid")
+    json_artifact.write_json_atomic(
+        path.with_name("review-failure.json"),
+        review_failure_evidence.receipt_payload(
+            action_token=action["action_token"],
+            workflow_key="travel_expense",
+            failure_code="codex_process_timeout",
+            attempt_error_codes=["codex_process_timeout"],
+        ),
+    )
+    document = manual_handoff.build(path, "codex_process_timeout")
     decision_path = tmp_path / "handoff.json"
     json_artifact.write_json_atomic(decision_path, document)
     monkeypatch.setattr(production_write.concurrency_control, "sample_local_health", lambda: {"status": "critical" if fault == "host_critical" else "healthy"})
@@ -206,7 +279,11 @@ def test_handoff_through_production_adapter_boundaries(tmp_path: Path, monkeypat
 
 
 @pytest.mark.parametrize("raw", ["not-json", "[]", "null", '"private-value"'])
-def test_raw_malformed_output_hands_off_without_retry(tmp_path: Path, monkeypatch, raw: str) -> None:
+def test_raw_malformed_output_fails_without_handoff(
+    tmp_path: Path,
+    monkeypatch,
+    raw: str,
+) -> None:
     import io
     from apps.oa_finance_preaudit import codex_review_worker as worker
     from tests.finance_preaudit.test_codex_review_worker import _task
@@ -227,8 +304,15 @@ def test_raw_malformed_output_hands_off_without_retry(tmp_path: Path, monkeypatc
     monkeypatch.setattr(worker.subprocess, "Popen", popen)
     monkeypatch.setattr(worker.runtime_control, "stop_requested", lambda: False)
     result = worker.review(task, executor=worker._execute_codex)
-    assert result["status"] == "reviewed"
-    assert result["decision"]["failure_code"] == "codex_decision_invalid"
+    assert result["status"] == "failed"
+    assert result["error_code"] == "codex_decision_invalid"
+    assert result["write_state"] == "not_requested"
+    assert "decision" not in result
     assert len(calls) == 1
-    receipt = path.with_name(result["decision"]["failure_receipt"]).read_text()
-    assert "private-value" not in receipt
+    assert not path.with_name("remark.txt").exists()
+    assert not path.with_name("execution-receipt.json").exists()
+    rejection = "".join(
+        artifact.read_text()
+        for artifact in path.parent.glob("review-rejection-*.json")
+    )
+    assert "private-value" not in rejection

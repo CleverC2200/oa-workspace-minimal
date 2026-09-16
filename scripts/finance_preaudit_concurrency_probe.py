@@ -83,7 +83,7 @@ ITEM_LOCAL_QUARANTINE_REASONS = {
     "material_collection_failed",
 }
 ITEM_LOCAL_REVIEW_FAILURE_REASONS = frozenset(
-    {"codex_process_failed", "codex_process_incomplete"}
+    {"codex_process_failed", "codex_process_incomplete", "codex_decision_invalid"}
 )
 ITEM_LOCAL_MATERIAL_FAILURE_DETAILS = (
     runtime_maintenance.ITEM_LOCAL_MATERIAL_FAILURE_DETAILS
@@ -2970,10 +2970,22 @@ def _run_dispatched_tasks(
                     error_code = str(
                         value.get("error_code") or "worker_process_failed"
                     )
+                    reported_value = (
+                        _merge_review_attempts(
+                            [*review_histories[index], value]
+                        )
+                        if index in review_histories
+                        else value
+                    )
+                    bounded_review_failure = (
+                        codex_review_worker.is_bounded_invalid_decision(value)
+                        if error_code == "codex_decision_invalid"
+                        else codex_review_worker.is_bounded_prewrite_failure(value)
+                    )
                     if (
                         (error_code in ITEM_LOCAL_REVIEW_FAILURE_REASONS
                          or error_code == "codex_process_timeout")
-                        and codex_review_worker.is_bounded_prewrite_failure(value)
+                        and bounded_review_failure
                     ):
                         try:
                             quarantine = quarantine_review(
@@ -2982,6 +2994,11 @@ def _run_dispatched_tasks(
                             )
                         except Exception:
                             quarantine = {}
+                        expected_reason = (
+                            "codex_decision_invalid"
+                            if error_code == "codex_decision_invalid"
+                            else "codex_review_failed"
+                        )
                         if all(
                             quarantine.get(field) == expected
                             for field, expected in {
@@ -2989,11 +3006,11 @@ def _run_dispatched_tasks(
                                 "execution_state": "needs_admin",
                                 "business_state": "not_available",
                                 "write_state": "not_requested",
-                                "reason": "codex_review_failed",
+                                "reason": expected_reason,
                             }.items()
                         ):
                             quarantined_value = {
-                                **value,
+                                **reported_value,
                                 "status": "quarantined",
                                 "execution_state": "needs_admin",
                                 "business_state": "not_available",
@@ -3015,14 +3032,17 @@ def _run_dispatched_tasks(
                                 pending_write_indices.remove(index)
                             else:
                                 skipped_write_indices.add(index)
+                            review_histories.pop(index, None)
                             advance_write_head()
                             observe_adaptive_window(quarantined_value)
                             continue
                         value = {
-                            **value,
+                            **reported_value,
                             "status": "failed",
                             "error_code": "codex_review_quarantine_failed",
                         }
+                    else:
+                        value = reported_value
                     outcomes[index] = process_pool.TaskOutcome(
                         index=index,
                         status="completed",
@@ -3031,6 +3051,7 @@ def _run_dispatched_tasks(
                             "prepare_elapsed_seconds": prepare_elapsed,
                         },
                     )
+                    review_histories.pop(index, None)
                     failed_now = True
                     if first_review_error_code is None:
                         first_review_error_code = str(

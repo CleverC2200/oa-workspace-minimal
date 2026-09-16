@@ -16,16 +16,16 @@ python3 -m apps.oa_finance_preaudit.cli next-action \
 stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSON：
 
 - `action=closed`：本轮结束，不取数、不等待。
-- `action=review_required`：只读取 `review_packet_file` 及审核包引用的 `material_file`，按审核包顺序完成当前流程的固定审核项。当前登录、会话、执行身份和流程授权可信时，五类财务流程的材料关系、规则口径或业务证据不足仍返回该动作；审核包标为 `material_state=degraded`，且 `required_uncertain_items` 列出必须交财务判断的项目。
+- `action=review_required`：只读取 `review_packet_file` 及审核包引用的 `material_file`，按审核包顺序完成当前流程的固定审核项。当前登录、会话、执行身份和流程授权可信时，六类财务流程的材料关系、规则口径或业务证据不足仍返回该动作；审核包标为 `material_state=degraded`，且 `required_uncertain_items` 列出必须交财务判断的项目。
 - `action=needs_admin`：当前登录/会话、执行身份、流程授权、单据身份、冻结 attempt、动作/状态、审核包完整性、写入授权或目标不再可信；这是退出码为 0 的正常动作结果。停止当前执行并报告 `reason`，不得生成财务意见、自行修复或重取。
 
-包装待办成功读取且为空时，入口另以只读已办结果核对历史材料失败。只有已办命中同一请求、action/state 身份及失败字段一致、`write_state=not_requested`，且无活动完成锁、Writer 边界、执行回执、审核决定、意见或提交信封时，才不再返回该旧失败。旧 attempt 和隔离证据保持不变，不创建新 attempt、不重新采集；没有其他动作时返回无工作 `closed`。已办不可读、未命中、身份冲突、未知写入和其他失败仍保留原阻断，已打开审核动作继续按原合同处理。其他五类财务流程不使用这一包装空队列规则。
+包装待办成功读取且为空时，入口另以只读已办结果核对历史材料失败。只有已办命中同一请求、action/state 身份及失败字段一致、`write_state=not_requested`，且无活动完成锁、Writer 边界、执行回执、审核决定、意见或提交信封时，才不再返回该旧失败。旧 attempt 和隔离证据保持不变，不创建新 attempt、不重新采集；没有其他动作时返回无工作 `closed`。已办不可读、未命中、身份冲突、未知写入和其他失败仍保留原阻断，已打开审核动作继续按原合同处理。其他六类财务流程不使用这一包装空队列规则。
 
 失败动作的 `reason` 与 `failure_detail_code` 必须一并保留，输出筛选不得丢弃细码。已授权告警遇到 `material_collection_failed` 且细码属于六类会话错误时，按[错误处理合同](error-handling.md)传递细码，由告警入口复核当前会话；不得把历史细码直接描述为当前登录故障。
 
 默认命令返回的 preview 动作固化 `mode=preview`、`write_authorized=false` 和 `write_state=not_requested`。审核决定不包含运行模式或授权，不能在第二步切换写入。
 
-手工 Skill 任务固定使用默认 preview，不得把已有 preview attempt 提升为写入。滚动生产控制器在五类财务流程中按 `received_at + requestId` 选取全局 FIFO；准备容量恒为 1，审核可并发，Writer 严格等待认领序号并保持全局单写。包装不进入该滚动池，继续走单据级图片文字校对路径。该入口校验当前显式确认、本地流程授权清单、停止状态、OA 身份和只读对账后才准备单据；健康窗口只调节并发，不改变提交次序。准备动作生成绑定当前单据和冻结证据的一小时 capability，完成动作再次验签并复核实时待办；任一边界验证失败均不写 OA。手工 `next-action --mode controlled-write` 和受控差旅 `complete-review` 明确拒绝，不能绕过控制器。唯一例外是人工已在 OA 核实未写入的 `writer_result_unknown`：独立确认必须绑定精确 requestId，action/state 均为 `needs_admin + write_state=unknown`，且控制器和所有 Writer 均不活动；入口重新核验实时待办、已办、最新 attempt、身份和执行回执后，仅创建新的受控冻结 attempt，不直接提交 OA，后续仍由滚动控制器和唯一 Writer 处理。
+手工 Skill 任务固定使用默认 preview，不得把已有 preview attempt 提升为写入。滚动生产控制器在六类财务流程中按 `received_at + requestId` 选取全局 FIFO；准备容量恒为 1，审核可并发，Writer 严格等待认领序号并保持全局单写。包装不进入该滚动池，继续走单据级图片文字校对路径。该入口校验当前显式确认、本地流程授权清单、停止状态、OA 身份和只读对账后才准备单据；健康窗口只调节并发，不改变提交次序。准备动作生成绑定当前单据和冻结证据的一小时 capability，完成动作再次验签并复核实时待办；任一边界验证失败均不写 OA。手工 `next-action --mode controlled-write` 和受控差旅 `complete-review` 明确拒绝，不能绕过控制器。唯一例外是人工已在 OA 核实未写入的 `writer_result_unknown`：独立确认必须绑定精确 requestId，action/state 均为 `needs_admin + write_state=unknown`，且控制器和所有 Writer 均不活动；入口重新核验实时待办、已办、最新 attempt、身份和执行回执后，仅创建新的受控冻结 attempt，不直接提交 OA，后续仍由滚动控制器和唯一 Writer 处理。
 
 控制器领取已打开动作时，若 capability 已过期或剩余有效期不超过 20 分钟，必须先在原身份、材料和 evidence 指纹绑定下刷新 capability 与提交 token，再开始最长 15 分钟的审核；剩余有效期超过该窗口时保持原 token，不因重复读取破坏幂等。完成宿主在提交前再次执行同一刷新判断；此时保留审核决定绑定的 action token，只轮换 capability 和 submission token。
 
@@ -45,11 +45,13 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
 
 资源等待与 AI 审核失败分开处理。CPU 高负载本身属于 `pressure`，不再单独触发 `critical`；弹性审核默认从 6 槽开始，持续压力按每次心跳逐级降到 2、1 槽，保留在途审核，不为降档杀进程。恢复后仍需连续两个完整健康窗口才按 `1 → 2 → 6 → 8 → 10 → 12` 升一级。材料准备及 Writer 均保持 1 槽，原全局 FIFO 不变。
 
-宿主健康采样未知时，控制器标记 `resource_paused=true`，暂停新领取、准备完成后的审核派发及排队 Writer；已在途操作仍受原超时和安全校验约束。周期性复测恢复可信后继续原队列，排队等待不启动 AI 审核计时。等待期间仍响应显式停止，已进入 Writer 的操作不能被重放。可用内存低于 12% 仍为 `critical`，即使 CPU 采样缺失也立即停止。资源繁忙或等待绝不生成下述人工交接意见；实际 AI 超时或结果格式失败继续按下述独立规则处理。
+宿主健康采样未知时，控制器标记 `resource_paused=true`，暂停新领取、准备完成后的审核派发及排队 Writer；已在途操作仍受原超时和安全校验约束。周期性复测恢复可信后继续原队列，排队等待不启动 AI 审核计时。等待期间仍响应显式停止，已进入 Writer 的操作不能被重放。可用内存低于 12% 仍为 `critical`，即使 CPU 采样缺失也立即停止。资源繁忙或等待绝不生成下述人工交接意见；只有实际 AI 超时继续按下述独立规则处理。
 
-五类财务当前受控 attempt 遇到 `codex_process_timeout` 或 `codex_decision_invalid` 时，宿主可生成 `preaudit_manual_handoff` 行政交接记录，说明 AI 未形成有效业务结论，请财务人工审核。它不是 `preaudit_review_decision`，不含 `items`，不计为完成业务审核覆盖；原固定项目规则只适用于有效业务决定。包装与手工 preview 不使用此分支。
+六类财务当前受控 attempt 遇到 `codex_process_timeout` 时，宿主可生成 `preaudit_manual_handoff` 行政交接记录，说明 AI 未形成有效业务结论，请财务人工审核。它不是 `preaudit_review_decision`，不含 `items`，不计为完成业务审核覆盖；原固定项目规则只适用于有效业务决定。包装与手工 preview 不使用此分支。
 
-超时须确认审核进程组退出并保存绑定当前 action token 的失败凭据；结构校验失败须保存当前决定摘要和固定校验码的拒绝凭据。宿主在同一完成锁内复核动作仍为 `review_required / authorized`、冻结输入、当前授权及零 Writer 痕迹，再将特别说明交给唯一串行 Writer；身份、待办、begin-submit、终态回执与后置校验仍全部执行。此分支不再请求 AI 重试，成功闭合为 `needs_human / submitted` 后继续 FIFO。意见只说明超时或结果格式异常，不包含原始错误内容，也不生成业务通过/不通过结论。
+超时须确认审核进程组退出并保存绑定当前 action token 的失败凭据。宿主在同一完成锁内复核动作仍为 `review_required / authorized`、冻结输入、当前授权及零 Writer 痕迹，再将特别说明交给唯一串行 Writer；身份、待办、begin-submit、终态回执与后置校验仍全部执行。此分支不再请求 AI 重试，成功闭合为 `needs_human / submitted` 后继续 FIFO。意见只说明审核超时，不包含原始错误内容，也不生成业务通过/不通过结论。
+
+`codex_decision_invalid` 不得生成 `preaudit_manual_handoff`，也不得进入 Writer。有效 JSON 对象在父 Writer 的结构校验失败时，由调度器重新发起一次独立 AI 审核；第二次仍无效则把当前 attempt 隔离为 `codex_decision_invalid / needs_admin / not_requested`，继续全局 FIFO。原始输出不是单个有效决定对象时不重试，直接按同一 no-write 结果隔离当前 attempt 并继续 FIFO。两种路径都保存脱敏拒绝凭据，禁止把“审核结果格式异常”写入 OA；最终人工交接校验边界也必须拒绝该失败码。
 
 登录失效、身份/材料/授权不可信、未知写入、当前停止门、本机 critical 或健康状态未知仍停止；进程回收未确认时不得转交接。历史隔离项不自动重试，已办意见不追改。普通进程失败和无有效对象的进程未完成仍按原隔离合同处理。
 

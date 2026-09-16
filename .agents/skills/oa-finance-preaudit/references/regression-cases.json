@@ -89,7 +89,7 @@
     },
     {
       "id": "RC-048-concise-retains-required-values",
-      "scope": "five-finance-workflows",
+      "scope": "six-finance-workflows",
       "audit_item": "output-format",
       "status": "confirmed",
       "input_facts": [
@@ -278,7 +278,7 @@
     },
     {
       "id": "RC-029-resource-pressure-keeps-ai-review",
-      "scope": "five-finance-workflows",
+      "scope": "six-finance-workflows",
       "audit_item": "resource-pressure",
       "status": "confirmed",
       "input_facts": ["CPU 持续高负载但内存充足，身份、冻结和授权可信", "AI 审核尚未发生实际超时或格式失败"],
@@ -289,13 +289,13 @@
     },
     {
       "id": "RC-028-bounded-ai-failure-handoff",
-      "scope": "five-finance-workflows",
+      "scope": "six-finance-workflows",
       "audit_item": "manual-handoff",
       "status": "confirmed",
-      "input_facts": ["当前受控审核超时且进程已退出，或结构校验失败", "登录身份、冻结、授权可信且尚未写入"],
-      "incorrect_output": "隔离当前单据，等待再次 AI 审核",
-      "expected_output": "AI审核结论：需人工审核 ⚠️；特别说明 AI 未形成有效业务审核结论，请财务人工核对材料并审核",
-      "failure_mode": "把可安全交接的 AI 审核失败扩大为财务流程阻断",
+      "input_facts": ["当前受控审核超时且进程已退出，或 AI 结果结构校验失败", "登录身份、冻结、授权可信且尚未写入"],
+      "incorrect_output": "结构校验失败后写入“AI审核结论：需人工审核”，推进 OA 流程",
+      "expected_output": "仅审核超时写人工交接意见；有效对象结构无效时重试一次后单据级隔离，原始输出不可解析时直接单据级隔离，两者均不写 OA 并继续后续 FIFO",
+      "failure_mode": "把无效 AI 结果转换成 OA 意见，导致没有业务结论的单据进入已办状态",
       "rule_ref": "flow-engine-contract.md#审核未完成的人工交接"
     },
     {

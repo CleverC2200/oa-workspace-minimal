@@ -1,17 +1,15 @@
 """Bound administrative handoff notices, never synthetic business decisions."""
 from __future__ import annotations
 
-import hashlib
-import re
 from pathlib import Path
 
-from . import decision_validation, review_failure_evidence
+from . import review_failure_evidence
 
 KIND = "preaudit_manual_handoff"
 WORKFLOWS = frozenset({"travel_expense", "business_entertainment", "business_support_fee",
                        "small_marketing_fee", "tpm_small_marketing_fee",
                        "general_expense"})
-REASONS = {"codex_process_timeout": "审核超时", "codex_decision_invalid": "审核结果格式异常"}
+REASONS = {"codex_process_timeout": "审核超时"}
 FIELDS = {"schema_version", "kind", "action_token", "workflow_key", "rule_version",
           "overall", "failure_code", "failure_receipt", "failure_fingerprint"}
 
@@ -29,31 +27,18 @@ def _proof(root: Path, document: dict) -> bool:
     token = document.get("action_token")
     if not isinstance(name, str) or not isinstance(token, str) or not token:
         return False
-    if code == "codex_process_timeout":
-        if name != "review-failure.json":
-            return False
-    elif code == "codex_decision_invalid":
-        if not re.fullmatch(r"review-rejection-[0-9a-f]{64}\.json", name):
-            return False
-    else:
+    if code != "codex_process_timeout" or name != "review-failure.json":
         return False
     path = root / name
     receipt = review_failure_evidence.read_receipt(path)
     fingerprint = review_failure_evidence.file_fingerprint(path)
     if receipt is None or fingerprint is None or fingerprint != document.get("failure_fingerprint"):
         return False
-    if code == "codex_process_timeout":
-        return review_failure_evidence.receipt_matches(
-            receipt, action_token=token, workflow_key=document["workflow_key"], failure_code=code,
-        )
-    return (
-        set(receipt) == {"schema_version", "kind", "action_token_sha256", "decision_sha256", "validation_code"}
-        and receipt.get("schema_version") == 1
-        and receipt.get("kind") == "preaudit_decision_rejection"
-        and receipt.get("action_token_sha256") == hashlib.sha256(token.encode()).hexdigest()
-        and receipt.get("decision_sha256") == name[len("review-rejection-"):-len(".json")]
-        and isinstance(receipt.get("validation_code"), str)
-        and receipt.get("validation_code") in decision_validation.CODES
+    return review_failure_evidence.receipt_matches(
+        receipt,
+        action_token=token,
+        workflow_key=document["workflow_key"],
+        failure_code=code,
     )
 
 
@@ -99,7 +84,7 @@ def build(action_file: Path, failure_code: str) -> dict:
     state = _read(root / "state.json")
     if not action.get("action_token") or state.get("action_token") != action.get("action_token"):
         raise ValueError("manual_handoff_invalid")
-    paths = [root / "review-failure.json"] if failure_code == "codex_process_timeout" else sorted(root.glob("review-rejection-*.json"))
+    paths = [root / "review-failure.json"]
     for path in paths:
         document = {
             "schema_version": 1, "kind": KIND, "overall": "needs_human",

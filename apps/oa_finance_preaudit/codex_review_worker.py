@@ -972,15 +972,11 @@ def _complete_decision(action_file: Path, decision: dict) -> str | None:
                     decision_validation.record_rejection(action_file, decision, error)
                 except (OSError, ValueError, TypeError):
                     return "codex_decision_diagnostic_failed"
-                if not _safe_to_retry(action_file):
-                    return "codex_decision_invalid"
-                try:
-                    handoff = manual_handoff.build(action_file, "codex_decision_invalid")
-                    # Re-enter the same parent Writer, never launch another model.
-                    return _complete_decision(action_file, handoff)
-                except (OSError, ValueError, TypeError):
-                    runtime_control.request_cycle_stop()
-                    return "codex_decision_diagnostic_failed"
+                # The dispatcher owns the one bounded retry and item-local
+                # quarantine. Never turn an invalid AI decision into an OA
+                # write: doing so advances the workflow with no business
+                # review and makes the original pending item unrecoverable.
+                return "codex_decision_invalid"
             runtime_control.request_stop("writer_result_unknown")
             return "codex_decision_submit_failed"
         except Exception:
@@ -1071,7 +1067,12 @@ def _valid_token_usage(value: object) -> bool:
     )
 
 
-def is_bounded_prewrite_failure(value: object) -> bool:
+def _is_bounded_failure(
+    value: object,
+    *,
+    allowed_attempts: set[int],
+    error_codes: set[str] | frozenset[str],
+) -> bool:
     if not isinstance(value, dict) or set(value) != {
         "schema_version",
         "kind",
@@ -1093,9 +1094,7 @@ def is_bounded_prewrite_failure(value: object) -> bool:
         and value.get("model") == MODEL
         and value.get("reasoning_effort") == REASONING_EFFORT
         and type(value.get("process_attempts")) is int
-        and value.get("process_attempts") in (
-            {1, 2} if value.get("error_code") == "codex_process_timeout" else {2}
-        )
+        and value.get("process_attempts") in allowed_attempts
         and type(value.get("process_retries")) is int
         and value.get("process_retries") == value["process_attempts"] - 1
         and _valid_token_usage(value.get("token_usage"))
@@ -1103,7 +1102,24 @@ def is_bounded_prewrite_failure(value: object) -> bool:
         and value.get("status") == "failed"
         and value.get("business_state") == "not_available"
         and value.get("write_state") == "not_requested"
-        and value.get("error_code") in _BOUNDED_PREWRITE_FAILURE_CODES
+        and value.get("error_code") in error_codes
+    )
+
+
+def is_bounded_prewrite_failure(value: object) -> bool:
+    error_code = value.get("error_code") if isinstance(value, dict) else None
+    return _is_bounded_failure(
+        value,
+        allowed_attempts={1, 2} if error_code == "codex_process_timeout" else {2},
+        error_codes=_BOUNDED_PREWRITE_FAILURE_CODES,
+    )
+
+
+def is_bounded_invalid_decision(value: object) -> bool:
+    return _is_bounded_failure(
+        value,
+        allowed_attempts={1, 2},
+        error_codes={"codex_decision_invalid"},
     )
 
 
@@ -1412,26 +1428,6 @@ def review(
                 "decision": execution.decision,
             }
         error_code = execution.error_code or "codex_process_incomplete"
-        if (
-            error_code == "codex_decision_invalid"
-            and execution.process_state == "exited"
-            and execution.exit_code == 0
-            and _safe_to_retry(action_file)
-            and not runtime_control.stop_requested()
-        ):
-            try:
-                handoff = manual_handoff.build(action_file, error_code)
-            except (OSError, ValueError, TypeError):
-                error_code = "codex_decision_diagnostic_failed"
-            else:
-                return {
-                    **_base_result(attempts=attempt, usages=usages),
-                    "codex_events": _merge_events(executions),
-                    "status": "reviewed", "business_state": "not_available",
-                    "write_state": "not_requested", "error_code": None,
-                    "agent_wall_seconds": max(0, int(time.monotonic() - run_started)),
-                    "decision": handoff,
-                }
         if (
             attempt == 1
             and error_code in {"codex_process_failed", "codex_process_incomplete"}
