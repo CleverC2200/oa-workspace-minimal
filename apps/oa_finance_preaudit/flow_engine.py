@@ -341,11 +341,16 @@ def _validate_tpm_small_marketing_conclusions(items: list[dict]) -> None:
         "发票购买方",
         "发票销售方",
         "发票金额",
+        "发票归属",
+        "申报金额",
+        "申报总额",
         "广告公司盖章版制作清单",
         "制作清单",
         "购买明细",
         "参考报价单",
         "现场定位照片",
+        "定位照片",
+        "现场执行附件",
         "制作完成定位照片",
         "试吃定位照片",
         "订货会现场",
@@ -359,85 +364,362 @@ def _validate_tpm_small_marketing_conclusions(items: list[dict]) -> None:
         "激励政策",
         "支付截图",
         "支付金额",
+        "实际支付",
+        "支付去重",
+        "对公支付豁免",
+        "付款状态",
+        "支付日期",
+        "流水号",
         "付款主体",
+        "收款主体",
         "收款关系",
+        "支付对应关系",
+        "付款收款人",
+        "收款方",
         "收款人姓名",
         "收款人身份证号",
         "收款人手机号",
         "购买方",
         "销售方",
-        "事项",
-        "金额",
         "印章",
         "明细归属",
-        "对应关系",
+        "附件字段",
+        "附件完整性",
+        "实际支付事实",
+        "实际外部供应商",
+        "非重复支付事实",
+        "制作数量",
+        "样式",
         "重复截图",
     )
     cue_patterns = (
-        re.compile(r"缺少|缺失|未提供|需补充"),
+        re.compile(r"缺(?:少|失)?|未提供|需补充"),
         re.compile(r"无法识别|无法确认|无法核对|无法确定|读取失败|不清"),
         re.compile(r"不足|重复|未关联"),
+        re.compile(
+            r"异常|不完整|待确认|待核对|未核实|不明|不符合|不满足|无可关联"
+        ),
     )
-    establish = re.compile(r"无法建立|未能建立|不能建立")
+    natural_issue_patterns = (
+        re.compile(
+            r"(?:无法|不能|未能|尚不能|不可).{0,24}"
+            r"(?:识别|确认|核对|判断|确定|匹配|核销|完成|读取|推定)"
+        ),
+        re.compile(
+            r"未取得|未解析|未形成|未核验|未确认|未记录|未关联|为空|不可读取"
+        ),
+    )
+    direct_conflict = re.compile(r"非纸质发票")
+    explicit_missing_cue = re.compile(
+        r"缺(?:少|失)?|未提供|需补充|未取得|未解析|未形成|未显示|"
+        r"不可读取|读取失败|无法识别|无可关联"
+    )
+    explicit_missing_markers = (*specific_markers, "附件清单")
+    field_state_cue = re.compile(
+        r"未确认|未核实|待核对|不明|为空|无法确认|无法核对|不能核对"
+    )
+    state_field_markers = (
+        "发票购买方",
+        "发票销售方",
+        "发票金额",
+        "发票归属",
+        "支付金额",
+        "付款状态",
+        "支付日期",
+        "流水号",
+        "付款主体",
+        "收款主体",
+        "收款关系",
+        "支付对应关系",
+        "付款收款人",
+        "收款方",
+        "收款人姓名",
+        "收款人身份证号",
+        "收款人手机号",
+        "明细归属",
+        "附件完整性",
+        "实际支付",
+        "支付去重",
+        "购买方",
+        "销售方",
+        "印章",
+    )
+    establish = re.compile(r"无法建立|未能建立|不能建立|未建立")
     relationship_object_groups = (
         ("关联发票", "纸质发票", "发票"),
-        ("支付截图", "支付凭证", "支付事实", "实际支付", "付款主体"),
+        (
+            "支付截图",
+            "支付凭证",
+            "支付事实",
+            "实际支付",
+            "付款主体",
+            "支付",
+        ),
         ("收据",),
         ("明细归属", "费用明细", "当前明细", "明细"),
         ("关联申请签报", "申请签报", "签报"),
         ("制作清单", "购买明细", "费用清单", "POS复核数据表", "激励政策"),
-        ("现场定位照片", "制作完成定位照片", "试吃定位照片", "全局定位照片"),
-        ("购买方", "销售方", "收款人", "印章"),
+        (
+            "现场定位照片",
+            "定位照片",
+            "制作完成定位照片",
+            "试吃定位照片",
+            "全局定位照片",
+        ),
+        ("购买方", "销售方", "收款人", "收款主体", "印章"),
         ("费用科目",),
     )
     mismatch = re.compile(r"不一致|相差|冲突")
+    mismatch_object_groups = (
+        ("发票购买方", "购买方"),
+        ("发票销售方", "销售方"),
+        ("收款人", "收款主体", "付款收款人", "收款方"),
+        ("印章",),
+        ("发票金额",),
+        ("发票归属",),
+        ("支付金额",),
+        ("付款状态",),
+        ("支付日期",),
+        ("流水号",),
+        ("付款主体",),
+        ("收款关系",),
+        ("支付对应关系",),
+        ("明细归属",),
+        ("申报金额", "申报总额"),
+        ("费用科目", "科目原值"),
+        ("关联发票", "纸质发票"),
+        ("支付截图", "支付凭证"),
+        ("实际支付", "实际支付事实"),
+        ("支付去重", "非重复支付事实", "重复截图"),
+        ("对公支付豁免",),
+        (
+            "现场定位照片",
+            "定位照片",
+            "制作完成定位照片",
+            "试吃定位照片",
+            "全局定位照片",
+        ),
+        (
+            "广告公司盖章版制作清单",
+            "制作清单",
+        ),
+        ("购买明细",),
+        ("参考报价单",),
+        ("现场执行附件",),
+        ("订货会现场",),
+        ("定位信息",),
+        ("关联申请签报", "申请签报"),
+        ("费用清单",),
+        ("签到表",),
+        ("POS复核数据表",),
+        ("激励政策",),
+        ("附件字段",),
+        ("附件完整性",),
+        ("实际外部供应商",),
+        ("制作数量",),
+        ("样式",),
+    )
+    specific_operation = re.compile(
+        r"逐字匹配|逐项核对|孰低|核销|照片数量|现场执行附件|"
+        r"附件完整性|纸质发票|实际外部供应商|是否齐备|"
+        r"非重复支付事实|对公支付豁免|制作数量|样式|去重结果|"
+        r"推定分配|一致性"
+    )
+    clause_boundary = re.compile(
+        r"[，,。；;：:！!？?\n]+|但(?:是)?|然而|并且|并(?!未|不|非|无)|且|同时|而"
+    )
+
+    def nearest_mismatch_group(text: str, *, from_right: bool) -> int | None:
+        matches: list[tuple[int, int, int, int]] = []
+        for index, group in enumerate(mismatch_object_groups):
+            for marker in group:
+                start = text.rfind(marker) if from_right else text.find(marker)
+                if start >= 0:
+                    matches.append((start, start + len(marker), len(marker), index))
+        if not matches:
+            return None
+        clusters: list[list[tuple[int, int, int, int]]] = []
+        for match in sorted(matches, key=lambda item: (item[0], item[1])):
+            if not clusters or match[0] > max(item[1] for item in clusters[-1]):
+                clusters.append([match])
+            else:
+                clusters[-1].append(match)
+        nearest_cluster = clusters[-1] if from_right else clusters[0]
+        return max(
+            nearest_cluster,
+            key=lambda match: (match[1], match[2]),
+        )[3]
+
     for item in items:
         if item.get("status") not in {"fail", "uncertain"}:
             continue
         conclusion = str(item.get("conclusion") or "").strip()
-        normalized = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", conclusion)
-        normalized = re.sub(
-            r"(?:请)?(?:财务|人工)(?:核对|判断|处理|确认)$",
-            "",
-            normalized,
+        conclusion = re.sub(
+            r"(缺失(?:的)?字段|缺少(?:的)?材料|"
+            r"需补充(?:材料|字段)?|缺少|缺失)\s*[：:]\s*",
+            r"\1",
+            conclusion,
         )
-        has_issue_cue = any(cue.search(normalized) for cue in cue_patterns)
-        has_specific_marker = any(
-            marker in normalized for marker in specific_markers
-        )
-        has_concrete_value = bool(
-            re.search(r"[0-9]", normalized)
-            or re.search(r"原值", normalized)
-            or re.search(r"[“”‘’\"'].[^“”‘’\"']*[“”‘’\"']", conclusion)
-        )
-        specific = has_issue_cue and (has_specific_marker or has_concrete_value)
-        relationship_objects = sum(
-            any(marker in normalized for marker in group)
-            for group in relationship_object_groups
-        )
-        specific = specific or bool(
-            establish.search(normalized)
-            and (
-                relationship_objects >= 2
-                or (relationship_objects == 1 and has_concrete_value)
+        specific_issue_count = 0
+        context_normalized = ""
+        previous_clause_specific_issue = False
+        for raw_clause in clause_boundary.split(conclusion):
+            raw_clause = raw_clause.strip()
+            if not raw_clause:
+                continue
+            normalized = re.sub(
+                r"[^0-9A-Za-z\u4e00-\u9fff]+",
+                "",
+                raw_clause,
             )
-        )
-        subject_out_of_scope = (
-            "费用科目" in normalized
-            and has_concrete_value
-            and (
-                ("不在" in normalized and "表" in normalized)
-                or "未匹配" in normalized
-            )
-        )
-        specific = specific or subject_out_of_scope
-        if mismatch.search(normalized) is not None:
-            if (has_specific_marker or has_concrete_value) and re.search(
-                r"与|和|分别|原值|[0-9]",
+            normalized = re.sub(
+                r"(?:请)?(?:财务|人工)(?:核对|判断|处理|确认)$",
+                "",
                 normalized,
-            ):
-                specific = True
-        if not specific:
+            )
+            issue_normalized = re.sub(
+                r"(?:支付)?截图未见重复|未见重复截图|截图不重复",
+                "",
+                normalized,
+            )
+            has_issue_cue = any(
+                cue.search(issue_normalized) for cue in cue_patterns
+            ) or any(
+                cue.search(issue_normalized) for cue in natural_issue_patterns
+            )
+            has_specific_marker = any(
+                marker in issue_normalized for marker in specific_markers
+            )
+            has_concrete_value = has_specific_marker and bool(
+                re.search(r"[0-9]", issue_normalized)
+                or re.search(r"原值", issue_normalized)
+                or re.search(
+                    r"[“”‘’\"'].[^“”‘’\"']*[“”‘’\"']",
+                    raw_clause,
+                )
+            )
+            relationship_source = (
+                context_normalized + issue_normalized
+                if "其与" in issue_normalized
+                else issue_normalized
+            )
+            relationship_objects = sum(
+                any(marker in relationship_source for marker in group)
+                for group in relationship_object_groups
+            )
+            explicit_missing_fact = bool(
+                explicit_missing_cue.search(issue_normalized)
+                and any(
+                    marker in issue_normalized
+                    for marker in explicit_missing_markers
+                )
+            )
+            concrete_field_state = bool(
+                field_state_cue.search(issue_normalized)
+                and any(
+                    marker in issue_normalized
+                    for marker in state_field_markers
+                )
+            )
+            concrete_operation = bool(
+                specific_operation.search(issue_normalized)
+                and has_specific_marker
+            )
+            clause_specific = concrete_field_state or (
+                has_issue_cue
+                and (
+                    has_concrete_value
+                    or relationship_objects >= 2
+                    or explicit_missing_fact
+                    or concrete_operation
+                )
+            )
+            clause_specific = clause_specific or bool(
+                direct_conflict.search(issue_normalized)
+            )
+            clause_specific = clause_specific or bool(
+                establish.search(issue_normalized)
+                and (
+                    relationship_objects >= 2
+                    or (relationship_objects == 1 and has_concrete_value)
+                )
+            )
+            subject_out_of_scope = (
+                "费用科目" in issue_normalized
+                and has_concrete_value
+                and (
+                    (
+                        "不在" in issue_normalized
+                        and "表" in issue_normalized
+                    )
+                    or "未匹配" in issue_normalized
+                )
+            )
+            clause_specific = clause_specific or subject_out_of_scope
+            if mismatch.search(issue_normalized) is not None:
+                mismatch_source = re.sub(
+                    r"[^0-9A-Za-z\u4e00-\u9fff、]+",
+                    "",
+                    raw_clause,
+                )
+                distinct_mismatch_objects = False
+                connector_matches = tuple(
+                    re.finditer(r"与|和|、|同|跟|及", mismatch_source)
+                )
+                for connector in reversed(connector_matches):
+                    mismatch_parts = (
+                        mismatch_source[: connector.start()],
+                        mismatch_source[connector.end() :],
+                    )
+                    left_group = nearest_mismatch_group(
+                        mismatch_parts[0],
+                        from_right=True,
+                    )
+                    right_group = nearest_mismatch_group(
+                        mismatch_parts[1],
+                        from_right=False,
+                    )
+                    distinct_mismatch_objects = (
+                        left_group is not None
+                        and right_group is not None
+                        and left_group != right_group
+                    )
+                    if left_group is not None and right_group is not None:
+                        break
+                clause_specific = clause_specific or bool(
+                    distinct_mismatch_objects or has_concrete_value
+                )
+            consequence_clause = bool(
+                previous_clause_specific_issue
+                and (
+                    specific_operation.search(issue_normalized)
+                    or re.search(
+                        r"实际付款及对应关系待(?:财务|人工)(?:判断|核对|确认)",
+                        raw_clause,
+                    )
+                )
+                and not explicit_missing_cue.search(issue_normalized)
+            )
+            clause_specific = clause_specific or consequence_clause
+            clause_is_issue = bool(
+                has_issue_cue
+                or direct_conflict.search(issue_normalized)
+                or establish.search(issue_normalized)
+                or mismatch.search(issue_normalized)
+                or concrete_field_state
+                or subject_out_of_scope
+            )
+            if clause_is_issue and not clause_specific:
+                raise decision_validation.InvalidDecision(
+                    "issue_list_not_specific"
+                )
+            if clause_is_issue:
+                specific_issue_count += 1
+            previous_clause_specific_issue = bool(
+                clause_is_issue and clause_specific
+            )
+            context_normalized += normalized
+        if specific_issue_count == 0:
             raise decision_validation.InvalidDecision("issue_list_not_specific")
 
 

@@ -3,6 +3,20 @@
   "description": "人工确认的脱敏财务预审错误案例。仅在盲测结果冻结后用于对照和回归，不作为观察子 Agent 的当前答案。",
   "cases": [
     {
+      "id": "RC-050-tpm-natural-specific-finding-rejected",
+      "scope": "tpm_small_marketing_fee",
+      "audit_item": "output-validation",
+      "status": "confirmed",
+      "input_facts": [
+        "问题结论已经写明具体费用科目、材料、发票、支付、金额或主体对象",
+        "结论使用无法逐字匹配、不能按孰低原则确定、字段未解析或非纸质发票等自然表达"
+      ],
+      "incorrect_output": "仅因未命中少量固定动词而返回 issue_list_not_specific",
+      "expected_output": "自然同义表达写明原值或金额、明细序号、关系两端或明确缺失材料字段时接受；没有具体事实的空泛套话仍拒绝",
+      "failure_mode": "把词表匹配当成问题具体性，误杀已经可供财务定位的签字意见",
+      "rule_ref": "flows/tpm-small-marketing-fee.md#问题具体性"
+    },
+    {
       "id": "RC-042-lodging-concise-mixed",
       "scope": "travel-expense",
       "audit_item": "4-住宿与考勤",
