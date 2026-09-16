@@ -101,7 +101,13 @@ def _authority_facts(
         facts.append(fact)
     if str(config.get("flow_key") or "") == _PACKAGING_FLOW:
         return facts
-    invoice_result = invoice_buyers.read_invoice_buyers(oa_api, workflow)
+    invoice_result = invoice_buyers.read_invoice_buyers(
+        oa_api,
+        workflow,
+        linked_detail_only=(
+            str(config.get("flow_key") or "") == "tpm_small_marketing_fee"
+        ),
+    )
     if str(invoice_result.get("read_status") or "") == "failed":
         raise RuntimeError(
             str(invoice_result.get("fail_code") or "invoice_buyer_read_failed")

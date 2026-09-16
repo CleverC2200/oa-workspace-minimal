@@ -41,6 +41,11 @@ _FINANCE_RULES = {
         "小额市场费",
         "references/flows/small-marketing-fee.md",
     ),
+    "tpm_small_marketing_fee": (
+        "tpm_small_marketing_fee:1",
+        "TPM小额市场费",
+        "references/flows/tpm-small-marketing-fee.md",
+    ),
     "general_expense": (
         "general_expense:1",
         "通用费用报销",
@@ -119,6 +124,14 @@ _SMALL_MARKETING_V2_REQUIREMENT = (
     "支付截图和发票”），不得使用“支付凭证”等近义词替代；支付公司一致"
     "通过时必须逐字使用“报销公司、支付公司、购买方三者一致，应选择"
     "当前实际公司全称支付。”的句式并替换公司全称；"
+)
+_TPM_SMALL_MARKETING_REQUIREMENT = (
+    "六项必须逐项按 TPM 小额市场费独立规则包形成结论；完整核对 10 类费用科目"
+    "及各自附件要求，只识别 OA 明细‘关联发票’处的发票并仅判断是否为纸质发票；"
+    "允许多张支付凭证合计对应一张发票但必须排除重复截图，金额按孰低原则核销；"
+    "对公支付无需支付截图，不设置员工代垫场景；缺少附件不技术阻断，必须写明具体"
+    "缺失材料、冲突事实、照片数量或定位缺口，不得只写‘异常’、‘无法识别’、"
+    "‘需补充’或‘附件不完整’；AI不得退回单据，财务保留退回权；"
 )
 @dataclass(frozen=True)
 class CodexExecution:
@@ -299,6 +312,8 @@ def _prompt(action_file: Path) -> str:
             if frozen_rule_version == "small_marketing_fee:2"
             else _SMALL_MARKETING_V1_REQUIREMENT
         )
+    elif workflow_key == "tpm_small_marketing_fee":
+        workflow_requirement = _TPM_SMALL_MARKETING_REQUIREMENT
     else:
         workflow_requirement = "只按该流程固定审核项判断，不得读取其他流程规则或证据；"
     output_requirement = (

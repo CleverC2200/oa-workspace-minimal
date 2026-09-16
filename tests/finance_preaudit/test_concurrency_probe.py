@@ -3245,6 +3245,7 @@ def test_rolling_scope_is_explicitly_limited_to_finance_worker_routes() -> None:
         "business_entertainment",
         "business_support_fee",
         "small_marketing_fee",
+        "tpm_small_marketing_fee",
         "general_expense",
     }
     assert (

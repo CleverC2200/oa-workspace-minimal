@@ -54,13 +54,22 @@ def _display_text(value: Any) -> str:
 
 def _invoice_refs(
     fields: List[Dict[str, Any]],
+    *,
+    linked_detail_only: bool = False,
 ) -> tuple[List[Dict[str, str]], List[str], bool]:
     refs: List[Dict[str, str]] = []
     invalid_invoice_numbers: List[str] = []
     has_misaligned_refs = False
     seen: set[str] = set()
     for field in fields:
-        if str(field.get("name") or "").strip() != "发票号码":
+        name = str(field.get("name") or "").strip()
+        if linked_detail_only and (
+            name != "关联发票"
+            or str(field.get("field_name") or "").strip() != "glfp"
+            or str(field.get("table") or "") != "detail_0"
+        ):
+            continue
+        if not linked_detail_only and name != "发票号码":
             continue
         data_ids = re.findall(r"\d+", str(field.get("raw_value") or ""))
         invoice_numbers = re.findall(r"\d+", str(field.get("value") or ""))
@@ -109,9 +118,13 @@ def read_invoice_buyers(
     data: Dict[str, Any],
     *,
     invoice_client: Any | None = None,
+    linked_detail_only: bool = False,
 ) -> Dict[str, Any]:
     fields = evidence_packet.extract_fields(data)
-    refs, invalid_invoice_numbers, has_misaligned_refs = _invoice_refs(fields)
+    refs, invalid_invoice_numbers, has_misaligned_refs = _invoice_refs(
+        fields,
+        linked_detail_only=linked_detail_only,
+    )
     if has_misaligned_refs:
         return _failed_result(
             [

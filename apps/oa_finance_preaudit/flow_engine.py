@@ -94,6 +94,25 @@ _FLOW_SPECS = {
             "支付公司一致",
         ),
     },
+    "tpm_small_marketing_fee": {
+        "rule_version": "tpm_small_marketing_fee:1",
+        "item_keys": (
+            "expense_subject",
+            "attachment_completeness",
+            "linked_invoice_receipt",
+            "payment_evidence",
+            "reimbursable_minimum",
+            "entity_consistency",
+        ),
+        "item_names": (
+            "费用科目",
+            "科目附件完整性",
+            "关联发票与收据",
+            "支付凭证",
+            "金额孰低核销",
+            "主体一致性",
+        ),
+    },
     "general_expense": {
         "rule_version": "general_expense:1",
         "item_keys": (
@@ -311,6 +330,92 @@ def _validate_small_marketing_conclusions(
     conclusion = str(attachment.get("conclusion") or "")
     if "支付截图" not in conclusion or "发票" not in conclusion:
         raise decision_validation.InvalidDecision("payment_attachment_terms")
+
+
+def _validate_tpm_small_marketing_conclusions(items: list[dict]) -> None:
+    specific_markers = (
+        "费用科目",
+        "科目原值",
+        "关联发票",
+        "纸质发票",
+        "发票购买方",
+        "发票销售方",
+        "发票金额",
+        "广告公司盖章版制作清单",
+        "制作清单",
+        "购买明细",
+        "参考报价单",
+        "现场定位照片",
+        "制作完成定位照片",
+        "试吃定位照片",
+        "订货会现场",
+        "全局定位照片",
+        "定位信息",
+        "关联申请签报",
+        "申请签报",
+        "费用清单",
+        "签到表",
+        "POS复核数据表",
+        "激励政策",
+        "支付截图",
+        "支付金额",
+        "付款主体",
+        "收款关系",
+        "收款人姓名",
+        "收款人身份证号",
+        "收款人手机号",
+        "购买方",
+        "销售方",
+        "事项",
+        "金额",
+        "印章",
+        "明细归属",
+        "对应关系",
+        "重复截图",
+    )
+    cue_patterns = (
+        re.compile(r"缺少|缺失|未提供|需补充"),
+        re.compile(r"无法识别|无法确认|无法核对|无法确定|读取失败|不清"),
+        re.compile(r"不足|重复|未关联"),
+    )
+    mismatch = re.compile(r"不一致|相差|冲突")
+    for item in items:
+        if item.get("status") not in {"fail", "uncertain"}:
+            continue
+        conclusion = str(item.get("conclusion") or "").strip()
+        normalized = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", conclusion)
+        normalized = re.sub(
+            r"(?:请)?(?:财务|人工)(?:核对|判断|处理|确认)$",
+            "",
+            normalized,
+        )
+        has_issue_cue = any(cue.search(normalized) for cue in cue_patterns)
+        has_specific_marker = any(
+            marker in normalized for marker in specific_markers
+        )
+        has_concrete_value = bool(
+            re.search(r"[0-9]", normalized)
+            or re.search(r"原值", normalized)
+            or re.search(r"[“”‘’\"'].[^“”‘’\"']*[“”‘’\"']", conclusion)
+        )
+        specific = has_issue_cue and (has_specific_marker or has_concrete_value)
+        subject_out_of_scope = (
+            "费用科目" in normalized
+            and has_concrete_value
+            and (
+                ("不在" in normalized and "表" in normalized)
+                or "未匹配" in normalized
+            )
+        )
+        specific = specific or subject_out_of_scope
+        if mismatch.search(normalized) is not None:
+            if (has_specific_marker or has_concrete_value) and re.search(
+                r"与|和|分别|原值|[0-9]",
+                normalized,
+            ):
+                specific = True
+        if not specific:
+            raise decision_validation.InvalidDecision("issue_list_not_specific")
 
 
 def _read_object(path: Path, *, code: str) -> dict:
@@ -3738,6 +3843,8 @@ class FlowEngine:
                     normalized_items,
                     quality_material,
                 )
+            if action["workflow_key"] == "tpm_small_marketing_fee":
+                _validate_tpm_small_marketing_conclusions(normalized_items)
             covered_page_refs = {
                 value
                 for item in normalized_items

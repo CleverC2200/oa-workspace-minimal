@@ -39,6 +39,11 @@ FLOW_CONFIGS = (
         "workflow_name": "小额市场费用报销申请流程",
     },
     {
+        "flow_key": "tpm_small_marketing_fee",
+        "workflow_id": "195039",
+        "workflow_name": "TPM小额市场费用报销申请流程",
+    },
+    {
         "flow_key": "general_expense",
         "workflow_id": "195021",
         "workflow_name": "通用费用报销申请流程",
@@ -625,6 +630,113 @@ class TestCollectCaseContract:
                 "buyer": "发票购买方公司",
             }
         ]
+
+    def test_tpm_invoice_buyers_use_only_detail_linked_invoices(self) -> None:
+        class InvoiceOaApi:
+            mapped_ids: list[str] = []
+
+            def get(self, path: str, params: object = None) -> dict:
+                if path == invoice_buyers.TOKEN_PATH:
+                    return {"status": "1", "token": "recorded-token"}
+                assert isinstance(params, dict)
+                self.mapped_ids.append(str(params["ids"]))
+                return {"status": "1", "targetIds": "mapped-id"}
+
+        class InvoiceClient:
+            def get_invoice(self, *, data_id: str, **_kwargs: object) -> dict:
+                return {
+                    "data": {
+                        "comm_info": {
+                            "buyer": {"company": f"购买方-{data_id}"},
+                        }
+                    }
+                }
+
+        main_invoice = {
+            "fieldShowName": "发票号码",
+            "fieldValue": "101",
+            "fieldShowValue": "11111111111111111111",
+        }
+        detail_invoice = {
+            "fieldName": "glfp",
+            "fieldShowName": "关联发票",
+            "fieldValue": "202",
+            "fieldShowValue": "22222222222222222222",
+        }
+        workflow = {
+            "workflowMainTableInfo": {
+                "requestRecords": [
+                    {"workflowRequestTableFields": [main_invoice]}
+                ]
+            },
+            "workflowDetailTableInfos": [
+                {
+                    "workflowRequestTableRecords": [
+                        {"workflowRequestTableFields": [detail_invoice]}
+                    ]
+                }
+            ],
+        }
+        oa_api = InvoiceOaApi()
+
+        result = invoice_buyers.read_invoice_buyers(
+            oa_api,
+            workflow,
+            invoice_client=InvoiceClient(),
+            linked_detail_only=True,
+        )
+
+        assert oa_api.mapped_ids == ["202"]
+        assert result["invoices"] == [
+            {
+                "invoice_no": "22222222222222222222",
+                "buyer": "购买方-202",
+            }
+        ]
+
+        detail_number_field = {
+            **detail_invoice,
+            "fieldName": "other",
+            "fieldShowName": "发票号码",
+            "fieldValue": "303",
+            "fieldShowValue": "33333333333333333333",
+        }
+        workflow["workflowDetailTableInfos"][0]["workflowRequestTableRecords"][0][
+            "workflowRequestTableFields"
+        ].append(detail_number_field)
+        oa_api.mapped_ids.clear()
+
+        filtered = invoice_buyers.read_invoice_buyers(
+            oa_api,
+            workflow,
+            invoice_client=InvoiceClient(),
+            linked_detail_only=True,
+        )
+
+        assert oa_api.mapped_ids == ["202"]
+        assert filtered == result
+
+    def test_tpm_collection_enables_detail_linked_invoice_filter(self) -> None:
+        with (
+            patch.object(case_bundle.official_sql, "travel_extra_fields", return_value=[]),
+            patch.object(
+                invoice_buyers,
+                "read_invoice_buyers",
+                return_value={"read_status": "not_applicable", "invoices": []},
+            ) as reader,
+        ):
+            material = collect_case(
+                "recorded-request",
+                oa_api=RecordedOaApi(
+                    "195039",
+                    "TPM小额市场费用报销申请流程",
+                ),
+                configs=FLOW_CONFIGS,
+                allow_browser_download=False,
+            )
+
+        assert material["workflow_key"] == "tpm_small_marketing_fee"
+        assert reader.call_args.kwargs["linked_detail_only"] is True
 
     def test_travel_order_text_is_not_truncated_before_agent_review(self) -> None:
         flow_mark = "CLBXLONG"
