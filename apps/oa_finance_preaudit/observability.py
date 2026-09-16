@@ -29,6 +29,7 @@ _WORKFLOW_KEYS = {
     "business_entertainment",
     "business_support_fee",
     "small_marketing_fee",
+    "tpm_small_marketing_fee",
     "general_expense",
     "packaging_layout_approval",
 }

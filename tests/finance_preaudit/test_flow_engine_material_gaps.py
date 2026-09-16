@@ -14,6 +14,7 @@ FINANCE_WORKFLOWS = (
     "business_entertainment",
     "business_support_fee",
     "small_marketing_fee",
+    "tpm_small_marketing_fee",
     "general_expense",
 )
 SESSION_BLOCKING_FAILURE_CODES = (

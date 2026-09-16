@@ -8,6 +8,7 @@
 | `business_entertainment` | [业务招待费](flows/business-entertainment.md) |
 | `business_support_fee` | [业务支持费](flows/business-support-fee.md) |
 | `small_marketing_fee` | [小额市场费](flows/small-marketing-fee.md) |
+| `tpm_small_marketing_fee` | [TPM 小额市场费](flows/tpm-small-marketing-fee.md) |
 | `general_expense` | [通用费用报销](flows/general-expense.md) |
 | `packaging_layout_approval` | [包装版面](flows/packaging-layout-approval.md) |
 

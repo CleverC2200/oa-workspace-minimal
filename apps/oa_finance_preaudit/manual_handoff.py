@@ -9,7 +9,8 @@ from . import decision_validation, review_failure_evidence
 
 KIND = "preaudit_manual_handoff"
 WORKFLOWS = frozenset({"travel_expense", "business_entertainment", "business_support_fee",
-                       "small_marketing_fee", "general_expense"})
+                       "small_marketing_fee", "tpm_small_marketing_fee",
+                       "general_expense"})
 REASONS = {"codex_process_timeout": "审核超时", "codex_decision_invalid": "审核结果格式异常"}
 FIELDS = {"schema_version", "kind", "action_token", "workflow_key", "rule_version",
           "overall", "failure_code", "failure_receipt", "failure_fingerprint"}

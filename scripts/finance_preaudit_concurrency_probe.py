@@ -95,6 +95,7 @@ ROLLING_WORKFLOW_KEYS = frozenset(
         "business_entertainment",
         "business_support_fee",
         "small_marketing_fee",
+        "tpm_small_marketing_fee",
         "general_expense",
     }
 )

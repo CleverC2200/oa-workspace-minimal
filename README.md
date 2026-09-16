@@ -2,7 +2,7 @@
 
 当前版本：`1.1.0`
 
-本项目以 Codex Skill 为审核入口：Codex 读取表单、附件和权威查询结果，形成五类财务流程的预审意见，以及包装版面的图片文字校对结果；Python 代码只负责稳定取数、材料冻结、确定性校验和受控提交，不生成业务判断。
+本项目以 Codex Skill 为审核入口：Codex 读取表单、附件和权威查询结果，形成六类财务流程的预审意见，以及包装版面的图片文字校对结果；Python 代码只负责稳定取数、材料冻结、确定性校验和受控提交，不生成业务判断。
 
 V1.1 是首次 GitHub 私有发布基线。发布本身不会创建或启动定时任务。经独立授权的生产环境只保留一个外部 Codex 每日 cron：它绑定唯一 `main` 工作树，每次调度创建独立任务，在该任务中调用现行滚动控制器并于当轮结束后退出。
 
@@ -12,12 +12,13 @@ V1.1 是首次 GitHub 私有发布基线。发布本身不会创建或启动定�
 - 业务招待费
 - 业务支持费
 - 小额市场费
+- TPM 小额市场费
 - 通用费用报销
 - 包装新制（更改）及包装版面审批
 
 财务流程只给出预审意见，不代替批准或退回。包装流程只校对图片文字，并在存在 Excel 时逐字符对照，不扩展为法规合规审核。
 
-五类财务流程的固定审核项、判定口径、证据边界和当前限制见[五类财务预审现行审核规则](docs/finance-preaudit-rules.md)。
+六类财务流程的固定审核项、判定口径、证据边界和当前限制见[六类财务预审现行审核规则](docs/finance-preaudit-rules.md)。
 
 ## 设计边界
 
@@ -31,7 +32,7 @@ V1.1 是首次 GitHub 私有发布基线。发布本身不会创建或启动定�
 
 ```text
 .agents/skills/oa-finance-preaudit/  # Skill 入口、流程规则与证据契约
-.agents/skills/oa-finance-preaudit/references/flows/  # 五类隔离规则包
+.agents/skills/oa-finance-preaudit/references/flows/  # 六类隔离规则包和包装规则包
 apps/oa_finance_preaudit/           # 单一深模块、JSON CLI、状态与观测
 apps/oa_approval/                   # OA 和外部数据的复用连接能力
 tests/finance_preaudit/             # 聚焦合同测试与回放测试
@@ -55,7 +56,7 @@ chmod 600 ~/.config/oa-workspace-minimal/oa-auth.env
 
 旧版 Word `.doc` 附件需要本机 LibreOffice（`soffice` 位于 PATH，或通过 `OA_LIBREOFFICE_BIN` 指定可执行文件）。采集器在独立临时配置中禁用宏、转换为 PDF 并逐页准备图片和确定性文本，保留原附件身份及哈希；单文件转换最多等待 60 秒，结束或超时时回收该转换进程组。转换器不可用、转换失败或超时分别保留 `legacy_doc_converter_unavailable`、`legacy_doc_conversion_failed`、`legacy_doc_conversion_timeout`。失败仍按现有材料降级路径处理，不把未读内容当作已审核；通用内容准备失败保留 `attachment_content_incomplete`。发布涉及此能力时须在生产执行环境核实转换器可用；仅安装 Python 依赖不能提供 LibreOffice。
 
-五类财务流程和包装版面校对已经提供同一个本地深模块两动作接口。先取得指定流程的下一个动作：
+六类财务流程和包装版面校对已经提供同一个本地深模块两动作接口。先取得指定流程的下一个动作：
 
 ```bash
 python3 -m apps.oa_finance_preaudit.cli next-action \
@@ -70,9 +71,9 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
   --decision-file /absolute/path/to/review-decision.json
 ```
 
-两条命令默认都是 preview，动作固定 `write_authorized=false`，写入状态固定为 `not_requested`；不会调用 OA 提交。模块和 CLI 共用同一业务实现，大对象通过本地文件传递，stdout 只输出一个版本化 JSON。五类财务流程无法可信取得材料时生成不含可疑证据的降级审核包，由 Agent 输出 `⚠️` 意见交财务判断；流程身份、冻结 attempt、写入授权或目标不一致时才返回 `needs_admin`。包装图片不可读仍停止，避免生成貌似完成的校对意见。六类流程的目录和当前动作投影相互独立；不同单据的材料收集与 Agent 审核可以并发，每个 attempt 使用自己的完成锁，互不等待；所有 OA 写入入口共用一把全局锁并严格串行。
+两条命令默认都是 preview，动作固定 `write_authorized=false`，写入状态固定为 `not_requested`；不会调用 OA 提交。模块和 CLI 共用同一业务实现，大对象通过本地文件传递，stdout 只输出一个版本化 JSON。六类财务流程无法可信取得材料时生成不含可疑证据的降级审核包，由 Agent 输出 `⚠️` 意见交财务判断；流程身份、冻结 attempt、写入授权或目标不一致时才返回 `needs_admin`。包装图片不可读仍停止，避免生成貌似完成的校对意见。七类流程的目录和当前动作投影相互独立；不同单据的材料收集与 Agent 审核可以并发，每个 attempt 使用自己的完成锁，互不等待；所有 OA 写入入口共用一把全局锁并严格串行。
 
-手工运行只使用 `next-action`、`complete-review`、`status`、`prune` 和 `clean` 五个命令；`clean --all-cache` 只清理当前配置的可重建附件缓存，并受控制器和 Writer 空闲门禁保护。五类财务的批量生产由唯一滚动控制器编排同一深模块：按 OA 操作时间选取，审核可并发，提交按认领顺序经过唯一 Writer；包装继续走单据级图片文字校对路径。候选发现、材料收集、冻结校验、单据锁、提交安全门和回执仍隐藏在模块内，没有角色 CLI、底层队列命令或跨任务消息协议。差旅手工受控入口默认拒绝；唯一例外是人工已核实未写入的 `writer_result_unknown` 恢复，它必须绑定精确 requestId，并在无活动控制器和 Writer 时仅创建新冻结 attempt，不直接提交 OA。
+手工运行只使用 `next-action`、`complete-review`、`status`、`prune` 和 `clean` 五个命令；`clean --all-cache` 只清理当前配置的可重建附件缓存，并受控制器和 Writer 空闲门禁保护。六类财务的批量生产由唯一滚动控制器编排同一深模块：按 OA 操作时间选取，审核可并发，提交按认领顺序经过唯一 Writer；包装继续走单据级图片文字校对路径。候选发现、材料收集、冻结校验、单据锁、提交安全门和回执仍隐藏在模块内，没有角色 CLI、底层队列命令或跨任务消息协议。差旅手工受控入口默认拒绝；唯一例外是人工已核实未写入的 `writer_result_unknown` 恢复，它必须绑定精确 requestId，并在无活动控制器和 Writer 时仅创建新冻结 attempt，不直接提交 OA。
 
 ## 脱敏运行指标
 
@@ -104,7 +105,7 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
 
 离线稳定性门固定覆盖容量 `1/2/4/8/10/12`、进程复用、失败隔离、任务超时回收、强制停止和重复单据单飞。弹性审核从 6 槽开始，连续两个完整健康窗口才按 `1 → 2 → 6 → 8 → 10 → 12` 提升一级；持续资源压力每次心跳降一级，最低 1 槽；CPU 负载高本身不再判为 critical，可用内存低于 12% 仍立即停止；健康采样未知时保留队列并暂停新工作，恢复后继续，资源等待不转人工；技术失败、容量完成数不一致或本机 critical 立即止损。材料领取与采集仍由单调度器串行，OA 提交仍由全局锁固定为 1，因此提升的是 AI 审核槽，不是浏览器或写入并发。离线通过不代表生产写入已启用。完整决策和递增/回退规则见 [ADR 0010](docs/adr/0010-bounded-process-pool.md)。
 
-生产滚动控制器不属于五个手工 JSON CLI 命令，也不创建定时任务。它先对五类财务流程完成只读对账，再由单调度器按 OA 操作时间串行发现和冻结材料；包装不进入该滚动池。每个 Codex 工作进程只审核一单，宿主按认领顺序在完成边界再次验证单据 capability 后通过全局单写提交。使用时仍要求本地流程授权清单和当前人工确认：
+生产滚动控制器不属于五个手工 JSON CLI 命令，也不创建定时任务。它先对六类财务流程完成只读对账，再由单调度器按 OA 操作时间串行发现和冻结材料；包装不进入该滚动池。每个 Codex 工作进程只审核一单，宿主按认领顺序在完成边界再次验证单据 capability 后通过全局单写提交。使用时仍要求本地流程授权清单和当前人工确认：
 
 ```bash
 python3 -m scripts.finance_preaudit_concurrency_probe \
@@ -155,7 +156,7 @@ python3 -m scripts.finance_preaudit_concurrency_probe \
 
 开发隔离排障按[隔离排障与恢复](docs/agents/quarantine-repair.md)继续诊断、回测和显式恢复，不能以生产已隔离或普通队列为空作为修复完成。只读对账的 `findings` 与 `manual_review.items` 对通过现有未写入证据校验、精确仍在待办且未命中已办的项统一给出 `confirmed_no_write_recovery_candidate`，覆盖审核进程失败和无效审核决定；缺少有效证据时保留核对建议。候选不是写入授权，查询和普通调度均不会自动恢复。
 
-五类财务历史 `material_collection_failed`、`codex_review_failed` 等已确认未写入的隔离项，只能把精确旧
+六类财务历史 `material_collection_failed`、`codex_review_failed` 等已确认未写入的隔离项，只能把精确旧
 `action.json` 交给同一个滚动控制器恢复；参数可重复。恢复仍在容量为 1、300 秒
 硬超时且可回收的 prepare 进程中完成，只创建新 attempt，后续审核和提交继续经过
 同一 FIFO 与唯一 Writer：
@@ -239,7 +240,7 @@ python3 -m apps.oa_finance_preaudit.cli prune \
 
 ## 离线质量回放
 
-离线基线包含六类流程的正常、业务异常、证据不足和技术失败场景，并为五类财务流程增加材料采集降级场景，共 29 个脱敏样本。回放比较固定审核项、状态/停止码、格式、耗时和精确 Token，不需要 OA 登录：
+离线基线包含七类流程的正常、业务异常、证据不足和技术失败场景，并为六类财务流程增加材料采集降级场景，共 34 个脱敏样本。回放比较固定审核项、状态/停止码、格式、耗时和精确 Token，不需要 OA 登录：
 
 ```bash
 python3 -m pytest tests/finance_preaudit/test_flow_evals.py -v

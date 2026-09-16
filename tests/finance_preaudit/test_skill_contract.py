@@ -21,6 +21,7 @@ FLOW_RULE_PACKS = {
     "business_entertainment": REFERENCE_ROOT / "flows" / "business-entertainment.md",
     "business_support_fee": REFERENCE_ROOT / "flows" / "business-support-fee.md",
     "small_marketing_fee": REFERENCE_ROOT / "flows" / "small-marketing-fee.md",
+    "tpm_small_marketing_fee": REFERENCE_ROOT / "flows" / "tpm-small-marketing-fee.md",
     "general_expense": REFERENCE_ROOT / "flows" / "general-expense.md",
     "packaging_layout_approval": REFERENCE_ROOT / "flows" / "packaging-layout-approval.md",
 }
@@ -142,6 +143,20 @@ def test_confirmed_feedback_and_regressions_stay_sanitized() -> None:
                 "报销公司、支付公司、购买方",
                 "small_marketing_fee:1",
                 "small_marketing_fee:2",
+            ),
+        ),
+        (
+            "tpm_small_marketing_fee",
+            (
+                "10 类费用科目",
+                "终端建设费-终端形象制作费",
+                "通路促销-订货会会务费",
+                "不少于 4 张",
+                "只识别 OA 明细“关联发票”处的发票",
+                "对公支付无需支付截图",
+                "排除重复截图",
+                "不设置容差",
+                "AI 只形成预审意见，不批准、不退回",
             ),
         ),
         (
