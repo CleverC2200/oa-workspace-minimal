@@ -4306,6 +4306,20 @@ def _continuation_is_ready(
         and continuation.get("blocking_reasons") == {}
     )
 
+    # Historical, isolated failures are deferred to the next rolling batch.
+    # They must remain visible in reconciliation, but must not stop admission
+    # when there is no unresolved write or identity safety issue.
+    deferred_historical = (
+        continuation.get("status") == "blocked"
+        and continuation.get("blocking_reasons") == {}
+        and isinstance(isolated, int)
+        and not isinstance(isolated, bool)
+        and isolated > 0
+        and isolated == quarantine.get("pending_quarantined")
+    )
+    if deferred_historical:
+        return True
+
     if ready or not recovery_action_files:
         return ready
     # This admits only explicitly selected preparation work; FlowEngine still
