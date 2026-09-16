@@ -378,6 +378,18 @@ def _validate_tpm_small_marketing_conclusions(items: list[dict]) -> None:
         re.compile(r"无法识别|无法确认|无法核对|无法确定|读取失败|不清"),
         re.compile(r"不足|重复|未关联"),
     )
+    establish = re.compile(r"无法建立|未能建立|不能建立")
+    relationship_object_groups = (
+        ("关联发票", "纸质发票", "发票"),
+        ("支付截图", "支付凭证", "支付事实", "实际支付", "付款主体"),
+        ("收据",),
+        ("明细归属", "费用明细", "当前明细", "明细"),
+        ("关联申请签报", "申请签报", "签报"),
+        ("制作清单", "购买明细", "费用清单", "POS复核数据表", "激励政策"),
+        ("现场定位照片", "制作完成定位照片", "试吃定位照片", "全局定位照片"),
+        ("购买方", "销售方", "收款人", "印章"),
+        ("费用科目",),
+    )
     mismatch = re.compile(r"不一致|相差|冲突")
     for item in items:
         if item.get("status") not in {"fail", "uncertain"}:
@@ -399,6 +411,17 @@ def _validate_tpm_small_marketing_conclusions(items: list[dict]) -> None:
             or re.search(r"[“”‘’\"'].[^“”‘’\"']*[“”‘’\"']", conclusion)
         )
         specific = has_issue_cue and (has_specific_marker or has_concrete_value)
+        relationship_objects = sum(
+            any(marker in normalized for marker in group)
+            for group in relationship_object_groups
+        )
+        specific = specific or bool(
+            establish.search(normalized)
+            and (
+                relationship_objects >= 2
+                or (relationship_objects == 1 and has_concrete_value)
+            )
+        )
         subject_out_of_scope = (
             "费用科目" in normalized
             and has_concrete_value
