@@ -573,3 +573,35 @@ def test_historical_unknown_is_preserved_without_blocking_fresh_identity(tmp_pat
     assert result["quarantine"]["actionable_pending"] == 1
     assert result["findings"][0]["recommendation"] == "manual_write_state_verification"
     assert before == {path: path.read_bytes() for path in root.rglob("*.json")}
+
+
+def test_historical_verified_no_write_round_is_deferred_for_new_pending_round(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "flows"
+    _state(
+        root,
+        "historical",
+        "2026-08-24 09:00:00",
+        reason="codex_review_failed",
+        created_at="2026-08-24T08:59:00+00:00",
+    )
+    result = reconciliation.reconcile(
+        root,
+        pending_rows=[
+            {
+                "request_id": "historical",
+                "received_at": "2026-08-25 09:00:00",
+                "workflow_key": "travel_expense",
+            }
+        ],
+        handled_rows=[],
+        now=datetime(2026, 8, 25, 10, tzinfo=timezone.utc),
+    )
+    assert result["continuation"] == {
+        "status": "ready",
+        "scope": "none",
+        "isolated_pending": 0,
+        "blocking_reasons": {},
+    }
+    assert result["findings"][0]["recommendation"] == "deferred_historical_cleanup"
