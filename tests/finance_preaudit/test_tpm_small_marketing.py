@@ -438,6 +438,31 @@ def test_tpm_public_remark_collapses_all_pass_items(tmp_path: Path) -> None:
             "tpm_optional_quote_conclusion",
         ),
         (
+            "attachment_completeness",
+            "第1条明细缺少参考报价单。",
+            "tpm_optional_quote_conclusion",
+        ),
+        (
+            "attachment_completeness",
+            "需补充材料：参考报价单。",
+            "tpm_optional_quote_conclusion",
+        ),
+        (
+            "attachment_completeness",
+            "缺少：参考报价单。",
+            "tpm_optional_quote_conclusion",
+        ),
+        (
+            "linked_invoice_receipt",
+            "收据已提供，收款人与购买方不一致。",
+            "tpm_issue_item_scope",
+        ),
+        (
+            "linked_invoice_receipt",
+            "收据收款人姓名甲某，与购买方甲公司不一致。",
+            "tpm_issue_item_scope",
+        ),
+        (
             "linked_invoice_receipt",
             "关联发票销售方未取得。",
             "tpm_issue_item_scope",
@@ -476,7 +501,14 @@ def test_tpm_v2_rejects_finance_rule_misinterpretations(
         ("linked_invoice_receipt", "关联电子发票购买方为空。"),
         ("linked_invoice_receipt", "第1笔电子发票购买方甲公司与报销公司乙公司不符合。"),
         ("linked_invoice_receipt", "第1笔收据缺少收款人姓名和收款人手机号。"),
+        ("linked_invoice_receipt", "收据缺少手机号。"),
+        ("linked_invoice_receipt", "收据缺少身份证号。"),
+        ("linked_invoice_receipt", "收据缺少事项。"),
+        ("linked_invoice_receipt", "收据缺少收款人姓名，票面金额100元与申报金额200元不一致。"),
         ("attachment_completeness", "已提供参考报价单，但缺少执行后的现场定位照片1张。"),
+        ("attachment_completeness", "无需补充参考报价单，但缺少执行后的现场定位照片1张。"),
+        ("attachment_completeness", "并非缺少参考报价单，缺少的是现场定位照片1张。"),
+        ("attachment_completeness", "参考报价单未提供，不影响核销，但现场定位照片缺失。"),
         (
             "linked_invoice_receipt",
             "关联发票为电子发票，但票面图像损坏无法读取。",
@@ -523,6 +555,10 @@ def test_tpm_v2_keeps_real_invoice_and_quote_gaps(
 @pytest.mark.parametrize("conclusion", (
     "支付状态、支付日期和流水号为空。",
     "缺少支付截图。",
+    "第1条明细缺少支付截图。",
+    "支付状态、支付日期及流水号均为空。",
+    "需补充材料：支付截图。",
+    "支付状态未显示，无法确认付款状态。",
 ))
 def test_tpm_v2_does_not_reopen_confirmed_company_payment_fields(
     tmp_path: Path,
@@ -565,9 +601,16 @@ def test_tpm_v2_does_not_reopen_confirmed_company_payment_fields(
     ("item_key", "conclusion"),
     (
         ("payment_evidence", "第1笔支付状态为失败，表单支付金额100元尚未支付。"),
+        ("payment_evidence", "支付状态为失败。"),
         ("entity_consistency", "第1笔支付截图显示收款人为丙公司，与发票销售方乙公司不一致。"),
+        ("entity_consistency", "支付截图显示收款人为丙公司，但其与发票销售方乙公司不一致。"),
+        ("entity_consistency", "支付截图显示收款人为丙公司，其名称与发票销售方乙公司不一致。"),
         ("payment_evidence", "第1笔支付截图重复，支付金额100元不能重复核销。"),
         ("payment_evidence", "第1笔支付截图已提供但流水号无法读取，无法确认支付去重结果。"),
+        ("payment_evidence", "无需补充支付截图，但发票金额缺失。"),
+        ("payment_evidence", "并非缺少支付截图，缺少的是发票金额。"),
+        ("payment_evidence", "缺少支付截图不影响核销，但发票金额缺失。"),
+        ("payment_evidence", "支付截图未提供，不影响核销，但发票金额缺失。"),
     ),
 )
 def test_tpm_company_payment_keeps_actual_conflicts(

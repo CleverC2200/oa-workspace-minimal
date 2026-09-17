@@ -375,18 +375,32 @@ def _tpm_company_payment_confirmed(material: dict) -> bool:
 def _tpm_reports_optional_field_absence(conclusion: str, fields: str) -> bool:
     """Reject explicit absence claims, not every mention of optional evidence.
 
-    Full clauses keep negations and findings about supplied evidence out of
-    this deterministic guard. Business interpretation stays with the reviewer.
+    Bind the absence verb to its object, allowing row labels and field-list
+    modifiers without matching unrelated gaps elsewhere in the sentence.
+    Negated absence and exemption statements are not requests for evidence.
     """
     field_list = rf"(?:{fields})(?:(?:、|和|及|与)(?:{fields}))*"
-    absence = (
-        rf"(?:(?:缺少|缺失|未提供|未上传|需补充){field_list}"
-        rf"|{field_list}(?:缺失|为空|未提供|未上传))"
+    absence = re.compile(
+        rf"(?:(?:缺少|缺失|未提供|未上传|需补充)(?:的)?"
+        rf"(?:材料|字段)?[：:]?{field_list}"
+        rf"|{field_list}(?:均|都|仍|仍然)?"
+        rf"(?:缺失|为空|未提供|未上传|未显示|未记录|未取得|未解析))"
     )
-    return any(
-        re.fullmatch(rf"(?:第[0-9一二三四五六七八九十]+笔)?{absence}", clause.strip())
-        for clause in re.split(r"[，,。；;！!？?\n]+|但(?:是)?", conclusion)
+    clauses = re.split(
+        r"[，,。；;！!？?\n]+|但(?:是)?", re.sub(r"\s+", "", conclusion),
     )
+    for index, clause in enumerate(clauses):
+        for match in absence.finditer(clause):
+            prefix, suffix = clause[:match.start()], clause[match.end():]
+            if not suffix and index + 1 < len(clauses):
+                suffix = clauses[index + 1]
+            if re.search(
+                r"(?:并非|不是|并不是|不|无|无需|无须|不需要|不应|未发现|没有)"
+                r"(?:因|因为)?$", prefix,
+            ) or re.match(r"(?:并)?不(?:影响|构成问题|作为问题)", suffix):
+                continue
+            return True
+    return False
 
 
 def _validate_tpm_small_marketing_conclusions(
@@ -394,6 +408,10 @@ def _validate_tpm_small_marketing_conclusions(
     material: dict,
 ) -> None:
     by_key = {str(item.get("item_key") or ""): item for item in items}
+    clause_boundary = re.compile(
+        r"[，,。；;：:！!？?\n]+|但(?:是)?|然而|并且|并(?!未|不|非|无)|且|同时|而"
+    )
+    continued_comparison = re.compile(r"^(?:其(?:名称)?)?(?:与|和|同|跟)")
     invoice = by_key.get("linked_invoice_receipt", {})
     invoice_conclusion = str(invoice.get("conclusion") or "")
     if invoice.get("status") != "pass":
@@ -416,13 +434,23 @@ def _validate_tpm_small_marketing_conclusions(
             )
         ):
             raise decision_validation.InvalidDecision("tpm_invoice_type_conclusion")
-        entity_markers = ("销售方", "收款方", "印章")
-        if "收据" not in invoice_conclusion:
-            entity_markers = (*entity_markers, "收款人")
-        if any(
-            marker in invoice_conclusion for marker in entity_markers
-        ):
-            raise decision_validation.InvalidDecision("tpm_issue_item_scope")
+        previous_scope_clause = ""
+        for clause in clause_boundary.split(invoice_conclusion):
+            clause = clause.strip()
+            if not clause:
+                continue
+            scope_text = clause
+            if continued_comparison.match(clause):
+                scope_text = previous_scope_clause + clause
+            if "收据" in invoice_conclusion and not re.search(r"不一致|冲突|相差", clause):
+                # Receipt field checks belong here; receipt presence alone
+                # must not exempt payee relationships from the entity item.
+                scope_text = re.sub(r"收款人(?:姓名|身份证号|手机号)", "", scope_text)
+            if any(
+                marker in scope_text for marker in ("销售方", "收款方", "收款人", "印章")
+            ):
+                raise decision_validation.InvalidDecision("tpm_issue_item_scope")
+            previous_scope_clause = clause
     attachment = by_key.get("attachment_completeness", {})
     attachment_conclusion = str(attachment.get("conclusion") or "")
     if (
@@ -655,9 +683,6 @@ def _validate_tpm_small_marketing_conclusions(
         r"非重复支付事实|对公支付豁免|制作数量|样式|去重结果|"
         r"推定分配|一致性"
     )
-    clause_boundary = re.compile(
-        r"[，,。；;：:！!？?\n]+|但(?:是)?|然而|并且|并(?!未|不|非|无)|且|同时|而"
-    )
 
     def nearest_mismatch_group(text: str, *, from_right: bool) -> int | None:
         matches: list[tuple[int, int, int, int]] = []
@@ -756,6 +781,19 @@ def _validate_tpm_small_marketing_conclusions(
                 specific_operation.search(issue_normalized)
                 and has_specific_marker
             )
+            receipt_field_gap = bool(
+                item.get("item_key") == "linked_invoice_receipt"
+                and "收据" in issue_normalized
+                and re.search(r"购买方|事项|金额|姓名|身份证号|手机号", issue_normalized)
+                and (
+                    explicit_missing_cue.search(issue_normalized)
+                    or field_state_cue.search(issue_normalized)
+                )
+            )
+            payment_failure = bool(
+                re.search(r"(?:支付|付款)状态为失败|(?:支付|付款)失败", issue_normalized)
+                and not re.search(r"未(?:见|发现)|没有|并非|不是", issue_normalized)
+            )
             clause_specific = concrete_field_state or (
                 has_issue_cue
                 and (
@@ -765,6 +803,7 @@ def _validate_tpm_small_marketing_conclusions(
                     or concrete_operation
                 )
             )
+            clause_specific = clause_specific or receipt_field_gap or payment_failure
             clause_specific = clause_specific or bool(
                 direct_conflict.search(issue_normalized)
             )
@@ -793,7 +832,7 @@ def _validate_tpm_small_marketing_conclusions(
                     "",
                     raw_clause,
                 )
-                if mismatch_source.startswith(("与", "和", "同", "跟")):
+                if continued_comparison.match(mismatch_source):
                     mismatch_source = previous_clause_normalized + mismatch_source
                 distinct_mismatch_objects = False
                 connector_matches = tuple(
@@ -841,6 +880,8 @@ def _validate_tpm_small_marketing_conclusions(
                 or mismatch.search(issue_normalized)
                 or concrete_field_state
                 or subject_out_of_scope
+                or receipt_field_gap
+                or payment_failure
             )
             if clause_is_issue and not clause_specific:
                 raise decision_validation.InvalidDecision(
