@@ -712,9 +712,19 @@ def _prepare_one_attachment(
         )
     elif suffix in SPREADSHEET_EXTS:
         try:
-            structured_contents.append(
-                spreadsheet_fact(path, resource_id=resource_id, name=name)
+            from apps.oa_approval import spreadsheet_images
+
+            extracted_images = spreadsheet_images.extract(
+                path, out_dir, safe_name(resource_id, path.stem),
             )
+            fact = spreadsheet_fact(path, resource_id=resource_id, name=name)
+            for number, (image_path, cell) in enumerate(extracted_images, 1):
+                images.append({
+                    **base, "path": image_path, "kind": f"spreadsheet_image_{number}",
+                    "content_sha256": _file_sha256(image_path), "spreadsheet_cell": cell,
+                })
+                fact["key_text"].append(f"{cell}: embedded image {number}")
+            structured_contents.append(fact)
         except Exception as err:
             manifest.append(
                 {
@@ -731,6 +741,7 @@ def _prepare_one_attachment(
                     "resource_id": resource_id,
                     "name": name,
                     "status": "spreadsheet_read",
+                    "image_count": len(images) - image_count_before,
                     "path": str(path),
                 }
             )

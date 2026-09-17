@@ -18,12 +18,10 @@ from apps.oa_finance_preaudit import (
 
 
 WORKFLOW_KEY = "tpm_small_marketing_fee"
-RULE_VERSION = "tpm_small_marketing_fee:2"
+RULE_VERSION = "tpm_small_marketing_fee:3"
 ITEM_KEYS = (
-    "expense_subject",
     "attachment_completeness",
     "linked_invoice_receipt",
-    "payment_evidence",
     "reimbursable_minimum",
     "entity_consistency",
 )
@@ -128,7 +126,7 @@ def test_tpm_is_registered_across_every_runtime_boundary() -> None:
     assert WORKFLOW_KEY in runtime_maintenance._WORKFLOW_KEYS
 
 
-def test_tpm_flow_freezes_an_independent_six_item_contract(tmp_path: Path) -> None:
+def test_tpm_flow_freezes_a_four_item_contract(tmp_path: Path) -> None:
     action = _engine(tmp_path).next_action(WORKFLOW_KEY)
     packet = json.loads(
         Path(action["review_packet_file"]).read_text(encoding="utf-8")
@@ -157,471 +155,136 @@ def test_tpm_worker_uses_only_the_tpm_rule_pack(tmp_path: Path) -> None:
     assert schema["properties"]["rule_version"]["const"] == RULE_VERSION
     assert "TPM小额市场费生产预审" in prompt
     assert "tpm-small-marketing-fee.md" in prompt
-    assert "10 类费用科目" in prompt
-    assert "电子发票及其他非纸质发票本身不是问题" in prompt
-    assert "参考报价单" in prompt and "不是必传附件" in prompt
-    assert "支付状态、支付日期或流水号" in prompt
-    assert "AI不得退回" in prompt
+    assert "四项" in prompt
+    assert "第六项" not in prompt
+    assert "六项" not in prompt
     assert "`references/flows/small-marketing-fee.md`" not in prompt
 
 
-@pytest.mark.parametrize(
-    "vague",
-    (
-        "异常",
-        "缺少",
-        "异常缺少",
-        "附件不完整，缺少",
-        "异常发票",
-        "发票冲突",
-        "异常，请财务核对",
-        "无法识别",
-        "无法识别发票",
-        "无法识别，请人工判断",
-        "需补充",
-        "需补充相关材料",
-        "缺少资料",
-        "需补充证明",
-        "无法识别票据",
-        "凭证异常",
-        "信息不清",
-        "不能建立",
-        "不能建立对应关系",
-        "无法建立金额",
-        "未能建立对应关系，请财务确认",
-        "待财务确认",
-        "对应关系待确认",
-        "对应关系不明",
-        "对应关系未确认",
-        "对应关系不可推定",
-        "事项未确认",
-        "事项1未确认",
-        "事项不符合要求",
-        "金额不满足规则",
-        "金额1未确认",
-        "对应关系1未确认",
-        "原值未确认",
-        "“异常”未确认",
-        "“未知”无法判断",
-        "制作清单已提供，但缺少资料",
-        "制作清单已提供且缺少资料",
-        "关联发票正常，需补充证明",
-        "关联发票正常并需补充证明",
-        "支付截图已齐全，仍缺少相关材料",
-        "发票金额已确认且事项不明",
-        "制作清单缺失，但其他资料异常",
-        "制作清单缺失，需补充证明",
-        "制作清单缺失，事项无法判断",
-        "制作清单缺失，无法确认对应关系",
-        "制作清单缺失，不能确定金额",
-        "制作清单缺失，已核对其他附件，无法判断",
-        "发票金额缺失，其他材料已齐全，对应关系不能建立",
-        "印章和印章冲突",
-        "制作清单与制作清单不一致",
-        "定位照片与现场定位照片冲突",
-        "关联发票与纸质发票不一致",
-        "制作清单与广告公司盖章版制作清单不一致",
-        "关联发票购买方与购买方冲突",
-        "关联发票销售方与销售方不一致",
-        "制作清单印章与印章冲突",
-        "申请签报及附件显示定位照片与现场定位照片冲突",
-        "申请签报及附件显示发票金额与发票金额冲突",
-        "发票金额记录显示定位照片与现场定位照片冲突",
-        "购买方资料中的关联发票与纸质发票不一致",
-        "费用科目说明制作清单与广告公司盖章版制作清单不一致",
-        "购买方与关联发票购买方冲突",
-        "销售方与关联发票销售方不一致",
-        "印章与制作清单印章冲突",
-        "定位照片未记录",
-        "费用科目未确认",
-        "关联发票无法判断",
-        "附件不完整",
-        "附件不完整，请补充附件",
-    ),
-)
-def test_tpm_rejects_vague_issue_conclusions(tmp_path: Path, vague: str) -> None:
+
+@pytest.mark.parametrize("all_pass", [True, False])
+def test_tpm_public_remark_keeps_all_four_checks(tmp_path: Path, all_pass: bool) -> None:
     engine = _engine(tmp_path)
     action = engine.next_action(WORKFLOW_KEY)
+    decision = _decision(action, conclusion="第15条现场照片可读取，仍缺少定位信息")
+    if all_pass:
+        decision["overall"] = "pass"
+        for item in decision["items"]:
+            item.update(status="pass", conclusion="已核对", evidence_refs=["material:declared_fields.expense_subject"], missing_evidence=[])
     decision_file = tmp_path / "decision.json"
-    decision_file.write_text(
-        json.dumps(_decision(action, conclusion=vague), ensure_ascii=False),
-        encoding="utf-8",
-    )
+    decision_file.write_text(json.dumps(decision, ensure_ascii=False))
+    closed = engine.complete_review(Path(action["action_file"]), decision_file)
+    assert closed["write_state"] == "not_requested"
+    assert closed["business_state"] == ("pass" if all_pass else "needs_human")
+    remark = Path(closed["remark_file"]).read_text()
+    assert len(remark.splitlines()) == 5
+    for number, name in enumerate(("附件完整性", "发票关联与金额", "金额孰低核销", "支付公司一致"), 1):
+        assert f"{number}、{name}：" in remark
+    assert remark.count("✅") >= (4 if all_pass else 3)
+    if not all_pass:
+        assert "⚠️ 1、附件完整性：第15条现场照片可读取，仍缺少定位信息" in remark
 
-    with pytest.raises(ValueError, match="review_decision_invalid"):
+
+@pytest.mark.parametrize("fault", ["extra_item", "missing_item", "reordered", "old_version", "missing_ref", "missing_gap", "overall"])
+def test_tpm_shared_contract_still_rejects_invalid_decisions(tmp_path: Path, fault: str) -> None:
+    engine = _engine(tmp_path)
+    action = engine.next_action(WORKFLOW_KEY)
+    decision = _decision(action, conclusion="第15条缺少定位照片")
+    if fault == "extra_item":
+        decision["items"].append({**decision["items"][0], "item_key": "payment_evidence"})
+    elif fault == "missing_item":
+        decision["items"].pop()
+    elif fault == "reordered":
+        decision["items"].reverse()
+    elif fault == "old_version":
+        decision["rule_version"] = "tpm_small_marketing_fee:2"
+    elif fault == "missing_ref":
+        decision["items"][1]["evidence_refs"] = []
+    elif fault == "missing_gap":
+        decision["items"][0]["missing_evidence"] = []
+    else:
+        decision["overall"] = "pass"
+    decision_file = tmp_path / "decision.json"
+    decision_file.write_text(json.dumps(decision))
+    with pytest.raises(ValueError):
         engine.complete_review(Path(action["action_file"]), decision_file)
+    assert not Path(action["action_file"]).with_name("remark.txt").exists()
 
 
-@pytest.mark.parametrize(
-    "specific",
-    (
-        "缺少执行后的现场定位照片 1 张",
-        "需补充关联发票",
-        "无法识别发票销售方",
-        "发票金额与支付金额相差 100 元",
-        "费用科目原值“渠道促销费”不在 10 类规则表",
-        "支付截图仅能证明一笔支付，尚不能建立其与关联发票的直接对应关系",
-        "关联发票与支付事实的对应关系尚不能建立，孰低核销金额待财务确认",
-        "申请签报与费用科目不一致",
-        "支付日期与关联发票不一致",
-        "支付对应关系与收款关系冲突",
-        "签到表与制作清单不一致",
-        "发票金额、支付金额不一致",
-        "发票金额同支付金额不一致",
-        "发票金额跟支付金额不一致",
-        "发票金额及支付金额不一致",
-        "合同显示发票金额与支付金额不一致",
-        "同一发票金额与申报金额不一致",
-        "本次涉及发票金额与支付金额不一致",
-        "需跟踪发票金额与支付金额不一致",
-    ),
-)
-def test_tpm_accepts_a_specific_actionable_issue(
-    tmp_path: Path,
-    specific: str,
+@pytest.mark.parametrize("version", [None, "tpm_small_marketing_fee:2"])
+@pytest.mark.parametrize("degraded", [False, True])
+def test_tpm_old_packets_remain_readable_but_cannot_resume(
+    tmp_path: Path, version: str | None, degraded: bool,
 ) -> None:
-    engine = _engine(tmp_path)
-    action = engine.next_action(WORKFLOW_KEY)
-    decision_file = tmp_path / "decision.json"
-    decision_file.write_text(
-        json.dumps(
-            _decision(action, conclusion=specific),
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-
-    closed = engine.complete_review(Path(action["action_file"]), decision_file)
-
-    assert closed["business_state"] == "needs_human"
-
-
-@pytest.mark.parametrize(
-    "explicit_missing",
-    (
-        "申请签报缺少",
-        "明细归属缺失",
-        "收款关系缺失",
-        "发票金额缺失",
-        "制作清单印章缺失",
-        "定位信息缺失",
-        "发票金额仍未确认",
-        "付款状态仍然不明",
-        "发票金额却为空",
-        "缺失字段：发票金额",
-        "需补充：申请签报",
-        "缺少材料：广告公司盖章版制作清单",
-        "缺失的字段：发票金额",
-        "缺少的材料：申请签报",
-        "需补充材料：申请签报",
-        "支付截图未见重复、发票金额缺失",
-    ),
-)
-def test_tpm_accepts_an_explicitly_missing_material_or_field(
-    tmp_path: Path,
-    explicit_missing: str,
-) -> None:
-    engine = _engine(tmp_path)
-    action = engine.next_action(WORKFLOW_KEY)
-    decision_file = tmp_path / "decision.json"
-    decision_file.write_text(
-        json.dumps(
-            _decision(action, conclusion=explicit_missing),
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-
-    closed = engine.complete_review(Path(action["action_file"]), decision_file)
-
-    assert closed["business_state"] == "needs_human"
-
-
-@pytest.mark.parametrize(
-    "natural_specific",
-    (
-        "未取得当前费用明细的费用科目原值，无法逐字匹配十类费用科目。",
-        "定位照片所在资源未记录与该费用明细的归属关系，不能据照片数量确认现场执行附件已满足要求。",
-        "实际支付状态、支付去重及收款方与发票销售方对应关系未确认，不能按孰低原则确定核销金额。",
-        "第2至4条关联发票字段未解析，第4条另缺广告公司盖章版制作清单。",
-        "关联发票金额未取得，支付事实与关联发票的去重对应关系未建立。",
-        "未取得费用明细及附件清单，无法按十类费用科目的必需材料逐项核对。",
-        "关联发票金额和转账金额合计一致，但支付收款关系不明，不能按四条明细推定分配。",
-        "第4条无实际支付金额，第5、6条关联发票和附件字段未解析，申报总额无法完成核销。",
-        "关联发票引用尚未解析，且支付截图准备页不可读取，附件完整性不能确认。",
-        "未能从OA明细关联发票确认纸质发票，购买方、销售方、金额及明细归属均未核验。",
-        "申报金额为356元，但关联发票金额未取得，支付事实与关联发票的对应关系未建立，不能按孰低原则确定核销金额。",
-        "第2至第4笔发票归属未确认，且付款状态和流水号为空，无法按孰低原则核销。",
-        "关联发票金额与支付截图金额均为198元，但支付对应关系未确认，无法按孰低原则确定核销金额。",
-    ),
-)
-def test_tpm_accepts_specific_natural_failure_phrasing(
-    tmp_path: Path,
-    natural_specific: str,
-) -> None:
-    engine = _engine(tmp_path)
-    action = engine.next_action(WORKFLOW_KEY)
-    decision_file = tmp_path / "decision.json"
-    decision_file.write_text(
-        json.dumps(
-            _decision(action, conclusion=natural_specific),
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-
-    closed = engine.complete_review(Path(action["action_file"]), decision_file)
-
-    assert closed["business_state"] == "needs_human"
-
-
-def test_tpm_public_remark_only_lists_problems(tmp_path: Path) -> None:
-    engine = _engine(tmp_path)
-    action = engine.next_action(WORKFLOW_KEY)
-    decision_file = tmp_path / "decision.json"
-    decision_file.write_text(
-        json.dumps(
-            _decision(action, conclusion="缺少执行后的现场定位照片 1 张"),
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-
-    engine.complete_review(Path(action["action_file"]), decision_file)
-
-    remark = Path(action["action_file"]).with_name("remark.txt").read_text()
-    assert remark == (
-        "AI审核问题清单：\n"
-        "⚠️ 2、科目附件完整性：缺少执行后的现场定位照片 1 张\n"
-    )
-    assert "费用科目：已核对" not in remark
-
-
-def test_tpm_public_remark_collapses_all_pass_items(tmp_path: Path) -> None:
-    engine = _engine(tmp_path)
-    action = engine.next_action(WORKFLOW_KEY)
-    decision = _decision(action, conclusion="unused")
-    decision["overall"] = "pass"
-    for item in decision["items"]:
-        item["status"] = "pass"
-        item["conclusion"] = "已核对"
-        item["evidence_refs"] = ["material:declared_fields.expense_subject"]
-        item["missing_evidence"] = []
-    decision_file = tmp_path / "decision.json"
-    decision_file.write_text(
-        json.dumps(decision, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
-    engine.complete_review(Path(action["action_file"]), decision_file)
-
-    remark = Path(action["action_file"]).with_name("remark.txt").read_text()
-    assert remark == "AI审核问题清单：未发现需提示问题。\n"
-
-
-@pytest.mark.parametrize(
-    ("item_key", "conclusion", "validation_code"),
-    (
-        (
-            "linked_invoice_receipt",
-            "关联发票为电子发票，非纸质发票。",
-            "tpm_invoice_type_conclusion",
-        ),
-        (
-            "attachment_completeness",
-            "缺少参考报价单。",
-            "tpm_optional_quote_conclusion",
-        ),
-        (
-            "linked_invoice_receipt",
-            "关联发票销售方未取得。",
-            "tpm_issue_item_scope",
-        ),
-    ),
-)
-def test_tpm_v2_rejects_finance_rule_misinterpretations(
-    tmp_path: Path,
-    item_key: str,
-    conclusion: str,
-    validation_code: str,
-) -> None:
-    engine = _engine(tmp_path)
-    action = engine.next_action(WORKFLOW_KEY)
-    decision = _decision(action, conclusion="缺少执行后的现场定位照片 1 张")
-    target = next(item for item in decision["items"] if item["item_key"] == item_key)
-    target["status"] = "uncertain"
-    target["conclusion"] = conclusion
-    target["evidence_refs"] = []
-    target["missing_evidence"] = [conclusion]
-    decision_file = tmp_path / "decision.json"
-    decision_file.write_text(
-        json.dumps(decision, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(flow_engine.decision_validation.InvalidDecision) as caught:
-        engine.complete_review(Path(action["action_file"]), decision_file)
-
-    assert caught.value.validation_code == validation_code
-
-
-@pytest.mark.parametrize(
-    ("item_key", "conclusion"),
-    (
-        ("linked_invoice_receipt", "关联电子发票购买方为空。"),
-        (
-            "linked_invoice_receipt",
-            "关联发票为电子发票，但票面图像损坏无法读取。",
-        ),
-        (
-            "attachment_completeness",
-            "已提供参考报价单，但内容模糊，无法核对制作数量和样式。",
-        ),
-    ),
-)
-def test_tpm_v2_keeps_real_invoice_and_quote_gaps(
-    tmp_path: Path,
-    item_key: str,
-    conclusion: str,
-) -> None:
-    engine = _engine(tmp_path)
-    action = engine.next_action(WORKFLOW_KEY)
-    decision = _decision(action, conclusion="缺少执行后的现场定位照片 1 张")
-    target = next(item for item in decision["items"] if item["item_key"] == item_key)
-    target["status"] = "uncertain"
-    target["conclusion"] = conclusion
-    target["evidence_refs"] = []
-    target["missing_evidence"] = [conclusion]
-    decision_file = tmp_path / "decision.json"
-    decision_file.write_text(
-        json.dumps(decision, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
-    closed = engine.complete_review(Path(action["action_file"]), decision_file)
-
-    assert closed["business_state"] == "needs_human"
-
-
-@pytest.mark.parametrize(
-    "item_key",
-    (
-        "attachment_completeness",
-        "payment_evidence",
-        "reimbursable_minimum",
-        "entity_consistency",
-    ),
-)
-def test_tpm_v2_does_not_reopen_confirmed_company_payment_fields(
-    tmp_path: Path,
-    item_key: str,
-) -> None:
-    declared_fields = [
-        {"name": "是否调用支付接口", "value": "是", "path": "main[0].field[0]"},
-        {"name": "支付公司", "value": "记录公司", "path": "main[0].field[1]"},
-        {"name": "收款人员名称", "value": "记录供应商", "path": "detail[2].row[0].field[0]"},
-        {"name": "收款方式", "value": "银行转账", "path": "detail[2].row[0].field[1]"},
-        {"name": "金额", "value": "2683", "path": "detail[2].row[0].field[2]"},
-        {"name": "支付状态", "value": "", "path": "detail[2].row[0].field[3]"},
-        {"name": "支付日期", "value": "", "path": "main[0].field[2]"},
-        {"name": "流水号", "value": "", "path": "detail[2].row[0].field[4]"},
+    old_items = [
+        {"item_key": key, "number": number, "name": name}
+        for number, (key, name) in enumerate((
+            ("expense_subject", "费用科目"),
+            ("attachment_completeness", "科目附件完整性"),
+            ("linked_invoice_receipt", "关联发票与收据"),
+            ("payment_evidence", "支付凭证"),
+            ("reimbursable_minimum", "金额孰低核销"),
+            ("entity_consistency", "主体一致性"),
+        ), 1)
     ]
-    engine = _engine(tmp_path, declared_fields=declared_fields)
-    action = engine.next_action(WORKFLOW_KEY)
-    decision = _decision(action, conclusion="缺少执行后的现场定位照片 1 张")
-    payment = next(
-        item for item in decision["items"] if item["item_key"] == item_key
-    )
-    payment["status"] = "uncertain"
-    payment["conclusion"] = "支付状态、支付日期和流水号为空。"
-    payment["evidence_refs"] = []
-    payment["missing_evidence"] = ["支付状态、支付日期和流水号"]
-    decision_file = tmp_path / "decision.json"
-    decision_file.write_text(
-        json.dumps(decision, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(flow_engine.decision_validation.InvalidDecision) as caught:
-        engine.complete_review(Path(action["action_file"]), decision_file)
-
-    assert caught.value.validation_code == "tpm_company_payment_conclusion"
+    current = {"rule_version": RULE_VERSION, "items": [], "material_state": "degraded" if degraded else "complete",
+               "required_uncertain_items": list(ITEM_KEYS) if degraded else []}
+    state = {"rule_version": version} if version else {}
+    old = flow_engine._accepted_tpm_small_marketing_packets(current, state)[0]
+    assert old["rule_version"] == (version or "tpm_small_marketing_fee:1")
+    assert old["items"] == old_items
+    assert old["required_uncertain_items"] == ([item["item_key"] for item in old_items] if degraded else [])
+    with pytest.raises(ValueError, match="frozen_packet_changed"):
+        flow_engine._accepted_tpm_small_marketing_packets(current, state, action=state)
 
 
-def test_tpm_v2_rejects_repeated_payment_relationship_gap(
-    tmp_path: Path,
-) -> None:
+def test_tpm_obsolete_rules_rejected_before_starting_worker(tmp_path: Path, monkeypatch) -> None:
+    action = _engine(tmp_path).next_action(WORKFLOW_KEY)
+    packet_path = Path(action["review_packet_file"])
+    packet = json.loads(packet_path.read_text())
+    packet["rule_version"] = "tpm_small_marketing_fee:2"
+    packet_path.write_text(json.dumps(packet))
+    monkeypatch.setattr(codex_review_worker, "_decision_schema", lambda *a, **k: {})
+    def unexpected_spawn(*args, **kwargs):
+        pytest.fail("Obsolete rules must not start a child process")
+    monkeypatch.setattr(codex_review_worker.subprocess, "Popen", unexpected_spawn)
+    result = codex_review_worker._execute_codex_raw(tmp_path, Path(action["action_file"]), 1, stderr_summary={})
+    assert result.error_code == "codex_review_task_invalid"
+    assert result.process_state == "not_started"
+
+
+@pytest.mark.parametrize("target", ["action_file", "state_file", "review_packet_file"])
+def test_tpm_current_version_cannot_be_removed_or_downgraded(tmp_path: Path, target: str) -> None:
     engine = _engine(tmp_path)
     action = engine.next_action(WORKFLOW_KEY)
-    decision = _decision(action, conclusion="缺少执行后的现场定位照片 1 张")
-    repeated = "支付凭证与关联发票的收款关系未确认。"
-    for item_key in ("payment_evidence", "reimbursable_minimum"):
-        item = next(
-            item for item in decision["items"] if item["item_key"] == item_key
-        )
-        item["status"] = "uncertain"
-        item["conclusion"] = repeated
-        item["evidence_refs"] = []
-        item["missing_evidence"] = [repeated]
+    path = Path(action[target])
+    value = json.loads(path.read_text())
+    value.pop("rule_version")
+    path.write_text(json.dumps(value))
     decision_file = tmp_path / "decision.json"
-    decision_file.write_text(
-        json.dumps(decision, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(flow_engine.decision_validation.InvalidDecision) as caught:
-        engine.complete_review(Path(action["action_file"]), decision_file)
-
-    assert caught.value.validation_code == "tpm_issue_item_scope"
+    decision_file.write_text(json.dumps(_decision(action, conclusion="缺少现场定位照片")))
+    result = engine.complete_review(Path(action["action_file"]), decision_file)
+    assert result["action"] == "needs_admin"
+    assert not Path(action["action_file"]).with_name("remark.txt").exists()
 
 
-def test_tpm_legacy_v1_packet_can_finish_under_its_frozen_version(
-    tmp_path: Path,
-) -> None:
+@pytest.mark.parametrize("write_state", ["submitting", "unknown"])
+def test_tpm_obsolete_pending_write_stays_unknown(tmp_path: Path, monkeypatch, write_state: str) -> None:
     engine = _engine(tmp_path)
     action = engine.next_action(WORKFLOW_KEY)
-    action_file = Path(action["action_file"])
-    state_file = Path(action["state_file"])
-    packet_file = Path(action["review_packet_file"])
-    legacy_action = json.loads(action_file.read_text())
-    legacy_state = json.loads(state_file.read_text())
-    legacy_packet = json.loads(packet_file.read_text())
-    legacy_action.pop("rule_version")
-    legacy_state.pop("rule_version")
-    legacy_packet["rule_version"] = "tpm_small_marketing_fee:1"
-    for path, payload in (
-        (action_file, legacy_action),
-        (state_file, legacy_state),
-        (packet_file, legacy_packet),
-    ):
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-    decision = _decision(
-        legacy_action,
-        conclusion="关联发票为电子发票，非纸质发票。",
-    )
-    decision["rule_version"] = "tpm_small_marketing_fee:1"
-    decision_file = tmp_path / "legacy-decision.json"
-    decision_file.write_text(
-        json.dumps(decision, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
-    closed = engine.complete_review(action_file, decision_file)
-
-    assert closed["business_state"] == "needs_human"
-
-
-def test_tpm_company_payment_requires_each_payment_row_to_be_complete() -> None:
-    material = {
-        "declared_fields": [
-            {"name": "是否调用支付接口", "value": "是", "path": "main[0].field[0]"},
-            {"name": "支付公司", "value": "记录公司", "path": "main[0].field[1]"},
-            {"name": "收款人员名称", "value": "供应商甲", "path": "detail[2].row[0].field[0]"},
-            {"name": "收款方式", "value": "银行转账", "path": "detail[2].row[0].field[1]"},
-            {"name": "金额", "value": "100", "path": "detail[2].row[0].field[2]"},
-            {"name": "收款人员名称", "value": "供应商乙", "path": "detail[2].row[1].field[0]"},
-            {"name": "金额", "value": "200", "path": "detail[2].row[1].field[2]"},
-        ]
-    }
-
-    assert flow_engine._tpm_company_payment_confirmed(material) is False
+    action_path = Path(action["action_file"])
+    state_path = Path(action["state_file"])
+    state = json.loads(state_path.read_text())
+    state.update(rule_version="tpm_small_marketing_fee:2", write_state=write_state)
+    state_path.write_text(json.dumps(state))
+    action.update(rule_version="tpm_small_marketing_fee:2", write_state=write_state)
+    action_path.write_text(json.dumps(action))
+    def unexpected_recovery(*args, **kwargs):
+        pytest.fail("Old pending write requires reconciliation, not automatic recovery")
+    monkeypatch.setattr(engine, "_recover_frozen_submission", unexpected_recovery)
+    result = engine._recover_completion(action_path.parent, state)
+    assert result["action"] == "needs_admin"
+    assert result["write_state"] == "unknown"
+    assert result["reason"] == "writer_result_unknown"
+    assert json.loads(state_path.read_text())["write_state"] == "unknown"
+    assert not action_path.with_name("remark.txt").exists()

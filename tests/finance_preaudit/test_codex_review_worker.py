@@ -646,6 +646,10 @@ def test_codex_command_pins_terra_high_and_json_output(tmp_path: Path) -> None:
     assert "--json" in command
     assert "--ephemeral" in command
     assert "--ignore-user-config" in command
+    assert 'model_provider="oa_https"' in command
+    assert 'model_providers.oa_https={name="OpenAI",requires_openai_auth=true,supports_websockets=false}' in command
+    assert command[command.index("--sandbox") + 1] == "read-only"
+    assert 'approval_policy="never"' in command
     assert command[command.index("--output-schema") + 1].endswith("schema.json")
     assert command[command.index("--output-last-message") + 1].endswith(
         "decision.json"
@@ -1732,3 +1736,39 @@ def test_invalid_bound_token_fails_before_process_start(tmp_path: Path, monkeypa
     assert result["error_code"] == "codex_review_task_invalid"
     assert result["write_state"] == "not_requested"
     assert not action_file.with_name("review-decision.json").exists()
+
+
+def test_review_prompt_keeps_required_business_values_inside_decision(tmp_path):
+    _, action = _task(tmp_path, workflow_key="general_expense")
+    prompt = codex_review_worker._prompt(action)
+    assert "JSON 之外" in prompt
+    assert "具体金额、实际公司全称" in prompt
+    assert "不得输出密钥、凭据" in prompt
+    assert "不添加 Markdown、解释、单号、人员、公司" not in prompt
+
+
+def test_tpm_prompt_requires_exact_evidence_references(tmp_path):
+    _, action = _task(tmp_path, workflow_key="tpm_small_marketing_fee")
+    packet_file = action.with_name("review-packet.json")
+    packet = json.loads(packet_file.read_text())
+    packet["rule_version"] = "tpm_small_marketing_fee:3"
+    json_artifact.write_json_atomic(packet_file, packet)
+    prompt = codex_review_worker._prompt(action)
+    assert "逐字使用 declared_fields 中的 path" in prompt
+    assert "不使用视图行号、简写路径或范围表达式" in prompt
+    assert "material.authority_facts[实际数组索引]" in prompt
+
+
+def test_tpm_prompt_keeps_passing_conclusions_short_and_direct(tmp_path):
+    _, action = _task(tmp_path, workflow_key="tpm_small_marketing_fee")
+    packet_file = action.with_name("review-packet.json")
+    packet = json.loads(packet_file.read_text())
+    packet["rule_version"] = "tpm_small_marketing_fee:3"
+    json_artifact.write_json_atomic(packet_file, packet)
+
+    prompt = codex_review_worker._prompt(action)
+
+    assert "通过项只写一句给审批人的结论" in prompt
+    assert "不复述取证过程" in prompt
+    assert "核销项直接写最终核销金额" in prompt
+    assert "支付公司项直接写应使用的公司全称" in prompt

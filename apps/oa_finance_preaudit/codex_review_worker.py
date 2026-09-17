@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 import signal
+import shlex
 import subprocess
 import tempfile
 import threading
@@ -42,7 +43,7 @@ _FINANCE_RULES = {
         "references/flows/small-marketing-fee.md",
     ),
     "tpm_small_marketing_fee": (
-        "tpm_small_marketing_fee:2",
+        "tpm_small_marketing_fee:3",
         "TPM小额市场费",
         "references/flows/tpm-small-marketing-fee.md",
     ),
@@ -126,17 +127,12 @@ _SMALL_MARKETING_V2_REQUIREMENT = (
     "当前实际公司全称支付。”的句式并替换公司全称；"
 )
 _TPM_SMALL_MARKETING_REQUIREMENT = (
-    "六项必须逐项按 TPM 小额市场费独立规则包形成结论；完整核对 10 类费用科目"
-    "及各自附件要求，只识别 OA 明细‘关联发票’处的发票；电子发票及其他非纸质"
-    "发票本身不是问题，只有纸质发票才核对寄送或签收；参考报价单只在已提供时作为"
-    "终端形象制作费的比对依据，不是必传附件；已确认对公支付时不得因缺少支付截图、"
-    "支付状态、支付日期或流水号而判定不符合或不确定；"
-    "允许多张支付凭证合计对应一张发票但必须排除重复截图，金额按孰低原则核销；"
-    "对公支付无需支付截图，不设置员工代垫场景；缺少附件不技术阻断，必须写明具体"
-    "缺失材料、冲突事实、照片数量或定位缺口，不得只写‘异常’、‘无法识别’、"
-    "‘需补充’或‘附件不完整’；销售方、清单印章和收款人关系只在第六项主体一致性"
-    "表达；同一源头缺口只在最相关项完整说明，其他项不得重复扩散；AI不得退回单据，"
-    "财务保留退回权；"
+    "按 TPM 规则包的四项形成完整结论：附件完整性、发票关联与金额、金额孰低核销、"
+    "支付公司一致；科目和支付截图要求归入这四项，不增加审核项；"
+    "通过项也必须输出。通过项只写一句给审批人的结论，不复述取证过程、图片覆盖、字段、"
+    "文件路径、豁免推理或发票挂票位置；发票项只写金额与报销金额的结果，核销项直接写最终核销金额，"
+    "支付公司项直接写应使用的公司全称。按当前流程的实际证据审核，缺口和冲突说明具体对象与事实；"
+    "不得把程序未读取到附件等同于申请人未上传。AI只给意见，不批准、不退回；"
 )
 @dataclass(frozen=True)
 class CodexExecution:
@@ -289,6 +285,8 @@ def _prompt(action_file: Path) -> str:
     workflow_key = _action_workflow(action_file) or "travel_expense"
     _rule_version, workflow_name, rule_reference = _FINANCE_RULES[workflow_key]
     frozen_rule_version = _frozen_rule_version(action_file, workflow_key)
+    if workflow_key == "tpm_small_marketing_fee" and frozen_rule_version != _rule_version:
+        raise ValueError("frozen_packet_changed")
     frozen_item_keys = (
         _frozen_item_keys(action_file, workflow_key)
         if workflow_key == "small_marketing_fee"
@@ -321,6 +319,19 @@ def _prompt(action_file: Path) -> str:
         workflow_requirement = _TPM_SMALL_MARKETING_REQUIREMENT
     else:
         workflow_requirement = "只按该流程固定审核项判断，不得读取其他流程规则或证据；"
+    material_reading = (
+        "材料先运行 `python3 -m apps.oa_finance_preaudit.read_material "
+        + shlex.quote(str(action_file))
+        + "` 读取；这是冻结材料的无损表格视图，列名后每行按列顺序给值，"
+        "absent 表示原记录不存在的字段。保留原始读取状态与证据归属。"
+        "命令输出较长，请设置足够的输出上限（max_output_tokens=60000）；"
+        "如工具仍截断，按行分段读完。不要反复猜测材料 JSON 结构。"
+        "prepared.images 列出原图路径及表格单元格；必须通过看图工具阅读图片，"
+        "不能将索引或文件存在当成图片内容。"
+        "evidence_refs 的表单字段引用必须逐字使用 declared_fields 中的 path，"
+        "不使用视图行号、简写路径或范围表达式；权威事实使用 material.authority_facts[实际数组索引]。"
+        if workflow_key == "tpm_small_marketing_fee" else ""
+    )
     output_requirement = (
         "最终只输出符合本次宿主 JSON schema 的单个 JSON 对象；`items` "
         "必须是以上六个规范键组成的对象，各键的值不包含 `item_key`；"
@@ -333,12 +344,13 @@ def _prompt(action_file: Path) -> str:
 
 只处理这个已冻结动作：{action_file}
 {fallback_routing}
+{material_reading}
 
 要求：
 1. 完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由读取 `references/result-contract.md`、`references/observation-contract.md`、`{rule_reference}`、动作引用的审核包、材料和准备页；{workflow_requirement}{frozen_item_requirement}不得读取其他 attempt。
 2. 不修改任何文件、项目代码、Skill、配置、授权清单或冻结材料；不得调用 `next-action`、`complete-review` 或任何 OA 写入，不得领取其他单据。
 3. 根据审核包中的固定审核项动态形成结构化决定。证据不足使用 `uncertain` 交财务判断，不得因为材料缺口卡住业务流程；身份、归属、冻结或授权不可信时停止。
-4. {output_requirement}不添加 Markdown、解释、单号、人员、公司、附件原文、路径、意见正文、密钥或日志。宿主会校验并负责受控提交。
+4. {output_requirement}JSON 之外不添加 Markdown、解释、日志或额外意见正文。结论内保留规则要求的具体金额、实际公司全称等必要业务原值；不得输出密钥、凭据或无关附件原文。宿主会校验并负责受控提交。
 """
 
 
@@ -378,6 +390,11 @@ def _codex_command(
         'approval_policy="never"',
         "--config",
         f'model_reasoning_effort="{REASONING_EFFORT}"',
+        # 避免长审核在 WebSocket 断流后耗尽重连时间；继续使用原生 OpenAI 登录。
+        "--config",
+        'model_provider="oa_https"',
+        "--config",
+        'model_providers.oa_https={name="OpenAI",requires_openai_auth=true,supports_websockets=false}',
         "--output-schema",
         str(schema_file),
         "--output-last-message",
@@ -759,6 +776,7 @@ def _execute_codex_raw(
 ) -> CodexExecution:
     try:
         schema = _decision_schema(action_file, read_only=read_only)
+        prompt = prompt_builder(action_file)
     except ValueError:
         return CodexExecution(
             "codex_review_task_invalid", _unknown_usage(),
@@ -848,7 +866,7 @@ def _execute_codex_raw(
         stderr_reader.start()
         try:
             process.communicate(
-                input=prompt_builder(action_file),
+                input=prompt,
                 timeout=timeout_seconds,
             )
         except subprocess.TimeoutExpired:
@@ -865,6 +883,7 @@ def _execute_codex_raw(
             usage = _parse_token_usage(output)
             event_counts = _parse_event_counts(output)
             event_status = _event_status(output, event_counts)
+            stderr_summary["event_signals"] = process_diagnostics.event_error_signals(output)
             stderr_summary["last_observed_stage"] = process_diagnostics.last_stage(output)
             output.close()
             return CodexExecution(
@@ -887,6 +906,7 @@ def _execute_codex_raw(
         usage = _parse_token_usage(output)
         event_counts = _parse_event_counts(output)
         event_status = _event_status(output, event_counts)
+        stderr_summary["event_signals"] = process_diagnostics.event_error_signals(output)
         stderr_summary["last_observed_stage"] = process_diagnostics.last_stage(output)
         decision: dict | None = None
         decision_state = "not_written"
