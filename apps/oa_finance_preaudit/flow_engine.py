@@ -95,7 +95,7 @@ _FLOW_SPECS = {
         ),
     },
     "tpm_small_marketing_fee": {
-        "rule_version": "tpm_small_marketing_fee:1",
+        "rule_version": "tpm_small_marketing_fee:2",
         "item_keys": (
             "expense_subject",
             "attachment_completeness",
@@ -150,8 +150,10 @@ _LEGACY_PACKAGING_RULE_VERSION = "packaging_layout_approval:1"
 _PACKAGING_RULE_VERSION = "packaging_layout_approval:2"
 _LEGACY_SMALL_MARKETING_RULE_VERSION = "small_marketing_fee:1"
 _SMALL_MARKETING_RULE_VERSION = "small_marketing_fee:2"
+_LEGACY_TPM_SMALL_MARKETING_RULE_VERSION = "tpm_small_marketing_fee:1"
+_TPM_SMALL_MARKETING_RULE_VERSION = "tpm_small_marketing_fee:2"
 _EXPLICIT_RULE_VERSION_WORKFLOWS = frozenset(
-    {"packaging_layout_approval", "small_marketing_fee"}
+    {"packaging_layout_approval", "small_marketing_fee", "tpm_small_marketing_fee"}
 )
 _PACKAGING_SKIP_REMARK = "AI审核结论：非包装版面，跳过审核。"
 _PACKAGING_PAGE_CLASSIFICATIONS = frozenset(
@@ -332,7 +334,113 @@ def _validate_small_marketing_conclusions(
         raise decision_validation.InvalidDecision("payment_attachment_terms")
 
 
-def _validate_tpm_small_marketing_conclusions(items: list[dict]) -> None:
+def _tpm_company_payment_confirmed(material: dict) -> bool:
+    fields = material.get("declared_fields")
+    if not isinstance(fields, list):
+        return False
+    main_values = {
+        str(item.get("name") or "").strip(): str(item.get("value") or "").strip()
+        for item in fields
+        if isinstance(item, dict)
+        and str(item.get("path") or "").startswith("main[")
+    }
+    payment_names = {"收款人员名称", "收款方式", "金额"}
+    payment_rows: dict[str, dict[str, str]] = {}
+    for item in fields:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        path = str(item.get("path") or "").strip()
+        if name not in payment_names or ".field[" not in path:
+            continue
+        row_ref = path.rsplit(".field[", 1)[0]
+        payment_rows.setdefault(row_ref, {})[name] = str(
+            item.get("value") or ""
+        ).strip()
+    return (
+        main_values.get("是否调用支付接口") == "是"
+        and bool(
+            main_values.get("支付公司")
+            or main_values.get("支付公司2")
+            or main_values.get("支付公司文本")
+        )
+        and bool(payment_rows)
+        and all(
+            all(row.get(name) for name in payment_names)
+            for row in payment_rows.values()
+        )
+    )
+
+
+def _validate_tpm_small_marketing_conclusions(
+    items: list[dict],
+    material: dict,
+) -> None:
+    by_key = {str(item.get("item_key") or ""): item for item in items}
+    invoice = by_key.get("linked_invoice_receipt", {})
+    invoice_conclusion = str(invoice.get("conclusion") or "")
+    if invoice.get("status") != "pass":
+        normalized_invoice = re.sub(r"[，,。；;：:\s]", "", invoice_conclusion)
+        type_only_conclusions = {
+            "电子发票非纸质发票",
+            "关联发票为电子发票非纸质发票",
+            "关联发票是电子发票非纸质发票",
+            "关联发票为非纸质发票",
+            "关联发票是非纸质发票",
+        }
+        if (
+            normalized_invoice in type_only_conclusions
+            or (
+                re.search(r"电子发票|非纸质发票", invoice_conclusion)
+                and re.search(
+                    r"类型不符|不符合|不允许|不可接受|错误|异常",
+                    invoice_conclusion,
+                )
+            )
+        ):
+            raise decision_validation.InvalidDecision("tpm_invoice_type_conclusion")
+        if any(
+            marker in invoice_conclusion
+            for marker in ("销售方", "收款方", "收款人", "印章")
+        ):
+            raise decision_validation.InvalidDecision("tpm_issue_item_scope")
+    attachment = by_key.get("attachment_completeness", {})
+    attachment_conclusion = str(attachment.get("conclusion") or "")
+    if (
+        attachment.get("status") != "pass"
+        and "参考报价单" in attachment_conclusion
+        and re.search(r"缺少|缺失|未提供|未上传|需补充", attachment_conclusion)
+    ):
+        raise decision_validation.InvalidDecision("tpm_optional_quote_conclusion")
+    if _tpm_company_payment_confirmed(material):
+        payment_gap = re.compile(r"支付截图|支付状态|支付日期|流水号")
+        for item_key in (
+            "attachment_completeness",
+            "payment_evidence",
+            "reimbursable_minimum",
+            "entity_consistency",
+        ):
+            item = by_key.get(item_key, {})
+            if item.get("status") != "pass" and payment_gap.search(
+                str(item.get("conclusion") or "")
+            ):
+                raise decision_validation.InvalidDecision(
+                    "tpm_company_payment_conclusion"
+                )
+    payment = by_key.get("payment_evidence", {})
+    minimum = by_key.get("reimbursable_minimum", {})
+    payment_relationship = re.compile(
+        r"(?:支付|付款|收款).{0,24}(?:关联发票|发票).{0,24}(?:关系|对应)"
+        r"|(?:关联发票|发票).{0,24}(?:支付|付款|收款).{0,24}(?:关系|对应)"
+    )
+    if (
+        payment.get("status") != "pass"
+        and minimum.get("status") != "pass"
+        and payment_relationship.search(str(payment.get("conclusion") or ""))
+        and payment_relationship.search(str(minimum.get("conclusion") or ""))
+    ):
+        raise decision_validation.InvalidDecision("tpm_issue_item_scope")
+
     specific_markers = (
         "费用科目",
         "科目原值",
@@ -342,6 +450,7 @@ def _validate_tpm_small_marketing_conclusions(items: list[dict]) -> None:
         "发票销售方",
         "发票金额",
         "发票归属",
+        "票面图像",
         "申报金额",
         "申报总额",
         "广告公司盖章版制作清单",
@@ -412,7 +521,7 @@ def _validate_tpm_small_marketing_conclusions(items: list[dict]) -> None:
     direct_conflict = re.compile(r"非纸质发票")
     explicit_missing_cue = re.compile(
         r"缺(?:少|失)?|未提供|需补充|未取得|未解析|未形成|未显示|"
-        r"不可读取|读取失败|无法识别|无可关联"
+        r"不可读取|读取失败|无法读取|无法识别|无可关联"
     )
     explicit_missing_markers = (*specific_markers, "附件清单")
     field_state_cue = re.compile(
@@ -1448,6 +1557,11 @@ def _validate_frozen_review_inputs(
         accepted_packets = _accepted_packaging_packets(expected_packet, state)
     elif workflow_key == "small_marketing_fee":
         accepted_packets = _accepted_small_marketing_packets(expected_packet, state)
+    elif workflow_key == "tpm_small_marketing_fee":
+        accepted_packets = _accepted_tpm_small_marketing_packets(
+            expected_packet,
+            state,
+        )
     if packet not in accepted_packets:
         raise ValueError("frozen_packet_changed")
 
@@ -1542,6 +1656,30 @@ def _accepted_small_marketing_packets(
         return [_legacy_small_marketing_packet(expected_packet)]
     if frozen_version == _SMALL_MARKETING_RULE_VERSION and (
         action is None or action.get("rule_version") == _SMALL_MARKETING_RULE_VERSION
+    ):
+        return [expected_packet]
+    raise ValueError("frozen_packet_changed")
+
+
+def _legacy_tpm_small_marketing_packet(packet: dict) -> dict:
+    legacy = dict(packet)
+    legacy["rule_version"] = _LEGACY_TPM_SMALL_MARKETING_RULE_VERSION
+    return legacy
+
+
+def _accepted_tpm_small_marketing_packets(
+    expected_packet: dict,
+    state: dict,
+    *,
+    action: dict | None = None,
+) -> list[dict]:
+    frozen_version = state.get("rule_version")
+    if frozen_version is None:
+        if action is not None and action.get("rule_version") is not None:
+            raise ValueError("frozen_packet_changed")
+        return [_legacy_tpm_small_marketing_packet(expected_packet)]
+    if frozen_version == _TPM_SMALL_MARKETING_RULE_VERSION and (
+        action is None or action.get("rule_version") == _TPM_SMALL_MARKETING_RULE_VERSION
     ):
         return [expected_packet]
     raise ValueError("frozen_packet_changed")
@@ -2641,7 +2779,11 @@ class FlowEngine:
                 ):
                     return False
                 validation_state = state
-                if rule_version in {_PACKAGING_RULE_VERSION, _SMALL_MARKETING_RULE_VERSION}:
+                if rule_version in {
+                    _PACKAGING_RULE_VERSION,
+                    _SMALL_MARKETING_RULE_VERSION,
+                    _TPM_SMALL_MARKETING_RULE_VERSION,
+                }:
                     validation_state = {**state, "rule_version": rule_version}
                 _validate_frozen_review_inputs(
                     attempt_root=attempt_root, state=validation_state,
@@ -2787,6 +2929,12 @@ class FlowEngine:
             )
         elif workflow_key == "small_marketing_fee":
             accepted_packets = _accepted_small_marketing_packets(
+                expected_packet,
+                state,
+                action=action,
+            )
+        elif workflow_key == "tpm_small_marketing_fee":
+            accepted_packets = _accepted_tpm_small_marketing_packets(
                 expected_packet,
                 state,
                 action=action,
@@ -4148,8 +4296,14 @@ class FlowEngine:
                     normalized_items,
                     quality_material,
                 )
-            if action["workflow_key"] == "tpm_small_marketing_fee":
-                _validate_tpm_small_marketing_conclusions(normalized_items)
+            if (
+                action["workflow_key"] == "tpm_small_marketing_fee"
+                and packet.get("rule_version") == _TPM_SMALL_MARKETING_RULE_VERSION
+            ):
+                _validate_tpm_small_marketing_conclusions(
+                    normalized_items,
+                    quality_material,
+                )
             covered_page_refs = {
                 value
                 for item in normalized_items
@@ -4323,6 +4477,24 @@ class FlowEngine:
             lines = [manual_handoff.remark(decision)]
         elif packaging_visual_outcome == "all_non_packaging":
             lines = [_PACKAGING_SKIP_REMARK]
+        elif action["workflow_key"] == "tpm_small_marketing_fee":
+            problem_items = [
+                (number, expected, item)
+                for number, (expected, item) in enumerate(
+                    zip(packet_items, normalized_items),
+                    start=1,
+                )
+                if item["status"] != "pass"
+            ]
+            if problem_items:
+                lines = ["AI审核问题清单："]
+                lines.extend(
+                    f"{status_mark[item['status']]} {number}、{expected['name']}："
+                    f"{item['conclusion'].strip()}"
+                    for number, expected, item in problem_items
+                )
+            else:
+                lines = ["AI审核问题清单：未发现需提示问题。"]
         else:
             lines = [first_line]
             for number, (expected, item) in enumerate(

@@ -101,12 +101,11 @@ def _authority_facts(
         facts.append(fact)
     if str(config.get("flow_key") or "") == _PACKAGING_FLOW:
         return facts
+    workflow_key = str(config.get("flow_key") or "")
     invoice_result = invoice_buyers.read_invoice_buyers(
         oa_api,
         workflow,
-        linked_detail_only=(
-            str(config.get("flow_key") or "") == "tpm_small_marketing_fee"
-        ),
+        linked_detail_only=(workflow_key == "tpm_small_marketing_fee"),
     )
     if str(invoice_result.get("read_status") or "") == "failed":
         raise RuntimeError(
@@ -124,6 +123,19 @@ def _authority_facts(
         and str(item.get("invoice_no") or "").strip()
         and str(item.get("buyer") or "").strip()
     )
+    if workflow_key == "tpm_small_marketing_fee":
+        facts.extend(
+            {
+                "source": "invoice_cloud",
+                "name": "发票销售方",
+                "value": str(item.get("seller") or ""),
+                "subject_ref": str(item.get("invoice_no") or ""),
+            }
+            for item in invoice_result.get("invoices", [])
+            if isinstance(item, dict)
+            and str(item.get("invoice_no") or "").strip()
+            and str(item.get("seller") or "").strip()
+        )
     return facts
 
 
