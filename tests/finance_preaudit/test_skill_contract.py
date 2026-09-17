@@ -155,7 +155,8 @@ def test_confirmed_feedback_and_regressions_stay_sanitized() -> None:
                 "核对当前单据 OA“关联发票”及发票金额",
                 "同一发票去重计入",
                 "不要求逐行重复挂票",
-                "收款人名称与关联发票销售方一致",
+                "一致即按对公支付免支付截图",
+                "不追加清单盖章要求",
                 "排除重复截图",
                 "不设置容差",
                 "AI 只形成预审意见，不批准、不退回",
@@ -239,3 +240,12 @@ def test_packaging_rule_keeps_text_scope_and_finite_escalation() -> None:
             "RC-025-packaging-carton-fixed-item-content-skipped"
         ]["input_facts"]
     )
+
+
+def test_shared_reading_distinguishes_display_differences_from_missing_facts():
+    contract = OBSERVATION_CONTRACT.read_text(encoding="utf-8")
+    assert "仅当当前流程规则明确允许时" in contract
+    tpm = FLOW_RULE_PACKS["tpm_small_marketing_fee"].read_text(encoding="utf-8")
+    assert "仅统一中英文括号并去掉首尾空白" in tpm
+    assert "不得改字、展开简称或做模糊匹配" in contract
+    assert "先检查同一事实是否已由其他可信字段或附件确认" in contract
