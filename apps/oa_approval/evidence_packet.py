@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+from html.parser import HTMLParser
 from pathlib import Path
 import re
 from typing import Any
@@ -13,10 +14,6 @@ ATTACHMENT_FIELD_URL_RE = re.compile(r"https://[^\s\"'<>]+", re.IGNORECASE)
 FIELD_ATTACHMENT_HOSTS = attachments.EXTRA_DOWNLOAD_HOSTS
 TRIP_ATTACHMENT_ID_RE = re.compile(
     r"/opera/(?:getFile|share/open)/(\d+)/",
-    re.IGNORECASE,
-)
-OA_ATTACHMENT_FILE_ID_RE = re.compile(
-    r"(?:[?&])fileid=([^&\"'<>\s]+)",
     re.IGNORECASE,
 )
 _TRUSTED_OWNER_DETAIL_KEY = "_trusted_owner_detail_id"
@@ -203,11 +200,8 @@ def _attachment_resource_bindings(data: dict[str, Any]) -> dict[str, dict[str, s
             str(field.get("name") or ""),
             owner_detail_id,
         )
-        attachment_html = html.unescape(str(field.get("attachment_html") or ""))
-        for match in OA_ATTACHMENT_FILE_ID_RE.finditer(attachment_html):
-            resource_id = urllib.parse.unquote(match.group(1)).strip()
-            if resource_id:
-                candidates.setdefault(resource_id, set()).add(binding)
+        for resource_id, _filename, _link in _validated_html_links(str(field.get("attachment_html") or "")):
+            candidates.setdefault(resource_id, set()).add(binding)
     bindings: dict[str, dict[str, str]] = {}
     for resource_id, values in candidates.items():
         if len(values) != 1:
@@ -219,6 +213,78 @@ def _attachment_resource_bindings(data: dict[str, Any]) -> dict[str, dict[str, s
             "owner_detail_id": owner_detail_id,
         }
     return bindings
+
+
+class _AttachmentLinkParser(HTMLParser):
+    """Read E9 attachment links without executing HTML or JavaScript."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        if tag == "a" and values.get("href"):
+            self.links.append(values["href"])
+        onclick = values.get("onclick") or ""
+        match = re.fullmatch(r"\s*toURL\(['\"]([^'\"]+)['\"]\s*,\s*false\s*\);?\s*", onclick)
+        if match:
+            self.links.append(match.group(1))
+
+
+def _validated_html_links(markup: str) -> list[tuple[str, str, str]]:
+    parser = _AttachmentLinkParser()
+    parser.feed(markup)
+    links = []
+    for link in parser.links:
+        try:
+            parsed = urllib.parse.urlsplit(link)
+            if parsed.path != "/news/download.do" or parsed.fragment:
+                continue
+            if parsed.netloc or parsed.scheme:
+                origin = urllib.parse.urlsplit(attachments.OA_HOST)
+                if (parsed.scheme not in ("", "https") or parsed.username or parsed.password
+                        or not origin.hostname or parsed.hostname != origin.hostname
+                        or (parsed.port or 443) != (origin.port or 443)):
+                    continue
+            query = urllib.parse.parse_qs(parsed.query)
+        except ValueError:
+            continue
+        ids = query.get("fileid", [])
+        if len(ids) != 1 or not re.fullmatch(r"[A-Za-z0-9_-]+", ids[0]):
+            continue
+        filenames = query.get("filename", [f"attachment-{ids[0]}.bin"])
+        if len(filenames) != 1 or not filenames[0]:
+            continue
+        links.append((ids[0], filenames[0], link))
+    return links
+
+
+def _html_attachment_resources(data: dict[str, Any]) -> list[dict[str, Any]]:
+    sources = [
+        (str(field.get("path") or ""), str(field.get("name") or ""), str(field.get("attachment_html") or ""))
+        for field in extract_fields(data)
+    ]
+    for index, log in enumerate(data.get("workflowRequestLogs") or []):
+        if isinstance(log, dict):
+            sources.append((f"workflowRequestLogs[{index}].annexDocHtmls", "签字附件", str(log.get("annexDocHtmls") or "")))
+    rows: dict[str, dict[str, Any]] = {}
+    paths: dict[str, set[str]] = {}
+    for path, name, markup in sources:
+        for resource_id, filename, link in _validated_html_links(markup):
+            rows.setdefault(resource_id, {
+                "id": resource_id, "name": filename,
+                # E9's rendered /news link is a UI route, not the file endpoint.
+                "downloadUrl": "/weaver/weaver.file.FileDownload?" + urllib.parse.urlencode({"fileid": resource_id}),
+                _TRUSTED_SOURCE_FIELD_PATH_KEY: path,
+                _TRUSTED_SOURCE_FIELD_NAME_KEY: name,
+            })
+            paths.setdefault(resource_id, set()).add(path)
+    for resource_id, row in rows.items():
+        if len(paths[resource_id]) != 1:
+            row.pop(_TRUSTED_SOURCE_FIELD_PATH_KEY, None)
+            row.pop(_TRUSTED_SOURCE_FIELD_NAME_KEY, None)
+    return list(rows.values())
 
 
 def logical_attachment_resources(
@@ -243,6 +309,16 @@ def logical_attachment_resources(
             item[_TRUSTED_SOURCE_FIELD_PATH_KEY] = binding["source_field_path"]
             item[_TRUSTED_SOURCE_FIELD_NAME_KEY] = binding["source_field_name"]
         rows.append(item)
+    known_ids = {str(item.get("id") or item.get("resourceId") or item.get("fileId") or "") for item in rows}
+    for item in _html_attachment_resources(data):
+        resource_id = item["id"]
+        if resource_id in known_ids:
+            continue
+        binding = bindings.get(resource_id)
+        if binding and binding["owner_detail_id"]:
+            item[_TRUSTED_OWNER_DETAIL_KEY] = binding["owner_detail_id"]
+        rows.append(item)
+        known_ids.add(resource_id)
     known_urls = {
         str(item.get("downloadUrl") or item.get("download_url") or "").strip()
         for item in rows
