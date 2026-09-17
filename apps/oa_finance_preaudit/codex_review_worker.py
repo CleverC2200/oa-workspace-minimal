@@ -42,7 +42,7 @@ _FINANCE_RULES = {
         "references/flows/small-marketing-fee.md",
     ),
     "tpm_small_marketing_fee": (
-        "tpm_small_marketing_fee:2",
+        "tpm_small_marketing_fee:3",
         "TPM小额市场费",
         "references/flows/tpm-small-marketing-fee.md",
     ),
@@ -126,23 +126,10 @@ _SMALL_MARKETING_V2_REQUIREMENT = (
     "当前实际公司全称支付。”的句式并替换公司全称；"
 )
 _TPM_SMALL_MARKETING_REQUIREMENT = (
-    "六项必须逐项按 TPM 小额市场费独立规则包形成结论；完整核对 10 类费用科目"
-    "及各自附件要求，只识别 OA 明细‘关联发票’处的发票；电子发票及其他非纸质"
-    "发票本身不是问题，只有纸质发票才核对寄送或签收；参考报价单只在已提供时作为"
-    "终端形象制作费的比对依据，不是必传附件；已确认对公支付时不得因缺少支付截图、"
-    "支付状态、支付日期或流水号而判定不符合或不确定；已提供材料中的支付失败、重复支付、"
-    "金额或主体冲突仍须报告；表单申请支付金额不能直接表述为实际已付金额；"
-    "已确认对公支付按发票可归属金额与表单申请支付明细金额孰低核对，"
-    "不得因缺少支付完成记录而新增问题；"
-    "允许多张支付凭证合计对应一张发票但必须排除重复截图，金额按孰低原则核销；"
-    "对公支付无需支付截图，不设置员工代垫场景；缺少附件不技术阻断，必须写明具体"
-    "缺失材料、冲突事实、照片数量或定位缺口，不得只写‘异常’、‘无法识别’、"
-    "‘需补充’或‘附件不完整’；销售方、清单印章和收款人关系只在第六项主体一致性"
-    "表达；同一源头缺口只在最相关项完整说明，其他项不得重复扩散；AI不得退回单据，"
-    "财务保留退回权；输出前逐项检查：linked_invoice_receipt 的 conclusion "
-    "只写购买方、金额、明细归属及适用的纸质寄送或收据字段问题，"
-    "不得把销售方、印章或收款关系混入该项的缺失字段列表；"
-    "销售方缺失也只写在 entity_consistency，不在第三项重复；"
+    "按 TPM 规则包的四项形成完整结论：附件完整性、发票关联与金额、金额孰低核销、"
+    "支付公司一致；科目和支付截图要求归入这四项，不增加审核项；"
+    "通过项也必须输出。按当前流程的实际证据审核，缺口和冲突说明具体对象与事实；"
+    "不得把程序未读取到附件等同于申请人未上传。AI只给意见，不批准、不退回；"
 )
 @dataclass(frozen=True)
 class CodexExecution:
@@ -295,6 +282,8 @@ def _prompt(action_file: Path) -> str:
     workflow_key = _action_workflow(action_file) or "travel_expense"
     _rule_version, workflow_name, rule_reference = _FINANCE_RULES[workflow_key]
     frozen_rule_version = _frozen_rule_version(action_file, workflow_key)
+    if workflow_key == "tpm_small_marketing_fee" and frozen_rule_version != _rule_version:
+        raise ValueError("frozen_packet_changed")
     frozen_item_keys = (
         _frozen_item_keys(action_file, workflow_key)
         if workflow_key == "small_marketing_fee"
@@ -765,6 +754,7 @@ def _execute_codex_raw(
 ) -> CodexExecution:
     try:
         schema = _decision_schema(action_file, read_only=read_only)
+        prompt = prompt_builder(action_file)
     except ValueError:
         return CodexExecution(
             "codex_review_task_invalid", _unknown_usage(),
@@ -854,7 +844,7 @@ def _execute_codex_raw(
         stderr_reader.start()
         try:
             process.communicate(
-                input=prompt_builder(action_file),
+                input=prompt,
                 timeout=timeout_seconds,
             )
         except subprocess.TimeoutExpired:

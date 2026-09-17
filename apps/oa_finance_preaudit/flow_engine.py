@@ -95,22 +95,18 @@ _FLOW_SPECS = {
         ),
     },
     "tpm_small_marketing_fee": {
-        "rule_version": "tpm_small_marketing_fee:2",
+        "rule_version": "tpm_small_marketing_fee:3",
         "item_keys": (
-            "expense_subject",
             "attachment_completeness",
             "linked_invoice_receipt",
-            "payment_evidence",
             "reimbursable_minimum",
             "entity_consistency",
         ),
         "item_names": (
-            "费用科目",
-            "科目附件完整性",
-            "关联发票与收据",
-            "支付凭证",
+            "附件完整性",
+            "发票关联与金额",
             "金额孰低核销",
-            "主体一致性",
+            "支付公司一致",
         ),
     },
     "general_expense": {
@@ -151,7 +147,7 @@ _PACKAGING_RULE_VERSION = "packaging_layout_approval:2"
 _LEGACY_SMALL_MARKETING_RULE_VERSION = "small_marketing_fee:1"
 _SMALL_MARKETING_RULE_VERSION = "small_marketing_fee:2"
 _LEGACY_TPM_SMALL_MARKETING_RULE_VERSION = "tpm_small_marketing_fee:1"
-_TPM_SMALL_MARKETING_RULE_VERSION = "tpm_small_marketing_fee:2"
+_TPM_SMALL_MARKETING_RULE_VERSION = "tpm_small_marketing_fee:3"
 _EXPLICIT_RULE_VERSION_WORKFLOWS = frozenset(
     {"packaging_layout_approval", "small_marketing_fee", "tpm_small_marketing_fee"}
 )
@@ -332,599 +328,6 @@ def _validate_small_marketing_conclusions(
     conclusion = str(attachment.get("conclusion") or "")
     if "支付截图" not in conclusion or "发票" not in conclusion:
         raise decision_validation.InvalidDecision("payment_attachment_terms")
-
-
-def _tpm_company_payment_confirmed(material: dict) -> bool:
-    fields = material.get("declared_fields")
-    if not isinstance(fields, list):
-        return False
-    main_values = {
-        str(item.get("name") or "").strip(): str(item.get("value") or "").strip()
-        for item in fields
-        if isinstance(item, dict)
-        and str(item.get("path") or "").startswith("main[")
-    }
-    payment_names = {"收款人员名称", "收款方式", "金额"}
-    payment_rows: dict[str, dict[str, str]] = {}
-    for item in fields:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("name") or "").strip()
-        path = str(item.get("path") or "").strip()
-        if name not in payment_names or ".field[" not in path:
-            continue
-        row_ref = path.rsplit(".field[", 1)[0]
-        payment_rows.setdefault(row_ref, {})[name] = str(
-            item.get("value") or ""
-        ).strip()
-    return (
-        main_values.get("是否调用支付接口") == "是"
-        and bool(
-            main_values.get("支付公司")
-            or main_values.get("支付公司2")
-            or main_values.get("支付公司文本")
-        )
-        and bool(payment_rows)
-        and all(
-            all(row.get(name) for name in payment_names)
-            for row in payment_rows.values()
-        )
-    )
-
-
-def _tpm_reports_optional_field_absence(conclusion: str, fields: str) -> bool:
-    """Reject explicit absence claims, not every mention of optional evidence.
-
-    Bind the absence verb to its object, allowing row labels and field-list
-    modifiers without matching unrelated gaps elsewhere in the sentence.
-    Negated absence and exemption statements are not requests for evidence.
-    """
-    field_list = rf"(?:{fields})(?:(?:、|和|及|与)(?:{fields}))*"
-    absence = re.compile(
-        rf"(?:(?:缺少|缺失|未提供|未上传|需补充)(?:的)?"
-        rf"(?:材料|字段)?[：:]?{field_list}"
-        rf"|{field_list}(?:均|都|仍|仍然)?"
-        rf"(?:缺失|为空|未提供|未上传|未显示|未记录|未取得|未解析))"
-    )
-    clauses = re.split(
-        r"[，,。；;！!？?\n]+|但(?:是)?", re.sub(r"\s+", "", conclusion),
-    )
-    for index, clause in enumerate(clauses):
-        for match in absence.finditer(clause):
-            prefix, suffix = clause[:match.start()], clause[match.end():]
-            if not suffix and index + 1 < len(clauses):
-                suffix = clauses[index + 1]
-            if re.search(
-                r"(?:并非|不是|并不是|不|无|无需|无须|不需要|不应|未发现|没有)"
-                r"(?:因|因为)?$", prefix,
-            ) or re.match(r"(?:并)?不(?:影响|构成问题|作为问题)", suffix):
-                continue
-            return True
-    return False
-
-
-def _validate_tpm_small_marketing_conclusions(
-    items: list[dict],
-    material: dict,
-) -> None:
-    by_key = {str(item.get("item_key") or ""): item for item in items}
-    clause_boundary = re.compile(
-        r"[，,。；;：:！!？?\n]+|但(?:是)?|然而|并且|并(?!未|不|非|无)|且|同时|而"
-    )
-    continued_comparison = re.compile(r"^(?:其(?:名称)?)?(?:与|和|同|跟)")
-    invoice = by_key.get("linked_invoice_receipt", {})
-    invoice_conclusion = str(invoice.get("conclusion") or "")
-    if invoice.get("status") != "pass":
-        normalized_invoice = re.sub(r"[，,。；;：:\s]", "", invoice_conclusion)
-        type_only_conclusions = {
-            "电子发票非纸质发票",
-            "关联发票为电子发票非纸质发票",
-            "关联发票是电子发票非纸质发票",
-            "关联发票为非纸质发票",
-            "关联发票是非纸质发票",
-        }
-        if (
-            normalized_invoice in type_only_conclusions
-            or (
-                re.search(
-                    r"(?:电子发票|非纸质发票)(?:类型)?(?:不符合要求|不允许|不可接受|类型不符)"
-                    r"|(?:不允许|不接受)(?:电子发票|非纸质发票)",
-                    invoice_conclusion,
-                )
-            )
-        ):
-            raise decision_validation.InvalidDecision("tpm_invoice_type_conclusion")
-        previous_scope_clause = ""
-        for clause in clause_boundary.split(invoice_conclusion):
-            clause = clause.strip()
-            if not clause:
-                continue
-            scope_text = clause
-            if continued_comparison.match(clause):
-                scope_text = previous_scope_clause + clause
-            if "收据" in invoice_conclusion and not re.search(r"不一致|冲突|相差|不同", clause):
-                # Receipt field checks belong here; receipt presence alone
-                # must not exempt payee relationships from the entity item.
-                scope_text = re.sub(r"收款人(?:姓名|身份证号|手机号)", "", scope_text)
-            if any(
-                marker in scope_text for marker in ("销售方", "收款方", "收款人", "印章")
-            ):
-                raise decision_validation.InvalidDecision("tpm_issue_item_scope")
-            previous_scope_clause = clause
-    attachment = by_key.get("attachment_completeness", {})
-    attachment_conclusion = str(attachment.get("conclusion") or "")
-    if (
-        attachment.get("status") != "pass"
-        and _tpm_reports_optional_field_absence(
-            attachment_conclusion, "参考报价单",
-        )
-    ):
-        raise decision_validation.InvalidDecision("tpm_optional_quote_conclusion")
-    if _tpm_company_payment_confirmed(material):
-        for item_key in (
-            "attachment_completeness",
-            "payment_evidence",
-            "reimbursable_minimum",
-            "entity_consistency",
-        ):
-            item = by_key.get(item_key, {})
-            if item.get("status") != "pass" and _tpm_reports_optional_field_absence(
-                str(item.get("conclusion") or ""),
-                "支付截图|支付状态|支付日期|流水号",
-            ):
-                raise decision_validation.InvalidDecision(
-                    "tpm_company_payment_conclusion"
-                )
-    payment = by_key.get("payment_evidence", {})
-    minimum = by_key.get("reimbursable_minimum", {})
-    payment_relationship = re.compile(
-        r"(?:支付|付款|收款).{0,24}(?:关联发票|发票).{0,24}(?:关系|对应)"
-        r"|(?:关联发票|发票).{0,24}(?:支付|付款|收款).{0,24}(?:关系|对应)"
-    )
-    if (
-        payment.get("status") != "pass"
-        and minimum.get("status") != "pass"
-        and payment_relationship.search(str(payment.get("conclusion") or ""))
-        and payment_relationship.search(str(minimum.get("conclusion") or ""))
-    ):
-        raise decision_validation.InvalidDecision("tpm_issue_item_scope")
-
-    specific_markers = (
-        "费用科目",
-        "科目原值",
-        "关联发票",
-        "纸质发票",
-        "发票购买方",
-        "发票销售方",
-        "发票金额",
-        "发票归属",
-        "票面图像",
-        "申报金额",
-        "申报总额",
-        "广告公司盖章版制作清单",
-        "制作清单",
-        "购买明细",
-        "参考报价单",
-        "现场定位照片",
-        "定位照片",
-        "现场执行附件",
-        "制作完成定位照片",
-        "试吃定位照片",
-        "订货会现场",
-        "全局定位照片",
-        "定位信息",
-        "关联申请签报",
-        "申请签报",
-        "费用清单",
-        "签到表",
-        "POS复核数据表",
-        "激励政策",
-        "支付截图",
-        "支付金额",
-        "实际支付",
-        "支付去重",
-        "对公支付豁免",
-        "付款状态",
-        "支付状态",
-        "支付日期",
-        "流水号",
-        "付款主体",
-        "收款主体",
-        "收款关系",
-        "支付对应关系",
-        "付款收款人",
-        "收款方",
-        "收款人姓名",
-        "收款人身份证号",
-        "收款人手机号",
-        "购买方",
-        "销售方",
-        "印章",
-        "明细归属",
-        "费用明细",
-        "附件字段",
-        "附件归属",
-        "附件完整性",
-        "实际支付事实",
-        "实际外部供应商",
-        "非重复支付事实",
-        "制作数量",
-        "样式",
-        "重复截图",
-    )
-    cue_patterns = (
-        re.compile(r"缺(?:少|失)?|未提供|需补充"),
-        re.compile(r"无法识别|无法确认|无法核对|无法确定|读取失败|不清"),
-        re.compile(r"不足|重复|未关联|支付失败|状态为失败|尚未支付"),
-        re.compile(
-            r"异常|不完整|待确认|待核对|未核实|不明|不符合|不满足|无可关联"
-        ),
-    )
-    natural_issue_patterns = (
-        re.compile(
-            r"(?:无法|不能|未能|尚不能|不可).{0,24}"
-            r"(?:识别|确认|核对|判断|确定|匹配|核销|完成|读取|推定)"
-        ),
-        re.compile(
-            r"未取得|未解析|未形成|未核验|未确认|未记录|未关联|为空|不可读取"
-        ),
-    )
-    direct_conflict = re.compile(r"非纸质发票")
-    explicit_missing_cue = re.compile(
-        r"缺(?:少|失)?|未提供|需补充|未取得|未解析|未形成|未显示|"
-        r"不可读取|读取失败|无法读取|无法识别|无可关联"
-    )
-    explicit_missing_markers = (*specific_markers, "附件清单")
-    field_state_cue = re.compile(
-        r"未确认|未核实|待核对|不明|为空|无法确认|无法核对|不能核对"
-    )
-    state_field_markers = (
-        "发票购买方",
-        "发票销售方",
-        "发票金额",
-        "发票归属",
-        "支付金额",
-        "付款状态",
-        "支付日期",
-        "流水号",
-        "付款主体",
-        "收款主体",
-        "收款关系",
-        "支付对应关系",
-        "付款收款人",
-        "收款方",
-        "收款人姓名",
-        "收款人身份证号",
-        "收款人手机号",
-        "明细归属",
-        "附件完整性",
-        "实际支付",
-        "支付去重",
-        "购买方",
-        "销售方",
-        "印章",
-    )
-    establish = re.compile(r"无法建立|未能建立|不能建立|未建立")
-    relationship_object_groups = (
-        ("关联发票", "纸质发票", "发票"),
-        (
-            "支付截图",
-            "支付凭证",
-            "支付事实",
-            "实际支付",
-            "付款主体",
-            "支付",
-        ),
-        ("收据",),
-        ("明细归属", "费用明细", "当前明细", "明细"),
-        ("关联申请签报", "申请签报", "签报"),
-        ("制作清单", "购买明细", "费用清单", "POS复核数据表", "激励政策"),
-        (
-            "现场定位照片",
-            "定位照片",
-            "制作完成定位照片",
-            "试吃定位照片",
-            "全局定位照片",
-        ),
-        ("购买方", "销售方", "收款人", "收款主体", "印章"),
-        ("费用科目",),
-    )
-    mismatch = re.compile(r"不一致|相差|冲突|不同")
-    mismatch_object_groups = (
-        ("发票购买方", "购买方"),
-        ("支付公司",),
-        ("发票销售方", "销售方"),
-        ("收款人", "收款主体", "付款收款人", "收款方"),
-        ("印章",),
-        ("发票金额",),
-        ("发票归属",),
-        ("支付金额",),
-        ("付款状态",),
-        ("支付日期",),
-        ("流水号",),
-        ("付款主体",),
-        ("收款关系",),
-        ("支付对应关系",),
-        ("明细归属",),
-        ("申报金额", "申报总额"),
-        ("费用科目", "科目原值"),
-        ("关联发票", "纸质发票"),
-        ("支付截图", "支付凭证"),
-        ("实际支付", "实际支付事实"),
-        ("支付去重", "非重复支付事实", "重复截图"),
-        ("对公支付豁免",),
-        (
-            "现场定位照片",
-            "定位照片",
-            "制作完成定位照片",
-            "试吃定位照片",
-            "全局定位照片",
-        ),
-        (
-            "广告公司盖章版制作清单",
-            "制作清单",
-        ),
-        ("购买明细",),
-        ("参考报价单",),
-        ("现场执行附件",),
-        ("订货会现场",),
-        ("定位信息",),
-        ("关联申请签报", "申请签报"),
-        ("费用清单",),
-        ("签到表",),
-        ("POS复核数据表",),
-        ("激励政策",),
-        ("附件字段",),
-        ("附件完整性",),
-        ("实际外部供应商",),
-        ("制作数量",),
-        ("样式",),
-    )
-    specific_operation = re.compile(
-        r"逐字匹配|逐项核对|孰低|核销|照片数量|现场执行附件|"
-        r"附件完整性|纸质发票|实际外部供应商|是否齐备|"
-        r"非重复支付事实|对公支付豁免|制作数量|样式|去重结果|"
-        r"推定分配|一致性|名称归一化"
-    )
-
-    def nearest_mismatch_group(text: str, *, from_right: bool) -> int | None:
-        matches: list[tuple[int, int, int, int]] = []
-        for index, group in enumerate(mismatch_object_groups):
-            for marker in group:
-                start = text.rfind(marker) if from_right else text.find(marker)
-                if start >= 0:
-                    matches.append((start, start + len(marker), len(marker), index))
-        if not matches:
-            return None
-        clusters: list[list[tuple[int, int, int, int]]] = []
-        for match in sorted(matches, key=lambda item: (item[0], item[1])):
-            if not clusters or match[0] > max(item[1] for item in clusters[-1]):
-                clusters.append([match])
-            else:
-                clusters[-1].append(match)
-        nearest_cluster = clusters[-1] if from_right else clusters[0]
-        return max(
-            nearest_cluster,
-            key=lambda match: (match[1], match[2]),
-        )[3]
-
-    for item in items:
-        if item.get("status") not in {"fail", "uncertain"}:
-            continue
-        conclusion = str(item.get("conclusion") or "").strip()
-        conclusion = re.sub(
-            r"(缺失(?:的)?字段|缺少(?:的)?材料|"
-            r"需补充(?:材料|字段)?|缺少|缺失)\s*[：:]\s*",
-            r"\1",
-            conclusion,
-        )
-        specific_issue_count = 0
-        context_normalized = ""
-        previous_clause_normalized = ""
-        previous_clause_specific_issue = False
-        for raw_clause in clause_boundary.split(conclusion):
-            raw_clause = raw_clause.strip()
-            if not raw_clause:
-                continue
-            normalized = re.sub(
-                r"[^0-9A-Za-z\u4e00-\u9fff]+",
-                "",
-                raw_clause,
-            )
-            normalized = re.sub(
-                r"(?:请)?(?:财务|人工)(?:核对|判断|处理|确认)$",
-                "",
-                normalized,
-            )
-            issue_normalized = re.sub(
-                r"(?:支付)?截图未见重复|未见重复截图|截图不重复",
-                "",
-                normalized,
-            )
-            has_issue_cue = any(
-                cue.search(issue_normalized) for cue in cue_patterns
-            ) or any(
-                cue.search(issue_normalized) for cue in natural_issue_patterns
-            )
-            has_specific_marker = any(
-                marker in issue_normalized for marker in specific_markers
-            )
-            has_concrete_value = has_specific_marker and bool(
-                re.search(r"[0-9]", issue_normalized)
-                or re.search(r"原值", issue_normalized)
-                or re.search(
-                    r"[“”‘’\"'].[^“”‘’\"']*[“”‘’\"']",
-                    raw_clause,
-                )
-            )
-            relationship_source = (
-                context_normalized + issue_normalized
-                if "其与" in issue_normalized
-                else issue_normalized
-            )
-            relationship_objects = sum(
-                any(marker in relationship_source for marker in group)
-                for group in relationship_object_groups
-            )
-            explicit_missing_fact = bool(
-                explicit_missing_cue.search(issue_normalized)
-                and any(
-                    marker in issue_normalized
-                    for marker in explicit_missing_markers
-                )
-            )
-            concrete_field_state = bool(
-                field_state_cue.search(issue_normalized)
-                and any(
-                    marker in issue_normalized
-                    for marker in state_field_markers
-                )
-            )
-            concrete_operation = bool(
-                specific_operation.search(issue_normalized)
-                and has_specific_marker
-            )
-            receipt_field_gap = bool(
-                item.get("item_key") == "linked_invoice_receipt"
-                and "收据" in issue_normalized
-                and re.search(r"购买方|事项|金额|姓名|身份证号|手机号", issue_normalized)
-                and (
-                    explicit_missing_cue.search(issue_normalized)
-                    or field_state_cue.search(issue_normalized)
-                )
-            )
-            payment_failure = bool(
-                re.search(r"(?:支付|付款)状态为失败|(?:支付|付款)失败", issue_normalized)
-                and not re.search(r"未(?:见|发现)|没有|并非|不是", issue_normalized)
-            )
-            # An identified attachment can be the subject of the next clause.
-            # Do not borrow unrelated facts or let a generic resource gap pass.
-            attachment_resource_gap = bool(
-                item.get("item_key") == "attachment_completeness"
-                and explicit_missing_cue.search(issue_normalized)
-                and re.search(
-                    r"(?:可读|可读取|可核对)(?:资源|内容|页面)|附件(?:资源|内容)",
-                    issue_normalized,
-                )
-                and any(
-                    re.search(
-                        r"第[0-9]+(?:至[0-9]+)?[笔条].{0,20}(?:附件|图片|照片)|"
-                        r"[0-9]+[个份张](?:附件|图片|照片)",
-                        source,
-                    )
-                    for source in (
-                        issue_normalized,
-                        previous_clause_normalized
-                        if not re.search(r"其他|其它|另外", issue_normalized)
-                        else "",
-                    )
-                )
-            )
-            clause_specific = concrete_field_state or (
-                has_issue_cue
-                and (
-                    has_concrete_value
-                    or relationship_objects >= 2
-                    or explicit_missing_fact
-                    or concrete_operation
-                )
-            )
-            clause_specific = (
-                clause_specific or receipt_field_gap or payment_failure
-                or attachment_resource_gap
-            )
-            clause_specific = clause_specific or bool(
-                direct_conflict.search(issue_normalized)
-            )
-            clause_specific = clause_specific or bool(
-                establish.search(issue_normalized)
-                and (
-                    relationship_objects >= 2
-                    or (relationship_objects == 1 and has_concrete_value)
-                )
-            )
-            subject_out_of_scope = (
-                "费用科目" in issue_normalized
-                and has_concrete_value
-                and (
-                    (
-                        "不在" in issue_normalized
-                        and "表" in issue_normalized
-                    )
-                    or "未匹配" in issue_normalized
-                )
-            )
-            clause_specific = clause_specific or subject_out_of_scope
-            if mismatch.search(issue_normalized) is not None:
-                mismatch_source = re.sub(
-                    r"[^0-9A-Za-z\u4e00-\u9fff、]+",
-                    "",
-                    raw_clause,
-                )
-                if continued_comparison.match(mismatch_source):
-                    mismatch_source = previous_clause_normalized + mismatch_source
-                distinct_mismatch_objects = False
-                connector_matches = tuple(
-                    re.finditer(r"与|和|、|同|跟|及", mismatch_source)
-                )
-                for connector in reversed(connector_matches):
-                    mismatch_parts = (
-                        mismatch_source[: connector.start()],
-                        mismatch_source[connector.end() :],
-                    )
-                    left_group = nearest_mismatch_group(
-                        mismatch_parts[0],
-                        from_right=True,
-                    )
-                    right_group = nearest_mismatch_group(
-                        mismatch_parts[1],
-                        from_right=False,
-                    )
-                    distinct_mismatch_objects = (
-                        left_group is not None
-                        and right_group is not None
-                        and left_group != right_group
-                    )
-                    if left_group is not None and right_group is not None:
-                        break
-                clause_specific = clause_specific or bool(
-                    distinct_mismatch_objects or has_concrete_value
-                )
-            consequence_clause = bool(
-                previous_clause_specific_issue
-                and (
-                    specific_operation.search(issue_normalized)
-                    or re.search(
-                        r"实际付款及对应关系待(?:财务|人工)(?:判断|核对|确认)",
-                        raw_clause,
-                    )
-                )
-                and not explicit_missing_cue.search(issue_normalized)
-            )
-            clause_specific = clause_specific or consequence_clause
-            clause_is_issue = bool(
-                has_issue_cue
-                or direct_conflict.search(issue_normalized)
-                or establish.search(issue_normalized)
-                or mismatch.search(issue_normalized)
-                or concrete_field_state
-                or subject_out_of_scope
-                or receipt_field_gap
-                or payment_failure
-            )
-            if clause_is_issue and not clause_specific:
-                raise decision_validation.InvalidDecision(
-                    "issue_list_not_specific"
-                )
-            if clause_is_issue:
-                specific_issue_count += 1
-            previous_clause_specific_issue = bool(
-                clause_is_issue and clause_specific
-            )
-            context_normalized += normalized
-            previous_clause_normalized = normalized
-        if specific_issue_count == 0:
-            raise decision_validation.InvalidDecision("issue_list_not_specific")
 
 
 def _read_object(path: Path, *, code: str) -> dict:
@@ -1756,28 +1159,35 @@ def _accepted_small_marketing_packets(
     raise ValueError("frozen_packet_changed")
 
 
-def _legacy_tpm_small_marketing_packet(packet: dict) -> dict:
-    legacy = dict(packet)
-    legacy["rule_version"] = _LEGACY_TPM_SMALL_MARKETING_RULE_VERSION
-    return legacy
-
-
 def _accepted_tpm_small_marketing_packets(
     expected_packet: dict,
     state: dict,
     *,
     action: dict | None = None,
 ) -> list[dict]:
-    frozen_version = state.get("rule_version")
-    if frozen_version is None:
-        if action is not None and action.get("rule_version") is not None:
-            raise ValueError("frozen_packet_changed")
-        return [_legacy_tpm_small_marketing_packet(expected_packet)]
-    if frozen_version == _TPM_SMALL_MARKETING_RULE_VERSION and (
-        action is None or action.get("rule_version") == _TPM_SMALL_MARKETING_RULE_VERSION
-    ):
+    version = state.get("rule_version")
+    if action is not None and action.get("rule_version") != version:
+        raise ValueError("frozen_packet_changed")
+    if version == _TPM_SMALL_MARKETING_RULE_VERSION:
         return [expected_packet]
-    raise ValueError("frozen_packet_changed")
+    if action is not None or version not in (None, "tpm_small_marketing_fee:2"):
+        raise ValueError("frozen_packet_changed")
+    # Only reconstruct old frozen packets; never reinterpret them as four checks.
+    legacy = {**expected_packet, "rule_version": version or _LEGACY_TPM_SMALL_MARKETING_RULE_VERSION}
+    legacy["items"] = [
+        {"item_key": key, "number": number, "name": name}
+        for number, (key, name) in enumerate((
+            ("expense_subject", "费用科目"),
+            ("attachment_completeness", "科目附件完整性"),
+            ("linked_invoice_receipt", "关联发票与收据"),
+            ("payment_evidence", "支付凭证"),
+            ("reimbursable_minimum", "金额孰低核销"),
+            ("entity_consistency", "主体一致性"),
+        ), 1)
+    ]
+    if legacy.get("material_state") == "degraded":
+        legacy["required_uncertain_items"] = [item["item_key"] for item in legacy["items"]]
+    return [legacy]
 
 
 def _validate_packaging_visual_review(
@@ -2534,6 +1944,12 @@ class FlowEngine:
         except ValueError as error:
             reason = str(error)
             if state.get("write_state") in {"submitting", "unknown"}:
+                if (
+                    state.get("workflow_key") == "tpm_small_marketing_fee"
+                    and state.get("rule_version") != _TPM_SMALL_MARKETING_RULE_VERSION
+                ):
+                    # An obsolete review cannot be resumed or relabelled unwritten.
+                    return self._persist_attempt_needs_admin(action_path, "writer_result_unknown")
                 try:
                     recovered = self._recover_frozen_submission(attempt_root, state)
                 except ValueError:
@@ -2878,6 +2294,7 @@ class FlowEngine:
                     _PACKAGING_RULE_VERSION,
                     _SMALL_MARKETING_RULE_VERSION,
                     _TPM_SMALL_MARKETING_RULE_VERSION,
+                    "tpm_small_marketing_fee:2",
                 }:
                     validation_state = {**state, "rule_version": rule_version}
                 _validate_frozen_review_inputs(
@@ -4391,14 +3808,6 @@ class FlowEngine:
                     normalized_items,
                     quality_material,
                 )
-            if (
-                action["workflow_key"] == "tpm_small_marketing_fee"
-                and packet.get("rule_version") == _TPM_SMALL_MARKETING_RULE_VERSION
-            ):
-                _validate_tpm_small_marketing_conclusions(
-                    normalized_items,
-                    quality_material,
-                )
             covered_page_refs = {
                 value
                 for item in normalized_items
@@ -4572,24 +3981,6 @@ class FlowEngine:
             lines = [manual_handoff.remark(decision)]
         elif packaging_visual_outcome == "all_non_packaging":
             lines = [_PACKAGING_SKIP_REMARK]
-        elif action["workflow_key"] == "tpm_small_marketing_fee":
-            problem_items = [
-                (number, expected, item)
-                for number, (expected, item) in enumerate(
-                    zip(packet_items, normalized_items),
-                    start=1,
-                )
-                if item["status"] != "pass"
-            ]
-            if problem_items:
-                lines = ["AI审核问题清单："]
-                lines.extend(
-                    f"{status_mark[item['status']]} {number}、{expected['name']}："
-                    f"{item['conclusion'].strip()}"
-                    for number, expected, item in problem_items
-                )
-            else:
-                lines = ["AI审核问题清单：未发现需提示问题。"]
         else:
             lines = [first_line]
             for number, (expected, item) in enumerate(
