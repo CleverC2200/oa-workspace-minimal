@@ -1405,6 +1405,7 @@ def download_resources(
     allow_browser_download: bool,
     request_id: str = "",
     flow_key: str = "",
+    reuse_cache: bool = True,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
     targets, identity_errors = _unique_attachment_resources(resources)
     if identity_errors:
@@ -1443,7 +1444,7 @@ def download_resources(
             request_id=cache_request_id,
             flow_key=cache_flow_key,
             legacy_resources=legacy_resources,
-        )
+        ) if reuse_cache else None
         if cached_entry:
             cached_item = _manifest_entry_to_item(dest_dir, resource, cached_entry)
             if cached_item:
