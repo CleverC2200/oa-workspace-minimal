@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from pathlib import Path
 from typing import TextIO
@@ -33,7 +34,7 @@ def stderr_summary(stream: TextIO) -> dict:
         size += len(chunk.encode("utf-8"))
         lower = suffix + chunk.lower()
         for code, terms in {
-            "transport_signal": ("connection", "tls", "dns", "stream disconnected"),
+            "transport_signal": ("connection", "tls", "dns", "stream disconnected", "websocket closed"),
             "rate_limit_signal": ("rate limit", "429"),
             "authentication_signal": ("unauthorized", "401", "authentication"),
             "retry_signal": ("retry", "reconnect"),
@@ -42,6 +43,26 @@ def stderr_summary(stream: TextIO) -> dict:
                 flags.add(code)
         suffix = lower[-64:]
     return {"stderr_bytes": size, "stderr_signals": sorted(flags)}
+
+
+def event_error_signals(stream: TextIO) -> list[str]:
+    """Classify CLI error events without keeping messages or tool output."""
+    stream.seek(0)
+    flags: set[str] = set()
+    for line in stream:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        item = event.get("item")
+        error = event if event.get("type") == "error" else (
+            item if isinstance(item, dict) and item.get("type") == "error" else None
+        )
+        if isinstance(error, dict) and isinstance(error.get("message"), str):
+            flags.update(stderr_summary(io.StringIO(error["message"]))["stderr_signals"])
+    return sorted(flags)
 
 
 def record(action_file: Path, *, execution, elapsed_seconds: float, stderr: dict) -> None:
@@ -67,6 +88,8 @@ def record(action_file: Path, *, execution, elapsed_seconds: float, stderr: dict
         "elapsed_seconds": max(0, int(elapsed_seconds)),
         "process_state": execution.process_state if execution.process_state in {"exited", "timed_out", "start_failed"} else "unknown",
         "exit_code": execution.exit_code if type(execution.exit_code) is int else None,
+        "event_signals": sorted({code for code in stderr.get("event_signals", [])
+                                 if isinstance(code, str) and code in {"transport_signal", "rate_limit_signal", "authentication_signal", "retry_signal"}}),
         "stderr_bytes": max(0, stderr["stderr_bytes"]) if type(stderr.get("stderr_bytes")) is int else 0,
         "stderr_signals": sorted({code for code in stderr.get("stderr_signals", [])
                                   if isinstance(code, str) and code in {"transport_signal", "rate_limit_signal", "authentication_signal", "retry_signal"}}),

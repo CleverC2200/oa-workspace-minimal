@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 import signal
+import shlex
 import subprocess
 import tempfile
 import threading
@@ -316,6 +317,17 @@ def _prompt(action_file: Path) -> str:
         workflow_requirement = _TPM_SMALL_MARKETING_REQUIREMENT
     else:
         workflow_requirement = "只按该流程固定审核项判断，不得读取其他流程规则或证据；"
+    material_reading = (
+        "材料先运行 `python3 -m apps.oa_finance_preaudit.read_material "
+        + shlex.quote(str(action_file))
+        + "` 读取；这是冻结材料的无损表格视图，列名后每行按列顺序给值，"
+        "absent 表示原记录不存在的字段。保留原始读取状态与证据归属。"
+        "命令输出较长，请设置足够的输出上限（max_output_tokens=60000）；"
+        "如工具仍截断，按行分段读完。不要反复猜测材料 JSON 结构。"
+        "prepared.images 列出原图路径及表格单元格；必须通过看图工具阅读图片，"
+        "不能将索引或文件存在当成图片内容。"
+        if workflow_key == "tpm_small_marketing_fee" else ""
+    )
     output_requirement = (
         "最终只输出符合本次宿主 JSON schema 的单个 JSON 对象；`items` "
         "必须是以上六个规范键组成的对象，各键的值不包含 `item_key`；"
@@ -328,6 +340,7 @@ def _prompt(action_file: Path) -> str:
 
 只处理这个已冻结动作：{action_file}
 {fallback_routing}
+{material_reading}
 
 要求：
 1. 完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由读取 `references/result-contract.md`、`references/observation-contract.md`、`{rule_reference}`、动作引用的审核包、材料和准备页；{workflow_requirement}{frozen_item_requirement}不得读取其他 attempt。
@@ -373,6 +386,11 @@ def _codex_command(
         'approval_policy="never"',
         "--config",
         f'model_reasoning_effort="{REASONING_EFFORT}"',
+        # 避免长审核在 WebSocket 断流后耗尽重连时间；继续使用原生 OpenAI 登录。
+        "--config",
+        'model_provider="oa_https"',
+        "--config",
+        'model_providers.oa_https={name="OpenAI",requires_openai_auth=true,supports_websockets=false}',
         "--output-schema",
         str(schema_file),
         "--output-last-message",
@@ -861,6 +879,7 @@ def _execute_codex_raw(
             usage = _parse_token_usage(output)
             event_counts = _parse_event_counts(output)
             event_status = _event_status(output, event_counts)
+            stderr_summary["event_signals"] = process_diagnostics.event_error_signals(output)
             stderr_summary["last_observed_stage"] = process_diagnostics.last_stage(output)
             output.close()
             return CodexExecution(
@@ -883,6 +902,7 @@ def _execute_codex_raw(
         usage = _parse_token_usage(output)
         event_counts = _parse_event_counts(output)
         event_status = _event_status(output, event_counts)
+        stderr_summary["event_signals"] = process_diagnostics.event_error_signals(output)
         stderr_summary["last_observed_stage"] = process_diagnostics.last_stage(output)
         decision: dict | None = None
         decision_state = "not_written"

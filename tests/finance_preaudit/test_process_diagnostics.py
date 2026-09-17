@@ -32,7 +32,7 @@ def test_diagnostic_retains_only_fixed_signals(tmp_path: Path) -> None:
     assert d["stderr_signals"] == ["retry_signal", "transport_signal"]
     assert set(d) == {"schema_version", "kind", "action_token_sha256", "last_observed_stage",
                       "event_counts", "elapsed_seconds", "process_state", "exit_code",
-                      "stderr_bytes", "stderr_signals"}
+                      "stderr_bytes", "stderr_signals", "event_signals"}
 
 
 def test_real_child_timeout_records_stage_and_reaps(tmp_path: Path, monkeypatch) -> None:
@@ -75,3 +75,34 @@ def test_diagnostic_conflict_is_not_overwritten(tmp_path: Path, damage: str) -> 
         json_artifact.write_json_atomic(target, {})
     with pytest.raises(ValueError, match="process_diagnostic_invalid"):
         process_diagnostics.record(path, **kwargs)
+
+
+def test_stdout_disconnect_survives_timeout_without_raw_error(tmp_path, monkeypatch):
+    path = _action(tmp_path)
+    monkeypatch.setattr(worker, "_decision_schema", lambda _, **_kwargs: {})
+    event = {"type": "error", "message": "Reconnecting... 2/5 (stream disconnected before completion: websocket closed by server before response.completed) private-secret"}
+    script = f"import time; print({json.dumps(event)!r}, flush=True); time.sleep(30)"
+    monkeypatch.setattr(worker, "_codex_command", lambda *_: [sys.executable, "-c", script])
+    result = worker._execute_codex(tmp_path, path, 0.2, prompt_builder=lambda _: "synthetic")
+    assert result.error_code == "codex_process_timeout"
+    text = next(tmp_path.glob("review-process-*.json")).read_text()
+    assert "private-secret" not in text
+    diagnostic = json.loads(text)
+    assert diagnostic["event_signals"] == ["retry_signal", "transport_signal"]
+    assert diagnostic["stderr_signals"] == []
+
+
+def test_error_signals_ignore_evidence_and_handle_fallback_event():
+    events = [
+        {"type": "item.completed", "item": {"type": "command_execution", "aggregated_output": "401 private"}},
+        {"type": "item.completed", "item": {"type": "error", "message": "stream disconnected"}},
+        {"type": "error", "message": 42},
+        [],
+    ]
+    stream = io.StringIO("\n".join(json.dumps(event) for event in events))
+    assert process_diagnostics.event_error_signals(stream) == ["transport_signal"]
+
+
+def test_websocket_closed_signal_without_disconnect_prefix():
+    event = {"type": "error", "message": "websocket closed before response.completed"}
+    assert process_diagnostics.event_error_signals(io.StringIO(json.dumps(event))) == ["transport_signal"]

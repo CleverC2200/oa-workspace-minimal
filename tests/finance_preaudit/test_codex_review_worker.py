@@ -646,6 +646,10 @@ def test_codex_command_pins_terra_high_and_json_output(tmp_path: Path) -> None:
     assert "--json" in command
     assert "--ephemeral" in command
     assert "--ignore-user-config" in command
+    assert 'model_provider="oa_https"' in command
+    assert 'model_providers.oa_https={name="OpenAI",requires_openai_auth=true,supports_websockets=false}' in command
+    assert command[command.index("--sandbox") + 1] == "read-only"
+    assert 'approval_policy="never"' in command
     assert command[command.index("--output-schema") + 1].endswith("schema.json")
     assert command[command.index("--output-last-message") + 1].endswith(
         "decision.json"

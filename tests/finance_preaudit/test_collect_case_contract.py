@@ -1580,7 +1580,8 @@ class TestCollectCaseContract:
 
 
 @pytest.mark.parametrize("config", FLOW_CONFIGS)
-def test_collection_preserves_populated_fields_and_reading_state(config: dict) -> None:
+@pytest.mark.parametrize("company_browser", ["browser.5534", "browser.38009"])
+def test_collection_preserves_populated_fields_and_reading_state(config: dict, company_browser: str) -> None:
     class FieldApi(RecordedOaApi):
         def request_context(self, request_id: str) -> tuple[dict, list]:
             workflow, resources = super().request_context(request_id)
@@ -1589,7 +1590,7 @@ def test_collection_preserves_populated_fields_and_reading_state(config: dict) -
             ] = [{
                 "fieldName": "bxgs", "fieldShowName": "报销公司",
                 "fieldHtmlType": "3", "fieldType": "226",
-                "fieldDBType": "browser.5534", "fieldValue": "示例食品有限公司",
+                "fieldDBType": company_browser, "fieldValue": "示例食品有限公司",
                 "fieldShowValue": "",
             }, {
                 "fieldName": "zfgs", "fieldShowName": "支付公司",
