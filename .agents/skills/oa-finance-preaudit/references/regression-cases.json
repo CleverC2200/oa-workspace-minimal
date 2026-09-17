@@ -735,6 +735,21 @@
             "expected_output": "按页面显示的支付成功状态和实际扣款金额认定已支付，并将该金额计入金额孰低核销",
             "failure_mode": "只按后付款字样做语义联想，忽略同页明确的支付终态和扣款金额",
             "rule_ref": "flows/general-expense.md#第-1-项附件完整性支付证据;flows/general-expense.md#第-4-项金额孰低核销"
+        },
+        {
+            "id": "RC-052-tpm-read-failure-reported-as-missing-data",
+            "scope": "tpm-small-marketing-fee",
+            "audit_item": "degraded-material;public-conclusion",
+            "status": "confirmed",
+            "input_facts": [
+                "当前 OA 登录、执行身份和流程授权可信",
+                "材料采集返回 attachment_content_incomplete，审核包为 degraded",
+                "降级材料不包含失败前的候选字段、发票或附件内容"
+            ],
+            "incorrect_output": "把自动读取失败写成申请人未填写公司字段、未上传附件或单据没有关联发票",
+            "expected_output": "对应项目使用 uncertain，只说明自动读取失败、未完成核对，请财务查看原单；不推断申请人是否填写或上传",
+            "failure_mode": "把系统未读取到材料错误表述为申请人没有提供材料",
+            "rule_ref": "flows/tpm-small-marketing-fee.md;SKILL.md#2-读取证据"
         }
   ]
 }

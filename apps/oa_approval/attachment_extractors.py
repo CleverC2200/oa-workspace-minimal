@@ -200,22 +200,29 @@ def _amount_value(value: Any) -> float | None:
 def spreadsheet_fact(path: Path, *, resource_id: str, name: str) -> Dict[str, Any]:
     import openpyxl
 
-    workbook = openpyxl.load_workbook(path, data_only=True, read_only=True)
-    try:
-        sheet_summaries: List[str] = []
-        key_text: List[str] = []
-        for sheet in workbook.worksheets:
-            sheet_summaries.append(
-                f"{sheet.title}({sheet.max_row}行{sheet.max_column}列)"
-            )
-            for row_index, row in enumerate(sheet.iter_rows(values_only=True), start=1):
-                values = [_cell_text(value) for value in row]
-                nonempty = [value for value in values if value]
-                if not nonempty:
-                    continue
-                key_text.append(f"{sheet.title}!R{row_index}: {' | '.join(nonempty)}")
-    finally:
-        workbook.close()
+    # Passing a file object lets openpyxl read valid OOXML content even when an
+    # upstream system has given the attachment a legacy `.xls` suffix.
+    with path.open("rb") as source:
+        workbook = openpyxl.load_workbook(source, data_only=True, read_only=True)
+        try:
+            sheet_summaries: List[str] = []
+            key_text: List[str] = []
+            for sheet in workbook.worksheets:
+                sheet_summaries.append(
+                    f"{sheet.title}({sheet.max_row}行{sheet.max_column}列)"
+                )
+                for row_index, row in enumerate(
+                    sheet.iter_rows(values_only=True), start=1
+                ):
+                    values = [_cell_text(value) for value in row]
+                    nonempty = [value for value in values if value]
+                    if not nonempty:
+                        continue
+                    key_text.append(
+                        f"{sheet.title}!R{row_index}: {' | '.join(nonempty)}"
+                    )
+        finally:
+            workbook.close()
     summary = f"Excel工作簿，包含工作表：{', '.join(sheet_summaries)}。"
     return {
         "resource_id": resource_id,
@@ -224,6 +231,16 @@ def spreadsheet_fact(path: Path, *, resource_id: str, name: str) -> Dict[str, An
         "summary": summary,
         "key_text": key_text,
     }
+
+
+def _is_ooxml_spreadsheet(path: Path) -> bool:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            archive.getinfo("[Content_Types].xml")
+            archive.getinfo("xl/workbook.xml")
+    except (KeyError, OSError, zipfile.BadZipFile):
+        return False
+    return True
 
 
 def legacy_spreadsheet_fact(
@@ -710,7 +727,9 @@ def _prepare_one_attachment(
                 "page_count": page_count,
             }
         )
-    elif suffix in SPREADSHEET_EXTS:
+    elif suffix in SPREADSHEET_EXTS or (
+        suffix in LEGACY_SPREADSHEET_EXTS and _is_ooxml_spreadsheet(path)
+    ):
         try:
             from apps.oa_approval import spreadsheet_images
 

@@ -1491,6 +1491,70 @@ class TestReadAdaptersContract:
         assert "R85C31" in fact["key_text"][-1]
         assert len(fact["key_text"]) == 85
 
+    def test_ooxml_workbook_mislabeled_as_xls_uses_modern_reader(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = root / "attendance.xlsx"
+            mislabeled = root / "attendance.xls"
+            workbook = openpyxl.Workbook()
+            sheet = workbook.active
+            sheet["A1"] = "attendance evidence"
+            workbook.save(original)
+            workbook.close()
+            original.rename(mislabeled)
+
+            images, manifest, structured = attachment_extractors.prepare_materials(
+                [
+                    {
+                        "resource_id": "attendance-001",
+                        "name": mislabeled.name,
+                        "path": str(mislabeled),
+                    }
+                ],
+                out_dir=root / "prepared",
+            )
+
+        assert images == []
+        assert manifest[0]["status"] == "spreadsheet_read"
+        assert structured[0]["document_type"] == "spreadsheet"
+        assert structured[0]["key_text"] == ["Sheet!R1: attendance evidence"]
+
+    def test_true_legacy_xls_keeps_legacy_reader(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "attendance.xls"
+            legacy.write_bytes(b"legacy workbook fixture")
+            fact = {
+                "resource_id": "attendance-legacy",
+                "name": legacy.name,
+                "document_type": "legacy_spreadsheet",
+                "summary": "legacy workbook",
+                "key_text": [],
+            }
+
+            with patch.object(
+                attachment_extractors,
+                "legacy_spreadsheet_fact",
+                return_value=fact,
+            ) as legacy_reader:
+                images, manifest, structured = (
+                    attachment_extractors.prepare_materials(
+                        [
+                            {
+                                "resource_id": "attendance-legacy",
+                                "name": legacy.name,
+                                "path": str(legacy),
+                            }
+                        ],
+                        out_dir=root / "prepared",
+                    )
+                )
+
+        legacy_reader.assert_called_once()
+        assert images == []
+        assert manifest[0]["status"] == "legacy_spreadsheet_read"
+        assert structured == [fact]
+
     def test_docx_reader_exposes_all_paragraphs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
