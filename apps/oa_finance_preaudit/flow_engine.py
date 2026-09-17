@@ -372,6 +372,23 @@ def _tpm_company_payment_confirmed(material: dict) -> bool:
     )
 
 
+def _tpm_reports_optional_field_absence(conclusion: str, fields: str) -> bool:
+    """Reject explicit absence claims, not every mention of optional evidence.
+
+    Full clauses keep negations and findings about supplied evidence out of
+    this deterministic guard. Business interpretation stays with the reviewer.
+    """
+    field_list = rf"(?:{fields})(?:(?:、|和|及|与)(?:{fields}))*"
+    absence = (
+        rf"(?:(?:缺少|缺失|未提供|未上传|需补充){field_list}"
+        rf"|{field_list}(?:缺失|为空|未提供|未上传))"
+    )
+    return any(
+        re.fullmatch(rf"(?:第[0-9一二三四五六七八九十]+笔)?{absence}", clause.strip())
+        for clause in re.split(r"[，,。；;！!？?\n]+|但(?:是)?", conclusion)
+    )
+
+
 def _validate_tpm_small_marketing_conclusions(
     items: list[dict],
     material: dict,
@@ -391,29 +408,31 @@ def _validate_tpm_small_marketing_conclusions(
         if (
             normalized_invoice in type_only_conclusions
             or (
-                re.search(r"电子发票|非纸质发票", invoice_conclusion)
-                and re.search(
-                    r"类型不符|不符合|不允许|不可接受|错误|异常",
+                re.search(
+                    r"(?:电子发票|非纸质发票)(?:类型)?(?:不符合要求|不允许|不可接受|类型不符)"
+                    r"|(?:不允许|不接受)(?:电子发票|非纸质发票)",
                     invoice_conclusion,
                 )
             )
         ):
             raise decision_validation.InvalidDecision("tpm_invoice_type_conclusion")
+        entity_markers = ("销售方", "收款方", "印章")
+        if "收据" not in invoice_conclusion:
+            entity_markers = (*entity_markers, "收款人")
         if any(
-            marker in invoice_conclusion
-            for marker in ("销售方", "收款方", "收款人", "印章")
+            marker in invoice_conclusion for marker in entity_markers
         ):
             raise decision_validation.InvalidDecision("tpm_issue_item_scope")
     attachment = by_key.get("attachment_completeness", {})
     attachment_conclusion = str(attachment.get("conclusion") or "")
     if (
         attachment.get("status") != "pass"
-        and "参考报价单" in attachment_conclusion
-        and re.search(r"缺少|缺失|未提供|未上传|需补充", attachment_conclusion)
+        and _tpm_reports_optional_field_absence(
+            attachment_conclusion, "参考报价单",
+        )
     ):
         raise decision_validation.InvalidDecision("tpm_optional_quote_conclusion")
     if _tpm_company_payment_confirmed(material):
-        payment_gap = re.compile(r"支付截图|支付状态|支付日期|流水号")
         for item_key in (
             "attachment_completeness",
             "payment_evidence",
@@ -421,8 +440,9 @@ def _validate_tpm_small_marketing_conclusions(
             "entity_consistency",
         ):
             item = by_key.get(item_key, {})
-            if item.get("status") != "pass" and payment_gap.search(
-                str(item.get("conclusion") or "")
+            if item.get("status") != "pass" and _tpm_reports_optional_field_absence(
+                str(item.get("conclusion") or ""),
+                "支付截图|支付状态|支付日期|流水号",
             ):
                 raise decision_validation.InvalidDecision(
                     "tpm_company_payment_conclusion"
@@ -477,6 +497,7 @@ def _validate_tpm_small_marketing_conclusions(
         "支付去重",
         "对公支付豁免",
         "付款状态",
+        "支付状态",
         "支付日期",
         "流水号",
         "付款主体",
@@ -504,7 +525,7 @@ def _validate_tpm_small_marketing_conclusions(
     cue_patterns = (
         re.compile(r"缺(?:少|失)?|未提供|需补充"),
         re.compile(r"无法识别|无法确认|无法核对|无法确定|读取失败|不清"),
-        re.compile(r"不足|重复|未关联"),
+        re.compile(r"不足|重复|未关联|支付失败|状态为失败|尚未支付"),
         re.compile(
             r"异常|不完整|待确认|待核对|未核实|不明|不符合|不满足|无可关联"
         ),
@@ -671,6 +692,7 @@ def _validate_tpm_small_marketing_conclusions(
         )
         specific_issue_count = 0
         context_normalized = ""
+        previous_clause_normalized = ""
         previous_clause_specific_issue = False
         for raw_clause in clause_boundary.split(conclusion):
             raw_clause = raw_clause.strip()
@@ -771,6 +793,8 @@ def _validate_tpm_small_marketing_conclusions(
                     "",
                     raw_clause,
                 )
+                if mismatch_source.startswith(("与", "和", "同", "跟")):
+                    mismatch_source = previous_clause_normalized + mismatch_source
                 distinct_mismatch_objects = False
                 connector_matches = tuple(
                     re.finditer(r"与|和|、|同|跟|及", mismatch_source)
@@ -828,6 +852,7 @@ def _validate_tpm_small_marketing_conclusions(
                 clause_is_issue and clause_specific
             )
             context_normalized += normalized
+            previous_clause_normalized = normalized
         if specific_issue_count == 0:
             raise decision_validation.InvalidDecision("issue_list_not_specific")
 

@@ -428,6 +428,11 @@ def test_tpm_public_remark_collapses_all_pass_items(tmp_path: Path) -> None:
             "tpm_invoice_type_conclusion",
         ),
         (
+            "linked_invoice_receipt",
+            "第1笔电子发票类型不符。",
+            "tpm_invoice_type_conclusion",
+        ),
+        (
             "attachment_completeness",
             "缺少参考报价单。",
             "tpm_optional_quote_conclusion",
@@ -469,6 +474,9 @@ def test_tpm_v2_rejects_finance_rule_misinterpretations(
     ("item_key", "conclusion"),
     (
         ("linked_invoice_receipt", "关联电子发票购买方为空。"),
+        ("linked_invoice_receipt", "第1笔电子发票购买方甲公司与报销公司乙公司不符合。"),
+        ("linked_invoice_receipt", "第1笔收据缺少收款人姓名和收款人手机号。"),
+        ("attachment_completeness", "已提供参考报价单，但缺少执行后的现场定位照片1张。"),
         (
             "linked_invoice_receipt",
             "关联发票为电子发票，但票面图像损坏无法读取。",
@@ -512,9 +520,14 @@ def test_tpm_v2_keeps_real_invoice_and_quote_gaps(
         "entity_consistency",
     ),
 )
+@pytest.mark.parametrize("conclusion", (
+    "支付状态、支付日期和流水号为空。",
+    "缺少支付截图。",
+))
 def test_tpm_v2_does_not_reopen_confirmed_company_payment_fields(
     tmp_path: Path,
     item_key: str,
+    conclusion: str,
 ) -> None:
     declared_fields = [
         {"name": "是否调用支付接口", "value": "是", "path": "main[0].field[0]"},
@@ -533,7 +546,7 @@ def test_tpm_v2_does_not_reopen_confirmed_company_payment_fields(
         item for item in decision["items"] if item["item_key"] == item_key
     )
     payment["status"] = "uncertain"
-    payment["conclusion"] = "支付状态、支付日期和流水号为空。"
+    payment["conclusion"] = conclusion
     payment["evidence_refs"] = []
     payment["missing_evidence"] = ["支付状态、支付日期和流水号"]
     decision_file = tmp_path / "decision.json"
@@ -546,6 +559,41 @@ def test_tpm_v2_does_not_reopen_confirmed_company_payment_fields(
         engine.complete_review(Path(action["action_file"]), decision_file)
 
     assert caught.value.validation_code == "tpm_company_payment_conclusion"
+
+
+@pytest.mark.parametrize(
+    ("item_key", "conclusion"),
+    (
+        ("payment_evidence", "第1笔支付状态为失败，表单支付金额100元尚未支付。"),
+        ("entity_consistency", "第1笔支付截图显示收款人为丙公司，与发票销售方乙公司不一致。"),
+        ("payment_evidence", "第1笔支付截图重复，支付金额100元不能重复核销。"),
+        ("payment_evidence", "第1笔支付截图已提供但流水号无法读取，无法确认支付去重结果。"),
+    ),
+)
+def test_tpm_company_payment_keeps_actual_conflicts(
+    tmp_path: Path, item_key: str, conclusion: str,
+) -> None:
+    fields = [
+        {"name": "是否调用支付接口", "value": "是", "path": "main[0].field[0]"},
+        {"name": "支付公司", "value": "甲公司", "path": "main[0].field[1]"},
+        {"name": "收款人员名称", "value": "乙公司", "path": "detail[2].row[0].field[0]"},
+        {"name": "收款方式", "value": "转账", "path": "detail[2].row[0].field[1]"},
+        {"name": "金额", "value": "100", "path": "detail[2].row[0].field[2]"},
+    ]
+    engine = _engine(tmp_path, declared_fields=fields)
+    action = engine.next_action(WORKFLOW_KEY)
+    decision = _decision(action, conclusion="缺少执行后的现场定位照片1张")
+    target = next(item for item in decision["items"] if item["item_key"] == item_key)
+    target.update(status="uncertain", conclusion=conclusion,
+                  evidence_refs=[], missing_evidence=[conclusion])
+    decision_file = tmp_path / "decision.json"
+    decision_file.write_text(json.dumps(decision, ensure_ascii=False), encoding="utf-8")
+
+    closed = engine.complete_review(Path(action["action_file"]), decision_file)
+
+    assert closed["business_state"] == "needs_human"
+    assert closed["write_state"] == "not_requested"
+    assert conclusion in Path(action["action_file"]).with_name("remark.txt").read_text()
 
 
 def test_tpm_v2_rejects_repeated_payment_relationship_gap(
