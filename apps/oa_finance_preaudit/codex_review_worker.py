@@ -326,6 +326,8 @@ def _prompt(action_file: Path) -> str:
         "如工具仍截断，按行分段读完。不要反复猜测材料 JSON 结构。"
         "prepared.images 列出原图路径及表格单元格；必须通过看图工具阅读图片，"
         "不能将索引或文件存在当成图片内容。"
+        "evidence_refs 的表单字段引用必须逐字使用 declared_fields 中的 path，"
+        "不使用视图行号、简写路径或范围表达式；权威事实使用 material.authority_facts[实际数组索引]。"
         if workflow_key == "tpm_small_marketing_fee" else ""
     )
     output_requirement = (
