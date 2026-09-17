@@ -794,6 +794,26 @@ def _validate_tpm_small_marketing_conclusions(
                 re.search(r"(?:支付|付款)状态为失败|(?:支付|付款)失败", issue_normalized)
                 and not re.search(r"未(?:见|发现)|没有|并非|不是", issue_normalized)
             )
+            # An identified attachment can be the subject of the next clause.
+            # Do not borrow unrelated facts or let a generic resource gap pass.
+            attachment_resource_gap = bool(
+                item.get("item_key") == "attachment_completeness"
+                and explicit_missing_cue.search(issue_normalized)
+                and re.search(r"可读资源|附件资源|附件内容", issue_normalized)
+                and any(
+                    re.search(
+                        r"第[0-9]+(?:至[0-9]+)?[笔条].{0,20}附件|"
+                        r"[0-9]+[个份张]附件",
+                        source,
+                    )
+                    for source in (
+                        issue_normalized,
+                        previous_clause_normalized
+                        if not re.search(r"其他|其它|另外", issue_normalized)
+                        else "",
+                    )
+                )
+            )
             clause_specific = concrete_field_state or (
                 has_issue_cue
                 and (
@@ -803,7 +823,10 @@ def _validate_tpm_small_marketing_conclusions(
                     or concrete_operation
                 )
             )
-            clause_specific = clause_specific or receipt_field_gap or payment_failure
+            clause_specific = (
+                clause_specific or receipt_field_gap or payment_failure
+                or attachment_resource_gap
+            )
             clause_specific = clause_specific or bool(
                 direct_conflict.search(issue_normalized)
             )
