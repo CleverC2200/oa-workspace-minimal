@@ -160,6 +160,8 @@ def test_confirmed_feedback_and_regressions_stay_sanitized() -> None:
                 "排除重复截图",
                 "不设置容差",
                 "AI 只形成预审意见，不批准、不退回",
+                "通过项只写一句给审批人的结论",
+                "按 X 元核销。",
             ),
         ),
         (
