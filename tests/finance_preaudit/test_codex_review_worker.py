@@ -1736,3 +1736,12 @@ def test_invalid_bound_token_fails_before_process_start(tmp_path: Path, monkeypa
     assert result["error_code"] == "codex_review_task_invalid"
     assert result["write_state"] == "not_requested"
     assert not action_file.with_name("review-decision.json").exists()
+
+
+def test_review_prompt_keeps_required_business_values_inside_decision(tmp_path):
+    _, action = _task(tmp_path, workflow_key="general_expense")
+    prompt = codex_review_worker._prompt(action)
+    assert "JSON 之外" in prompt
+    assert "具体金额、实际公司全称" in prompt
+    assert "不得输出密钥、凭据" in prompt
+    assert "不添加 Markdown、解释、单号、人员、公司" not in prompt
