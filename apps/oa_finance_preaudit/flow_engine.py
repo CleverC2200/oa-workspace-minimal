@@ -442,7 +442,7 @@ def _validate_tpm_small_marketing_conclusions(
             scope_text = clause
             if continued_comparison.match(clause):
                 scope_text = previous_scope_clause + clause
-            if "收据" in invoice_conclusion and not re.search(r"不一致|冲突|相差", clause):
+            if "收据" in invoice_conclusion and not re.search(r"不一致|冲突|相差|不同", clause):
                 # Receipt field checks belong here; receipt presence alone
                 # must not exempt payee relationships from the entity item.
                 scope_text = re.sub(r"收款人(?:姓名|身份证号|手机号)", "", scope_text)
@@ -541,7 +541,9 @@ def _validate_tpm_small_marketing_conclusions(
         "销售方",
         "印章",
         "明细归属",
+        "费用明细",
         "附件字段",
+        "附件归属",
         "附件完整性",
         "实际支付事实",
         "实际外部供应商",
@@ -627,9 +629,10 @@ def _validate_tpm_small_marketing_conclusions(
         ("购买方", "销售方", "收款人", "收款主体", "印章"),
         ("费用科目",),
     )
-    mismatch = re.compile(r"不一致|相差|冲突")
+    mismatch = re.compile(r"不一致|相差|冲突|不同")
     mismatch_object_groups = (
         ("发票购买方", "购买方"),
+        ("支付公司",),
         ("发票销售方", "销售方"),
         ("收款人", "收款主体", "付款收款人", "收款方"),
         ("印章",),
@@ -681,7 +684,7 @@ def _validate_tpm_small_marketing_conclusions(
         r"逐字匹配|逐项核对|孰低|核销|照片数量|现场执行附件|"
         r"附件完整性|纸质发票|实际外部供应商|是否齐备|"
         r"非重复支付事实|对公支付豁免|制作数量|样式|去重结果|"
-        r"推定分配|一致性"
+        r"推定分配|一致性|名称归一化"
     )
 
     def nearest_mismatch_group(text: str, *, from_right: bool) -> int | None:
@@ -799,11 +802,14 @@ def _validate_tpm_small_marketing_conclusions(
             attachment_resource_gap = bool(
                 item.get("item_key") == "attachment_completeness"
                 and explicit_missing_cue.search(issue_normalized)
-                and re.search(r"可读资源|附件资源|附件内容", issue_normalized)
+                and re.search(
+                    r"(?:可读|可读取|可核对)(?:资源|内容|页面)|附件(?:资源|内容)",
+                    issue_normalized,
+                )
                 and any(
                     re.search(
-                        r"第[0-9]+(?:至[0-9]+)?[笔条].{0,20}附件|"
-                        r"[0-9]+[个份张]附件",
+                        r"第[0-9]+(?:至[0-9]+)?[笔条].{0,20}(?:附件|图片|照片)|"
+                        r"[0-9]+[个份张](?:附件|图片|照片)",
                         source,
                     )
                     for source in (

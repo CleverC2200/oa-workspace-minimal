@@ -242,6 +242,9 @@ def test_tpm_worker_uses_only_the_tpm_rule_pack(tmp_path: Path) -> None:
         "第15笔虽显示7个附件，但其他资料异常",
         "第15笔虽显示7个附件，已核对付款，冻结材料未提供可读资源",
         "第15笔7个附件已齐全，但其他可读资源未提供",
+        "支付公司与支付公司不同",
+        "不能作名称归一化后确认一致",
+        "费用明细不一致",
     ),
 )
 def test_tpm_rejects_vague_issue_conclusions(tmp_path: Path, vague: str) -> None:
@@ -361,6 +364,10 @@ def test_tpm_accepts_an_explicitly_missing_material_or_field(
         "第15笔虽显示7个附件，但冻结材料未提供可读资源",
         "第15笔7个附件未提供可读资源",
         "第3条显示2份附件，附件内容不可读取",
+        "关联发票已读取，其金额800.00与第1笔费用明细50.00不一致",
+        "发票购买方与支付公司名称的括号字符不同，不能作名称归一化后确认一致",
+        "15笔均未有可读取的制作清单或购买明细及制作完成定位照片；第15笔虽列示7张图片，但冻结材料未提供可读取页面。",
+        "15笔明细未建立可回查附件归属；发票、制作清单或购买明细、制作完成定位照片均无可用资源或准备页。第15笔仅显示7个附件条目，未提供可核对内容及其归属。",
         "第1至14笔附件字段未解析；第15笔虽显示7个附件，但冻结材料未提供可读资源，无法核对制作清单或购买明细及执行完成定位照片的内容、归属和定位。",
     ),
 )
@@ -468,12 +475,22 @@ def test_tpm_public_remark_collapses_all_pass_items(tmp_path: Path) -> None:
         ),
         (
             "linked_invoice_receipt",
+            "收据收款人姓名甲某与购买方甲公司不同。",
+            "tpm_issue_item_scope",
+        ),
+        (
+            "linked_invoice_receipt",
             "收据收款人姓名甲某，与购买方甲公司不一致。",
             "tpm_issue_item_scope",
         ),
         (
             "linked_invoice_receipt",
             "关联发票销售方未取得。",
+            "tpm_issue_item_scope",
+        ),
+        (
+            "linked_invoice_receipt",
+            "第1笔关联发票已读取购买方，未提供金额和销售方；第2至15笔关联发票字段未解析，无法核对发票金额及明细归属。",
             "tpm_issue_item_scope",
         ),
     ),

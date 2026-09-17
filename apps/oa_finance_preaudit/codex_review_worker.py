@@ -139,7 +139,10 @@ _TPM_SMALL_MARKETING_REQUIREMENT = (
     "缺失材料、冲突事实、照片数量或定位缺口，不得只写‘异常’、‘无法识别’、"
     "‘需补充’或‘附件不完整’；销售方、清单印章和收款人关系只在第六项主体一致性"
     "表达；同一源头缺口只在最相关项完整说明，其他项不得重复扩散；AI不得退回单据，"
-    "财务保留退回权；"
+    "财务保留退回权；输出前逐项检查：linked_invoice_receipt 的 conclusion "
+    "只写购买方、金额、明细归属及适用的纸质寄送或收据字段问题，"
+    "不得把销售方、印章或收款关系混入该项的缺失字段列表；"
+    "销售方缺失也只写在 entity_consistency，不在第三项重复；"
 )
 @dataclass(frozen=True)
 class CodexExecution:
