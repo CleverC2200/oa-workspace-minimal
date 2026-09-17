@@ -42,7 +42,7 @@ _FINANCE_RULES = {
         "references/flows/small-marketing-fee.md",
     ),
     "tpm_small_marketing_fee": (
-        "tpm_small_marketing_fee:1",
+        "tpm_small_marketing_fee:2",
         "TPM小额市场费",
         "references/flows/tpm-small-marketing-fee.md",
     ),
@@ -127,11 +127,16 @@ _SMALL_MARKETING_V2_REQUIREMENT = (
 )
 _TPM_SMALL_MARKETING_REQUIREMENT = (
     "六项必须逐项按 TPM 小额市场费独立规则包形成结论；完整核对 10 类费用科目"
-    "及各自附件要求，只识别 OA 明细‘关联发票’处的发票并仅判断是否为纸质发票；"
+    "及各自附件要求，只识别 OA 明细‘关联发票’处的发票；电子发票及其他非纸质"
+    "发票本身不是问题，只有纸质发票才核对寄送或签收；参考报价单只在已提供时作为"
+    "终端形象制作费的比对依据，不是必传附件；已确认对公支付时不得因缺少支付截图、"
+    "支付状态、支付日期或流水号而判定不符合或不确定；"
     "允许多张支付凭证合计对应一张发票但必须排除重复截图，金额按孰低原则核销；"
     "对公支付无需支付截图，不设置员工代垫场景；缺少附件不技术阻断，必须写明具体"
     "缺失材料、冲突事实、照片数量或定位缺口，不得只写‘异常’、‘无法识别’、"
-    "‘需补充’或‘附件不完整’；AI不得退回单据，财务保留退回权；"
+    "‘需补充’或‘附件不完整’；销售方、清单印章和收款人关系只在第六项主体一致性"
+    "表达；同一源头缺口只在最相关项完整说明，其他项不得重复扩散；AI不得退回单据，"
+    "财务保留退回权；"
 )
 @dataclass(frozen=True)
 class CodexExecution:

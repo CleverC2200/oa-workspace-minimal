@@ -648,6 +648,7 @@ class TestCollectCaseContract:
                     "data": {
                         "comm_info": {
                             "buyer": {"company": f"购买方-{data_id}"},
+                            "payer": {"company": f"销售方-{data_id}"},
                         }
                     }
                 }
@@ -691,6 +692,7 @@ class TestCollectCaseContract:
             {
                 "invoice_no": "22222222222222222222",
                 "buyer": "购买方-202",
+                "seller": "销售方-202",
             }
         ]
 
@@ -715,6 +717,45 @@ class TestCollectCaseContract:
 
         assert oa_api.mapped_ids == ["202"]
         assert filtered == result
+
+    def test_tpm_exposes_linked_invoice_seller_as_authority_fact(self) -> None:
+        with (
+            patch.object(case_bundle.official_sql, "travel_extra_fields", return_value=[]),
+            patch.object(
+                invoice_buyers,
+                "read_invoice_buyers",
+                return_value={
+                    "read_status": "content_read",
+                    "invoices": [
+                        {
+                            "invoice_no": "recorded-invoice",
+                            "buyer": "购买方公司",
+                            "seller": "销售方公司",
+                        }
+                    ],
+                },
+            ),
+        ):
+            facts = case_bundle._authority_facts(
+                oa_api=object(),
+                config={"flow_key": "tpm_small_marketing_fee"},
+                workflow={},
+            )
+
+        assert facts == [
+            {
+                "source": "invoice_cloud",
+                "name": "发票购买方",
+                "value": "购买方公司",
+                "subject_ref": "recorded-invoice",
+            },
+            {
+                "source": "invoice_cloud",
+                "name": "发票销售方",
+                "value": "销售方公司",
+                "subject_ref": "recorded-invoice",
+            },
+        ]
 
     def test_tpm_collection_enables_detail_linked_invoice_filter(self) -> None:
         with (

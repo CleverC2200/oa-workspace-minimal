@@ -9,12 +9,28 @@
       "status": "confirmed",
       "input_facts": [
         "问题结论已经写明具体费用科目、材料、发票、支付、金额或主体对象",
-        "结论使用无法逐字匹配、不能按孰低原则确定、字段未解析或非纸质发票等自然表达"
+        "结论使用无法逐字匹配、不能按孰低原则确定或字段未解析等自然表达"
       ],
       "incorrect_output": "仅因未命中少量固定动词而返回 issue_list_not_specific",
       "expected_output": "自然同义表达写明原值或金额、明细序号、关系两端或明确缺失材料字段时接受；没有具体事实的空泛套话仍拒绝",
       "failure_mode": "把词表匹配当成问题具体性，误杀已经可供财务定位的签字意见",
       "rule_ref": "flows/tpm-small-marketing-fee.md#问题具体性"
+    },
+    {
+      "id": "RC-051-tpm-electronic-invoice-company-payment-cascade",
+      "scope": "tpm_small_marketing_fee",
+      "audit_item": "attachment;invoice;payment;amount;entity;output-format",
+      "status": "confirmed",
+      "input_facts": [
+        "费用科目为终端建设费-终端形象制作费，已关联电子发票",
+        "已提供广告公司盖章版制作清单和至少一张执行后现场定位照片，未提供参考报价单",
+        "表单明确调用企业支付接口，支付公司、收款人、银行转账方式和金额可读，支付状态、支付日期和流水号为空",
+        "发票金额、表单支付金额和清单金额一致"
+      ],
+      "incorrect_output": "把电子发票判为非纸质发票错误；把参考报价单当必传附件；再因对公支付完成字段为空，把同一缺口扩散为支付、金额和主体多项警告，并展示全部通过项",
+      "expected_output": "电子发票类型不构成问题；参考报价单未提供不单独提示；确认对公支付后不要求支付截图或完成字段；按可信金额孰低；从关联发票权威资料读取销售方核对印章和收款方；OA签字意见只列仍存在的具体问题，全部通过时只写未发现需提示问题",
+      "failure_mode": "把判断触发条件误当合规门槛，并因关联发票销售方未采集造成连锁误报",
+      "rule_ref": "flows/tpm-small-marketing-fee.md#固定审核项;flows/tpm-small-marketing-fee.md#签字意见"
     },
     {
       "id": "RC-042-lodging-concise-mixed",

@@ -168,12 +168,21 @@ def read_invoice_buyers(
 
     invoices: List[Dict[str, str]] = []
     for ref, detail in zip(refs, details):
+        comm_info = (detail.get("data") or {}).get("comm_info") or {}
         buyer = _display_text(
+            (comm_info.get("buyer") or {}).get("company")
+        )
+        seller = _display_text(
             (
-                ((detail.get("data") or {}).get("comm_info") or {}).get("buyer") or {}
+                comm_info.get("seller")
+                or comm_info.get("payer")
+                or {}
             ).get("company")
         )
-        invoices.append({"invoice_no": ref["invoice_no"], "buyer": buyer})
+        invoice = {"invoice_no": ref["invoice_no"], "buyer": buyer}
+        if seller:
+            invoice["seller"] = seller
+        invoices.append(invoice)
 
     return {
         "read_status": "content_read",
