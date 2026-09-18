@@ -45,7 +45,7 @@
 
 控制器收尾捕获 Python 中断和退出异常，记录 failed 并保留实际回收状态；进程被强制终止仍可能遗留 running。不能仅凭无标准输出、CPU 空闲或某一刻没有子进程判断卡死；采集和线程内等待可能没有子进程，先检查阶段进度、超时边界和原调用回执。
 
-发布后可在已授权的生产维护范围使用 `python -m apps.oa_finance_preaudit.controller_recovery --confirm-children-reaped YES`。执行前必须核对原控制器进程树（包括独立进程组）已全部退出；死 PID 本身不足以确认子进程回收。入口持有控制器与全局请求 Writer 租约，重查身份和对账，拒绝存活 PID、脏代码、停止标记、活跃请求 Writer、隔离及未决写入。原清单保存为同目录 `orphan-controller-<run_id>.json`，当前清单仅闭合为 failed/degraded，不恢复单据、不启动审批、不清除告警。执行后复核生产交接状态；发布和生产操作仍需当前授权。
+发布后可在已授权的生产维护范围使用 `python -m apps.oa_finance_preaudit.controller_recovery --confirm-children-reaped YES`。执行前必须核对原控制器进程树（包括独立进程组）已全部退出；死 PID 本身不足以确认子进程回收。入口持有控制器与全局请求 Writer 租约，重查身份和对账，拒绝存活 PID、脏代码、停止标记、活跃请求 Writer 及未决写入。数量一致、无阻断原因的历史隔离项不阻断清单恢复，仍须通过显式单据恢复入口处理。原清单保存为同目录 `orphan-controller-<run_id>.json`，当前清单仅闭合为 failed/degraded，不恢复单据、不启动审批、不清除告警。执行后复核生产交接状态；发布和生产操作仍需当前授权。
 
 ### 运行中监测与失败清单恢复
 

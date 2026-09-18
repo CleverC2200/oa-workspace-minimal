@@ -24,6 +24,29 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONTROLLER_INSTANCE_ID = secrets.token_hex(16)
 
 
+def _recovery_reconciliation_is_trusted(reconciled: Mapping[str, object]) -> bool:
+    """Allow orphan cleanup while deferring proven historical no-write failures."""
+    continuation = reconciled.get("continuation")
+    quarantine = reconciled.get("quarantine")
+    if not isinstance(continuation, Mapping) or not isinstance(quarantine, Mapping):
+        return False
+    if continuation == {
+        "status": "ready", "scope": "none", "isolated_pending": 0,
+        "blocking_reasons": {},
+    } and quarantine.get("pending_quarantined") == 0:
+        return True
+    isolated = continuation.get("isolated_pending")
+    if (continuation.get("status") != "ready"
+        or continuation.get("scope") != "item"
+        or continuation.get("blocking_reasons") != {}
+        or type(isolated) is not int or isolated <= 0
+        or type(quarantine.get("pending_quarantined")) is not int
+        or isolated != quarantine.get("pending_quarantined")
+        or set(continuation) != {"status", "scope", "isolated_pending", "blocking_reasons"}):
+        return False
+    return True
+
+
 def manifest_file() -> Path:
     lock_file = runtime_control.controller_lock_file().expanduser()
     if not lock_file.is_absolute():
@@ -295,12 +318,9 @@ def recover_orphaned_run(
                 snapshot = check_live()
                 live = snapshot.get("live_check", {})
                 reconciled = snapshot.get("reconciliation", {})
-                continuation = reconciled.get("continuation", {})
                 if (live.get("credentials", {}).get("status") != "ok"
                     or live.get("oa", {}).get("execution_identity") != "verified"
-                    or continuation != {"status": "ready", "scope": "none",
-                                        "isolated_pending": 0, "blocking_reasons": {}}
-                    or reconciled.get("quarantine", {}).get("pending_quarantined") != 0
+                    or not _recovery_reconciliation_is_trusted(reconciled)
                     or _read_manifest() != manifest
                     or stop_snapshot() != original_stop
                     or _code_state() != (revision, False)

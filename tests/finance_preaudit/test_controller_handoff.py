@@ -538,6 +538,57 @@ def test_orphan_recovery_preserves_original_and_requires_locked_live_gates(monke
     assert manifest["health"] == "degraded"
 
 
+@pytest.mark.parametrize("attention", ["clear", "attention_required"])
+def test_orphan_recovery_allows_deferred_historical_isolation(monkeypatch, attention):
+    original = _orphan(monkeypatch)
+    reconciled = _clear_reconciliation()
+    reconciled["continuation"] = {
+        "status": "ready", "scope": "item", "isolated_pending": 2,
+        "blocking_reasons": {},
+    }
+    reconciled["quarantine"]["pending_quarantined"] = 2
+    reconciled["failure_attention"]["status"] = attention
+
+    result = controller_handoff.recover_orphaned_run(
+        confirmed_children_reaped=True,
+        check_live=lambda: {
+            "live_check": _live_status(), "reconciliation": reconciled,
+        },
+    )
+
+    assert result["status"] == "recovered"
+    assert json.loads(Path(result["evidence_file"]).read_text()) == original
+
+
+@pytest.mark.parametrize("gate", [
+    "unknown_write", "identity", "counts", "boolean",
+    "blocked", "controller_scope",
+])
+def test_isolated_orphan_recovery_rejects_untrusted_reconciliation(monkeypatch, gate):
+    original = _orphan(monkeypatch)
+    reconciled = _clear_reconciliation()
+    continuation = {
+        "status": "ready", "scope": "item", "isolated_pending": 2,
+        "blocking_reasons": {},
+    }
+    reconciled["continuation"] = continuation
+    reconciled["quarantine"]["pending_quarantined"] = 2
+    if gate == "unknown_write":
+        continuation["blocking_reasons"] = {"pending_write_state_unresolved": 1}
+    if gate == "identity":
+        continuation["blocking_reasons"] = {"identity_conflict": 1}
+    if gate == "counts": reconciled["quarantine"]["pending_quarantined"] = 1
+    if gate == "boolean": continuation["isolated_pending"] = True
+    if gate == "blocked": continuation["status"] = "blocked"
+    if gate == "controller_scope": continuation["scope"] = "controller"
+    with pytest.raises(ValueError, match="controller_handoff_recovery_blocked"):
+        controller_handoff.recover_orphaned_run(
+            confirmed_children_reaped=True,
+            check_live=lambda: {"live_check": _live_status(), "reconciliation": reconciled},
+        )
+    assert json.loads(controller_handoff.manifest_file().read_text()) == original
+
+
 @pytest.mark.parametrize("gate", ["confirmation", "pid", "identity", "reconciliation", "dirty"])
 def test_orphan_recovery_keeps_manifest_when_gate_fails(monkeypatch, gate):
     original = _orphan(monkeypatch)
