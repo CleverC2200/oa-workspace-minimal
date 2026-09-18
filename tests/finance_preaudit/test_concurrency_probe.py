@@ -4081,6 +4081,33 @@ def test_production_cli_preserves_primary_error_when_reaping_fails(
     assert payload["primary_error_code"] == "codex_decision_invalid"
 
 
+def test_production_cli_preserves_known_error_prefix_with_detail(
+    monkeypatch,
+    capsys,
+) -> None:
+    alerts: list[str] = []
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "run_rolling_drain",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("production_reconciliation_blocked: stale handoff")
+        ),
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.session_alert,
+        "alert_from_environment",
+        lambda code: alerts.append(code) or {"error_code": code},
+    )
+
+    assert finance_preaudit_concurrency_probe.main(
+        ["--capacity", "6", "--confirm-write", "YES"]
+    ) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error_code"] == "production_reconciliation_blocked"
+    assert payload["notification"]["error_code"] == "production_reconciliation_blocked"
+    assert alerts == ["production_reconciliation_blocked"]
+
+
 def test_production_cli_does_not_mask_success_when_alert_reset_is_unknown(
     monkeypatch,
     capsys,

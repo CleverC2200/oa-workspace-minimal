@@ -4969,6 +4969,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }, ensure_ascii=False, sort_keys=True))
                 return 0
         error_code = session_code or str(error)
+        if not session_code:
+            error_prefix = error_code.partition(":")[0].strip()
+            if error_prefix in session_alert.PRODUCTION_ERROR_CODES:
+                error_code = error_prefix
         if not error_code.replace("_", "").isalnum() or not error_code.isascii():
             error_code = "controller_failed" if controller_started else "production_probe_failed"
         payload = {
