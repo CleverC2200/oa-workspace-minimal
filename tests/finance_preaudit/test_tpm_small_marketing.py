@@ -161,6 +161,29 @@ def test_tpm_worker_uses_only_the_tpm_rule_pack(tmp_path: Path) -> None:
     assert "`references/flows/small-marketing-fee.md`" not in prompt
 
 
+def test_tpm_degraded_prompt_does_not_turn_read_failure_into_missing_data(
+    tmp_path: Path,
+) -> None:
+    engine = flow_engine.FlowEngine(
+        root=tmp_path / "runtime" / "finance_preaudit_flows",
+        discover_candidates=lambda workflow_key: [
+            {
+                "request_id": "tpm-marketing-request",
+                "received_at": "2026-09-16T09:00:00+08:00",
+                "workflow_key": workflow_key,
+            }
+        ],
+        collect_material=lambda _request_id, _attempt: (_ for _ in ()).throw(
+            RuntimeError("attachment_content_incomplete")
+        ),
+    )
+    action = engine.next_action(WORKFLOW_KEY)
+
+    prompt = codex_review_worker._prompt(Path(action["action_file"]))
+
+    assert "只说明自动读取没有完成" in prompt
+    assert "不得声称申请人未填写字段、未上传附件或单据没有发票" in prompt
+
 
 @pytest.mark.parametrize("all_pass", [True, False])
 def test_tpm_public_remark_keeps_all_four_checks(tmp_path: Path, all_pass: bool) -> None:
