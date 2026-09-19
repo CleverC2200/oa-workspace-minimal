@@ -36,17 +36,15 @@ def _recovery_reconciliation_is_trusted(reconciled: Mapping[str, object]) -> boo
     } and quarantine.get("pending_quarantined") == 0:
         return True
     isolated = continuation.get("isolated_pending")
-    if (continuation.get("status") not in {"ready", "blocked"}
+    if (continuation.get("status") != "ready"
         or continuation.get("scope") != "item"
         or continuation.get("blocking_reasons") != {}
         or type(isolated) is not int or isolated <= 0
-        or isolated != quarantine.get("pending_quarantined")):
+        or type(quarantine.get("pending_quarantined")) is not int
+        or isolated != quarantine.get("pending_quarantined")
+        or set(continuation) != {"status", "scope", "isolated_pending", "blocking_reasons"}):
         return False
-    attention = reconciled.get("failure_attention", {})
-    return (not attention
-            or (isinstance(attention, Mapping)
-                and attention.get("scope") == "live_pending"
-                and attention.get("status") == "clear"))
+    return True
 
 
 def manifest_file() -> Path:
