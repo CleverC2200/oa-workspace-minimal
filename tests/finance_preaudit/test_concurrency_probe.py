@@ -616,6 +616,30 @@ def test_prepare_skips_quarantined_item_without_global_stop(
     assert stop_requests == []
 
 
+def test_development_clone_keeps_isolated_items_in_diagnostic_queue(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "PROJECT_ROOT",
+        tmp_path / "oa-workspace-dev",
+    )
+    assert finance_preaudit_concurrency_probe._include_isolated_development_items()
+
+
+def test_production_clone_keeps_isolated_items_out_of_queue(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "PROJECT_ROOT",
+        tmp_path / "oa-workspace-minimal",
+    )
+    assert not finance_preaudit_concurrency_probe._include_isolated_development_items()
+
+
 def test_prepare_global_fifo_selects_oldest_supported_workflow(
     monkeypatch,
 ) -> None:

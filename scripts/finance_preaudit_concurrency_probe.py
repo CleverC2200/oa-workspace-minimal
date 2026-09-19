@@ -44,6 +44,7 @@ from apps.oa_finance_preaudit import runtime_doctor
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEVELOPMENT_PROJECT_SUFFIX = "-dev"
 RenewActions = Callable[[list[Path]], list[Path]]
 ReviewRunner = Callable[[list[dict], int], process_pool.PoolResult[dict]]
 PrepareRunner = Callable[[int], process_pool.PoolResult[dict]]
@@ -778,6 +779,11 @@ def _local_quarantined_identities() -> frozenset[tuple[str, str]]:
     return frozenset(identities)
 
 
+def _include_isolated_development_items() -> bool:
+    """Development clones must keep isolated items in the diagnostic queue."""
+    return PROJECT_ROOT.name.endswith(DEVELOPMENT_PROJECT_SUFFIX)
+
+
 def _local_unknown_quarantined_identities() -> frozenset[tuple[str, str]]:
     identities: set[tuple[str, str]] = set()
     for state in _latest_local_states():
@@ -1021,7 +1027,11 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 live_candidates = production_pending.actionable_fifo(
                     cli._live_pending_identities(),
                     excluded_identities=(
-                        _local_quarantined_identities()
+                        (
+                            frozenset()
+                            if _include_isolated_development_items()
+                            else _local_quarantined_identities()
+                        )
                         | historical_unknown_identities
                         | assigned_identities
                     ),
