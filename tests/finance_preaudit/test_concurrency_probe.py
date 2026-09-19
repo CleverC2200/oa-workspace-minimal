@@ -3911,7 +3911,7 @@ def test_production_cli_defaults_to_rolling_and_rejects_legacy_drain(
     assert len(calls) == 3
 
 
-def test_production_cli_defaults_to_four_adaptive_slots(monkeypatch, capsys) -> None:
+def test_production_cli_defaults_to_two_adaptive_slots(monkeypatch, capsys) -> None:
     calls = []
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe,
@@ -3922,7 +3922,7 @@ def test_production_cli_defaults_to_four_adaptive_slots(monkeypatch, capsys) -> 
     assert finance_preaudit_concurrency_probe.main(
         ["--confirm-write", "YES"]
     ) == 0
-    assert calls[0]["capacity"] == 4
+    assert calls[0]["capacity"] == 2
     assert calls[0]["adaptive"] is True
     capsys.readouterr()
 

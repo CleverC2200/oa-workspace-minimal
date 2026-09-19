@@ -1750,7 +1750,7 @@ def run_read_only_probe(
 
 def run_adaptive_read_only_probe(
     *,
-    start_capacity: int = 4,
+    start_capacity: int = 2,
     sample_size: int = 20,
     max_waves: int = 6,
     probe_runner: Callable[..., dict] = run_read_only_probe,
@@ -4413,9 +4413,9 @@ def _continuation_is_ready(
         and continuation.get("blocking_reasons") == {}
     )
 
-    # Historical, isolated failures are deferred to the next rolling batch.
-    # They must remain visible in reconciliation, but must not stop admission
-    # when there is no unresolved write or identity safety issue.
+    # Historical, isolated failures remain visible and stop admission until an
+    # explicit recovery selection is supplied. The listener may keep checking
+    # this gate, but it must not approve later items automatically.
     deferred_historical = (
         continuation.get("status") == "blocked"
         and continuation.get("blocking_reasons") == {}
@@ -4425,10 +4425,12 @@ def _continuation_is_ready(
         and isolated == quarantine.get("pending_quarantined")
     )
     if deferred_historical:
-        return True
+        return bool(recovery_action_files)
 
-    if ready or not recovery_action_files:
-        return ready
+    if ready:
+        return isolated == 0 or bool(recovery_action_files)
+    if not recovery_action_files:
+        return False
     # This admits only explicitly selected preparation work; FlowEngine still
     # revalidates live identity and no-write evidence before creating a new attempt.
     reasons = continuation.get("blocking_reasons")
@@ -4961,7 +4963,7 @@ def _verified_active_controller() -> dict | None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="finance-preaudit-concurrency-probe")
-    parser.add_argument("--capacity", type=int, default=4)
+    parser.add_argument("--capacity", type=int, default=2)
     parser.add_argument("--confirm-write", choices=("YES",))
     parser.add_argument("--read-only", action="store_true")
     parser.add_argument(
