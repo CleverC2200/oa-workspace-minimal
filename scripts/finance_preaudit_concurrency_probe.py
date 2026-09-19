@@ -44,6 +44,7 @@ from apps.oa_finance_preaudit import runtime_doctor
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEVELOPMENT_PROJECT_SUFFIX = "-dev"
 RenewActions = Callable[[list[Path]], list[Path]]
 ReviewRunner = Callable[[list[dict], int], process_pool.PoolResult[dict]]
 PrepareRunner = Callable[[int], process_pool.PoolResult[dict]]
@@ -55,6 +56,7 @@ PipelineRunner = Callable[[int, int], process_pool.PoolResult[dict]]
 ReviewWorker = Callable[[dict], dict]
 ReviewCompleter = Callable[[Path, dict], dict]
 ReviewQuarantine = Callable[[Path, str], dict]
+FailureRoundRecorder = Callable[[Path, str], dict]
 ExecutorFactory = Callable[[int], object]
 
 
@@ -777,6 +779,11 @@ def _local_quarantined_identities() -> frozenset[tuple[str, str]]:
     return frozenset(identities)
 
 
+def _include_isolated_development_items() -> bool:
+    """Development clones must keep isolated items in the diagnostic queue."""
+    return PROJECT_ROOT.name.endswith(DEVELOPMENT_PROJECT_SUFFIX)
+
+
 def _local_unknown_quarantined_identities() -> frozenset[tuple[str, str]]:
     identities: set[tuple[str, str]] = set()
     for state in _latest_local_states():
@@ -1020,7 +1027,11 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 live_candidates = production_pending.actionable_fifo(
                     cli._live_pending_identities(),
                     excluded_identities=(
-                        _local_quarantined_identities()
+                        (
+                            frozenset()
+                            if _include_isolated_development_items()
+                            else _local_quarantined_identities()
+                        )
                         | historical_unknown_identities
                         | assigned_identities
                     ),
@@ -1689,6 +1700,9 @@ def run_read_only_probe(
     transient_error_events = codex_events["counts"].get("error")
     if transient_error_events is None and codex_events["status"] == "recorded":
         transient_error_events = 0
+    rate_limit_events = codex_events["counts"].get("rate_limit_signal")
+    if rate_limit_events is None and codex_events["status"] == "recorded":
+        rate_limit_events = 0
     return {
         "schema_version": 1,
         "kind": "preaudit_read_only_concurrency_probe",
@@ -1706,6 +1720,7 @@ def run_read_only_probe(
         "decision_states": dict(sorted(decision_states.items())),
         "codex_events": codex_events,
         "transient_error_events": transient_error_events,
+        "rate_limit_events": rate_limit_events,
         "exit_codes": dict(sorted(exit_codes.items())),
         "model": codex_review_worker.MODEL,
         "reasoning_effort": codex_review_worker.REASONING_EFFORT,
@@ -1745,7 +1760,7 @@ def run_read_only_probe(
 
 def run_adaptive_read_only_probe(
     *,
-    start_capacity: int = 6,
+    start_capacity: int = 2,
     sample_size: int = 20,
     max_waves: int = 6,
     probe_runner: Callable[..., dict] = run_read_only_probe,
@@ -1787,6 +1802,13 @@ def run_adaptive_read_only_probe(
                 "timed_out": int(wave.get("timed_out") or 0),
                 "stopped": int(wave.get("stopped") or 0),
                 "transient_error_events": wave.get("transient_error_events"),
+                "rate_limit_events": wave.get(
+                    "rate_limit_events",
+                    0
+                    if isinstance(wave.get("codex_events"), dict)
+                    and wave["codex_events"].get("status") == "recorded"
+                    else None,
+                ),
                 "codex_event_status": (
                     wave.get("codex_events", {}).get("status")
                     if isinstance(wave.get("codex_events"), dict)
@@ -1815,6 +1837,9 @@ def run_adaptive_read_only_probe(
     transient_error_events = codex_events["counts"].get("error")
     if transient_error_events is None and codex_events["status"] == "recorded":
         transient_error_events = 0
+    rate_limit_events = codex_events["counts"].get("rate_limit_signal")
+    if rate_limit_events is None and codex_events["status"] == "recorded":
+        rate_limit_events = 0
     return {
         "schema_version": 1,
         "kind": "preaudit_adaptive_read_only_probe",
@@ -1831,6 +1856,7 @@ def run_adaptive_read_only_probe(
         "token_usage": dict(token_totals),
         "codex_events": codex_events,
         "transient_error_events": transient_error_events,
+        "rate_limit_events": rate_limit_events,
         "production_write": False,
     }
 
@@ -2014,6 +2040,7 @@ def _run_dispatched_tasks(
     quarantine_review: ReviewQuarantine = (
         codex_review_worker.quarantine_review_failure
     ),
+    record_failure_round: FailureRoundRecorder | None = None,
     executor_factory: ExecutorFactory = _process_executor,
     task_timeout_sec: float = 960,
     prepare_timeout_sec: float = 300,
@@ -2125,6 +2152,7 @@ def _run_dispatched_tasks(
     halted = False
     primary_error_code: str | None = None
     force_terminated = False
+    retry_pending_now = False
     runtime_samples: list[dict] = []
     max_task_elapsed_seconds = 0.0
     next_heartbeat = time.monotonic()
@@ -2317,6 +2345,11 @@ def _run_dispatched_tasks(
                     "stopped": 0,
                     "codex_event_status": codex_events["status"],
                     "transient_error_events": transient_errors,
+                    "rate_limit_events": (
+                        codex_events["counts"].get("rate_limit_signal", 0)
+                        if codex_events["status"] == "recorded"
+                        else None
+                    ),
                 },
                 host=window_host,
             )
@@ -2987,6 +3020,47 @@ def _run_dispatched_tasks(
                          or error_code == "codex_process_timeout")
                         and bounded_review_failure
                     ):
+                        failure_round = None
+                        production_failure_round_recorder = (
+                            record_failure_round
+                            or (
+                                codex_review_worker.record_production_failure_round
+                                if strict_global_fifo and continuous_discovery
+                                else None
+                            )
+                        )
+                        if production_failure_round_recorder is not None:
+                            try:
+                                failure_round = production_failure_round_recorder(
+                                    action_file,
+                                    error_code,
+                                ).get("production_failure_round")
+                            except Exception:
+                                failure_round = None
+                        if isinstance(failure_round, int) and failure_round < 3:
+                            retry_pending_now = True
+                            retry_value = {
+                                **reported_value,
+                                "status": "retry_pending",
+                                "execution_state": "review_required",
+                                "business_state": "not_available",
+                                "write_state": "authorized",
+                                "error_code": "codex_review_retry_pending",
+                                "production_failure_round": failure_round,
+                                "prepare_elapsed_seconds": prepare_elapsed,
+                            }
+                            outcomes[index] = process_pool.TaskOutcome(
+                                index=index,
+                                status="completed",
+                                value=retry_value,
+                            )
+                            if strict_global_fifo:
+                                pending_write_indices.remove(index)
+                            else:
+                                skipped_write_indices.add(index)
+                            review_histories.pop(index, None)
+                            advance_write_head()
+                            continue
                         try:
                             quarantine = quarantine_review(
                                 action_file,
@@ -3345,7 +3419,12 @@ def _run_dispatched_tasks(
             and outcome.value.get("status") in {"late_visible", "no_action"}
         )
     )
-    if halted and not force_terminated and not runtime_control.stop_requested():
+    if (
+        halted
+        and not retry_pending_now
+        and not force_terminated
+        and not runtime_control.stop_requested()
+    ):
         runtime_control.request_cycle_stop()
     return process_pool.PoolResult(
         requested=len(completed_outcomes),
@@ -3851,6 +3930,7 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
     completed = 0
     failed = 0
     isolated_quarantines = 0
+    retry_pending = 0
     process_attempts = 0
     process_retries = 0
     prepare_active_seconds = 0.0
@@ -3867,7 +3947,17 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
         if outcome.status == "completed" and worker_status in {
             "completed",
             "quarantined",
+            "retry_pending",
         }:
+            if worker_status == "retry_pending":
+                completed += 1
+                retry_pending += 1
+                error_code = value.get("error_code") or outcome.error_code
+                if isinstance(error_code, str):
+                    error_counts[error_code] += 1
+                process_attempts += int(value.get("process_attempts") or 0)
+                process_retries += int(value.get("process_retries") or 0)
+                continue
             if worker_status == "quarantined" and not (
                 value.get("write_state") == "not_requested"
                 and value.get("error_code") in ITEM_LOCAL_QUARANTINE_REASONS
@@ -3944,6 +4034,9 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
     transient_error_events = codex_events["counts"].get("error")
     if transient_error_events is None and codex_events["status"] == "recorded":
         transient_error_events = 0
+    rate_limit_events = codex_events["counts"].get("rate_limit_signal")
+    if rate_limit_events is None and codex_events["status"] == "recorded":
+        rate_limit_events = 0
     review_samples = [
         sample
         for sample in result.runtime_samples
@@ -4030,6 +4123,7 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
         "started": result.started,
         "completed": completed,
         "isolated_quarantines": isolated_quarantines,
+        "retry_pending": retry_pending,
         "failed": failed + result.failed,
         "timed_out": result.timed_out,
         "stopped": result.stopped,
@@ -4051,6 +4145,7 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
         "primary_error_code": primary_error_code,
         "codex_events": codex_events,
         "transient_error_events": transient_error_events,
+        "rate_limit_events": rate_limit_events,
         "pipeline": pipeline,
         "processes_reaped": result.processes_reaped,
         "discovery_refreshes": result.discovery_refreshes,
@@ -4328,9 +4423,9 @@ def _continuation_is_ready(
         and continuation.get("blocking_reasons") == {}
     )
 
-    # Historical, isolated failures are deferred to the next rolling batch.
-    # They must remain visible in reconciliation, but must not stop admission
-    # when there is no unresolved write or identity safety issue.
+    # Historical, isolated failures remain visible and stop admission until an
+    # explicit recovery selection is supplied. The listener may keep checking
+    # this gate, but it must not approve later items automatically.
     deferred_historical = (
         continuation.get("status") == "blocked"
         and continuation.get("blocking_reasons") == {}
@@ -4340,10 +4435,12 @@ def _continuation_is_ready(
         and isolated == quarantine.get("pending_quarantined")
     )
     if deferred_historical:
-        return True
+        return bool(recovery_action_files)
 
-    if ready or not recovery_action_files:
-        return ready
+    if ready:
+        return isolated == 0 or bool(recovery_action_files)
+    if not recovery_action_files:
+        return False
     # This admits only explicitly selected preparation work; FlowEngine still
     # revalidates live identity and no-write evidence before creating a new attempt.
     reasons = continuation.get("blocking_reasons")
@@ -4411,7 +4508,7 @@ def _run_rolling_drain_locked(
     allowed_workflows: frozenset[str] = ROLLING_WORKFLOW_KEYS,
 ) -> dict:
     if (
-        not 1 <= capacity <= 6
+        capacity not in concurrency_control.CAPACITY_STEPS
         or not isinstance(recovery_count, int)
         or isinstance(recovery_count, bool)
         or recovery_count < 0
@@ -4512,6 +4609,13 @@ def _run_rolling_drain_locked(
         wave["capacity"] = current_capacity
         waves.append(wave)
         late_visible_pending = int(wave.get("late_visible_pending") or 0)
+        if int(wave.get("retry_pending") or 0) > 0:
+            # A transient first/second-round review failure is persisted on the
+            # open attempt. End this production cycle quietly; the next cycle
+            # will retry it and only round three can create an isolation.
+            status = "completed"
+            stop_reason = "review_retry_pending"
+            break
         if (
             wave["failed"]
             or wave["timed_out"]
@@ -4520,6 +4624,16 @@ def _run_rolling_drain_locked(
         ):
             runtime_control.request_cycle_stop()
             status = "failed"
+            if adaptive and int(wave.get("rate_limit_events") or 0) > 0:
+                current_capacity = concurrency_control.CAPACITY_STEPS[0]
+                last_decision = {
+                    "action": "decrease",
+                    "next_capacity": concurrency_control.CAPACITY_STEPS[0],
+                    "healthy_windows": 0,
+                    "reason": "rate_limit_pressure",
+                }
+                stop_reason = "rate_limit_pressure"
+                break
             internal_stops = [
                 decision
                 for decision in wave.get("capacity_decisions", [])
@@ -4602,6 +4716,7 @@ def _run_rolling_drain_locked(
                         "transient_error_events": wave[
                             "transient_error_events"
                         ],
+                        "rate_limit_events": wave.get("rate_limit_events"),
                         "codex_event_status": wave["codex_events"]["status"],
                     },
                     host=wave["runtime_health"],
@@ -4651,6 +4766,9 @@ def _run_rolling_drain_locked(
     transient_error_events = codex_events["counts"].get("error")
     if transient_error_events is None and codex_events["status"] == "recorded":
         transient_error_events = 0
+    rate_limit_events = codex_events["counts"].get("rate_limit_signal")
+    if rate_limit_events is None and codex_events["status"] == "recorded":
+        rate_limit_events = 0
     pipeline_wait_samples = [
         float(value)
         for wave in waves
@@ -4814,6 +4932,7 @@ def _run_rolling_drain_locked(
         "primary_error_code": primary_error_code,
         "codex_events": codex_events,
         "transient_error_events": transient_error_events,
+        "rate_limit_events": rate_limit_events,
         "pipeline": pipeline,
         "processes_reaped": processes_reaped,
         "token_usage": {
@@ -4854,10 +4973,21 @@ def _verified_active_controller() -> dict | None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="finance-preaudit-concurrency-probe")
-    parser.add_argument("--capacity", type=int, required=True)
+    parser.add_argument("--capacity", type=int, default=2)
     parser.add_argument("--confirm-write", choices=("YES",))
     parser.add_argument("--read-only", action="store_true")
-    parser.add_argument("--adaptive", action="store_true")
+    parser.add_argument(
+        "--adaptive",
+        action="store_true",
+        default=True,
+        help="按健康窗口逐级扩容（生产默认开启）",
+    )
+    parser.add_argument(
+        "--fixed-capacity",
+        dest="adaptive",
+        action="store_false",
+        help="关闭生产弹性扩容，固定使用 --capacity",
+    )
     parser.add_argument("--waves", type=int, default=6)
     parser.add_argument("--samples", type=int, default=20)
     parser.add_argument("--drain", action="store_true")
@@ -4936,9 +5066,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
                 "",
             )
+            non_retry_counts = {
+                code: count
+                for code, count in (counts or {}).items()
+                if code != "codex_review_retry_pending"
+            }
             if not session_code and (
                 payload.get("status") not in {"completed", "completed_with_quarantine"}
-                or any(isinstance(n, int) and n > 0 for n in (counts or {}).values())
+                or any(
+                    isinstance(n, int) and n > 0
+                    for n in non_retry_counts.values()
+                )
             ):
                 session_code = "controller_failed"
             if session_code:

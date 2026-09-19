@@ -3527,6 +3527,57 @@ class FlowEngine:
                 ),
             )
 
+    def record_review_failure_round(
+        self,
+        action_file: Path,
+        failure_code: str,
+    ) -> dict:
+        """Persist a production retry streak without isolating the attempt.
+
+        The attempt remains reviewable so the next production cycle can retry it.
+        Isolation is deliberately a separate operation after the third cycle.
+        """
+        if failure_code not in _REVIEW_QUARANTINE_REASONS:
+            raise ValueError("review_failure_round_invalid")
+        action_path = Path(action_file).expanduser().resolve()
+        if (
+            not action_path.is_relative_to(self._root)
+            or not _is_attempt_action_path(action_path, self._root)
+            or action_path.is_symlink()
+        ):
+            raise ValueError("review_failure_round_invalid")
+        state_path = action_path.with_name("state.json")
+        with _exclusive_lock(action_path.parent / "complete.lock"):
+            action = _read_object(action_path, code="review_failure_round_invalid")
+            state = _read_object(state_path, code="review_failure_round_invalid")
+            if any(
+                payload.get(field) != expected
+                for payload in (action, state)
+                for field, expected in {
+                    "action": "review_required",
+                    "execution_state": "review_required",
+                    "write_state": "authorized",
+                }.items()
+            ):
+                raise ValueError("review_failure_round_invalid")
+            previous = state.get("production_failure_round", 0)
+            if not isinstance(previous, int) or isinstance(previous, bool) or previous < 0:
+                raise ValueError("review_failure_round_invalid")
+            current = previous + 1
+            updated = {
+                **action,
+                "production_failure_round": current,
+                "production_failure_code": failure_code,
+            }
+            updated_state = {
+                **state,
+                "production_failure_round": current,
+                "production_failure_code": failure_code,
+            }
+            json_artifact.write_json_atomic(state_path, updated_state, indent=2)
+            json_artifact.write_json_atomic(action_path, updated, indent=2)
+            return updated
+
     def quarantine_invalid_review(self, action_file: Path) -> dict:
         return self.quarantine_review_failure(
             action_file,

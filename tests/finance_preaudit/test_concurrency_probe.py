@@ -616,6 +616,30 @@ def test_prepare_skips_quarantined_item_without_global_stop(
     assert stop_requests == []
 
 
+def test_development_clone_keeps_isolated_items_in_diagnostic_queue(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "PROJECT_ROOT",
+        tmp_path / "oa-workspace-dev",
+    )
+    assert finance_preaudit_concurrency_probe._include_isolated_development_items()
+
+
+def test_production_clone_keeps_isolated_items_out_of_queue(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "PROJECT_ROOT",
+        tmp_path / "oa-workspace-minimal",
+    )
+    assert not finance_preaudit_concurrency_probe._include_isolated_development_items()
+
+
 def test_prepare_global_fifo_selects_oldest_supported_workflow(
     monkeypatch,
 ) -> None:
@@ -3864,7 +3888,7 @@ def test_production_cli_defaults_to_rolling_and_rejects_legacy_drain(
     assert calls == [
         (
             6,
-            False,
+            True,
             (),
             finance_preaudit_concurrency_probe.ROLLING_WORKFLOW_KEYS,
         )
@@ -3884,7 +3908,7 @@ def test_production_cli_defaults_to_rolling_and_rejects_legacy_drain(
     ) == 0
     assert calls[-1] == (
         6,
-        False,
+        True,
         (recovery,),
         finance_preaudit_concurrency_probe.ROLLING_WORKFLOW_KEYS,
     )
@@ -3900,7 +3924,7 @@ def test_production_cli_defaults_to_rolling_and_rejects_legacy_drain(
             "general_expense",
         ]
     ) == 0
-    assert calls[-1] == (6, False, (), frozenset({"general_expense"}))
+    assert calls[-1] == (6, True, (), frozenset({"general_expense"}))
     capsys.readouterr()
 
     assert finance_preaudit_concurrency_probe.main(
@@ -3909,6 +3933,22 @@ def test_production_cli_defaults_to_rolling_and_rejects_legacy_drain(
     payload = json.loads(capsys.readouterr().out)
     assert payload["error_code"] == "production_legacy_scheduler_removed"
     assert len(calls) == 3
+
+
+def test_production_cli_defaults_to_two_adaptive_slots(monkeypatch, capsys) -> None:
+    calls = []
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "run_rolling_drain",
+        lambda **kwargs: calls.append(kwargs) or {"status": "completed"},
+    )
+
+    assert finance_preaudit_concurrency_probe.main(
+        ["--confirm-write", "YES"]
+    ) == 0
+    assert calls[0]["capacity"] == 2
+    assert calls[0]["adaptive"] is True
+    capsys.readouterr()
 
 
 def test_production_cli_alerts_on_session_failure_without_masking_it(
@@ -7195,9 +7235,9 @@ def test_dispatcher_adaptive_window_keeps_worst_heartbeat_health(
         decision["next_capacity"]
         for decision in result.capacity_decisions
         if decision["reason"] == "host_pressure"
-    ] == [6, 2, 1]
+    ] == [6, 4, 2]
     assert result.capacity_decisions[-1]["reason"] == "host_pressure_active"
-    assert result.recommended_capacity == 1
+    assert result.recommended_capacity == 2
 
 
 def test_strict_global_fifo_merges_recovered_open_and_live_claim_order(

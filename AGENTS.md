@@ -4,7 +4,7 @@
 
 - 当前发布基线为 V1.1；发布本身不创建或启动自动化。生产定时任务只能由独立授权的唯一 Codex 审批 cron 在生产克隆的唯一 `main` 工作树创建独立任务，并调用现行滚动控制器；频率以当前自动化配置为准。
 - Codex Skill 负责读取证据和形成业务意见；脚本只负责取数、冻结、确定性校验和受控提交，不生成审批判断。
-- 范围是六类财务预审与包装图片文字校对。财务预审只给意见，不批准、不退回；包装不扩展为法规审核。
+- 范围是六类财务预审、包装图片文字校对及海外采购发票识别回填。财务预审只给意见，不批准、不退回；包装不扩展为法规审核；发票回填只处理已授权字段及流程提交。
 - 优先复用 `apps/oa_approval/` 的现有连接能力，不建设通用审批平台、策略引擎或大规模状态模型。
 
 ## 工作约束
@@ -18,7 +18,10 @@
 
 ## 按需读取
 
+- 查询或修改 OA 接口调用时，优先查阅[泛微 E9 官方后端接口文档](https://e-cloudstore.com/ec/api/applist/index.html#/)，以对应接口的参数说明和展开示例为依据；提交及发票回填的已核实合同见 [OA 官方接口入口](docs/agents/oa-api.md)。
+
 - 用户要求排查、修复或清理隔离/历史失败时，先读[隔离排障与恢复](docs/agents/quarantine-repair.md)。生产隔离是止损，开发排障须继续诊断、回测并在已有同范围授权内显式恢复；隔离成功或普通队列为空不代表修复完成。
+- 海外采购付款的发票识别及字段回填使用 `.agents/skills/oa-overseas-invoice/SKILL.md`，独立授权与单据级提交，不进入财务预审滚动队列。
 - 实际单据预审使用 `.agents/skills/oa-finance-preaudit/SKILL.md`。开发结果结构读 [.agents/skills/oa-finance-preaudit/references/flow-engine-contract.md](.agents/skills/oa-finance-preaudit/references/flow-engine-contract.md)；证据规则读 [.agents/skills/oa-finance-preaudit/references/observation-contract.md](.agents/skills/oa-finance-preaudit/references/observation-contract.md)；流程规则经 [result-contract.md](.agents/skills/oa-finance-preaudit/references/result-contract.md) 只选择匹配流程。开发和测试不执行真实单据 next-action 或 complete-review。
 - 创建、更新 GitHub Issue 或拆分需求、依赖与验收：读 [Issue 追踪](docs/agents/issue-tracker.md)；设置工作状态或分类标签时再读 [标签规范](docs/agents/triage-labels.md)。
 - 准备提交、PR 或调整交付规则：读 `CONTRIBUTING.md` 中对应的“分支与提交”“Pull Request”或“验证层级”；涉及发布或生产同步时按上方发布入口读取。
