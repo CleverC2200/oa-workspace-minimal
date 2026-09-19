@@ -4438,7 +4438,9 @@ def _continuation_is_ready(
         return bool(recovery_action_files)
 
     if ready:
-        return isolated == 0 or bool(recovery_action_files)
+        # Production may continue ordinary pending work while trusted item
+        # quarantines remain visible; quarantined identities stay excluded.
+        return True
     if not recovery_action_files:
         return False
     # This admits only explicitly selected preparation work; FlowEngine still
