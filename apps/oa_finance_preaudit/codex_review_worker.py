@@ -1646,6 +1646,13 @@ def quarantine_review_failure(action_file: Path, failure_code: str) -> dict:
     )
 
 
+def record_production_failure_round(action_file: Path, failure_code: str) -> dict:
+    return cli._live_flow_engine(controlled=True).record_review_failure_round(
+        action_file,
+        failure_code,
+    )
+
+
 def quarantine_invalid_decision(action_file: Path) -> dict:
     return quarantine_review_failure(action_file, "codex_decision_invalid")
 

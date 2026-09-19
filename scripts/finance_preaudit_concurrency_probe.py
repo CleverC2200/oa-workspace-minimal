@@ -55,6 +55,7 @@ PipelineRunner = Callable[[int, int], process_pool.PoolResult[dict]]
 ReviewWorker = Callable[[dict], dict]
 ReviewCompleter = Callable[[Path, dict], dict]
 ReviewQuarantine = Callable[[Path, str], dict]
+FailureRoundRecorder = Callable[[Path, str], dict]
 ExecutorFactory = Callable[[int], object]
 
 
@@ -2029,6 +2030,7 @@ def _run_dispatched_tasks(
     quarantine_review: ReviewQuarantine = (
         codex_review_worker.quarantine_review_failure
     ),
+    record_failure_round: FailureRoundRecorder | None = None,
     executor_factory: ExecutorFactory = _process_executor,
     task_timeout_sec: float = 960,
     prepare_timeout_sec: float = 300,
@@ -2140,6 +2142,7 @@ def _run_dispatched_tasks(
     halted = False
     primary_error_code: str | None = None
     force_terminated = False
+    retry_pending_now = False
     runtime_samples: list[dict] = []
     max_task_elapsed_seconds = 0.0
     next_heartbeat = time.monotonic()
@@ -3007,6 +3010,47 @@ def _run_dispatched_tasks(
                          or error_code == "codex_process_timeout")
                         and bounded_review_failure
                     ):
+                        failure_round = None
+                        production_failure_round_recorder = (
+                            record_failure_round
+                            or (
+                                codex_review_worker.record_production_failure_round
+                                if strict_global_fifo and continuous_discovery
+                                else None
+                            )
+                        )
+                        if production_failure_round_recorder is not None:
+                            try:
+                                failure_round = production_failure_round_recorder(
+                                    action_file,
+                                    error_code,
+                                ).get("production_failure_round")
+                            except Exception:
+                                failure_round = None
+                        if isinstance(failure_round, int) and failure_round < 3:
+                            retry_pending_now = True
+                            retry_value = {
+                                **reported_value,
+                                "status": "retry_pending",
+                                "execution_state": "review_required",
+                                "business_state": "not_available",
+                                "write_state": "authorized",
+                                "error_code": "codex_review_retry_pending",
+                                "production_failure_round": failure_round,
+                                "prepare_elapsed_seconds": prepare_elapsed,
+                            }
+                            outcomes[index] = process_pool.TaskOutcome(
+                                index=index,
+                                status="completed",
+                                value=retry_value,
+                            )
+                            if strict_global_fifo:
+                                pending_write_indices.remove(index)
+                            else:
+                                skipped_write_indices.add(index)
+                            review_histories.pop(index, None)
+                            advance_write_head()
+                            continue
                         try:
                             quarantine = quarantine_review(
                                 action_file,
@@ -3365,7 +3409,12 @@ def _run_dispatched_tasks(
             and outcome.value.get("status") in {"late_visible", "no_action"}
         )
     )
-    if halted and not force_terminated and not runtime_control.stop_requested():
+    if (
+        halted
+        and not retry_pending_now
+        and not force_terminated
+        and not runtime_control.stop_requested()
+    ):
         runtime_control.request_cycle_stop()
     return process_pool.PoolResult(
         requested=len(completed_outcomes),
@@ -3871,6 +3920,7 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
     completed = 0
     failed = 0
     isolated_quarantines = 0
+    retry_pending = 0
     process_attempts = 0
     process_retries = 0
     prepare_active_seconds = 0.0
@@ -3887,7 +3937,17 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
         if outcome.status == "completed" and worker_status in {
             "completed",
             "quarantined",
+            "retry_pending",
         }:
+            if worker_status == "retry_pending":
+                completed += 1
+                retry_pending += 1
+                error_code = value.get("error_code") or outcome.error_code
+                if isinstance(error_code, str):
+                    error_counts[error_code] += 1
+                process_attempts += int(value.get("process_attempts") or 0)
+                process_retries += int(value.get("process_retries") or 0)
+                continue
             if worker_status == "quarantined" and not (
                 value.get("write_state") == "not_requested"
                 and value.get("error_code") in ITEM_LOCAL_QUARANTINE_REASONS
@@ -4053,6 +4113,7 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
         "started": result.started,
         "completed": completed,
         "isolated_quarantines": isolated_quarantines,
+        "retry_pending": retry_pending,
         "failed": failed + result.failed,
         "timed_out": result.timed_out,
         "stopped": result.stopped,
@@ -4536,6 +4597,13 @@ def _run_rolling_drain_locked(
         wave["capacity"] = current_capacity
         waves.append(wave)
         late_visible_pending = int(wave.get("late_visible_pending") or 0)
+        if int(wave.get("retry_pending") or 0) > 0:
+            # A transient first/second-round review failure is persisted on the
+            # open attempt. End this production cycle quietly; the next cycle
+            # will retry it and only round three can create an isolation.
+            status = "completed"
+            stop_reason = "review_retry_pending"
+            break
         if (
             wave["failed"]
             or wave["timed_out"]
@@ -4986,9 +5054,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
                 "",
             )
+            non_retry_counts = {
+                code: count
+                for code, count in (counts or {}).items()
+                if code != "codex_review_retry_pending"
+            }
             if not session_code and (
                 payload.get("status") not in {"completed", "completed_with_quarantine"}
-                or any(isinstance(n, int) and n > 0 for n in (counts or {}).values())
+                or any(
+                    isinstance(n, int) and n > 0
+                    for n in non_retry_counts.values()
+                )
             ):
                 session_code = "controller_failed"
             if session_code:
