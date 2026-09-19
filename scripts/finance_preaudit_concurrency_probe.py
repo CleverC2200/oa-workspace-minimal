@@ -1689,6 +1689,9 @@ def run_read_only_probe(
     transient_error_events = codex_events["counts"].get("error")
     if transient_error_events is None and codex_events["status"] == "recorded":
         transient_error_events = 0
+    rate_limit_events = codex_events["counts"].get("rate_limit_signal")
+    if rate_limit_events is None and codex_events["status"] == "recorded":
+        rate_limit_events = 0
     return {
         "schema_version": 1,
         "kind": "preaudit_read_only_concurrency_probe",
@@ -1706,6 +1709,7 @@ def run_read_only_probe(
         "decision_states": dict(sorted(decision_states.items())),
         "codex_events": codex_events,
         "transient_error_events": transient_error_events,
+        "rate_limit_events": rate_limit_events,
         "exit_codes": dict(sorted(exit_codes.items())),
         "model": codex_review_worker.MODEL,
         "reasoning_effort": codex_review_worker.REASONING_EFFORT,
@@ -1745,7 +1749,7 @@ def run_read_only_probe(
 
 def run_adaptive_read_only_probe(
     *,
-    start_capacity: int = 6,
+    start_capacity: int = 4,
     sample_size: int = 20,
     max_waves: int = 6,
     probe_runner: Callable[..., dict] = run_read_only_probe,
@@ -1787,6 +1791,13 @@ def run_adaptive_read_only_probe(
                 "timed_out": int(wave.get("timed_out") or 0),
                 "stopped": int(wave.get("stopped") or 0),
                 "transient_error_events": wave.get("transient_error_events"),
+                "rate_limit_events": wave.get(
+                    "rate_limit_events",
+                    0
+                    if isinstance(wave.get("codex_events"), dict)
+                    and wave["codex_events"].get("status") == "recorded"
+                    else None,
+                ),
                 "codex_event_status": (
                     wave.get("codex_events", {}).get("status")
                     if isinstance(wave.get("codex_events"), dict)
@@ -1815,6 +1826,9 @@ def run_adaptive_read_only_probe(
     transient_error_events = codex_events["counts"].get("error")
     if transient_error_events is None and codex_events["status"] == "recorded":
         transient_error_events = 0
+    rate_limit_events = codex_events["counts"].get("rate_limit_signal")
+    if rate_limit_events is None and codex_events["status"] == "recorded":
+        rate_limit_events = 0
     return {
         "schema_version": 1,
         "kind": "preaudit_adaptive_read_only_probe",
@@ -1831,6 +1845,7 @@ def run_adaptive_read_only_probe(
         "token_usage": dict(token_totals),
         "codex_events": codex_events,
         "transient_error_events": transient_error_events,
+        "rate_limit_events": rate_limit_events,
         "production_write": False,
     }
 
@@ -2317,6 +2332,11 @@ def _run_dispatched_tasks(
                     "stopped": 0,
                     "codex_event_status": codex_events["status"],
                     "transient_error_events": transient_errors,
+                    "rate_limit_events": (
+                        codex_events["counts"].get("rate_limit_signal", 0)
+                        if codex_events["status"] == "recorded"
+                        else None
+                    ),
                 },
                 host=window_host,
             )
@@ -3944,6 +3964,9 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
     transient_error_events = codex_events["counts"].get("error")
     if transient_error_events is None and codex_events["status"] == "recorded":
         transient_error_events = 0
+    rate_limit_events = codex_events["counts"].get("rate_limit_signal")
+    if rate_limit_events is None and codex_events["status"] == "recorded":
+        rate_limit_events = 0
     review_samples = [
         sample
         for sample in result.runtime_samples
@@ -4051,6 +4074,7 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
         "primary_error_code": primary_error_code,
         "codex_events": codex_events,
         "transient_error_events": transient_error_events,
+        "rate_limit_events": rate_limit_events,
         "pipeline": pipeline,
         "processes_reaped": result.processes_reaped,
         "discovery_refreshes": result.discovery_refreshes,
@@ -4411,7 +4435,7 @@ def _run_rolling_drain_locked(
     allowed_workflows: frozenset[str] = ROLLING_WORKFLOW_KEYS,
 ) -> dict:
     if (
-        not 1 <= capacity <= 6
+        capacity not in concurrency_control.CAPACITY_STEPS
         or not isinstance(recovery_count, int)
         or isinstance(recovery_count, bool)
         or recovery_count < 0
@@ -4520,6 +4544,16 @@ def _run_rolling_drain_locked(
         ):
             runtime_control.request_cycle_stop()
             status = "failed"
+            if adaptive and int(wave.get("rate_limit_events") or 0) > 0:
+                current_capacity = concurrency_control.CAPACITY_STEPS[0]
+                last_decision = {
+                    "action": "decrease",
+                    "next_capacity": concurrency_control.CAPACITY_STEPS[0],
+                    "healthy_windows": 0,
+                    "reason": "rate_limit_pressure",
+                }
+                stop_reason = "rate_limit_pressure"
+                break
             internal_stops = [
                 decision
                 for decision in wave.get("capacity_decisions", [])
@@ -4602,6 +4636,7 @@ def _run_rolling_drain_locked(
                         "transient_error_events": wave[
                             "transient_error_events"
                         ],
+                        "rate_limit_events": wave.get("rate_limit_events"),
                         "codex_event_status": wave["codex_events"]["status"],
                     },
                     host=wave["runtime_health"],
@@ -4651,6 +4686,9 @@ def _run_rolling_drain_locked(
     transient_error_events = codex_events["counts"].get("error")
     if transient_error_events is None and codex_events["status"] == "recorded":
         transient_error_events = 0
+    rate_limit_events = codex_events["counts"].get("rate_limit_signal")
+    if rate_limit_events is None and codex_events["status"] == "recorded":
+        rate_limit_events = 0
     pipeline_wait_samples = [
         float(value)
         for wave in waves
@@ -4814,6 +4852,7 @@ def _run_rolling_drain_locked(
         "primary_error_code": primary_error_code,
         "codex_events": codex_events,
         "transient_error_events": transient_error_events,
+        "rate_limit_events": rate_limit_events,
         "pipeline": pipeline,
         "processes_reaped": processes_reaped,
         "token_usage": {
@@ -4854,10 +4893,21 @@ def _verified_active_controller() -> dict | None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="finance-preaudit-concurrency-probe")
-    parser.add_argument("--capacity", type=int, required=True)
+    parser.add_argument("--capacity", type=int, default=4)
     parser.add_argument("--confirm-write", choices=("YES",))
     parser.add_argument("--read-only", action="store_true")
-    parser.add_argument("--adaptive", action="store_true")
+    parser.add_argument(
+        "--adaptive",
+        action="store_true",
+        default=True,
+        help="按健康窗口逐级扩容（生产默认开启）",
+    )
+    parser.add_argument(
+        "--fixed-capacity",
+        dest="adaptive",
+        action="store_false",
+        help="关闭生产弹性扩容，固定使用 --capacity",
+    )
     parser.add_argument("--waves", type=int, default=6)
     parser.add_argument("--samples", type=int, default=20)
     parser.add_argument("--drain", action="store_true")

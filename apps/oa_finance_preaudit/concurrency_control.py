@@ -8,7 +8,9 @@ import threading
 from typing import Callable
 
 
-CAPACITY_STEPS = (1, 2, 6, 8, 10, 12)
+# Production review capacity deliberately starts at two workers.  A one-worker
+# mode is useful for manual recovery, but is not part of the adaptive policy.
+CAPACITY_STEPS = (2, 4, 6, 8, 10, 12)
 _MEMORY_PERCENT = re.compile(r"free percentage:\s*([0-9]{1,3})%")
 
 
@@ -143,6 +145,25 @@ def decide_capacity(
             "next_capacity": current_capacity,
             "healthy_windows": 0,
             "reason": "codex_events_unknown",
+        }
+    rate_limit_errors = wave.get("rate_limit_events", 0)
+    if (
+        not isinstance(rate_limit_errors, int)
+        or isinstance(rate_limit_errors, bool)
+        or rate_limit_errors < 0
+    ):
+        return {
+            "action": "hold",
+            "next_capacity": current_capacity,
+            "healthy_windows": 0,
+            "reason": "codex_events_unknown",
+        }
+    if rate_limit_errors > 0:
+        return {
+            "action": "decrease",
+            "next_capacity": CAPACITY_STEPS[0],
+            "healthy_windows": 0,
+            "reason": "rate_limit_pressure",
         }
     if transient_errors > 0:
         return {

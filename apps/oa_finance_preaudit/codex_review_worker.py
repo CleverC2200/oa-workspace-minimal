@@ -63,7 +63,13 @@ _EVENT_TYPES = frozenset(
         "turn.started",
     }
 )
-_SANITIZED_EVENT_TYPES = _EVENT_TYPES | {"other"}
+_SANITIZED_EVENT_TYPES = _EVENT_TYPES | {
+    "other",
+    "authentication_signal",
+    "rate_limit_signal",
+    "retry_signal",
+    "transport_signal",
+}
 _COMPLETION_FAILURE_CODES = writer_outcomes.FAILURE_CODES | {
     "writer_result_unknown",
 }
@@ -144,6 +150,7 @@ class CodexExecution:
     event_counts: dict[str, int] = field(default_factory=dict)
     event_status: str = "unknown"
     exit_code: int | None = None
+    event_signals: tuple[str, ...] = ()
 
 
 Executor = Callable[[Path, Path, int], CodexExecution]
@@ -625,6 +632,9 @@ def _merge_events(executions: list[CodexExecution]) -> dict:
                 and count >= 0
             ):
                 counts[event_type] = counts.get(event_type, 0) + count
+        for signal in execution.event_signals:
+            if signal in _SANITIZED_EVENT_TYPES:
+                counts[signal] = counts.get(signal, 0) + 1
     attempts = len(executions)
     return {
         "status": (
@@ -894,6 +904,7 @@ def _execute_codex_raw(
                 event_counts=event_counts,
                 event_status=event_status,
                 exit_code=process.returncode,
+                event_signals=tuple(stderr_summary.get("event_signals", ())),
             )
         finally:
             restore_sigterm()
@@ -946,6 +957,7 @@ def _execute_codex_raw(
         event_counts=event_counts,
         event_status=event_status,
         exit_code=process.returncode,
+        event_signals=tuple(stderr_summary.get("event_signals", ())),
     )
 
 

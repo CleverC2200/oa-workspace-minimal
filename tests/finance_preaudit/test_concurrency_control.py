@@ -20,6 +20,7 @@ def _wave(**changes: object) -> dict:
         "timed_out": 0,
         "stopped": 0,
         "transient_error_events": 0,
+        "rate_limit_events": 0,
         "codex_event_status": "recorded",
     }
     wave.update(changes)
@@ -82,11 +83,11 @@ def test_pressure_decreases_one_step_and_technical_failure_stops() -> None:
     }
 
 
-def test_transient_errors_or_unknown_host_hold_without_upgrade() -> None:
+def test_rate_limit_pressure_returns_to_two_and_unknown_host_holds() -> None:
     transient = concurrency_control.decide_capacity(
         current_capacity=8,
         healthy_windows=1,
-        wave=_wave(transient_error_events=2),
+        wave=_wave(rate_limit_events=2),
         host=HEALTHY,
     )
     unknown = concurrency_control.decide_capacity(
@@ -96,9 +97,10 @@ def test_transient_errors_or_unknown_host_hold_without_upgrade() -> None:
         host={**HEALTHY, "status": "unknown", "memory_free_percent": None},
     )
 
-    assert transient["action"] == "hold"
+    assert transient["action"] == "decrease"
+    assert transient["next_capacity"] == 2
     assert transient["healthy_windows"] == 0
-    assert transient["reason"] == "transient_errors_observed"
+    assert transient["reason"] == "rate_limit_pressure"
     assert unknown["action"] == "hold"
     assert unknown["healthy_windows"] == 0
     assert unknown["reason"] == "host_health_unknown"
