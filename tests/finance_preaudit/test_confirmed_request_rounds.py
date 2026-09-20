@@ -23,6 +23,15 @@ def _grant(context):
             "expires_at": "2099-01-01T00:00:00+08:00", "proof": "offline"}
 
 
+def _material(request_id):
+    return {
+        "schema_version": 1, "kind": "preaudit_material", "request_id": request_id,
+        "workflow_key": WORKFLOW, "workflow_name": "通用费用报销申请流程",
+        "declared_fields": [], "resources": [], "authority_facts": [], "warnings": [],
+        "prepared": {"images": [], "structured_contents": [], "manifest": []},
+    }
+
+
 @pytest.fixture
 def completed_round(tmp_path, monkeypatch):
     class FrozenTime(datetime):
@@ -43,12 +52,7 @@ def completed_round(tmp_path, monkeypatch):
     engine = flow_engine.FlowEngine(
         root=tmp_path, discover_candidates=lambda _workflow: list(rows),
         discover_handled=lambda: [],
-        collect_material=lambda request_id, _root: {
-            "schema_version": 1, "kind": "preaudit_material", "request_id": request_id,
-            "workflow_key": WORKFLOW, "workflow_name": "通用费用报销申请流程",
-            "declared_fields": [], "resources": [], "authority_facts": [], "warnings": [],
-            "prepared": {"images": [], "structured_contents": [], "manifest": []},
-        },
+        collect_material=lambda request_id, _root: _material(request_id),
         authorization_source=_grant,
         authorization_verifier=lambda grant, context: grant == _grant(context),
         submit_frozen=submit,
@@ -74,6 +78,116 @@ def completed_round(tmp_path, monkeypatch):
 
 def _reconcile(root, rows, handled=()):
     return reconciliation.reconcile(root, pending_rows=rows, handled_rows=handled, now=NOW)
+
+
+@pytest.fixture
+def opened_round(tmp_path, monkeypatch):
+    """A real controlled-write attempt that stays open and never reaches the Writer."""
+    class FrozenTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.fromisoformat("2026-09-10T17:53:00+08:00").astimezone(tz or timezone.utc)
+
+    monkeypatch.setattr(flow_engine, "datetime", FrozenTime)
+    rows = [{"request_id": "opened-round-request", "received_at": OLD_TIME, "workflow_key": WORKFLOW}]
+    submitted = []
+
+    def submit(job):
+        submitted.append(job)
+        raise AssertionError("an opened superseded round must never be submitted")
+
+    engine = flow_engine.FlowEngine(
+        root=tmp_path, discover_candidates=lambda _workflow: list(rows),
+        discover_handled=lambda: [],
+        collect_material=lambda request_id, _root: _material(request_id),
+        authorization_source=_grant,
+        authorization_verifier=lambda grant, context: grant == _grant(context),
+        submit_frozen=submit,
+    )
+    action = engine.next_action(WORKFLOW, mode="controlled_write")
+    assert action["action"] == "review_required" and action["write_state"] == "authorized"
+    rows[0]["received_at"] = NEW_TIME
+    return engine, action, rows, submitted
+
+
+def test_opened_round_superseded_before_writer_does_not_block(opened_round, tmp_path):
+    from apps.oa_finance_preaudit import controller_handoff
+
+    engine, action, rows, submitted = opened_round
+    attempt_root = Path(action["action_file"]).parent
+    before = {p.name: p.read_bytes() for p in attempt_root.iterdir() if p.is_file()}
+    report = _reconcile(tmp_path, rows)
+    assert report["continuation"] == {
+        "status": "ready", "scope": "none", "isolated_pending": 0, "blocking_reasons": {},
+    }
+    finding = report["findings"][0]
+    assert finding["category"] == "prior_round_unsubmitted"
+    assert finding["recommendation"] == "deferred_unsubmitted_round"
+    assert finding["current_item_key"] == reconciliation._item_key(
+        rows[0]["request_id"], NEW_TIME
+    )
+    assert controller_handoff._recovery_reconciliation_is_trusted(report)
+    assert submitted == []
+    assert {p.name: p.read_bytes() for p in attempt_root.iterdir() if p.is_file()} == before
+    fresh = engine.next_action(WORKFLOW, mode="controlled_write")
+    assert fresh["action"] == "review_required" and fresh["attempt"] == 1
+    assert fresh["case_key"] != action["case_key"]
+    assert fresh["authorization_fingerprint"] != action["authorization_fingerprint"]
+    after = {p.name: p.read_bytes() for p in attempt_root.iterdir() if p.is_file()}
+    assert all(after.get(name) == raw for name, raw in before.items())
+    assert not {
+        "writer-boundary.json", "execution-receipt.json", "review-decision.json",
+        "remark.txt", "submission-envelope.json",
+    } & set(after)
+
+
+@pytest.mark.parametrize("artifact", ["writer-boundary.json", "execution-receipt.json",
+                                      "review-decision.json", "remark.txt", "submission-envelope.json"])
+def test_superseded_opened_round_with_writer_evidence_still_blocks(artifact, opened_round, tmp_path):
+    _engine, action, rows, _submitted = opened_round
+    (Path(action["action_file"]).parent / artifact).write_text("{}", encoding="utf-8")
+    assert _reconcile(tmp_path, rows)["continuation"] == {
+        "status": "blocked", "scope": "controller", "isolated_pending": 0,
+        "blocking_reasons": {"identity_conflict": 1},
+    }
+
+
+@pytest.mark.parametrize("changed", ["same_time", "earlier", "before_creation", "future", "date_only",
+                                    "unparsed", "same_instant", "duplicate", "alias_conflict",
+                                    "handled", "different_workflow"])
+def test_superseded_opened_round_needs_one_newer_same_request_round(changed, opened_round, tmp_path):
+    _engine, _action, rows, _submitted = opened_round
+    times = {"same_time": OLD_TIME, "earlier": "2026-09-10 17:40:00",
+             "before_creation": "2026-09-10 17:50:00", "future": "2099-01-01 00:00:00",
+             "date_only": "2026-09-11", "unparsed": "changed",
+             "same_instant": "2026-09-10T09:42:35Z"}
+    if changed in times:
+        rows[0]["received_at"] = times[changed]
+    elif changed == "duplicate":
+        rows.append({**rows[0], "received_at": "2026-09-10 18:01:00"})
+    elif changed == "alias_conflict":
+        rows[0]["requestId"] = "different-request"
+    elif changed == "different_workflow":
+        rows[0]["workflow_key"] = "travel_expense"
+    handled = [{"request_id": rows[0]["request_id"]}] if changed == "handled" else []
+    report = _reconcile(tmp_path, rows, handled)
+    categories = {item["category"] for item in report["findings"]}
+    assert "prior_round_unsubmitted" not in categories
+    if changed == "same_time":
+        # The live round is still exactly the frozen one, so it stays resumable.
+        assert categories == {"pending_not_handled"}
+        assert report["continuation"]["status"] == "ready"
+    else:
+        assert report["continuation"]["status"] == "blocked"
+
+
+def test_superseded_opened_round_needs_valid_frozen_evidence(opened_round, tmp_path):
+    _engine, action, rows, _submitted = opened_round
+    material = Path(action["action_file"]).parent / "material.json"
+    value = json.loads(material.read_text())
+    value["unexpected_change"] = True
+    json_artifact.write_json_atomic(material, value)
+    assert _reconcile(tmp_path, rows)["continuation"]["status"] == "blocked"
 
 
 def test_confirmed_previous_round_does_not_block_fresh_round(completed_round, tmp_path):

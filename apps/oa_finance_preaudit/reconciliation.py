@@ -4,6 +4,7 @@ from collections import Counter
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 from typing import Iterable
@@ -36,6 +37,13 @@ QUARANTINED_REASONS = frozenset(
 _CASE_KEY = re.compile(r"^[0-9a-f]{64}$")
 _ATTEMPT = re.compile(r"^attempt-([1-9][0-9]*)$")
 _OA_TIMEZONE = ZoneInfo("Asia/Shanghai")
+_PREWRITE_ABSENT_ARTIFACTS = (
+    "writer-boundary.json",
+    "execution-receipt.json",
+    "review-decision.json",
+    "remark.txt",
+    "submission-envelope.json",
+)
 
 
 def _identity(row: dict) -> tuple[str, str]:
@@ -279,6 +287,49 @@ def _deferred_historical_no_write_round(
     return True
 
 
+def _superseded_unsubmitted_round(
+    root: Path, state: dict, attempt_root: Path, rows: list[dict], now: datetime,
+) -> bool:
+    """Defer one opened round that a strictly newer round replaced before the Writer.
+
+    The old round is obsolete: its frozen evidence describes a version the live
+    queue no longer carries. Only a round that provably never reached the Writer
+    may leave the blocking set, so any Writer boundary, execution receipt,
+    decision, remark or submission envelope keeps the identity conflict.
+    """
+    from .flow_engine import FlowEngine
+
+    if (
+        state.get("mode") != "controlled_write"
+        or state.get("write_authorized") is not True
+        or state.get("execution_state") != "review_required"
+        or state.get("write_state") != "authorized"
+        or len(rows) != 1
+        or rows[0].get("workflow_key") != state.get("workflow_key")
+    ):
+        return False
+    row = rows[0]
+    if row.get("request_id") and row.get("requestId") and row["request_id"] != row["requestId"]:
+        return False
+    old_time, new_time = str(state.get("received_at") or ""), _identity(row)[1]
+    timestamp = r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?"
+    if re.fullmatch(timestamp, old_time) is None or re.fullmatch(timestamp, new_time) is None:
+        return False
+    try:
+        previous, current = _received_at_utc(old_time), _received_at_utc(new_time)
+        created = datetime.fromisoformat(str(state["created_at"]).replace("Z", "+00:00"))
+        if not previous < current <= now or not created < current:
+            return False
+    except (ValueError, TypeError, KeyError):
+        return False
+    if any(
+        os.path.lexists(Path(attempt_root) / name)
+        for name in _PREWRITE_ABSENT_ARTIFACTS
+    ):
+        return False
+    return FlowEngine.resumable_review(root, state)
+
+
 def reconcile(
     root: Path,
     *,
@@ -328,11 +379,16 @@ def reconcile(
         handled = request_id in handled_ids
         current_rows = [row for row in pending_input if _identity(row)[0] == request_id]
         if request_pending and not exact_pending:
-            category = (
-                "prior_round_submitted"
-                if not handled and _confirmed_prior_round(root, state, current_rows, current_time)
-                else "identity_conflict"
-            )
+            if not handled and _confirmed_prior_round(
+                root, state, current_rows, current_time
+            ):
+                category = "prior_round_submitted"
+            elif not handled and _superseded_unsubmitted_round(
+                root, state, attempt_root, current_rows, current_time
+            ):
+                category = "prior_round_unsubmitted"
+            else:
+                category = "identity_conflict"
         elif exact_pending and handled:
             category = "pending_handled_conflict"
         elif handled:
@@ -362,6 +418,8 @@ def reconcile(
             and category in {"handled_not_pending", "prior_round_submitted"}
         ):
             recommendation = "none"
+        elif category == "prior_round_unsubmitted":
+            recommendation = "deferred_unsubmitted_round"
         elif (
             category == "identity_conflict"
             and _deferred_historical_no_write_round(root, state, current_rows, current_time)
@@ -439,7 +497,8 @@ def reconcile(
                 "category": category,
                 "recommendation": recommendation,
                 **({"current_item_key": _item_key(*_identity(current_rows[0]))}
-                   if category == "prior_round_submitted" else {}),
+                   if category in {"prior_round_submitted", "prior_round_unsubmitted"}
+                   else {}),
             }
         )
 

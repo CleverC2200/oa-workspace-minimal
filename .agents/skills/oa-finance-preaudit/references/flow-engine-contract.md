@@ -4,6 +4,8 @@
 
 只读对账按 `requestId + received_at` 区分单据轮次。旧轮次只有在完成锁空闲、action/state 完整闭合为 `controlled_write / submitted`，且执行回执、提交与已办后查结果、绑定指纹和冻结审核输入全部复核通过时，才可能归类为 `prior_round_submitted`：当前必须只有一个同流程实时版本，接收时间可解析、晚于旧接收及旧 attempt 创建时间且不在未来，并且已办列表没有同请求冲突。投影以 `current_item_key` 关联新版本；旧文件不变，新版本重新取材、审核和授权，不继承旧决定或 token。缺失流程身份、同请求多版本、时间倒退、活动锁、preview、未闭合、未知写入或任何证据不可信均保留阻断。
 
+本地最新 attempt 仍处于已打开轮次（`mode=controlled_write`、`write_authorized=true`、`execution_state=review_required`、`write_state=authorized`）时，只有同时满足以下条件才归类为 `prior_round_unsubmitted`，只投影不阻断：attempt 目录不存在 `writer-boundary.json`、`execution-receipt.json`、`review-decision.json`、`remark.txt` 或 `submission-envelope.json`；`FlowEngine.resumable_review` 验证 action/state、审核包与冻结材料身份及指纹一致；实时只有一条同流程、同 requestId 的待办，接收时间可解析、严格晚于旧接收时间与旧 attempt 创建时间、不在未来，且已办列表没有同请求冲突。存在任何写入边界证据、review 决定、意见或提交信封，或 identity 多版本、时间不可解析或倒退、preview、未知写入时，仍按 `identity_conflict` 阻断整轮。
+
 ## 两动作循环
 
 从项目根执行：
