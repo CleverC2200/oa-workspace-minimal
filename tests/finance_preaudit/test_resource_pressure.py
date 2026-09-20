@@ -16,21 +16,25 @@ def test_cpu_pressure_is_not_a_critical_memory_failure():
         load_reader=lambda: (0, 0, 0), cpu_reader=lambda: 10)["status"] == "critical"
 
 
-def test_pressure_can_reduce_to_one_and_recover_in_steps():
+def test_pressure_reduces_to_the_two_worker_floor_and_recovers_in_steps():
     wave = dict(requested=2, completed=2, failed=0, timed_out=0, stopped=0,
                 codex_event_status="recorded", transient_error_events=0)
     capacity = 6
-    for expected in (2, 1, 1):
+    for expected in (4, 2, 2):
         result = control.decide_capacity(current_capacity=capacity, healthy_windows=0,
             wave=wave, host={"status": "pressure"})
         assert result["next_capacity"] == expected
         assert result["action"] != "stop"
         capacity = expected
-    first = control.decide_capacity(current_capacity=1, healthy_windows=0,
+    # A one-worker run stays a manual-recovery mode: sustained pressure must hold
+    # at the policy floor instead of degrading below it.
+    assert capacity == control.CAPACITY_STEPS[0] == 2
+    first = control.decide_capacity(current_capacity=2, healthy_windows=0,
         wave=wave, host={"status": "healthy"})
-    second = control.decide_capacity(current_capacity=1, healthy_windows=first["healthy_windows"],
+    second = control.decide_capacity(current_capacity=2, healthy_windows=first["healthy_windows"],
         wave=wave, host={"status": "healthy"})
-    assert second["next_capacity"] == 2
+    assert first["next_capacity"] == 2
+    assert second["next_capacity"] == 4
 
 
 def test_sustained_cpu_pressure_keeps_fifo_and_does_not_handoff(tmp_path: Path, monkeypatch):
@@ -56,7 +60,7 @@ def test_sustained_cpu_pressure_keeps_fifo_and_does_not_handoff(tmp_path: Path, 
     assert result.completed == 4
     assert result.failed == result.stopped == result.timed_out == 0
     assert completed == paths
-    assert result.recommended_capacity == 1
+    assert result.recommended_capacity == control.CAPACITY_STEPS[0] == 2
     assert result.processes_reaped
 
 
@@ -204,4 +208,4 @@ def test_prepared_work_waits_until_existing_reviews_drain_after_decrease(tmp_pat
         executor_factory=lambda n: ThreadPoolExecutor(max_workers=n))
     assert result.completed == 6
     assert sixth_started
-    assert result.recommended_capacity == 1
+    assert result.recommended_capacity == control.CAPACITY_STEPS[0] == 2
