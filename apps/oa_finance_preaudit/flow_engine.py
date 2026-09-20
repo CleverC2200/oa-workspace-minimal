@@ -2807,6 +2807,18 @@ class FlowEngine:
                     action_path.parent / "execution-receipt.json"
                 )
             )
+            # A submit boundary without an execution receipt is an unconfirmed
+            # write. The caller may list it as historical only after the live
+            # continuation gate proved no pending identity still owns it; the
+            # record stays in the manual review list either way.
+            boundary_path = action_path.parent / "writer-boundary.json"
+            unconfirmed_submit_boundary = (
+                boundary_path.is_file()
+                and not boundary_path.is_symlink()
+                and not os.path.lexists(
+                    action_path.parent / "execution-receipt.json"
+                )
+            )
             if (
                 expected != action_path
                 or latest_by_case.get(case_key) != action_path.parent
@@ -2822,7 +2834,7 @@ class FlowEngine:
                 != state.get("write_authorized")
                 or "request_id" in action
                 or "received_at" in action
-                or not preview_confirmed_no_write
+                or not (preview_confirmed_no_write or unconfirmed_submit_boundary)
                 or any(action.get(key) != value for key, value in required.items())
                 or any(state.get(key) != value for key, value in required.items())
             ):
