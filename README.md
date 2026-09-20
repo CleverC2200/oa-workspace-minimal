@@ -229,6 +229,17 @@ python3 -m apps.oa_finance_preaudit.cli next-action \
   --confirm-unknown-request-id EXACT_REQUEST_ID
 ```
 
+已确认写入落地的历史未知写入不会再触发止损（见下文 `prior_round` 与历史未知写入规则），但上一轮失败留下的 `stop_requested:<reason>` 停止标记仍需人工处理。操作人在控制器与全局 Writer 空闲、实时身份与对账可信、且只读对账把绑定的 attempt 判为已办或不可见（非实时待办）后，可按精确原因清除该标记，入口会保留停止证据哈希、绑定 attempt 指纹与对账快照为回执：
+
+```bash
+python3 -m apps.oa_finance_preaudit.stop_recovery \
+  --confirm-reconciled YES \
+  --expected-reason writer_result_unknown \
+  --bind-action-file /absolute/path/to/action.json
+```
+
+该入口只接受允许列表内的失败原因并逐字节核对标记内容，不删除业务证据、不重放 attempt、不写 OA；仍待办的未知写入、不可信实时身份或不可信对账一律返回 `writer_stop_recovery_blocked`。
+
 受控清理使用同一 JSON CLI。它在同一维护锁和事件锁内先计算脱敏日聚合，完整校验计划与所有目标，再以不跟随符号链接的原子写入落盘，最后才归档或删除原始 attempt：
 
 ```bash

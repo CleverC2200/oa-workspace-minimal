@@ -312,6 +312,35 @@ def write_control_bytes_atomic(path: Path, payload: bytes) -> None:
 
 def clear_cycle_stop(*, expected_identity: tuple[int, int, int] | None = None) -> bool:
     """Remove only the controller-owned, recoverable cycle stop marker."""
+    return _clear_stop(_CYCLE_STOP_PAYLOAD, expected_identity=expected_identity)
+
+
+def clear_failure_stop(
+    *,
+    expected_reason: str,
+    expected_identity: tuple[int, int, int] | None = None,
+) -> bool:
+    """Remove one controller-owned failure stop after an operator reconciled it.
+
+    Only a stop reason from the fixed allowlist is accepted, and the marker payload
+    must match that reason byte for byte.
+    """
+    if (
+        _STOP_REASON.fullmatch(str(expected_reason)) is None
+        or expected_reason not in _ALLOWED_STOP_REASONS
+        or expected_reason == "controller_cycle_stop"
+    ):
+        raise ValueError("stop_reason_invalid")
+    payload = f"stop_requested:{expected_reason}\n".encode("ascii")
+    return _clear_stop(payload, expected_identity=expected_identity)
+
+
+def _clear_stop(
+    expected_payload: bytes,
+    *,
+    expected_identity: tuple[int, int, int] | None = None,
+) -> bool:
+    """Remove one controller-owned stop marker whose payload matches exactly."""
     raw = str(
         os.environ.get("OA_FINANCE_PREAUDIT_STOP_REQUESTED") or ""
     ).strip().lower()
@@ -351,8 +380,8 @@ def clear_cycle_stop(*, expected_identity: tuple[int, int, int] | None = None) -
             or pinned.st_mode & 0o077
         ):
             raise RuntimeError("control_file_unsafe")
-        payload = os.read(file_descriptor, len(_CYCLE_STOP_PAYLOAD) + 1)
-        if payload != _CYCLE_STOP_PAYLOAD:
+        payload = os.read(file_descriptor, len(expected_payload) + 1)
+        if payload != expected_payload:
             return False
         current = os.stat(
             target.name,
