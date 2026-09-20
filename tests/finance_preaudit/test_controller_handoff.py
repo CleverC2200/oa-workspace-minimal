@@ -497,7 +497,7 @@ def test_interrupted_pipeline_closes_manifest_without_claiming_reaped(monkeypatc
 
     with pytest.raises(interrupt):
         finance_preaudit_concurrency_probe.run_rolling_drain(
-            capacity=1,
+            capacity=2,
             live_status=lambda: _live_status(1),
             reconcile_status=lambda: _reconciliation(1),
             pipeline_runner=interrupted,
