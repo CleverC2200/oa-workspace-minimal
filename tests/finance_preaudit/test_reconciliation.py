@@ -559,6 +559,34 @@ def test_continuation_preserves_unresolved_current_state_gate(
     }
 
 
+def test_opened_round_without_verified_frozen_evidence_keeps_identity_conflict(
+    tmp_path: Path,
+) -> None:
+    """An unverified opened round must not gain the superseded-round exemption."""
+    root = tmp_path / "flows"
+    _state(
+        root,
+        "unverified-round",
+        "2026-08-24 09:00:00",
+        execution_state="review_required",
+        write_state="authorized",
+        reason="",
+    )
+    result = reconciliation.reconcile(
+        root,
+        pending_rows=[
+            {"request_id": "unverified-round", "received_at": "2026-08-24 10:00:00"},
+        ],
+        handled_rows=[],
+    )
+    assert result["continuation"] == {
+        "status": "blocked",
+        "scope": "controller",
+        "isolated_pending": 0,
+        "blocking_reasons": {"identity_conflict": 1},
+    }
+
+
 def test_historical_unknown_is_preserved_without_blocking_fresh_identity(tmp_path: Path) -> None:
     root = tmp_path / "flows"
     _state(root, "historical", "2026-08-24 09:00:00", write_state="unknown",

@@ -15,6 +15,8 @@
 | `write_state=unknown` | 核对真实写入结果及既有回执，保留未知；不因“清理隔离”而认定未写入或纳入普通恢复 |
 | 已办或当前不可见 | 核对历史与当前状态，按留存入口处理可归档项；没有精确待办身份时不重新提交 |
 
+已被严格更晚的同请求轮次取代、且可证明从未进入 Writer 的已打开轮次不算缺口：只读对账归类为 `prior_round_unsubmitted` 并只投影、不阻断整轮，旧 attempt 与证据字节不变，新轮次仍按新 case 重新取材、审核和授权。其余身份冲突仍按上表继续调查，不能删证据、改状态或加白名单放行。
+
 `findings` 和 `manual_review.items` 使用同一恢复建议。候选建议复用 `FlowEngine.recoverable_no_write` 校验原 action/state、冻结材料和适用的失败或 Writer 边界证据；仅有失败标签不足以证明未写入。实际恢复入口还会在执行时重新检查最新 attempt、实时唯一待办、流程身份和已办结果。只读查询不创建 attempt，`automatic_retry` 保持 `false`。
 
 ## 诊断、修复和回测
