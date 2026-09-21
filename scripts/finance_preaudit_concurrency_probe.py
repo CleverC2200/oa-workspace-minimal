@@ -34,6 +34,7 @@ from apps.oa_finance_preaudit import (
     flow_engine,
     item_failure,
     observability,
+    prepare_failure,
     process_pool,
     production_pending,
     reconciliation,
@@ -896,6 +897,35 @@ def _prepare_one(selection: PrepareSelection) -> dict:
     known_late_visible_keys: set[str] = set()
     admission_cutoff: datetime | None = None
     allowed_workflows = ROLLING_WORKFLOW_KEYS
+
+    def failed(
+        stage: str,
+        *,
+        error_code: str = "production_probe_prepare_failed",
+        reason_code: str | None = None,
+        error: BaseException | None = None,
+        stop_action: str | None = None,
+        workflow_key: str | None = None,
+        action_file: Path | None = None,
+    ) -> dict:
+        # Every generic prepare failure keeps its stable code and adds one
+        # bounded, redacted diagnostic so the controller receipt stays usable.
+        return {
+            "action": "failed",
+            "error_code": error_code,
+            "prepare_failure": prepare_failure.describe(
+                stage,
+                error_code=error_code,
+                reason_code=reason_code or error_code,
+                error=error,
+                stop_action=stop_action,
+                workflow_key=workflow_key,
+                action_file=(
+                    str(action_file) if action_file is not None else None
+                ),
+            ),
+        }
+
     if isinstance(selection, str):
         workflow_key = selection
     elif isinstance(selection, dict) and selection.get("workflow_key") == "*":
@@ -935,10 +965,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
             or any(character not in "0123456789abcdef" for character in value)
             for value in raw_late_visible_keys
         ):
-            return {
-                "action": "failed",
-                "error_code": "production_probe_prepare_failed",
-            }
+            return failed("selection_contract")
         allowed_workflows = frozenset(raw_allowed_workflows)
         for identity in raw_assigned:
             if (
@@ -946,10 +973,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 or len(identity) != 2
                 or not all(isinstance(value, str) and value for value in identity)
             ):
-                return {
-                    "action": "failed",
-                    "error_code": "production_probe_prepare_failed",
-                }
+                return failed("selection_contract")
             assigned_identities.add((identity[0], identity[1]))
         for identity in raw_historical_unknown:
             if (
@@ -957,10 +981,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 or len(identity) != 2
                 or not all(isinstance(value, str) and value for value in identity)
             ):
-                return {
-                    "action": "failed",
-                    "error_code": "production_probe_prepare_failed",
-                }
+                return failed("selection_contract")
             historical_unknown_identities.add((identity[0], identity[1]))
         recovery_action_files = tuple(Path(path) for path in raw_recovery_actions)
         known_late_visible_keys.update(raw_late_visible_keys)
@@ -983,15 +1004,9 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                     raise ValueError
                 admission_cutoff = _received_at_utc(raw_admission_cutoff)
         except ValueError:
-            return {
-                "action": "failed",
-                "error_code": "production_probe_prepare_failed",
-            }
+            return failed("selection_contract")
     else:
-        return {
-            "action": "failed",
-            "error_code": "production_probe_prepare_failed",
-        }
+        return failed("selection_contract")
     if runtime_control.stop_requested():
         return {"action": "failed", "error_code": "production_probe_stopped"}
     try:
@@ -999,12 +1014,9 @@ def _prepare_one(selection: PrepareSelection) -> dict:
             _historical_write_authorization_failures()
         )
         quarantine_budget = _local_quarantine_count() + 1
-    except ValueError:
+    except ValueError as error:
         runtime_control.request_stop("production_probe_prepare_failed")
-        return {
-            "action": "failed",
-            "error_code": "production_probe_prepare_failed",
-        }
+        return failed("quarantine_probe", error=error, stop_action="stop")
     quarantined = 0
     newly_late_visible_keys: set[str] = set()
     late_visible_pending_count = 0
@@ -1039,13 +1051,16 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 )
             except Exception as error:
                 runtime_control.request_cycle_stop()
-                return {
-                    "action": "failed",
-                    "error_code": (
+                return failed(
+                    "live_pending_read",
+                    error_code=(
                         flow_engine.session_blocking_failure_code(error)
                         or "production_probe_prepare_failed"
                     ),
-                }
+                    error=error,
+                    stop_action="cycle_stop",
+                    workflow_key=selected_workflow,
+                )
             eligible_live_candidates: list[dict] = []
             for candidate in live_candidates:
                 request_id = str(candidate.get("requestId") or "")
@@ -1056,14 +1071,16 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                     continue
                 try:
                     candidate_received_at = _received_at_utc(received_at)
-                except ValueError:
+                except ValueError as error:
                     runtime_control.request_stop(
                         "production_probe_prepare_failed"
                     )
-                    return {
-                        "action": "failed",
-                        "error_code": "production_probe_prepare_failed",
-                    }
+                    return failed(
+                        "identity_contract",
+                        error=error,
+                        stop_action="stop",
+                        workflow_key=str(candidate.get("flow_key") or ""),
+                    )
                 if committed_received_at is not None and (
                     candidate_received_at,
                     request_id,
@@ -1137,13 +1154,16 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 )
         except Exception as error:
             runtime_control.request_cycle_stop()
-            return {
-                "action": "failed",
-                "error_code": (
+            return failed(
+                "engine_build",
+                error_code=(
                     flow_engine.session_blocking_failure_code(error)
                     or "production_probe_prepare_failed"
                 ),
-            }
+                error=error,
+                stop_action="cycle_stop",
+                workflow_key=selected_workflow,
+            )
         selected_workflow_root = (
             PROJECT_ROOT
             / "runtime"
@@ -1189,11 +1209,13 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 )
                 if recovery_action_file is not None and not session_failure_code:
                     runtime_control.request_stop("production_probe_prepare_failed")
+                    stop_action = "stop"
                 else:
                     runtime_control.request_cycle_stop()
-                return {
-                    "action": "failed",
-                    "error_code": (
+                    stop_action = "cycle_stop"
+                return failed(
+                    "next_action",
+                    error_code=(
                         session_failure_code
                         or (
                             "production_probe_recovery_failed"
@@ -1201,18 +1223,24 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                             else "production_probe_prepare_failed"
                         )
                     ),
-                }
+                    error=error,
+                    stop_action=stop_action,
+                    workflow_key=selected_workflow,
+                    action_file=recovery_action_file,
+                )
             except Exception as error:
                 session_failure_code = (
                     flow_engine.session_blocking_failure_code(error)
                 )
                 if recovery_action_file is not None and not session_failure_code:
                     runtime_control.request_stop("production_probe_prepare_failed")
+                    stop_action = "stop"
                 else:
                     runtime_control.request_cycle_stop()
-                return {
-                    "action": "failed",
-                    "error_code": (
+                    stop_action = "cycle_stop"
+                return failed(
+                    "next_action",
+                    error_code=(
                         session_failure_code
                         or (
                             "production_probe_recovery_failed"
@@ -1220,7 +1248,11 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                             else "production_probe_prepare_failed"
                         )
                     ),
-                }
+                    error=error,
+                    stop_action=stop_action,
+                    workflow_key=selected_workflow,
+                    action_file=recovery_action_file,
+                )
             break
         if runtime_control.stop_requested():
             return {
@@ -1229,10 +1261,13 @@ def _prepare_one(selection: PrepareSelection) -> dict:
             }
         if recovery_action_file is not None and action.get("action") != "review_required":
             runtime_control.request_stop("production_probe_prepare_failed")
-            return {
-                "action": "failed",
-                "error_code": "production_probe_recovery_failed",
-            }
+            return failed(
+                "unexpected_action",
+                error_code="production_probe_recovery_failed",
+                stop_action="stop",
+                workflow_key=selected_workflow,
+                action_file=recovery_action_file,
+            )
         if action.get("action") == "review_required":
             if selected is not None:
                 persisted_action: dict = {}
@@ -1381,12 +1416,14 @@ def _prepare_one(selection: PrepareSelection) -> dict:
             quarantined += 1
             try:
                 current_quarantine_count = _local_quarantine_count()
-            except ValueError:
+            except ValueError as error:
                 runtime_control.request_stop("production_probe_prepare_failed")
-                return {
-                    "action": "failed",
-                    "error_code": "production_probe_prepare_failed",
-                }
+                return failed(
+                    "quarantine_probe",
+                    error=error,
+                    stop_action="stop",
+                    workflow_key=selected_workflow,
+                )
             quarantine_budget = max(
                 quarantine_budget,
                 current_quarantine_count + 1,
@@ -1397,11 +1434,23 @@ def _prepare_one(selection: PrepareSelection) -> dict:
         )
         try:
             runtime_control.request_stop(error_code)
+            stop_action = "stop"
         except ValueError:
             runtime_control.request_cycle_stop()
+            stop_action = "cycle_stop"
         return {
             "action": str(action.get("action") or "failed"),
             "error_code": error_code,
+            "prepare_failure": prepare_failure.describe(
+                "unexpected_action",
+                error_code=(
+                    error_code
+                    if prepare_failure.is_code(error_code)
+                    else "production_probe_prepare_failed"
+                ),
+                stop_action=stop_action,
+                workflow_key=selected_workflow,
+            ),
         }
     return {
         "action": "failed",
@@ -2028,6 +2077,94 @@ def _processes_reaped(
             process.join(timeout=min(0.1, remaining))
 
 
+_PREPARE_FAILURE_FIELDS = (
+    "stage",
+    "error_code",
+    "reason_code",
+    "error_class_name",
+    "last_frame_name",
+    "stop_action",
+    "workflow_key",
+    "case_key",
+    "attempt",
+    "action_file",
+)
+
+
+def _prepare_failure_directory(action_file: Path | None) -> Path:
+    flow_root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
+    if action_file is not None:
+        try:
+            if (
+                action_file.is_absolute()
+                and not action_file.is_symlink()
+                and action_file.is_relative_to(flow_root)
+                and action_file.parent.is_dir()
+                and not action_file.parent.is_symlink()
+            ):
+                return action_file.parent
+        except (OSError, ValueError):
+            pass
+    return PROJECT_ROOT / "runtime" / "control"
+
+
+def _prepare_failure_item(action_file: Path) -> dict:
+    """Derive the item identity encoded in an attempt action path."""
+    flow_root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
+    try:
+        relative = action_file.relative_to(flow_root)
+    except ValueError:
+        return {}
+    parts = relative.parts
+    if len(parts) != 5 or parts[1] != "cases" or parts[4] != "action.json":
+        return {}
+    attempt_text = parts[3].removeprefix("attempt-")
+    if parts[3] == attempt_text or not attempt_text.isdigit():
+        return {}
+    return {
+        "workflow_key": parts[0],
+        "case_key": parts[2],
+        "attempt": int(attempt_text),
+    }
+
+
+def _record_prepare_failure(
+    diagnostic: object,
+    *,
+    action_file: Path | None = None,
+    run_id: str | None = None,
+    controller_instance_id: str | None = None,
+) -> Path | None:
+    """Persist one bounded prepare-failure receipt.
+
+    Diagnosis must never change control flow: unknown fields and any write
+    failure are dropped, and the caller keeps its original stop behaviour.
+    """
+    if not isinstance(diagnostic, dict):
+        return None
+    request = {
+        key: diagnostic[key]
+        for key in _PREPARE_FAILURE_FIELDS
+        if key in diagnostic
+    }
+    if action_file is not None:
+        request["action_file"] = str(action_file)
+    raw_action_file = request.get("action_file")
+    try:
+        target = _prepare_failure_directory(
+            Path(raw_action_file) if isinstance(raw_action_file, str) else None
+        )
+        return prepare_failure.record(
+            target,
+            create=True,
+            run_id=run_id,
+            controller_instance_id=controller_instance_id,
+            **request,
+        )
+    except (OSError, TypeError, ValueError):
+        return None
+
+
 def _run_dispatched_tasks(
     count: int,
     capacity: int,
@@ -2057,6 +2194,8 @@ def _run_dispatched_tasks(
     admission_cutoff: str | None = None,
     continuous_discovery: bool = False,
     allowed_workflows: frozenset[str] = ROLLING_WORKFLOW_KEYS,
+    run_id: str | None = None,
+    controller_instance_id: str | None = None,
 ) -> process_pool.PoolResult[dict]:
     maximum_capacity = capacity if max_capacity is None else max_capacity
     recovery_queue = tuple(
@@ -2774,10 +2913,15 @@ def _run_dispatched_tasks(
                 prepare_elapsed = time.monotonic() - prepare_started_at
                 try:
                     prepared = prepare_future.result()
-                except Exception:
+                except Exception as error:
                     prepared = {
                         "action": "failed",
                         "error_code": "production_probe_prepare_failed",
+                        "prepare_failure": prepare_failure.describe(
+                            "child_exception",
+                            error=error,
+                            stop_action="cycle_stop",
+                        ),
                     }
                 preparation = None
                 preparation_stop_deadline = None
@@ -2804,6 +2948,10 @@ def _run_dispatched_tasks(
                     prepared = {
                         "action": "failed",
                         "error_code": "production_probe_prepare_failed",
+                        "prepare_failure": prepare_failure.describe(
+                            "late_visible_contract",
+                            stop_action="cycle_stop",
+                        ),
                     }
                 else:
                     late_visible_keys.update(raw_late_keys)
@@ -2876,6 +3024,11 @@ def _run_dispatched_tasks(
                     skipped_write_indices.add(index)
                     advance_write_head()
                 elif prepared.get("action") != "review_required":
+                    _record_prepare_failure(
+                        prepared.get("prepare_failure"),
+                        run_id=run_id,
+                        controller_instance_id=controller_instance_id,
+                    )
                     outcomes[index] = process_pool.TaskOutcome(
                         index=index,
                         status="completed",
@@ -2952,7 +3105,25 @@ def _run_dispatched_tasks(
                                     )
                                 assigned_order_keys[index] = order_key
                                 pending_write_indices.add(index)
-                            except ValueError:
+                            except ValueError as error:
+                                _record_prepare_failure(
+                                    prepare_failure.describe(
+                                        "identity_validation",
+                                        reason_code=(
+                                            str(error)
+                                            if prepare_failure.is_code(str(error))
+                                            else "production_probe_prepare_failed"
+                                        ),
+                                        stop_action="cycle_stop",
+                                        action_file=str(action_file),
+                                        **_prepare_failure_item(action_file),
+                                    ),
+                                    action_file=action_file,
+                                    run_id=run_id,
+                                    controller_instance_id=(
+                                        controller_instance_id
+                                    ),
+                                )
                                 outcomes[index] = process_pool.TaskOutcome(
                                     index=index,
                                     status="completed",
@@ -3483,6 +3654,8 @@ def _run_global_dispatched_tasks(
     known_late_visible_keys: frozenset[str] = frozenset(),
     admission_cutoff: str | None = None,
     allowed_workflows: frozenset[str] = ROLLING_WORKFLOW_KEYS,
+    run_id: str | None = None,
+    controller_instance_id: str | None = None,
 ) -> process_pool.PoolResult[dict]:
     codex_review_worker._reviewer_environment()
     frozen_unknown = (
@@ -3501,6 +3674,8 @@ def _run_global_dispatched_tasks(
         "admission_cutoff": admission_cutoff,
         "continuous_discovery": True,
         "allowed_workflows": allowed_workflows,
+        "run_id": run_id,
+        "controller_instance_id": controller_instance_id,
     }
     if recovery_action_files:
         dispatcher_args["recovery_action_files"] = recovery_action_files
@@ -4264,6 +4439,10 @@ def run_rolling_drain(
                         known_late_visible_keys=known_late_visible_keys,
                         admission_cutoff=admission_cutoff,
                         allowed_workflows=allowed_workflows,
+                        run_id=manifest["run_id"],
+                        controller_instance_id=(
+                            manifest["controller_instance_id"]
+                        ),
                     )
                     pending_recoveries = ()
                     committed_received_at = wave_result.committed_received_at

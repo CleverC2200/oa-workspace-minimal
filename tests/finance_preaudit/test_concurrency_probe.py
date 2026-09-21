@@ -878,6 +878,25 @@ def test_prepare_global_fifo_stops_when_claimed_identity_changes(
     assert stop_requests == ["production_probe_prepare_failed"]
 
 
+def _assert_prepare_failure(
+    result: dict,
+    *,
+    stage: str,
+    error_code: str,
+    stop_action: str,
+    error_class_name: str | None = None,
+) -> dict:
+    """Assert the bounded, redacted prepare-failure diagnostic."""
+    diagnostic = result["prepare_failure"]
+    assert isinstance(diagnostic, dict)
+    assert diagnostic["stage"] == stage
+    assert diagnostic["error_code"] == error_code
+    assert diagnostic["reason_code"] == error_code
+    assert diagnostic["stop_action"] == stop_action
+    assert diagnostic["error_class_name"] == error_class_name
+    return diagnostic
+
+
 def test_prepare_live_discovery_failure_requests_only_cycle_stop(
     monkeypatch,
 ) -> None:
@@ -924,10 +943,17 @@ def test_prepare_live_discovery_failure_requests_only_cycle_stop(
         frozenset,
     )
 
-    assert finance_preaudit_concurrency_probe._prepare_one("*") == {
-        "action": "failed",
-        "error_code": "oa_execution_identity_login_failed",
-    }
+    result = finance_preaudit_concurrency_probe._prepare_one("*")
+    assert result["action"] == "failed"
+    assert result["error_code"] == "oa_execution_identity_login_failed"
+    diagnostic = _assert_prepare_failure(
+        result,
+        stage="live_pending_read",
+        error_code="oa_execution_identity_login_failed",
+        stop_action="cycle_stop",
+        error_class_name="RuntimeError",
+    )
+    assert "redacted login detail" not in json.dumps(diagnostic)
     assert cycle_stop_requests == [True]
     assert persistent_stop_requests == []
 
@@ -982,12 +1008,17 @@ def test_prepare_propagates_session_failure_from_live_engine(
         frozenset,
     )
 
-    assert finance_preaudit_concurrency_probe._prepare_one(
-        "travel_expense"
-    ) == {
-        "action": "failed",
-        "error_code": "rpa_session_invalid",
-    }
+    result = finance_preaudit_concurrency_probe._prepare_one("travel_expense")
+    assert result["action"] == "failed"
+    assert result["error_code"] == "rpa_session_invalid"
+    diagnostic = _assert_prepare_failure(
+        result,
+        stage=("engine_build" if failure_stage == "engine" else "next_action"),
+        error_code="rpa_session_invalid",
+        stop_action="cycle_stop",
+        error_class_name="RuntimeError",
+    )
+    assert "redacted session detail" not in json.dumps(diagnostic)
     assert cycle_stop_requests == [True]
     assert persistent_stop_requests == []
 
@@ -1425,6 +1456,8 @@ def test_global_dispatcher_passes_frozen_unknown_snapshot(monkeypatch) -> None:
                 "allowed_workflows": (
                     finance_preaudit_concurrency_probe.ROLLING_WORKFLOW_KEYS
                 ),
+                "run_id": None,
+                "controller_instance_id": None,
             }
         ]
 
@@ -1751,10 +1784,17 @@ def test_prepare_one_recovery_failure_requests_a_valid_stop(
         }
     )
 
-    assert result == {
-        "action": "failed",
-        "error_code": "production_probe_recovery_failed",
-    }
+    assert result["action"] == "failed"
+    assert result["error_code"] == "production_probe_recovery_failed"
+    _assert_prepare_failure(
+        result,
+        stage=("unexpected_action" if outcome == "needs_admin" else "next_action"),
+        error_code="production_probe_recovery_failed",
+        stop_action="stop",
+        error_class_name=(
+            None if outcome == "needs_admin" else "ValueError"
+        ),
+    )
     assert stops == ["production_probe_prepare_failed"]
 
 
@@ -1997,12 +2037,15 @@ def test_prepare_stops_on_unknown_write_result(monkeypatch) -> None:
         frozenset,
     )
 
-    assert finance_preaudit_concurrency_probe._prepare_one(
-        "travel_expense"
-    ) == {
-        "action": "needs_admin",
-        "error_code": "writer_result_unknown",
-    }
+    result = finance_preaudit_concurrency_probe._prepare_one("travel_expense")
+    assert result["action"] == "needs_admin"
+    assert result["error_code"] == "writer_result_unknown"
+    _assert_prepare_failure(
+        result,
+        stage="unexpected_action",
+        error_code="writer_result_unknown",
+        stop_action="cycle_stop",
+    )
     assert calls == 1
     assert stop_requests == ["writer_result_unknown", None]
 
@@ -2468,12 +2511,16 @@ def test_prepare_stops_when_dynamic_quarantine_count_is_invalid(
         frozenset,
     )
 
-    assert finance_preaudit_concurrency_probe._prepare_one(
-        "travel_expense"
-    ) == {
-        "action": "failed",
-        "error_code": "production_probe_prepare_failed",
-    }
+    result = finance_preaudit_concurrency_probe._prepare_one("travel_expense")
+    assert result["action"] == "failed"
+    assert result["error_code"] == "production_probe_prepare_failed"
+    _assert_prepare_failure(
+        result,
+        stage="quarantine_probe",
+        error_code="production_probe_prepare_failed",
+        stop_action="stop",
+        error_class_name="ValueError",
+    )
     assert stop_requests == ["production_probe_prepare_failed"]
 
 
@@ -2515,12 +2562,15 @@ def test_prepare_stops_on_new_write_authorization_failure(monkeypatch) -> None:
         lambda: frozenset({Path("/safe/old-action.json")}),
     )
 
-    assert finance_preaudit_concurrency_probe._prepare_one(
-        "travel_expense"
-    ) == {
-        "action": "needs_admin",
-        "error_code": "write_authorization_invalid",
-    }
+    result = finance_preaudit_concurrency_probe._prepare_one("travel_expense")
+    assert result["action"] == "needs_admin"
+    assert result["error_code"] == "write_authorization_invalid"
+    _assert_prepare_failure(
+        result,
+        stage="unexpected_action",
+        error_code="write_authorization_invalid",
+        stop_action="stop",
+    )
     assert stop_requests == [True]
 
 
@@ -2628,12 +2678,17 @@ def test_prepare_requests_stop_when_next_action_raises(monkeypatch) -> None:
         frozenset,
     )
 
-    assert finance_preaudit_concurrency_probe._prepare_one(
-        "travel_expense"
-    ) == {
-        "action": "failed",
-        "error_code": "production_probe_prepare_failed",
-    }
+    result = finance_preaudit_concurrency_probe._prepare_one("travel_expense")
+    assert result["action"] == "failed"
+    assert result["error_code"] == "production_probe_prepare_failed"
+    diagnostic = _assert_prepare_failure(
+        result,
+        stage="next_action",
+        error_code="production_probe_prepare_failed",
+        stop_action="cycle_stop",
+        error_class_name="RuntimeError",
+    )
+    assert "boom" not in json.dumps(diagnostic)
     assert cycle_stop_requests == [True]
     assert persistent_stop_requests == []
 
@@ -7944,3 +7999,287 @@ def test_finance_success_does_not_clear_whole_task_production_fault(tmp_path, mo
     state = alert.status(control_root=tmp_path / "alerts")
     assert state["status"] == "active"
     assert state["attempt_count"] == 1
+
+
+def _run_once_with_prepare(
+    tmp_path: Path,
+    monkeypatch,
+    prepare,
+    *,
+    run_id: str | None = None,
+    controller_instance_id: str | None = None,
+):
+    class CompletedExecutor:
+        _processes: dict = {}
+
+        def submit(self, action, *args) -> Future:
+            future = Future()
+            try:
+                future.set_result(action(*args))
+            except Exception as error:  # noqa: BLE001 - propagate like a pool
+                future.set_exception(error)
+            return future
+
+        def shutdown(self, **_kwargs) -> None:
+            return None
+
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "_preparation_executor",
+        CompletedExecutor,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_cycle_stop",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_stop",
+        lambda reason=None: None,
+    )
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe,
+        "PROJECT_ROOT",
+        tmp_path,
+    )
+    return finance_preaudit_concurrency_probe._run_dispatched_tasks(
+        1,
+        1,
+        project_root=tmp_path,
+        prepare_action=prepare,
+        review_worker=lambda task: {"status": "reviewed"},
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        runtime_status=lambda: {"status": "healthy"},
+        run_id=run_id,
+        controller_instance_id=controller_instance_id,
+    )
+
+
+def _control_receipts(tmp_path: Path) -> list[dict]:
+    return [
+        json.loads(path.read_text())
+        for path in sorted((tmp_path / "runtime" / "control").glob(
+            "prepare-failure-*.json"
+        ))
+    ]
+
+
+def test_dispatcher_records_prepare_failure_when_child_raises(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    def prepare(_workflow: str) -> dict:
+        raise RuntimeError("boom: private detail")
+
+    result = _run_once_with_prepare(
+        tmp_path,
+        monkeypatch,
+        prepare,
+        run_id="0123456789abcdef0123456789abcdef",
+        controller_instance_id="fedcba9876543210fedcba9876543210",
+    )
+
+    assert result.outcomes[0].value["status"] == "failed"
+    assert (
+        result.outcomes[0].value["error_code"]
+        == "production_probe_prepare_failed"
+    )
+    receipts = _control_receipts(tmp_path)
+    assert len(receipts) == 1
+    receipt = receipts[0]
+    assert receipt["kind"] == "preaudit_prepare_failure_diagnostic"
+    assert receipt["stage"] == "child_exception"
+    assert receipt["error_code"] == "production_probe_prepare_failed"
+    assert receipt["error_class"] == "RuntimeError"
+    assert receipt["last_frame"] == "prepare"
+    assert receipt["stop_action"] == "cycle_stop"
+    assert receipt["run_id"] == "0123456789abcdef0123456789abcdef"
+    assert receipt["controller_instance_id"] == "fedcba9876543210fedcba9876543210"
+    written = (tmp_path / "runtime" / "control").glob("prepare-failure-*.json")
+    assert "private detail" not in next(written).read_text()
+
+
+def test_dispatcher_records_child_diagnostic_for_failed_prepare(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    probe = finance_preaudit_concurrency_probe
+
+    def prepare(_selection) -> dict:
+        # The dispatcher passes the global "*" selection here; a real
+        # post-selection failure carries the resolved workflow instead.
+        return {
+            "action": "failed",
+            "error_code": "production_probe_prepare_failed",
+            "prepare_failure": probe.prepare_failure.describe(
+                "live_pending_read",
+                error=RuntimeError("oa_read_failed: private detail"),
+                stop_action="cycle_stop",
+                workflow_key="travel_expense",
+            ),
+        }
+
+    result = _run_once_with_prepare(tmp_path, monkeypatch, prepare)
+
+    assert result.outcomes[0].value["status"] == "failed"
+    receipts = _control_receipts(tmp_path)
+    assert len(receipts) == 1
+    assert receipts[0]["stage"] == "live_pending_read"
+    assert receipts[0]["item"] == {"workflow_key": "travel_expense"}
+    assert receipts[0]["error_class"] == "RuntimeError"
+
+
+def test_prepare_failure_helpers_resolve_receipt_location(tmp_path: Path, monkeypatch) -> None:
+    probe = finance_preaudit_concurrency_probe
+    monkeypatch.setattr(probe, "PROJECT_ROOT", tmp_path)
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    attempt = (
+        flow_root
+        / "travel_expense"
+        / "cases"
+        / ("a" * 64)
+        / "attempt-2"
+    )
+    attempt.mkdir(parents=True)
+    action_file = attempt / "action.json"
+
+    assert probe._prepare_failure_item(action_file) == {
+        "workflow_key": "travel_expense",
+        "case_key": "a" * 64,
+        "attempt": 2,
+    }
+    assert probe._prepare_failure_item(tmp_path / "elsewhere" / "action.json") == {}
+    assert (
+        probe._prepare_failure_item(flow_root / "travel_expense" / "action.json")
+        == {}
+    )
+    assert probe._prepare_failure_directory(action_file) == attempt
+    assert (
+        probe._prepare_failure_directory(tmp_path / "elsewhere" / "action.json")
+        == tmp_path / "runtime" / "control"
+    )
+    assert probe._prepare_failure_directory(None) == tmp_path / "runtime" / "control"
+
+
+def test_prepare_failure_recorder_ignores_unknown_shapes(tmp_path: Path, monkeypatch) -> None:
+    probe = finance_preaudit_concurrency_probe
+    monkeypatch.setattr(probe, "PROJECT_ROOT", tmp_path)
+
+    assert probe._record_prepare_failure(None) is None
+    assert probe._record_prepare_failure("not-a-diagnostic") is None
+    assert probe._record_prepare_failure({"stage": "not_a_stage"}) is None
+    assert not (tmp_path / "runtime" / "control").exists()
+
+
+def test_dispatcher_records_identity_validation_failure_next_to_attempt(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    probe = finance_preaudit_concurrency_probe
+    case_key = "b" * 64
+    attempt_root = (
+        tmp_path
+        / "runtime"
+        / "finance_preaudit_flows"
+        / "travel_expense"
+        / "cases"
+        / case_key
+        / "attempt-1"
+    )
+    attempt_root.mkdir(parents=True)
+    missing_action = attempt_root / "action.json"
+
+    def prepare(_selection) -> dict:
+        return {
+            "action": "review_required",
+            "action_file": str(missing_action),
+        }
+
+    class CompletedExecutor:
+        _processes: dict = {}
+
+        def submit(self, action, *args) -> Future:
+            future = Future()
+            future.set_result(action(*args))
+            return future
+
+        def shutdown(self, **_kwargs) -> None:
+            return None
+
+    monkeypatch.setattr(probe, "_preparation_executor", CompletedExecutor)
+    monkeypatch.setattr(probe, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        probe.runtime_control,
+        "stop_requested",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        probe.runtime_control,
+        "request_cycle_stop",
+        lambda: None,
+    )
+
+    result = probe._run_dispatched_tasks(
+        1,
+        1,
+        project_root=tmp_path,
+        strict_global_fifo=True,
+        prepare_action=prepare,
+        review_worker=lambda task: {"status": "reviewed"},
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        runtime_status=lambda: {"status": "healthy"},
+        run_id="0123456789abcdef0123456789abcdef",
+    )
+
+    assert result.outcomes[0].value["status"] == "failed"
+    assert (
+        result.outcomes[0].value["error_code"]
+        == "production_probe_prepare_failed"
+    )
+    receipts = sorted(attempt_root.glob("prepare-failure-*.json"))
+    assert len(receipts) == 1
+    receipt = json.loads(receipts[0].read_text())
+    assert receipt["stage"] == "identity_validation"
+    assert receipt["reason_code"] == "production_probe_state_invalid"
+    assert receipt["item"] == {
+        "workflow_key": "travel_expense",
+        "case_key": case_key,
+        "attempt": 1,
+        "action_file": str(missing_action),
+    }
+
+
+def test_dispatcher_keeps_failure_when_diagnostic_write_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    probe = finance_preaudit_concurrency_probe
+
+    def prepare(_selection) -> dict:
+        return {
+            "action": "failed",
+            "error_code": "production_probe_prepare_failed",
+            "prepare_failure": probe.prepare_failure.describe(
+                "live_pending_read",
+                stop_action="cycle_stop",
+            ),
+        }
+
+    def failing_record(*_args, **_kwargs):
+        raise OSError("disk on fire")
+
+    monkeypatch.setattr(probe.prepare_failure, "record", failing_record)
+
+    result = _run_once_with_prepare(tmp_path, monkeypatch, prepare)
+
+    assert result.outcomes[0].value["status"] == "failed"
+    assert (
+        result.outcomes[0].value["error_code"]
+        == "production_probe_prepare_failed"
+    )
