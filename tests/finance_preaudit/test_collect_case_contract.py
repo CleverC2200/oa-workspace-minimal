@@ -1654,3 +1654,83 @@ def test_field_resolution_does_not_confuse_missing_values_and_internal_ids(
     entry = evidence_packet.extract_fields(workflow)[0]
     assert (entry["value"], entry["read_status"], entry["value_source"]) == (value, status, source)
     assert entry["raw_value"] == ("" if field.get("fieldValue") is None else str(field["fieldValue"]))
+
+
+def _company_workflow(bxgs: dict, bxgsmc: dict | None) -> dict:
+    fields = [bxgs]
+    if bxgsmc is not None:
+        fields.append(bxgsmc)
+    return {
+        "workflowMainTableInfo": {
+            "requestRecords": [{"workflowRequestTableFields": fields}]
+        }
+    }
+
+
+def test_company_field_uses_companion_name_when_browser_display_is_empty() -> None:
+    workflow = _company_workflow(
+        {
+            "fieldName": "bxgs", "fieldShowName": "报销公司",
+            "fieldHtmlType": "3", "fieldType": "226",
+            "fieldDBType": "browser.9999", "fieldValue": "11", "fieldShowValue": "",
+        },
+        {
+            "fieldName": "bxgsmc", "fieldShowName": "报销公司名称",
+            "fieldHtmlType": "1", "fieldValue": "示例食品有限公司", "fieldShowValue": "",
+        },
+    )
+
+    fields = evidence_packet.extract_fields(workflow)
+
+    assert (fields[0]["value"], fields[0]["read_status"], fields[0]["value_source"]) == (
+        "示例食品有限公司",
+        "present",
+        "companion",
+    )
+    assert fields[0]["raw_value"] == "11"
+
+
+@pytest.mark.parametrize("companion", [
+    None,
+    {
+        "fieldName": "bxgsmc", "fieldShowName": "报销公司名称",
+        "fieldHtmlType": "1", "fieldValue": "", "fieldShowValue": "",
+    },
+])
+def test_company_field_stays_unresolved_without_a_populated_companion(
+    companion: dict | None,
+) -> None:
+    workflow = _company_workflow(
+        {
+            "fieldName": "bxgs", "fieldShowName": "报销公司",
+            "fieldHtmlType": "3", "fieldType": "226",
+            "fieldDBType": "browser.9999", "fieldValue": "11", "fieldShowValue": "",
+        },
+        companion,
+    )
+
+    fields = evidence_packet.extract_fields(workflow)
+
+    assert (fields[0]["value"], fields[0]["read_status"]) == ("", "unresolved")
+
+
+def test_company_field_does_not_fall_back_to_a_present_browser_display() -> None:
+    workflow = _company_workflow(
+        {
+            "fieldName": "bxgs", "fieldShowName": "报销公司",
+            "fieldHtmlType": "3", "fieldType": "226",
+            "fieldDBType": "browser.5534", "fieldValue": "示例食品有限公司",
+            "fieldShowValue": "示例食品有限公司",
+        },
+        {
+            "fieldName": "bxgsmc", "fieldShowName": "报销公司名称",
+            "fieldHtmlType": "1", "fieldValue": "其他公司", "fieldShowValue": "",
+        },
+    )
+
+    fields = evidence_packet.extract_fields(workflow)
+
+    assert (fields[0]["value"], fields[0]["value_source"]) == (
+        "示例食品有限公司",
+        "display",
+    )
