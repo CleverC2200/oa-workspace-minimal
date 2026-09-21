@@ -2299,6 +2299,17 @@ def _run_dispatched_tasks(
     peak_active = 0
     halted = False
     consecutive_review_failures = 0
+    review_retry_diagnostics = {
+        "item_local_failure": 0,
+        "bounded": 0,
+        "unbounded": 0,
+        "recorder_missing": 0,
+        "recorder_error": 0,
+        "recorder_invalid": 0,
+        "streak_exhausted": 0,
+        "retry_pending": 0,
+        "isolated": 0,
+    }
     primary_error_code: str | None = None
     force_terminated = False
     retry_pending_now = False
@@ -3210,6 +3221,14 @@ def _run_dispatched_tasks(
                         else codex_review_worker.is_bounded_prewrite_failure(value)
                     )
                     if (
+                        error_code in ITEM_LOCAL_REVIEW_FAILURE_REASONS
+                        or error_code == "codex_process_timeout"
+                    ):
+                        review_retry_diagnostics["item_local_failure"] += 1
+                        review_retry_diagnostics[
+                            "bounded" if bounded_review_failure else "unbounded"
+                        ] += 1
+                    if (
                         (error_code in ITEM_LOCAL_REVIEW_FAILURE_REASONS
                          or error_code == "codex_process_timeout")
                         and bounded_review_failure
@@ -3223,7 +3242,9 @@ def _run_dispatched_tasks(
                                 else None
                             )
                         )
-                        if production_failure_round_recorder is not None:
+                        if production_failure_round_recorder is None:
+                            review_retry_diagnostics["recorder_missing"] += 1
+                        else:
                             try:
                                 failure_round = production_failure_round_recorder(
                                     action_file,
@@ -3231,7 +3252,14 @@ def _run_dispatched_tasks(
                                 ).get("production_failure_round")
                             except Exception:
                                 failure_round = None
+                                review_retry_diagnostics["recorder_error"] += 1
+                            if not isinstance(failure_round, int):
+                                if failure_round is not None:
+                                    review_retry_diagnostics[
+                                        "recorder_invalid"
+                                    ] += 1
                         if isinstance(failure_round, int) and failure_round < 3:
+                            review_retry_diagnostics["retry_pending"] += 1
                             retry_pending_now = True
                             retry_value = {
                                 **reported_value,
@@ -3255,6 +3283,8 @@ def _run_dispatched_tasks(
                             review_histories.pop(index, None)
                             advance_write_head()
                             continue
+                        if isinstance(failure_round, int):
+                            review_retry_diagnostics["streak_exhausted"] += 1
                         try:
                             quarantine = quarantine_review(
                                 action_file,
@@ -3262,6 +3292,7 @@ def _run_dispatched_tasks(
                             )
                         except Exception:
                             quarantine = {}
+                        review_retry_diagnostics["isolated"] += 1
                         expected_reason = (
                             "codex_decision_invalid"
                             if error_code == "codex_decision_invalid"
@@ -3621,6 +3652,19 @@ def _run_dispatched_tasks(
         and not runtime_control.stop_requested()
     ):
         runtime_control.request_cycle_stop()
+    # 固定原因计数:只记分类计数,便于下一轮定位"为什么失败单被隔离"。
+    try:
+        json_artifact.write_json_atomic(
+            Path(root) / "runtime" / "control" / "review-retry-diagnostics.json",
+            {
+                "schema_version": 1,
+                "kind": "preaudit_review_retry_diagnostics",
+                "counts": dict(sorted(review_retry_diagnostics.items())),
+            },
+            indent=2,
+        )
+    except (OSError, TypeError, ValueError):
+        pass
     return process_pool.PoolResult(
         requested=len(completed_outcomes),
         started=started,
