@@ -189,6 +189,8 @@ python3 -m apps.oa_finance_preaudit.cli status --check-live
 
 状态入口本身保持只读，不发送消息。生产滚动入口会对本轮材料失败、审核失败、未知写入、授权失败、控制器失败及降级结果发出脱敏提醒；其他未识别的控制器失败使用 `controller_failed` 汇总，不发送原始异常正文。登录类告警在发送前复查当前会话，避免历史登录错误误报；其他故障不以登录正常作为恢复依据。同一连续故障窗口最多尝试提醒三次，单次最多等待 15 秒；发送结果不确定时不自动重试。配置或发送失败保留本地 `runtime/control/oa-session-alert.json` 回执，恢复清除去重窗口时仍保留上次发送状态和次数，供查询送达情况。财务控制器成功仅清登录窗口；整轮财务、包装及结束检查无错误后才清生产故障窗口；提醒不改变审批、停止门或未知写入保护。真实发送必须显式确认：
 
+prepare（领取/准备）阶段的通用失败除稳定码 `production_probe_prepare_failed` 外，还会落一份有界、脱敏的诊断回执：已解析出 attempt 身份时写在该 attempt 目录下的 `prepare-failure-<digest>.json`，领取或发现阶段失败写在 `runtime/control/prepare-failure-<digest>.json`。回执只含固定 `stage`、稳定错误码、异常类名、最内层 traceback 函数名、停止动作（`cycle_stop`/`stop`）、`run_id`/控制器实例和可解析出的单据身份（`workflow_key`/`case_key`/`attempt`/`action_file`），不含异常正文；诊断写入失败不改变原有停止门与运行结果。
+
 ```bash
 python3 -m apps.oa_finance_preaudit.session_alert \
   --error-code oa_session_expired \

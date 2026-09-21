@@ -1242,6 +1242,41 @@ def test_prune_waits_for_flow_state_transition_lock(tmp_path: Path) -> None:
     assert isinstance(results[0], dict)
 
 
+def test_prune_plan_ignores_prepare_failure_receipts(tmp_path: Path) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    expired = _attempt(root, case_key="a" * 64, attempt=1, age_days=31)
+    current = _attempt(root, case_key="b" * 64, attempt=1, age_days=1)
+    control = root / "control"
+    control.mkdir()
+    control_receipt = control / f"prepare-failure-{'0' * 64}.json"
+    control_receipt.write_text(
+        json.dumps({"kind": "preaudit_prepare_failure_diagnostic"})
+    )
+    attempt_receipt = expired / f"prepare-failure-{'1' * 64}.json"
+    attempt_receipt.write_text(
+        json.dumps({"kind": "preaudit_prepare_failure_diagnostic"})
+    )
+
+    plan = runtime_maintenance.build_prune_plan(root, now=NOW)
+
+    planned = {
+        action["relative_path"]: action["action"] for action in plan["actions"]
+    }
+    assert set(planned) == {
+        str(expired.relative_to(root)),
+        str(current.relative_to(root)),
+    }
+    assert planned[str(expired.relative_to(root))] == "delete_path"
+    assert not any(path.startswith("control/") for path in planned)
+    result = runtime_maintenance.apply_prune_plan(root, plan, now=NOW)
+
+    assert result["deleted"] == 1
+    assert not expired.exists()
+    assert control_receipt.exists()
+
+
 def test_prune_rejects_entire_plan_before_mutation(tmp_path: Path) -> None:
     root = tmp_path / "runtime"
     root.mkdir()
