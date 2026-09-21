@@ -1453,6 +1453,9 @@ def test_global_dispatcher_passes_frozen_unknown_snapshot(monkeypatch) -> None:
             "known_late_visible_keys": frozenset(),
                 "admission_cutoff": None,
                 "continuous_discovery": True,
+                "record_failure_round": (
+                    finance_preaudit_concurrency_probe._record_failure_round
+                ),
                 "allowed_workflows": (
                     finance_preaudit_concurrency_probe.ROLLING_WORKFLOW_KEYS
                 ),
@@ -8298,3 +8301,43 @@ def test_dispatcher_keeps_failure_when_diagnostic_write_fails(
         result.outcomes[0].value["error_code"]
         == "production_probe_prepare_failed"
     )
+
+
+def test_failure_round_recorder_does_not_build_a_live_oa_engine(tmp_path, monkeypatch) -> None:
+    """失败轮次记录器只写单据文件,不得构建 OA/RPA 会话。"""
+    probe = finance_preaudit_concurrency_probe
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    case = flow_root / "travel_expense" / "cases" / ("a" * 64) / "attempt-1"
+    case.mkdir(parents=True)
+    action = {
+        "schema_version": 1,
+        "kind": "preaudit_action",
+        "action": "review_required",
+        "execution_state": "review_required",
+        "business_state": "not_available",
+        "write_state": "authorized",
+        "workflow_key": "travel_expense",
+        "case_key": "a" * 64,
+        "attempt": 1,
+        "mode": "preview",
+        "write_authorized": False,
+        "action_token": "t",
+    }
+    action_file = case / "action.json"
+    (case / "state.json").write_text(json.dumps(action))
+    action_file.write_text(json.dumps(action))
+
+    monkeypatch.setattr(probe, "PROJECT_ROOT", tmp_path)
+    called = {"live": 0}
+
+    def forbidden(*_args, **_kwargs):
+        called["live"] += 1
+        raise AssertionError("must not build a live flow engine")
+
+    monkeypatch.setattr(probe.cli, "_live_flow_engine", forbidden)
+
+    recorded = probe._record_failure_round(action_file, "codex_process_failed")
+
+    assert recorded.get("production_failure_round") == 1
+    assert called["live"] == 0
+    assert json.loads((case / "state.json").read_text())["production_failure_round"] == 1

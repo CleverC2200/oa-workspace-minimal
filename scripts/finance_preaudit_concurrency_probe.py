@@ -97,6 +97,25 @@ REVIEW_FAILURE_CIRCUIT_BREAKER_ERROR = "review_failure_circuit_breaker"
 def _review_failure_streak_reached(streak: int) -> bool:
     """同一轮内连续的单据级审核失败是否达到熔断阈值。"""
     return streak >= REVIEW_FAILURE_CIRCUIT_BREAKER
+
+
+def _record_failure_round(action_file: Path, failure_code: str) -> dict:
+    """只改单据文件、不建 OA/RPA 会话的失败轮次记录器。
+
+    默认实现会新建 live FlowEngine(连带建 OA 会话),在控制器轮内必然抛错并被
+    except 吞掉,于是所有有界写前失败都被直接隔离。这里用最小引擎完成同样的
+    state.json 记账,不需要任何实时访问。
+    """
+    engine = flow_engine.FlowEngine(
+        root=PROJECT_ROOT / "runtime" / "finance_preaudit_flows",
+        discover_candidates=lambda _workflow_key: [],
+        collect_material=_unused_material_collector,
+    )
+    return engine.record_review_failure_round(Path(action_file), failure_code)
+
+
+def _unused_material_collector(_request_id: str, _attempt_root: Path) -> dict:
+    raise RuntimeError("material_collection_not_available")
 ITEM_LOCAL_MATERIAL_FAILURE_DETAILS = (
     runtime_maintenance.ITEM_LOCAL_MATERIAL_FAILURE_DETAILS
 )
@@ -3741,6 +3760,7 @@ def _run_global_dispatched_tasks(
         "known_late_visible_keys": known_late_visible_keys,
         "admission_cutoff": admission_cutoff,
         "continuous_discovery": True,
+        "record_failure_round": _record_failure_round,
         "allowed_workflows": allowed_workflows,
         "run_id": run_id,
         "controller_instance_id": controller_instance_id,
