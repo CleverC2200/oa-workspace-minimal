@@ -19,6 +19,10 @@ TRIP_ATTACHMENT_ID_RE = re.compile(
 _TRUSTED_OWNER_DETAIL_KEY = "_trusted_owner_detail_id"
 _TRUSTED_SOURCE_FIELD_PATH_KEY = "_trusted_source_field_path"
 _TRUSTED_SOURCE_FIELD_NAME_KEY = "_trusted_source_field_name"
+# 表单里「报销公司」是 browser 字段,display 为空时同一行仍带一个文本字段
+# 「报销公司名称」;该文本字段就是业务公司全称,不得因为 browser 字段读不到
+# 显示值就把它当成未填写。
+_COMPANY_NAME_COMPANION_FIELDS = {"bxgs": ("bxgsmc",)}
 
 
 def _raw_field_is_business_value(field: dict[str, Any], value: str) -> bool:
@@ -87,6 +91,37 @@ def _field_entry(
     }
 
 
+def _apply_company_name_companions(fields: list[dict[str, Any]]) -> None:
+    """用同一行的公司全称文本字段补齐读不到显示值的公司字段。
+
+    只在该字段自身既没有显示值、也没有可信 raw 值(read_status 不是
+    present),且同表同行的文本字段已经读到时生效;不改写原始 raw_value。
+    """
+    for field in fields:
+        if field.get("read_status") == "present":
+            continue
+        companions = _COMPANY_NAME_COMPANION_FIELDS.get(
+            str(field.get("field_name") or "")
+        )
+        if not companions:
+            continue
+        for candidate in fields:
+            if (
+                str(candidate.get("field_name") or "") not in companions
+                or str(candidate.get("table") or "") != str(field.get("table") or "")
+                or str(candidate.get("row")) != str(field.get("row"))
+                or candidate.get("read_status") != "present"
+            ):
+                continue
+            value = str(candidate.get("value") or "").strip()
+            if not value:
+                continue
+            field["value"] = value
+            field["value_source"] = "companion"
+            field["read_status"] = "present"
+            break
+
+
 def extract_fields(data: dict[str, Any]) -> list[dict[str, Any]]:
     fields: list[dict[str, Any]] = []
     base = (
@@ -134,6 +169,7 @@ def extract_fields(data: dict[str, Any]) -> list[dict[str, Any]]:
                             ),
                         )
                     )
+    _apply_company_name_companions(fields)
     return fields
 
 
