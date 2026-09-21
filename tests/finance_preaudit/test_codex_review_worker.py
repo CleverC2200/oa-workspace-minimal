@@ -1045,6 +1045,35 @@ def test_production_review_accumulates_retry_events_and_tokens(
     }
 
 
+def test_turn_failed_review_is_bounded_so_the_controller_retries(tmp_path: Path) -> None:
+    """上游容量失败(turn.failed)两次后仍属于有界写前失败:
+    控制器据此记录跨轮重试,而不是立刻把单据隔离。
+    """
+    task, action_file = _task(tmp_path)
+
+    result = codex_review_worker.review(
+        task,
+        executor=lambda *_args: codex_review_worker.CodexExecution(
+            error_code="codex_process_failed",
+            token_usage={"status": "unknown"},
+            event_counts={
+                "error": 1,
+                "thread.started": 1,
+                "turn.failed": 1,
+                "turn.started": 1,
+            },
+            event_status="recorded",
+            process_state="exited",
+            exit_code=1,
+        ),
+    )
+
+    assert result["process_attempts"] == 2
+    assert result["codex_events"]["counts"].get("turn.failed") == 2
+    assert codex_review_worker.is_bounded_prewrite_failure(result)
+    assert action_file.with_name("review-failure.json").is_file()
+
+
 @pytest.mark.parametrize("code,count", [("codex_process_failed", 2), ("codex_process_timeout", 1)])
 def test_bounded_prewrite_failure_persists_bound_receipt(tmp_path: Path, code: str, count: int) -> None:
     task, action_file = _task(tmp_path)
@@ -1332,6 +1361,47 @@ def test_parent_completion_reports_writer_failure_state(
     assert result["error_code"] == failure_code
     assert result["write_state"] == expected_write_state
     assert stopped == [True]
+
+
+def test_turn_failed_stream_is_recorded_and_bounded_prewrite_failure() -> None:
+    """上游以 turn.failed 结束(如 Selected model is at capacity)时:
+    事件流仍视为完整,失败属于有界写前失败,因此进入跨轮重试而不是立即隔离。
+    """
+    stream = io.StringIO(
+        '{"type":"thread.started","thread_id":"t"}\n'
+        '{"type":"turn.started"}\n'
+        '{"type":"error","message":"Selected model is at capacity. '
+        'Please try a different model."}\n'
+        '{"type":"turn.failed","error":{"message":"Selected model is at '
+        'capacity. Please try a different model."}}\n'
+    )
+
+    counts = codex_review_worker._parse_event_counts(stream)
+    assert counts == {"error": 1, "thread.started": 1, "turn.failed": 1, "turn.started": 1}
+    assert codex_review_worker._event_status(stream, counts) == "recorded"
+    assert codex_review_worker._event_terminal_count(counts) == 1
+    assert codex_review_worker._valid_events(
+        {
+            "status": "recorded",
+            "attempts": 1,
+            "recorded_attempts": 1,
+            "unknown_attempts": 0,
+            "counts": counts,
+        },
+        attempts=1,
+    )
+
+
+def test_turn_failed_without_terminal_event_stays_unknown() -> None:
+    stream = io.StringIO(
+        '{"type":"thread.started","thread_id":"t"}\n'
+        '{"type":"turn.started"}\n'
+    )
+
+    counts = codex_review_worker._parse_event_counts(stream)
+
+    assert codex_review_worker._event_status(stream, counts) == "unknown"
+    assert codex_review_worker._event_terminal_count(counts) == 0
 
 
 def test_usage_parser_reads_only_turn_completed_usage() -> None:

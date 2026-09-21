@@ -88,6 +88,15 @@ ITEM_LOCAL_QUARANTINE_REASONS = {
 ITEM_LOCAL_REVIEW_FAILURE_REASONS = frozenset(
     {"codex_process_failed", "codex_process_incomplete", "codex_decision_invalid"}
 )
+# 同一轮里连续这么多单单据级审核进程失败时，停止本轮领取，避免把整批待办
+# 全部推进隔离；阈值以内仍按既有规则继续处理。
+REVIEW_FAILURE_CIRCUIT_BREAKER = 3
+REVIEW_FAILURE_CIRCUIT_BREAKER_ERROR = "review_failure_circuit_breaker"
+
+
+def _review_failure_streak_reached(streak: int) -> bool:
+    """同一轮内连续的单据级审核失败是否达到熔断阈值。"""
+    return streak >= REVIEW_FAILURE_CIRCUIT_BREAKER
 ITEM_LOCAL_MATERIAL_FAILURE_DETAILS = (
     runtime_maintenance.ITEM_LOCAL_MATERIAL_FAILURE_DETAILS
 )
@@ -2289,6 +2298,7 @@ def _run_dispatched_tasks(
     started = 0
     peak_active = 0
     halted = False
+    consecutive_review_failures = 0
     primary_error_code: str | None = None
     force_terminated = False
     retry_pending_now = False
@@ -3174,6 +3184,19 @@ def _run_dispatched_tasks(
                     error_code = str(
                         value.get("error_code") or "worker_process_failed"
                     )
+                    if (
+                        error_code in ITEM_LOCAL_REVIEW_FAILURE_REASONS
+                        or error_code == "codex_process_timeout"
+                    ):
+                        consecutive_review_failures += 1
+                        if _review_failure_streak_reached(
+                            consecutive_review_failures
+                        ):
+                            request_pipeline_stop(
+                                REVIEW_FAILURE_CIRCUIT_BREAKER_ERROR
+                            )
+                    else:
+                        consecutive_review_failures = 0
                     reported_value = (
                         _merge_review_attempts(
                             [*review_histories[index], value]
@@ -3306,6 +3329,7 @@ def _run_dispatched_tasks(
                 reviewed_now.append(
                     (index, prepare_elapsed, action_file, value)
                 )
+                consecutive_review_failures = 0
             if failed_now:
                 for index, prepare_elapsed, _action, reviewed in reviewed_now:
                     stopped_review(index, prepare_elapsed, reviewed)

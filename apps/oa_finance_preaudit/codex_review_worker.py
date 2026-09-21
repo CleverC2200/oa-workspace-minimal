@@ -60,6 +60,7 @@ _EVENT_TYPES = frozenset(
         "item.started",
         "thread.started",
         "turn.completed",
+        "turn.failed",
         "turn.started",
     }
 )
@@ -604,6 +605,11 @@ def _parse_event_counts(stream: TextIO) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
+def _event_terminal_count(counts: dict[str, int]) -> int:
+    """一次执行只允许一个终态事件：正常结束或上游失败。"""
+    return counts.get("turn.completed", 0) + counts.get("turn.failed", 0)
+
+
 def _event_status(stream: TextIO, counts: dict[str, int]) -> str:
     stream.seek(0)
     for line in stream:
@@ -619,7 +625,9 @@ def _event_status(stream: TextIO, counts: dict[str, int]) -> str:
             or event["type"] not in _EVENT_TYPES
         ):
             return "unknown"
-    return "recorded" if counts.get("turn.completed") == 1 else "unknown"
+    # 上游以 turn.failed 结束时流本身是完整的；仍算"已记录"，
+    # 这样容量/限流类失败能进入既有的跨轮重试判定，而不是直接隔离。
+    return "recorded" if _event_terminal_count(counts) == 1 else "unknown"
 
 
 def _merge_events(executions: list[CodexExecution]) -> dict:
@@ -701,9 +709,9 @@ def _valid_events(value: object, *, attempts: int) -> bool:
     expected_status = (
         "recorded" if attempts > 0 and recorded == attempts else "unknown"
     )
-    completed = counts.get("turn.completed", 0)
-    if completed < recorded or (
-        expected_status == "recorded" and completed != attempts
+    terminal = _event_terminal_count(counts)
+    if terminal < recorded or (
+        expected_status == "recorded" and terminal != attempts
     ):
         return False
     return value.get("status") == expected_status
