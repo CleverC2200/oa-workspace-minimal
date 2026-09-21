@@ -164,6 +164,11 @@ _GENERAL_EXPENSE_BUDGET_CONCLUSION = (
 _PAYMENT_COMPANY_PASS = re.compile(
     r"^报销公司、支付公司、购买方三者一致，应选择.+支付。$"
 )
+_TPM_IMAGE_EVIDENCE_ITEM = "attachment_completeness"
+_TPM_IMAGE_EVIDENCE_PREFIX = "material:prepared.images."
+_TPM_IMAGE_EVIDENCE_GAP = (
+    "仅核对了附件名称与上传情况，未按清单与照片内容核对，请财务核对原单。"
+)
 _SMALL_MARKETING_SPECIAL_SUBJECT = "配送费-自提/租车费"
 _GENERAL_EXPENSE_DEFERRED_AMOUNT = re.compile(
     r"均为收到货后自动付款.*[0-9]+(?:\.[0-9]+)?元"
@@ -310,6 +315,44 @@ def small_marketing_requires_payment_attachments(material: dict) -> bool:
     return bool(subjects) and any(
         subject != _SMALL_MARKETING_SPECIAL_SUBJECT for subject in subjects
     )
+
+
+def tpm_prepared_image_count(material: dict) -> int:
+    prepared = material.get("prepared")
+    images = prepared.get("images") if isinstance(prepared, dict) else None
+    return len(images) if isinstance(images, list) else 0
+
+
+def enforce_tpm_attachment_image_evidence(items: list[dict], material: dict) -> bool:
+    """TPM 第 1 项不得只用附件名称或上传存在性判通过。
+
+    规则要求第 1 项核对照片与制作清单内容（"现场定位及照片要求都在本项
+    核对"、"制作清单内容结合照片核对数量、样式"）。材料里已经有可看的
+    原图，但决定没有引用任何图片内容证据时，只降级为需人工判断并写明
+    缺口——不技术阻断、不伪造通过。返回是否发生了降级。
+    """
+    if tpm_prepared_image_count(material) == 0:
+        return False
+    for item in items:
+        if item.get("item_key") != _TPM_IMAGE_EVIDENCE_ITEM:
+            continue
+        if item.get("status") != "pass":
+            return False
+        if any(
+            str(reference).startswith(_TPM_IMAGE_EVIDENCE_PREFIX)
+            for reference in item.get("evidence_refs") or ()
+        ):
+            return False
+        item["status"] = "uncertain"
+        item["conclusion"] = _TPM_IMAGE_EVIDENCE_GAP
+        missing = item.get("missing_evidence")
+        if not isinstance(missing, list):
+            missing = []
+            item["missing_evidence"] = missing
+        if _TPM_IMAGE_EVIDENCE_GAP not in missing:
+            missing.append(_TPM_IMAGE_EVIDENCE_GAP)
+        return True
+    return False
 
 
 def _validate_small_marketing_conclusions(
@@ -3871,6 +3914,15 @@ class FlowEngine:
                     normalized_items,
                     quality_material,
                 )
+            if (
+                action["workflow_key"] == "tpm_small_marketing_fee"
+                and packet.get("rule_version") == _TPM_SMALL_MARKETING_RULE_VERSION
+            ):
+                if enforce_tpm_attachment_image_evidence(
+                    normalized_items,
+                    quality_material,
+                ):
+                    decision["overall"] = "needs_human"
             covered_page_refs = {
                 value
                 for item in normalized_items

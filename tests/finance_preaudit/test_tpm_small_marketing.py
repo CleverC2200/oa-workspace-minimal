@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -90,6 +91,206 @@ def _decision(action: dict, *, conclusion: str) -> dict:
         "overall": "needs_human",
         "items": items,
     }
+
+
+def _image_engine(tmp_path: Path) -> flow_engine.FlowEngine:
+    """带一张可查看原图的 TPM 引擎，用于验证第 1 项的图片证据要求。"""
+
+    def collect(request_id: str, attempt_root: Path) -> dict:
+        attachment = (
+            attempt_root
+            / "attachments"
+            / WORKFLOW_KEY
+            / request_id
+            / "111_现场.jpg"
+        )
+        attachment.parent.mkdir(parents=True, exist_ok=True)
+        attachment.write_bytes(b"attachment-bytes")
+        prepared_image = attempt_root / "prepared" / "111" / "page-1.png"
+        prepared_image.parent.mkdir(parents=True, exist_ok=True)
+        prepared_image.write_bytes(b"page-bytes")
+        return {
+            "schema_version": 1,
+            "kind": "preaudit_material",
+            "request_id": request_id,
+            "workflow_key": WORKFLOW_KEY,
+            "workflow_name": "TPM小额市场费用报销申请流程",
+            "declared_fields": [
+                {
+                    "code": "subject",
+                    "name": "预算科目",
+                    "path": "detail[0].row[0].field[4]",
+                    "read_status": "present",
+                    "value": "终端建设费-终端形象制作费",
+                }
+            ],
+            "resources": [
+                {
+                    "request_id": request_id,
+                    "resource_id": "111",
+                    "source_resource_id": "111",
+                    "source_system": "oa",
+                    "name": "现场.jpg",
+                    "local_readonly_path": str(attachment),
+                }
+            ],
+            "prepared": {
+                "images": [
+                    {
+                        "kind": "image",
+                        "name": "现场.jpg",
+                        "resource_id": "111",
+                        "parent_resource_id": "111",
+                        "path": str(prepared_image),
+                        "content_sha256": hashlib.sha256(
+                            prepared_image.read_bytes()
+                        ).hexdigest(),
+                        "source_content_sha256": hashlib.sha256(
+                            attachment.read_bytes()
+                        ).hexdigest(),
+                    }
+                ],
+                "structured_contents": [],
+                "manifest": [
+                    {
+                        "resource_id": "111",
+                        "name": "现场.jpg",
+                        "status": "image",
+                        "image_count": 1,
+                    }
+                ],
+            },
+            "authority_facts": [],
+            "warnings": [],
+        }
+
+    return flow_engine.FlowEngine(
+        root=tmp_path / "runtime" / "finance_preaudit_flows",
+        discover_candidates=lambda workflow_key: [
+            {
+                "request_id": "tpm-marketing-request",
+                "received_at": "2026-09-16T09:00:00+08:00",
+                "workflow_key": workflow_key,
+            }
+        ],
+        collect_material=collect,
+    )
+
+
+def _all_pass_decision(action: dict, *, attachment_refs: list[str]) -> dict:
+    decision = _decision(action, conclusion="已核对")
+    decision["overall"] = "pass"
+    for item in decision["items"]:
+        item.update(
+            status="pass",
+            conclusion="已核对",
+            evidence_refs=["material:declared_fields.detail[0].row[0].field[4]"],
+            missing_evidence=[],
+        )
+    attachment = decision["items"][0]
+    attachment["conclusion"] = "附件齐全，符合当前科目要求。"
+    attachment["evidence_refs"] = [
+        "material:declared_fields.detail[0].row[0].field[20]",
+        "material:resources.111",
+        *attachment_refs,
+    ]
+    return decision
+
+
+def test_tpm_attachment_pass_without_image_evidence_is_downgraded(
+    tmp_path: Path,
+) -> None:
+    engine = _image_engine(tmp_path)
+    action = engine.next_action(WORKFLOW_KEY)
+    decision_file = tmp_path / "decision.json"
+    decision_file.write_text(
+        json.dumps(_all_pass_decision(action, attachment_refs=[]), ensure_ascii=False)
+    )
+
+    closed = engine.complete_review(Path(action["action_file"]), decision_file)
+
+    remark = Path(closed["remark_file"]).read_text()
+    assert closed["business_state"] == "needs_human"
+    assert (
+        "⚠️ 1、附件完整性：仅核对了附件名称与上传情况，未按清单与照片内容核对，请财务核对原单。"
+        in remark
+    )
+    assert "AI审核结论：需人工判断 ⚠️" in remark
+    # 冻结的 model 决定保持原样（receipt 指纹绑定它），降级只体现在公开意见与业务结论上。
+    frozen = json.loads(Path(closed["decision_file"]).read_text())
+    assert frozen["items"][0]["status"] == "pass"
+
+
+def test_tpm_attachment_pass_with_image_evidence_is_kept(tmp_path: Path) -> None:
+    engine = _image_engine(tmp_path)
+    action = engine.next_action(WORKFLOW_KEY)
+    decision_file = tmp_path / "decision.json"
+    decision_file.write_text(
+        json.dumps(
+            _all_pass_decision(
+                action, attachment_refs=["material:prepared.images.111.1"]
+            ),
+            ensure_ascii=False,
+        )
+    )
+
+    closed = engine.complete_review(Path(action["action_file"]), decision_file)
+
+    remark = Path(closed["remark_file"]).read_text()
+    assert closed["business_state"] == "pass"
+    assert "✅ 1、附件完整性：附件齐全，符合当前科目要求。" in remark
+    assert flow_engine._TPM_IMAGE_EVIDENCE_GAP not in remark
+
+
+def test_tpm_image_evidence_rule_ignores_materials_without_images() -> None:
+    item = {
+        "item_key": "attachment_completeness",
+        "status": "pass",
+        "conclusion": "附件齐全，符合当前科目要求。",
+        "evidence_refs": ["material:resources.111"],
+        "missing_evidence": [],
+    }
+
+    flow_engine.enforce_tpm_attachment_image_evidence(
+        [item], {"prepared": {"images": []}}
+    )
+
+    assert item["status"] == "pass"
+    assert item["missing_evidence"] == []
+
+
+def test_tpm_image_evidence_rule_leaves_non_pass_items_alone() -> None:
+    item = {
+        "item_key": "attachment_completeness",
+        "status": "fail",
+        "conclusion": "缺少盖章制作清单。",
+        "evidence_refs": ["material:resources.111"],
+        "missing_evidence": ["缺少盖章制作清单"],
+    }
+
+    flow_engine.enforce_tpm_attachment_image_evidence(
+        [item], {"prepared": {"images": [{"name": "现场.jpg"}]}}
+    )
+
+    assert item["status"] == "fail"
+    assert item["conclusion"] == "缺少盖章制作清单。"
+
+
+def test_tpm_image_evidence_rule_is_idempotent() -> None:
+    item = {
+        "item_key": "attachment_completeness",
+        "status": "pass",
+        "conclusion": "附件齐全，符合当前科目要求。",
+        "evidence_refs": ["material:resources.111"],
+        "missing_evidence": [],
+    }
+    material = {"prepared": {"images": [{"name": "现场.jpg"}]}}
+
+    flow_engine.enforce_tpm_attachment_image_evidence([item], material)
+    flow_engine.enforce_tpm_attachment_image_evidence([item], material)
+
+    assert item["status"] == "uncertain"
+    assert item["missing_evidence"] == [flow_engine._TPM_IMAGE_EVIDENCE_GAP]
 
 
 def test_tpm_and_ordinary_marketing_use_distinct_exact_identities() -> None:
