@@ -36,6 +36,7 @@ def stderr_summary(stream: TextIO) -> dict:
         for code, terms in {
             "transport_signal": ("connection", "tls", "dns", "stream disconnected", "websocket closed"),
             "rate_limit_signal": ("rate limit", "429"),
+            "capacity_signal": ("at capacity", "capacity limit", "overloaded"),
             "authentication_signal": ("unauthorized", "401", "authentication"),
             "retry_signal": ("retry", "reconnect"),
         }.items():
@@ -89,10 +90,10 @@ def record(action_file: Path, *, execution, elapsed_seconds: float, stderr: dict
         "process_state": execution.process_state if execution.process_state in {"exited", "timed_out", "start_failed"} else "unknown",
         "exit_code": execution.exit_code if type(execution.exit_code) is int else None,
         "event_signals": sorted({code for code in stderr.get("event_signals", [])
-                                 if isinstance(code, str) and code in {"transport_signal", "rate_limit_signal", "authentication_signal", "retry_signal"}}),
+                                 if isinstance(code, str) and code in {"transport_signal", "rate_limit_signal", "capacity_signal", "authentication_signal", "retry_signal"}}),
         "stderr_bytes": max(0, stderr["stderr_bytes"]) if type(stderr.get("stderr_bytes")) is int else 0,
         "stderr_signals": sorted({code for code in stderr.get("stderr_signals", [])
-                                  if isinstance(code, str) and code in {"transport_signal", "rate_limit_signal", "authentication_signal", "retry_signal"}}),
+                                  if isinstance(code, str) and code in {"transport_signal", "rate_limit_signal", "capacity_signal", "authentication_signal", "retry_signal"}}),
     }
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
     target = path.with_name(f"review-process-{digest}.json")

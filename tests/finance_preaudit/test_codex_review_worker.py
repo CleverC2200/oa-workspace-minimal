@@ -1363,6 +1363,90 @@ def test_parent_completion_reports_writer_failure_state(
     assert stopped == [True]
 
 
+def test_errored_stream_without_terminal_event_is_recorded() -> None:
+    """上游报错后进程直接退出(没有 turn.failed / turn.completed):
+    失败已由 error 事件说明,同样算已记录,避免直接隔离。"""
+    stream = io.StringIO(
+        '{"type":"thread.started","thread_id":"t"}\n'
+        '{"type":"turn.started"}\n'
+        '{"type":"error","message":"Selected model is at capacity. '
+        'Please try a different model."}\n'
+    )
+
+    counts = codex_review_worker._parse_event_counts(stream)
+
+    assert codex_review_worker._event_terminal_count(counts) == 0
+    assert codex_review_worker._event_status(stream, counts) == "recorded"
+    assert codex_review_worker._valid_events(
+        {
+            "status": "recorded",
+            "attempts": 2,
+            "recorded_attempts": 2,
+            "unknown_attempts": 0,
+            "counts": {"error": 2, "thread.started": 2, "turn.started": 2},
+        },
+        attempts=2,
+    )
+
+
+def test_truncated_stream_without_error_event_stays_unknown() -> None:
+    stream = io.StringIO(
+        '{"type":"thread.started","thread_id":"t"}\n'
+        '{"type":"turn.started"}\n'
+        '{"type":"item.started","item":{"id":"i","type":"reasoning"}}\n'
+    )
+
+    counts = codex_review_worker._parse_event_counts(stream)
+
+    assert codex_review_worker._event_status(stream, counts) == "unknown"
+    assert not codex_review_worker._valid_events(
+        {
+            "status": "recorded",
+            "attempts": 1,
+            "recorded_attempts": 1,
+            "unknown_attempts": 0,
+            "counts": counts,
+        },
+        attempts=1,
+    )
+
+
+def test_successful_stream_still_requires_a_terminal_event_per_attempt() -> None:
+    counts = {"error": 1, "turn.completed": 2}
+
+    assert codex_review_worker._valid_events(
+        {
+            "status": "recorded",
+            "attempts": 2,
+            "recorded_attempts": 2,
+            "unknown_attempts": 0,
+            "counts": counts,
+        },
+        attempts=2,
+    )
+    assert not codex_review_worker._valid_events(
+        {
+            "status": "recorded",
+            "attempts": 2,
+            "recorded_attempts": 2,
+            "unknown_attempts": 0,
+            "counts": {"error": 0, "turn.completed": 1},
+        },
+        attempts=2,
+    )
+
+
+def test_capacity_signal_is_recorded_without_the_message_text() -> None:
+    diagnostics = codex_review_worker.process_diagnostics
+
+    summary = diagnostics.stderr_summary(
+        io.StringIO("Selected model is at capacity. Please try a different model.")
+    )
+
+    assert summary["stderr_signals"] == ["capacity_signal"]
+    assert "capacity" not in json.dumps(summary) .replace("capacity_signal", "")
+
+
 def test_turn_failed_stream_is_recorded_and_bounded_prewrite_failure() -> None:
     """上游以 turn.failed 结束(如 Selected model is at capacity)时:
     事件流仍视为完整,失败属于有界写前失败,因此进入跨轮重试而不是立即隔离。
@@ -1424,16 +1508,20 @@ def test_usage_parser_reads_only_turn_completed_usage() -> None:
     }
 
 
-def test_event_status_rejects_missing_or_malformed_jsonl() -> None:
+def test_event_status_rejects_malformed_jsonl_and_keeps_classified_errors() -> None:
     complete = io.StringIO('{"type":"turn.completed"}\n')
-    missing = io.StringIO('{"type":"error"}\n')
+    error_only = io.StringIO('{"type":"error"}\n')
+    truncated = io.StringIO('{"type":"turn.started"}\n')
     malformed = io.StringIO('{"type":"turn.completed"}\nnot-json\n')
 
     assert codex_review_worker._event_status(
         complete,
         {"turn.completed": 1},
     ) == "recorded"
-    assert codex_review_worker._event_status(missing, {"error": 1}) == "unknown"
+    # error 事件已经说明失败,算已记录(不再直接隔离);没有 error 又没有终态事件的
+    # 截断流仍是 unknown。
+    assert codex_review_worker._event_status(error_only, {"error": 1}) == "recorded"
+    assert codex_review_worker._event_status(truncated, {"turn.started": 1}) == "unknown"
     assert codex_review_worker._event_status(
         malformed,
         {"turn.completed": 1},
