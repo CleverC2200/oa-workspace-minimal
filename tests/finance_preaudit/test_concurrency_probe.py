@@ -3466,6 +3466,21 @@ def test_rolling_failure_retains_internal_host_critical_decision() -> None:
     ]
 
 
+def test_review_failure_circuit_breaker_threshold_is_bounded() -> None:
+    """连续单据级审核失败达到阈值即停止本轮领取,阈值以内继续处理。"""
+    probe = finance_preaudit_concurrency_probe
+    threshold = probe.REVIEW_FAILURE_CIRCUIT_BREAKER
+
+    assert threshold >= 2
+    assert probe._review_failure_streak_reached(0) is False
+    assert probe._review_failure_streak_reached(threshold - 1) is False
+    assert probe._review_failure_streak_reached(threshold) is True
+    assert probe._review_failure_streak_reached(threshold + 1) is True
+    assert probe.REVIEW_FAILURE_CIRCUIT_BREAKER_ERROR == (
+        "review_failure_circuit_breaker"
+    )
+
+
 def test_rolling_wave_preserves_transient_codex_error_counts() -> None:
     metrics = finance_preaudit_concurrency_probe._rolling_wave_metrics(
         process_pool.PoolResult(
