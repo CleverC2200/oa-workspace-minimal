@@ -67,6 +67,7 @@ _EVENT_TYPES = frozenset(
 _SANITIZED_EVENT_TYPES = _EVENT_TYPES | {
     "other",
     "authentication_signal",
+    "capacity_signal",
     "rate_limit_signal",
     "retry_signal",
     "transport_signal",
@@ -625,9 +626,13 @@ def _event_status(stream: TextIO, counts: dict[str, int]) -> str:
             or event["type"] not in _EVENT_TYPES
         ):
             return "unknown"
-    # 上游以 turn.failed 结束时流本身是完整的；仍算"已记录"，
-    # 这样容量/限流类失败能进入既有的跨轮重试判定，而不是直接隔离。
-    return "recorded" if _event_terminal_count(counts) == 1 else "unknown"
+    # 上游以 turn.failed 结束时流本身是完整的；只有 error 事件、没有终态事件
+    # 时失败同样已经被说明。两种情况都算"已记录"，这样容量/限流类失败能进入
+    # 既有的跨轮重试判定，而不是直接隔离；真正被截断且没有 error 事件的流
+    # 仍然是 unknown。
+    if _event_terminal_count(counts) == 1:
+        return "recorded"
+    return "recorded" if counts.get("error", 0) > 0 else "unknown"
 
 
 def _merge_events(executions: list[CodexExecution]) -> dict:
@@ -710,9 +715,13 @@ def _valid_events(value: object, *, attempts: int) -> bool:
         "recorded" if attempts > 0 and recorded == attempts else "unknown"
     )
     terminal = _event_terminal_count(counts)
-    if terminal < recorded or (
-        expected_status == "recorded" and terminal != attempts
-    ):
+    errored = counts.get("error", 0)
+    if terminal > attempts:
+        return False
+    if expected_status == "recorded":
+        if terminal + errored < attempts:
+            return False
+    elif terminal < recorded:
         return False
     return value.get("status") == expected_status
 
