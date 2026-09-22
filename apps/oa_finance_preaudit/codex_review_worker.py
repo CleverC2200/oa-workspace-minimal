@@ -88,6 +88,7 @@ _REVIEWER_ENVIRONMENT_KEYS = frozenset(
         "LC_ALL",
         "LC_CTYPE",
         "LOGNAME",
+        "OA_REVIEW_API_KEY",
         "OPENAI_API_KEY",
         "PATH",
         "SHELL",
@@ -403,11 +404,21 @@ def _codex_command(
         'approval_policy="never"',
         "--config",
         f'model_reasoning_effort="{REASONING_EFFORT}"',
-        # 避免长审核在 WebSocket 断流后耗尽重连时间；继续使用原生 OpenAI 登录。
+        # 审核与小时调度使用同一供应商（DeepSeek），避免 OpenAI 账号限流把整批单据打成隔离；
+        # 密钥只从环境变量读取，不写入命令行或冻结证据。
         "--config",
-        'model_provider="oa_https"',
+        'model_provider="oa_deepseek"',
         "--config",
-        'model_providers.oa_https={name="OpenAI",requires_openai_auth=true,supports_websockets=false}',
+        (
+            'model_providers.oa_deepseek={name="DeepSeek",'
+            'base_url="https://api.deepseek.com",wire_api="responses",'
+            'env_key="OA_REVIEW_API_KEY"}'
+        ),
+        # DeepSeek 的 Responses 实现是无状态的，必须关闭服务端响应存储。
+        "--config",
+        "disable_response_storage=true",
+        "--config",
+        "model_context_window=1000000",
         "--output-schema",
         str(schema_file),
         "--output-last-message",
@@ -1149,7 +1160,7 @@ def _is_bounded_failure(
     return (
         value.get("schema_version") == 1
         and value.get("kind") == "preaudit_review_worker_result"
-        and value.get("model") == MODEL
+        and review_failure_evidence.model_matches(value.get("model"))
         and value.get("reasoning_effort") == REASONING_EFFORT
         and type(value.get("process_attempts")) is int
         and value.get("process_attempts") in allowed_attempts
