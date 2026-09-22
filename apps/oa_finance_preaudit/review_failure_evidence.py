@@ -6,13 +6,14 @@ import os
 from pathlib import Path
 
 
-MODEL = "deepseek-v4-pro"
+MODEL = "deepseek-v4-flash"
 REASONING_EFFORT = "high"
 # 历史冻结证据（审核失败回执、agent 时序、worker 结果）写入过 OpenAI 模型名。
 # 只放宽读取校验，不改变新证据写入的模型名，保证既有隔离项与历史 attempt 仍可对账。
 LEGACY_MODELS = frozenset({"gpt-5.6-terra"})
 # 同一供应商的其它可用模型：将来切换模型时不至于让既有冻结证据立即失效。
-ALTERNATE_MODELS = frozenset({"deepseek-v4-flash"})
+# deepseek-v4-pro 无视觉能力，不能用于看图审核；仅为已写入的冻结证据保留可校验性。
+ALTERNATE_MODELS = frozenset({"deepseek-v4-pro"})
 ACCEPTED_MODELS = frozenset({MODEL}) | ALTERNATE_MODELS | LEGACY_MODELS
 PROCESS_FAILURE_CODES = frozenset(
     {"codex_process_failed", "codex_process_incomplete", "codex_process_timeout"}
