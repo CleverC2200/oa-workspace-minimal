@@ -419,7 +419,7 @@ def test_probe_renews_oldest_open_actions_and_returns_only_sanitized_counts(
         "elapsed_seconds": 1.25,
         "business_results": {"needs_human": 1},
         "error_counts": {},
-        "model": "deepseek-v4-pro",
+        "model": "deepseek-v4-flash",
         "reasoning_effort": "high",
         "process_attempts": 1,
         "process_retries": 0,
