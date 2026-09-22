@@ -421,6 +421,29 @@ def test_invalid_review_quarantine_persists_confirmed_no_write(
     assert quarantined["write_state"] == state["write_state"] == "not_requested"
 
 
+def test_invalid_review_quarantine_archives_superseded_process_failure(
+    tmp_path: Path,
+) -> None:
+    """旧进程失败回执不能挡住决定无效的隔离，否则整轮生产会被中止。"""
+    calls: list[dict] = []
+    engine = _engine(tmp_path, calls=calls)
+    action = engine.next_action(WORKFLOW_KEY)
+    action_file = Path(action["action_file"])
+    _write_process_failure_receipt(action_file)
+    receipt = action_file.with_name("review-failure.json")
+    before = receipt.read_bytes()
+
+    quarantined = engine.quarantine_invalid_review(action_file)
+
+    assert quarantined["reason"] == "codex_decision_invalid"
+    assert quarantined["write_state"] == "not_requested"
+    assert not receipt.exists()
+    archived = sorted(action_file.parent.glob("superseded-review-failure-*.json"))
+    assert len(archived) == 1
+    assert archived[0].read_bytes() == before
+    assert calls == []
+
+
 def test_invalid_review_quarantine_rejects_write_artifact(tmp_path: Path) -> None:
     calls: list[dict] = []
     engine = _engine(tmp_path, calls=calls)

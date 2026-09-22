@@ -508,7 +508,7 @@ def test_worker_returns_sanitized_success_only_after_bound_receipt(
         "business_state": "needs_human",
         "write_state": "submitted",
         "error_code": None,
-        "model": "deepseek-v4-flash",
+        "model": "deepseek-v4-pro",
         "reasoning_effort": "high",
         "process_attempts": 1,
         "process_retries": 0,
@@ -646,7 +646,7 @@ def test_codex_command_pins_deepseek_high_and_json_output(tmp_path: Path) -> Non
     )
 
     assert command[command.index("--model") + 1] == review_failure_evidence.MODEL
-    assert review_failure_evidence.MODEL == "deepseek-v4-flash"
+    assert review_failure_evidence.MODEL == "deepseek-v4-pro"
     assert 'model_reasoning_effort="high"' in command
     assert "--json" in command
     assert "--ephemeral" in command
@@ -956,7 +956,7 @@ def test_worker_submits_structured_agent_decision_through_host(
         action_file.with_name("agent-timing.json").read_text(encoding="utf-8")
     )
     assert timing["action_token"] == "test-action-token"
-    assert timing["model"] == "deepseek-v4-flash"
+    assert timing["model"] == "deepseek-v4-pro"
     assert timing["process_attempts"] == 1
     assert "request_id" not in timing
 
@@ -1786,7 +1786,7 @@ def test_read_only_worker_returns_structured_decision_without_completion(
         "business_state": "needs_human",
         "write_state": "not_requested",
         "error_code": None,
-        "model": "deepseek-v4-flash",
+        "model": "deepseek-v4-pro",
         "reasoning_effort": "high",
         "process_attempts": 1,
         "process_retries": 0,

@@ -396,6 +396,21 @@ def _file_fingerprint(path: Path) -> str:
     return f"sha256:{hashlib.sha256(raw).hexdigest()}"
 
 
+def _supersede_stale_review_failure(action_path: Path) -> None:
+    """Archive a superseded process-failure receipt in place without deleting evidence."""
+    receipt = action_path.with_name("review-failure.json")
+    if receipt.is_symlink() or not receipt.is_file():
+        raise ValueError("review_quarantine_invalid")
+    try:
+        digest = hashlib.sha256(receipt.read_bytes()).hexdigest()[:16]
+    except OSError as error:
+        raise ValueError("review_quarantine_invalid") from error
+    archived = receipt.with_name(f"superseded-review-failure-{digest}.json")
+    if os.path.lexists(archived):
+        raise ValueError("review_quarantine_invalid")
+    os.replace(receipt, archived)
+
+
 def _review_failure_fingerprint(
     action_path: Path,
     action: dict,
@@ -3554,7 +3569,10 @@ class FlowEngine:
                     failure_code,
                 )
             elif os.path.lexists(action_path.with_name("review-failure.json")):
-                raise ValueError("review_quarantine_invalid")
+                # 该 attempt 之前以进程级失败进入过重试，盘上回执描述的是已被取代的旧失败。
+                # 决定无效的隔离与后续恢复都要求该文件不存在：原样保留会让隔离永久失败，
+                # 而隔离失败会把整轮生产中止。这里只改名归档，不删除任何证据。
+                _supersede_stale_review_failure(action_path)
             forbidden = (
                 "writer-boundary.json",
                 "execution-receipt.json",
