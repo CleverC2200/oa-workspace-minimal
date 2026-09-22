@@ -92,6 +92,15 @@ ITEM_LOCAL_REVIEW_FAILURE_REASONS = frozenset(
 # 全部推进隔离；阈值以内仍按既有规则继续处理。
 REVIEW_FAILURE_CIRCUIT_BREAKER = 3
 REVIEW_FAILURE_CIRCUIT_BREAKER_ERROR = "review_failure_circuit_breaker"
+# 失败轮次记录器抛错时只记固定分类,用于定位是状态前置条件不满足还是文件/类型问题。
+_RECORDER_ERROR_CODES = {
+    "ValueError": "recorder_error_value",
+    "KeyError": "recorder_error_key",
+    "TypeError": "recorder_error_type",
+    "OSError": "recorder_error_os",
+    "FileNotFoundError": "recorder_error_missing",
+    "RuntimeError": "recorder_error_runtime",
+}
 
 
 def _review_failure_streak_reached(streak: int) -> bool:
@@ -2324,6 +2333,13 @@ def _run_dispatched_tasks(
         "unbounded": 0,
         "recorder_missing": 0,
         "recorder_error": 0,
+        "recorder_error_value": 0,
+        "recorder_error_key": 0,
+        "recorder_error_type": 0,
+        "recorder_error_os": 0,
+        "recorder_error_missing": 0,
+        "recorder_error_runtime": 0,
+        "recorder_error_other": 0,
         "recorder_invalid": 0,
         "streak_exhausted": 0,
         "retry_pending": 0,
@@ -3269,9 +3285,15 @@ def _run_dispatched_tasks(
                                     action_file,
                                     error_code,
                                 ).get("production_failure_round")
-                            except Exception:
+                            except Exception as error:
                                 failure_round = None
                                 review_retry_diagnostics["recorder_error"] += 1
+                                review_retry_diagnostics[
+                                    _RECORDER_ERROR_CODES.get(
+                                        type(error).__name__,
+                                        "recorder_error_other",
+                                    )
+                                ] += 1
                             if not isinstance(failure_round, int):
                                 if failure_round is not None:
                                     review_retry_diagnostics[
