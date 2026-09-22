@@ -1573,7 +1573,7 @@ class FlowEngine:
             or timing.get("kind") != "preaudit_agent_timing"
             or timing.get("action_token") != action.get("action_token")
             or timing.get("workflow_key") != action.get("workflow_key")
-            or timing.get("model") != "gpt-5.6-terra"
+            or not review_failure_evidence.model_matches(timing.get("model"))
             or timing.get("reasoning_effort") != "high"
             or not isinstance(timing.get("wall_seconds"), int)
             or isinstance(timing.get("wall_seconds"), bool)

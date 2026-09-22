@@ -6,11 +6,21 @@ import os
 from pathlib import Path
 
 
-MODEL = "gpt-5.6-terra"
+MODEL = "deepseek-v4-flash"
 REASONING_EFFORT = "high"
+# 历史冻结证据（审核失败回执、agent 时序、worker 结果）写入过 OpenAI 模型名。
+# 只放宽读取校验，不改变新证据写入的模型名，保证既有隔离项与历史 attempt 仍可对账。
+LEGACY_MODELS = frozenset({"gpt-5.6-terra"})
+# 同一供应商的其它可用模型：将来切换模型时不至于让既有冻结证据立即失效。
+ALTERNATE_MODELS = frozenset({"deepseek-v4-pro"})
+ACCEPTED_MODELS = frozenset({MODEL}) | ALTERNATE_MODELS | LEGACY_MODELS
 PROCESS_FAILURE_CODES = frozenset(
     {"codex_process_failed", "codex_process_incomplete", "codex_process_timeout"}
 )
+
+
+def model_matches(value: object) -> bool:
+    return isinstance(value, str) and value in ACCEPTED_MODELS
 
 
 def valid_attempt_codes(codes: object) -> bool:
@@ -68,11 +78,17 @@ def receipt_matches(
         )
     ):
         return False
-    return value == receipt_payload(
+    expected = receipt_payload(
         action_token=action_token,
         workflow_key=workflow_key,
         failure_code=actual_failure_code,
         attempt_error_codes=actual_attempt_codes,
+    )
+    if set(value) != set(expected):
+        return False
+    return all(
+        model_matches(value.get(key)) if key == "model" else value.get(key) == wanted
+        for key, wanted in expected.items()
     )
 
 

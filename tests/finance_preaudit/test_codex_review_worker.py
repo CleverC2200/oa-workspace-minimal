@@ -10,7 +10,11 @@ import time
 import pytest
 
 from apps import json_artifact
-from apps.oa_finance_preaudit import codex_review_worker, flow_engine
+from apps.oa_finance_preaudit import (
+    codex_review_worker,
+    flow_engine,
+    review_failure_evidence,
+)
 from apps.oa_approval import runtime_control
 
 
@@ -504,7 +508,7 @@ def test_worker_returns_sanitized_success_only_after_bound_receipt(
         "business_state": "needs_human",
         "write_state": "submitted",
         "error_code": None,
-        "model": "gpt-5.6-terra",
+        "model": "deepseek-v4-flash",
         "reasoning_effort": "high",
         "process_attempts": 1,
         "process_retries": 0,
@@ -634,20 +638,27 @@ def test_worker_does_not_retry_timeout_or_changed_action(tmp_path: Path) -> None
     assert action_file.exists()
 
 
-def test_codex_command_pins_terra_high_and_json_output(tmp_path: Path) -> None:
+def test_codex_command_pins_deepseek_high_and_json_output(tmp_path: Path) -> None:
     command = codex_review_worker._codex_command(
         tmp_path,
         tmp_path / "schema.json",
         tmp_path / "decision.json",
     )
 
-    assert command[command.index("--model") + 1] == "gpt-5.6-terra"
+    assert command[command.index("--model") + 1] == review_failure_evidence.MODEL
+    assert review_failure_evidence.MODEL == "deepseek-v4-flash"
     assert 'model_reasoning_effort="high"' in command
     assert "--json" in command
     assert "--ephemeral" in command
     assert "--ignore-user-config" in command
-    assert 'model_provider="oa_https"' in command
-    assert 'model_providers.oa_https={name="OpenAI",requires_openai_auth=true,supports_websockets=false}' in command
+    assert 'model_provider="oa_deepseek"' in command
+    assert (
+        'model_providers.oa_deepseek={name="DeepSeek",'
+        'base_url="https://api.deepseek.com",wire_api="responses",'
+        'env_key="OA_REVIEW_API_KEY"}'
+    ) in command
+    assert "disable_response_storage=true" in command
+    assert "model_context_window=1000000" in command
     assert command[command.index("--sandbox") + 1] == "read-only"
     assert 'approval_policy="never"' in command
     assert command[command.index("--output-schema") + 1].endswith("schema.json")
@@ -945,7 +956,7 @@ def test_worker_submits_structured_agent_decision_through_host(
         action_file.with_name("agent-timing.json").read_text(encoding="utf-8")
     )
     assert timing["action_token"] == "test-action-token"
-    assert timing["model"] == "gpt-5.6-terra"
+    assert timing["model"] == "deepseek-v4-flash"
     assert timing["process_attempts"] == 1
     assert "request_id" not in timing
 
@@ -1775,7 +1786,7 @@ def test_read_only_worker_returns_structured_decision_without_completion(
         "business_state": "needs_human",
         "write_state": "not_requested",
         "error_code": None,
-        "model": "gpt-5.6-terra",
+        "model": "deepseek-v4-flash",
         "reasoning_effort": "high",
         "process_attempts": 1,
         "process_retries": 0,
@@ -1930,3 +1941,42 @@ def test_tpm_prompt_keeps_passing_conclusions_short_and_direct(tmp_path):
     assert "不复述取证过程" in prompt
     assert "核销项直接写最终核销金额" in prompt
     assert "支付公司项直接写应使用的公司全称" in prompt
+
+
+def test_reviewer_environment_passes_only_the_deepseek_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-leak")
+
+    environment = codex_review_worker._reviewer_environment()
+
+    assert environment["OA_REVIEW_API_KEY"] == "unit-test-key"
+    assert "UNRELATED_SECRET" not in environment
+    assert environment["HOME"] and environment["PATH"]
+
+
+def test_legacy_openai_review_evidence_still_validates() -> None:
+    legacy = review_failure_evidence.receipt_payload(
+        action_token="legacy-token",
+        workflow_key="travel_expense",
+        failure_code="codex_process_failed",
+        attempt_error_codes=["codex_process_failed", "codex_process_failed"],
+    )
+    legacy["model"] = "gpt-5.6-terra"
+
+    assert review_failure_evidence.receipt_matches(
+        legacy,
+        action_token="legacy-token",
+        workflow_key="travel_expense",
+    )
+    assert review_failure_evidence.model_matches("gpt-5.6-terra")
+    assert review_failure_evidence.model_matches("deepseek-v4-flash")
+    assert not review_failure_evidence.model_matches(None)
+
+    tampered = {**legacy, "model": "unknown-model"}
+    assert not review_failure_evidence.receipt_matches(
+        tampered,
+        action_token="legacy-token",
+        workflow_key="travel_expense",
+    )
