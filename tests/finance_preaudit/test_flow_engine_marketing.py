@@ -657,3 +657,57 @@ def test_marketing_independent_reviewer_replay_scores_100_percent(tmp_path: Path
     report = flow_evals.run_replay(suite, actuals)
     assert report["accuracy"] == report["format_compliance"] == 1.0
     assert not [item for item in report["differences"] if item["workflow_key"] == WORKFLOW_KEY]
+
+
+def test_process_failure_receipt_rebases_when_attempt_codes_change(
+    tmp_path: Path,
+) -> None:
+    """attempt 已带旧回执且失败码不同时，必须归档重写而不是整体失败。"""
+    calls: list[dict] = []
+    engine = _engine(tmp_path, calls=calls)
+    action = engine.next_action(WORKFLOW_KEY)
+    action_file = Path(action["action_file"])
+    _write_process_failure_receipt(action_file)
+    receipt = action_file.with_name("review-failure.json")
+    original = receipt.read_bytes()
+
+    reviewed = {
+        "schema_version": 1,
+        "kind": "preaudit_review_worker_result",
+        "model": codex_review_worker.MODEL,
+        "reasoning_effort": codex_review_worker.REASONING_EFFORT,
+        "process_attempts": 2,
+        "process_retries": 1,
+        "token_usage": {"status": "unknown"},
+        "codex_events": {
+            "status": "unknown",
+            "attempts": 2,
+            "recorded_attempts": 0,
+            "unknown_attempts": 2,
+            "counts": {},
+        },
+        "status": "failed",
+        "business_state": "not_available",
+        "write_state": "not_requested",
+        "error_code": "codex_process_incomplete",
+    }
+    codes = ["codex_process_incomplete", "codex_process_incomplete"]
+
+    assert codex_review_worker._write_review_failure_receipt(
+        action_file,
+        reviewed,
+        attempt_error_codes=codes,
+    )
+
+    archived = sorted(action_file.parent.glob("superseded-review-failure-*.json"))
+    assert len(archived) == 1
+    assert archived[0].read_bytes() == original
+    assert json.loads(receipt.read_text(encoding="utf-8"))["attempt_error_codes"] == codes
+
+    # 同码再次记账：复用已有回执，不再归档
+    assert codex_review_worker._write_review_failure_receipt(
+        action_file,
+        reviewed,
+        attempt_error_codes=codes,
+    )
+    assert len(sorted(action_file.parent.glob("superseded-review-failure-*.json"))) == 1

@@ -1250,13 +1250,30 @@ def _write_review_failure_receipt(
         attempt_error_codes=attempt_error_codes,
     )
     if os.path.lexists(receipt_file):
-        return review_failure_evidence.receipt_matches(
+        if review_failure_evidence.receipt_matches(
             review_failure_evidence.read_receipt(receipt_file),
             action_token=action_token,
             workflow_key=action["workflow_key"],
             failure_code=reviewed["error_code"],
             attempt_error_codes=attempt_error_codes,
-        )
+        ):
+            return True
+        # 该 attempt 已带一份更早的失败回执（例如换审核模型或换失败码之前写的），
+        # 与本次失败码序列不一致。归档旧回执保留证据，再写本次回执；
+        # 否则整个审核失败记账会失败，表现为 codex_review_failure_evidence_invalid。
+        existing = review_failure_evidence.read_receipt(receipt_file)
+        if existing is None or not review_failure_evidence.valid_attempt_codes(
+            existing.get("attempt_error_codes")
+        ):
+            return False
+        try:
+            digest = hashlib.sha256(receipt_file.read_bytes()).hexdigest()[:16]
+            archived = receipt_file.with_name(f"superseded-review-failure-{digest}.json")
+            if os.path.lexists(archived):
+                return False
+            os.replace(receipt_file, archived)
+        except OSError:
+            return False
     try:
         json_artifact.write_json_atomic(receipt_file, payload, indent=2)
     except OSError:
