@@ -166,6 +166,11 @@ _PAYMENT_COMPANY_PASS = re.compile(
 )
 _TPM_IMAGE_EVIDENCE_ITEM = "attachment_completeness"
 _TPM_IMAGE_EVIDENCE_PREFIX = "material:prepared.images."
+_TPM_SUBJECT_FIELD_CODE = "yskm"
+_TPM_LINKED_INVOICE_FIELD_CODE = "glfp"
+_TPM_LINKED_INVOICE_ITEM = "linked_invoice_receipt"
+_TPM_SUBJECT_EVIDENCE_GAP = "未核对预算科目对应的附件要求，请财务核对原单。"
+_TPM_LINKED_INVOICE_GAP = "关联发票未读取到关联记录，请财务核对原单。"
 _TPM_IMAGE_EVIDENCE_GAP = (
     "仅核对了附件名称与上传情况，未按清单与照片内容核对，请财务核对原单。"
 )
@@ -351,6 +356,72 @@ def enforce_tpm_attachment_image_evidence(items: list[dict], material: dict) -> 
             item["missing_evidence"] = missing
         if _TPM_IMAGE_EVIDENCE_GAP not in missing:
             missing.append(_TPM_IMAGE_EVIDENCE_GAP)
+        return True
+    return False
+
+
+def _tpm_field_paths(material: dict, *, code: str, statuses: tuple[str, ...]) -> tuple[str, ...]:
+    rows = material.get("declared_fields")
+    if not isinstance(rows, list):
+        return ()
+    return tuple(
+        str(row.get("path") or "")
+        for row in rows
+        if isinstance(row, dict)
+        and str(row.get("code") or "") == code
+        and str(row.get("read_status") or "") in statuses
+        and str(row.get("path") or "")
+    )
+
+
+def _downgrade_tpm_item(item: dict, conclusion: str) -> None:
+    item["status"] = "uncertain"
+    item["conclusion"] = conclusion
+    missing = item.get("missing_evidence")
+    if not isinstance(missing, list):
+        missing = []
+        item["missing_evidence"] = missing
+    if conclusion not in missing:
+        missing.append(conclusion)
+
+
+def enforce_tpm_subject_evidence(items: list[dict], material: dict) -> bool:
+    """财务口径以预算科目为准：第 1 项判通过必须引用该行科目证据。
+
+    决策文本保持一句话，所以"科目确实看过"由证据引用落地；通过但未引用
+    任何可读预算科目字段时，只降级为需人工判断，不技术阻断、不伪造通过。
+    """
+    paths = _tpm_field_paths(material, code=_TPM_SUBJECT_FIELD_CODE, statuses=("present",))
+    if not paths:
+        return False
+    for item in items:
+        if item.get("item_key") != _TPM_IMAGE_EVIDENCE_ITEM:
+            continue
+        if item.get("status") != "pass":
+            return False
+        references = [str(reference) for reference in item.get("evidence_refs") or ()]
+        if any(path in reference for path in paths for reference in references):
+            return False
+        _downgrade_tpm_item(item, _TPM_SUBJECT_EVIDENCE_GAP)
+        return True
+    return False
+
+
+def enforce_tpm_linked_invoice_evidence(items: list[dict], material: dict) -> bool:
+    """OA「关联发票」全部未解析时，第 2 项不得判通过（财务口径）。"""
+    rows = [row for row in (material.get("declared_fields") or ())
+            if isinstance(row, dict) and str(row.get("code") or "") == _TPM_LINKED_INVOICE_FIELD_CODE]
+    if not rows:
+        return False
+    if any(str(row.get("read_status") or "") == "present" and str(row.get("value") or "").strip()
+           for row in rows):
+        return False
+    for item in items:
+        if item.get("item_key") != _TPM_LINKED_INVOICE_ITEM:
+            continue
+        if item.get("status") != "pass":
+            return False
+        _downgrade_tpm_item(item, _TPM_LINKED_INVOICE_GAP)
         return True
     return False
 
@@ -3937,6 +4008,16 @@ class FlowEngine:
                 and packet.get("rule_version") == _TPM_SMALL_MARKETING_RULE_VERSION
             ):
                 if enforce_tpm_attachment_image_evidence(
+                    normalized_items,
+                    quality_material,
+                ):
+                    decision["overall"] = "needs_human"
+                if enforce_tpm_subject_evidence(
+                    normalized_items,
+                    quality_material,
+                ):
+                    decision["overall"] = "needs_human"
+                if enforce_tpm_linked_invoice_evidence(
                     normalized_items,
                     quality_material,
                 ):
