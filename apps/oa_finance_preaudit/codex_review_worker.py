@@ -108,6 +108,14 @@ _TRAVEL_PAGE_ROUTING_REQUIREMENT = (
     "或 `missing_evidence`；`uncertain` 的 `missing_evidence` 除页面引用外"
     "还必须写明具体缺失事实或关系；其余页面必须完整覆盖；"
 )
+_OPINION_BREVITY_REQUIREMENT = (
+    "表达要求（所有流程共用，优先于逐项展开）：每个审核项只写一句给审批人的结论，"
+    "通过项更要短；禁止复述取证过程，禁止罗列日期清单、金额清单、卡号、发票号、"
+    "地点枚举和计算过程，不得重复同一事实；需要说明缺口或冲突时只写具体对象与事实，"
+    "不写已经核对过的明细。流程规则要求逐字使用的固定句式必须原样保留，不受本条限制。"
+    "输出前自检：任一通过项仍带日期、金额、地点或号码等细节，或明显超过一句话，"
+    "必须先改写成一句结论再输出。"
+)
 _GENERAL_EXPENSE_REQUIREMENT = (
     "仅对科目要求支付截图的明细，缺支付截图时先核对收款人名称与关联发票销售方，"
     "逐字完全一致则免支付截图；多笔收款或发票须按可信对应关系分别核验；"
@@ -364,7 +372,9 @@ def _prompt(action_file: Path) -> str:
 1. 完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由读取 `references/result-contract.md`、`references/observation-contract.md`、`{rule_reference}`、动作引用的审核包、材料和准备页；{workflow_requirement}{frozen_item_requirement}不得读取其他 attempt。
 2. 不修改任何文件、项目代码、Skill、配置、授权清单或冻结材料；不得调用 `next-action`、`complete-review` 或任何 OA 写入，不得领取其他单据。
 3. 根据审核包中的固定审核项动态形成结构化决定。证据不足使用 `uncertain` 交财务判断，不得因为材料缺口卡住业务流程；身份、归属、冻结或授权不可信时停止。审核包为 `material_state=degraded` 时，`collection_gaps` 只说明自动读取没有完成，不得声称申请人未填写字段、未上传附件或单据没有发票；结论直接说明自动读取失败、对应项目未完成核对，请财务查看原单。
-4. {output_requirement}JSON 之外不添加 Markdown、解释、日志或额外意见正文。结论内保留规则要求的具体金额、实际公司全称等必要业务原值；不得输出密钥、凭据或无关附件原文。宿主会校验并负责受控提交。
+4. {_OPINION_BREVITY_REQUIREMENT}结论内保留规则要求的具体金额、实际公司全称等必要业务原值；不得输出密钥、凭据或无关附件原文。宿主会校验并负责受控提交。
+
+5. {output_requirement}JSON 之外不添加 Markdown、解释、日志或额外意见正文。
 """
 
 
