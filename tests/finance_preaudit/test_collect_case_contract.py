@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import tempfile
+import shutil
 from pathlib import Path
 from unittest.mock import patch
 
 import fitz
 import pytest
 
+from apps import json_artifact
 from apps.oa_approval import (
     attachments,
     evidence_packet,
@@ -14,7 +16,7 @@ from apps.oa_approval import (
     invoice_buyers,
     travel_orders,
 )
-from apps.oa_finance_preaudit import case_bundle
+from apps.oa_finance_preaudit import case_bundle, flow_engine
 from apps.oa_finance_preaudit.case_bundle import collect_case
 
 FLOW_CONFIGS = (
@@ -575,6 +577,149 @@ class TestCollectCaseContract:
                 "dropped_source_resource_id": "bottom-copy",
             }
         ]
+
+    def test_packaging_pdf_pages_keep_resource_ownership_and_full_coverage(
+        self, tmp_path: Path,
+    ) -> None:
+        class PdfPackagingOaApi(RecordedOaApi):
+            def request_context(self, request_id: str) -> tuple[dict, list[dict]]:
+                workflow, _resources = super().request_context(request_id)
+                workflow["workflowDetailTableInfos"][0][
+                    "workflowRequestTableRecords"
+                ][0]["workflowRequestTableFields"].append(
+                    {
+                        "fieldShowName": case_bundle._PACKAGING_IMAGE_FIELD,
+                        "filedHtmlShow": (
+                            "<a href='/news/download.do?fileid=proof-pdf"
+                            "&filename=proof-pdf.PDF'>proof-pdf.PDF</a>"
+                        ),
+                    }
+                )
+                return workflow, [
+                    {
+                        "id": resource_id,
+                        "name": f"{resource_id}.PDF",
+                        "downloadUrl": f"/download/{resource_id}",
+                    }
+                    for resource_id in ("proof-pdf", "layout-pdf")
+                ] + [
+                    {
+                        "id": "reference-xlsx",
+                        "name": "reference-xlsx.xlsx",
+                        "downloadUrl": "/download/reference-xlsx",
+                    }
+                ]
+
+        originals = {}
+        for resource_id, page_count in (("proof-pdf", 1), ("layout-pdf", 2)):
+            path = tmp_path / f"{resource_id}.PDF"
+            document = fitz.open()
+            try:
+                for _index in range(page_count):
+                    document.new_page()
+                document.save(path)
+            finally:
+                document.close()
+            originals[resource_id] = path
+        from openpyxl import Workbook
+        workbook = Workbook()
+        workbook.active["A1"] = "配料：测试内容"
+        excel_path = tmp_path / "reference-xlsx.xlsx"
+        workbook.save(excel_path)
+        workbook.close()
+        originals["reference-xlsx"] = excel_path
+
+        def recorded_download(resources: list[dict], *, dest_dir: Path, **_kwargs):
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            return ([
+                {
+                    "resource_id": str(resource["id"]),
+                    "name": str(resource["name"]),
+                    "path": str(
+                        shutil.copyfile(
+                            originals[str(resource["id"])],
+                            dest_dir / str(resource["name"]),
+                        )
+                    ),
+                    "reused": False,
+                }
+                for resource in resources
+            ], [])
+
+        with patch(
+            "apps.oa_finance_preaudit.case_bundle.attachments.download_resources",
+            side_effect=recorded_download,
+        ):
+            material = collect_case(
+                "recorded-request",
+                oa_api=PdfPackagingOaApi(
+                    "198521", "包装新制（更改）及包装版面审批流程",
+                ),
+                configs=FLOW_CONFIGS,
+                allow_browser_download=False,
+                attachment_root=tmp_path / "attachments",
+                prepared_root=tmp_path / "prepared",
+            )
+
+        assert [item["review_role"] for item in material["resources"]] == [
+            "packaging_image", "packaging_image", "excel_reference",
+        ]
+        assert [item["source_field_name"] for item in material["resources"]] == [
+            case_bundle._PACKAGING_IMAGE_FIELD, "", "",
+        ]
+        assert [item["image_count"] for item in material["prepared"]["manifest"][:2]] == [1, 2]
+        assert [item["resource_id"] for item in material["prepared"]["images"]] == [
+            "proof-pdf", "layout-pdf", "layout-pdf",
+        ]
+        assert any(
+            item.get("resource_id") == "reference-xlsx"
+            for item in material["prepared"]["structured_contents"]
+        )
+        assert [item.get("parent_resource_id") for item in material["prepared"]["images"]] == [
+            "proof-pdf", "layout-pdf", "layout-pdf",
+        ]
+        flow_engine._validate_flow_material("packaging_layout_approval", material)
+        material_file = tmp_path / "material.json"
+        json_artifact.write_json_atomic(material_file, material)
+        verified = flow_engine._validate_material_bundle(
+            material_file,
+            expected_request_id="recorded-request",
+            attachment_root=tmp_path / "attachments",
+            prepared_root=tmp_path / "prepared",
+        )
+        assert verified["image_count"] == 3
+        assert flow_engine._packaging_page_refs(material) == (
+            "material:prepared.images.proof-pdf.page-1",
+            "material:prepared.images.layout-pdf.page-1",
+            "material:prepared.images.layout-pdf.page-2",
+        )
+
+        incomplete = {
+            **material,
+            "prepared": {
+                **material["prepared"],
+                "images": material["prepared"]["images"][:-1],
+            },
+        }
+        with pytest.raises(ValueError, match="packaging_material_incomplete"):
+            flow_engine._validate_flow_material("packaging_layout_approval", incomplete)
+
+        originals["layout-pdf"].write_bytes(b"not-a-pdf")
+        with patch(
+            "apps.oa_finance_preaudit.case_bundle.attachments.download_resources",
+            side_effect=recorded_download,
+        ):
+            with pytest.raises(fitz.FileDataError):
+                collect_case(
+                    "recorded-request",
+                    oa_api=PdfPackagingOaApi(
+                        "198521", "包装新制（更改）及包装版面审批流程",
+                    ),
+                    configs=FLOW_CONFIGS,
+                    allow_browser_download=False,
+                    attachment_root=tmp_path / "attachments",
+                    prepared_root=tmp_path / "broken-prepared",
+                )
 
     def test_invoice_buyers_are_read_even_when_form_companies_differ(self) -> None:
         class InvoiceOaApi:
