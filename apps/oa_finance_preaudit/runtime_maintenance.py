@@ -70,7 +70,7 @@ def _timestamp(value: object) -> datetime:
     return parsed
 
 
-def _read_state(path: Path) -> dict:
+def _read_state(path: Path, *, strict_path_identity: bool = False) -> dict:
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -82,27 +82,37 @@ def _read_state(path: Path) -> dict:
         raise ValueError("runtime_state_invalid") from error
     expected_case = attempt_root.parent.name
     expected_workflow = attempt_root.parent.parent.parent.name
+    identity_error = (
+        "runtime_state_identity_invalid"
+        if strict_path_identity else "runtime_state_invalid"
+    )
     if (
         not isinstance(state, dict)
         or state.get("schema_version") != SCHEMA_VERSION
         or state.get("kind") != "preaudit_action"
-        or state.get("workflow_key") not in _WORKFLOW_KEYS
         or state.get("execution_state")
         not in {"collecting", "review_required", "needs_admin", "closed"}
         or state.get("business_state")
         not in {"not_available", "pass", "needs_human"}
         or state.get("write_state")
         not in {"not_requested", "authorized", "submitting", "submitted", "unknown"}
+    ):
+        raise ValueError("runtime_state_invalid")
+    if (
+        state.get("workflow_key") not in _WORKFLOW_KEYS
         or not isinstance(state.get("case_key"), str)
         or not isinstance(state.get("attempt"), int)
         or isinstance(state.get("attempt"), bool)
         or state["attempt"] < 1
-        or state.get("workflow_key") != expected_workflow
-        or state.get("case_key") != expected_case
-        or state.get("attempt") != expected_attempt
         or not re.fullmatch(r"[0-9a-f]{64}", expected_case)
     ):
-        raise ValueError("runtime_state_invalid")
+        raise ValueError(identity_error)
+    if (
+        state["workflow_key"] != expected_workflow
+        or state["case_key"] != expected_case
+        or state["attempt"] != expected_attempt
+    ):
+        raise ValueError(identity_error)
     request_id = state.get("request_id")
     received_at = state.get("received_at")
     if (
@@ -742,18 +752,26 @@ def _read_daily_metric(path: Path) -> dict:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError("runtime_state_invalid") from error
+    required_fields = {
+        "schema_version", "kind", "day", "generated_at", "metrics",
+    }
     if (
         not isinstance(payload, dict)
-        or set(payload) != {
-            "schema_version",
-            "kind",
-            "day",
-            "generated_at",
-            "metrics",
-        }
+        or set(payload) not in (required_fields, required_fields | {"prior_fingerprints"})
         or payload.get("schema_version") != SCHEMA_VERSION
         or payload.get("kind") != "preaudit_daily_metric"
         or payload.get("day") != path.stem
+    ):
+        raise ValueError("runtime_state_invalid")
+    fingerprints = payload.get("prior_fingerprints")
+    if "prior_fingerprints" in payload and (
+        not isinstance(fingerprints, list)
+        or not 1 <= len(fingerprints) <= 1024
+        or any(
+            not isinstance(value, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None
+            for value in fingerprints
+        )
     ):
         raise ValueError("runtime_state_invalid")
     _timestamp(payload.get("generated_at"))
@@ -763,6 +781,59 @@ def _read_daily_metric(path: Path) -> dict:
 
 def _local_day(value: datetime) -> str:
     return value.astimezone(_LOCAL_TIMEZONE).date().isoformat()
+
+
+def _daily_outcomes(cases: list[dict]) -> dict:
+    by_flow = {
+        workflow_key: [
+            sample for sample in cases if sample["workflow_key"] == workflow_key
+        ]
+        for workflow_key in sorted(_WORKFLOW_KEYS)
+    }
+    return {
+        "overall": _aggregate_case_metrics(cases),
+        "by_flow": {
+            workflow_key: _aggregate_case_metrics(samples)
+            for workflow_key, samples in by_flow.items()
+            if samples
+        },
+    }
+
+
+def _late_daily_outcomes_are_additive(
+    existing: dict,
+    current: dict,
+    entries: list[tuple[dict, Path]],
+    *,
+    same_event_count: bool,
+) -> bool:
+    if (
+        same_event_count
+        and existing["metrics"]["observability"] != current["observability"]
+    ):
+        return False
+    generated_at = _timestamp(existing["generated_at"])
+    prior_cases: list[dict] = []
+    late_cases = 0
+    for metric, state_path in entries:
+        if state_path.is_symlink():
+            return False
+        try:
+            modified_at = datetime.fromtimestamp(
+                state_path.stat().st_mtime, tz=timezone.utc,
+            )
+        except OSError:
+            return False
+        if modified_at > generated_at:
+            late_cases += 1
+        else:
+            prior_cases.append(metric)
+    return (
+        late_cases > 0
+        and _daily_outcomes(prior_cases) == existing["metrics"]["outcomes"]
+        and current["outcomes"]["overall"]["attempt_count"]
+        > existing["metrics"]["outcomes"]["overall"]["attempt_count"]
+    )
 
 
 def _daily_payloads(root: Path, *, now: datetime) -> dict[Path, dict]:
@@ -777,16 +848,21 @@ def _daily_payloads(root: Path, *, now: datetime) -> dict[Path, dict]:
         for attempt_root in attempt_roots
         if (attempt_root / "observability.json").is_file()
     )
-    cases_by_day: dict[str, list[dict]] = {}
+    cases_by_day: dict[str, list[tuple[dict, Path]]] = {}
     for attempt_root in attempt_roots:
+        state_path = attempt_root / "state.json"
         try:
-            state = _read_state(attempt_root / "state.json")
+            state = _read_state(state_path, strict_path_identity=True)
             metric = _project_case_metric(attempt_root, state)
-        except (OSError, ValueError):
+        except ValueError as error:
+            if str(error) == "runtime_state_identity_invalid":
+                raise
+            metric = None
+        except OSError:
             metric = None
         if metric is not None:
             day = _local_day(_timestamp(metric["closed_at"]))
-            cases_by_day.setdefault(day, []).append(metric)
+            cases_by_day.setdefault(day, []).append((metric, state_path))
     daily_root = root / ".metrics" / "daily"
     if daily_root.is_symlink() or daily_root.parent.is_symlink():
         raise ValueError("runtime_path_symlink")
@@ -801,25 +877,11 @@ def _daily_payloads(root: Path, *, now: datetime) -> dict[Path, dict]:
             raise ValueError("runtime_state_invalid") from error
         if parsed_day < cutoff or parsed_day > local_today:
             continue
-        day_cases = cases_by_day.get(day, [])
-        by_flow_cases = {
-            workflow_key: [
-                sample
-                for sample in day_cases
-                if sample["workflow_key"] == workflow_key
-            ]
-            for workflow_key in sorted(_WORKFLOW_KEYS)
-        }
+        day_entries = cases_by_day.get(day, [])
+        day_cases = [metric for metric, _state_path in day_entries]
         metrics = {
             "observability": operational,
-            "outcomes": {
-                "overall": _aggregate_case_metrics(day_cases),
-                "by_flow": {
-                    workflow_key: _aggregate_case_metrics(samples)
-                    for workflow_key, samples in by_flow_cases.items()
-                    if samples
-                },
-            },
+            "outcomes": _daily_outcomes(day_cases),
         }
         target = daily_root / f"{day}.json"
         payload = {
@@ -839,10 +901,29 @@ def _daily_payloads(root: Path, *, now: datetime) -> dict[Path, dict]:
             current_count = metrics["observability"]["overall"]["event_count"]
             if existing_count > current_count:
                 continue
-            if existing_count == current_count:
-                if existing["metrics"] != metrics:
-                    raise ValueError("daily_metric_conflict")
+            if existing["metrics"] == metrics:
                 continue
+            if (
+                existing_count == current_count
+                and existing["metrics"]["observability"] != operational
+            ):
+                raise ValueError("daily_metric_conflict")
+            if (
+                existing["metrics"]["outcomes"] != metrics["outcomes"]
+                and not _late_daily_outcomes_are_additive(
+                    existing, metrics, day_entries,
+                    same_event_count=existing_count == current_count,
+                )
+            ):
+                raise ValueError("daily_metric_conflict")
+            previous_fingerprint = (
+                f"sha256:{hashlib.sha256(target.read_bytes()).hexdigest()}"
+            )
+            if len(existing.get("prior_fingerprints", [])) >= 1024:
+                raise ValueError("daily_metric_conflict")
+            payload["prior_fingerprints"] = [
+                *existing.get("prior_fingerprints", []), previous_fingerprint,
+            ]
         payloads[target] = payload
     return payloads
 
@@ -850,6 +931,17 @@ def _daily_payloads(root: Path, *, now: datetime) -> dict[Path, dict]:
 def _write_daily_metric(target: Path, payload: dict) -> None:
     if target.is_symlink() or target.parent.is_symlink():
         raise ValueError("runtime_path_symlink")
+    prior_fingerprints = payload.get("prior_fingerprints")
+    if target.exists():
+        if (
+            not isinstance(prior_fingerprints, list)
+            or not prior_fingerprints
+            or f"sha256:{hashlib.sha256(target.read_bytes()).hexdigest()}"
+            != prior_fingerprints[-1]
+        ):
+            raise ValueError("daily_metric_conflict")
+    elif prior_fingerprints is not None:
+        raise ValueError("daily_metric_conflict")
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.is_symlink() or target.parent.is_symlink():
         raise ValueError("runtime_path_symlink")
