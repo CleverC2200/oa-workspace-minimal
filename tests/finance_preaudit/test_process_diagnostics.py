@@ -36,6 +36,7 @@ def test_diagnostic_retains_only_fixed_signals(tmp_path: Path) -> None:
 
 
 def test_real_child_timeout_records_stage_and_reaps(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
     path = _action(tmp_path)
     monkeypatch.setattr(worker, "_decision_schema", lambda _, **_kwargs: {})
     monkeypatch.setattr(worker, "_codex_command", lambda *_: [sys.executable, "-c",
@@ -78,6 +79,7 @@ def test_diagnostic_conflict_is_not_overwritten(tmp_path: Path, damage: str) -> 
 
 
 def test_stdout_disconnect_survives_timeout_without_raw_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
     path = _action(tmp_path)
     monkeypatch.setattr(worker, "_decision_schema", lambda _, **_kwargs: {})
     event = {"type": "error", "message": "Reconnecting... 2/5 (stream disconnected before completion: websocket closed by server before response.completed) private-secret"}

@@ -81,15 +81,12 @@ _UNKNOWN_WRITE_FAILURE_CODES = (
 _BOUNDED_PREWRITE_FAILURE_CODES = review_failure_evidence.PROCESS_FAILURE_CODES
 _REVIEWER_ENVIRONMENT_KEYS = frozenset(
     {
-        "CODEX_API_KEY",
-        "CODEX_HOME",
         "HOME",
         "LANG",
         "LC_ALL",
         "LC_CTYPE",
         "LOGNAME",
         "OA_REVIEW_API_KEY",
-        "OPENAI_API_KEY",
         "PATH",
         "SHELL",
         "SSL_CERT_DIR",
@@ -183,7 +180,7 @@ Completer = Callable[[Path, dict], str | None]
 StopRequester = Callable[[], None]
 
 
-def _reviewer_environment() -> dict[str, str]:
+def _reviewer_environment(codex_home: Path | None = None) -> dict[str, str]:
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -191,6 +188,14 @@ def _reviewer_environment() -> dict[str, str]:
     }
     if not environment.get("HOME") or not environment.get("PATH"):
         raise ValueError("codex_reviewer_environment_invalid")
+    review_key = environment.get("OA_REVIEW_API_KEY", "").strip()
+    if not review_key:
+        raise ValueError("oa_review_api_key_missing")
+    environment["OA_REVIEW_API_KEY"] = review_key
+    if codex_home is not None:
+        if not codex_home.is_absolute() or codex_home.is_symlink() or not codex_home.is_dir():
+            raise ValueError("codex_reviewer_environment_invalid")
+        environment["CODEX_HOME"] = str(codex_home)
     # The host CLI shim must not start shared services inside a bounded review.
     environment["OCX_SHIM_BYPASS"] = "1"
     return environment
@@ -432,7 +437,7 @@ def _codex_command(
         (
             'model_providers.oa_deepseek={name="DeepSeek",'
             'base_url="https://api.deepseek.com",wire_api="responses",'
-            'env_key="OA_REVIEW_API_KEY"}'
+            'env_key="OA_REVIEW_API_KEY",requires_openai_auth=false}'
         ),
         # DeepSeek 的 Responses 实现是无状态的，必须关闭服务端响应存储。
         "--config",
@@ -847,6 +852,22 @@ def _execute_codex_raw(
     output = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
     with tempfile.TemporaryDirectory(prefix="oa-preaudit-codex-") as temporary:
         temporary_root = Path(temporary)
+        codex_home = temporary_root / "codex-home"
+        try:
+            codex_home.mkdir(mode=0o700)
+            reviewer_environment = _reviewer_environment(codex_home)
+        except (OSError, ValueError) as error:
+            output.close()
+            return CodexExecution(
+                (
+                    "oa_review_api_key_missing"
+                    if isinstance(error, ValueError)
+                    and str(error) == "oa_review_api_key_missing"
+                    else "codex_process_start_failed"
+                ),
+                _unknown_usage(),
+                process_state="start_failed", decision_state="not_attempted",
+            )
         schema_file = temporary_root / "decision-schema.json"
         decision_file = temporary_root / "decision.json"
         json_artifact.write_json_atomic(
@@ -893,7 +914,7 @@ def _execute_codex_raw(
             process = subprocess.Popen(
                 command,
                 cwd=project_root,
-                env=_reviewer_environment(),
+                env=reviewer_environment,
                 stdin=subprocess.PIPE,
                 stdout=output,
                 stderr=subprocess.PIPE,

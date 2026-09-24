@@ -655,7 +655,7 @@ def test_codex_command_pins_deepseek_high_and_json_output(tmp_path: Path) -> Non
     assert (
         'model_providers.oa_deepseek={name="DeepSeek",'
         'base_url="https://api.deepseek.com",wire_api="responses",'
-        'env_key="OA_REVIEW_API_KEY"}'
+        'env_key="OA_REVIEW_API_KEY",requires_openai_auth=false}'
     ) in command
     assert "disable_response_storage=true" in command
     assert "model_context_window=1000000" in command
@@ -671,6 +671,7 @@ def test_execute_codex_normalizes_small_marketing_transport_schema(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
     task, action_file = _small_marketing_v2_task(
         tmp_path,
         budget_account="市场活动费",
@@ -808,6 +809,7 @@ def test_codex_start_blocks_sigterm_until_process_group_is_registered(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
     task, action_file = _task(tmp_path)
     calls: list[tuple[str, object]] = []
 
@@ -868,7 +870,13 @@ def test_codex_process_receives_only_reviewer_runtime_environment(
     monkeypatch.setenv("OA_BASE_URL", "must-not-reach-reviewer")
     monkeypatch.setenv("OA_UID", "must-not-reach-reviewer")
     monkeypatch.setenv("UNRELATED_SECRET", "must-not-reach-reviewer")
-    monkeypatch.setenv("OPENAI_API_KEY", "reviewer-auth")
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "deepseek-reviewer-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-reviewer")
+    monkeypatch.setenv("CODEX_API_KEY", "must-not-reach-reviewer")
+    inherited_codex_home = tmp_path / "user-codex-home"
+    inherited_codex_home.mkdir()
+    (inherited_codex_home / "auth.json").write_text("user-login")
+    monkeypatch.setenv("CODEX_HOME", str(inherited_codex_home))
     monkeypatch.setenv("OCX_SHIM_BYPASS", "0")
 
     class Process:
@@ -884,6 +892,9 @@ def test_codex_process_receives_only_reviewer_runtime_environment(
 
     def popen(*_args, **kwargs) -> Process:
         captured_environment.update(kwargs["env"])
+        isolated_home = Path(kwargs["env"]["CODEX_HOME"])
+        assert isolated_home.is_dir()
+        assert list(isolated_home.iterdir()) == []
         return Process()
 
     monkeypatch.setattr(codex_review_worker.subprocess, "Popen", popen)
@@ -897,7 +908,10 @@ def test_codex_process_receives_only_reviewer_runtime_environment(
     assert result.error_code == "codex_process_failed"
     assert captured_environment["HOME"]
     assert captured_environment["PATH"]
-    assert captured_environment["OPENAI_API_KEY"] == "reviewer-auth"
+    assert captured_environment["OA_REVIEW_API_KEY"] == "deepseek-reviewer-key"
+    assert captured_environment["CODEX_HOME"] != str(inherited_codex_home)
+    assert "OPENAI_API_KEY" not in captured_environment
+    assert "CODEX_API_KEY" not in captured_environment
     assert captured_environment["OCX_SHIM_BYPASS"] == "1"
     assert "OA_APP_SECRET" not in captured_environment
     assert "OA_DB_PASSWORD" not in captured_environment
@@ -1860,6 +1874,7 @@ def test_read_only_schema_keeps_probe_token(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("read_only", [False, True])
 def test_process_receives_bound_token_schema(tmp_path: Path, monkeypatch, read_only: bool) -> None:
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
     task, action_file = _task(tmp_path)
     seen = []
 
@@ -1948,14 +1963,54 @@ def test_tpm_prompt_keeps_passing_conclusions_short_and_direct(tmp_path):
 def test_reviewer_environment_passes_only_the_deepseek_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "  unit-test-key  ")
     monkeypatch.setenv("UNRELATED_SECRET", "must-not-leak")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-leak")
+    monkeypatch.setenv("CODEX_API_KEY", "must-not-leak")
+    monkeypatch.setenv("CODEX_HOME", "/user/codex/auth")
 
     environment = codex_review_worker._reviewer_environment()
 
     assert environment["OA_REVIEW_API_KEY"] == "unit-test-key"
     assert "UNRELATED_SECRET" not in environment
+    assert "OPENAI_API_KEY" not in environment
+    assert "CODEX_API_KEY" not in environment
+    assert "CODEX_HOME" not in environment
     assert environment["HOME"] and environment["PATH"]
+
+
+@pytest.mark.parametrize("key", [None, "  "])
+def test_reviewer_environment_requires_the_deepseek_key(
+    monkeypatch: pytest.MonkeyPatch, key: str | None,
+) -> None:
+    if key is None:
+        monkeypatch.delenv("OA_REVIEW_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("OA_REVIEW_API_KEY", key)
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-used-as-fallback")
+    monkeypatch.setenv("CODEX_API_KEY", "must-not-be-used-as-fallback")
+
+    with pytest.raises(ValueError, match="oa_review_api_key_missing"):
+        codex_review_worker._reviewer_environment()
+
+
+def test_missing_deepseek_key_prevents_codex_process_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task, action_file = _task(tmp_path)
+    monkeypatch.delenv("OA_REVIEW_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-used-as-fallback")
+    monkeypatch.setattr(
+        codex_review_worker.subprocess, "Popen",
+        lambda *_args, **_kwargs: pytest.fail("review process must not start"),
+    )
+
+    result = codex_review_worker._execute_codex_raw(
+        Path(task["project_root"]), action_file, 60, stderr_summary={},
+    )
+
+    assert result.error_code == "oa_review_api_key_missing"
+    assert result.process_state == "start_failed"
 
 
 def test_legacy_openai_review_evidence_still_validates() -> None:

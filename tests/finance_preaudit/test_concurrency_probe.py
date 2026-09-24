@@ -1419,6 +1419,7 @@ def test_local_unknown_quarantine_snapshot_is_separate(
 
 
 def test_global_dispatcher_passes_frozen_unknown_snapshot(monkeypatch) -> None:
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
     historical = frozenset(
         {("historical-request", "2026-08-25T08:00:00+08:00")}
     )
