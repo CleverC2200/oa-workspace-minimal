@@ -280,10 +280,18 @@ def _failure_payload(error: Exception, *, command: str = "next-action") -> dict:
     if command in {"status", "prune", "clean"}:
         raw_code = str(error).strip()
         code = raw_code if raw_code in _RUNTIME_FAILURE_CODES else "runtime_failed"
+        failure = {"code": code, "stage": command}
+        if (
+            command == "prune"
+            and code == "retention_plan_invalid"
+            and isinstance(error.__cause__, ValueError)
+            and str(error.__cause__) == "daily_metric_conflict"
+        ):
+            failure["detail_code"] = "daily_metric_conflict"
         return {
             "schema_version": 1,
             "kind": "preaudit_runtime_failed",
-            "failure": {"code": code, "stage": command},
+            "failure": failure,
         }
     if command in {"next-action", "complete-review"}:
         raw_code = str(error).strip()
