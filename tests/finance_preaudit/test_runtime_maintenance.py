@@ -1084,6 +1084,233 @@ def test_prune_compacts_raw_metrics_before_delete_and_keeps_daily_180_days(
     ] in {"exact", "unknown"}
 
 
+def test_prune_refreshes_a_late_unknown_outcome_without_changing_its_state(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    old_generated_at = NOW - timedelta(minutes=10)
+    for index in range(6):
+        attempt_root = _attempt(
+            root, case_key=f"original-{index}", attempt=1, age_days=1,
+        )
+        state_path = attempt_root / "state.json"
+        earlier = (old_generated_at - timedelta(minutes=1)).timestamp()
+        os.utime(state_path, (earlier, earlier))
+    old_payloads = runtime_maintenance._daily_payloads(
+        root, now=old_generated_at,
+    )
+    assert len(old_payloads) == 1
+    daily_path, old_payload = next(iter(old_payloads.items()))
+    assert old_payload["metrics"]["outcomes"]["overall"]["attempt_count"] == 6
+    daily_path.parent.mkdir(parents=True)
+    json_artifact.write_json_atomic(daily_path, old_payload)
+
+    late = _attempt(
+        root, case_key="late-unknown", attempt=1, age_days=1,
+        workflow_key="business_entertainment", execution_state="needs_admin",
+        business_state="not_available", write_state="unknown",
+        reason="writer_result_unknown",
+    )
+    late_state = late / "state.json"
+    later = (old_generated_at + timedelta(minutes=1)).timestamp()
+    os.utime(late_state, (later, later))
+    frozen_state = late_state.read_bytes()
+    old_fingerprint = f"sha256:{hashlib.sha256(daily_path.read_bytes()).hexdigest()}"
+
+    receipt = runtime_maintenance.prune(root, now=NOW)
+    refreshed = runtime_maintenance._read_daily_metric(daily_path)
+
+    assert receipt["status"] == "ok"
+    assert refreshed["metrics"]["outcomes"]["overall"]["attempt_count"] == 7
+    assert refreshed["metrics"]["outcomes"]["overall"]["write_unknown"] == 1
+    assert refreshed["metrics"]["observability"] == old_payload["metrics"]["observability"]
+    assert refreshed["prior_fingerprints"] == [old_fingerprint]
+    assert late_state.read_bytes() == frozen_state
+
+
+def test_prune_rejects_rewritten_prior_outcome(tmp_path: Path) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    old_generated_at = NOW - timedelta(minutes=10)
+    attempt_root = _attempt(root, case_key="prior", attempt=1, age_days=1)
+    daily_path, old_payload = next(iter(runtime_maintenance._daily_payloads(
+        root, now=old_generated_at,
+    ).items()))
+    daily_path.parent.mkdir(parents=True)
+    json_artifact.write_json_atomic(daily_path, old_payload)
+    old_daily = daily_path.read_bytes()
+    state_path = attempt_root / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state.update({
+        "execution_state": "needs_admin",
+        "business_state": "not_available",
+        "write_state": "unknown",
+        "reason": "writer_result_unknown",
+    })
+    json_artifact.write_json_atomic(state_path, state)
+
+    with pytest.raises(ValueError, match="retention_plan_invalid") as failure:
+        runtime_maintenance.prune(root, now=NOW)
+
+    assert str(failure.value.__cause__) == "daily_metric_conflict"
+    assert cli._failure_payload(failure.value, command="prune")["failure"] == {
+        "code": "retention_plan_invalid",
+        "detail_code": "daily_metric_conflict",
+        "stage": "prune",
+    }
+    assert daily_path.read_bytes() == old_daily
+
+
+def test_prune_rejects_changed_observability_with_equal_event_count(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    old_generated_at = NOW - timedelta(minutes=10)
+    prior = _attempt(root, case_key="prior", attempt=1, age_days=1)
+    state_path = prior / "state.json"
+    earlier = (old_generated_at - timedelta(minutes=1)).timestamp()
+    os.utime(state_path, (earlier, earlier))
+    event_path = prior / "observability.json"
+    observability.record_event(event_path, {
+        "event_id": "review",
+        "item_key": observability.attempt_key(
+            "request-prior", (NOW - timedelta(days=1)).isoformat(), 1,
+        ),
+        "workflow_key": "travel_expense",
+        "occurred_at": (NOW - timedelta(days=1)).isoformat().replace("+00:00", "Z"),
+        "phase": "review",
+        "wall_seconds": 1,
+        "active_seconds": 1,
+        "queue_wait_seconds": 0,
+        "result": "success",
+        "model": None,
+        "token_usage": {"status": "unknown"},
+    })
+    daily_path, old_payload = next(iter(runtime_maintenance._daily_payloads(
+        root, now=old_generated_at,
+    ).items()))
+    daily_path.parent.mkdir(parents=True)
+    json_artifact.write_json_atomic(daily_path, old_payload)
+    old_daily = daily_path.read_bytes()
+
+    late = _attempt(
+        root, case_key="late", attempt=1, age_days=1,
+        workflow_key="business_entertainment", execution_state="needs_admin",
+        business_state="not_available", write_state="unknown",
+        reason="writer_result_unknown",
+    )
+    later = (old_generated_at + timedelta(minutes=1)).timestamp()
+    os.utime(late / "state.json", (later, later))
+    event_log = json.loads(event_path.read_text(encoding="utf-8"))
+    event_log["events"][0]["wall_seconds"] = 2
+    json_artifact.write_json_atomic(event_path, event_log)
+
+    with pytest.raises(ValueError, match="retention_plan_invalid") as failure:
+        runtime_maintenance.prune(root, now=NOW)
+
+    assert str(failure.value.__cause__) == "daily_metric_conflict"
+    assert daily_path.read_bytes() == old_daily
+
+
+def test_prune_rejects_prior_outcome_rewrite_when_event_count_grows(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    prior = _attempt(root, case_key="prior", attempt=1, age_days=1)
+    daily_path, old_payload = next(iter(runtime_maintenance._daily_payloads(
+        root, now=NOW - timedelta(minutes=10),
+    ).items()))
+    daily_path.parent.mkdir(parents=True)
+    json_artifact.write_json_atomic(daily_path, old_payload)
+    old_daily = daily_path.read_bytes()
+    state_path = prior / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state.update({
+        "execution_state": "needs_admin",
+        "business_state": "not_available",
+        "write_state": "unknown",
+        "reason": "writer_result_unknown",
+    })
+    json_artifact.write_json_atomic(state_path, state)
+    observability.record_event(prior / "observability.json", {
+        "event_id": "late-event",
+        "item_key": observability.attempt_key(
+            "request-prior", (NOW - timedelta(days=1)).isoformat(), 1,
+        ),
+        "workflow_key": "travel_expense",
+        "occurred_at": (NOW - timedelta(days=1)).isoformat().replace("+00:00", "Z"),
+        "phase": "review",
+        "wall_seconds": 1,
+        "active_seconds": 1,
+        "queue_wait_seconds": 0,
+        "result": "success",
+        "model": None,
+        "token_usage": {"status": "unknown"},
+    })
+
+    with pytest.raises(ValueError, match="retention_plan_invalid") as failure:
+        runtime_maintenance.prune(root, now=NOW)
+
+    assert str(failure.value.__cause__) == "daily_metric_conflict"
+    assert daily_path.read_bytes() == old_daily
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("request_id", "different-request"),
+        ("workflow_key", "packaging_layout_approval"),
+        ("workflow_key", "unsupported_workflow"),
+        ("case_key", "b" * 64),
+        ("case_key", None),
+        ("attempt", 2),
+        ("attempt", "1"),
+    ],
+)
+def test_prune_rejects_invalid_attempt_identity(
+    tmp_path: Path, field: str, replacement: object,
+) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    attempt_root = _attempt(root, case_key="invalid", attempt=1, age_days=1)
+    state_path = attempt_root / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state[field] = replacement
+    json_artifact.write_json_atomic(state_path, state)
+
+    with pytest.raises(ValueError, match="retention_plan_invalid") as failure:
+        runtime_maintenance.prune(root, now=NOW)
+
+    assert str(failure.value.__cause__) == "runtime_state_identity_invalid"
+    assert attempt_root.is_dir()
+
+
+def test_daily_metric_rejects_null_fingerprint_history(tmp_path: Path) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    _attempt(root, case_key="prior", attempt=1, age_days=1)
+    daily_path, payload = next(iter(runtime_maintenance._daily_payloads(
+        root, now=NOW,
+    ).items()))
+    daily_path.parent.mkdir(parents=True)
+    payload["prior_fingerprints"] = None
+    json_artifact.write_json_atomic(daily_path, payload)
+
+    with pytest.raises(ValueError, match="runtime_state_invalid"):
+        runtime_maintenance._read_daily_metric(daily_path)
+    with pytest.raises(ValueError, match="retention_plan_invalid"):
+        runtime_maintenance.prune(root, now=NOW)
+
+
 def test_daily_metric_rejects_nested_unapproved_fields(tmp_path: Path) -> None:
     root = tmp_path / "runtime"
     root.mkdir()
