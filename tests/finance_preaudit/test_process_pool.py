@@ -373,6 +373,7 @@ def test_outer_stop_reaps_codex_process_group_and_grandchild(
     expected_status: str,
     expected_error: str,
 ) -> None:
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
     task, action_file = _codex_task(tmp_path)
     json_artifact.write_json_atomic(
         action_file.with_name("state.json"),
@@ -407,6 +408,7 @@ def test_inner_codex_timeout_reaps_process_group_and_grandchild(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
     task, action_file = _codex_task(tmp_path)
     json_artifact.write_json_atomic(
         action_file.with_name("state.json"),

@@ -284,6 +284,7 @@ def test_raw_malformed_output_fails_without_handoff(
     monkeypatch,
     raw: str,
 ) -> None:
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
     import io
     from apps.oa_finance_preaudit import codex_review_worker as worker
     from tests.finance_preaudit.test_codex_review_worker import _task
