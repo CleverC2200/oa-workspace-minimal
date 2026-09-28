@@ -287,14 +287,23 @@ def verified_no_write_failure(attempt_root: Path, state: dict, code: str) -> boo
 def verified_cycle_stop_no_write_failure(attempt_root: Path, state: dict) -> bool:
     """Recognize an exact signed stop before submit; never clear a stop or replay."""
     if (state.get("reason") != writer_outcomes.PREFLIGHT_FAILED
-            or state.get("write_state") != "not_requested"):
+            or state.get("write_state") != "not_requested"
+            or state.get("failure_detail_code") not in {None, "stop_requested"}):
         return False
     boundary = _verified_failure_boundary(attempt_root, state)
-    return (boundary is not None
-            and boundary["failure_code"] == writer_outcomes.PREFLIGHT_FAILED
-            and boundary.get("failure_detail_code") == "stop_requested"
-            and boundary["stages"][-1] == "preflight_failed"
-            and "submit_started" not in boundary["stages"])
+    if (boundary is None
+            or boundary["failure_code"] != writer_outcomes.PREFLIGHT_FAILED
+            or boundary.get("failure_detail_code") != "stop_requested"
+            or boundary["stages"][-1] != "preflight_failed"
+            or "submit_started" in boundary["stages"]):
+        return False
+    try:
+        flow_engine._validate_frozen_review_inputs(
+            attempt_root=attempt_root, state=state, workflow_key=state["workflow_key"],
+        )
+    except (OSError, KeyError, TypeError, ValueError):
+        return False
+    return True
 
 
 def verified_unknown_write_failure(attempt_root: Path, state: dict, code: str) -> bool:

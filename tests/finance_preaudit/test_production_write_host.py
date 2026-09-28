@@ -729,7 +729,7 @@ def test_stop_before_writer_preflight_is_confirmed_no_write(
     assert api.calls == []
 
 
-@pytest.mark.parametrize("mutation", [None, "signature", "detail", "started", "receipt", "remark", "symlink"])
+@pytest.mark.parametrize("mutation", [None, "signature", "detail", "started", "receipt", "remark", "symlink", "packet", "attachment", "prepared", "state_detail"])
 def test_cycle_stop_receipt_only_isolates_signed_unwritten_stop(tmp_path: Path, monkeypatch, mutation: str | None) -> None:
     root = tmp_path / "flows"
     policy = tmp_path / "write-policy.json"
@@ -746,7 +746,7 @@ def test_cycle_stop_receipt_only_isolates_signed_unwritten_stop(tmp_path: Path, 
     candidate = {"request_id": "live-request", "received_at": api.received_at, "workflow_key": "travel_expense"}
     engine = flow_engine.FlowEngine(
         root=root, discover_candidates=lambda key: [candidate],
-        collect_material=lambda request_id, _root: _material(request_id), **ports,
+        collect_material=_material_with_files, **ports,
     )
     action = engine.next_action("travel_expense", mode="controlled_write")
     decision = tmp_path / "decision.json"
@@ -776,6 +776,18 @@ def test_cycle_stop_receipt_only_isolates_signed_unwritten_stop(tmp_path: Path, 
         target = tmp_path / "boundary.json"
         boundary_path.rename(target)
         boundary_path.symlink_to(target)
+    elif mutation == "packet":
+        (attempt / "review-packet.json").write_text("{}")
+    elif mutation == "attachment":
+        (attempt / "attachments" / "source.txt").write_text("changed attachment")
+    elif mutation == "prepared":
+        (attempt / "prepared" / "page-1.txt").write_text("changed page")
+    elif mutation == "state_detail":
+        state["failure_detail_code"] = "authorization_invalid"
+        changed_action = json.loads((attempt / "action.json").read_text())
+        changed_action["failure_detail_code"] = state["failure_detail_code"]
+        json_artifact.write_json_atomic(attempt / "action.json", changed_action)
+        json_artifact.write_json_atomic(attempt / "state.json", state)
     item_failure.persist(attempt, state)
     assert item_failure.isolated(attempt, state) is (mutation is None)
     assert production_write.runtime_control.stop_requested() is True
