@@ -587,7 +587,7 @@ def test_opened_round_without_verified_frozen_evidence_keeps_identity_conflict(
     }
 
 
-def test_historical_unknown_is_preserved_without_blocking_fresh_identity(tmp_path: Path) -> None:
+def test_unverified_historical_unknown_is_preserved_and_blocks_fresh_identity(tmp_path: Path) -> None:
     root = tmp_path / "flows"
     _state(root, "historical", "2026-08-24 09:00:00", write_state="unknown",
            reason="writer_result_unknown")
@@ -597,7 +597,8 @@ def test_historical_unknown_is_preserved_without_blocking_fresh_identity(tmp_pat
         pending_rows=[{"request_id": "fresh", "received_at": "2026-09-09 09:00:00"}],
         handled_rows=[],
     )
-    assert result["continuation"]["status"] == "ready"
+    assert result["continuation"]["status"] == "blocked"
+    assert result["continuation"]["blocking_reasons"] == {"historical_unknown_failure_invalid": 1}
     assert result["quarantine"]["actionable_pending"] == 1
     assert result["findings"][0]["recommendation"] == "manual_write_state_verification"
     assert before == {path: path.read_bytes() for path in root.rglob("*.json")}

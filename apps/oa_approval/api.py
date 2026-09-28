@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -146,6 +147,20 @@ class OaApi:
             "userid": self.enc_uid,
         }
 
+    def _read_response(self, request: urllib.request.Request) -> dict[str, Any]:
+        """Retry one transport failure only for the existing read-only callers."""
+        for attempt in range(2):
+            try:
+                with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+                    return _decode_json(response.read().decode("utf-8", errors="ignore"))
+            except urllib.error.HTTPError as error:
+                return {"http_status": error.code, "error": str(error),
+                        "raw_text": error.read().decode("utf-8", errors="ignore")}
+            except urllib.error.URLError:
+                if attempt == 1: raise
+                time.sleep(0.25)
+        raise AssertionError("unreachable")
+
     def get(
         self,
         path: str,
@@ -157,15 +172,7 @@ class OaApi:
             headers=self._headers(),
             method="GET",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-                return _decode_json(response.read().decode("utf-8", errors="ignore"))
-        except urllib.error.HTTPError as error:
-            return {
-                "http_status": error.code,
-                "error": str(error),
-                "raw_text": error.read().decode("utf-8", errors="ignore"),
-            }
+        return self._read_response(request)
 
     def _post_readonly(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
         if path not in READONLY_POST_ENDPOINTS:
@@ -179,15 +186,7 @@ class OaApi:
             },
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-                return _decode_json(response.read().decode("utf-8", errors="ignore"))
-        except urllib.error.HTTPError as error:
-            return {
-                "http_status": error.code,
-                "error": str(error),
-                "raw_text": error.read().decode("utf-8", errors="ignore"),
-            }
+        return self._read_response(request)
 
     def handled_rows(
         self,

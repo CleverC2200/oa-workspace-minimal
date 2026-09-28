@@ -24,3 +24,7 @@ FAILURE_CODES = frozenset(
         PENDING_CONFLICT,
     }
 )
+
+UNKNOWN_WRITE_CODES = frozenset({
+    TRANSPORT_UNKNOWN, POSTCHECK_TIMEOUT, PENDING_CONFLICT, "writer_result_unknown",
+})

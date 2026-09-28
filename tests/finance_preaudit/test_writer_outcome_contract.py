@@ -535,3 +535,89 @@ def test_mixed_batch_continues_after_verified_rejection(tmp_path: Path, monkeypa
     failed_root = Path(actions[0]["action_file"]).parent
     assert (failed_root / "writer-boundary.json").is_file()
     assert (failed_root / "review-decision.json").is_file()
+
+
+def _historical_unknown(tmp_path: Path, monkeypatch, code: str):
+    monkeypatch.setenv("OA_APP_SECRET", "local-test-secret")
+    root = tmp_path / "flows"
+    policy = tmp_path / "policy.json"
+    json_artifact.write_json_atomic(policy, {
+        "schema_version": 1, "kind": "preaudit_write_policy",
+        "authorized_workflows": ["travel_expense"],
+    })
+    api = _WriterApi({
+        "submit_ok": code != "writer_transport_unknown", "done_hit": False,
+        "postcheck_done_hit": False, "failure_code": code,
+    })
+    ports = production_write.build_ports(
+        root=root, policy_file=policy, signing_secret="local-test-secret",
+        api_factory=lambda: api, now=lambda: NOW,
+    )
+    rows = [{"request_id": "live-request", "received_at": "2026-08-23T08:30:00+08:00",
+             "workflow_key": "travel_expense"}]
+    engine = flow_engine.FlowEngine(
+        root=root, discover_candidates=lambda _: rows, discover_handled=lambda: [],
+        collect_material=lambda request_id, _: _material(request_id), **ports,
+    )
+    action = engine.next_action("travel_expense", mode="controlled_write")
+    decision = tmp_path / "decision.json"
+    json_artifact.write_json_atomic(decision, _decision(action))
+    failed = engine.complete_review(Path(action["action_file"]), decision)
+    assert failed["write_state"] == "unknown"
+    return root, engine, rows, api, failed
+
+
+@pytest.mark.parametrize("code", [
+    "writer_transport_unknown", "writer_postcheck_timeout", "writer_pending_conflict",
+])
+def test_signed_historical_unknown_allows_fresh_work_without_replay(
+    tmp_path: Path, monkeypatch, code: str,
+) -> None:
+    root, engine, rows, api, failed = _historical_unknown(tmp_path, monkeypatch, code)
+    action = Path(failed["action_file"])
+    before = {name: (action.parent / name).read_bytes()
+              for name in ("action.json", "state.json", "writer-boundary.json")}
+    fresh = {"request_id": "fresh-request", "received_at": "2026-08-23T08:40:00+08:00",
+             "workflow_key": "travel_expense"}
+    report = reconciliation.reconcile(
+        root, pending_rows=[fresh], handled_rows=[{"request_id": "live-request"}],
+    )
+    assert report["continuation"]["status"] == "ready"
+    assert report["manual_review"]["items"][0]["recommendation"] == "manual_write_state_verification"
+    rows[:] = [fresh]
+    resumed = engine.next_action(
+        "travel_expense", mode="controlled_write", skip_unknown_failures=frozenset({action}),
+    )
+    assert resumed["action"] == "review_required"
+    assert resumed["case_key"] != failed["case_key"]
+    assert len(api.calls) == 1
+    assert all((action.parent / name).read_bytes() == content for name, content in before.items())
+
+
+@pytest.mark.parametrize("tamper", ["proof", "job_key", "decision"])
+def test_damaged_historical_unknown_blocks_both_gate_and_claim(
+    tmp_path: Path, monkeypatch, tamper: str,
+) -> None:
+    root, engine, rows, api, failed = _historical_unknown(
+        tmp_path, monkeypatch, "writer_postcheck_timeout",
+    )
+    action = Path(failed["action_file"])
+    if tamper == "decision":
+        (action.parent / "review-decision.json").write_text("{}", encoding="utf-8")
+    else:
+        path = action.parent / "writer-boundary.json"
+        payload = json.loads(path.read_text())
+        payload[tamper] = "invalid"
+        json_artifact.write_json_atomic(path, payload)
+    fresh = {"request_id": "fresh-request", "received_at": "2026-08-23T08:40:00+08:00",
+             "workflow_key": "travel_expense"}
+    report = reconciliation.reconcile(
+        root, pending_rows=[fresh], handled_rows=[{"request_id": "live-request"}],
+    )
+    assert report["continuation"]["blocking_reasons"] == {"historical_unknown_failure_invalid": 1}
+    rows[:] = [fresh]
+    with pytest.raises(ValueError, match="historical_unknown_failure_invalid"):
+        engine.next_action(
+            "travel_expense", mode="controlled_write", skip_unknown_failures=frozenset({action}),
+        )
+    assert len(api.calls) == 1

@@ -563,3 +563,14 @@ def test_new_window_uncertain_send_keeps_previous_delivery_evidence(tmp_path):
     assert stored["history"] == [{key: value for key, value in previous.items() if key != "history"}]
     assert stored["window_id"] != previous["window_id"]
     assert _alert(tmp_path, at=NOW + timedelta(days=2))["delivery_state"] == "unknown"
+
+
+def test_overdue_message_retains_unknown_delivery_protection(tmp_path: Path):
+    text = session_alert.build_message("preaudit_pending_overdue", occurred_at=NOW)
+    assert "超过目标时限" in text
+    calls = []
+    def unknown(*args):
+        calls.append(args); raise RuntimeError("unknown delivery")
+    assert _alert(tmp_path, "preaudit_pending_overdue", sender=unknown)["delivery_state"] == "unknown"
+    assert _alert(tmp_path, "preaudit_pending_overdue", sender=unknown)["delivery_state"] == "unknown"
+    assert len(calls) == 1

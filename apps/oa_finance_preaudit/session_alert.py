@@ -44,6 +44,7 @@ PRODUCTION_ERROR_CODES = frozenset(
         "writer_result_unknown",
         "controller_cycle_stop",
         "controller_failed",
+        "preaudit_pending_overdue",
     }
 )
 ALERT_ERROR_CODES = SESSION_ERROR_CODES | PRODUCTION_ERROR_CODES
@@ -83,6 +84,8 @@ def build_message(error_code: str, *, occurred_at: datetime | None = None) -> st
             f"稳定错误码：{code}",
             "原因：OA 网页登录状态不可用，请人工重新登录 RPA 专用浏览器。"
             if code in SESSION_ERROR_CODES else (
+                "原因：预审待办或人工处置超过目标时限，请查看本地处理人、期限和下一步。"
+                if code == "preaudit_pending_overdue" else
                 "原因：生产启动门禁未通过，请查看本地任务回执。"
                 if code in STARTUP_ERROR_CODES else "原因：本轮出现失败或隔离项，请查看本地控制器回执和人工核对清单。"
             ),

@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 from apps.oa_approval import writer_outcomes
 
-from . import item_failure, review_failure_evidence, recovery_receipt
+from . import case_recovery, item_failure, review_failure_evidence, recovery_receipt
 
 
 _WORKFLOW_KEYS = {
@@ -400,6 +400,9 @@ def reconcile(
 
         if state.get("write_state") == "unknown":
             recommendation = "manual_write_state_verification"
+            if (category in {"handled_not_pending", "invisible"}
+                    and not FlowEngine.historical_unknown_safe(root, state)):
+                blocking_reasons["historical_unknown_failure_invalid"] += 1
         elif (
             category == "pending_not_handled"
             and state.get("execution_state") == "needs_admin"
@@ -559,5 +562,8 @@ def reconcile(
             "read_only": True, "total": len(manual_items),
             "items": sorted(manual_items, key=lambda item: item["item_key"]),
         },
+        "pending_dispositions": case_recovery.pending_dispositions(
+            root, states, pending_input, manual_items, current_time, findings=findings,
+        ),
         "findings": sorted(findings, key=lambda item: item["item_key"]),
     }

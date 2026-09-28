@@ -117,6 +117,7 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--root", type=Path, default=None)
     status.add_argument("--check-live", action="store_true")
     status.add_argument("--reconcile", action="store_true")
+    status.add_argument("--summary", action="store_true")
     prune = subparsers.add_parser("prune")
     prune.add_argument("--root", type=Path, default=None)
     clean = subparsers.add_parser("clean")
@@ -534,6 +535,9 @@ def main(
             payload["controller_handoff"] = controller_handoff.status()
             from . import session_alert
             payload["notification"] = session_alert.status()
+            if args.summary:
+                from .case_recovery import summary
+                payload = summary(payload)
         elif args.command == "prune":
             operation = runtime_prune or runtime_maintenance.prune
             payload = operation(_runtime_root(args.root))

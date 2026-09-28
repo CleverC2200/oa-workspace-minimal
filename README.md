@@ -154,6 +154,10 @@ python3 -m scripts.finance_preaudit_concurrency_probe \
 
 ### 滚动恢复隔离项
 
+已明确批准有限恢复的生产调度，可在唯一滚动入口增加 `--recover-confirmed-no-write-once YES`。宿主在租约内核对实时状态，只对当前授权流程、可信单据级确认未写入的首个 attempt 执行一次跨轮恢复；已有后续尝试进入人工处置，未知写入仍不重试。默认入口继续跳过历史隔离。处理人、当前 RPA 等待时长、期限、恢复上限及修复占位收尾见[阻断处置手册](docs/runbooks/blocking-recovery.md)。
+
+生产只读门禁可使用 `status --check-live --reconcile --summary` 返回完整安全门与当前处置摘要，省略大型历史指标。诊断列表超过 200 项时只截断展示并保留总数与标记，安全门判定仍基于完整对账；需要全部诊断时使用原状态命令。
+
 开发隔离排障按[隔离排障与恢复](docs/agents/quarantine-repair.md)继续诊断、回测和显式恢复，不能以生产已隔离或普通队列为空作为修复完成。只读对账的 `findings` 与 `manual_review.items` 对通过现有未写入证据校验、精确仍在待办且未命中已办的项统一给出 `confirmed_no_write_recovery_candidate`，覆盖审核进程失败和无效审核决定；缺少有效证据时保留核对建议。候选不是写入授权，查询和普通调度均不会自动恢复。
 
 六类财务历史 `material_collection_failed`、`codex_review_failed` 等已确认未写入的隔离项，只能把精确旧
