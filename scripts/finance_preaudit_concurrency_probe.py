@@ -2215,6 +2215,7 @@ def _run_dispatched_tasks(
         codex_review_worker.quarantine_review_failure
     ),
     record_failure_round: FailureRoundRecorder | None = None,
+    defer_review_failures: bool = True,
     executor_factory: ExecutorFactory = _process_executor,
     task_timeout_sec: float = 960,
     prepare_timeout_sec: float = 300,
@@ -3299,7 +3300,7 @@ def _run_dispatched_tasks(
                                     review_retry_diagnostics[
                                         "recorder_invalid"
                                     ] += 1
-                        if isinstance(failure_round, int) and failure_round < 3:
+                        if defer_review_failures and isinstance(failure_round, int) and failure_round < 3:
                             review_retry_diagnostics["retry_pending"] += 1
                             retry_pending_now = True
                             retry_value = {
@@ -3765,6 +3766,7 @@ def _run_global_dispatched_tasks(
     allowed_workflows: frozenset[str] = ROLLING_WORKFLOW_KEYS,
     run_id: str | None = None,
     controller_instance_id: str | None = None,
+    defer_review_failures: bool = True,
 ) -> process_pool.PoolResult[dict]:
     codex_review_worker._reviewer_environment()
     frozen_unknown = (
@@ -3789,6 +3791,8 @@ def _run_global_dispatched_tasks(
     }
     if recovery_action_files:
         dispatcher_args["recovery_action_files"] = recovery_action_files
+    if not defer_review_failures:
+        dispatcher_args["defer_review_failures"] = False
     return _run_dispatched_tasks(count, capacity, **dispatcher_args)
 
 
@@ -4567,6 +4571,7 @@ def run_rolling_drain(
                         controller_instance_id=(
                             manifest["controller_instance_id"]
                         ),
+                        **({"defer_review_failures": False} if authorized_recovery_once else {}),
                     )
                     pending_recoveries = ()
                     committed_received_at = wave_result.committed_received_at
@@ -4914,7 +4919,9 @@ def _run_rolling_drain_locked(
         wave["capacity"] = current_capacity
         waves.append(wave)
         late_visible_pending = int(wave.get("late_visible_pending") or 0)
-        if int(wave.get("retry_pending") or 0) > 0:
+        if (int(wave.get("retry_pending") or 0) > 0
+                and not (wave["failed"] or wave["timed_out"] or wave["stopped"]
+                         or wave["completed"] != wave["requested"])):
             # A transient first/second-round review failure is persisted on the
             # open attempt. End this production cycle quietly; the next cycle
             # will retry it and only round three can create an isolation.

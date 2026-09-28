@@ -8342,3 +8342,50 @@ def test_failure_round_recorder_does_not_build_a_live_oa_engine(tmp_path, monkey
     assert recorded.get("production_failure_round") == 1
     assert called["live"] == 0
     assert json.loads((case / "state.json").read_text())["production_failure_round"] == 1
+
+
+def test_bounded_policy_isolates_exhausted_review_without_extra_production_rounds(tmp_path, monkeypatch):
+    from apps.oa_finance_preaudit import codex_review_worker as worker
+    probe = finance_preaudit_concurrency_probe
+    monkeypatch.setattr(probe.runtime_control, "stop_requested", lambda: False)
+    _open_action(tmp_path / "runtime" / "finance_preaudit_flows", case_key="8" * 64,
+                 created_at="2026-08-24T12:00:00+00:00")
+    value = {**worker._base_result(attempts=2, usages=[{"status": "unknown"}] * 2),
+             "codex_events": worker._unknown_events(2), "status": "failed",
+             "business_state": "not_available", "write_state": "not_requested",
+             "error_code": "codex_process_failed"}
+    quarantines = []
+    def quarantine(path, code):
+        quarantines.append(code)
+        return {"action": "needs_admin", "execution_state": "needs_admin", "business_state": "not_available",
+                "write_state": "not_requested", "reason": "codex_review_failed"}
+    result = probe._run_dispatched_tasks(
+        1, 1, project_root=tmp_path, renew_actions=lambda paths: paths,
+        review_worker=lambda _: value, quarantine_review=quarantine,
+        record_failure_round=lambda *_: {"production_failure_round": 1}, defer_review_failures=False,
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        runtime_status=lambda: {"status": "healthy"},
+    )
+    assert quarantines == ["codex_process_failed"]
+    assert result.outcomes[0].value["status"] == "quarantined"
+
+
+def test_retry_pending_does_not_hide_prepare_timeout(monkeypatch):
+    probe = finance_preaudit_concurrency_probe
+    monkeypatch.setattr(probe.runtime_control, "stop_requested", lambda: False)
+    monkeypatch.setattr(probe.runtime_control, "request_cycle_stop", lambda: None)
+    result = process_pool.PoolResult(requested=2, started=2, completed=1, failed=0, timed_out=1,
+        stopped=0, peak_active=1, elapsed_seconds=1.0, outcomes=(
+            process_pool.TaskOutcome(index=0, status="completed", value={"status": "retry_pending",
+                "error_code": "codex_review_retry_pending", "token_usage": {"status": "unknown"}}),
+            process_pool.TaskOutcome(index=1, status="timed_out", value=None,
+                error_code="production_probe_prepare_timeout"),
+        ))
+    payload = probe._run_rolling_drain_locked(
+        capacity=2, live_status=lambda: {"credentials": {"status": "ok"}, "oa": {
+            "execution_identity": "verified", "by_workflow": {"travel_expense": 2}}},
+        reconcile_status=lambda: _reconciliation_snapshot(2, 0),
+        pipeline_runner=lambda *_: result,
+    )
+    assert payload["status"] == "failed"
+    assert payload["primary_error_code"] == "production_probe_prepare_timeout"
