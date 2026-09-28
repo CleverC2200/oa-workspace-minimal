@@ -284,6 +284,19 @@ def verified_no_write_failure(attempt_root: Path, state: dict, code: str) -> boo
             and boundary["stages"][-1] == stages[code])
 
 
+def verified_cycle_stop_no_write_failure(attempt_root: Path, state: dict) -> bool:
+    """Recognize an exact signed stop before submit; never clear a stop or replay."""
+    if (state.get("reason") != writer_outcomes.PREFLIGHT_FAILED
+            or state.get("write_state") != "not_requested"):
+        return False
+    boundary = _verified_failure_boundary(attempt_root, state)
+    return (boundary is not None
+            and boundary["failure_code"] == writer_outcomes.PREFLIGHT_FAILED
+            and boundary.get("failure_detail_code") == "stop_requested"
+            and boundary["stages"][-1] == "preflight_failed"
+            and "submit_started" not in boundary["stages"])
+
+
 def verified_unknown_write_failure(attempt_root: Path, state: dict, code: str) -> bool:
     """Validate historical unknown evidence without resolving or authorizing it."""
     if code not in writer_outcomes.UNKNOWN_WRITE_CODES:
