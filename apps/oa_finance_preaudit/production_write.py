@@ -246,19 +246,12 @@ def verified_submit_rejection(attempt_root: Path, state: dict) -> bool:
     return verified_no_write_failure(attempt_root, state, writer_outcomes.SUBMIT_REJECTED)
 
 
-def verified_no_write_failure(attempt_root: Path, state: dict, code: str) -> bool:
-    """Recheck the exact signed local Writer boundary without contacting OA."""
+def _verified_failure_boundary(attempt_root: Path, state: dict) -> dict | None:
+    """Read an exact signed frozen boundary; never contact OA or replay a write."""
     try:
-        stages = {
-            writer_outcomes.SUBMIT_REJECTED: "submit_rejected",
-            writer_outcomes.PREFLIGHT_FAILED: "preflight_failed",
-            writer_outcomes.TARGET_CHANGED: "preflight_failed",
-        }
-        if code not in stages:
-            return False
         secret = auth.env("OA_APP_SECRET")
-        if not secret:
-            return False
+        if not secret or os.path.lexists(attempt_root / "execution-receipt.json"):
+            return None
         files = {
             "decision_file": attempt_root / "review-decision.json",
             "remark_file": attempt_root / "remark.txt",
@@ -272,15 +265,41 @@ def verified_no_write_failure(attempt_root: Path, state: dict, code: str) -> boo
             envelope_fingerprint=_file_fingerprint(files["envelope_file"]),
         )
         _validate_job(job, attempt_root.parents[3])
-        boundary = _read_boundary(attempt_root / _BOUNDARY_FILE, job, secret)
-        return (
-            boundary is not None
-            and boundary["failure_code"] == code
-            and boundary["stages"][-1] == stages[code]
-            and not os.path.lexists(attempt_root / "execution-receipt.json")
-        )
+        return _read_boundary(attempt_root / _BOUNDARY_FILE, job, secret)
     except (OSError, KeyError, TypeError, ValueError, RuntimeError):
+        return None
+
+
+def verified_no_write_failure(attempt_root: Path, state: dict, code: str) -> bool:
+    """Recheck the exact signed local Writer boundary without contacting OA."""
+    stages = {
+        writer_outcomes.SUBMIT_REJECTED: "submit_rejected",
+        writer_outcomes.PREFLIGHT_FAILED: "preflight_failed",
+        writer_outcomes.TARGET_CHANGED: "preflight_failed",
+    }
+    if code not in stages:
         return False
+    boundary = _verified_failure_boundary(attempt_root, state)
+    return (boundary is not None and boundary["failure_code"] == code
+            and boundary["stages"][-1] == stages[code])
+
+
+def verified_unknown_write_failure(attempt_root: Path, state: dict, code: str) -> bool:
+    """Validate historical unknown evidence without resolving or authorizing it."""
+    if code not in writer_outcomes.UNKNOWN_WRITE_CODES:
+        return False
+    boundary = _verified_failure_boundary(attempt_root, state)
+    if boundary is None or "submit_started" not in boundary["stages"]:
+        return False
+    if code == "writer_result_unknown":
+        return (boundary["failure_code"] in writer_outcomes.UNKNOWN_WRITE_CODES | {None}
+                and boundary["stages"][-1] != "postcheck_verified")
+    stages = {
+        writer_outcomes.TRANSPORT_UNKNOWN: "submit_unknown",
+        writer_outcomes.POSTCHECK_TIMEOUT: "postcheck_unknown",
+        writer_outcomes.PENDING_CONFLICT: "postcheck_conflict",
+    }
+    return boundary["failure_code"] == code and boundary["stages"][-1] == stages[code]
 
 
 def _record_boundary(

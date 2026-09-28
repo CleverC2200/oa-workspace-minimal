@@ -568,6 +568,8 @@ def _decision_schema(action_file: Path | None = None, *, read_only: bool = False
 
 
 def _normalize_decision(action_file: Path, decision: dict) -> dict:
+    from .review_decision import bind_frozen_fields
+    decision = bind_frozen_fields(action_file, decision)
     workflow_key = _action_workflow(action_file)
     if (
         workflow_key != "small_marketing_fee"
@@ -1006,7 +1008,7 @@ def _execute_codex_raw(
                 candidate = None
                 decision_state = "unreadable"
             if isinstance(candidate, dict):
-                decision = _normalize_decision(action_file, candidate)
+                decision = candidate if read_only else _normalize_decision(action_file, candidate)
                 decision_state = "valid_object"
             elif candidate is not None:
                 decision_state = "not_object"

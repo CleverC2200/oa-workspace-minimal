@@ -406,14 +406,10 @@ def test_validated_preview_no_write_unknown_can_be_skipped_before_discovery(
     assert resumed["case_key"] != first["case_key"]
 
 
-def test_listed_unconfirmed_submit_boundary_can_be_skipped(
+def test_unsigned_unconfirmed_submit_boundary_cannot_be_skipped(
     tmp_path: Path,
 ) -> None:
-    """A historical unknown whose write is unconfirmed may be skipped when listed.
-
-    The caller lists it only after the live continuation gate proved that no
-    pending identity still owns the attempt; the manual review record stays.
-    """
+    """Listing a historical record cannot replace a signed Writer boundary."""
     candidates = _candidates(("first-request", "second-request"))
     first = _engine(tmp_path, candidates=[candidates[0]]).next_action(
         "travel_expense"
@@ -425,19 +421,14 @@ def test_listed_unconfirmed_submit_boundary_can_be_skipped(
         encoding="utf-8",
     )
 
-    resumed = _engine(
-        tmp_path,
-        candidates=[candidates[1]],
-        authorization_source=_grant,
-        submit_frozen=_success,
-    ).next_action(
-        "travel_expense",
-        mode="controlled_write",
-        skip_unknown_failures=frozenset({action_path}),
-    )
-
-    assert resumed["action"] == "review_required"
-    assert resumed["case_key"] != first["case_key"]
+    with pytest.raises(ValueError, match="historical_unknown_failure_invalid"):
+        _engine(
+            tmp_path, candidates=[candidates[1]], authorization_source=_grant,
+            submit_frozen=_success,
+        ).next_action(
+            "travel_expense", mode="controlled_write",
+            skip_unknown_failures=frozenset({action_path}),
+        )
 
 
 def test_unconfirmed_submit_boundary_with_receipt_cannot_be_skipped(

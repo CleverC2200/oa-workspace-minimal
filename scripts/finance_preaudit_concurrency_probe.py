@@ -4470,6 +4470,7 @@ def run_rolling_drain(
     recovery_action_files: Sequence[Path] = (),
     allowed_workflows: frozenset[str] = ROLLING_WORKFLOW_KEYS,
     confirm_stale_children_reaped: bool = False,
+    authorized_recovery_once: bool = False,
 ) -> dict:
     recovery_queue = tuple(
         Path(path).expanduser().resolve() for path in recovery_action_files
@@ -4480,6 +4481,8 @@ def run_rolling_drain(
     ):
         raise ValueError("production_rolling_workflow_scope_invalid")
     if recovery_queue and pipeline_runner is not _run_global_dispatched_tasks:
+        raise ValueError("production_rolling_recovery_runner_invalid")
+    if authorized_recovery_once and (recovery_queue or pipeline_runner is not _run_global_dispatched_tasks):
         raise ValueError("production_rolling_recovery_runner_invalid")
     scoped_reconcile_status = (
         (lambda: _production_reconciliation(allowed_workflows))
@@ -4496,6 +4499,16 @@ def run_rolling_drain(
     controller_handoff.assert_ready_for_start()
     try:
         with runtime_control.global_controller_lease():
+            if authorized_recovery_once:
+                from apps.oa_finance_preaudit.case_recovery import select_once
+                from apps.oa_finance_preaudit import production_write
+                authorized_workflows = frozenset(production_write._authorized_workflows(
+                    production_write._policy_path(),
+                ))
+                recovery_queue = select_once(
+                    PROJECT_ROOT / "runtime" / "finance_preaudit_flows",
+                    scoped_reconcile_status(), allowed_workflows & authorized_workflows,
+                )
             cache_maintenance = attachment_cache.prune_expired()
             admission_cutoff = (
                 datetime.now(timezone.utc) + timedelta(minutes=60)
@@ -4517,6 +4530,7 @@ def run_rolling_drain(
                     "review_timeout_seconds": 960,
                     "writer_capacity": 1,
                     "recovery_count": len(recovery_queue),
+                    "authorized_recovery_once": authorized_recovery_once,
                     "admission_cutoff": admission_cutoff,
                 }
             )
@@ -5295,6 +5309,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         default=[],
     )
+    parser.add_argument("--recover-confirmed-no-write-once", choices=("YES",))
     parser.add_argument(
         "--confirm-stale-children-reaped",
         choices=("YES",),
@@ -5309,6 +5324,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 or args.recover_action_file
                 or args.workflow
                 or args.confirm_stale_children_reaped
+                or args.recover_confirmed_no_write_once
             ):
                 raise ValueError("read_only_probe_scheduler_invalid")
             payload = (
@@ -5341,6 +5357,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 rolling_args["recovery_action_files"] = tuple(
                     args.recover_action_file
                 )
+            if args.recover_confirmed_no_write_once == "YES":
+                rolling_args["authorized_recovery_once"] = True
             if args.confirm_stale_children_reaped == "YES":
                 rolling_args["confirm_stale_children_reaped"] = True
             controller_started = True
