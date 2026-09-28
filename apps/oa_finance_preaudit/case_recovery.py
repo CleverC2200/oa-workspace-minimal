@@ -3,11 +3,12 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from apps.oa_approval import writer_outcomes
+from apps.oa_approval import auth, writer_outcomes
 from apps import json_artifact
 from . import review_failure_evidence as evidence
 
@@ -16,6 +17,11 @@ ALLOWED_REASONS = frozenset({
     "codex_review_failed", "codex_decision_invalid", "material_collection_failed",
     *writer_outcomes.CONFIRMED_NO_WRITE_CODES,
 })
+
+
+def _owner_key() -> str | None:
+    target = str(auth.env("OA_FEISHU_ALERT_CHAT_ID") or "").strip()
+    return hashlib.sha256(("oa-preaudit-owner-v1\0" + target).encode()).hexdigest() if target else None
 
 
 def takeover(action_file: Path, *, confirmed: bool) -> dict:
@@ -31,7 +37,10 @@ def takeover(action_file: Path, *, confirmed: bool) -> dict:
         raise ValueError("takeover_identity_invalid")
     receipt = {"schema_version": 1, "kind": "preaudit_takeover", "item_key": state["case_key"],
                "workflow_key": state["workflow_key"], "attempt": state["attempt"], "owner": OWNER,
+               "owner_key": _owner_key(),
                "state_fingerprint": evidence.file_fingerprint(path.with_name("state.json"))}
+    if receipt["owner_key"] is None:
+        raise ValueError("takeover_owner_unconfigured")
     target = path.with_name("takeover-receipt.json")
     if target.exists() or target.is_symlink():
         existing = evidence.read_receipt(target)
@@ -53,6 +62,7 @@ def _takeover_receipt(state: dict) -> dict | None:
             or receipt.get("workflow_key") != state.get("workflow_key")
             or receipt.get("item_key") != state.get("case_key")
             or receipt.get("attempt") != state.get("attempt") or receipt.get("owner") != OWNER
+            or not isinstance(receipt.get("owner_key"), str) or len(receipt["owner_key"]) != 64
             or receipt.get("state_fingerprint") != evidence.file_fingerprint(path)):
         return None
     try:
@@ -105,10 +115,12 @@ def select_once(root: Path, report: dict, allowed_workflows: frozenset[str]) -> 
 
 
 def pending_dispositions(root: Path, states: list[dict], pending: list[dict],
-                         manual: list[dict], now: datetime) -> dict:
+                         manual: list[dict], now: datetime, findings: list[dict] | None = None) -> dict:
     """Every current pending identity gets a bounded, non-authorizing next step."""
     by_identity = {(s["request_id"], s["received_at"]): s for s in states}
     by_case = {item["item_key"]: item for item in manual}
+    by_finding = {item["item_key"]: item for item in (findings or [])}
+    owner_key = _owner_key()
     rows = []
     for row in pending:
         request = str(row.get("request_id") or row.get("requestId") or "")
@@ -125,15 +137,23 @@ def pending_dispositions(root: Path, states: list[dict], pending: list[dict],
         age = max(0, int((now - started).total_seconds())) if started else "unknown"
         attempted = "recovered_from_attempt" in state or state.get("attempt", 1) > 1
         next_step, owner = "continue_fifo", "rolling_controller"
+        related = [by_finding.get(s["case_key"], {}) for s in states if s["request_id"] == request]
+        security_fault = any(x.get("category") in {"identity_conflict", "pending_handled_conflict"} for x in related)
         if state.get("write_state") in {"unknown", "submitting"}:
             next_step, owner = "verify_original_write", OWNER
+            security_fault = True
         elif state.get("execution_state") == "needs_admin":
             next_step, owner = "investigate_failure", OWNER
             if item.get("recommendation") == "confirmed_no_write_recovery_candidate":
                 next_step = "manual_takeover" if attempted else "authorized_recovery_once"
+        if state.get("reason") == "write_authorization_invalid":
+            security_fault = True
+        if security_fault and state.get("write_state") not in {"unknown", "submitting"}:
+            next_step, owner = "verify_identity_or_authorization", OWNER
         if started is None:
             next_step, owner = "verify_received_at", OWNER
         due = started + timedelta(hours=24 if owner == OWNER else 2) if started else None
+        escalation = started + timedelta(hours=2) if started else None
         acknowledged = _takeover_receipt(state) if state else None
         if acknowledged:
             due = _time(acknowledged["resolution_due_at"])
@@ -143,13 +163,19 @@ def pending_dispositions(root: Path, states: list[dict], pending: list[dict],
             "item_key": _item_key(request, received), "workflow_key": row.get("workflow_key"),
             "received_at": received, "age_seconds": age,
             "attempt_created_at": state.get("created_at"),
+            "first_failure_at": state.get("failed_at"),
             "execution_state": state.get("execution_state", "not_claimed"),
             "write_state": state.get("write_state", "not_requested"),
             "failure_code": item.get("failure_code"), "owner": owner,
+            "owner_key": acknowledged["owner_key"] if acknowledged else (owner_key if owner == OWNER else None),
+            "owner_status": "bound" if acknowledged or owner != OWNER or owner_key else "unconfigured",
+            "owner_configuration_changed": bool(acknowledged and acknowledged["owner_key"] != owner_key),
             "next_step": next_step, "recovery_limit_reached": attempted,
             "takeover_status": "acknowledged" if acknowledged else "not_acknowledged",
             "takeover_due_at": (started + timedelta(hours=4)).isoformat() if owner == OWNER and started else None,
             "resolution_due_at": due.isoformat() if due else None, "overdue": now > due if due else False,
+            "escalation_due_at": escalation.isoformat() if escalation else None,
+            "escalation_overdue": now > escalation if escalation else False,
         })
     return {"read_only": True, "items": sorted(rows, key=lambda x: (x["received_at"], x["item_key"])),
             "overdue": sum(row["overdue"] for row in rows), "total": len(rows)}

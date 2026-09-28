@@ -88,7 +88,8 @@ def test_summary_preserves_all_safety_gates_and_removes_large_history():
     assert len(result["reconciliation"]["manual_review"]["items"]) == 1
 
 
-def test_takeover_records_responsibility_without_touching_frozen_state(tmp_path: Path):
+def test_takeover_records_responsibility_without_touching_frozen_state(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OA_FEISHU_ALERT_CHAT_ID", "configured-person")
     root = tmp_path / "flows"
     rows = [{"request_id": "case", "received_at": "2026-09-01 09:00:00", "workflow_key": "travel_expense"}]
     engine = flow_engine.FlowEngine(root=root, discover_candidates=lambda _: rows,
@@ -104,3 +105,21 @@ def test_takeover_records_responsibility_without_touching_frozen_state(tmp_path:
     report = reconciliation.reconcile(root, pending_rows=rows, handled_rows=[])
     assert report["pending_dispositions"]["items"][0]["takeover_status"] == "acknowledged"
     assert report["pending_dispositions"]["items"][0]["next_step"] == "manual_processing"
+    assert len(first["owner_key"]) == 64 and "configured-person" not in json.dumps(first)
+    monkeypatch.setenv("OA_FEISHU_ALERT_CHAT_ID", "different-person")
+    changed = reconciliation.reconcile(root, pending_rows=rows, handled_rows=[])
+    assert changed["pending_dispositions"]["items"][0]["owner_key"] == first["owner_key"]
+    assert changed["pending_dispositions"]["items"][0]["owner_configuration_changed"] is True
+
+
+def test_unknown_write_gets_two_hour_escalation_and_real_recipient_binding(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OA_FEISHU_ALERT_CHAT_ID", "configured-person")
+    state = {"request_id": "case", "received_at": "2026-09-28 12:00:00", "case_key": "case",
+             "attempt": 1, "write_state": "unknown", "execution_state": "needs_admin"}
+    now = datetime(2026, 9, 28, 7, tzinfo=timezone.utc)
+    result = case_recovery.pending_dispositions(tmp_path, [state], [{
+        "request_id": "case", "received_at": state["received_at"], "workflow_key": "travel_expense",
+    }], [], now)
+    row = result["items"][0]
+    assert row["escalation_due_at"] == "2026-09-28T06:00:00+00:00"
+    assert row["escalation_overdue"] is True and row["owner_status"] == "bound"

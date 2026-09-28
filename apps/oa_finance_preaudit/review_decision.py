@@ -35,9 +35,9 @@ def main(argv=None) -> int:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
-    output = args.output.absolute()
-    if (output.exists() or output.is_symlink() or args.input.is_symlink()
-            or output.is_relative_to(args.action_file.absolute().parent)):
+    output = args.output.resolve()
+    if (output.exists() or args.output.is_symlink() or args.input.is_symlink()
+            or output.is_relative_to(args.action_file.resolve().parent)):
         raise ValueError("review_decision_output_unsafe")
     result = bind_frozen_fields(args.action_file, json.loads(args.input.read_text(encoding="utf-8")))
     json_artifact.write_json_atomic(output, result, indent=2)

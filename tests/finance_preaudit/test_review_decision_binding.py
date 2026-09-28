@@ -40,3 +40,14 @@ def test_binding_rejects_changed_frozen_inputs_and_reserved_output(tmp_path: Pat
                               "--output", str(path.with_name("review-decision.json"))])
     path.with_name("material.json").write_text("{}")
     with pytest.raises(ValueError): review_decision.bind_frozen_fields(path, {"overall": "pass", "items": []})
+
+
+def test_output_cannot_enter_attempt_through_parent_alias(tmp_path: Path):
+    action = _action(tmp_path)
+    path = Path(action["action_file"])
+    draft = tmp_path / "draft.json"; draft.write_text("{}")
+    alias = tmp_path / "alias"; alias.symlink_to(path.parent, target_is_directory=True)
+    for output in (alias / "new-decision.json", tmp_path / "unused" / ".." / "alias" / "new-decision.json"):
+        with pytest.raises(ValueError, match="review_decision_output_unsafe"):
+            review_decision.main(["--action-file", str(path), "--input", str(draft), "--output", str(output)])
+    assert not path.with_name("new-decision.json").exists()

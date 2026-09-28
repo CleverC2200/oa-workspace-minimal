@@ -563,7 +563,7 @@ def reconcile(
             "items": sorted(manual_items, key=lambda item: item["item_key"]),
         },
         "pending_dispositions": case_recovery.pending_dispositions(
-            root, states, pending_input, manual_items, current_time,
+            root, states, pending_input, manual_items, current_time, findings=findings,
         ),
         "findings": sorted(findings, key=lambda item: item["item_key"]),
     }

@@ -1332,9 +1332,10 @@ def _validate_packaging_visual_review(
         or set(visual_review) != {"outcome", "pages"}
         or visual_review.get("outcome") not in {"reviewed", "all_non_packaging"}
         or not isinstance(visual_review.get("pages"), list)
-        or len(visual_review["pages"]) < len(page_refs)
     ):
         raise decision_validation.InvalidDecision("packaging_visual_contract")
+    if len(visual_review["pages"]) < len(page_refs):
+        raise decision_validation.InvalidDecision("packaging_page_coverage")
     items_by_key = {item["item_key"]: item for item in items}
     page_positions = {page_ref: index for index, page_ref in enumerate(page_refs)}
     if len(page_positions) != len(page_refs):
@@ -1357,10 +1358,10 @@ def _validate_packaging_visual_review(
         classification = page.get("classification")
         version_id = page.get("package_version_id")
         reviewed_keys = page.get("item_keys")
+        if not isinstance(page_ref, str) or page_ref not in page_positions:
+            raise decision_validation.InvalidDecision("packaging_page_reference")
         if (
-            not isinstance(page_ref, str)
-            or page_ref not in page_positions
-            or classification not in _PACKAGING_PAGE_CLASSIFICATIONS
+            classification not in _PACKAGING_PAGE_CLASSIFICATIONS
             or not isinstance(reviewed_keys, list)
             or not all(isinstance(key, str) for key in reviewed_keys)
             or len(set(reviewed_keys)) != len(reviewed_keys)
@@ -1391,7 +1392,7 @@ def _validate_packaging_visual_review(
                     *item["evidence_refs"],
                     *item["missing_evidence"],
                 }:
-                    raise decision_validation.InvalidDecision("packaging_visual_contract")
+                    raise decision_validation.InvalidDecision("packaging_page_reference")
         elif version_id is not None or reviewed_keys:
             raise decision_validation.InvalidDecision("packaging_visual_contract")
         elif classification == "uncertain":
@@ -1407,7 +1408,7 @@ def _validate_packaging_visual_review(
         set(classifications_by_ref) != set(page_refs)
         or observed_positions != sorted(observed_positions)
     ):
-        raise decision_validation.InvalidDecision("packaging_visual_contract")
+        raise decision_validation.InvalidDecision("packaging_page_coverage")
     classifications = [classifications_by_ref[page_ref] for page_ref in page_refs]
 
     referenced_item_pages = {
@@ -1416,7 +1417,7 @@ def _validate_packaging_visual_review(
         for reference in (*item["evidence_refs"], *item["missing_evidence"])
     }
     if non_packaging_refs & referenced_item_pages:
-        raise decision_validation.InvalidDecision("packaging_visual_contract")
+        raise decision_validation.InvalidDecision("packaging_page_reference")
 
     outcome = visual_review["outcome"]
     if outcome == "all_non_packaging":
@@ -1425,14 +1426,14 @@ def _validate_packaging_visual_review(
             or overall != "pass"
             or any(item["status"] != "pass" for item in items)
         ):
-            raise decision_validation.InvalidDecision("packaging_visual_contract")
+            raise decision_validation.InvalidDecision("packaging_overall_mismatch")
         return outcome
 
     if all(value == "non_packaging" for value in classifications):
-        raise decision_validation.InvalidDecision("packaging_visual_contract")
+        raise decision_validation.InvalidDecision("packaging_overall_mismatch")
     expected_items = set(item_keys)
     if any(covered != expected_items for covered in version_items.values()):
-        raise decision_validation.InvalidDecision("packaging_visual_contract")
+        raise decision_validation.InvalidDecision("packaging_version_coverage")
     if uncertain_refs:
         covered_uncertain_refs = {
             reference
@@ -1440,10 +1441,10 @@ def _validate_packaging_visual_review(
             if item["status"] == "uncertain"
             for reference in item["missing_evidence"]
         }
-        if overall != "needs_human" or not uncertain_refs.issubset(
-            covered_uncertain_refs
-        ):
-            raise decision_validation.InvalidDecision("packaging_visual_contract")
+        if overall != "needs_human":
+            raise decision_validation.InvalidDecision("packaging_overall_mismatch")
+        if not uncertain_refs.issubset(covered_uncertain_refs):
+            raise decision_validation.InvalidDecision("packaging_page_reference")
     return outcome
 
 
@@ -1768,13 +1769,14 @@ class FlowEngine:
             **(failure_details or {}),
         )
         json_artifact.write_json_atomic(action_path, action, indent=2)
+        failed_state = {**state, **action, "failed_at": state.get("failed_at") or datetime.now(timezone.utc).isoformat()}
         json_artifact.write_json_atomic(
             state_path,
-            {**state, **action},
+            failed_state,
             indent=2,
         )
         item_failure.persist(
-            attempt_root, {**state, **action}, confirmed_rejection=confirmed_rejection,
+            attempt_root, failed_state, confirmed_rejection=confirmed_rejection,
         )
         return self._persist_current_action(
             workflow_root,

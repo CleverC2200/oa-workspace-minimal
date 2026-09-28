@@ -8,6 +8,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import uuid
 
@@ -44,6 +45,30 @@ def _window(root: Path, key: str) -> Path:
     return root / (hashlib.sha256(key.encode()).hexdigest() + ".json")
 
 
+def _owned(root: Path, terminal_result: str | None = None) -> dict:
+    active = root / "active"
+    if active.is_symlink() or not active.is_dir():
+        raise ValueError("repair_dispatch_owner_invalid")
+    owner = _read(active / "owner.json")
+    record = _read(_window(root, owner.get("window_key")))
+    if (owner.get("schema_version") != 1 or owner.get("kind") != "oa_repair_dispatch"
+            or not isinstance(owner.get("reservation_id"), str)
+            or re.fullmatch(r"[0-9a-f]{32}", owner["reservation_id"]) is None
+            or owner.get("status") not in {"reserved", "running"}
+            or not isinstance(owner.get("source_thread_id"), str) or not owner["source_thread_id"]
+            or (owner["status"] == "running" and (not isinstance(owner.get("thread_id"), str) or not owner["thread_id"]))):
+        raise ValueError("repair_dispatch_owner_invalid")
+    if record != owner:
+        binding = ("schema_version", "kind", "window_key", "source_thread_id", "reservation_id", "thread_id")
+        if (terminal_result is None or owner["status"] != "running" or record.get("status") != terminal_result
+                or any(owner.get(key) != record.get(key) for key in binding)):
+            raise ValueError("repair_dispatch_owner_invalid")
+    updated = datetime.fromisoformat(str(owner.get("updated_at") or ""))
+    if updated.tzinfo is None:
+        raise ValueError("repair_dispatch_owner_invalid")
+    return owner
+
+
 def status(root: Path = DEFAULT_ROOT) -> dict:
     active = root / "active"
     if not os.path.lexists(active):
@@ -51,14 +76,7 @@ def status(root: Path = DEFAULT_ROOT) -> dict:
     if active.is_symlink() or not active.is_dir():
         return {"status": "ownership_unverified", "next_step": "verify_ownership"}
     try:
-        owner = _read(active / "owner.json")
-        record = _read(_window(root, owner["window_key"]))
-        if (owner != record or owner.get("schema_version") != 1
-                or owner.get("kind") != "oa_repair_dispatch"
-                or owner.get("status") not in {"reserved", "running"}
-                or not isinstance(owner.get("reservation_id"), str)
-                or len(owner["reservation_id"]) != 32):
-            raise ValueError("repair_dispatch_owner_invalid")
+        owner = _owned(root)
         created = datetime.fromisoformat(owner["updated_at"])
         if created.tzinfo is None:
             raise ValueError("repair_dispatch_owner_invalid")
@@ -74,6 +92,11 @@ def reserve(root: Path, window_key: str, source_thread_id: str) -> dict:
         target = _window(root, window_key)
         if os.path.lexists(target):
             return {"status": "already_dispatched", "record": _read(target)}
+        for path in root.glob("*.json"):
+            legacy = _read(path)
+            if (legacy.get("window_key") == window_key or legacy.get("window_id") == window_key
+                    or path.stem == window_key):
+                return {"status": "already_dispatched", "record": legacy}
         if status(root)["status"] != "idle":
             return {"status": "waiting_for_user", "reason": "repair_dispatch_active_exists",
                     "active": status(root)}
@@ -117,13 +140,9 @@ def finish(root: Path, reservation_id: str, thread_id: str, result: str, *, conf
     if not confirmed_terminal or result not in {"completed", "failed", "waiting_for_user"}:
         raise ValueError("repair_dispatch_terminal_confirmation_required")
     with _lease(root):
-        owner = _read(root / "active" / "owner.json")
-        record = _read(_window(root, owner.get("window_key")))
-        binding = ("schema_version", "kind", "window_key", "source_thread_id", "reservation_id", "thread_id")
+        owner = _owned(root, terminal_result=result)
         if (owner.get("reservation_id") != reservation_id or owner.get("thread_id") != thread_id
-                or owner.get("status") != "running"
-                or any(owner.get(key) != record.get(key) for key in binding)
-                or record.get("status") not in {"running", result}):
+                or owner.get("status") != "running"):
             raise ValueError("repair_dispatch_owner_invalid")
         record = dict(owner)
         record.update(status=result, updated_at=datetime.now(timezone.utc).isoformat())

@@ -56,3 +56,27 @@ def test_confirmed_terminal_release_recovers_interrupted_window_update(tmp_path:
     assert dispatch.status(root)["status"] == "ownership_unverified"
     dispatch.finish(root, reserved["reservation_id"], "task", "completed", confirmed_terminal=True)
     assert dispatch.status(root)["status"] == "idle"
+
+
+def test_legacy_window_record_prevents_duplicate_dispatch(tmp_path: Path):
+    from apps import json_artifact
+    root = tmp_path / "dispatch"; root.mkdir()
+    json_artifact.write_json_atomic(root / "old-window.json", {
+        "window_id": "window", "state": "completed", "threadId": "old-task",
+    })
+    assert dispatch.reserve(root, "window", "source")["status"] == "already_dispatched"
+    assert dispatch.status(root)["status"] == "idle"
+
+
+@pytest.mark.parametrize("field,value", [("schema_version", 2), ("kind", "unrecognized"), ("reservation_id", "bad")])
+def test_finish_reuses_owner_validation_for_matching_corrupted_records(tmp_path: Path, field, value):
+    from apps import json_artifact
+    root = tmp_path / "dispatch"
+    reserved = dispatch.reserve(root, "window", "source")
+    running = dispatch.bind(root, reserved["reservation_id"], "task")
+    corrupted = {**running, field: value}
+    json_artifact.write_json_atomic(root / "active" / "owner.json", corrupted)
+    json_artifact.write_json_atomic(dispatch._window(root, "window"), corrupted)
+    with pytest.raises(ValueError):
+        dispatch.finish(root, corrupted["reservation_id"], "task", "completed", confirmed_terminal=True)
+    assert (root / "active").exists()
