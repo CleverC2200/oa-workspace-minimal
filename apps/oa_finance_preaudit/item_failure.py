@@ -66,6 +66,10 @@ def _scope(root: Path, state: dict, *, confirmed_rejection: bool) -> str:
     reason = state.get("reason")
     if reason == writer_outcomes.SUBMIT_REJECTED:
         return "item" if confirmed_rejection else "controller"
+    if reason == writer_outcomes.PREFLIGHT_FAILED:
+        from . import production_write
+
+        return "item" if production_write.verified_cycle_stop_no_write_failure(root, state) else "controller"
     if any(os.path.lexists(root / name) for name in _ARTIFACTS[3:]):
         return "controller"
     if reason == "codex_review_failed":

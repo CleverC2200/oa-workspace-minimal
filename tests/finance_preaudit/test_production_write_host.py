@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from apps import json_artifact
-from apps.oa_finance_preaudit import flow_engine, production_write, submission
+from apps.oa_finance_preaudit import flow_engine, item_failure, production_write, reconciliation, submission
 
 
 NOW = datetime(2026, 8, 23, 1, 0, tzinfo=timezone.utc)
@@ -727,6 +727,75 @@ def test_stop_before_writer_preflight_is_confirmed_no_write(
     assert result["reason"] == "writer_preflight_failed"
     assert result["write_state"] == "not_requested"
     assert api.calls == []
+
+
+@pytest.mark.parametrize("mutation", [None, "signature", "detail", "started", "receipt", "remark", "symlink", "packet", "attachment", "prepared", "state_detail"])
+def test_cycle_stop_receipt_only_isolates_signed_unwritten_stop(tmp_path: Path, monkeypatch, mutation: str | None) -> None:
+    root = tmp_path / "flows"
+    policy = tmp_path / "write-policy.json"
+    json_artifact.write_json_atomic(policy, {
+        "schema_version": 1, "kind": "preaudit_write_policy", "authorized_workflows": ["travel_expense"],
+    })
+    secret = "local-test-secret"
+    monkeypatch.setenv("OA_APP_SECRET", secret)
+    stopped = [False]
+    api = FakeWriterApi(on_pending=lambda: stopped.__setitem__(0, True))
+    ports = production_write.build_ports(
+        root=root, policy_file=policy, signing_secret=secret, api_factory=lambda: api, now=lambda: NOW,
+    )
+    candidate = {"request_id": "live-request", "received_at": api.received_at, "workflow_key": "travel_expense"}
+    engine = flow_engine.FlowEngine(
+        root=root, discover_candidates=lambda key: [candidate],
+        collect_material=_material_with_files, **ports,
+    )
+    action = engine.next_action("travel_expense", mode="controlled_write")
+    decision = tmp_path / "decision.json"
+    json_artifact.write_json_atomic(decision, _decision(action))
+    monkeypatch.setattr(production_write.runtime_control, "stop_requested", lambda: stopped[0])
+    failed = engine.complete_review(Path(action["action_file"]), decision)
+    attempt = Path(failed["action_file"]).parent
+    state = json.loads((attempt / "state.json").read_text())
+    boundary_path = attempt / "writer-boundary.json"
+    boundary = json.loads(boundary_path.read_text())
+    if mutation == "signature":
+        boundary["proof"] = "hmac-sha256:" + "0" * 64
+    elif mutation == "detail":
+        boundary["failure_detail_code"] = "authorization_invalid"
+        boundary["proof"] = production_write._boundary_proof(boundary, secret)
+    elif mutation == "started":
+        boundary.update(stages=["preflight_started", "target_verified", "submit_started", "submit_unknown"],
+                        failure_code="writer_transport_unknown", failure_detail_code=None)
+        boundary["proof"] = production_write._boundary_proof(boundary, secret)
+    if mutation in {"signature", "detail", "started"}:
+        json_artifact.write_json_atomic(boundary_path, boundary)
+    elif mutation == "receipt":
+        (attempt / "execution-receipt.json").write_text("{}")
+    elif mutation == "remark":
+        (attempt / "remark.txt").write_text("changed frozen text")
+    elif mutation == "symlink":
+        target = tmp_path / "boundary.json"
+        boundary_path.rename(target)
+        boundary_path.symlink_to(target)
+    elif mutation == "packet":
+        (attempt / "review-packet.json").write_text("{}")
+    elif mutation == "attachment":
+        (attempt / "attachments" / "source.txt").write_text("changed attachment")
+    elif mutation == "prepared":
+        (attempt / "prepared" / "page-1.txt").write_text("changed page")
+    elif mutation == "state_detail":
+        state["failure_detail_code"] = "authorization_invalid"
+        changed_action = json.loads((attempt / "action.json").read_text())
+        changed_action["failure_detail_code"] = state["failure_detail_code"]
+        json_artifact.write_json_atomic(attempt / "action.json", changed_action)
+        json_artifact.write_json_atomic(attempt / "state.json", state)
+    item_failure.persist(attempt, state)
+    assert item_failure.isolated(attempt, state) is (mutation is None)
+    assert production_write.runtime_control.stop_requested() is True
+    assert api.calls == []
+    before = (attempt / "state.json").read_bytes()
+    report = reconciliation.reconcile(root, pending_rows=[candidate], handled_rows=[])
+    assert report["continuation"]["status"] == ("ready" if mutation is None else "blocked")
+    assert (attempt / "state.json").read_bytes() == before
 
 
 def test_submit_started_unknown_is_not_replayed(tmp_path: Path) -> None:
