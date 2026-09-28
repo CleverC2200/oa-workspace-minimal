@@ -138,7 +138,10 @@ def pending_dispositions(root: Path, states: list[dict], pending: list[dict],
         attempted = "recovered_from_attempt" in state or state.get("attempt", 1) > 1
         next_step, owner = "continue_fifo", "rolling_controller"
         related = [by_finding.get(s["case_key"], {}) for s in states if s["request_id"] == request]
-        security_fault = any(x.get("category") in {"identity_conflict", "pending_handled_conflict"} for x in related)
+        security_fault = any(
+            x.get("category") in {"identity_conflict", "pending_handled_conflict"}
+            and x.get("recommendation") != "deferred_historical_cleanup" for x in related
+        )
         if state.get("write_state") in {"unknown", "submitting"}:
             next_step, owner = "verify_original_write", OWNER
             security_fault = True

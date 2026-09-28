@@ -123,3 +123,14 @@ def test_unknown_write_gets_two_hour_escalation_and_real_recipient_binding(tmp_p
     row = result["items"][0]
     assert row["escalation_due_at"] == "2026-09-28T06:00:00+00:00"
     assert row["escalation_overdue"] is True and row["owner_status"] == "bound"
+
+
+def test_verified_deferred_history_keeps_fresh_round_in_fifo(tmp_path: Path):
+    old = {"request_id": "same", "received_at": "2026-09-23 09:00:00", "case_key": "old", "attempt": 1}
+    result = case_recovery.pending_dispositions(tmp_path, [old], [{
+        "request_id": "same", "received_at": "2026-09-28 14:00:00", "workflow_key": "travel_expense",
+    }], [], datetime(2026, 9, 28, 7, tzinfo=timezone.utc), findings=[{
+        "item_key": "old", "category": "identity_conflict", "recommendation": "deferred_historical_cleanup",
+    }])
+    row = result["items"][0]
+    assert row["next_step"] == "continue_fifo" and row["owner"] == "rolling_controller"
