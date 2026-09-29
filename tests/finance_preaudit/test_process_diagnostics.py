@@ -108,3 +108,19 @@ def test_error_signals_ignore_evidence_and_handle_fallback_event():
 def test_websocket_closed_signal_without_disconnect_prefix():
     event = {"type": "error", "message": "websocket closed before response.completed"}
     assert process_diagnostics.event_error_signals(io.StringIO(json.dumps(event))) == ["transport_signal"]
+
+
+@pytest.mark.parametrize("event", [
+    {"type": "error", "message": "unexpected status 413 Payload Too Large private-secret"},
+    {"type": "turn.failed", "error": {"message": "413 Request Entity Too Large private-secret"}},
+])
+def test_payload_too_large_signal_is_recorded_without_raw_error(tmp_path, event):
+    path = _action(tmp_path)
+    signals = process_diagnostics.event_error_signals(io.StringIO(json.dumps(event)))
+    assert signals == ["payload_too_large_signal"]
+    process_diagnostics.record(path, execution=worker.CodexExecution(
+        "codex_process_failed", {}, process_state="exited", exit_code=1,
+    ), elapsed_seconds=1, stderr={"event_signals": signals})
+    text = next(tmp_path.glob("review-process-*.json")).read_text()
+    assert "private-secret" not in text
+    assert json.loads(text)["event_signals"] == signals

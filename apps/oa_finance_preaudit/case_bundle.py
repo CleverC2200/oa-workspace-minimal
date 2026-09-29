@@ -544,6 +544,7 @@ def collect_case(
             bound_downloads.append(bound_item)
         images, manifest, structured_contents = attachment_extractors.prepare_materials(
             bound_downloads,
+            compact_pdf=config.get("flow_key") == "general_expense",
             out_dir=Path(
                 prepared_root or Path("runtime/finance_preaudit_prepared")
             ).expanduser().resolve()

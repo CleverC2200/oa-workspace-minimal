@@ -1129,6 +1129,19 @@ def test_bounded_prewrite_failure_persists_bound_receipt(tmp_path: Path, code: s
     }
 
 
+def test_payload_too_large_keeps_diagnostic_and_existing_failure_boundary(tmp_path: Path) -> None:
+    task, action_file = _task(tmp_path)
+    result = codex_review_worker.review(task, executor=lambda *_: codex_review_worker.CodexExecution(
+        error_code="codex_process_failed", token_usage={"status": "unknown"},
+        event_signals=("payload_too_large_signal",), process_state="exited", exit_code=1,
+    ))
+    assert result["process_attempts"] == 2
+    assert result["write_state"] == "not_requested"
+    assert result["codex_events"]["counts"]["payload_too_large_signal"] == 2
+    assert codex_review_worker.is_bounded_prewrite_failure(result)
+    assert action_file.with_name("review-failure.json").is_file()
+
+
 def test_bounded_prewrite_failure_reuses_matching_receipt_after_stop(
     tmp_path: Path,
 ) -> None:

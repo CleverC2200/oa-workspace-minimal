@@ -44,6 +44,7 @@ def render_pdf(
     *,
     out_dir: Path,
     resource_id: str,
+    compact: bool = False,
 ) -> tuple[List[Tuple[Path, str, str]], int, List[str]]:
     out: List[Tuple[Path, str, str]] = []
     page_texts: List[str] = []
@@ -53,8 +54,15 @@ def render_pdf(
         for index in range(page_count):
             page = doc[index]
             pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-            dest = out_dir / f"{safe_name(resource_id, path.stem)}_p{index + 1}.png"
-            pixmap.save(dest)
+            image = pixmap.tobytes("png")
+            suffix = ".png"
+            if compact and len(image) > 256 * 1024:
+                # Preserve resolution; only change the encoding of large scan pages.
+                jpeg = pixmap.tobytes("jpeg", jpg_quality=95)
+                if len(jpeg) < len(image):
+                    image, suffix = jpeg, ".jpg"
+            dest = out_dir / f"{safe_name(resource_id, path.stem)}_p{index + 1}{suffix}"
+            dest.write_bytes(image)
             out.append(
                 (
                     dest,
@@ -630,6 +638,7 @@ def _prepare_one_attachment(
     images: List[Dict[str, Any]],
     manifest: List[Dict[str, Any]],
     structured_contents: List[Dict[str, Any]],
+    compact_pdf: bool = False,
 ) -> None:
     path = Path(str(item.get("path") or "")).expanduser()
     resource_id = str(item.get("resource_id") or "")
@@ -695,6 +704,7 @@ def _prepare_one_attachment(
         try:
             rendered, page_count, page_texts = renderer(
                 path, out_dir=out_dir, resource_id=resource_id or path.stem,
+                **({"compact": True} if compact_pdf and suffix in PDF_EXTS else {}),
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError("legacy_doc_conversion_timeout") from None
@@ -896,6 +906,7 @@ def prepare_materials(
     attachments: List[Dict[str, Any]],
     *,
     out_dir: Path,
+    compact_pdf: bool = False,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     images: List[Dict[str, Any]] = []
     manifest: List[Dict[str, Any]] = []
@@ -919,6 +930,7 @@ def prepare_materials(
                         images=images,
                         manifest=child_manifest,
                         structured_contents=structured_contents,
+                        compact_pdf=compact_pdf,
                     )
             validation_manifest.extend(child_manifest)
             manifest.append(
@@ -938,6 +950,7 @@ def prepare_materials(
                 images=images,
                 manifest=manifest,
                 structured_contents=structured_contents,
+                compact_pdf=compact_pdf,
             )
             validation_manifest.extend(manifest[manifest_count_before:])
     successful_statuses = {

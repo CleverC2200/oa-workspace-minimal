@@ -71,6 +71,7 @@ _SANITIZED_EVENT_TYPES = _EVENT_TYPES | {
     "rate_limit_signal",
     "retry_signal",
     "transport_signal",
+    "payload_too_large_signal",
 }
 _COMPLETION_FAILURE_CODES = writer_outcomes.FAILURE_CODES | {
     "writer_result_unknown",
