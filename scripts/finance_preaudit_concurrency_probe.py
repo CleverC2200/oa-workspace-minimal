@@ -18,6 +18,7 @@ from multiprocessing.connection import wait as wait_for_process
 import os
 from pathlib import Path
 import signal
+import secrets
 import sys
 import threading
 import time
@@ -35,6 +36,7 @@ from apps.oa_finance_preaudit import (
     item_failure,
     observability,
     prepare_failure,
+    prepare_trace,
     process_pool,
     production_pending,
     reconciliation,
@@ -925,6 +927,7 @@ def _recovery_candidates(
 
 
 def _prepare_one(selection: PrepareSelection) -> dict:
+    prepare_trace.stage("selection_contract")
     global_selection = False
     assigned_identities: set[tuple[str, str]] = set()
     historical_unknown_identities: set[tuple[str, str]] = set()
@@ -1046,6 +1049,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
         return failed("selection_contract")
     if runtime_control.stop_requested():
         return {"action": "failed", "error_code": "production_probe_stopped"}
+    prepare_trace.stage("quarantine_probe")
     try:
         historical_authorization_failures = (
             _historical_write_authorization_failures()
@@ -1072,6 +1076,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 and datetime.now(timezone.utc) > admission_cutoff
             ):
                 return {"action": "admission_closed"}
+            prepare_trace.stage("live_pending_read")
             try:
                 live_candidates = production_pending.actionable_fifo(
                     cli._live_pending_identities(),
@@ -1098,6 +1103,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                     stop_action="cycle_stop",
                     workflow_key=selected_workflow,
                 )
+            prepare_trace.stage("identity_contract")
             eligible_live_candidates: list[dict] = []
             for candidate in live_candidates:
                 request_id = str(candidate.get("requestId") or "")
@@ -1132,6 +1138,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 and datetime.now(timezone.utc) > admission_cutoff
             ):
                 return {"action": "admission_closed"}
+            prepare_trace.stage("recovery_candidates")
             try:
                 recovery_candidates = production_pending.actionable_fifo(
                     _recovery_candidates(
@@ -1176,6 +1183,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 and datetime.now(timezone.utc) > admission_cutoff
             ):
                 return {"action": "admission_closed"}
+        prepare_trace.stage("engine_build")
         try:
             if selected is None:
                 engine = cli._live_flow_engine(controlled=True)
@@ -1213,6 +1221,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
             if action_file.is_relative_to(selected_workflow_root)
         )
         while True:
+            prepare_trace.stage("next_action")
             try:
                 if recovery_action_file is not None:
                     action = engine.recover_confirmed_no_write(
@@ -1234,6 +1243,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                     )
             except ValueError as error:
                 if str(error) == "completion_in_progress":
+                    prepare_trace.stage("completion_wait")
                     if runtime_control.stop_requested():
                         return {
                             "action": "failed",
@@ -1291,6 +1301,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                     action_file=recovery_action_file,
                 )
             break
+        prepare_trace.stage("action_validation")
         if runtime_control.stop_requested():
             return {
                 "action": "failed",
@@ -2363,6 +2374,10 @@ def _run_dispatched_tasks(
     write_queue_capacity = max(2, maximum_capacity * 2)
     max_write_queue_depth = 0
     prepare_action = prepare_action or _prepare_one
+    trace_id = secrets.token_hex(16)
+    trace_directory = root / "runtime" / "control"
+    prepare_trace_context: dict = {}
+    timed_out_prepare_context: dict | None = None
     prepare_executor = _preparation_executor()
     prepare_executor_terminated = False
     executor = executor_factory(maximum_capacity)
@@ -2891,6 +2906,8 @@ def _run_dispatched_tasks(
                         owned_process_groups=True,
                     )
                     prepare_executor_terminated = True
+                    if prepare_timed_out:
+                        timed_out_prepare_context = prepare_trace_context
                     preparation = None
                 request_pipeline_stop(
                     "production_probe_prepare_timeout"
@@ -3575,10 +3592,20 @@ def _run_dispatched_tasks(
                         next_index += 1
                         request_pipeline_stop("production_probe_prepare_failed")
                         break
+                    prepare_trace_context = {
+                        "trace_id": trace_id,
+                        "task_id": secrets.token_hex(16),
+                        "task_index": next_index,
+                        "run_id": run_id,
+                        "controller_instance_id": controller_instance_id,
+                    }
                     preparation = (
                         prepare_executor.submit(
+                            prepare_trace.run,
                             prepare_action,
                             selection,
+                            trace_directory,
+                            prepare_trace_context,
                         ),
                         next_index,
                         time.monotonic(),
@@ -3669,6 +3696,9 @@ def _run_dispatched_tasks(
         known_processes,
         timeout_seconds=5,
     )
+
+    if timed_out_prepare_context is not None:
+        prepare_trace.record_timeout(trace_directory, timed_out_prepare_context)
 
     for index, outcome in enumerate(outcomes):
         if outcome is None:
