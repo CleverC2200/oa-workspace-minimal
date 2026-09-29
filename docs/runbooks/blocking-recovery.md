@@ -5,10 +5,16 @@
 生产只读查询使用生产克隆与其 Python：
 
 ```bash
-.venv/bin/python -m apps.oa_finance_preaudit.cli status --check-live --reconcile --summary
+status_dir=$(mktemp -d /tmp/oa-status.XXXXXX) &&
+.venv/bin/python -m apps.oa_finance_preaudit.cli status \
+  --check-live --reconcile --summary --output-file "$status_dir/status.json"
 ```
 
-解析完整终态 JSON。工具返回 session_id 时持续等待原会话；30 秒是工具等待窗口，不是业务命令超时。可信活动控制器只跳过重复启动。
+启动前、结束后和其他需要实时对账的查询都使用新建目录中的独立结果文件。命令先以仅当前用户可读写的权限保存并回读校验完整 JSON，再输出原值保留的身份、交接、continuation、隔离计数和告警字段；大明细列表显示为空并标记 `display_truncated=true`，计数不变，这不表示没有待办或无需人工处理。`status_file` 给出完整文件路径、字节数和 SHA-256。完整文件包含历史、所有明细和原安全字段；仅在本机保留，不提交仓库或上传。
+
+必须等待原调用 `exit_code=0` 后解析终态 JSON。工具返回 session_id 时持续等待原会话；30 秒是工具等待窗口，不是业务命令超时。文件目标已存在、写入或回读校验失败均非零退出，不返回成功门禁摘要，不覆盖已有文件。失败留下的文件不能当作成功对账证据。
+
+需要逐项核对时，从该次 `status_file.path` 读取并校验字节数和 SHA-256，再用 Python/JQ 按字段或小批量提取明细，读取全部必需项；不要把整个文件再次打印到工具输出，也不要为补齐显示而重复调用实时 status。stdout 仍被宿主截断时，只能在确认原调用成功后从同一已知结果文件提取门禁；原会话或文件不可信仍停止。`display_truncated` 仅影响展示，不能用它放宽门禁或跳过超期、历史未知写入等必要核对。可信活动控制器只跳过重复启动。
 
 OA GET 及已有白名单只读 POST 的网络连接异常最多重试一次，复用相同请求；HTTP 登录拒绝不重试，不自动修复登录。OA 提交不使用此重试路径。
 

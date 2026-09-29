@@ -184,8 +184,10 @@ def pending_dispositions(root: Path, states: list[dict], pending: list[dict],
             "overdue": sum(row["overdue"] for row in rows), "total": len(rows)}
 
 
-def summary(payload: dict) -> dict:
-    """Keep all live safety gates and actionable dispositions, omit historical metrics."""
+def summary(payload: dict, *, detail_limit: int = 200) -> dict:
+    """Keep safety gates unchanged and limit displayed diagnostic details."""
+    if type(detail_limit) is not int or not 0 <= detail_limit <= 200:
+        raise ValueError("status_summary_limit_invalid")
     result = {key: payload[key] for key in (
         "schema_version", "kind", "generated_at", "live_check", "controller_handoff", "notification",
     ) if key in payload}
@@ -198,12 +200,12 @@ def summary(payload: dict) -> dict:
                  if item.get("category") in {"pending_not_handled", "identity_conflict", "pending_handled_conflict"}
                  or item.get("write_state") == "unknown" or item.get("receipt_status") != "verified"]
         result["reconciliation"]["manual_review"] = {**manual, "items": items, "visible": len(items)}
-        if len(items) > 200:
-            result["reconciliation"]["manual_review"].update(items=items[:200], visible=200, display_truncated=True)
+        if len(items) > detail_limit or (detail_limit == 0 and manual.get("items")):
+            result["reconciliation"]["manual_review"].update(items=items[:detail_limit], visible=detail_limit, display_truncated=True)
         pending = report.get("pending_dispositions", {})
-        if len(pending.get("items", [])) > 200:
+        if len(pending.get("items", [])) > detail_limit:
             result["reconciliation"]["pending_dispositions"] = {
-                **pending, "items": pending["items"][:200], "visible": 200, "display_truncated": True,
+                **pending, "items": pending["items"][:detail_limit], "visible": detail_limit, "display_truncated": True,
             }
     return result
 

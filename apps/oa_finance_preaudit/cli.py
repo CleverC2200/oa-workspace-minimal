@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -53,6 +54,8 @@ _RUNTIME_FAILURE_CODES = {
     "oa_auth_file_outside_worktree_required",
     "cache_clean_failed",
     "cache_clean_runtime_active",
+    "status_output_file_exists",
+    "status_output_file_failed",
 }
 _FLOW_FAILURE_CODES = {
     "flow_candidate_invalid",
@@ -90,6 +93,35 @@ def _print_payload(payload: dict) -> None:
     )
 
 
+
+def _status_file_payload(payload: dict, target: Path) -> dict:
+    """Keep the full snapshot locally before emitting a small, unchanged gate view."""
+    from .case_recovery import summary
+
+    target = target.expanduser().absolute()
+    raw = (json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                      default=_json_default) + "\n").encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()
+    try:
+        descriptor = os.open(target, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w+b") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+            stream.seek(0)
+            if hashlib.sha256(stream.read()).hexdigest() != digest:
+                raise OSError("status_output_readback_failed")
+    except FileExistsError as error:
+        raise RuntimeError("status_output_file_exists") from error
+    except OSError as error:
+        # Preserve any partial file as evidence; it is not a successful receipt.
+        raise RuntimeError("status_output_file_failed") from error
+    return {
+        **summary(payload, detail_limit=0),
+        "status_file": {"path": str(target), "bytes": len(raw), "sha256": digest},
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="oa-finance-preaudit")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -118,6 +150,8 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--check-live", action="store_true")
     status.add_argument("--reconcile", action="store_true")
     status.add_argument("--summary", action="store_true")
+    status.add_argument("--output-file", type=Path, default=None,
+                        help="Save full JSON to a new private file; print gates and counts only")
     prune = subparsers.add_parser("prune")
     prune.add_argument("--root", type=Path, default=None)
     clean = subparsers.add_parser("clean")
@@ -535,7 +569,9 @@ def main(
             payload["controller_handoff"] = controller_handoff.status()
             from . import session_alert
             payload["notification"] = session_alert.status()
-            if args.summary:
+            if args.output_file is not None:
+                payload = _status_file_payload(payload, args.output_file)
+            elif args.summary:
                 from .case_recovery import summary
                 payload = summary(payload)
         elif args.command == "prune":
