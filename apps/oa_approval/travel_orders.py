@@ -344,22 +344,28 @@ def _ephemeral_trip_cookie_header(cookies: List[Dict[str, Any]]) -> str:
     return "; ".join(values)
 
 
+class _TravelReadDeadline(BaseException):
+    """Cancel this collection without being swallowed by page-error fallbacks."""
+
+
 @contextmanager
 def _wall_clock_timeout(timeout_sec: int):
+    deadline = {"expired": False}
     if threading.current_thread() is not threading.main_thread() or not hasattr(
         signal, "SIGALRM"
     ):
-        yield
+        yield deadline
         return
     previous_handler = signal.getsignal(signal.SIGALRM)
 
     def _raise_timeout(_signum, _frame):
-        raise TimeoutError("商旅页面读取超时")
+        deadline["expired"] = True
+        raise _TravelReadDeadline("商旅页面读取超时")
 
     signal.signal(signal.SIGALRM, _raise_timeout)
     signal.setitimer(signal.ITIMER_REAL, max(1, int(timeout_sec)))
     try:
-        yield
+        yield deadline
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous_handler)
@@ -608,10 +614,9 @@ def _read_browser_trip_candidates_uncoordinated(
     except Exception:
         return []
 
-    browser = None
     results: List[Dict[str, Any]] = []
     try:
-        with _wall_clock_timeout(max(1, timeout_sec) + 5):
+        with _wall_clock_timeout(max(1, timeout_sec) + 5) as timeout_state:
             with sync_playwright() as playwright:
                 launch_kwargs: Dict[str, Any] = {
                     "headless": headless,
@@ -620,111 +625,113 @@ def _read_browser_trip_candidates_uncoordinated(
                 if Path(attachments.CHROME_BIN).exists():
                     launch_kwargs["executable_path"] = attachments.CHROME_BIN
                 browser = playwright.chromium.launch(**launch_kwargs)
-                context = browser.new_context(storage_state=storage_state)
-                page = context.new_page()
-                response_resources: List[Dict[str, Any]] = []
-                hotel_orders: List[Dict[str, str]] = []
+                try:
+                    context = browser.new_context(storage_state=storage_state)
+                    page = context.new_page()
+                    response_resources: List[Dict[str, Any]] = []
+                    hotel_orders: List[Dict[str, str]] = []
 
-                def capture_response(response: Any) -> None:
-                    _capture_attachment_response(response, response_resources)
-                    _capture_hotel_order_response(response, hotel_orders)
+                    def capture_response(response: Any) -> None:
+                        _capture_attachment_response(response, response_resources)
+                        _capture_hotel_order_response(response, hotel_orders)
 
-                page.on("response", capture_response)
-                deadline = time.monotonic() + max(1, timeout_sec)
-                for index, url in enumerate(urls):
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    budget = max(1.0, remaining / max(1, len(urls) - index))
-                    candidate_deadline = min(deadline, time.monotonic() + budget)
-                    try:
-                        page.goto(
-                            url,
-                            wait_until="domcontentloaded",
-                            timeout=max(1000, int(budget * 1000)),
-                        )
-                        page.wait_for_timeout(200)
-                        initial_text = _read_stable_body_text(
-                            page,
-                            timeout_sec=max(
-                                1, int(candidate_deadline - time.monotonic())
-                            ),
-                        )
-                        hotel_order_details = _read_hotel_order_details(
-                            context,
-                            hotel_orders,
-                            timeout_sec=max(
-                                0.5, candidate_deadline - time.monotonic()
-                            ),
-                        )
-                        snapshot = _read_attachment_snapshot(
-                            page,
-                            url=url,
-                            timeout_sec=max(0.5, candidate_deadline - time.monotonic()),
-                            expected_resource_count=expected_resource_count,
-                            response_resources=response_resources,
-                        )
-                        text = str(snapshot.get("text") or initial_text)
-                        if initial_text and initial_text not in text:
-                            text = f"{initial_text}\n{text}".strip()
-                        observed = list(snapshot.get("resources") or [])
-                        resources = (
-                            observed if snapshot.get("resource_scan_stable") else []
-                        )
-                        if resources:
-                            try:
-                                cookie_header = _ephemeral_trip_cookie_header(
-                                    context.cookies([TRIP_BASE_URL])
-                                )
-                            except Exception:
-                                cookie_header = ""
-                            if cookie_header:
-                                for resource in resources:
-                                    resource["_ephemeral_cookie_header"] = cookie_header
-                        status = "resources_found" if resources else "read_failed"
-                        if (
-                            not resources
-                            and snapshot.get("attachment_tab_activated")
-                            and snapshot.get("empty_scan_stable")
-                        ):
-                            status = "empty"
-                        elif (
-                            not resources
-                            and not snapshot.get("attachment_tab_activated")
-                            and not observed
-                        ):
-                            status = "tab_unavailable"
-                        candidate = {
-                            "text": text,
-                            "resources": resources,
-                            "attachment_scan_status": status,
-                            "hotel_order_details": hotel_order_details,
-                            "source_url": str(getattr(page, "url", "") or url),
-                        }
-                        results.append(candidate)
-                        if _trip_candidate_complete(
-                            candidate,
-                            expected_marker=expected_marker,
-                            expected_resource_count=expected_resource_count,
-                        ):
+                    page.on("response", capture_response)
+                    deadline = time.monotonic() + max(1, timeout_sec)
+                    for index, url in enumerate(urls):
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
                             break
-                    except Exception:
-                        results.append(
-                            {
-                                "text": "",
-                                "resources": [],
-                                "attachment_scan_status": "read_failed",
-                                "source_url": url,
+                        budget = max(1.0, remaining / max(1, len(urls) - index))
+                        candidate_deadline = min(deadline, time.monotonic() + budget)
+                        try:
+                            page.goto(
+                                url,
+                                wait_until="domcontentloaded",
+                                timeout=max(1000, int(budget * 1000)),
+                            )
+                            page.wait_for_timeout(200)
+                            initial_text = _read_stable_body_text(
+                                page,
+                                timeout_sec=max(
+                                    1, int(candidate_deadline - time.monotonic())
+                                ),
+                            )
+                            hotel_order_details = _read_hotel_order_details(
+                                context,
+                                hotel_orders,
+                                timeout_sec=max(
+                                    0.5, candidate_deadline - time.monotonic()
+                                ),
+                            )
+                            snapshot = _read_attachment_snapshot(
+                                page,
+                                url=url,
+                                timeout_sec=max(0.5, candidate_deadline - time.monotonic()),
+                                expected_resource_count=expected_resource_count,
+                                response_resources=response_resources,
+                            )
+                            text = str(snapshot.get("text") or initial_text)
+                            if initial_text and initial_text not in text:
+                                text = f"{initial_text}\n{text}".strip()
+                            observed = list(snapshot.get("resources") or [])
+                            resources = (
+                                observed if snapshot.get("resource_scan_stable") else []
+                            )
+                            if resources:
+                                try:
+                                    cookie_header = _ephemeral_trip_cookie_header(
+                                        context.cookies([TRIP_BASE_URL])
+                                    )
+                                except Exception:
+                                    cookie_header = ""
+                                if cookie_header:
+                                    for resource in resources:
+                                        resource["_ephemeral_cookie_header"] = cookie_header
+                            status = "resources_found" if resources else "read_failed"
+                            if (
+                                not resources
+                                and snapshot.get("attachment_tab_activated")
+                                and snapshot.get("empty_scan_stable")
+                            ):
+                                status = "empty"
+                            elif (
+                                not resources
+                                and not snapshot.get("attachment_tab_activated")
+                                and not observed
+                            ):
+                                status = "tab_unavailable"
+                            candidate = {
+                                "text": text,
+                                "resources": resources,
+                                "attachment_scan_status": status,
+                                "hotel_order_details": hotel_order_details,
+                                "source_url": str(getattr(page, "url", "") or url),
                             }
-                        )
-    except Exception:
+                            results.append(candidate)
+                            if _trip_candidate_complete(
+                                candidate,
+                                expected_marker=expected_marker,
+                                expected_resource_count=expected_resource_count,
+                            ):
+                                break
+                        except Exception:
+                            results.append(
+                                {
+                                    "text": "",
+                                    "resources": [],
+                                    "attachment_scan_status": "read_failed",
+                                    "source_url": url,
+                                }
+                            )
+                finally:
+                    # A wall-clock interruption may already have unwound the sync
+                    # dispatcher. Let Playwright dispose its owned browser then;
+                    # never make another sync call after that deadline fired.
+                    if not timeout_state["expired"]:
+                        browser.close()
+
+    except (_TravelReadDeadline, Exception):
         return results
-    finally:
-        if browser is not None:
-            try:
-                browser.close()
-            except Exception:
-                pass
     return results
 
 
