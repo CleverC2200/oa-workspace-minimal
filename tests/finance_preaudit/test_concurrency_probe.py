@@ -5423,6 +5423,24 @@ def test_dispatcher_prepare_timeout_reclaims_owned_child_process_group(
         lambda: stop_requests.append(True),
     )
 
+    real_record = finance_preaudit_concurrency_probe.prepare_trace.record_timeout
+    real_reaped = finance_preaudit_concurrency_probe._processes_reaped
+    reaped_checks = []
+
+    def checked_reaped(*args, **kwargs):
+        result = real_reaped(*args, **kwargs)
+        reaped_checks.append(result)
+        return result
+
+    def record_after_cleanup(*args, **kwargs):
+        assert stop_requests == [True]
+        assert reaped_checks and all(reaped_checks)
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(finance_preaudit_concurrency_probe, "_processes_reaped", checked_reaped)
+    monkeypatch.setattr(finance_preaudit_concurrency_probe.prepare_trace,
+                        "record_timeout", record_after_cleanup)
+
     result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
         1,
         1,
@@ -5448,6 +5466,15 @@ def test_dispatcher_prepare_timeout_reclaims_owned_child_process_group(
     else:
         raise AssertionError("preparation child process was not reclaimed")
     assert stop_requests == [True]
+    receipts = list((tmp_path / "runtime" / "control").glob("prepare-timeout-*.json"))
+    assert len(receipts) == 1
+    diagnostic = json.loads(receipts[0].read_text())
+    assert diagnostic["error_code"] == "production_probe_prepare_timeout"
+    assert diagnostic["task_index"] == 0
+    assert diagnostic["sample_status"] == "recorded"
+    assert diagnostic["sample"]["stage"] == "selection_contract"
+    assert diagnostic["sample_age_seconds"] >= 0
+    assert diagnostic["sample"]["stack"]
 
 
 def test_dispatcher_retries_one_prewrite_invalid_decision_with_merged_usage(
