@@ -58,6 +58,30 @@ FLOW_CONFIGS = (
 )
 
 
+@pytest.mark.parametrize("flow_key,compact", [("general_expense", True), ("business_entertainment", False)])
+def test_scan_encoding_policy_is_applied_at_collection(tmp_path, monkeypatch, flow_key, compact):
+    config = next(value for value in FLOW_CONFIGS if value["flow_key"] == flow_key)
+    resource = {"id": "resource-001", "name": "scan.pdf", "downloadUrl": "/download/scan.pdf"}
+    monkeypatch.setattr(case_bundle.evidence_packet, "logical_attachment_resources", lambda *_: [resource])
+    monkeypatch.setattr(case_bundle.attachments, "download_resources", lambda *_a, **_k: ([{
+        "resource_id": "resource-001", "name": "scan.pdf", "path": str(tmp_path / "scan.pdf"),
+    }], []))
+    captured = []
+
+    def prepare(_downloads, *, out_dir, compact_pdf=False):
+        captured.append(compact_pdf)
+        return [], [], []
+
+    monkeypatch.setattr(case_bundle.attachment_extractors, "prepare_materials", prepare)
+    monkeypatch.setattr(case_bundle.invoice_buyers, "read_invoice_buyers", lambda *_a, **_k: {
+        "read_status": "not_applicable", "invoices": [],
+    })
+    collect_case("recorded-request", oa_api=RecordedOaApi(config["workflow_id"], config["workflow_name"]),
+                 configs=FLOW_CONFIGS, allow_browser_download=False,
+                 attachment_root=tmp_path / "attachments", prepared_root=tmp_path / "prepared")
+    assert captured == [compact]
+
+
 class RecordedOaApi:
     def __init__(self, workflow_id: str, workflow_name: str) -> None:
         self._workflow_id = workflow_id
@@ -135,7 +159,7 @@ class TestCollectCaseContract:
                 [],
             )
 
-        def recorded_prepare(_downloads: list[dict], *, out_dir: Path):
+        def recorded_prepare(_downloads: list[dict], *, out_dir: Path, compact_pdf=False):
             captured["prepared_dir"] = out_dir
             return [], [{"resource_id": "resource-001"}], []
 

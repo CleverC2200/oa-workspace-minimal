@@ -9,6 +9,14 @@ from typing import TextIO
 from apps import json_artifact
 
 STAGES = frozenset({"thread.started", "turn.started", "item.started", "item.completed", "turn.completed"})
+_SIGNAL_TERMS = {
+    "transport_signal": ("connection", "tls", "dns", "stream disconnected", "websocket closed"),
+    "rate_limit_signal": ("rate limit", "429"),
+    "capacity_signal": ("at capacity", "capacity limit", "overloaded"),
+    "authentication_signal": ("unauthorized", "401", "authentication"),
+    "retry_signal": ("retry", "reconnect"),
+    "payload_too_large_signal": ("status 413", "413 request", "payload too large", "request entity too large"),
+}
 
 
 def last_stage(stream: TextIO) -> str:
@@ -33,13 +41,7 @@ def stderr_summary(stream: TextIO) -> dict:
     while chunk := stream.read(4096):
         size += len(chunk.encode("utf-8"))
         lower = suffix + chunk.lower()
-        for code, terms in {
-            "transport_signal": ("connection", "tls", "dns", "stream disconnected", "websocket closed"),
-            "rate_limit_signal": ("rate limit", "429"),
-            "capacity_signal": ("at capacity", "capacity limit", "overloaded"),
-            "authentication_signal": ("unauthorized", "401", "authentication"),
-            "retry_signal": ("retry", "reconnect"),
-        }.items():
+        for code, terms in _SIGNAL_TERMS.items():
             if any(term in lower for term in terms):
                 flags.add(code)
         suffix = lower[-64:]
@@ -61,6 +63,8 @@ def event_error_signals(stream: TextIO) -> list[str]:
         error = event if event.get("type") == "error" else (
             item if isinstance(item, dict) and item.get("type") == "error" else None
         )
+        if event.get("type") == "turn.failed":
+            error = event.get("error")
         if isinstance(error, dict) and isinstance(error.get("message"), str):
             flags.update(stderr_summary(io.StringIO(error["message"]))["stderr_signals"])
     return sorted(flags)
@@ -90,10 +94,10 @@ def record(action_file: Path, *, execution, elapsed_seconds: float, stderr: dict
         "process_state": execution.process_state if execution.process_state in {"exited", "timed_out", "start_failed"} else "unknown",
         "exit_code": execution.exit_code if type(execution.exit_code) is int else None,
         "event_signals": sorted({code for code in stderr.get("event_signals", [])
-                                 if isinstance(code, str) and code in {"transport_signal", "rate_limit_signal", "capacity_signal", "authentication_signal", "retry_signal"}}),
+                                 if isinstance(code, str) and code in _SIGNAL_TERMS}),
         "stderr_bytes": max(0, stderr["stderr_bytes"]) if type(stderr.get("stderr_bytes")) is int else 0,
         "stderr_signals": sorted({code for code in stderr.get("stderr_signals", [])
-                                  if isinstance(code, str) and code in {"transport_signal", "rate_limit_signal", "capacity_signal", "authentication_signal", "retry_signal"}}),
+                                  if isinstance(code, str) and code in _SIGNAL_TERMS}),
     }
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
     target = path.with_name(f"review-process-{digest}.json")
