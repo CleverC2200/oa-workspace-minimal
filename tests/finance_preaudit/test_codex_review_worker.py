@@ -1948,7 +1948,7 @@ def test_tpm_prompt_requires_exact_evidence_references(tmp_path):
     _, action = _task(tmp_path, workflow_key="tpm_small_marketing_fee")
     packet_file = action.with_name("review-packet.json")
     packet = json.loads(packet_file.read_text())
-    packet["rule_version"] = "tpm_small_marketing_fee:3"
+    packet["rule_version"] = "tpm_small_marketing_fee:4"
     json_artifact.write_json_atomic(packet_file, packet)
     prompt = codex_review_worker._prompt(action)
     assert "逐字使用 declared_fields 中的 path" in prompt
@@ -1960,7 +1960,7 @@ def test_tpm_prompt_keeps_passing_conclusions_short_and_direct(tmp_path):
     _, action = _task(tmp_path, workflow_key="tpm_small_marketing_fee")
     packet_file = action.with_name("review-packet.json")
     packet = json.loads(packet_file.read_text())
-    packet["rule_version"] = "tpm_small_marketing_fee:3"
+    packet["rule_version"] = "tpm_small_marketing_fee:4"
     json_artifact.write_json_atomic(packet_file, packet)
 
     prompt = codex_review_worker._prompt(action)
