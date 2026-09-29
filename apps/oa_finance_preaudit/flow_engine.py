@@ -17,7 +17,7 @@ import fitz
 from apps import json_artifact
 from apps.oa_approval import writer_outcomes
 
-from . import decision_validation, item_failure, manual_handoff, observability, review_failure_evidence, submission
+from . import decision_validation, item_failure, manual_handoff, observability, review_failure_evidence, submission, tpm_price_reference
 
 
 SCHEMA_VERSION = 1
@@ -95,7 +95,7 @@ _FLOW_SPECS = {
         ),
     },
     "tpm_small_marketing_fee": {
-        "rule_version": "tpm_small_marketing_fee:3",
+        "rule_version": "tpm_small_marketing_fee:4",
         "item_keys": (
             "attachment_completeness",
             "linked_invoice_receipt",
@@ -147,7 +147,7 @@ _PACKAGING_RULE_VERSION = "packaging_layout_approval:2"
 _LEGACY_SMALL_MARKETING_RULE_VERSION = "small_marketing_fee:1"
 _SMALL_MARKETING_RULE_VERSION = "small_marketing_fee:2"
 _LEGACY_TPM_SMALL_MARKETING_RULE_VERSION = "tpm_small_marketing_fee:1"
-_TPM_SMALL_MARKETING_RULE_VERSION = "tpm_small_marketing_fee:3"
+_TPM_SMALL_MARKETING_RULE_VERSION = "tpm_small_marketing_fee:4"
 _EXPLICIT_RULE_VERSION_WORKFLOWS = frozenset(
     {"packaging_layout_approval", "small_marketing_fee", "tpm_small_marketing_fee"}
 )
@@ -1299,6 +1299,8 @@ def _accepted_tpm_small_marketing_packets(
         raise ValueError("frozen_packet_changed")
     if version == _TPM_SMALL_MARKETING_RULE_VERSION:
         return [expected_packet]
+    if action is None and version == "tpm_small_marketing_fee:3":
+        return [{**expected_packet, "rule_version": version}]
     if action is not None or version not in (None, "tpm_small_marketing_fee:2"):
         raise ValueError("frozen_packet_changed")
     # Only reconstruct old frozen packets; never reinterpret them as four checks.
@@ -2426,6 +2428,7 @@ class FlowEngine:
                     _SMALL_MARKETING_RULE_VERSION,
                     _TPM_SMALL_MARKETING_RULE_VERSION,
                     "tpm_small_marketing_fee:2",
+                    "tpm_small_marketing_fee:3",
                 }:
                     validation_state = {**state, "rule_version": rule_version}
                 _validate_frozen_review_inputs(
@@ -2663,6 +2666,10 @@ class FlowEngine:
                     claim["request_id"],
                     workflow_key,
                     error,
+                )
+            if workflow_key == "tpm_small_marketing_fee" and tpm_price_reference.applies(material):
+                material["tpm_price_reference"] = tpm_price_reference.snapshot(
+                    self._root.parent / tpm_price_reference.REFERENCE_PATH
                 )
             try:
                 material_file = attempt_root / "material.json"
@@ -4033,6 +4040,11 @@ class FlowEngine:
                     quality_material,
                 ):
                     decision["overall"] = "needs_human"
+                for item in normalized_items:
+                    gap = tpm_price_reference.evidence_gap(item, quality_material)
+                    if gap:
+                        _downgrade_tpm_item(item, gap)
+                        decision["overall"] = "needs_human"
                 if enforce_tpm_linked_invoice_evidence(
                     normalized_items,
                     quality_material,

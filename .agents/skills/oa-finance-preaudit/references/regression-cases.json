@@ -3,6 +3,48 @@
   "description": "人工确认的脱敏财务预审错误案例。仅在盲测结果冻结后用于对照和回归，不作为观察子 Agent 的当前答案。",
   "cases": [
     {
+      "id": "RC-053-tpm-price-differences-belong-to-first-item",
+      "scope": "tpm_small_marketing_fee",
+      "audit_item": "attachment_completeness;reimbursable_minimum",
+      "status": "confirmed",
+      "input_facts": [
+        "合成案例：终端建设费-终端形象制作费，物料甲编码名称规格单位匹配，单价25元/平方米，H列指导价20元/平方米；物料乙单价15元/平方米，H列指导价18元/平方米",
+        "清单、发票与可信支付金额均为500元；税率与参考表不同，安装运输已单列，其他附件及主体要求满足"
+      ],
+      "incorrect_output": "只提示高价；用未税价或换算税率后比较；增加第五项；把指导价乘数量计入孰低，或将安装运输从核销金额剔除",
+      "expected_output": "第一项uncertain，列出物料甲25对20偏高、物料乙15对18偏低，请财务核实；不设容差、不直接认定价格不合理；第三项仍按500元核销，四项完整输出",
+      "failure_mode": "遗漏低价差异或把价格提示变成金额扣减",
+      "rule_ref": "flows/tpm-small-marketing-fee.md#制作单价核对（归入第一项）"
+    },
+    {
+      "id": "RC-054-tpm-price-match-and-unit-evidence",
+      "scope": "tpm_small_marketing_fee",
+      "audit_item": "attachment_completeness",
+      "status": "confirmed",
+      "input_facts": [
+        "合成案例：目标科目物料甲每块长200cm宽50cm，20元/块，规格一致且单块计价，指导价20元/平方米",
+        "同清单物料乙名称对应参考编码B但清单编码C，物料丙缺少尺寸，物料丁合并安装运输且无分项金额",
+        "混合单据另有推广费用-物料费明细"
+      ],
+      "incorrect_output": "直接比较元/块和元/平方米，猜测冲突材料、缺失尺寸或拆分金额，对推广物料也执行本价格规则",
+      "expected_output": "甲为1平方米/块，换算20元/平方米后一致；第一项列出乙编码名称冲突、丙缺尺寸、丁费用不可拆分，无法准确比价并交财务核实；不扩展到推广物料，金额仍按原规则",
+      "failure_mode": "单位换算与材料匹配缺乏证据，或越过科目范围",
+      "rule_ref": "flows/tpm-small-marketing-fee.md#制作单价核对（归入第一项）"
+    },
+    {
+      "id": "RC-055-tpm-price-reference-is-host-data",
+      "scope": "tpm_small_marketing_fee",
+      "audit_item": "attachment_completeness",
+      "status": "confirmed",
+      "input_facts": [
+        "目标科目的盖章清单和执行照片已提供，宿主参考报价状态为not_configured或unreadable"
+      ],
+      "incorrect_output": "第一项判通过，或要求申请人补传参考报价单，或阻断整单取数",
+      "expected_output": "第一项说明参考报价未加载成功、制作清单单价未完成核对，请财务核实；不把参考基准当作申请人必传附件，继续其他三项原规则",
+      "failure_mode": "把宿主数据缺口当作申请人缺件或技术失败",
+      "rule_ref": "flows/tpm-small-marketing-fee.md#制作单价核对（归入第一项）"
+    },
+    {
       "id": "RC-050-tpm-natural-specific-finding-rejected",
       "scope": "tpm_small_marketing_fee",
       "audit_item": "output-validation",
@@ -28,7 +70,7 @@
         "发票金额、表单支付金额和清单金额一致"
       ],
       "incorrect_output": "把电子发票判为非纸质发票错误；把参考报价单当必传附件；再因对公支付完成字段为空，把同一缺口扩散为支付、金额和主体多项警告，且隐藏通过项",
-      "expected_output": "电子发票类型不构成问题；参考报价单未提供不单独提示；确认对公支付后不要求支付截图或完成字段；按可信金额孰低；从关联发票权威资料读取销售方核对印章和收款方；OA签字意见完整展示四项，包括通过项",
+      "expected_output": "电子发票类型不构成问题；申请人未传参考报价不算缺件，V4使用宿主冻结参考表，未加载时只在第一项提示单价未完成核对；确认对公支付后不要求支付截图或完成字段；按可信金额孰低；从关联发票权威资料读取销售方核对印章和收款方；OA签字意见完整展示四项，包括通过项",
       "failure_mode": "把判断触发条件误当合规门槛，并因关联发票销售方未采集造成连锁误报",
       "rule_ref": "flows/tpm-small-marketing-fee.md#固定四项审核;flows/tpm-small-marketing-fee.md#签字意见"
     },

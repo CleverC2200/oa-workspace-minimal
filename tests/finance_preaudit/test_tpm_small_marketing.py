@@ -19,7 +19,7 @@ from apps.oa_finance_preaudit import (
 
 
 WORKFLOW_KEY = "tpm_small_marketing_fee"
-RULE_VERSION = "tpm_small_marketing_fee:3"
+RULE_VERSION = "tpm_small_marketing_fee:4"
 ITEM_KEYS = (
     "attachment_completeness",
     "linked_invoice_receipt",
@@ -221,7 +221,7 @@ def test_tpm_attachment_pass_without_image_evidence_is_downgraded(
     assert frozen["items"][0]["status"] == "pass"
 
 
-def test_tpm_attachment_pass_with_image_evidence_is_kept(tmp_path: Path) -> None:
+def test_tpm_image_evidence_does_not_replace_price_evidence(tmp_path: Path) -> None:
     engine = _image_engine(tmp_path)
     action = engine.next_action(WORKFLOW_KEY)
     decision_file = tmp_path / "decision.json"
@@ -237,8 +237,8 @@ def test_tpm_attachment_pass_with_image_evidence_is_kept(tmp_path: Path) -> None
     closed = engine.complete_review(Path(action["action_file"]), decision_file)
 
     remark = Path(closed["remark_file"]).read_text()
-    assert closed["business_state"] == "pass"
-    assert "✅ 1、附件完整性：附件齐全，符合当前科目要求。" in remark
+    assert closed["business_state"] == "needs_human"
+    assert "⚠️ 1、附件完整性：参考报价未加载成功" in remark
     assert flow_engine._TPM_IMAGE_EVIDENCE_GAP not in remark
 
 
