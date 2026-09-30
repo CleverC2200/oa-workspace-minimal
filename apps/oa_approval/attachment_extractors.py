@@ -13,6 +13,7 @@ from tempfile import TemporaryDirectory
 from typing import Any, Dict, List, Tuple
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 
 import fitz
 
@@ -82,15 +83,37 @@ def render_pdf(
     return out, page_count, page_texts
 
 
-def render_legacy_doc(
+def render_office_document(
     path: Path, *, out_dir: Path, resource_id: str,
 ) -> tuple[List[Tuple[Path, str, str]], int, List[str]]:
+    presentation = path.suffix.lower() == ".pptx"
+    prefix = "pptx" if presentation else "legacy_doc"
+    expected_pages = None
+    if presentation:
+        try:
+            with zipfile.ZipFile(path) as archive:
+                member = archive.getinfo("ppt/presentation.xml")
+                if member.file_size > MAX_DOCX_XML_BYTES:
+                    raise ValueError("presentation_xml_too_large")
+                root = ET.fromstring(archive.read(member))
+            namespace = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+            expected_pages = len(root.findall(f"{namespace}sldIdLst/{namespace}sldId"))
+            if expected_pages < 1:
+                raise ValueError("presentation_slides_missing")
+        except (OSError, ValueError, KeyError, zipfile.BadZipFile, zlib.error, ET.ParseError):
+            raise RuntimeError("pptx_content_invalid") from None
+    pdf_filter = (
+        'pdf:impress_pdf_Export:{"ExportHiddenSlides":{"type":"boolean","value":"true"},'
+        '"UseLosslessCompression":{"type":"boolean","value":"true"},'
+        '"ReduceImageResolution":{"type":"boolean","value":"false"}}'
+        if presentation else "pdf:writer_pdf_Export"
+    )
     converter = shutil.which(os.environ.get("OA_LIBREOFFICE_BIN") or "soffice")
     if converter is None:
-        raise RuntimeError("legacy_doc_converter_unavailable")
-    with TemporaryDirectory(prefix="legacy-doc-", dir=out_dir) as temporary:
+        raise RuntimeError(f"{prefix}_converter_unavailable")
+    with TemporaryDirectory(prefix="pptx-" if presentation else "legacy-doc-", dir=out_dir) as temporary:
         work = Path(temporary).resolve()
-        source = work / "source.doc"
+        source = work / ("source.pptx" if presentation else "source.doc")
         shutil.copyfile(path, source)
         profile = work / "profile"
         profile.mkdir()
@@ -116,12 +139,12 @@ def render_legacy_doc(
             process = subprocess.Popen(
                 [converter, f"-env:UserInstallation={profile.as_uri()}",
                  "--headless", "--nologo", "--nodefault", "--norestore",
-                 "--convert-to", "pdf:writer_pdf_Export", "--outdir", str(work), str(source)],
+                 "--convert-to", pdf_filter, "--outdir", str(work), str(source)],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, start_new_session=True, env=environment,
             )
         except OSError:
-            raise RuntimeError("legacy_doc_converter_unavailable") from None
+            raise RuntimeError(f"{prefix}_converter_unavailable") from None
         try:
             returncode = process.wait(timeout=LEGACY_DOC_TIMEOUT_SECONDS)
         finally:
@@ -133,15 +156,19 @@ def render_legacy_doc(
             process.wait()
         pdf = work / "source.pdf"
         if returncode != 0 or not pdf.is_file():
-            raise RuntimeError("legacy_doc_conversion_failed")
+            raise RuntimeError(f"{prefix}_conversion_failed")
         try:
             rendered = render_pdf(pdf, out_dir=out_dir, resource_id=resource_id)
         except Exception:
-            raise RuntimeError("legacy_doc_conversion_failed") from None
-        if rendered[1] < 1 or len(rendered[0]) != rendered[1]:
-            raise RuntimeError("legacy_doc_conversion_failed")
+            raise RuntimeError(f"{prefix}_conversion_failed") from None
+        if (rendered[1] < 1 or len(rendered[0]) != rendered[1]
+                or (expected_pages is not None and rendered[1] != expected_pages)):
+            raise RuntimeError(f"{prefix}_conversion_failed")
         return rendered
 
+
+# Preserve the existing helper name for legacy DOC callers.
+render_legacy_doc = render_office_document
 
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -699,15 +726,21 @@ def _prepare_one_attachment(
                 "image_count": 1,
             }
         )
-    elif suffix in PDF_EXTS or suffix == ".doc":
-        renderer = render_legacy_doc if suffix == ".doc" else render_pdf
+    elif suffix in PDF_EXTS or suffix in {".doc", ".pptx"}:
+        renderer = render_office_document if suffix in {".doc", ".pptx"} else render_pdf
         try:
             rendered, page_count, page_texts = renderer(
                 path, out_dir=out_dir, resource_id=resource_id or path.stem,
                 **({"compact": True} if compact_pdf and suffix in PDF_EXTS else {}),
             )
         except subprocess.TimeoutExpired:
+            if suffix == ".pptx":
+                raise RuntimeError("attachment_content_incomplete") from None
             raise RuntimeError("legacy_doc_conversion_timeout") from None
+        except RuntimeError:
+            if suffix == ".pptx":
+                raise RuntimeError("attachment_content_incomplete") from None
+            raise
         for rendered_path, kind, page_sha256 in rendered:
             images.append(
                 {
