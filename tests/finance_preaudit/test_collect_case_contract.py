@@ -4,6 +4,7 @@ import tempfile
 import shutil
 from pathlib import Path
 from unittest.mock import patch
+import zipfile
 
 import fitz
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from apps import json_artifact
 from apps.oa_approval import (
     attachments,
+    attachment_extractors,
     evidence_packet,
     flow,
     invoice_buyers,
@@ -602,8 +604,9 @@ class TestCollectCaseContract:
             }
         ]
 
-    def test_packaging_pdf_pages_keep_resource_ownership_and_full_coverage(
-        self, tmp_path: Path,
+    @pytest.mark.parametrize("document_suffix", [".PDF", ".PPTX"])
+    def test_packaging_document_pages_keep_resource_ownership_and_full_coverage(
+        self, tmp_path: Path, document_suffix: str,
     ) -> None:
         class PdfPackagingOaApi(RecordedOaApi):
             def request_context(self, request_id: str) -> tuple[dict, list[dict]]:
@@ -615,14 +618,14 @@ class TestCollectCaseContract:
                         "fieldShowName": case_bundle._PACKAGING_IMAGE_FIELD,
                         "filedHtmlShow": (
                             "<a href='/news/download.do?fileid=proof-pdf"
-                            "&filename=proof-pdf.PDF'>proof-pdf.PDF</a>"
+                            f"&filename=proof-pdf{document_suffix}'>proof-pdf{document_suffix}</a>"
                         ),
                     }
                 )
                 return workflow, [
                     {
                         "id": resource_id,
-                        "name": f"{resource_id}.PDF",
+                        "name": f"{resource_id}{document_suffix}",
                         "downloadUrl": f"/download/{resource_id}",
                     }
                     for resource_id in ("proof-pdf", "layout-pdf")
@@ -635,6 +638,7 @@ class TestCollectCaseContract:
                 ]
 
         originals = {}
+        converted_pdfs = {}
         for resource_id, page_count in (("proof-pdf", 1), ("layout-pdf", 2)):
             path = tmp_path / f"{resource_id}.PDF"
             document = fitz.open()
@@ -644,6 +648,16 @@ class TestCollectCaseContract:
                 document.save(path)
             finally:
                 document.close()
+            converted_pdfs[resource_id] = path
+            if document_suffix == ".PPTX":
+                path = tmp_path / f"{resource_id}{document_suffix}"
+                slides = "".join(f'<p:sldId id="{256 + index}"/>' for index in range(page_count))
+                with zipfile.ZipFile(path, "w") as archive:
+                    archive.writestr(
+                        "ppt/presentation.xml",
+                        '<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">'
+                        f"<p:sldIdLst>{slides}</p:sldIdLst></p:presentation>",
+                    )
             originals[resource_id] = path
         from openpyxl import Workbook
         workbook = Workbook()
@@ -670,9 +684,19 @@ class TestCollectCaseContract:
                 for resource in resources
             ], [])
 
+        def recorded_office_render(path: Path, *, out_dir: Path, resource_id: str):
+            # Converter behavior is tested separately; replay its PDF output at this collection seam.
+            assert path.suffix == ".PPTX"
+            return attachment_extractors.render_pdf(
+                converted_pdfs[resource_id], out_dir=out_dir, resource_id=resource_id,
+            )
+
         with patch(
             "apps.oa_finance_preaudit.case_bundle.attachments.download_resources",
             side_effect=recorded_download,
+        ), patch(
+            "apps.oa_finance_preaudit.case_bundle.attachment_extractors.render_office_document",
+            side_effect=recorded_office_render,
         ):
             material = collect_case(
                 "recorded-request",
@@ -728,12 +752,17 @@ class TestCollectCaseContract:
         with pytest.raises(ValueError, match="packaging_material_incomplete"):
             flow_engine._validate_flow_material("packaging_layout_approval", incomplete)
 
-        originals["layout-pdf"].write_bytes(b"not-a-pdf")
+        originals["proof-pdf"].write_bytes(b"not-a-document")
         with patch(
             "apps.oa_finance_preaudit.case_bundle.attachments.download_resources",
             side_effect=recorded_download,
-        ):
-            with pytest.raises(fitz.FileDataError):
+        ), patch(
+            "apps.oa_finance_preaudit.case_bundle.attachment_extractors.subprocess.Popen",
+            side_effect=AssertionError("Unexpected Office converter launch"),
+        ) as office_process:
+            error_type = RuntimeError if document_suffix == ".PPTX" else fitz.FileDataError
+            error_match = "^attachment_content_incomplete$" if document_suffix == ".PPTX" else None
+            with pytest.raises(error_type, match=error_match):
                 collect_case(
                     "recorded-request",
                     oa_api=PdfPackagingOaApi(
@@ -744,6 +773,7 @@ class TestCollectCaseContract:
                     attachment_root=tmp_path / "attachments",
                     prepared_root=tmp_path / "broken-prepared",
                 )
+            office_process.assert_not_called()
 
     def test_invoice_buyers_are_read_even_when_form_companies_differ(self) -> None:
         class InvoiceOaApi:

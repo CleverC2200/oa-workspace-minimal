@@ -223,9 +223,9 @@ def _packaging_review_role(resource: dict[str, Any]) -> str:
     suffix = Path(attachments.resource_name(resource).strip()).suffix.casefold()
     if suffix in _SPREADSHEET_SUFFIXES:
         return "excel_reference"
-    # PDF pages are visual review candidates; the reviewer still classifies
+    # Rendered document pages are visual review candidates; the reviewer still classifies
     # each rendered page before forming any packaging conclusion.
-    if suffix in attachment_extractors.PREPARABLE_IMAGE_EXTS or suffix == ".pdf":
+    if suffix in attachment_extractors.PREPARABLE_IMAGE_EXTS or suffix in {".pdf", ".pptx"}:
         return "packaging_image"
     return "supporting_attachment"
 
@@ -537,9 +537,9 @@ def collect_case(
             if (
                 config.get("flow_key") == _PACKAGING_FLOW
                 and descriptor["review_role"] == "packaging_image"
-                and path.suffix.casefold() == ".pdf"
+                and path.suffix.casefold() in {".pdf", ".pptx"}
             ):
-                # The source PDF is the stable parent of each rendered page.
+                # The source document is the stable parent of each rendered page.
                 bound_item["parent_resource_id"] = descriptor["resource_id"]
             bound_downloads.append(bound_item)
         images, manifest, structured_contents = attachment_extractors.prepare_materials(
