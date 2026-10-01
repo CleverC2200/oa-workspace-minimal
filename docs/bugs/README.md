@@ -16,13 +16,19 @@
 
 | 领域 | 症状 / 搜索词 | 主记录或历史组件 | 回归 / 经验入口 |
 |---|---|---|---|
-| 调度与交接 | 终态丢失、孤立 running、Unknown process id、提前判卡死、旧窗口派单 | [#325 重复交接症状记录](https://github.com/CleverC2200/oa-workspace-minimal/issues/325)；相关组件 [#150](https://github.com/CleverC2200/oa-workspace-minimal/issues/150)、[#202](https://github.com/CleverC2200/oa-workspace-minimal/issues/202) | [交接回归](../../tests/finance_preaudit/test_controller_handoff.py)、[隔离排障与恢复](../agents/quarantine-repair.md)；组件实现不代表所有退出原因已解决 |
+| 调度与交接 | 终态丢失、孤立 running、Unknown process id、提前判卡死、旧窗口派单 | [#325 重复交接症状记录](https://github.com/CleverC2200/oa-workspace-minimal/issues/325)；留证工程 [#326](https://github.com/CleverC2200/oa-workspace-minimal/issues/326)；相关组件 [#150](https://github.com/CleverC2200/oa-workspace-minimal/issues/150)、[#202](https://github.com/CleverC2200/oa-workspace-minimal/issues/202) | [执行与原会话回归](../../tests/finance_preaudit/test_controller_execution.py)、[交接回归](../../tests/finance_preaudit/test_controller_handoff.py)、[隔离排障与恢复](../agents/quarantine-repair.md)；组件实现不代表所有退出原因已解决 |
 | 观测与输出 | 状态 JSON 截断、完整文件、摘要门禁 | [#311](https://github.com/CleverC2200/oa-workspace-minimal/issues/311) | [完整状态输出回归](../../tests/finance_preaudit/test_status_output_file.py) |
 | 商旅准备 | browser.close、Playwright 生命周期、真实准备 watchdog | [#313](https://github.com/CleverC2200/oa-workspace-minimal/issues/313)；诊断能力 [#304](https://github.com/CleverC2200/oa-workspace-minimal/issues/304) | [浏览器生命周期回归](../../tests/finance_preaudit/test_travel_browser_lifecycle.py)、[阶段采样回归](../../tests/finance_preaudit/test_prepare_trace.py)、[采集契约](../../tests/finance_preaudit/test_collect_case_contract.py)；关闭警告单独不能证明卡死 |
 | 包装材料 | PPTX 不支持、隐藏页、页数不足、视觉候选漏页、PDF 页归属 | [#319](https://github.com/CleverC2200/oa-workspace-minimal/issues/319)、[#292](https://github.com/CleverC2200/oa-workspace-minimal/issues/292) | [PPTX 准备回归](../../tests/finance_preaudit/test_pptx_preparation.py)、[全链采集/页覆盖](../../tests/finance_preaudit/test_collect_case_contract.py) |
+| 审核失败记账 | NameError、cli 未导入、record_production_failure_round | [#329](https://github.com/CleverC2200/oa-workspace-minimal/issues/329) | [真实入口参数/返回回归](../../tests/finance_preaudit/test_codex_review_worker.py)；不与历史异常退出原因自动归并 |
+| 审核协议 | 空属性对象 Schema、唯一 JSON 围栏、多候选、包装草稿 | [#327](https://github.com/CleverC2200/oa-workspace-minimal/issues/327)（正式入口改进） | [包装入口/消费回归](../../tests/finance_preaudit/test_packaging_review.py)、[只读审核边界](../agents/packaging-review.md)；草稿与真实看图验收分开 |
 | 业务规则 | 里程、住宿、发票、支付、包装文字误报或漏报 | 从 [人工确认反馈](../../.agents/skills/oa-finance-preaudit/references/confirmed-feedback.md) 的编号找规则和原记录 | [脱敏业务回归](../../.agents/skills/oa-finance-preaudit/references/regression-cases.json)；不作为生产审核答案提示 |
 
 ## 其他相关工作
+
+- [#328 机械质量检查](https://github.com/CleverC2200/oa-workspace-minimal/issues/328)：[YAML、生成 Schema 和 lint](../agents/quality-checks.md)。
+- [#330 历史原会话定位](https://github.com/CleverC2200/oa-workspace-minimal/issues/330)：[UUID、压缩归档与有限工具投影](../agents/session-evidence.md)。
+- [#331 小时调度指令分层](https://github.com/CleverC2200/oa-workspace-minimal/issues/331)：[配置候选及启用条件](../runbooks/hourly-production.md)；按授权发布后才接入。
 
 - [#190 生产恢复与告警端到端验收](https://github.com/CleverC2200/oa-workspace-minimal/issues/190)：验收工作，证据范围看原票。
 - [#321 审核质量门与执行回执](https://github.com/CleverC2200/oa-workspace-minimal/issues/321)：质量改造及验证；局部实验不等于默认生产已启用。
