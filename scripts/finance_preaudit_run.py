@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -22,6 +23,36 @@ MANIFEST_ENV = "OA_CONTROLLER_EXECUTION_MANIFEST_FILE"
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def bind_tool_session(receipt_file: Path, *, owner_task_id: str, session_id: str) -> dict:
+    """Retain the caller's tool ID separately so the waiting supervisor cannot overwrite it."""
+    UUID(owner_task_id)
+    path = Path(os.path.abspath(receipt_file))
+    if (path.name != "execution.json" or path.parent.parent != controller_handoff.manifest_file().parent / "executions"
+            or controller_handoff._RUN_ID.fullmatch(path.parent.name) is None
+            or re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", session_id) is None):
+        raise ValueError("controller_tool_session_binding_invalid")
+    receipt = json.loads(runtime_control.read_control_bytes(path) or b"null")
+    if (not isinstance(receipt, dict) or receipt.get("kind") != "preaudit_controller_execution"
+            or receipt.get("owner_task_id") != owner_task_id or receipt.get("invocation_id") != path.parent.name):
+        raise ValueError("controller_tool_session_binding_invalid")
+    value = {"kind": "preaudit_controller_tool_session", "owner_task_id": owner_task_id,
+             "invocation_id": path.parent.name, "tool_session_id": session_id,
+             "evidence_source": "caller_reported_tool_result"}
+    with runtime_control.pinned_directory(path.parent) as parent:
+        try:
+            descriptor = os.open("tool-session.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+        except FileExistsError:
+            if json.loads(runtime_control.read_control_bytes(path.with_name("tool-session.json")) or b"null") != value:
+                raise ValueError("controller_tool_session_binding_conflict") from None
+        else:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write((json.dumps(value) + "\n").encode())
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.fsync(parent)
+    return {"status": "bound", "tool_session_file": str(path.with_name("tool-session.json"))}
 
 
 def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str) -> dict:
@@ -42,6 +73,7 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str) ->
         "stop_requested_by_supervisor": False,
         "controller_state": "unknown", "children_reaped": "unknown",
         "run_id": None, "controller_instance_id": None,
+        "tool_session_file": str(directory / "tool-session.json"),
     }
     old_umask = os.umask(0o077)
     process = None
@@ -112,8 +144,11 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str) ->
                 os.fsync(stream.fileno())
                 stream.seek(0)
                 receipt["output_sha256"][name] = hashlib.file_digest(stream, "sha256").hexdigest()
+        mirror_missing = False
         try:
-            manifest = json.loads(runtime_control.read_control_bytes(manifest_file) or b"null")
+            raw_manifest = runtime_control.read_control_bytes(manifest_file)
+            mirror_missing = raw_manifest is None
+            manifest = json.loads(raw_manifest or b"null")
             if not isinstance(manifest, dict):
                 raise ValueError("controller_manifest_invalid")
             started = datetime.fromisoformat(manifest["started_at"])
@@ -140,6 +175,25 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str) ->
             and "stop_request_error" not in receipt
             else "blocked"
         )
+        if receipt["state"] == "exited" and receipt["exit_code"] == 0 and mirror_missing:
+            try:
+                payload = json.loads(runtime_control.read_control_bytes(directory / "stdout.log") or b"null")
+                handoff = payload.get("controller_handoff", {}) if isinstance(payload, dict) else {}
+                verified_skip = (
+                    payload.get("kind") == "preaudit_production_rolling_drain"
+                    and payload.get("status") == "skipped"
+                    and payload.get("reason") == "production_rolling_controller_active"
+                    and isinstance(handoff, dict)
+                    and handoff.get("status") == "active"
+                    and handoff.get("manifest_state") == "running"
+                    and all(handoff.get(key) is True for key in (
+                        "controller_active", "lock_owner_consistent", "restart_verified", "code_matches_current",
+                    ))
+                )
+            except (OSError, RuntimeError, ValueError, AttributeError):
+                verified_skip = False
+            if verified_skip and "stop_request_error" not in receipt:
+                receipt["result"] = "skipped"
         persist()
         return {**receipt, "receipt_file": str(receipt_file)}
     finally:
@@ -159,23 +213,34 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str) ->
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--owner-task-id", required=True, type=UUID)
+    parser.add_argument("--bind-tool-session")
+    parser.add_argument("--receipt-file", type=Path)
     parser.add_argument("controller_args", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     arguments = args.controller_args
     if arguments[:1] == ["--"]:
         arguments = arguments[1:]
-    auth.load_local_env()
-    directory = controller_handoff.manifest_file().parent / "executions" / uuid4().hex
+    directory = None
     try:
+        auth.load_local_env()
+        if args.bind_tool_session is not None:
+            if args.receipt_file is None or arguments:
+                raise ValueError("controller_tool_session_binding_invalid")
+            result = bind_tool_session(args.receipt_file, owner_task_id=str(args.owner_task_id), session_id=args.bind_tool_session)
+            print(json.dumps(result))
+            return 0
+        if args.receipt_file is not None:
+            raise ValueError("controller_tool_session_binding_invalid")
+        directory = controller_handoff.manifest_file().parent / "executions" / uuid4().hex
         receipt = supervise(
             [sys.executable, "-m", "scripts.finance_preaudit_concurrency_probe", *arguments],
             directory=directory, owner_task_id=str(args.owner_task_id),
         )
     except (OSError, RuntimeError, ValueError):
-        print(json.dumps({"error_code": "controller_execution_evidence_failed", "receipt_file": str(directory / "execution.json")}))
+        print(json.dumps({"error_code": "controller_execution_evidence_failed", "receipt_file": str(directory / "execution.json") if directory else None}))
         return 1
     print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
-    return 0 if receipt["result"] == "completed" else 1
+    return 0 if receipt["result"] in {"completed", "skipped"} else 1
 
 
 if __name__ == "__main__":
