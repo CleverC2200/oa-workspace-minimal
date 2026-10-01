@@ -2050,3 +2050,20 @@ def test_legacy_openai_review_evidence_still_validates() -> None:
         action_token="legacy-token",
         workflow_key="travel_expense",
     )
+
+
+def test_production_failure_round_uses_existing_controlled_engine(tmp_path, monkeypatch):
+    from apps.oa_finance_preaudit import cli
+    calls = []
+    path = tmp_path / 'action.json'
+    expected = {'status': 'recorded', 'write_state': 'not_requested'}
+    class Engine:
+        def record_review_failure_round(self, action_file, failure_code):
+            calls.append((action_file, failure_code))
+            return expected
+    def live(*, controlled):
+        assert controlled is True
+        return Engine()
+    monkeypatch.setattr(cli, '_live_flow_engine', live)
+    assert codex_review_worker.record_production_failure_round(path, 'codex_decision_invalid') is expected
+    assert calls == [(path, 'codex_decision_invalid')]

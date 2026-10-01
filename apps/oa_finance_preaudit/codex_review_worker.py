@@ -1747,6 +1747,8 @@ def quarantine_review_failure(action_file: Path, failure_code: str) -> dict:
 
 
 def record_production_failure_round(action_file: Path, failure_code: str) -> dict:
+    from apps.oa_finance_preaudit import cli
+
     return cli._live_flow_engine(controlled=True).record_review_failure_round(
         action_file,
         failure_code,
