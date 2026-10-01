@@ -289,7 +289,7 @@ python3 -m pytest -v
 git diff --check
 ```
 
-贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。V1.2 的流程拆分、并发提交、监控、留存与代码质量工程在 GitHub Issues 中分票推进；已合并能力只代表代码和测试完成，不代表生产已经启用。
+贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。排错入口为 [Bug 快速索引](docs/bugs/README.md)，记录、复发与关闭规则见 [Bug 记录规范](docs/agents/bug-ledger.md)。V1.2 的流程拆分、并发提交、监控、留存与代码质量工程在 GitHub Issues 中分票推进；已合并能力只代表代码和测试完成，不代表生产已经启用。
 
 
 生产启动门禁失败也使用 `apps.oa_finance_preaudit.session_alert` 的有限稳定错误码：代码基线、流程授权、运行环境、实时对账、控制器交接、运行记忆路径和本机 critical。正常已有控制器运行只跳过重复启动，不当作故障。提醒保持同一窗口最多三次，发送不确定保留本地回执且不自动重试。

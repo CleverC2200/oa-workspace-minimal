@@ -20,7 +20,7 @@
 
 - 查询或修改 OA 接口调用时，优先查阅[泛微 E9 官方后端接口文档](https://e-cloudstore.com/ec/api/applist/index.html#/)，以对应接口的参数说明和展开示例为依据；提交及发票回填的已核实合同见 [OA 官方接口入口](docs/agents/oa-api.md)。
 
-- 用户要求排查、修复或清理隔离/历史失败时，先读[隔离排障与恢复](docs/agents/quarantine-repair.md)。生产隔离是止损，开发排障须继续诊断、回测并在已有同范围授权内显式恢复；隔离成功或普通队列为空不代表修复完成。
+- 用户要求排查、修复或清理隔离/历史失败时，安全止损与原会话收尾优先；排错先查 [Bug 快速索引](docs/bugs/README.md) 和匹配的 Issue，再读[隔离排障与恢复](docs/agents/quarantine-repair.md)。同轮追加发生记录，根因未明只标相关；记录与关闭标准见 [Bug 记录规范](docs/agents/bug-ledger.md)。生产隔离是止损，开发排障须继续诊断、回测并在已有同范围授权内显式恢复；隔离成功或普通队列为空不代表修复完成。
 - 海外采购付款的发票识别及字段回填使用 `.agents/skills/oa-overseas-invoice/SKILL.md`，独立授权与单据级提交，不进入财务预审滚动队列。
 - 实际单据预审使用 `.agents/skills/oa-finance-preaudit/SKILL.md`。开发结果结构读 [.agents/skills/oa-finance-preaudit/references/flow-engine-contract.md](.agents/skills/oa-finance-preaudit/references/flow-engine-contract.md)；证据规则读 [.agents/skills/oa-finance-preaudit/references/observation-contract.md](.agents/skills/oa-finance-preaudit/references/observation-contract.md)；流程规则经 [result-contract.md](.agents/skills/oa-finance-preaudit/references/result-contract.md) 只选择匹配流程。开发和测试不执行真实单据 next-action 或 complete-review。
 - 创建、更新 GitHub Issue 或拆分需求、依赖与验收：读 [Issue 追踪](docs/agents/issue-tracker.md)；设置工作状态或分类标签时再读 [标签规范](docs/agents/triage-labels.md)。
@@ -30,10 +30,10 @@
 
 ## Issue、提交与 PR
 
-- 非琐碎改动先关联 Issue；一个 PR 只解决一个可独立验收的问题，使用 `Closes #<issue>`。
+- 非琐碎改动先关联 Issue；一个 PR 只解决一个可独立验收的问题。完成该票使用 `Closes #<issue>`；Bug 的生产验收未齐时使用 `Refs #<issue>`，保留打开。
 - 分支默认使用 `codex/<slug>`；提交使用英文 Conventional Commits，正文说明原因和验证，不添加 AI 签名。
 - 默认交付停在验证通过的本地提交；用户只说“提交”时仅创建本地 commit。只有用户明确授权对应动作和范围时，才执行 `git push`、创建或更新 PR、转 Ready、合并或清理远端分支；否则汇报待发布分支和提交，等待用户统一推送。
-- PR 未完成时保持 Draft；聚焦测试、必要的完整测试和文档检查通过后再转 Ready。合并后核对关联 Issue 已关闭。
+- PR 未完成时保持 Draft；聚焦测试、必要的完整测试和文档检查通过后再转 Ready。合并后核对 `Closes` 票已关闭；`Refs` 票继续跟进验收，证据齐后再关闭。
 
 ## 验证
 
