@@ -384,6 +384,22 @@ def _write_manifest(manifest: Mapping[str, object]) -> None:
         raise ValueError("controller_handoff_untrusted") from error
 
 
+def _record_execution_manifest(manifest: Mapping[str, object]) -> None:
+    """Copy this run's handoff into its supervisor-owned evidence directory."""
+    raw = os.environ.get("OA_CONTROLLER_EXECUTION_MANIFEST_FILE")
+    if not raw:
+        return
+    path = Path(raw)
+    base = manifest_file().parent / "executions"
+    if (not path.is_absolute() or path.parent.parent != base
+            or _RUN_ID.fullmatch(path.parent.name) is None
+            or path.name != "controller-manifest.json"):
+        raise ValueError("controller_execution_evidence_failed")
+    runtime_control.write_control_bytes_atomic(
+        path, (json.dumps(dict(manifest), sort_keys=True) + "\n").encode(),
+    )
+
+
 def begin(config: Mapping[str, object]) -> dict:
     owner_pid = runtime_control.controller_owner_pid()
     writer_inactive = (
@@ -427,6 +443,7 @@ def begin(config: Mapping[str, object]) -> dict:
         "restart_verified": True,
         "health": "unknown",
     }
+    _record_execution_manifest(manifest)
     _write_manifest(manifest)
     return manifest
 
@@ -451,6 +468,7 @@ def finish(
         "health": health,
     }
     _write_manifest(terminal)
+    _record_execution_manifest(terminal)
     return {
         "status": terminal["state"],
         "code_revision": terminal["code_revision"],
