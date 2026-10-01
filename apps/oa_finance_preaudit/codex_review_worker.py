@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import nullcontext
 import json
 import os
 from dataclasses import dataclass, field
@@ -850,17 +851,22 @@ def _execute_codex_raw(
     prompt_builder: Callable[[Path], str] = _prompt,
     stderr_summary: dict,
     read_only: bool = False,
+    schema_builder: Callable[[Path], dict] | None = None,
+    decision_parser: Callable[[str], dict] = json.loads,
+    audit_directory: Path | None = None,
 ) -> CodexExecution:
     try:
-        schema = _decision_schema(action_file, read_only=read_only)
+        schema = schema_builder(action_file) if schema_builder else _decision_schema(action_file, read_only=read_only)
         prompt = prompt_builder(action_file)
     except ValueError:
         return CodexExecution(
             "codex_review_task_invalid", _unknown_usage(),
             process_state="not_started", decision_state="not_attempted",
         )
-    output = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
-    with tempfile.TemporaryDirectory(prefix="oa-preaudit-codex-") as temporary:
+    output = ((audit_directory / "events.jsonl").open("x+", encoding="utf-8")
+              if audit_directory else tempfile.TemporaryFile(mode="w+", encoding="utf-8"))
+    workspace = nullcontext(str(audit_directory)) if audit_directory else tempfile.TemporaryDirectory(prefix="oa-preaudit-codex-")
+    with workspace as temporary:
         temporary_root = Path(temporary)
         codex_home = temporary_root / "codex-home"
         try:
@@ -884,6 +890,10 @@ def _execute_codex_raw(
             schema_file, schema,
         )
         command = _codex_command(project_root, schema_file, decision_file)
+        if audit_directory:
+            # The isolated home retains native tool receipts for this review only.
+            command.remove("--ephemeral")
+            (temporary_root / "prompt.txt").write_text(prompt, encoding="utf-8")
         process: subprocess.Popen | None = None
         previous_sigterm: object | None = None
         previous_sigterm_mask: set[signal.Signals] | None = None
@@ -951,7 +961,18 @@ def _execute_codex_raw(
         def collect_stderr() -> None:
             try:
                 with errors:
-                    stderr_summary.update(process_diagnostics.stderr_summary(errors))
+                    if audit_directory:
+                        with (temporary_root / "stderr.log").open("x", encoding="utf-8") as raw:
+                            class RetainedStderr:
+                                def read(self, size):
+                                    chunk = errors.read(size)
+                                    raw.write(chunk)
+                                    return chunk
+                            stderr_summary.update(process_diagnostics.stderr_summary(RetainedStderr()))
+                            raw.flush()
+                            os.fsync(raw.fileno())
+                    else:
+                        stderr_summary.update(process_diagnostics.stderr_summary(errors))
             except (OSError, ValueError):
                 stderr_failed.append(True)
 
@@ -991,6 +1012,8 @@ def _execute_codex_raw(
             )
         finally:
             restore_sigterm()
+            if process.poll() is None:
+                _terminate_process_group(process, grace_seconds=0.2)
             stderr_reader.join(timeout=5)
             if stderr_reader.is_alive():
                 _terminate_process_group(process, grace_seconds=0.2)
@@ -1008,11 +1031,11 @@ def _execute_codex_raw(
         if process.returncode == 0:
             try:
                 raw_decision = decision_file.read_text(encoding="utf-8")
-                candidate = json.loads(raw_decision)
+                candidate = decision_parser(raw_decision)
                 decision_state = "not_object"
             except OSError:
                 candidate = None
-            except json.JSONDecodeError:
+            except ValueError:
                 candidate = None
                 decision_state = "unreadable"
             if isinstance(candidate, dict):
@@ -1021,6 +1044,12 @@ def _execute_codex_raw(
             elif candidate is not None:
                 decision_state = "not_object"
             if decision_state in {"unreadable", "not_object"}:
+                if audit_directory and read_only:
+                    output_error = "codex_decision_invalid"
+                    output.close()
+                    return CodexExecution(output_error, usage, process_state="exited",
+                                          decision_state=decision_state, event_counts=event_counts,
+                                          event_status=event_status, exit_code=process.returncode)
                 try:
                     decision_validation.record_rejection(
                         action_file,

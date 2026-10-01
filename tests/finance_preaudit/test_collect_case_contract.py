@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import json
 import shutil
 from pathlib import Path
 from unittest.mock import patch
@@ -741,6 +742,31 @@ class TestCollectCaseContract:
             "material:prepared.images.layout-pdf.page-1",
             "material:prepared.images.layout-pdf.page-2",
         )
+
+        # Follow the collected resources into the real frozen packet consumer,
+        # then into the independent reviewer schema; conversion alone is insufficient.
+        def collect_frozen(request_id, attempt_root):
+            value = collect_case(
+                request_id, oa_api=PdfPackagingOaApi("198521", "包装新制（更改）及包装版面审批流程"),
+                configs=FLOW_CONFIGS, allow_browser_download=False,
+                attachment_root=attempt_root / "attachments", prepared_root=attempt_root / "prepared",
+            )
+            return value
+        with patch("apps.oa_finance_preaudit.case_bundle.attachments.download_resources", side_effect=recorded_download), patch(
+            "apps.oa_finance_preaudit.case_bundle.attachment_extractors.render_office_document", side_effect=recorded_office_render,
+        ):
+            engine = flow_engine.FlowEngine(
+                root=tmp_path / "flows", collect_material=collect_frozen,
+                discover_candidates=lambda key: [{"request_id": "recorded-request", "workflow_key": key,
+                                                   "received_at": "2026-09-01T00:00:00+00:00"}],
+            )
+            action = engine.next_action("packaging_layout_approval")
+        assert action["action"] == "review_required"
+        packet = json.loads(Path(action["review_packet_file"]).read_text())
+        assert packet["packaging_visual_contract"]["page_refs"] == list(flow_engine._packaging_page_refs(material))
+        from apps.oa_finance_preaudit.packaging_review import draft_schema
+        schema = draft_schema(packet)
+        assert schema["properties"]["visual_review"]["properties"]["pages"]["items"]["properties"]["page_ref"]["enum"] == packet["packaging_visual_contract"]["page_refs"]
 
         incomplete = {
             **material,
