@@ -1,0 +1,70 @@
+name: Bug 记录
+description: 记录发生、根因、回归与验收；重复问题关联原票。
+title: "bug: "
+labels: [bug, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        先检索已有 Issue 和仓库 docs/bugs/README.md。Issue 是唯一状态源；同一轮重复观测不重复计事件。
+        只提交脱敏技术信息，真实单号、requestId、账号、附件正文、内部地址、密钥及日志原文留在本地受控证据。
+        根因未明、暂未复现或验收未齐仍需跟进，不属于 non-actionable。
+  - type: input
+    id: related
+    attributes:
+      label: 相关问题
+      description: 已有同一问题请直接追加原票；仅症状相似时说明关联，勿先认定同一根因。
+      placeholder: "原票 #编号；或说明未发现匹配记录"
+  - type: textarea
+    id: impact
+    attributes:
+      label: 现象、预期与影响
+      description: 说明实际入口/阶段、预期行为和受影响范围。
+    validations:
+      required: true
+  - type: textarea
+    id: occurrences
+    attributes:
+      label: 每次发生与证据
+      description: 时间、代码/配置版本、脱敏运行身份、原会话/退出码、实际结果及证据引用；未知明确填 unknown。
+      value: |
+        | 时间 | 版本 | 运行/会话身份 | 终态与结果 | 脱敏证据 |
+        |---|---|---|---|---|
+    validations:
+      required: true
+  - type: textarea
+    id: cause
+    attributes:
+      label: 复现、根因与责任位置
+      description: 根因未确定也可登记，明确未知和缺口；不要凭相似错误码归并。
+      value: |
+        已确认：
+        推测：
+        未知/缺口：
+        复现方式与模块/调用者：
+    validations:
+      required: true
+  - type: textarea
+    id: recovery
+    attributes:
+      label: 临时恢复与剩余问题
+      description: 记录恢复操作、回执和仍未解决的部分；恢复成功不等于根因修复。
+  - type: textarea
+    id: verification
+    attributes:
+      label: 修复、回归与验收
+      description: 验收未齐保持打开；没有生产影响时写明生产验收不适用及理由。
+      value: |
+        - [ ] 有证据支持根因及修复范围。
+        - [ ] 原错误有可执行复现/回归，覆盖真实调用链及正常反例。
+        - [ ] 必要接线、旧路径及工程验证已完成。
+        - [ ] 发布和配置加载版本已核对；或明确不适用。
+        - [ ] 适用的正常授权生产运行证据已齐；或明确不适用。
+        分支/PR与证据引用：
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 提交确认
+      options:
+        - label: 已检索相关问题，内容已脱敏，不含真实业务身份、附件正文、内部地址或密钥。
+          required: true
