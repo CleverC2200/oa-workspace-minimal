@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import sys
+import tempfile
 from typing import Iterable
 
 
@@ -150,6 +152,122 @@ def check_pr_body(body: object) -> list[str]:
     return findings
 
 
+def check_yaml(paths: Iterable[Path]) -> list[str]:
+    import yaml
+
+    class Loader(yaml.SafeLoader):
+        pass
+
+    # YAML 1.2 booleans: GitHub Actions' "on" remains a mapping key.
+    Loader.yaml_implicit_resolvers = {
+        key: [(tag, pattern) for tag, pattern in values if tag != 'tag:yaml.org,2002:bool']
+        for key, values in Loader.yaml_implicit_resolvers.items()
+    }
+    Loader.add_implicit_resolver('tag:yaml.org,2002:bool', re.compile(r'^(?:true|false)$', re.I), list('tTfF'))
+
+    def unique_mapping(loader, node, deep=False):
+        result = {}
+        for key_node, value_node in node.value:
+            key = loader.construct_object(key_node, deep=deep)
+            if key in result:
+                raise ValueError('yaml_duplicate_key')
+            result[key] = loader.construct_object(value_node, deep=deep)
+        return result
+    Loader.add_constructor('tag:yaml.org,2002:map', unique_mapping)
+    findings = []
+    for path in paths:
+        if path.suffix.lower() not in {'.yml', '.yaml'}:
+            continue
+        try:
+            value = yaml.load(path.read_text(encoding='utf-8'), Loader=Loader)
+            if not isinstance(value, dict):
+                raise ValueError('yaml_mapping_required')
+        except (OSError, yaml.YAMLError, ValueError, TypeError):
+            findings.append(f'yaml_invalid:{path.name}')
+            continue
+        if path.parent.name == 'ISSUE_TEMPLATE' and path.name != 'config.yml':
+            findings.extend(check_issue_form(value, path.name))
+    return sorted(findings)
+
+
+def check_issue_form(form: dict, name: str) -> list[str]:
+    invalid = [f'issue_form_invalid:{name}']
+    if (not isinstance(form.get('name'), str) or not form['name'].strip()
+            or not isinstance(form.get('description'), str) or not form['description'].strip()
+            or not isinstance(form.get('body'), list) or not form['body']):
+        return invalid
+    ids = set()
+    for field in form['body']:
+        if not isinstance(field, dict):
+            return invalid
+        kind = field.get('type')
+        attributes = field.get('attributes')
+        if (not isinstance(kind, str) or kind not in {'markdown', 'input', 'textarea', 'dropdown', 'checkboxes'}
+                or not isinstance(attributes, dict)):
+            return invalid
+        if kind == 'markdown':
+            if not isinstance(attributes.get('value'), str):
+                return invalid
+            continue
+        field_id = field.get('id')
+        if (not isinstance(field_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', field_id)
+                or field_id in ids or not isinstance(attributes.get('label'), str)
+                or not attributes['label'].strip()):
+            return invalid
+        ids.add(field_id)
+        validations = field.get('validations', {})
+        if (not isinstance(validations, dict)
+                or set(validations) - {'required'}
+                or ('required' in validations and type(validations['required']) is not bool)):
+            return invalid
+        if kind in {'dropdown', 'checkboxes'}:
+            options = attributes.get('options')
+            if not isinstance(options, list) or not options:
+                return invalid
+            if kind == 'dropdown' and (not all(isinstance(item, str) and item.strip() for item in options)
+                                       or len(set(options)) != len(options)):
+                return invalid
+            if kind == 'checkboxes' and any(not isinstance(item, dict) or not isinstance(item.get('label'), str)
+                    or ('required' in item and type(item['required']) is not bool) for item in options):
+                return invalid
+    return []
+
+
+def check_review_schemas() -> list[str]:
+    from jsonschema import Draft202012Validator
+    from jsonschema.exceptions import SchemaError
+    from apps.oa_finance_preaudit import codex_review_worker as worker, flow_engine, packaging_review
+
+    findings = []
+    with tempfile.TemporaryDirectory(prefix='oa-schema-check-') as temporary:
+        for workflow in worker._FINANCE_RULES:
+            def material(request, _attempt, key=workflow):
+                return {'schema_version': 1, 'kind': 'preaudit_material', 'request_id': request,
+                        'workflow_key': key, 'workflow_name': 'Offline schema check', 'declared_fields': [],
+                        'resources': [], 'prepared': {'images': [], 'structured_contents': [], 'manifest': []},
+                        'authority_facts': [], 'warnings': []}
+            engine = flow_engine.FlowEngine(root=Path(temporary) / workflow,
+                discover_candidates=lambda key: [{'request_id': 'offline-case', 'workflow_key': key,
+                                                  'received_at': '2026-09-01T00:00:00+00:00'}],
+                collect_material=material)
+            try:
+                action = engine.next_action(workflow)
+                schema = worker._decision_schema(Path(action['action_file']))
+                Draft202012Validator.check_schema(schema)
+                packaging_review.check_provider_schema(schema)
+            except (ValueError, KeyError, SchemaError):
+                findings.append(f'review_schema_invalid:{workflow}')
+    try:
+        packaging_review.draft_schema({
+            'rule_version': 'packaging_layout_approval:2',
+            'items': [{'item_key': key} for key in flow_engine._FLOW_SPECS['packaging_layout_approval']['item_keys']],
+            'packaging_visual_contract': {'page_refs': ['material:prepared.images.offline.page-1']},
+        })
+    except (ValueError, KeyError, SchemaError):
+        findings.append('review_schema_invalid:packaging_layout_approval')
+    return findings
+
+
 def _event_body(path: Path) -> object:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -160,7 +278,7 @@ def _event_body(path: Path) -> object:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="repository-quality")
-    parser.add_argument("check", choices=("skill", "hygiene", "format", "links", "pr"))
+    parser.add_argument("check", choices=("skill", "hygiene", "format", "links", "pr", "yaml", "schema", "lint"))
     parser.add_argument("--event", type=Path)
     args = parser.parse_args(argv)
     files = tracked_files()
@@ -172,6 +290,12 @@ def main(argv: list[str] | None = None) -> int:
         findings = check_format(files)
     elif args.check == "links":
         findings = check_markdown_links(files)
+    elif args.check == "yaml":
+        findings = check_yaml(files)
+    elif args.check == "schema":
+        findings = check_review_schemas()
+    elif args.check == "lint":
+        return subprocess.call([sys.executable, '-m', 'ruff', 'check', 'apps', 'scripts', 'tests'], cwd=PROJECT_ROOT)
     else:
         findings = check_pr_body(_event_body(args.event)) if args.event else ["pr_event_missing"]
     if findings:

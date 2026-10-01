@@ -60,10 +60,15 @@ python3 -m scripts.quality skill
 python3 -m scripts.quality format
 python3 -m scripts.quality hygiene
 python3 -m scripts.quality links
+python3 -m scripts.quality yaml
+python3 -m scripts.quality schema
+python3 -m scripts.quality lint
 python3 -m pytest -q --tb=short
 python3 -m compileall -q apps scripts tests
 git diff --check
 ```
+
+机械检查的范围及边界见[质量检查](docs/agents/quality-checks.md)。
 
 仓库继续保持私有，不配置 GitHub 服务端分支保护。`main` 的分支、验证、PR、合并和清理规则由仓库所有者本地维护，具体见[main 本地管理规则](docs/agents/branch-protection.md)；不得把人工规范表述为平台强制。
 

@@ -30,6 +30,12 @@ jobs:
         run: python -m scripts.quality hygiene
       - name: Markdown links
         run: python -m scripts.quality links
+      - name: YAML and issue forms
+        run: python -m scripts.quality yaml
+      - name: Generated review schemas
+        run: python -m scripts.quality schema
+      - name: Python critical lint
+        run: python -m scripts.quality lint
       - name: PR contract
         if: github.event_name == 'pull_request'
         run: python -m scripts.quality pr --event "$GITHUB_EVENT_PATH"
