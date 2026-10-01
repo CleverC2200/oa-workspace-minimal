@@ -67,3 +67,49 @@ class TestQualityGate:
             document.write_text("[missing](docs/missing.md)\n", encoding="utf-8")
             findings = quality.check_markdown_links([document], root)
         assert findings == ["missing_link:README.md:docs/missing.md"]
+
+
+def test_yaml_rejects_duplicate_keys_and_keeps_actions_on(tmp_path):
+    valid = tmp_path / 'quality.yml'
+    valid.write_text('name: checks\non: [push]\njobs: {}\n')
+    assert quality.check_yaml([valid]) == []
+    valid.write_text('name: first\nname: second\n')
+    assert quality.check_yaml([valid]) == ['yaml_invalid:quality.yml']
+    valid.write_text('name: [broken\n')
+    assert quality.check_yaml([valid]) == ['yaml_invalid:quality.yml']
+
+
+def test_issue_form_fixed_contract_and_unique_ids(tmp_path):
+    import yaml
+    path = tmp_path / 'ISSUE_TEMPLATE' / 'bug.yml'; path.parent.mkdir()
+    form = {'name': 'Bug', 'description': 'Record a bug', 'body': [
+        {'type': 'textarea', 'id': 'impact', 'attributes': {'label': 'Impact'}, 'validations': {'required': True}},
+        {'type': 'checkboxes', 'id': 'privacy', 'attributes': {'label': 'Privacy',
+         'options': [{'label': 'Redacted', 'required': True}]}},
+    ]}
+    path.write_text(yaml.safe_dump(form))
+    assert quality.check_yaml([path]) == []
+    form['body'][1]['id'] = 'impact'
+    path.write_text(yaml.safe_dump(form))
+    assert quality.check_yaml([path]) == ['issue_form_invalid:bug.yml']
+    form['body'][1]['id'] = 'privacy'
+    form['body'][0]['validations']['required'] = 'true'
+    path.write_text(yaml.safe_dump(form))
+    assert quality.check_yaml([path]) == ['issue_form_invalid:bug.yml']
+
+
+def test_current_yaml_and_generated_review_schemas_pass():
+    assert quality.check_yaml(quality.tracked_files()) == []
+    assert quality.check_review_schemas() == []
+
+
+def test_bad_generated_schema_reports_each_workflow(monkeypatch):
+    from apps.oa_finance_preaudit import codex_review_worker
+    monkeypatch.setattr(codex_review_worker, '_decision_schema', lambda *_args, **_kwargs: {'type': 'bad-type'})
+    assert quality.check_review_schemas() == [f'review_schema_invalid:{key}' for key in codex_review_worker._FINANCE_RULES]
+
+
+def test_issue_form_unhashable_type_is_a_finding():
+    for kind in ([], {}):
+        assert quality.check_issue_form({'name': 'Bug', 'description': 'Bug', 'body': [
+            {'type': kind, 'attributes': {'label': 'Impact'}}]}, 'bug.yml') == ['issue_form_invalid:bug.yml']
