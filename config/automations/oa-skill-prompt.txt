@@ -4,7 +4,7 @@
 
 门禁通过后只调用一次独立 exec_command：
 .venv/bin/python -m scripts.finance_preaudit_run --owner-task-id <当前任务真实UUID> -- --rolling --adaptive --capacity 6 --confirm-write YES --recover-confirmed-no-write-once YES --workflow travel_expense --workflow business_entertainment --workflow business_support_fee --workflow small_marketing_fee --workflow tpm_small_marketing_fee --workflow general_expense
-保留原 session_id、exit_code、output 和 receipt_file，用原 write_stdin 等到真实终态，不启动第二控制器。session_id 无 exit_code 或函数单元 Script completed 均不表示业务退出；静默、低CPU、固定35/60分钟或浏览器关闭警告不证明卡死。必要时按同 run/instance/task/trace 核对 prepare 采样年龄和只读门禁。原会话丢失则留住错误及归属，终态/回收未知，转人工；不假称安全停止。执行回执和限制见 docs/agents/controller-execution.md。
+保留原 session_id、exit_code、output 和 receipt_file；取得原工具 session ID 后，按 docs/agents/controller-execution.md 的元数据入口绑定同轮 ID，再用原 write_stdin 等到真实终态，不启动第二控制器。可信 result=skipped 只跳过本轮，不进入包装或清窗。session_id 无 exit_code 或函数单元 Script completed 均不表示业务退出；静默、低CPU、固定35/60分钟或浏览器关闭警告不证明卡死。必要时按同 run/instance/task/trace 核对 prepare 采样年龄和只读门禁。原会话丢失则留住错误及归属，终态/回收未知，转人工；不假称安全停止。执行回执和限制见 docs/agents/controller-execution.md。
 
 按条件读取手册对应章并执行：停止/隔离/当前未知写入、控制器failed、主机critical或运行中身份/授权/冻结/对账等任一安全门失信→“停止隔离与有限恢复”；财务可信终态且结束门禁通过后→“包装待审核”；真实故障→“故障通知”；明确程序缺陷→“程序故障派单”。保留现有通知unknown保护，一窗口一次修复、已有归属不重复创建；历史告警不代替本轮故障身份。
 
