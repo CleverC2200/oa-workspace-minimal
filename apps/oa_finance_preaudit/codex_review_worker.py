@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import signal
 import shlex
+import stat
 import subprocess
 import tempfile
 import threading
@@ -396,7 +397,7 @@ def _prompt(action_file: Path) -> str:
 
 要求：
 1. 完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由读取 `references/result-contract.md`、`references/observation-contract.md`、`{rule_reference}`、动作引用的审核包、材料和准备页；{workflow_requirement}{frozen_item_requirement}不得读取其他 attempt。
-2. 不修改任何文件、项目代码、Skill、配置、授权清单或冻结材料；不得调用 `next-action`、`complete-review` 或任何 OA 写入，不得领取其他单据。
+2. 不修改任何文件、项目代码、Skill、配置、授权清单或冻结材料；不得调用 `next-action`、`complete-review` 或任何 OA 写入，不得领取其他单据；不得读取现有审核决定、意见或 `review-output-*.txt` 失败原输出。
 3. 根据审核包中的固定审核项动态形成结构化决定。证据不足使用 `uncertain` 交财务判断，不得因为材料缺口卡住业务流程；身份、归属、冻结或授权不可信时停止。审核包为 `material_state=degraded` 时，`collection_gaps` 只说明自动读取没有完成，不得声称申请人未填写字段、未上传附件或单据没有发票；结论直接说明自动读取失败、对应项目未完成核对，请财务查看原单。
 4. {_OPINION_BREVITY_REQUIREMENT}结论内保留规则要求的具体金额、实际公司全称等必要业务原值；不得输出密钥、凭据或无关附件原文。宿主会校验并负责受控提交。
 
@@ -1059,7 +1060,8 @@ def _execute_codex_raw(
         output_error = None
         if process.returncode == 0:
             try:
-                raw_decision = decision_file.read_text(encoding="utf-8")
+                raw_bytes = decision_file.read_bytes()
+                raw_decision = raw_bytes.decode("utf-8")
                 candidate = decision_parser(raw_decision)
                 decision_state = "not_object"
             except OSError:
@@ -1080,13 +1082,22 @@ def _execute_codex_raw(
                                           decision_state=decision_state, event_counts=event_counts,
                                           event_status=event_status, exit_code=process.returncode)
                 try:
+                    raw_hash = hashlib.sha256(raw_bytes).hexdigest()
+                    raw_file = action_file.with_name(f"review-output-{raw_hash}.txt")
+                    if os.path.lexists(raw_file):
+                        if (raw_file.is_symlink() or not raw_file.is_file()
+                                or stat.S_IMODE(raw_file.stat().st_mode) != 0o600
+                                or raw_file.read_bytes() != raw_bytes):
+                            raise ValueError("decision_diagnostic_invalid")
+                    else:
+                        runtime_control.write_control_bytes_atomic(raw_file, raw_bytes)
                     decision_validation.record_rejection(
                         action_file,
-                        {"raw_output_sha256": hashlib.sha256(raw_decision.encode("utf-8")).hexdigest()},
+                        {"raw_output_sha256": raw_hash},
                         decision_validation.InvalidDecision("decision_json" if decision_state == "unreadable" else "decision_object"),
                     )
                     output_error = "codex_decision_invalid"
-                except (OSError, ValueError, TypeError):
+                except (OSError, RuntimeError, ValueError, TypeError):
                     output_error = "codex_decision_diagnostic_failed"
     output.close()
     return CodexExecution(

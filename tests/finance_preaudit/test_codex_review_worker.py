@@ -166,7 +166,8 @@ def _mock_final_output(monkeypatch, raw):
             return self.returncode
 
     def popen(command, **kwargs):
-        Path(command[command.index("--output-last-message") + 1]).write_text(raw)
+        payload = raw if isinstance(raw, bytes) else raw.encode()
+        Path(command[command.index("--output-last-message") + 1]).write_bytes(payload)
         return Process()
 
     monkeypatch.setattr(codex_review_worker.subprocess, "Popen", popen)
@@ -193,6 +194,7 @@ def test_finance_reviewer_consumes_single_json_fence(tmp_path, monkeypatch, wrap
     assert result["decision"] == decision
     assert not list(action_file.parent.glob("review-rejection-*.json"))
     assert not action_file.with_name("execution-receipt.json").exists()
+    assert not list(action_file.parent.glob("review-output-*.txt"))
     decision_file = tmp_path / "decision.json"
     json_artifact.write_json_atomic(decision_file, result["decision"])
     closed = engine.complete_review(action_file, decision_file)
@@ -211,6 +213,7 @@ def test_finance_reviewer_consumes_single_json_fence(tmp_path, monkeypatch, wrap
     '{"amount":1e309}', '{"amount":-1e309}',
     '```json\n{"amount":1e309}\n```',
     '```json\n{"items":',
+    'not-json\r\n', b'not-json\xff', '[]', 'null', '"private-value"',
 ])
 def test_finance_reviewer_rejects_ambiguous_or_invalid_json(tmp_path, monkeypatch, raw):
     task, action_file = _task(tmp_path)
@@ -222,6 +225,55 @@ def test_finance_reviewer_rejects_ambiguous_or_invalid_json(tmp_path, monkeypatc
     assert "decision" not in result
     assert len(list(action_file.parent.glob("review-rejection-*.json"))) == 1
     assert not action_file.with_name("execution-receipt.json").exists()
+    outputs = list(action_file.parent.glob("review-output-*.txt"))
+    assert len(outputs) == 1
+    payload = raw if isinstance(raw, bytes) else raw.encode()
+    assert outputs[0].read_bytes() == payload
+    import hashlib
+    assert outputs[0].name == f"review-output-{hashlib.sha256(payload).hexdigest()}.txt"
+    assert outputs[0].stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("damage", ["symlink", "content", "permissions", "directory"])
+def test_failed_output_retention_refuses_changed_evidence(tmp_path, monkeypatch, damage):
+    import hashlib
+
+    task, action_file = _task(tmp_path)
+    raw = "not-json"
+    target = action_file.with_name(f"review-output-{hashlib.sha256(raw.encode()).hexdigest()}.txt")
+    if damage == "symlink":
+        target.symlink_to(tmp_path / "outside")
+    elif damage == "directory":
+        target.mkdir()
+    elif damage == "permissions":
+        target.write_text(raw)
+        target.chmod(0o644)
+    else:
+        target.write_text("other evidence")
+    _mock_final_output(monkeypatch, raw)
+    result = codex_review_worker.review(task)
+    assert result["error_code"] == "codex_decision_diagnostic_failed"
+    assert result["write_state"] == "not_requested"
+    assert not list(action_file.parent.glob("review-rejection-*.json"))
+    if damage == "content":
+        assert target.read_text() == "other evidence"
+    if damage == "permissions":
+        assert target.stat().st_mode & 0o777 == 0o644
+
+
+def test_failed_output_retention_failure_remains_unwritten(tmp_path, monkeypatch):
+    task, action_file = _task(tmp_path)
+    _mock_final_output(monkeypatch, "not-json")
+
+    def unsafe(*args):
+        raise RuntimeError("control_file_unsafe")
+
+    monkeypatch.setattr(codex_review_worker.runtime_control, "write_control_bytes_atomic", unsafe)
+    result = codex_review_worker.review(task)
+    assert result["error_code"] == "codex_decision_diagnostic_failed"
+    assert result["write_state"] == "not_requested"
+    assert not list(action_file.parent.glob("review-rejection-*.json"))
+    assert "review-output-*.txt" in codex_review_worker._prompt(action_file)
 
 
 
