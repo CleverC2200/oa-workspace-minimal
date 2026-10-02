@@ -208,6 +208,8 @@ def test_finance_reviewer_consumes_single_json_fence(tmp_path, monkeypatch, wrap
     '```json\n{"overall":"pass","overall":"needs_human"}\n```',
     '{"item":{"status":"pass","status":"fail"}}',
     '{"amount":NaN}', '{"amount":Infinity}', '{"amount":-Infinity}',
+    '{"amount":1e309}', '{"amount":-1e309}',
+    '```json\n{"amount":1e309}\n```',
     '```json\n{"items":',
 ])
 def test_finance_reviewer_rejects_ambiguous_or_invalid_json(tmp_path, monkeypatch, raw):

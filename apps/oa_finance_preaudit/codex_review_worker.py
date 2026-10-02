@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from contextlib import nullcontext
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -861,7 +862,14 @@ def _parse_decision_json(raw: str) -> object:
     def reject_constant(_value):
         raise ValueError("decision_json_nonfinite")
 
-    return json.loads(raw, object_pairs_hook=unique_fields, parse_constant=reject_constant)
+    def finite_float(value):
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError("decision_json_nonfinite")
+        return number
+
+    return json.loads(raw, object_pairs_hook=unique_fields,
+                      parse_constant=reject_constant, parse_float=finite_float)
 
 
 def _execute_codex_raw(
