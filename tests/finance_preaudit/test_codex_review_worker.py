@@ -151,6 +151,78 @@ def test_non_travel_schema_and_timing_follow_bound_action(tmp_path: Path) -> Non
     assert "page_routing" not in prompt
 
 
+def _mock_final_output(monkeypatch, raw):
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
+
+    class Process:
+        pid = 12345
+        returncode = 0
+        stderr = io.StringIO()
+
+        def communicate(self, **kwargs):
+            pass
+
+        def poll(self):
+            return self.returncode
+
+    def popen(command, **kwargs):
+        Path(command[command.index("--output-last-message") + 1]).write_text(raw)
+        return Process()
+
+    monkeypatch.setattr(codex_review_worker.subprocess, "Popen", popen)
+    monkeypatch.setattr(codex_review_worker.runtime_control, "stop_requested", lambda: False)
+
+
+@pytest.mark.parametrize("wrapper", ["{}", "```json\n{}\n```", " \n```json\r\n{}\r\n```\n"])
+def test_finance_reviewer_consumes_single_json_fence(tmp_path, monkeypatch, wrapper):
+    from tests.finance_preaudit.test_flow_engine_submission import _material, _needs_human_decision
+
+    project_root = tmp_path / "project"
+    engine = flow_engine.FlowEngine(
+        root=project_root / "runtime/finance_preaudit_flows",
+        discover_candidates=lambda key: [{"request_id": "synthetic", "received_at": "2026-08-22T09:00:00+08:00", "workflow_key": key}],
+        collect_material=lambda request, _: _material(request),
+    )
+    action = engine.next_action("travel_expense")
+    action_file = Path(action["action_file"])
+    decision = _needs_human_decision(action)
+    _mock_final_output(monkeypatch, wrapper.format(json.dumps(decision)))
+    task = {"project_root": str(project_root), "action_file": str(action_file), "timeout_seconds": 60}
+    result = codex_review_worker.review(task)
+    assert result["status"] == "reviewed"
+    assert result["decision"] == decision
+    assert not list(action_file.parent.glob("review-rejection-*.json"))
+    assert not action_file.with_name("execution-receipt.json").exists()
+    decision_file = tmp_path / "decision.json"
+    json_artifact.write_json_atomic(decision_file, result["decision"])
+    closed = engine.complete_review(action_file, decision_file)
+    assert closed["action"] == "closed"
+    assert closed["business_state"] == "needs_human"
+    assert closed["write_state"] == "not_requested"
+
+
+@pytest.mark.parametrize("raw", [
+    '说明\n```json\n{}\n```',
+    '{}\n```json\n{}\n```',
+    '```json\n{}\n```\n```json\n{}\n```',
+    '```json\n{"overall":"pass","overall":"needs_human"}\n```',
+    '{"item":{"status":"pass","status":"fail"}}',
+    '{"amount":NaN}', '{"amount":Infinity}', '{"amount":-Infinity}',
+    '```json\n{"items":',
+])
+def test_finance_reviewer_rejects_ambiguous_or_invalid_json(tmp_path, monkeypatch, raw):
+    task, action_file = _task(tmp_path)
+    _mock_final_output(monkeypatch, raw)
+    result = codex_review_worker.review(task)
+    assert result["status"] == "failed"
+    assert result["error_code"] == "codex_decision_invalid"
+    assert result["write_state"] == "not_requested"
+    assert "decision" not in result
+    assert len(list(action_file.parent.glob("review-rejection-*.json"))) == 1
+    assert not action_file.with_name("execution-receipt.json").exists()
+
+
+
 def test_general_expense_worker_uses_bound_rule_pack(tmp_path: Path) -> None:
     _task_payload, action_file = _task(
         tmp_path,
