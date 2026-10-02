@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 from contextlib import nullcontext
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 import signal
 import shlex
 import subprocess
@@ -843,6 +845,33 @@ def _execute_codex(
     return execution
 
 
+def _parse_decision_json(raw: str) -> object:
+    """Unwrap one complete JSON fence without selecting or repairing a decision."""
+    block = re.fullmatch(r"\s*```json[ \t]*\r?\n(.*?)\r?\n```\s*", raw, re.DOTALL)
+    if block:
+        raw = block.group(1)
+
+    def unique_fields(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("decision_json_duplicate_field")
+            result[key] = value
+        return result
+
+    def reject_constant(_value):
+        raise ValueError("decision_json_nonfinite")
+
+    def finite_float(value):
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError("decision_json_nonfinite")
+        return number
+
+    return json.loads(raw, object_pairs_hook=unique_fields,
+                      parse_constant=reject_constant, parse_float=finite_float)
+
+
 def _execute_codex_raw(
     project_root: Path,
     action_file: Path,
@@ -852,7 +881,7 @@ def _execute_codex_raw(
     stderr_summary: dict,
     read_only: bool = False,
     schema_builder: Callable[[Path], dict] | None = None,
-    decision_parser: Callable[[str], dict] = json.loads,
+    decision_parser: Callable[[str], object] = _parse_decision_json,
     audit_directory: Path | None = None,
 ) -> CodexExecution:
     try:
