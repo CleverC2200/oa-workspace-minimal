@@ -300,3 +300,5 @@ git diff --check
 统一查询使用 `apps.oa_finance_preaudit.cli status --check-live --reconcile`：`workflows[].write_states` 显示本地提交状态，`reconciliation.manual_review` 列出人工核对项，`continuation` 与 `controller_handoff` 显示整轮阻断，`notification` 显示最近发送结果。`recoveries.items` 显示显式恢复的来源/目标 attempt、未写入依据、准备结果和证据校验状态；缺失或被改动的历史回执标为 `missing_or_invalid`，不补造证明。
 
 恢复仍复用 `next-action --recover-action-file` 的明确确认、实时待办/已办与精确身份门，Writer 类未写入标签还必须有匹配冻结 job 的签名边界。新 attempt 的 `recovery-receipt.json` 在准备前记为 started，准备后记为 prepared 或 preparation_failed；恢复准备不代表已提交 OA。历史未知写入不自动重试，人工确认未知写入未发生的既有入口仍要求逐单明确确认。旧 attempt 保持不变，查询不会触发恢复、发送或写入。
+
+开发检查前使用 [只读环境预检与原生 Actions](docs/agents/dev-environment.md)，依赖准备单独显式执行。
