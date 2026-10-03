@@ -20,7 +20,8 @@ from typing import Callable, TextIO
 from apps import json_artifact
 from apps.oa_approval import runtime_control, writer_outcomes
 
-from . import concurrency_control, decision_validation, manual_handoff, process_diagnostics, review_failure_evidence
+from . import concurrency_control, decision_validation, manual_handoff, process_diagnostics, review_failure_evidence, review_output, review_context
+from .review_output import parse_json as _parse_decision_json
 
 
 MODEL = review_failure_evidence.MODEL
@@ -846,33 +847,6 @@ def _execute_codex(
     return execution
 
 
-def _parse_decision_json(raw: str) -> object:
-    """Unwrap one complete JSON fence without selecting or repairing a decision."""
-    block = re.fullmatch(r"\s*```json[ \t]*\r?\n(.*?)\r?\n```\s*", raw, re.DOTALL)
-    if block:
-        raw = block.group(1)
-
-    def unique_fields(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError("decision_json_duplicate_field")
-            result[key] = value
-        return result
-
-    def reject_constant(_value):
-        raise ValueError("decision_json_nonfinite")
-
-    def finite_float(value):
-        number = float(value)
-        if not math.isfinite(number):
-            raise ValueError("decision_json_nonfinite")
-        return number
-
-    return json.loads(raw, object_pairs_hook=unique_fields,
-                      parse_constant=reject_constant, parse_float=finite_float)
-
-
 def _execute_codex_raw(
     project_root: Path,
     action_file: Path,
@@ -893,6 +867,7 @@ def _execute_codex_raw(
             "codex_review_task_invalid", _unknown_usage(),
             process_state="not_started", decision_state="not_attempted",
         )
+    retained_context = review_context.capture(action_file, schema)
     output = ((audit_directory / "events.jsonl").open("x+", encoding="utf-8")
               if audit_directory else tempfile.TemporaryFile(mode="w+", encoding="utf-8"))
     workspace = nullcontext(str(audit_directory)) if audit_directory else tempfile.TemporaryDirectory(prefix="oa-preaudit-codex-")
@@ -1061,9 +1036,9 @@ def _execute_codex_raw(
         if process.returncode == 0:
             try:
                 raw_bytes = decision_file.read_bytes()
-                raw_decision = raw_bytes.decode("utf-8")
-                candidate = decision_parser(raw_decision)
-                decision_state = "not_object"
+                parsed = review_output.consume(raw_bytes, parser=decision_parser)
+                candidate = parsed.value
+                decision_state = parsed.state
             except OSError:
                 candidate = None
             except ValueError:
@@ -1091,10 +1066,12 @@ def _execute_codex_raw(
                             raise ValueError("decision_diagnostic_invalid")
                     else:
                         runtime_control.write_control_bytes_atomic(raw_file, raw_bytes)
+                    context_hash = review_context.persist(raw_file, retained_context) if retained_context is not None else None
                     decision_validation.record_rejection(
                         action_file,
                         {"raw_output_sha256": raw_hash},
                         decision_validation.InvalidDecision("decision_json" if decision_state == "unreadable" else "decision_object"),
+                        **({"context_fingerprint": context_hash} if context_hash else {}),
                     )
                     output_error = "codex_decision_invalid"
                 except (OSError, RuntimeError, ValueError, TypeError):
