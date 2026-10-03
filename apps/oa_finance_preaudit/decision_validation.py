@@ -28,7 +28,7 @@ class InvalidDecision(ValueError):
         self.validation_code = validation_code if validation_code in CODES else "unspecified"
 
 
-def record_rejection(action_file: Path, decision: dict, error: ValueError) -> None:
+def record_rejection(action_file: Path, decision: dict, error: ValueError, *, context_fingerprint: str | None = None) -> None:
     action_path = Path(action_file)
     state_path = action_path.with_name("state.json")
     if action_path.is_symlink() or state_path.is_symlink():
@@ -51,6 +51,8 @@ def record_rejection(action_file: Path, decision: dict, error: ValueError) -> No
         "decision_sha256": decision_hash,
         "validation_code": code if isinstance(code, str) and code in CODES else "unspecified",
     }
+    if context_fingerprint is not None:
+        payload["context_fingerprint"] = context_fingerprint
     receipt_file = action_path.with_name(f"review-rejection-{decision_hash}.json")
     if receipt_file.is_symlink():
         raise ValueError("decision_diagnostic_invalid")

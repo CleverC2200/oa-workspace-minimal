@@ -152,6 +152,12 @@ python3 -m scripts.finance_preaudit_concurrency_probe \
 
 只读对账的 `continuation` 将继续条件与 `failure_attention` 分开：有可信失败回执、无写入边界且未请求写入的 `codex_review_failed` 仅列为 `scope=item`，继续精确排除该单据版本；人工关注状态仍保留。`status=ready` 且 `isolated_pending == quarantine.pending_quarantined` 才可通过隔离门。当前未知或未闭合写入、身份/待办已办冲突以及未经验证的其他失败返回 `scope=controller` 和脱敏 `blocking_reasons`。普通周期停止恢复使用这一门禁，仍核验身份、锁和进程回收；不会重试隔离项或清除未知写入证据。统一失败回执也支持经过允许列表验证的材料失败、无效审核决定和经签名边界确认的提交拒绝。已打开且冻结证据完整、尚未进入 Writer 的审核动作可继续由 FlowEngine 重新核验授权；明确指定的未写入恢复项只在首轮门禁按精确身份匹配，其他阻塞项仍停止整轮。调度必须采用相同字段；仅发布代码不会改写工作树外的自动化提示词。
 
+### 失败审核输出离线诊断
+
+已留存的失败原字节可通过 `python3 -m apps.oa_finance_preaudit.review_diagnostics` 只读回放，
+分开报告来源、解析、冻结绑定与实际留存 Schema 合同；不调用模型或 OA、不执行恢复或提交。
+旧记录缺少原上下文时保留未验证状态。命令、私有报告与验收边界见[离线回放说明](docs/agents/offline-review-diagnosis.md)。
+
 ### 滚动恢复隔离项
 
 已明确批准有限恢复的生产调度，可在唯一滚动入口增加 `--recover-confirmed-no-write-once YES`。宿主在租约内核对实时状态，只对当前授权流程、可信单据级确认未写入的首个 attempt 执行一次跨轮恢复；已有后续尝试进入人工处置，未知写入仍不重试。默认入口继续跳过历史隔离。处理人、当前 RPA 等待时长、期限、恢复上限及修复占位收尾见[阻断处置手册](docs/runbooks/blocking-recovery.md)。
