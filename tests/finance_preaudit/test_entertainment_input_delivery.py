@@ -59,6 +59,14 @@ def prepare(tmp_path, *, page_count=5, width=16, height=16, degraded=False, tail
 
 def reviewer(monkeypatch, tmp_path, task, *, direct=True, image_count=5, unknown_usage=False, wrong_token=False, resource_evidence=False, probe_large=False, probe_invalid=False, host_scope=False):
     """A real controllable subprocess, replacing the external paid CLI only."""
+    # Resolve and fingerprint our controlled CLI through the production resolver.
+    # Popen below supplies its real subprocess behavior; no installed Codex is used.
+    native_dir = tmp_path / "offline-native-bin"
+    native_dir.mkdir(exist_ok=True)
+    native = native_dir / "codex"
+    native.write_bytes(b"\x7fELFcontrolled-offline-native-codec")
+    native.chmod(0o700)
+    monkeypatch.setenv("PATH", str(native_dir))
     action = json.loads(Path(task["action_file"]).read_text())
     packet = json.loads(Path(action["review_packet_file"]).read_text())
     decision = {"schema_version": 1, "kind": "preaudit_review_decision", "action_token": action["action_token"],
@@ -271,21 +279,25 @@ def test_large_original_sources_are_delivered_in_existing_cli_path(monkeypatch, 
 
 def test_small_compressed_sources_do_not_hide_reencoding_capacity(monkeypatch, tmp_path):
     engine, task = prepare(tmp_path, width=1200, height=2800)
-    reviewer(monkeypatch, tmp_path, task, direct=False, image_count=0, probe_large=True)
+    calls = reviewer(monkeypatch, tmp_path, task, direct=False, image_count=0, probe_large=True)
     closed = close(engine, task, worker.review(task))
     assert closed["action"] == "closed"
     diagnostic = json.loads(next(Path(task["action_file"]).parent.glob("review-process-*.json")).read_text())
     assert diagnostic["input_delivery"]["fallback_reason"] == "request_bytes_limit"
+    assert len([call for call in calls if call[1:3] == ["debug", "prompt-input"]]) == 1
+    assert len([call for call in calls if call[1] == "exec"]) == 1
 
 
 def test_native_encoded_sizes_allow_all_five_large_jpegs(monkeypatch, tmp_path):
     engine, task = prepare(tmp_path, width=1200, height=2800, image_format="jpeg")
+    monkeypatch.setenv("PATH", str(tmp_path))  # CI has no installed Codex.
     calls = reviewer(monkeypatch, tmp_path, task)
     closed = close(engine, task, worker.review(task))
     assert closed["action"] == "closed"
     assert closed["write_state"] == "not_requested"
     assert len([call for call in calls if call[1] == "exec"]) == 1
     assert len([call for call in calls if call[1:3] == ["debug","prompt-input"]]) == 1
+    assert calls[0][0] == calls[1][0] == str(tmp_path / "offline-native-bin" / "codex")
 
 
 def test_incomplete_native_render_retains_all_pages_on_existing_path(monkeypatch, tmp_path):
@@ -295,6 +307,7 @@ def test_incomplete_native_render_retains_all_pages_on_existing_path(monkeypatch
     assert closed["action"] == "closed"
     assert closed["write_state"] == "not_requested"
     assert len([call for call in calls if call[1] == "exec"]) == 1
+    assert len([call for call in calls if call[1:3] == ["debug", "prompt-input"]]) == 1
 
 
 def test_capacity_measurement_cannot_clear_image_preparation_difference(monkeypatch, tmp_path):
