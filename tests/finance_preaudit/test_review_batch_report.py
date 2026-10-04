@@ -25,7 +25,7 @@ def digest(path):
 
 def archive(
     tmp_path, usage=None, *, with_attachment=False, closed=True, business_value=None,
-    structured_pdf=False,
+    structured_pdf=False, workflow="travel_expense", request_id="synthetic",
 ):
     root = tmp_path / "batch"
     root.mkdir(mode=0o700)
@@ -34,7 +34,7 @@ def archive(
         pytest.fail("report must not call business ports")
 
     def collect(request, attempt):
-        material = _material(request)
+        material = {**_material(request), "workflow_key": workflow}
         if business_value is not None:
             material["declared_fields"] = [
                 {"path": "declared_fields.period", "value": business_value}
@@ -72,7 +72,7 @@ def archive(
         root=root / "flows",
         discover_candidates=lambda key: [
             {
-                "request_id": "synthetic",
+                "request_id": request_id,
                 "received_at": "2026-08-22T09:00:00+08:00",
                 "workflow_key": key,
             }
@@ -80,7 +80,7 @@ def archive(
         collect_material=collect,
         submit_frozen=forbidden,
     )
-    a = engine.next_action("travel_expense")
+    a = engine.next_action(workflow)
     action = Path(a["action_file"])
     inputs = {str(p): digest(p) for p in (root / "flows").rglob("*") if p.is_file()}
     for name in ("requirements-dev.txt", "apps/example.py"):
@@ -113,7 +113,7 @@ def archive(
         },
     )
     save(root / "started.json", {"manifest_sha256": digest(root / "manifest.json")})
-    decision = _needs_human_decision(a)
+    decision = {**_needs_human_decision(a), "workflow_key": workflow}
     if with_attachment:
         for item in decision["items"]:
             item.update(

@@ -879,6 +879,51 @@ def _read_bound_artifact(reference: object, *, document: bool = True) -> object:
         raise ValueError("financial_review_invalid") from error
 
 
+def _financial_replay_binding(review: dict, checklist: dict, assessment: dict) -> dict:
+    """Consume the archive reporter's validated machine facts, never a caller label."""
+    unknown = {"status": "not_established", "start": {"status": "not_established"}}
+    reference = review.get("archive")
+    if reference is None:
+        return unknown
+    manifest = _read_bound_artifact(reference)
+    path = Path(reference["file"])
+    if path.name != "manifest.json" or not isinstance(manifest, dict):
+        raise ValueError("financial_review_binding_invalid")
+    from .review_batch_report import build_report
+
+    report = build_report(path.parent)
+    binding = report["financial_binding"]
+    fingerprint = report["archive_fingerprint"]
+    if (fingerprint != reference["sha256"]
+            or checklist.get("archive_manifest_sha256") != fingerprint
+            or assessment.get("archive_manifest_sha256") != fingerprint
+            or review["item_key"] != binding.get("item_key")
+            or assessment.get("item_key") != binding.get("item_key")
+            or checklist["workflow_key"] != report["scope"]["workflow"]
+            or assessment.get("result_sha256") != binding.get("result_sha256")
+            or sorted(ref["sha256"] for ref in checklist["source_refs"])
+            != binding.get("original_file_sha256")
+            or not {ref["sha256"] for ref in checklist["rule_refs"]}.issubset(
+                set(binding.get("rule_file_sha256", [])))):
+        raise ValueError("financial_review_binding_invalid")
+    required = {binding["result_sha256"]}
+    if binding["status"] == "verified_consumed_correspondence":
+        required.update(binding[field] for field in (
+            "raw_decision_sha256", "consumed_decision_sha256", "remark_sha256", "receipt_sha256",
+        ))
+    if not required.issubset({ref["sha256"] for ref in assessment["output_refs"]}):
+        raise ValueError("financial_review_binding_invalid")
+    start = report["timing"]["start_receipt"]
+    if start["status"] == "bound_source_host_receipt" and review.get("replay_started_at") is not None:
+        try:
+            same = datetime.fromisoformat(review["replay_started_at"]) == datetime.fromisoformat(start["replay_started_at"])
+        except (TypeError, ValueError) as error:
+            raise ValueError("financial_review_binding_invalid") from error
+        if not same:
+            raise ValueError("financial_review_binding_invalid")
+    return {**binding, "start": start}
+
+
 def build_financial_quality_report(reviews: object) -> dict:
     """Bind independent manual claim checks to original evidence and consumed output.
 
@@ -936,13 +981,17 @@ def build_financial_quality_report(reviews: object) -> dict:
             raise ValueError("financial_review_invalid")
         failed = [check["id"] for check in checked if check["outcome"] == "fail"]
         unknown = [check["id"] for check in checked if check["outcome"] == "unverified"]
+        binding = _financial_replay_binding(review, checklist, assessment)
         confirmed = False
         if review.get("confirmation") is not None:
             record = _read_bound_artifact(review["confirmation"])
             try:
                 approved = datetime.fromisoformat(record["approved_at"])
-                started = datetime.fromisoformat(review["replay_started_at"])
-                confirmed = (record.get("role") == "finance"
+                trusted_start = binding["start"].get("replay_started_at")
+                started = datetime.fromisoformat(trusted_start) if trusted_start else None
+                confirmed = (binding["start"]["status"] == "bound_source_host_receipt"
+                             and started is not None
+                             and record.get("role") == "finance"
                              and bool(record.get("reviewer_record"))
                              and record.get("checklist_sha256") == review["checklist"]["sha256"]
                              and approved.tzinfo is not None and started.tzinfo is not None
@@ -953,16 +1002,21 @@ def build_financial_quality_report(reviews: object) -> dict:
         if assessment["reviewer_role"] == "finance":
             try:
                 reviewed_at = datetime.fromisoformat(assessment["reviewed_at"])
-                started_at = datetime.fromisoformat(review["replay_started_at"])
-                result_reviewed_by_finance = (reviewed_at.tzinfo is not None
-                                             and started_at.tzinfo is not None
-                                             and reviewed_at >= started_at)
+                closed_at = binding.get("closed_at")
+                closed = datetime.fromisoformat(closed_at) if closed_at and closed_at != "not_established" else None
+                result_reviewed_by_finance = (binding["status"] == "verified_consumed_correspondence"
+                                             and reviewed_at.tzinfo is not None
+                                             and closed is not None and closed.tzinfo is not None
+                                             and reviewed_at >= closed)
             except (KeyError, TypeError, ValueError) as error:
                 raise ValueError("financial_review_invalid") from error
         workflow, scenario = checklist["workflow_key"], checklist["scenario"]
         if workflow == "business_entertainment" and checklist["source_kind"] == "real_archive":
             covered.add(scenario)
         cases.append({"item_key": key, "workflow_key": workflow, "scenario": scenario,
+                      "source_kind": checklist["source_kind"],
+                      "binding_status": binding["status"],
+                      "replay_start_status": binding["start"]["status"],
                       "checklist_sha256": review["checklist"]["sha256"],
                       "assessment_sha256": review["assessment"]["sha256"],
                       "verdict": "fail" if failed else "unverified" if unknown else "pass",
@@ -975,7 +1029,9 @@ def build_financial_quality_report(reviews: object) -> dict:
             "cases": cases, "financial_confirmation": "confirmed" if confirmed else "pending",
             "missing_entertainment_scenarios": missing,
             "eligible": confirmed and not missing and all(
-                case["verdict"] == "pass" and case["result_reviewed_by_finance"] for case in cases)}
+                case["source_kind"] == "real_archive"
+                and case["binding_status"] == "verified_consumed_correspondence"
+                and case["verdict"] == "pass" and case["result_reviewed_by_finance"] for case in cases)}
 
 
 def build_acceptance_report(
