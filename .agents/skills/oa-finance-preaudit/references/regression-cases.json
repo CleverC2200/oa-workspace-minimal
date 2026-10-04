@@ -792,6 +792,35 @@
             "expected_output": "对应项目使用 uncertain，只说明自动读取失败、未完成核对，请财务查看原单；不推断申请人是否填写或上传",
             "failure_mode": "把系统未读取到材料错误表述为申请人没有提供材料",
             "rule_ref": "flows/tpm-small-marketing-fee.md;SKILL.md#2-读取证据"
-        }
+        },
+    {
+      "id": "RC-056-entertainment-paid-is-not-expense-confirmed",
+      "scope": "business_entertainment",
+      "audit_item": "attachment_payment_evidence;reimbursable_minimum",
+      "status": "confirmed",
+      "input_facts": [
+        "合成案例：明细甲个人转账80元已收款，页面仅昵称、金额与收款状态，原材料无费用用途或代付结算说明",
+        "明细乙丙稳定绑定同一份精确重复餐馆付款150元，同交易、业务上下文一致，拆分申报120与30；另一餐饮明细丁实付与申报20元",
+        "四行发票、购买方及预算既定口径可核，历史审批曾同意全部250元，但没有新增甲的用途说明"
+      ],
+      "incorrect_output": "共享付款正确只算一次后，凭甲已收款和同额发票申报判整单250元核销通过",
+      "expected_output": "支付证据与金额项uncertain，定位甲费用用途待核；保留共享150及丁20的已确认170元，不把个人款80纳入已确认部分；发票、预算仍按原规则pass，整体needs_human",
+      "failure_mode": "把支付发生当费用对应，或把共享分组通过扩张到独立款",
+      "rule_ref": "flows/business-entertainment.md#核销前逐笔核对"
+    },
+    {
+      "id": "RC-057-entertainment-confirmed-personal-settlement-is-usable",
+      "scope": "business_entertainment",
+      "audit_item": "attachment_payment_evidence;reimbursable_minimum",
+      "status": "confirmed",
+      "input_facts": [
+        "合成案例：个人转账80元已收款，当前费用原结算说明明确该收款人为本次餐饮代付人，原订单、商户和结算金额能唯一对应当前明细",
+        "发票买方与公司相符，申报、票和实际支出均80元，其他必要事实明确，无退款重复"
+      ],
+      "incorrect_output": "仅因个人收款或商户品牌名称不同要求补件，或自动把金额判未知",
+      "expected_output": "已有可信用途及结算关系充分时正常采用，原固定四项按规则输出，金额孰低80元；不新增姓名逐字匹配、统一日期或额外补件要求",
+      "failure_mode": "修复漏判时把所有个人收款变成未知",
+      "rule_ref": "flows/business-entertainment.md#核销前逐笔核对"
+    }
   ]
 }

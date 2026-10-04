@@ -22,7 +22,8 @@ DOCS = ('SKILL.md', 'references/result-contract.md', 'references/observation-con
 
 @pytest.mark.parametrize('fallback', [False, True])
 @pytest.mark.parametrize('wrong_binding', [False, True])
-def test_both_reading_paths_deliver_common_rule_and_preserve_consumer_contract(tmp_path, monkeypatch, fallback, wrong_binding):
+@pytest.mark.parametrize('amount_status', ['uncertain', 'fail'])
+def test_both_reading_paths_deliver_common_rule_and_preserve_consumer_contract(tmp_path, monkeypatch, fallback, wrong_binding, amount_status):
     engine, task = prepare(tmp_path, page_count=0, tail='synthetic-long-material' * 6000 if fallback else 'synthetic material')
     project = Path(task['project_root'])
     for name in DOCS:
@@ -34,8 +35,8 @@ def test_both_reading_paths_deliver_common_rule_and_preserve_consumer_contract(t
     decision = {'schema_version': 1, 'kind': 'preaudit_review_decision', 'action_token': action['action_token'],
         'workflow_key': 'business_entertainment', 'rule_version': packet['rule_version'], 'overall': 'needs_human',
         'items': [
-            {'item_key': item['item_key'], 'status': 'uncertain' if index == 0 else 'fail' if index == 3 else 'pass',
-             'conclusion': '一条明细仍需核对费用对应。' if index == 0 else '保留已确认异常；另一明细未知，不确定整单核销总额。' if index == 3 else '当前固定项目按原规则核对。',
+            {'item_key': item['item_key'], 'status': 'uncertain' if index == 0 else amount_status if index == 3 else 'pass',
+             'conclusion': '一条明细仍需核对费用对应。' if index == 0 else ('保留已确认异常；另一明细未知，不确定整单核销总额。' if amount_status == 'fail' else '一条支付用途仍待核，保留其他已确认部分。') if index == 3 else '当前固定项目按原规则核对。',
              'evidence_refs': ['material:declared_fields'] if index else [],
              'missing_evidence': ['一条明细费用对应关系尚未确认。'] if index in {0, 3} else []}
             for index, item in enumerate(packet['items'])]}
@@ -80,7 +81,7 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'cached_inp
         assert closed['business_state'] == 'needs_human'
         assert closed['write_state'] == 'not_requested'
         consumed = json.loads(Path(closed['decision_file']).read_text())
-        assert [item['status'] for item in consumed['items']] == ['uncertain', 'pass', 'pass', 'fail']
+        assert [item['status'] for item in consumed['items']] == ['uncertain', 'pass', 'pass', amount_status]
         assert consumed == decision
         samples = runtime_maintenance.status(Path(task['action_file']).parents[4])['case_metrics']
         acceptance = flow_evals.build_acceptance_report(samples,
