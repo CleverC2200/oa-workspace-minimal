@@ -821,6 +821,20 @@
       "expected_output": "已有可信用途及结算关系充分时正常采用，原固定四项按规则输出，金额孰低80元；不新增姓名逐字匹配、统一日期或额外补件要求",
       "failure_mode": "修复漏判时把所有个人收款变成未知",
       "rule_ref": "flows/business-entertainment.md#核销前逐笔核对"
+    },
+    {
+      "id": "RC-058-entertainment-preserve-paid-fact-when-purpose-unknown",
+      "scope": "business_entertainment",
+      "audit_item": "attachment_payment_evidence;reimbursable_minimum",
+      "status": "confirmed",
+      "input_facts": [
+        "合成案例：明细甲的原账单能确认支出65元，但原材料仍不能确认该支出用于本次费用；明细乙的支付、发票和申报40元及费用对应均已确认",
+        "金额、来源和支出事实可读，未发现退款或失败；未知仅为甲的费用对应关系"
+      ],
+      "incorrect_output": "把已确认支出与用途一并写成支付发生及费用对应均未确认，或只写整单不能核销而遗漏乙的已确认金额",
+      "expected_output": "第1项明确甲支出已确认而费用对应待核；missing_evidence只保留真实必要缺口，不要求统一补日期或交易号；第4项保留已确认可核销40元，甲待财务核实，其他固定项按原事实处理",
+      "failure_mode": "后一步用途未知覆盖前一步已确认的支付事实，或省略已确认核销范围",
+      "rule_ref": "flows/business-entertainment.md#核销前逐笔核对"
     }
   ]
 }
