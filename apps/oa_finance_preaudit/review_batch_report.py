@@ -533,6 +533,8 @@ def _financial_binding(root: Path, manifest: dict, action: Path, state: dict, pr
         "rule_file_sha256": sorted(h for p, h in manifest["source_files"].items() if "/.agents/skills/oa-finance-preaudit/" in p and p.endswith(".md")),
         "preview": preview,
     }
+    packet = _object(root, action.with_name("review-packet.json"))
+    facts["required_review_item_keys"] = [item["item_key"] for item in packet["items"]]
     source_root = Path(os.path.commonpath([str(Path(p).parent) for p in manifest["source_files"]]))
     relative = {str(Path(p).relative_to(source_root)): h for p, h in manifest["source_files"].items()}
     docs = ("SKILL.md", "references/result-contract.md", "references/observation-contract.md",

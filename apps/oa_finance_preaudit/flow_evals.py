@@ -1107,6 +1107,10 @@ def build_financial_quality_report(reviews: object) -> dict:
         workflow, scenario = checklist["workflow_key"], checklist["scenario"]
         if workflow == "business_entertainment" and checklist["source_kind"] == "real_archive":
             covered.add(scenario)
+        required_items = binding.get("required_review_item_keys", [])
+        covered_items = {check.get("item_key") for check in expected if check.get("item_key") in required_items}
+        complete_scope = (checklist.get("review_scope") == "complete_financial_review"
+                          and bool(required_items) and covered_items == set(required_items))
         metric = binding.get("case_metric")
         window_binding = {field: metric[field] for field in (
             "closed_at", "stage_timestamps", "execution_state", "business_state",
@@ -1114,6 +1118,8 @@ def build_financial_quality_report(reviews: object) -> dict:
         )} if isinstance(metric, dict) else None
         cases.append({"item_key": key, "workflow_key": workflow, "scenario": scenario,
                       "source_kind": checklist["source_kind"],
+                      "complete_review_scope": complete_scope,
+                      "missing_review_items": sorted(set(required_items) - covered_items),
                       "historical_crosscheck": historical,
                       "expectations_frozen_before_replay": frozen_before,
                       "result_audit_complete": result_audit_complete,
@@ -1134,6 +1140,7 @@ def build_financial_quality_report(reviews: object) -> dict:
             "missing_entertainment_scenarios": missing,
             "eligible": bool(cases) and not missing and all(
                 case["source_kind"] == "real_archive"
+                and case["complete_review_scope"]
                 and case["binding_status"] == "verified_consumed_correspondence"
                 and case["original_final_contract"] == "verified_snapshot_schema"
                 and case["window_binding"] is not None

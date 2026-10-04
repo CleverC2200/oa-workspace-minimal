@@ -262,7 +262,7 @@ def test_valid_bound_preview_keeps_post_run_financial_review_possible(tmp_path):
     assert report["eligible"] is False  # Travel control cannot fill entertainment scenes.
 
 
-def _scene_reviews(tmp_path, source_kinds, monkeypatch):
+def _scene_reviews(tmp_path, source_kinds, monkeypatch, *, complete_review=True):
     scenes = ["ordinary_payment", "multiple_payment_refund_overclaim", "relationship_unknown",
               "shared_payment", "confirmed_exception_with_unknown", "ordinary_payment"]
     reviews = []
@@ -273,6 +273,12 @@ def _scene_reviews(tmp_path, source_kinds, monkeypatch):
         checklist_path = Path(review["checklist"]["file"])
         checklist = json.loads(checklist_path.read_text())
         checklist.update(source_kind=kind, scenario=scenes[index])
+        if complete_review:
+            source = json.loads(Path(review["archive"]["file"]).read_text())
+            packet = json.loads(Path(source["action_file"]).with_name("review-packet.json").read_text())
+            checklist["review_scope"] = "complete_financial_review"
+            checklist["checks"] = [{"id": item["item_key"], "item_key": item["item_key"],
+                "expected": "controlled independent complete-item expectation"} for item in packet["items"]]
         review["checklist"] = _artifact(root, "bound-checklist.json", checklist)
         for field in ("assessment", "confirmation"):
             path = Path(review[field]["file"])
@@ -283,8 +289,8 @@ def _scene_reviews(tmp_path, source_kinds, monkeypatch):
         material = json.loads(Path(next(iter(manifest["originals"]))).read_text())
         history = _artifact(root, "original-context.json", _original_history(material))
         checklist["history_refs"] = [history]
-        checklist["historical_checks"] = [{"id": "known_and_unknown_facts", "outcome": "uninformative",
-            "basis": "original_material_and_rules", "reason": "历史泛泛同意，按原资料核对事实。"}]
+        checklist["historical_checks"] = [{"id": check["id"], "outcome": "uninformative",
+            "basis": "original_material_and_rules", "reason": "历史泛泛同意，按原资料核对事实。"} for check in checklist["checks"]]
         review["checklist"] = _artifact(root, "bound-checklist.json", checklist)
         class FrozenClock(datetime):
             @classmethod
@@ -295,6 +301,7 @@ def _scene_reviews(tmp_path, source_kinds, monkeypatch):
             review["expectations"] = flow_evals.freeze_financial_expectations(review["checklist"], root / "expectations.json")
         value = json.loads(Path(review["assessment"]["file"]).read_text())
         value.update(checklist_sha256=review["checklist"]["sha256"], reviewer_role="historical_crosscheck")
+        value["checks"] = [{"id": check["id"], "outcome": "pass", "reason": "controlled independent complete-item result audit"} for check in checklist["checks"]]
         review["assessment"] = _artifact(root, "bound-assessment.json", value)
         review["confirmation"] = None
         reviews.append(review)
@@ -553,3 +560,34 @@ def test_actual_definition_can_use_existing_exact_name_fallback_and_saved_alias(
                                "basis": "original_material_and_rules", "reason": "independent original evidence"}]})
     frozen = flow_evals.freeze_financial_expectations(checklist, tmp_path / "expectations.json")
     assert json.loads(Path(frozen["file"]).read_text())["historical_crosscheck"] == "complete"
+
+
+def test_limited_payment_fact_pass_cannot_become_complete_financial_qualification(tmp_path, monkeypatch):
+    reviews = _scene_reviews(tmp_path, ["real_archive"] * 5, monkeypatch, complete_review=False)
+    report = flow_evals.build_financial_quality_report(reviews)
+    assert all(case["verdict"] == "pass" for case in report["cases"])
+    assert report["eligible"] is False
+
+
+def test_full_scope_label_without_fixed_items_keeps_narrow_facts_unqualified(tmp_path, monkeypatch):
+    reviews = _scene_reviews(tmp_path, ["real_archive"] * 5, monkeypatch, complete_review=False)
+    review = reviews[0]
+    checklist = json.loads(Path(review["checklist"]["file"]).read_text())
+    checklist["review_scope"] = "complete_financial_review"
+    checklist["checks"][0]["item_key"] = "reimbursable_minimum"
+    review["checklist"] = _artifact(tmp_path, "partial-full-scope.json", checklist)
+    class FrozenClock(datetime):
+        @classmethod
+        def now(cls, tz=None): return datetime(2026, 10, 3, 10, tzinfo=timezone.utc)
+    with monkeypatch.context() as clock:
+        clock.setattr(flow_evals, "datetime", FrozenClock)
+        review["expectations"] = flow_evals.freeze_financial_expectations(review["checklist"], tmp_path / "scope-freeze.json")
+    assessment = json.loads(Path(review["assessment"]["file"]).read_text())
+    assessment["checklist_sha256"] = review["checklist"]["sha256"]
+    review["assessment"] = _artifact(tmp_path, "partial-scope-assessment.json", assessment)
+    report = flow_evals.build_financial_quality_report(reviews)
+    case = report["cases"][0]
+    assert case["verdict"] == "pass"
+    assert case["complete_review_scope"] is False
+    assert set(case["missing_review_items"]) == {"attachment_payment_evidence", "invoice_linkage", "budget"}
+    assert report["eligible"] is False

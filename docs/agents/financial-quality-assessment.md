@@ -29,3 +29,5 @@
 链接：[业务招待规则](../../.agents/skills/oa-finance-preaudit/references/flows/business-entertainment.md)、[验证层级](../../CONTRIBUTING.md#验证层级)、[质量检查](quality-checks.md)。
 
 原历史 context 还须按已有 flow 选择入口核验真实流程：原 workflow 和 handled 实际定义一致，material 的规范名或已保存别名也唯一映射到同一 flow key；不能仅用 caller workflow_key 或费用内容分类。沿用配置的精确名称/别名 fallback，配置历史 ID 与实际 ID 不同并不单独拒绝，也不修改配置。冻结记录保留实际匹配配置文件指纹；配置漂移不能追认原冻结资格。相关配置 JSON 同时进入宿主 runtime pin 和 calling-source Git pin。
+
+完整财务资格须显式声明 `review_scope=complete_financial_review`，并将每个检查以 `item_key` 绑定原冻结 packet 的固定审核项。业务招待的四项均须完整覆盖原规则要求的断言；缺预算策略、发票主体/关联、付款/费用对应或净额异常/未知核对时，人工记录保持 unverified。宿主只验证完整范围声明、固定项覆盖与显式逐项结论，不按文字猜实际核对是否正确。有限付款/金额事实仍可报告 pass，但不能升级为完整财务100%资格。
