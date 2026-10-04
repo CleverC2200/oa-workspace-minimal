@@ -879,6 +879,56 @@ def _read_bound_artifact(reference: object, *, document: bool = True) -> object:
         raise ValueError("financial_review_invalid") from error
 
 
+def _historical_crosscheck(checklist: dict) -> str:
+    refs = checklist.get("history_refs")
+    if not isinstance(refs, list) or not refs:
+        return "missing"
+    materials = [_read_bound_artifact(ref) for ref in checklist["source_refs"]
+                 if Path(ref["file"]).name == "material.json"]
+    if len(materials) != 1 or not isinstance(materials[0], dict) or not materials[0].get("request_id"):
+        raise ValueError("financial_history_binding_invalid")
+    request = str(materials[0]["request_id"])
+    for ref in refs:
+        context = _read_bound_artifact(ref)
+        workflow = context.get("workflow") if isinstance(context, dict) else None
+        handled = context.get("handled_row") if isinstance(context, dict) else None
+        if (not isinstance(workflow, dict) or not isinstance(handled, dict)
+                or str(workflow.get("requestId")) != request
+                or str(handled.get("requestId")) != request
+                or not isinstance(workflow.get("workflowRequestLogs"), list)
+                or not workflow["workflowRequestLogs"]
+                or not all(isinstance(log, dict) for log in workflow["workflowRequestLogs"])):
+            raise ValueError("financial_history_binding_invalid")
+    checks = checklist.get("historical_checks")
+    expected_ids = {check["id"] for check in checklist["checks"]}
+    if (not isinstance(checks, list) or len(checks) != len(expected_ids)
+            or any(not isinstance(check, dict) for check in checks)
+            or {check.get("id") for check in checks} != expected_ids
+            or any(check.get("outcome") not in {"consistent", "conflict", "uninformative"}
+                   or check.get("basis") != "original_material_and_rules"
+                   or not isinstance(check.get("reason"), str) or not check["reason"] for check in checks)):
+        raise ValueError("financial_history_binding_invalid")
+    return "conflict" if any(check["outcome"] == "conflict" for check in checks) else "complete"
+
+
+def freeze_financial_expectations(checklist_reference: dict, destination: Path) -> dict:
+    """Freeze source-based historical crosschecks now; no caller-provided time/signature."""
+    checklist = _read_bound_artifact(checklist_reference)
+    for ref in checklist["source_refs"] + checklist["rule_refs"]:
+        _read_bound_artifact(ref, document=False)
+    status = _historical_crosscheck(checklist)
+    path = Path(destination).absolute()
+    payload = {"schema_version": 1, "kind": "preaudit_expectations_freeze",
+               "checklist_sha256": checklist_reference["sha256"],
+               "historical_crosscheck": status, "frozen_at": datetime.now().astimezone().isoformat()}
+    with path.open("x", encoding="utf-8") as stream:
+        import os
+        os.chmod(path, 0o600)
+        json.dump(payload, stream, ensure_ascii=False, indent=2, allow_nan=False)
+        stream.write("\n")
+    return {"file": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
 def _financial_replay_binding(review: dict, checklist: dict, assessment: dict) -> dict:
     """Consume the archive reporter's validated machine facts, never a caller label."""
     unknown = {"status": "not_established", "start": {"status": "not_established"}}
@@ -895,7 +945,8 @@ def _financial_replay_binding(review: dict, checklist: dict, assessment: dict) -
     binding = report["financial_binding"]
     fingerprint = report["archive_fingerprint"]
     if (fingerprint != reference["sha256"]
-            or checklist.get("archive_manifest_sha256") != fingerprint
+            or (checklist.get("archive_manifest_sha256") is not None
+                and checklist["archive_manifest_sha256"] != fingerprint)
             or assessment.get("archive_manifest_sha256") != fingerprint
             or review["item_key"] != binding.get("item_key")
             or assessment.get("item_key") != binding.get("item_key")
@@ -949,7 +1000,7 @@ def build_financial_quality_report(reviews: object) -> dict:
                 or not isinstance(checklist.get("scenario"), str)
                 or not isinstance(assessment, dict) or assessment.get("schema_version") != 1
                 or assessment.get("method") != "independent_manual"
-                or assessment.get("reviewer_role") not in {"engineering_draft", "finance"}
+                or assessment.get("reviewer_role") not in {"engineering_draft", "finance", "historical_crosscheck"}
                 or not isinstance(assessment.get("reviewer_record"), str)
                 or not assessment["reviewer_record"]
                 or assessment.get("checklist_sha256") != review["checklist"]["sha256"]):
@@ -999,15 +1050,32 @@ def build_financial_quality_report(reviews: object) -> dict:
             except (KeyError, TypeError, ValueError) as error:
                 raise ValueError("financial_review_invalid") from error
         result_reviewed_by_finance = False
-        if assessment["reviewer_role"] == "finance":
+        result_audit_complete = False
+        if assessment["reviewer_role"] in {"finance", "historical_crosscheck"}:
             try:
                 reviewed_at = datetime.fromisoformat(assessment["reviewed_at"])
                 closed_at = binding.get("closed_at")
                 closed = datetime.fromisoformat(closed_at) if closed_at and closed_at != "not_established" else None
-                result_reviewed_by_finance = (binding["status"] == "verified_consumed_correspondence"
+                result_audit_complete = (binding["status"] == "verified_consumed_correspondence"
                                              and reviewed_at.tzinfo is not None
                                              and closed is not None and closed.tzinfo is not None
                                              and reviewed_at >= closed)
+                result_reviewed_by_finance = result_audit_complete and assessment["reviewer_role"] == "finance"
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError("financial_review_invalid") from error
+        historical = _historical_crosscheck(checklist)
+        frozen_before = False
+        if review.get("expectations") is not None:
+            freeze = _read_bound_artifact(review["expectations"])
+            try:
+                frozen = datetime.fromisoformat(freeze["frozen_at"])
+                started_value = binding["start"].get("replay_started_at")
+                started = datetime.fromisoformat(started_value) if started_value else None
+                frozen_before = (freeze.get("kind") == "preaudit_expectations_freeze"
+                                 and freeze.get("checklist_sha256") == review["checklist"]["sha256"]
+                                 and freeze.get("historical_crosscheck") == historical == "complete"
+                                 and frozen.tzinfo is not None and started is not None
+                                 and frozen <= started)
             except (KeyError, TypeError, ValueError) as error:
                 raise ValueError("financial_review_invalid") from error
         workflow, scenario = checklist["workflow_key"], checklist["scenario"]
@@ -1015,6 +1083,9 @@ def build_financial_quality_report(reviews: object) -> dict:
             covered.add(scenario)
         cases.append({"item_key": key, "workflow_key": workflow, "scenario": scenario,
                       "source_kind": checklist["source_kind"],
+                      "historical_crosscheck": historical,
+                      "expectations_frozen_before_replay": frozen_before,
+                      "result_audit_complete": result_audit_complete,
                       "binding_status": binding["status"],
                       "replay_start_status": binding["start"]["status"],
                       "checklist_sha256": review["checklist"]["sha256"],
@@ -1028,10 +1099,12 @@ def build_financial_quality_report(reviews: object) -> dict:
     return {"schema_version": 1, "kind": "preaudit_financial_quality_report",
             "cases": cases, "financial_confirmation": "confirmed" if confirmed else "pending",
             "missing_entertainment_scenarios": missing,
-            "eligible": confirmed and not missing and all(
+            "eligible": bool(cases) and not missing and all(
                 case["source_kind"] == "real_archive"
                 and case["binding_status"] == "verified_consumed_correspondence"
-                and case["verdict"] == "pass" and case["result_reviewed_by_finance"] for case in cases)}
+                and case["verdict"] == "pass" and case["result_audit_complete"]
+                and case["historical_crosscheck"] == "complete"
+                and case["expectations_frozen_before_replay"] for case in cases)}
 
 
 def build_acceptance_report(

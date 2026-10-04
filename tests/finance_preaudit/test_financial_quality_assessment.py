@@ -119,8 +119,8 @@ def test_acceptance_gate_distinguishes_closed_preview_from_financial_confirmatio
 
 
 @pytest.mark.parametrize("source_kind,eligible", [("synthetic", False), ("real_archive", True)])
-def test_only_complete_confirmed_real_scene_set_is_eligible(tmp_path, source_kind, eligible):
-    reviews = _scene_reviews(tmp_path, [source_kind] * 5)
+def test_only_complete_confirmed_real_scene_set_is_eligible(tmp_path, monkeypatch, source_kind, eligible):
+    reviews = _scene_reviews(tmp_path, [source_kind] * 5, monkeypatch)
     report = flow_evals.build_financial_quality_report(reviews)
     assert report["eligible"] is eligible
 
@@ -132,8 +132,8 @@ def test_expectation_confirmation_does_not_replace_financial_result_review(tmp_p
     assert result["cases"][0]["result_reviewed_by_finance"] is False
 
 
-def test_synthetic_extra_trial_cannot_qualify_even_when_five_real_scenes_exist(tmp_path):
-    reviews = _scene_reviews(tmp_path, ["real_archive"] * 5 + ["synthetic"])
+def test_synthetic_extra_trial_cannot_qualify_even_when_five_real_scenes_exist(tmp_path, monkeypatch):
+    reviews = _scene_reviews(tmp_path, ["real_archive"] * 5 + ["synthetic"], monkeypatch)
     report = flow_evals.build_financial_quality_report(reviews)
     assert len(report["cases"]) == 6
     assert report["eligible"] is False
@@ -251,7 +251,7 @@ def test_valid_bound_preview_keeps_post_run_financial_review_possible(tmp_path):
     assert report["eligible"] is False  # Travel control cannot fill entertainment scenes.
 
 
-def _scene_reviews(tmp_path, source_kinds):
+def _scene_reviews(tmp_path, source_kinds, monkeypatch):
     scenes = ["ordinary_payment", "multiple_payment_refund_overclaim", "relationship_unknown",
               "shared_payment", "confirmed_exception_with_unknown", "ordinary_payment"]
     reviews = []
@@ -268,5 +268,103 @@ def _scene_reviews(tmp_path, source_kinds):
             value = json.loads(path.read_text())
             value["checklist_sha256"] = review["checklist"]["sha256"]
             review[field] = _artifact(root, path.name, value)
+        manifest = json.loads(Path(review["archive"]["file"]).read_text())
+        material = json.loads(Path(next(iter(manifest["originals"]))).read_text())
+        history = _artifact(root, "original-context.json", {
+            "workflow": {"requestId": material["request_id"], "workflowRequestLogs": [{"remark": "同意"}]},
+            "handled_row": {"requestId": material["request_id"]},
+        })
+        checklist["history_refs"] = [history]
+        checklist["historical_checks"] = [{"id": "known_and_unknown_facts", "outcome": "uninformative",
+            "basis": "original_material_and_rules", "reason": "历史泛泛同意，按原资料核对事实。"}]
+        review["checklist"] = _artifact(root, "bound-checklist.json", checklist)
+        class FrozenClock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 10, 3, 10, tzinfo=timezone.utc)
+        monkeypatch.setattr(flow_evals, "datetime", FrozenClock)
+        review["expectations"] = flow_evals.freeze_financial_expectations(review["checklist"], root / "expectations.json")
+        value = json.loads(Path(review["assessment"]["file"]).read_text())
+        value.update(checklist_sha256=review["checklist"]["sha256"], reviewer_role="historical_crosscheck")
+        review["assessment"] = _artifact(root, "bound-assessment.json", value)
+        review["confirmation"] = None
         reviews.append(review)
     return reviews
+
+
+def test_history_crosscheck_freezes_expectations_without_new_finance_signature(tmp_path, monkeypatch):
+    reviews = _archived_review(tmp_path)
+    review = reviews[0]
+    manifest = json.loads(Path(review["archive"]["file"]).read_text())
+    material = json.loads(Path(next(iter(manifest["originals"]))).read_text())
+    history = _artifact(tmp_path, "original-context.json", {
+        "workflow": {"requestId": material["request_id"], "workflowRequestLogs": [{"remark": "同意"}]},
+        "handled_row": {"requestId": material["request_id"]},
+    })
+    checklist = json.loads(Path(review["checklist"]["file"]).read_text())
+    checklist["history_refs"] = [history]
+    checklist["historical_checks"] = [{"id": "known_and_unknown_facts", "outcome": "uninformative",
+        "basis": "original_material_and_rules", "reason": "历史同意没有确认具体事实；预期以原材料和规则的未知关系为准。"}]
+    review["checklist"] = _artifact(tmp_path, "history-checklist.json", checklist)
+    class FrozenClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 3, 10, tzinfo=timezone.utc)
+    monkeypatch.setattr(flow_evals, "datetime", FrozenClock)
+    review["expectations"] = flow_evals.freeze_financial_expectations(review["checklist"], tmp_path / "expectations.json")
+    assessment = json.loads(Path(review["assessment"]["file"]).read_text())
+    assessment.update(reviewer_role="historical_crosscheck", checklist_sha256=review["checklist"]["sha256"])
+    review["assessment"] = _artifact(tmp_path, "history-assessment.json", assessment)
+    review["confirmation"] = None
+    result = flow_evals.build_financial_quality_report(reviews)
+    assert result["cases"][0]["historical_crosscheck"] == "complete"
+    assert result["cases"][0]["expectations_frozen_before_replay"] is True
+    assert result["cases"][0]["result_audit_complete"] is True
+    assert result["financial_confirmation"] == "pending"
+
+
+def test_history_of_another_case_cannot_be_used_to_freeze_expected_facts(tmp_path):
+    reviews = _archived_review(tmp_path)
+    checklist = json.loads(Path(reviews[0]["checklist"]["file"]).read_text())
+    history = _artifact(tmp_path, "wrong-context.json", {
+        "workflow": {"requestId": "different-case", "workflowRequestLogs": [{"remark": "同意"}]},
+        "handled_row": {"requestId": "different-case"},
+    })
+    checklist["history_refs"] = [history]
+    ref = _artifact(tmp_path, "wrong-checklist.json", checklist)
+    with pytest.raises(ValueError, match="financial_history_binding_invalid"):
+        flow_evals.freeze_financial_expectations(ref, tmp_path / "expectations.json")
+
+
+def test_historical_conflict_or_approval_only_basis_cannot_qualify(tmp_path, monkeypatch):
+    reviews = _scene_reviews(tmp_path, ["real_archive"] * 5, monkeypatch)
+    first = reviews[0]
+    checklist = json.loads(Path(first["checklist"]["file"]).read_text())
+    checklist["historical_checks"][0]["outcome"] = "conflict"
+    ref = _artifact(tmp_path, "conflict-checklist.json", checklist)
+    first["checklist"] = ref
+    first["expectations"] = flow_evals.freeze_financial_expectations(ref, tmp_path / "conflict-freeze.json")
+    assessment = json.loads(Path(first["assessment"]["file"]).read_text())
+    assessment["checklist_sha256"] = ref["sha256"]
+    first["assessment"] = _artifact(tmp_path, "conflict-assessment.json", assessment)
+    report = flow_evals.build_financial_quality_report(reviews)
+    assert report["cases"][0]["historical_crosscheck"] == "conflict"
+    assert report["eligible"] is False
+    checklist["historical_checks"][0]["basis"] = "historical_agree_only"
+    ref = _artifact(tmp_path, "agree-only-checklist.json", checklist)
+    with pytest.raises(ValueError, match="financial_history_binding_invalid"):
+        flow_evals.freeze_financial_expectations(ref, tmp_path / "agree-only-freeze.json")
+
+
+def test_late_freeze_cannot_qualify_already_consumed_replay(tmp_path, monkeypatch):
+    reviews = _scene_reviews(tmp_path, ["real_archive"] * 5, monkeypatch)
+    class LateClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 5, 10, tzinfo=timezone.utc)
+    monkeypatch.setattr(flow_evals, "datetime", LateClock)
+    reviews[0]["expectations"] = flow_evals.freeze_financial_expectations(
+        reviews[0]["checklist"], tmp_path / "late-freeze.json")
+    report = flow_evals.build_financial_quality_report(reviews)
+    assert report["cases"][0]["expectations_frozen_before_replay"] is False
+    assert report["eligible"] is False
