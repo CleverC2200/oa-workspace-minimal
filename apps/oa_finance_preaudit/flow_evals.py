@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 from pathlib import Path
 from statistics import mean
@@ -856,6 +857,127 @@ def _apply_runtime_evidence(
         overall[field] = sum(by_flow[key][field] for key in WORKFLOW_KEYS)
 
 
+_FINANCIAL_SCENARIOS = {
+    "ordinary_payment", "multiple_payment_refund_overclaim", "relationship_unknown",
+    "shared_payment", "confirmed_exception_with_unknown",
+}
+
+
+def _read_bound_artifact(reference: object, *, document: bool = True) -> object:
+    if not isinstance(reference, dict) or set(reference) != {"file", "sha256"}:
+        raise ValueError("financial_review_invalid")
+    path, digest = reference["file"], reference["sha256"]
+    if (not isinstance(path, str) or not Path(path).is_absolute()
+            or not isinstance(digest, str) or len(digest) != 64):
+        raise ValueError("financial_review_invalid")
+    try:
+        raw = Path(path).read_bytes()
+        if hashlib.sha256(raw).hexdigest() != digest:
+            raise ValueError("financial_review_evidence_changed")
+        return json.loads(raw) if document else None
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ValueError("financial_review_invalid") from error
+
+
+def build_financial_quality_report(reviews: object) -> dict:
+    """Bind independent manual claim checks to original evidence and consumed output.
+
+    This reads assessments; it does not infer financial truth from model text.
+    Source, rules, checklist, output and confirmation stay in private artifacts.
+    """
+    if not isinstance(reviews, list):
+        raise ValueError("financial_review_invalid")
+    cases, keys, covered = [], set(), set()
+    for review in reviews:
+        if not isinstance(review, dict):
+            raise ValueError("financial_review_invalid")
+        key = review.get("item_key")
+        if (not isinstance(key, str) or len(key) != 64
+                or any(char not in "0123456789abcdef" for char in key) or key in keys):
+            raise ValueError("financial_review_invalid")
+        keys.add(key)
+        checklist = _read_bound_artifact(review.get("checklist"))
+        assessment = _read_bound_artifact(review.get("assessment"))
+        if (not isinstance(checklist, dict) or checklist.get("schema_version") != 1
+                or checklist.get("workflow_key") not in WORKFLOW_KEYS
+                or checklist.get("source_kind") not in {"real_archive", "synthetic"}
+                or not isinstance(checklist.get("scenario"), str)
+                or not isinstance(assessment, dict) or assessment.get("schema_version") != 1
+                or assessment.get("method") != "independent_manual"
+                or assessment.get("reviewer_role") not in {"engineering_draft", "finance"}
+                or not isinstance(assessment.get("reviewer_record"), str)
+                or not assessment["reviewer_record"]
+                or assessment.get("checklist_sha256") != review["checklist"]["sha256"]):
+            raise ValueError("financial_review_invalid")
+        for owner, field in ((checklist, "source_refs"), (checklist, "rule_refs"),
+                             (assessment, "output_refs")):
+            references = owner.get(field)
+            if not isinstance(references, list) or not references:
+                raise ValueError("financial_review_invalid")
+            for reference in references:
+                _read_bound_artifact(reference, document=False)
+        expected, checked = checklist.get("checks"), assessment.get("checks")
+        if not isinstance(expected, list) or not expected or not isinstance(checked, list):
+            raise ValueError("financial_review_invalid")
+        for check in expected:
+            if (not isinstance(check, dict) or not isinstance(check.get("id"), str)
+                    or not check["id"] or not isinstance(check.get("expected"), str)
+                    or not check["expected"]):
+                raise ValueError("financial_review_invalid")
+        expected_ids = [check["id"] for check in expected]
+        if len(set(expected_ids)) != len(expected_ids):
+            raise ValueError("financial_review_invalid")
+        for check in checked:
+            if (not isinstance(check, dict) or check.get("outcome") not in {"pass", "fail", "unverified"}
+                    or not isinstance(check.get("reason"), str) or not check["reason"]):
+                raise ValueError("financial_review_invalid")
+        checked_ids = [check.get("id") for check in checked]
+        if len(checked_ids) != len(expected_ids) or set(checked_ids) != set(expected_ids):
+            raise ValueError("financial_review_invalid")
+        failed = [check["id"] for check in checked if check["outcome"] == "fail"]
+        unknown = [check["id"] for check in checked if check["outcome"] == "unverified"]
+        confirmed = False
+        if review.get("confirmation") is not None:
+            record = _read_bound_artifact(review["confirmation"])
+            try:
+                approved = datetime.fromisoformat(record["approved_at"])
+                started = datetime.fromisoformat(review["replay_started_at"])
+                confirmed = (record.get("role") == "finance"
+                             and bool(record.get("reviewer_record"))
+                             and record.get("checklist_sha256") == review["checklist"]["sha256"]
+                             and approved.tzinfo is not None and started.tzinfo is not None
+                             and approved <= started)
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError("financial_review_invalid") from error
+        result_reviewed_by_finance = False
+        if assessment["reviewer_role"] == "finance":
+            try:
+                reviewed_at = datetime.fromisoformat(assessment["reviewed_at"])
+                started_at = datetime.fromisoformat(review["replay_started_at"])
+                result_reviewed_by_finance = (reviewed_at.tzinfo is not None
+                                             and started_at.tzinfo is not None
+                                             and reviewed_at >= started_at)
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError("financial_review_invalid") from error
+        workflow, scenario = checklist["workflow_key"], checklist["scenario"]
+        if workflow == "business_entertainment" and checklist["source_kind"] == "real_archive":
+            covered.add(scenario)
+        cases.append({"item_key": key, "workflow_key": workflow, "scenario": scenario,
+                      "checklist_sha256": review["checklist"]["sha256"],
+                      "assessment_sha256": review["assessment"]["sha256"],
+                      "verdict": "fail" if failed else "unverified" if unknown else "pass",
+                      "failed_checks": failed, "unverified_checks": unknown,
+                      "financial_confirmed_before_replay": confirmed,
+                      "result_reviewed_by_finance": result_reviewed_by_finance})
+    confirmed = bool(cases) and all(case["financial_confirmed_before_replay"] for case in cases)
+    missing = sorted(_FINANCIAL_SCENARIOS - covered)
+    return {"schema_version": 1, "kind": "preaudit_financial_quality_report",
+            "cases": cases, "financial_confirmation": "confirmed" if confirmed else "pending",
+            "missing_entertainment_scenarios": missing,
+            "eligible": confirmed and not missing and all(
+                case["verdict"] == "pass" and case["result_reviewed_by_finance"] for case in cases)}
+
+
 def build_acceptance_report(
     attempt_samples: object,
     *,
@@ -863,6 +985,7 @@ def build_acceptance_report(
     cli_samples: object,
     review_timing_receipts: object = (),
     runtime_evidence: object = None,
+    financial_reviews: object = None,
 ) -> dict:
     if not isinstance(attempt_samples, list) or not isinstance(replay_report, dict):
         raise ValueError("acceptance_input_invalid")
@@ -911,6 +1034,18 @@ def build_acceptance_report(
         "coordination_seconds_0": True,
         "coordination_tokens_0": True,
     }
+    financial_quality = None
+    if financial_reviews is not None:
+        financial_quality = build_financial_quality_report(financial_reviews)
+        assessed = {case["item_key"]: case for case in financial_quality["cases"]}
+        sample_by_key = {sample["item_key"]: sample for sample in samples}
+        if any(key not in sample_by_key or sample_by_key[key]["workflow_key"] != case["workflow_key"]
+               for key, case in assessed.items()):
+            raise ValueError("financial_review_sample_mismatch")
+        closed_keys = {sample["item_key"] for sample in samples if sample["execution_state"] == "closed"}
+        quality_checks["financial_quality_100"] = (
+            financial_quality["eligible"] and closed_keys == set(assessed)
+        )
     quality_gate = {**quality_checks, "passed": all(quality_checks.values())}
     target_gate = {
         "p95_end_to_end_below_900": all(
@@ -968,6 +1103,7 @@ def build_acceptance_report(
             "cli_is_primary_failure_source": cli_primary,
         },
         "applied": False,
+        **({"financial_quality": financial_quality} if financial_quality is not None else {}),
     }
 
 
