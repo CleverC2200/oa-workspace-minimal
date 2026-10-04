@@ -18,7 +18,7 @@ def forbidden(*_args, **_kwargs):
     raise AssertionError("OA, authorization, submission and recovery are forbidden")
 
 
-def prepare(tmp_path, *, page_count=5, width=16, height=16, degraded=False, tail="完整尾值"):
+def prepare(tmp_path, *, page_count=5, width=16, height=16, degraded=False, tail="完整尾值", image_format="png", page_specs=None):
     root = tmp_path / "project"
 
     def collect(request_id, attempt):
@@ -26,12 +26,13 @@ def prepare(tmp_path, *, page_count=5, width=16, height=16, degraded=False, tail
             raise ValueError("material_relation_untrusted")
         resources, images, manifest = [], [], []
         for index in range(page_count):
+            page_width, page_height, page_format = (page_specs[index] if page_specs else (width, height, image_format))
             resource_id = f"resource-{index}"
             source = attempt / "attachments" / f"source-{index}.png"
             page = attempt / "prepared" / f"page-{index}.png"
-            pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, width, height), False)
+            pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, page_width, page_height), False)
             pix.clear_with(255)
-            raw = pix.tobytes("png")
+            raw = pix.tobytes(page_format)
             source.write_bytes(raw)
             page.write_bytes(raw)
             resources.append({"request_id": request_id, "resource_id": resource_id,
@@ -56,7 +57,7 @@ def prepare(tmp_path, *, page_count=5, width=16, height=16, degraded=False, tail
     return engine, {"project_root": str(root), "action_file": action["action_file"], "timeout_seconds": 60}
 
 
-def reviewer(monkeypatch, tmp_path, task, *, direct=True, image_count=5, unknown_usage=False, wrong_token=False, resource_evidence=False):
+def reviewer(monkeypatch, tmp_path, task, *, direct=True, image_count=5, unknown_usage=False, wrong_token=False, resource_evidence=False, probe_large=False, probe_invalid=False):
     """A real controllable subprocess, replacing the external paid CLI only."""
     action = json.loads(Path(task["action_file"]).read_text())
     packet = json.loads(Path(action["review_packet_file"]).read_text())
@@ -70,9 +71,19 @@ def reviewer(monkeypatch, tmp_path, task, *, direct=True, image_count=5, unknown
     if wrong_token:
         decision["action_token"] = "wrong-token"
     script = tmp_path / "reviewer.py"
-    script.write_text('''import json,sys
+    script.write_text('''import json,sys,base64
 from pathlib import Path
-argv=sys.argv[1:];prompt=sys.stdin.read()
+argv=sys.argv[1:]
+if argv[:2]==["debug","prompt-input"]:
+ images=[argv[i+1] for i,x in enumerate(argv) if x=="--image"]
+ data=[{"type":"input_image","image_url":"data:image/png;base64,"+base64.b64encode(Path(p).read_bytes()).decode()} for p in images]
+ if ''' + repr(probe_large) + ''':
+  data=[{"type":"input_image","image_url":"data:image/png;base64,"+"A"*(11*1024*1024)} for p in images]
+ if ''' + repr(probe_invalid) + ''': data=data[:-1]
+ assert not __import__('os').environ.get("OA_REVIEW_API_KEY")
+ print(json.dumps([{"role":"user","content":data}]))
+ sys.exit(0)
+prompt=sys.stdin.read()
 direct=''' + repr(direct) + '''
 if direct:
  if ''' + repr(resource_evidence) + ''':
@@ -84,7 +95,7 @@ else:
  assert "冻结数据：material" not in prompt
 images=[argv[i+1] for i,x in enumerate(argv) if x=="--image"]
 assert len(images)==''' + str(image_count) + '''
-assert all(Path(p).read_bytes().startswith(b"\\x89PNG") for p in images)
+assert all(Path(p).read_bytes().startswith((b"\\x89PNG",b"\\xff\\xd8\\xff")) for p in images)
 schema=json.loads(Path(argv[argv.index("--output-schema")+1]).read_text())
 assert set(schema["required"])=={"schema_version","kind","action_token","workflow_key","rule_version","overall","items"}
 Path(argv[argv.index("--output-last-message")+1]).write_text(''' + repr(json.dumps(decision, ensure_ascii=False)) + ''')
@@ -258,8 +269,126 @@ def test_large_original_sources_are_delivered_in_existing_cli_path(monkeypatch, 
 
 def test_small_compressed_sources_do_not_hide_reencoding_capacity(monkeypatch, tmp_path):
     engine, task = prepare(tmp_path, width=1200, height=2800)
-    reviewer(monkeypatch, tmp_path, task, direct=False, image_count=0)
+    reviewer(monkeypatch, tmp_path, task, direct=False, image_count=0, probe_large=True)
     closed = close(engine, task, worker.review(task))
     assert closed["action"] == "closed"
     diagnostic = json.loads(next(Path(task["action_file"]).parent.glob("review-process-*.json")).read_text())
     assert diagnostic["input_delivery"]["fallback_reason"] == "request_bytes_limit"
+
+
+def test_native_encoded_sizes_allow_all_five_large_jpegs(monkeypatch, tmp_path):
+    engine, task = prepare(tmp_path, width=1200, height=2800, image_format="jpeg")
+    calls = reviewer(monkeypatch, tmp_path, task)
+    closed = close(engine, task, worker.review(task))
+    assert closed["action"] == "closed"
+    assert closed["write_state"] == "not_requested"
+    assert len([call for call in calls if call[1] == "exec"]) == 1
+    assert len([call for call in calls if call[1:3] == ["debug","prompt-input"]]) == 1
+
+
+def test_incomplete_native_render_retains_all_pages_on_existing_path(monkeypatch, tmp_path):
+    engine, task = prepare(tmp_path, width=1200, height=2800, image_format="jpeg")
+    calls = reviewer(monkeypatch, tmp_path, task, direct=False, image_count=0, probe_invalid=True)
+    closed = close(engine, task, worker.review(task))
+    assert closed["action"] == "closed"
+    assert closed["write_state"] == "not_requested"
+    assert len([call for call in calls if call[1] == "exec"]) == 1
+
+
+def test_capacity_measurement_cannot_clear_image_preparation_difference(monkeypatch, tmp_path):
+    engine, task = prepare(tmp_path, page_count=2, page_specs=[(1200,2800,"jpeg"),(2048,2048,"png")])
+    calls = reviewer(monkeypatch, tmp_path, task, direct=False, image_count=0)
+    closed = close(engine, task, worker.review(task))
+    assert closed["action"] == "closed"
+    assert closed["write_state"] == "not_requested"
+    assert not [call for call in calls if call[1:3] == ["debug","prompt-input"]]
+
+
+def test_cancel_during_native_measurement_reaps_owned_tree(tmp_path):
+    import os
+    import signal
+    import time
+
+    _engine, task = prepare(tmp_path, width=1200, height=2800, image_format="jpeg")
+    pids = tmp_path / "native-pids.json"
+    fake = tmp_path / "hanging-native.py"
+    fake.write_text('''import os,json,sys,signal,subprocess,threading,time
+from pathlib import Path
+assert sys.argv[1:3]==["debug","prompt-input"]
+signal.signal(signal.SIGTERM,signal.SIG_IGN)
+child=subprocess.Popen([sys.executable,"-c","import time; time.sleep(120)"])
+threading.Thread(target=child.wait,daemon=True).start()
+Path(''' + repr(str(pids)) + ''').write_text(json.dumps([os.getpid(),child.pid]))
+time.sleep(120)
+''')
+    driver = tmp_path / "measurement-worker.py"
+    driver.write_text('''import sys,json,subprocess,shutil
+from pathlib import Path
+sys.path.insert(0,''' + repr(str(Path(__file__).resolve().parents[2])) + ''')
+from apps.oa_finance_preaudit import codex_review_worker as worker
+original=subprocess.Popen
+shutil.which=lambda _:sys.executable
+def start(command,**kwargs):
+ return original([sys.executable,''' + repr(str(fake)) + ''',*command[1:]],**kwargs)
+subprocess.Popen=start
+worker.review(''' + repr(task) + ''')
+''')
+    process = subprocess.Popen([sys.executable, str(driver)], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, start_new_session=True)
+    owned = []
+    try:
+        deadline = time.monotonic() + 8
+        while not pids.exists() and time.monotonic() < deadline:
+            assert process.poll() is None
+            time.sleep(0.02)
+        assert pids.exists()
+        owned = json.loads(pids.read_text())
+        os.kill(process.pid, signal.SIGTERM)
+        assert process.wait(timeout=5) == 128 + signal.SIGTERM
+        for pid in owned:
+            with pytest.raises(ProcessLookupError):
+                os.kill(pid, 0)
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+        if owned:
+            try:
+                os.killpg(owned[0], signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_native_binary_drift_rejects_review_with_unchanged_launcher(monkeypatch, tmp_path):
+    import platform
+    from apps.oa_finance_preaudit import review_input
+
+    engine, task = prepare(tmp_path, width=1200, height=2800, image_format="jpeg")
+    package = tmp_path / "node_modules" / "@openai" / "codex"
+    launcher = package / "bin" / "codex.js"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("// installed Codex launcher\n")
+    (package / "package.json").write_text(json.dumps({"name":"@openai/codex","version":"0.160.0"}))
+    arch = {"arm64":"arm64","aarch64":"arm64","x86_64":"x64","amd64":"x64"}[platform.machine().lower()]
+    native = package.parent / f"codex-{sys.platform}-{arch}" / "vendor" / "target" / "bin" / "codex"
+    native.parent.mkdir(parents=True)
+    (native.parents[3] / "package.json").write_text("{}")
+    native.write_bytes(b"\x7fELFnative-codec-before")
+    native.chmod(0o700)
+    original_which = review_input.shutil.which
+    monkeypatch.setattr(review_input.shutil, "which", lambda name: str(launcher) if name=="codex" else original_which(name))
+    calls = reviewer(monkeypatch, tmp_path, task)
+    frozen = review_input.prepare(Path(task["action_file"]))
+    assert frozen.fallback_reason is None
+    launcher_hash = hashlib.sha256(launcher.read_bytes()).hexdigest()
+    native.write_bytes(b"\x7fELFnative-codec-after")
+
+    def execute(root, action, timeout):
+        return worker._execute_codex_raw(root, action, timeout, stderr_summary={}, frozen_input=frozen)
+
+    reviewed = worker.review(task, executor=execute)
+    assert reviewed["status"] == "failed"
+    assert reviewed["error_code"] == "codex_review_task_invalid"
+    assert not [call for call in calls if call[1] == "exec"]
+    assert hashlib.sha256(launcher.read_bytes()).hexdigest() == launcher_hash
+    assert json.loads(Path(task["action_file"]).read_text())["action"] == "review_required"

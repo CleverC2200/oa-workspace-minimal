@@ -3,6 +3,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import base64
+import os
+import shutil
+import subprocess
+import tempfile
+import signal
+import threading
+import platform
+import sys
 import json
 import math
 from pathlib import Path
@@ -102,6 +111,8 @@ class ReviewInput:
     text: str
     images: tuple[Path, ...]
     fallback_reason: str | None
+    codec: tuple[Path, str] | None = None
+    encoded_images: tuple[tuple[int, str], ...] = ()
 
     @property
     def instruction(self) -> str:
@@ -120,6 +131,10 @@ class ReviewInput:
         # Re-run the existing validator immediately before launch, not a second identity system.
         if load(action_file) != self.bundle:
             raise ValueError('review_input_changed')
+        if self.codec is not None:
+            path, expected = self.codec
+            if not _regular_path(path) or _binary_sha256(path) != expected:
+                raise ValueError('review_input_changed')
 
 
 def _encoded_size_bound(raw: bytes, width: int, height: int, *, resized: bool) -> int | None:
@@ -148,6 +163,123 @@ def _encoded_size_bound(raw: bytes, width: int, height: int, *, resized: bool) -
     return None
 
 
+def _native_codex_file() -> Path | None:
+    """Resolve the installed npm launcher's native payload, or an existing native CLI."""
+    name = shutil.which('codex')
+    if name is None:
+        return None
+    launcher = Path(name).resolve()
+
+    def native(path):
+        if not path.is_file() or not os.access(path, os.X_OK):
+            return False
+        with path.open('rb') as stream:
+            magic = stream.read(4)
+        return magic in {b'\x7fELF', b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf',
+                         b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca'} or magic[:2] == b'MZ'
+
+    if native(launcher):
+        return launcher
+    if launcher.suffix != '.js':
+        return None
+    package = launcher.parent.parent
+    if json.loads((package / 'package.json').read_text()).get('name') != '@openai/codex':
+        return None
+    arch = {'arm64': 'arm64', 'aarch64': 'arm64', 'x86_64': 'x64', 'amd64': 'x64'}.get(platform.machine().lower())
+    if arch is None or sys.platform not in {'darwin', 'linux', 'win32'}:
+        return None
+    # Match Node's module search from bin/codex.js, then its bundled-vendor fallback.
+    vendor = package / 'vendor'
+    for directory in launcher.parents:
+        if directory.name == 'node_modules':
+            continue
+        optional = directory / 'node_modules' / '@openai' / f'codex-{sys.platform}-{arch}'
+        if (optional / 'package.json').is_file():
+            vendor = optional / 'vendor'
+            break
+    suffix = 'codex.exe' if sys.platform == 'win32' else 'codex'
+    candidates = list(vendor.glob('*/bin/' + suffix))
+    if len(candidates) != 1:
+        return None
+    binary = candidates[0].resolve()
+    return binary if native(binary) else None
+
+
+def _binary_sha256(path: Path) -> str:
+    with path.open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def _native_image_sizes(images: tuple[Path, ...]):
+    """Use the same CLI's offline input renderer, without credentials or a model turn."""
+    from . import codex_review_worker as worker
+
+    if threading.current_thread() is not threading.main_thread() or not hasattr(signal, 'pthread_sigmask'):
+        return None
+    binary = _native_codex_file()
+    if binary is None:
+        return None
+    fingerprint = _binary_sha256(binary)
+    args = [str(binary), 'debug', 'prompt-input', 'capacity-probe',
+            '-c', f'model="{worker.MODEL}"', '-c', f'model_reasoning_effort="{worker.REASONING_EFFORT}"',
+            '-c', 'model_provider="oa_deepseek"',
+            '-c', 'model_providers.oa_deepseek={name="DeepSeek",base_url="http://127.0.0.1:1",wire_api="responses",requires_openai_auth=false}',
+            '-c', 'disable_response_storage=true', '-c', 'model_context_window=1000000',
+            '-c', 'approval_policy="never"', '-c', 'sandbox_mode="read-only"']
+    args.extend(part for path in images for part in ('--image', str(path)))
+    environment = {k: v for k, v in os.environ.items()
+                   if k in {'HOME', 'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TMPDIR', 'TZ'}}
+    with tempfile.TemporaryDirectory(prefix='oa-native-image-size-') as home, tempfile.TemporaryFile() as output:
+        environment.update(CODEX_HOME=home, OCX_SHIM_BYPASS='1')
+        process = None
+        previous = signal.getsignal(signal.SIGTERM)
+        mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+
+        def cancel(signum, _frame):
+            raise SystemExit(128 + signum)
+
+        try:
+            signal.signal(signal.SIGTERM, cancel)
+            try:
+                process = subprocess.Popen(args, cwd=_ROOT, env=environment, stdin=subprocess.DEVNULL,
+                                           stdout=output, stderr=subprocess.DEVNULL, start_new_session=True)
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+            try:
+                process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                return None
+        finally:
+            if process is not None:
+                worker._terminate_process_group(process, grace_seconds=0.2)
+                process.wait()
+            signal.signal(signal.SIGTERM, previous)
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+        if process.returncode != 0 or output.tell() > _MAX_REQUEST_BYTES + _REQUEST_RESERVE_BYTES:
+            return None
+        output.seek(0)
+        data = json.load(output)
+    if not isinstance(data, list):
+        return None
+    encoded = []
+    for message in data:
+        if not isinstance(message, dict) or message.get('role') != 'user':
+            continue
+        for part in message.get('content', []):
+            if not isinstance(part, dict) or part.get('type') != 'input_image':
+                continue
+            url = part.get('image_url')
+            if not isinstance(url, str) or not url.startswith(('data:image/png;base64,', 'data:image/jpeg;base64,', 'data:image/webp;base64,')):
+                return None
+            raw = base64.b64decode(url.split(',', 1)[1], validate=True)
+            if not raw:
+                return None
+            encoded.append((len(raw), hashlib.sha256(raw).hexdigest()))
+    if len(encoded) != len(images) or _binary_sha256(binary) != fingerprint:
+        return None
+    return (binary, fingerprint), tuple(encoded)
+
+
 def prepare(action_file: Path) -> ReviewInput:
     bundle = load(action_file)
     text = render_inline(bundle)
@@ -157,6 +289,7 @@ def prepare(action_file: Path) -> ReviewInput:
         reason = 'text_limit'
     elif len(images) > _MAX_IMAGES:
         reason = 'image_count_limit'
+    protected_reason = reason
     encoded_bytes = len(json.dumps(text, ensure_ascii=False).encode('utf-8')) + _REQUEST_RESERVE_BYTES
     for path in images:
         raw = path.read_bytes()
@@ -165,14 +298,14 @@ def prepare(action_file: Path) -> ReviewInput:
         supported = (raw.startswith(b'\x89PNG\r\n\x1a\n') or raw.startswith(b'\xff\xd8\xff')
                      or (raw.startswith(b'RIFF') and raw[8:12] == b'WEBP'))
         if not supported:
-            reason = reason or 'image_encoding_not_preserved'
+            protected_reason = protected_reason or 'image_encoding_not_preserved'
         # Initial LocalImage and default view_image share the 2048 resize. If
         # high detail would additionally apply its patch cap, retain that old path.
         scale = min(1, _CLI_IMAGE_DIMENSION / max(pixmap.width, pixmap.height))
         width, height = math.ceil(pixmap.width * scale), math.ceil(pixmap.height * scale)
         patches = ((width + 31) // 32) * ((height + 31) // 32)
         if patches > _HIGH_DETAIL_PATCHES:
-            reason = reason or 'image_preparation_differs'
+            protected_reason = protected_reason or 'image_preparation_differs'
         if len(raw) > _MAX_IMAGE_BYTES:
             reason = reason or 'image_bytes_limit'
         bound = _encoded_size_bound(raw, width, height, resized=scale < 1)
@@ -184,4 +317,18 @@ def prepare(action_file: Path) -> ReviewInput:
             encoded_bytes += 4 * ((bound + 2) // 3) + 256
     if encoded_bytes > _MAX_REQUEST_BYTES:
         reason = reason or 'request_bytes_limit'
-    return ReviewInput(bundle, text, () if reason else images, reason)
+    reason = protected_reason or reason
+    codec = None
+    encodings = ()
+    if protected_reason is None and reason in {'image_bytes_limit', 'request_bytes_limit', 'encoded_size_not_verified'}:
+        try:
+            measured = _native_image_sizes(images)
+        except (OSError, ValueError, TypeError, RuntimeError):
+            measured = None
+        if measured is not None:
+            codec, encodings = measured
+            encoded_bytes = len(json.dumps(text, ensure_ascii=False).encode('utf-8')) + _REQUEST_RESERVE_BYTES
+            encoded_bytes += sum(4 * ((size + 2) // 3) + 256 for size, _ in encodings)
+            reason = ('image_bytes_limit' if any(size > _MAX_IMAGE_BYTES for size, _ in encodings)
+                      else 'request_bytes_limit' if encoded_bytes > _MAX_REQUEST_BYTES else None)
+    return ReviewInput(bundle, text, () if reason else images, reason, codec, encodings)

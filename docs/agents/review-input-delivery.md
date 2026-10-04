@@ -11,11 +11,11 @@ Worker 启动审核前复用 FlowEngine 冻结校验，取得适用 Skill、共�
 图像容量同时受执行器与供应商约束：
 
 - 本次核实 CLI 为 0.160.0。初始 `--image` 与生产既有默认看图共用 2,048 像素尺寸处理。源文件保持原字节；首轮逐页对比实际模型输入字节，确认沿用原图像处理而没有混入图像质量变化。若默认 high 的 2,500 patch 上限会进一步改变处理，则回退原读取路径。仅使用 CLI 能按既有方式读取的 PNG/JPEG/WebP，不自行转换图像。
-- DeepSeek Responses 的原生 inline 限制为单图 32 MiB、请求体 48 MiB、最多 600 图。启动前检查 JSON 文本与图像实际编码大小的可信上界。无需重新编码的图像按原字节数；重新编码的 PNG 按 RGBA8/DEFLATE 上界，JPEG 按 RGB 系数/Huffman/字节填充上界，并保留源大小的元数据余量。含压缩 ICC 的 PNG 和需重新编码的 WebP 缺少已核验上界时回退。另为 CLI 指令、工具与 Schema 预留 1 MiB。上界超过容量仅表示无法证明能容纳，不宣称实际超限。
-- 官方 CLI 源码：[初始图片处理](https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/protocol/src/local_media.rs)、[尺寸与原字节条件](https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/utils/image/src/lib.rs)。供应商限制：[DeepSeek 图像文档](https://api-docs.deepseek.com/guides/vision/)。核实日期为 2026-10-04；更换执行器后需重新核实，不能以调整配置冒充容量。
+- DeepSeek Responses 的原生 inline 限制为单图 32 MiB、请求体 48 MiB、最多 600 图。启动前检查 JSON 文本与图像实际编码大小的可信上界。无需重新编码的图像按原字节数；重新编码的 PNG 按 RGBA8/DEFLATE 上界，JPEG 按 RGB 系数/Huffman/字节填充上界，并保留源大小的元数据余量。含压缩 ICC 的 PNG 和需重新编码的 WebP 缺少已核验上界时回退。保守上界无法证明容量时，使用同一 CLI 的离线 `debug prompt-input` 原生图片处理取得实际编码字节数与哈希，再按原限额检查；渲染不完整、失败或仍超限时整体回退；实测结果不能解除格式、文本、页数或图像处理差异等其他保护。渲染器使用隔离临时目录、无业务凭据和不可用本机端点，只构建输入，不发起模型审核，并回收自己创建的进程组。npm 启动脚本解析到真实 native 可执行文件，无法可信解析则回退；该文件的路径与字节指纹绑定到本次输入，审核启动前再次检查并使用该执行器。另为 CLI 指令、工具与 Schema 预留 1 MiB；原保护限额不扩大。
+- 官方 CLI 源码：[初始图片处理](https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/protocol/src/local_media.rs)、[尺寸与原字节条件](https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/utils/image/src/lib.rs)。供应商限制：[DeepSeek 图像文档](https://api-docs.deepseek.com/guides/vision/)。离线渲染调用依据：[CLI debug prompt-input 源码](https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/cli/src/main.rs)。核实日期为 2026-10-04；更换执行器后需重新核实，不能以调整配置冒充容量。
 
 主验证入口为 Worker → FlowEngine preview，外部付费 CLI 在离线测试中替换为可控子进程。正常/降级材料、漂移、非法路径、缺页、输入超限、错决定及未知用量分别验证。离线闭合只证明工程行为。
 
-首个真实已办目标的五页为竖屏图片，既有生产实际输入经过上述尺寸处理后，均处于 high 的 patch 上限内；完整文本为 84,129 字符。五页源文件可以完整关联，但 JPEG 重新编码的可信最坏上界不能证明落在现有容量内，当前候选整体回退，首轮对照停在启动前，未消耗模型调用额度。实际编码回执显示这些历史图片更小，但不得把历史小样本大小当作通用容量保证。后续须在相同 CLI 图片处理下可靠取得实际编码大小，再重新冻结可执行计划；达到改善门前 #360 保持未完成，#361 不启动。真实材料和新计划留在工作树外私有归档，旧已启动计划与失败原档案保持原样。
+首个真实已办目标的五页为竖屏图片，既有生产实际输入经过上述尺寸处理后，均处于 high 的 patch 上限内；完整文本为 84,129 字符。五页通过当前原生离线渲染得到的编码合计为 818,640 字节，逐页编码哈希与旧生产实际回执一致，容量准备门已通过。这只证明完整交付及图片处理可比；真实 240 秒闭合、完整用量和有限质量仍由新冻结首轮对照验证。达到改善门前 #360 保持未完成，#361 不启动。真实材料和新计划留在工作树外私有归档，旧已启动计划与失败原档案保持原样。
 
 交付分别报告工程、真实闭合、逐页观察、有限质量、完整用量、30% 改善门、财务确认与生产资格；后者不由本地检查授予。

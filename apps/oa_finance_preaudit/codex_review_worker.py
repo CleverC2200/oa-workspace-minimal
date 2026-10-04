@@ -923,6 +923,8 @@ def _execute_codex_raw(
                     "codex_review_task_invalid", _unknown_usage(),
                     process_state="not_started", decision_state="not_attempted",
                 )
+            if frozen_input.codec is not None:
+                command[0] = str(frozen_input.codec[0])
             command[2:2] = [part for path in frozen_input.images for part in ("--image", str(path))]
             stderr_summary["input_delivery"] = {
                 "mode": "existing_reading_path" if frozen_input.fallback_reason else "complete_initial_input",
