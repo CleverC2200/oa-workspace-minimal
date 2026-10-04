@@ -19,6 +19,7 @@ from . import (
     flow_evals,
     observability,
     review_failure_evidence,
+    runtime_maintenance,
 )
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
@@ -532,6 +533,18 @@ def _financial_binding(root: Path, manifest: dict, action: Path, state: dict, pr
         "rule_file_sha256": sorted(h for p, h in manifest["source_files"].items() if "/.agents/skills/oa-finance-preaudit/" in p and p.endswith(".md")),
         "preview": preview,
     }
+    source_root = Path(os.path.commonpath([str(Path(p).parent) for p in manifest["source_files"]]))
+    relative = {str(Path(p).relative_to(source_root)): h for p, h in manifest["source_files"].items()}
+    docs = ("SKILL.md", "references/result-contract.md", "references/observation-contract.md",
+            "references/flow-engine-contract.md", worker._FINANCE_RULES[state["workflow_key"]][2])
+    required = [".agents/skills/oa-finance-preaudit/" + doc for doc in docs]
+    facts["required_rule_file_sha256"] = sorted(relative[name] for name in required) if all(name in relative for name in required) else None
+    # Reuse the existing producer's original consumed-attempt metric projection.
+    # This disambiguates repeated replays sharing the canonical historical key.
+    try:
+        facts["case_metric"] = runtime_maintenance._project_case_metric(action.parent, state) if preview == "verified_closed" else None
+    except (OSError, KeyError, TypeError, ValueError):
+        facts["case_metric"] = None
     raw_file = root / "reviewer/decision.json"
     if preview != "verified_closed" or not raw_file.exists():
         return facts
@@ -716,16 +729,11 @@ def _build(root: Path) -> dict:
             raw = worker._parse_decision_json(final_bytes.decode("utf-8"))
         except (ValueError, UnicodeError):
             raw = None
-        constants = {
-            k: v["const"]
-            for k, v in schema.get("properties", {}).items()
-            if isinstance(v, dict) and "const" in v
-        }
         contract = (
             "verified_snapshot_schema"
             if isinstance(raw, dict)
             and Draft202012Validator(schema, registry=Registry()).is_valid(
-                {**constants, **raw}
+                raw
             )
             else "rejected"
         )

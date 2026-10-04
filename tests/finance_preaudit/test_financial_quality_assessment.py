@@ -13,6 +13,7 @@ from apps.oa_finance_preaudit import flow_evals
 def _artifact(root, name, value):
     path = root / name
     path.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+    path.chmod(0o600)
     return {"file": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
@@ -152,16 +153,26 @@ def _archived_review(tmp_path, *, closed=True, trusted_start=True, workflow="tra
     # Freeze the actual matched original rule source in this controlled archive.
     repository = Path(__file__).resolve().parents[2]
     rule = "travel-expense" if workflow == "travel_expense" else "business-entertainment"
-    name = f".agents/skills/oa-finance-preaudit/references/flows/{rule}.md"
-    path = root / "calling-source" / name
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes((repository / name).read_bytes())
-    path.chmod(0o600)
-    for parent in path.parents:
-        if parent == root:
-            break
-        parent.chmod(0o700)
-    manifest["source_files"][str(Path("/removed/checkout") / name)] = digest(path)
+    docs = ("SKILL.md", "references/result-contract.md", "references/observation-contract.md",
+            "references/flow-engine-contract.md", f"references/flows/{rule}.md")
+    rule_refs = []
+    for doc in docs:
+        name = ".agents/skills/oa-finance-preaudit/" + doc
+        path = root / "calling-source" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes((repository / name).read_bytes())
+        path.chmod(0o600)
+        for parent in path.parents:
+            if parent == root:
+                break
+            parent.chmod(0o700)
+        manifest["source_files"][str(Path("/removed/checkout") / name)] = digest(path)
+        rule_refs.append({"file": str(path), "sha256": digest(path)})
+    original = json.loads((root / "reviewer/decision.json").read_text())
+    schema = {"type": "object", "required": list(original), "properties": {
+        key: {"const": original[key]} for key in ("schema_version", "kind", "action_token", "workflow_key", "rule_version")}}
+    save(root / "generation-schema.json", schema)
+    manifest["inputs"][str(root / "generation-schema.json")] = digest(root / "generation-schema.json")
     save(root / "manifest.json", manifest)
     started = {"manifest_sha256": digest(root / "manifest.json")}
     result = json.loads((root / "result.json").read_text())
@@ -182,7 +193,7 @@ def _archived_review(tmp_path, *, closed=True, trusted_start=True, workflow="tra
         "scenario": "travel_uncertainty_control",
         "archive_manifest_sha256": digest(root / "manifest.json"),
         "source_refs": [{"file": p, "sha256": sha} for p, sha in manifest["originals"].items()],
-        "rule_refs": [{"file": str(path), "sha256": digest(path)}],
+        "rule_refs": rule_refs,
         "checks": [{"id": "known_and_unknown_facts", "expected": "独立核对原资料与最终意见"}],
     })
     outputs = [root / "reviewer/decision.json", root / "result.json"]
@@ -191,7 +202,7 @@ def _archived_review(tmp_path, *, closed=True, trusted_start=True, workflow="tra
     assessment = _artifact(tmp_path, "bound-assessment.json", {
         "schema_version": 1, "method": "independent_manual", "reviewer_role": "finance",
         "reviewer_record": "controlled-finance-record-not-real-signoff",
-        "reviewed_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(), "item_key": key,
+        "reviewed_at": datetime.now(timezone.utc).isoformat(), "item_key": key,
         "archive_manifest_sha256": digest(root / "manifest.json"),
         "result_sha256": digest(root / "result.json"),
         "checklist_sha256": checklist["sha256"],
@@ -282,8 +293,9 @@ def _scene_reviews(tmp_path, source_kinds, monkeypatch):
             @classmethod
             def now(cls, tz=None):
                 return datetime(2026, 10, 3, 10, tzinfo=timezone.utc)
-        monkeypatch.setattr(flow_evals, "datetime", FrozenClock)
-        review["expectations"] = flow_evals.freeze_financial_expectations(review["checklist"], root / "expectations.json")
+        with monkeypatch.context() as clock:
+            clock.setattr(flow_evals, "datetime", FrozenClock)
+            review["expectations"] = flow_evals.freeze_financial_expectations(review["checklist"], root / "expectations.json")
         value = json.loads(Path(review["assessment"]["file"]).read_text())
         value.update(checklist_sha256=review["checklist"]["sha256"], reviewer_role="historical_crosscheck")
         review["assessment"] = _artifact(root, "bound-assessment.json", value)
@@ -312,6 +324,7 @@ def test_history_crosscheck_freezes_expectations_without_new_finance_signature(t
             return datetime(2026, 10, 3, 10, tzinfo=timezone.utc)
     monkeypatch.setattr(flow_evals, "datetime", FrozenClock)
     review["expectations"] = flow_evals.freeze_financial_expectations(review["checklist"], tmp_path / "expectations.json")
+    monkeypatch.setattr(flow_evals, "datetime", datetime)
     assessment = json.loads(Path(review["assessment"]["file"]).read_text())
     assessment.update(reviewer_role="historical_crosscheck", checklist_sha256=review["checklist"]["sha256"])
     review["assessment"] = _artifact(tmp_path, "history-assessment.json", assessment)
@@ -368,3 +381,121 @@ def test_late_freeze_cannot_qualify_already_consumed_replay(tmp_path, monkeypatc
     report = flow_evals.build_financial_quality_report(reviews)
     assert report["cases"][0]["expectations_frozen_before_replay"] is False
     assert report["eligible"] is False
+
+
+def test_future_claimed_review_time_is_not_a_completed_result_audit(tmp_path):
+    reviews = _archived_review(tmp_path)
+    value = json.loads(Path(reviews[0]["assessment"]["file"]).read_text())
+    value["reviewed_at"] = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    reviews[0]["assessment"] = _artifact(tmp_path, "future-assessment.json", value)
+    report = flow_evals.build_financial_quality_report(reviews)
+    assert report["cases"][0]["result_audit_complete"] is False
+
+
+def test_rule_pack_from_another_flow_cannot_replace_selected_business_rules(tmp_path):
+    from tests.finance_preaudit.test_review_batch_report import digest, save
+    reviews = _archived_review(tmp_path, workflow="business_entertainment")
+    review = reviews[0]
+    root = Path(review["archive"]["file"]).parent
+    manifest = json.loads((root / "manifest.json").read_text())
+    relative = ".agents/skills/oa-finance-preaudit/references/flows/travel-expense.md"
+    path = root / "calling-source" / relative
+    path.write_bytes((Path(__file__).resolve().parents[2] / relative).read_bytes())
+    path.chmod(0o600)
+    manifest["source_files"][str(Path("/removed/checkout") / relative)] = digest(path)
+    save(root / "manifest.json", manifest)
+    started = json.loads((root / "started.json").read_text())
+    started["manifest_sha256"] = digest(root / "manifest.json")
+    save(root / "started.json", started)
+    result = json.loads((root / "result.json").read_text())
+    result["started_receipt_sha256"] = digest(root / "started.json")
+    save(root / "result.json", result)
+    review["archive"] = {"file": str(root / "manifest.json"), "sha256": digest(root / "manifest.json")}
+    checklist = json.loads(Path(review["checklist"]["file"]).read_text())
+    checklist["archive_manifest_sha256"] = review["archive"]["sha256"]
+    checklist["rule_refs"] = [{"file": str(path), "sha256": digest(path)}]
+    review["checklist"] = _artifact(tmp_path, "wrong-rules-checklist.json", checklist)
+    assessment = json.loads(Path(review["assessment"]["file"]).read_text())
+    assessment.update(archive_manifest_sha256=review["archive"]["sha256"],
+                      result_sha256=digest(root / "result.json"), checklist_sha256=review["checklist"]["sha256"])
+    assessment["output_refs"] = [_artifact_ref(Path(ref["file"])) for ref in assessment["output_refs"]]
+    review["assessment"] = _artifact(tmp_path, "wrong-rules-assessment.json", assessment)
+    review["confirmation"] = None
+    with pytest.raises(ValueError, match="financial_review_binding_invalid"):
+        flow_evals.build_financial_quality_report(reviews)
+
+
+def _artifact_ref(path):
+    return {"file": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def test_same_key_older_replay_assessment_cannot_attach_to_current_metric_window(tmp_path):
+    from apps.oa_finance_preaudit import runtime_maintenance
+    from tests.finance_preaudit.test_acceptance_report import REPLAY_OK
+    old_root, current_root = tmp_path / "old", tmp_path / "current"
+    old_root.mkdir()
+    current_root.mkdir()
+    old = _archived_review(old_root)
+    current = _archived_review(current_root)
+    assert old[0]["item_key"] == current[0]["item_key"]
+    manifest = json.loads(Path(current[0]["archive"]["file"]).read_text())
+    runtime = Path(manifest["action_file"]).parents[4]
+    samples = runtime_maintenance.status(runtime)["case_metrics"]
+    assert len(samples) == 1
+    with pytest.raises(ValueError, match="financial_review_sample_mismatch"):
+        flow_evals.build_acceptance_report(samples, replay_report=REPLAY_OK, cli_samples=[], financial_reviews=old)
+    report = flow_evals.build_acceptance_report(samples, replay_report=REPLAY_OK, cli_samples=[], financial_reviews=current)
+    assert report["financial_quality"]["cases"][0]["binding_status"] == "verified_consumed_correspondence"
+
+
+def test_consumable_missing_protocol_field_does_not_bypass_original_contract_gate(tmp_path, monkeypatch):
+    from tests.finance_preaudit.test_review_batch_report import digest
+    reviews = _scene_reviews(tmp_path, ["real_archive"] * 5, monkeypatch)
+    review = reviews[0]
+    root = Path(review["archive"]["file"]).parent
+    raw = json.loads((root / "reviewer/decision.json").read_text())
+    token = raw.pop("action_token")
+    _artifact(root / "reviewer", "decision.json", raw)
+    # Required original generation contract is frozen without changing consumer.
+    schema = root / "generation-schema.json"
+    _artifact(root, schema.name, {"type": "object", "required": ["action_token"],
+                                  "properties": {"action_token": {"const": token}}})
+    manifest = json.loads((root / "manifest.json").read_text())
+    manifest["inputs"][str(schema)] = digest(schema)
+    _artifact(root, "manifest.json", manifest)
+    started = json.loads((root / "started.json").read_text())
+    started["manifest_sha256"] = digest(root / "manifest.json")
+    _artifact(root, "started.json", started)
+    result = json.loads((root / "result.json").read_text())
+    result["started_receipt_sha256"] = digest(root / "started.json")
+    _artifact(root, "result.json", result)
+    review["archive"] = _artifact_ref(root / "manifest.json")
+    # Pre-run expectation links original material/rules, not final mutable carrier.
+    checklist = json.loads(Path(review["checklist"]["file"]).read_text())
+    checklist.pop("archive_manifest_sha256", None)
+    review["checklist"] = _artifact(tmp_path, "contract-checklist.json", checklist)
+    class FrozenClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 3, 10, tzinfo=timezone.utc)
+    with monkeypatch.context() as clock:
+        clock.setattr(flow_evals, "datetime", FrozenClock)
+        review["expectations"] = flow_evals.freeze_financial_expectations(review["checklist"], tmp_path / "contract-freeze.json")
+    assessment = json.loads(Path(review["assessment"]["file"]).read_text())
+    assessment.update(archive_manifest_sha256=review["archive"]["sha256"], result_sha256=digest(root / "result.json"),
+                      checklist_sha256=review["checklist"]["sha256"])
+    assessment["output_refs"] = [_artifact_ref(Path(ref["file"])) for ref in assessment["output_refs"]]
+    review["assessment"] = _artifact(tmp_path, "contract-assessment.json", assessment)
+    report = flow_evals.build_financial_quality_report(reviews)
+    assert report["cases"][0]["verdict"] == "pass"
+    assert report["cases"][0]["original_final_contract"] == "rejected"
+    assert report["eligible"] is False
+    from apps.oa_finance_preaudit import runtime_maintenance
+    from tests.finance_preaudit.test_acceptance_report import REPLAY_OK
+    samples = []
+    for assessment in reviews:
+        source = json.loads(Path(assessment["archive"]["file"]).read_text())
+        samples.extend(runtime_maintenance.status(Path(source["action_file"]).parents[4])["case_metrics"])
+    acceptance = flow_evals.build_acceptance_report(samples, replay_report=REPLAY_OK, cli_samples=[], financial_reviews=reviews)
+    assert acceptance["quality_gate"]["financial_quality_100"] is False
+    assert acceptance["quality_gate"]["passed"] is False

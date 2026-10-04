@@ -492,3 +492,16 @@ def test_financial_projection_rejects_a_different_model_business_decision(tmp_pa
     report = review_batch_report.build_report(root)
     assert report["financial_binding"]["status"] == "original_consumed_mismatch"
     assert report["usage"]["status"] == "exact"
+
+
+def test_original_schema_required_protocol_field_is_not_repaired_by_report(tmp_path):
+    root = archive(tmp_path)
+    raw_file = root / "reviewer/decision.json"
+    raw = json.loads(raw_file.read_text())
+    token = raw.pop("action_token")
+    save(raw_file, raw)
+    bind_schema(root, {"type": "object", "required": ["action_token"],
+                       "properties": {"action_token": {"const": token}}})
+    report = review_batch_report.build_report(root)
+    assert report["acceptance"]["final_contract"] == "rejected"
+    assert report["usage"]["status"] == "exact"

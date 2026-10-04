@@ -261,3 +261,165 @@ def test_quality_reference_is_not_promoted_to_production_by_arm_name(tmp_path, s
     assert report["source"]["role"]["declared"] == "quality_reference"
     assert report["acceptance"]["production_loaded"] == "not_established"
     assert report["timing"]["start_receipt"]["status"] == "bound_source_host_receipt"
+
+
+def test_expired_explicit_authorization_never_starts_reviewer(tmp_path, sources, monkeypatch):
+    from apps.oa_finance_preaudit import review_experiment
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "offline-placeholder")
+    path, auth, before, after = plan(tmp_path, sources)
+    value = json.loads(auth.read_text())
+    value["expires_at"] = "2020-01-01T00:00:00+00:00"
+    save(auth, value)
+    result = review_experiment.run_pair(path, auth)
+    assert result["reason"] == "authorization_expired"
+    assert result["cli_starts"] == 0
+    assert not (before / "reviewer").exists()
+    assert not (after / "reviewer").exists()
+
+
+@pytest.mark.parametrize("missing", ["AGENTS.md", ".agents/skills/oa-finance-preaudit/references/flows/business-entertainment.md"])
+def test_unlisted_actual_instructions_cannot_be_used_by_source_host(tmp_path, sources, missing):
+    from apps.oa_finance_preaudit import review_experiment
+    before = arm(tmp_path, sources, "baseline", "business_entertainment", BASE)
+    after = arm(tmp_path, sources, "candidate", "business_entertainment", CANDIDATE)
+    manifest = json.loads((after / "manifest.json").read_text())
+    del manifest["source_files"][str(ROOT / missing)]
+    save(after / "manifest.json", manifest)
+    (after / "calling-source" / missing).write_text("unlisted instructions drifted")
+    with pytest.raises(ValueError):
+        review_experiment.freeze_pair(before, after, tmp_path / "plan.json", repository=ROOT,
+            reviewer=fake_cli(tmp_path), purpose="effect", timeout_seconds=60, maximum_cli_starts=2)
+    assert not (after / "reviewer").exists()
+
+
+@pytest.mark.parametrize("module", ["flow_evals.py", "flow_engine.py"])
+def test_local_report_dependency_drift_is_rejected_in_fresh_process(tmp_path, sources, monkeypatch, module):
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "offline-placeholder")
+    path, auth, before, after = plan(tmp_path, sources)
+    dependency = ROOT / "apps/oa_finance_preaudit" / module
+    original = dependency.read_bytes()
+    try:
+        dependency.write_bytes(original + b"\n# controlled local dependency drift\n")
+        output = subprocess.check_output([sys.executable, "-c",
+            "import json,sys; from pathlib import Path; from apps.oa_finance_preaudit.review_experiment import run_pair; print(json.dumps(run_pair(Path(sys.argv[1]),Path(sys.argv[2]))))",
+            str(path), str(auth)], cwd=ROOT, text=True)
+        result = json.loads(output)
+    finally:
+        dependency.write_bytes(original)
+    assert result["reason"] == "host_drift"
+    assert result["cli_starts"] == 0
+    assert not (before / "reviewer").exists()
+    assert not (after / "reviewer").exists()
+
+
+def test_host_timeout_after_real_cli_launch_does_not_report_zero_or_not_started(tmp_path, sources, monkeypatch):
+    import time
+    from apps.oa_finance_preaudit import review_experiment
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "offline-placeholder")
+    path, auth, before, after = plan(tmp_path, sources)
+    original = subprocess.Popen
+    class DispatchTimeout:
+        def __init__(self, process, command):
+            self.process, self.command = process, command
+        def __getattr__(self, name):
+            return getattr(self.process, name)
+        def communicate(self, *args, **kwargs):
+            deadline = time.monotonic() + 10
+            while not (before / "cli-start.json").exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert (before / "cli-start.json").exists()
+            raise subprocess.TimeoutExpired(self.command, kwargs.get("timeout"))
+    def start(command, **kwargs):
+        process = original(command, **kwargs)
+        return DispatchTimeout(process, command) if command[-1] == "execute" else process
+    monkeypatch.setattr(review_experiment.subprocess, "Popen", start)
+    result = review_experiment.run_pair(path, auth)
+    assert result["status"] == "stopped", result
+    assert result["cli_starts"] in {1, "unknown"}
+    assert "baseline" not in result["not_started"]
+    assert not (after / "reviewer").exists()
+
+
+def test_parent_cancel_in_real_host_spawn_window_reaps_host_and_never_dispatches_candidate(tmp_path, sources, monkeypatch):
+    import os
+    import signal
+    from apps.oa_finance_preaudit import review_experiment
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "offline-placeholder")
+    path, auth, before, after = plan(tmp_path, sources)
+    driver = tmp_path / "cancel-driver.py"
+    pid_file, result_file = tmp_path / "host-pid.json", tmp_path / "cancel-result.json"
+    driver.write_text('''import json,os,signal,subprocess,sys,time
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from apps.oa_finance_preaudit import review_experiment
+original=subprocess.Popen
+def start(command,**kwargs):
+ process=original(command,**kwargs)
+ if command[-1]=="execute":
+  Path(sys.argv[4]).write_text(json.dumps(process.pid))
+  os.kill(os.getpid(),signal.SIGTERM)
+  time.sleep(.1)
+ return process
+subprocess.Popen=start
+result=review_experiment.run_pair(Path(sys.argv[2]),Path(sys.argv[3]))
+Path(sys.argv[5]).write_text(json.dumps(result))
+''')
+    process = subprocess.Popen([sys.executable, str(driver), str(ROOT), str(path), str(auth),
+                                str(pid_file), str(result_file)], cwd=ROOT)
+    try:
+        assert process.wait(timeout=20) == 0
+        result = json.loads(result_file.read_text())
+        assert result["status"] == "stopped"
+        assert not (after / "reviewer").exists()
+        with pytest.raises(ProcessLookupError):
+            os.kill(json.loads(pid_file.read_text()), 0)
+    finally:
+        for receipt in (pid_file, before / "cli-start.json"):
+            if receipt.exists():
+                value = json.loads(receipt.read_text())
+                pid = value["pid"] if isinstance(value, dict) else value
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
+def test_non_main_dispatch_without_signal_handoff_is_rejected_before_start(tmp_path, sources, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from apps.oa_finance_preaudit import review_experiment
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "offline-placeholder")
+    path, auth, before, after = plan(tmp_path, sources)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        result = pool.submit(review_experiment.run_pair, path, auth).result(timeout=20)
+    assert result["reason"] == "cancellation_guard_unavailable"
+    assert result["cli_starts"] == 0
+    assert not (before / "reviewer").exists()
+    assert not (after / "reviewer").exists()
+
+
+def test_cancellation_after_prepare_output_never_proceeds_to_any_model(tmp_path, sources, monkeypatch):
+    from apps.oa_finance_preaudit import review_experiment
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "offline-placeholder")
+    path, auth, before, after = plan(tmp_path, sources)
+    original = subprocess.Popen
+    class FinishedPrepare:
+        def __init__(self, process): self.process = process
+        def __getattr__(self, name): return getattr(self.process, name)
+        def communicate(self, *args, **kwargs):
+            output = self.process.communicate(*args, **kwargs)
+            # Real source host has exited; exercise the installed owner handler.
+            import os, signal
+            os.kill(os.getpid(), signal.SIGTERM)
+            return output
+    def start(command, **kwargs):
+        process = original(command, **kwargs)
+        return FinishedPrepare(process) if command[-1] == "prepare" else process
+    monkeypatch.setattr(review_experiment.subprocess, "Popen", start)
+    result = review_experiment.run_pair(path, auth)
+    assert result["reason"] == "source_host_cancelled"
+    assert result["cli_starts"] == 0
+    assert not (before / "reviewer").exists()
+    assert not (after / "reviewer").exists()

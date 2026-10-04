@@ -954,8 +954,8 @@ def _financial_replay_binding(review: dict, checklist: dict, assessment: dict) -
             or assessment.get("result_sha256") != binding.get("result_sha256")
             or sorted(ref["sha256"] for ref in checklist["source_refs"])
             != binding.get("original_file_sha256")
-            or not {ref["sha256"] for ref in checklist["rule_refs"]}.issubset(
-                set(binding.get("rule_file_sha256", [])))):
+            or sorted(ref["sha256"] for ref in checklist["rule_refs"])
+            != binding.get("required_rule_file_sha256")):
         raise ValueError("financial_review_binding_invalid")
     required = {binding["result_sha256"]}
     if binding["status"] == "verified_consumed_correspondence":
@@ -972,7 +972,7 @@ def _financial_replay_binding(review: dict, checklist: dict, assessment: dict) -
             raise ValueError("financial_review_binding_invalid") from error
         if not same:
             raise ValueError("financial_review_binding_invalid")
-    return {**binding, "start": start}
+    return {**binding, "start": start, "final_contract": report["acceptance"]["final_contract"]}
 
 
 def build_financial_quality_report(reviews: object) -> dict:
@@ -1059,7 +1059,7 @@ def build_financial_quality_report(reviews: object) -> dict:
                 result_audit_complete = (binding["status"] == "verified_consumed_correspondence"
                                              and reviewed_at.tzinfo is not None
                                              and closed is not None and closed.tzinfo is not None
-                                             and reviewed_at >= closed)
+                                             and closed <= reviewed_at <= datetime.now().astimezone())
                 result_reviewed_by_finance = result_audit_complete and assessment["reviewer_role"] == "finance"
             except (KeyError, TypeError, ValueError) as error:
                 raise ValueError("financial_review_invalid") from error
@@ -1081,12 +1081,19 @@ def build_financial_quality_report(reviews: object) -> dict:
         workflow, scenario = checklist["workflow_key"], checklist["scenario"]
         if workflow == "business_entertainment" and checklist["source_kind"] == "real_archive":
             covered.add(scenario)
+        metric = binding.get("case_metric")
+        window_binding = {field: metric[field] for field in (
+            "closed_at", "stage_timestamps", "execution_state", "business_state",
+            "write_state", "quality", "pipeline_evidence",
+        )} if isinstance(metric, dict) else None
         cases.append({"item_key": key, "workflow_key": workflow, "scenario": scenario,
                       "source_kind": checklist["source_kind"],
                       "historical_crosscheck": historical,
                       "expectations_frozen_before_replay": frozen_before,
                       "result_audit_complete": result_audit_complete,
                       "binding_status": binding["status"],
+                      "original_final_contract": binding.get("final_contract", "not_established"),
+                      "window_binding": window_binding,
                       "replay_start_status": binding["start"]["status"],
                       "checklist_sha256": review["checklist"]["sha256"],
                       "assessment_sha256": review["assessment"]["sha256"],
@@ -1102,6 +1109,8 @@ def build_financial_quality_report(reviews: object) -> dict:
             "eligible": bool(cases) and not missing and all(
                 case["source_kind"] == "real_archive"
                 and case["binding_status"] == "verified_consumed_correspondence"
+                and case["original_final_contract"] == "verified_snapshot_schema"
+                and case["window_binding"] is not None
                 and case["verdict"] == "pass" and case["result_audit_complete"]
                 and case["historical_crosscheck"] == "complete"
                 and case["expectations_frozen_before_replay"] for case in cases)}
@@ -1171,6 +1180,10 @@ def build_acceptance_report(
         if any(key not in sample_by_key or sample_by_key[key]["workflow_key"] != case["workflow_key"]
                for key, case in assessed.items()):
             raise ValueError("financial_review_sample_mismatch")
+        for key, case in assessed.items():
+            protected = case.get("window_binding")
+            if protected is not None and any(sample_by_key[key].get(field) != value for field, value in protected.items()):
+                raise ValueError("financial_review_sample_mismatch")
         closed_keys = {sample["item_key"] for sample in samples if sample["execution_state"] == "closed"}
         quality_checks["financial_quality_100"] = (
             financial_quality["eligible"] and closed_keys == set(assessed)

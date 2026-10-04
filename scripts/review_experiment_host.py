@@ -180,4 +180,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # The dispatcher blocks SIGTERM while assigning child ownership. Unblock in
+    # the new host before it can launch any reviewer; worker then owns handoff.
+    if hasattr(signal, "pthread_sigmask"):
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
     main()

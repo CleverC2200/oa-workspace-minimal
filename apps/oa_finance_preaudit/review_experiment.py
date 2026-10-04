@@ -14,6 +14,7 @@ import sys
 import os
 import signal
 import threading
+from datetime import datetime, timezone
 from typing import Callable
 
 from . import review_batch_report as batch
@@ -42,7 +43,13 @@ def _verify_sources(root: Path, repository: Path) -> dict:
     relative = {str(Path(p).relative_to(source_root)): h for p, h in files.items()}
     tree = subprocess.check_output(["git", "ls-tree", "-r", "--name-only", revision], cwd=repository, text=True).splitlines()
     required = {n for n in tree if n.startswith("apps/") and n.endswith(".py")}
-    required.add("requirements-dev.txt")
+    required.update({"requirements-dev.txt", "AGENTS.md"})
+    action = batch._path(root, manifest["action_file"])
+    packet = batch._object(root, action.with_name("review-packet.json"))
+    flow = packet["workflow_key"]
+    docs = ("SKILL.md", "references/result-contract.md", "references/observation-contract.md",
+            "references/flow-engine-contract.md", batch.worker._FINANCE_RULES[flow][2])
+    required.update(".agents/skills/oa-finance-preaudit/" + name for name in docs)
     if not required.issubset(relative):
         raise ValueError(ERROR)
     for name, expected in relative.items():
@@ -65,32 +72,42 @@ def _host(plan: Path, name: str, *, execute: bool = False) -> dict:
         raise ValueError("host_drift")
     environment = {k: v for k, v in os.environ.items() if k in {"HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "OA_REVIEW_API_KEY", "SSL_CERT_DIR", "SSL_CERT_FILE"}}
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
-    process = subprocess.Popen([sys.executable, str(HOST), str(plan), name, "execute" if execute else "prepare"], env=environment, cwd=value["arms"][name], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    if threading.current_thread() is not threading.main_thread() or not hasattr(signal, "pthread_sigmask"):
+        raise ValueError("cancellation_guard_unavailable")
+    process = None
     cancelled = False
-    previous = None
-    if threading.current_thread() is threading.main_thread():
-        def cancel(_signal, _frame):
-            nonlocal cancelled
-            cancelled = True
-            # The host owns the reviewer group and forwards its cancellation.
+    def cancel(_signal, _frame):
+        nonlocal cancelled
+        cancelled = True
+        if process is not None:
+            # Source host forwards cancellation to its independently owned CLI.
             process.terminate()
-        previous = signal.signal(signal.SIGTERM, cancel)
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    previous = signal.signal(signal.SIGTERM, cancel)
     try:
+        try:
+            process = subprocess.Popen([sys.executable, str(HOST), str(plan), name, "execute" if execute else "prepare"], env=environment, cwd=value["arms"][name], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        finally:
+            # Pending cancellation cannot arrive before ownership/PID is recorded.
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
         output, _errors = process.communicate(timeout=value["timeout_seconds"] + 40)
     finally:
-        if previous is not None:
+        try:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+        finally:
             signal.signal(signal.SIGTERM, previous)
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
     if process.returncode:
-        raise ValueError("source_host_failed")
+        raise ValueError("source_host_cancelled" if cancelled else "source_host_failed")
     result = batch._decode(output)
     if cancelled:
+        if not execute:
+            raise ValueError("source_host_cancelled")
         result["dispatch_cancelled"] = True
     return result
 
@@ -129,7 +146,13 @@ def freeze_pair(baseline: Path, candidate: Path, plan: Path, *, repository: Path
             "reviewer_sha256": batch._sha(reviewer), "host_sha256": batch._sha(HOST),
             "timeout_seconds": timeout_seconds, "maximum_cli_starts": maximum_cli_starts,
             "oa_write_authorized": False, "timing_boundary": "input_preparation_to_preview_consumption"}
-    data["runtime_files"] = {str(path): batch._sha(path) for path in (Path(__file__).resolve(), HOST, Path(batch.__file__).resolve(), Path(sys.executable).resolve())}
+    # Pin the local Python implementation closure conservatively, including
+    # transitive report/engine/authorization helpers, not only the entry modules.
+    local = Path(__file__).resolve().parents[2]
+    runtime_files = {Path(__file__).resolve(), HOST, Path(batch.__file__).resolve(),
+                     Path(sys.executable).resolve(), local / "requirements-dev.txt"}
+    runtime_files.update(path.resolve() for path in (local / "apps").rglob("*.py") if path.is_file())
+    data["runtime_files"] = {str(path): batch._sha(path) for path in sorted(runtime_files)}
     data.update(source_revisions=revisions, source_roles=roles, manifests=manifests)
     # A provisional plan is used only by the offline source hosts, then removed.
     provisional = plan.with_name(plan.name + ".preparing")
@@ -155,6 +178,39 @@ def _admission(plan: dict) -> str | None:
     return None
 
 
+def _valid_authority_time(authority: dict) -> None:
+    now = datetime.now(timezone.utc)
+    for field in ("not_before", "expires_at"):
+        if field not in authority:
+            continue
+        try:
+            value = datetime.fromisoformat(authority[field])
+        except (TypeError, ValueError) as error:
+            raise ValueError("authorization_not_bound") from error
+        if value.tzinfo is None:
+            raise ValueError("authorization_not_bound")
+        if field == "not_before" and now < value:
+            raise ValueError("authorization_not_yet_valid")
+        if field == "expires_at" and now >= value:
+            raise ValueError("authorization_expired")
+
+
+def _observed_cli_start(plan: dict, name: str) -> int | str:
+    root = Path(plan["arms"][name])
+    try:
+        started = batch._object(root, "started.json")
+        cli = batch._object(root, "cli-start.json")
+        if (started.get("manifest_sha256") == batch._sha(root / "manifest.json")
+                and started.get("source_revision") == cli.get("source_revision") == plan["source_revisions"][name]
+                and started.get("source_snapshot_sha256") == plan["preparations"][name]["source_snapshot_sha256"]
+                and cli.get("input_sha256") == plan["preparations"][name]["input_sha256"]
+                and type(cli.get("pid")) is int and cli["pid"] > 0):
+            return 1
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return "unknown"
+
+
 def run_pair(plan_file: Path, authorization_file: Path, *,
              stop_requested: Callable[[], bool] = lambda: False) -> dict:
     """Consume one plan once. No retry, implicit diagnosis or business judgement."""
@@ -162,6 +218,9 @@ def run_pair(plan_file: Path, authorization_file: Path, *,
     started = 0
     trials = {}
     plan = {}
+    dispatching = None
+    counted = set()
+    consumed = set()
     try:
         plan = batch._object(plan_file.parent, plan_file)
         authority = batch._object(Path(authorization_file).absolute().parent, authorization_file)
@@ -172,6 +231,7 @@ def run_pair(plan_file: Path, authorization_file: Path, *,
                 or type(authority.get("maximum_cli_starts")) is not int
                 or authority["maximum_cli_starts"] < plan["maximum_cli_starts"]):
             raise ValueError("authorization_not_bound")
+        _valid_authority_time(authority)
         if plan.get("schema_version") != 1 or plan.get("kind") != "preaudit_replay_pair_plan" or plan.get("purpose") not in {"effect", "diagnostic"} or plan.get("unique_change") != "complete_initial_input" or set(plan.get("arms", {})) != {"baseline", "candidate"} or type(plan.get("maximum_cli_starts")) is not int or plan["maximum_cli_starts"] > 2:
             raise ValueError(ERROR)
         if plan["maximum_cli_starts"] < 2:
@@ -198,16 +258,31 @@ def run_pair(plan_file: Path, authorization_file: Path, *,
         for name in ("baseline", "candidate"):
             if stop_requested():
                 return {"status": "stopped", "reason": "cancelled_before_dispatch", "cli_starts": started, "trials": trials, "not_started": [n for n in plan["arms"] if n not in trials], "benefit": "not_established"}
+            _valid_authority_time(authority)
             _verify_sources(Path(plan["arms"][name]), Path(plan["repository"]))
+            dispatching = name
             result = _host(plan_file, name, execute=True)
             started += result["cli_starts"]
+            counted.add(name)
+            if result["cli_starts"]:
+                consumed.add(name)
             trials[name] = batch.build_report(Path(plan["arms"][name]))
+            dispatching = None
             if result.get("dispatch_cancelled") or result["execution"]["process_state"] not in {"exited", "timed_out", "not_started", "start_failed"}:
                 return {"status": "stopped", "reason": "cancelled_during_review" if result["execution"]["process_state"] == "cancelled" or result.get("dispatch_cancelled") else "process_cleanup_unverified", "cli_starts": started, "trials": trials, "not_started": [n for n in plan["arms"] if n not in trials], "benefit": "not_established"}
         return {"status": "observed", "purpose": plan["purpose"], "cli_starts": started, "trials": trials, "not_started": [], "benefit": "not_established", "quality": "requires_explicit_financial_assessment"}
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         # A host interruption can occur after consumption: do not invent zero.
         reason = str(error) if isinstance(error, ValueError) else ERROR
-        allowed = {ERROR, "source_drift", "host_drift", "source_host_failed", "archive_already_started", "authorization_not_bound", "start_budget_exhausted", "cancelled_before_start", "reviewer_drift", "prepared_input_drift", "comparison_conditions_mismatch", "candidate_capacity_fallback", "treatment_not_applied"}
-        unknown = reason == "source_host_failed" and any((Path(p) / "started.json").exists() for p in plan.get("arms", {}).values())
-        return {"status": "stopped" if trials or unknown else "rejected", "reason": reason if reason in allowed else ERROR, "cli_starts": "unknown" if unknown else started, "trials": trials, "not_started": [n for n in plan.get("arms", {}) if n not in trials], "benefit": "not_established"}
+        allowed = {ERROR, "source_drift", "host_drift", "source_host_failed", "source_host_cancelled", "cancellation_guard_unavailable", "archive_already_started", "authorization_not_bound", "authorization_expired", "authorization_not_yet_valid", "start_budget_exhausted", "cancelled_before_start", "reviewer_drift", "prepared_input_drift", "comparison_conditions_mismatch", "candidate_capacity_fallback", "treatment_not_applied"}
+        unknown = False
+        if dispatching is not None and dispatching not in counted:
+            # Every execute-host failure can follow actual consumption, including
+            # timeout, decode failure and interruption; absence is not zero proof.
+            observed = _observed_cli_start(plan, dispatching)
+            if observed == "unknown":
+                unknown = True
+            else:
+                started += observed
+            consumed.add(dispatching)
+        return {"status": "stopped" if trials or dispatching is not None else "rejected", "reason": reason if reason in allowed else ERROR, "cli_starts": "unknown" if unknown else started, "trials": trials, "not_started": [n for n in plan.get("arms", {}) if n not in consumed], "benefit": "not_established"}

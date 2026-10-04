@@ -19,3 +19,11 @@
 ## 无凭据回归
 
 `python -m pytest tests/finance_preaudit/test_review_experiment.py tests/finance_preaudit/test_review_batch_report.py tests/finance_preaudit/test_review_cost_report.py tests/finance_preaudit/test_review_window_report.py -q` 使用受控外部进程，走实际 Worker → FlowEngine preview → 报告；不调用付费模型或 OA。现有 quality workflow 的 pytest/lint/hygiene/links 继续覆盖这些模块，未增加另一套检查平台。
+
+## 运行与核对保护
+
+计划固定当前本地 apps Python 实现、宿主、driver、解释器和依赖清单；新进程加载前检查实际字节。calling-source 的项目指令和当前流程五份必需规则文档也必须在 Git 固定清单中，漏列不能用来绕过漂移检查。
+
+授权可选声明带时区的 not_before / expires_at，声明后按实际宿主时间逐次核验。取消保护先阻塞信号，登记宿主 PID 和 handler 后恢复信号；保护不可用的非 main 调用拒绝启动。准备完成后的取消也停止后续模型派发。所有 execute 宿主失败，包括 communicate 超时，均回查真实启动回执；无法确认保持 unknown，不报伪零或把已启动基线列为 not_started。
+
+原生成合同直接校验原 JSON，不借消费端的既有协议补全冒充合格。原决定确实可消费但生成合同不合格时，事实核对仍单独报告，完整质量资格保持失败。财务核对绑定当前流程完整所选规则及原消费指标窗口；同历史 attempt 的旧轮次不能仅靠相同 key 套到当前窗口，未来的核对时间不能算已完成。
