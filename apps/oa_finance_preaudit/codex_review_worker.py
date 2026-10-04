@@ -371,6 +371,13 @@ def _prompt(action_file: Path, *, reading_instruction: str | None = None) -> str
         )
     elif workflow_key == "tpm_small_marketing_fee":
         workflow_requirement = _TPM_SMALL_MARKETING_REQUIREMENT
+    elif workflow_key == "business_entertainment":
+        workflow_requirement = (
+            "只按本流程固定审核项判断；形成最终四项决定前，执行业务招待费规则包"
+            "“核销前逐笔核对”与核销范围复核；evidence_refs 引用支持拟采用支出费用对应的原事实，"
+            "missing_evidence 按各固定审核项保留仍未确认的必要事实或关系；"
+            "费用对应只要求尚未确认的必要关系，不能用泛泛的支付成功替代这一步；"
+        )
     else:
         workflow_requirement = "只按该流程固定审核项判断，不得读取其他流程规则或证据；"
     material_reading = (

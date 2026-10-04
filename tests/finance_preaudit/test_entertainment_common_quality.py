@@ -21,6 +21,23 @@ DOCS = ('SKILL.md', 'references/result-contract.md', 'references/observation-con
 
 
 @pytest.mark.parametrize('fallback', [False, True])
+def test_actual_prompt_routes_final_expense_check_after_material_delivery(tmp_path, fallback):
+    from apps.oa_finance_preaudit import review_input
+
+    _engine, task = prepare(tmp_path, page_count=0, tail='synthetic-long-material' * 6000 if fallback else 'synthetic material')
+    action = Path(task['action_file'])
+    frozen = review_input.prepare(action)
+    prompt = worker._prompt(action, reading_instruction=frozen.instruction)
+    checkpoint = prompt.find('形成最终四项决定前')
+    assert checkpoint >= 0
+    assert '核销前逐笔核对' in prompt[checkpoint:]
+    if not fallback:
+        assert checkpoint > prompt.index('冻结输入原文结束。')
+    assert 'missing_evidence' in prompt[checkpoint:]
+    assert '必要事实或关系' in prompt[checkpoint:]
+
+
+@pytest.mark.parametrize('fallback', [False, True])
 @pytest.mark.parametrize('wrong_binding', [False, True])
 @pytest.mark.parametrize('amount_status', ['uncertain', 'fail'])
 def test_both_reading_paths_deliver_common_rule_and_preserve_consumer_contract(tmp_path, monkeypatch, fallback, wrong_binding, amount_status):
