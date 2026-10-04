@@ -121,7 +121,9 @@ class ReviewInput:
                     '沿用原读取路径，完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，'
                     '按其路由读取 `references/result-contract.md`、`references/observation-contract.md`、'
                     '`references/flows/business-entertainment.md`、动作引用的审核包、材料和全部准备页；')
-        return ('完整原文已随本条消息提供，宿主已验证冻结绑定。直接完整阅读下列规则与材料，'
+        return ('完整原文已随本条消息提供。宿主校验仅确认当前冻结身份、文件和资源映射一致，'
+                '不表示申报内容、实际支付或费用对应关系已经核验；业务判断仍须遵守下列完整原规则。'
+                '直接完整阅读下列规则与材料，'
                 '无需重复打开同一规则/JSON文件或检查宿主实现。初始附图顺序与 prepared.images 顺序一致，'
                 '逐页映射到原资源；附图、路径和引用不证明实际观察，仍须按原页面覆盖规则完成观察及必要复核。'
                 'evidence_refs 的表单字段引用必须逐字使用 declared_fields 中的 path；'

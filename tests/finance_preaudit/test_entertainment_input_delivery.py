@@ -57,7 +57,7 @@ def prepare(tmp_path, *, page_count=5, width=16, height=16, degraded=False, tail
     return engine, {"project_root": str(root), "action_file": action["action_file"], "timeout_seconds": 60}
 
 
-def reviewer(monkeypatch, tmp_path, task, *, direct=True, image_count=5, unknown_usage=False, wrong_token=False, resource_evidence=False, probe_large=False, probe_invalid=False):
+def reviewer(monkeypatch, tmp_path, task, *, direct=True, image_count=5, unknown_usage=False, wrong_token=False, resource_evidence=False, probe_large=False, probe_invalid=False, host_scope=False):
     """A real controllable subprocess, replacing the external paid CLI only."""
     action = json.loads(Path(task["action_file"]).read_text())
     packet = json.loads(Path(action["review_packet_file"]).read_text())
@@ -86,6 +86,8 @@ if argv[:2]==["debug","prompt-input"]:
 prompt=sys.stdin.read()
 direct=''' + repr(direct) + '''
 if direct:
+ if ''' + repr(host_scope) + ''':
+  assert "不表示申报内容、实际支付或费用对应关系已经核验" in prompt
  if ''' + repr(resource_evidence) + ''':
   assert "evidence_refs 的表单字段引用必须逐字使用" in prompt
  assert "冻结数据：material" in prompt
@@ -392,3 +394,13 @@ def test_native_binary_drift_rejects_review_with_unchanged_launcher(monkeypatch,
     assert not [call for call in calls if call[1] == "exec"]
     assert hashlib.sha256(launcher.read_bytes()).hexdigest() == launcher_hash
     assert json.loads(Path(task["action_file"]).read_text())["action"] == "review_required"
+
+
+def test_initial_delivery_does_not_claim_host_verified_business_facts(monkeypatch, tmp_path):
+    engine, task = prepare(tmp_path)
+    reviewer(monkeypatch, tmp_path, task, host_scope=True)
+    reviewed = worker.review(task)
+    closed = close(engine, task, reviewed)
+    assert closed["action"] == "closed"
+    assert closed["business_state"] == "needs_human"
+    assert closed["write_state"] == "not_requested"
