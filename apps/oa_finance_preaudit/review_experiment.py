@@ -44,6 +44,7 @@ def _verify_sources(root: Path, repository: Path) -> dict:
     tree = subprocess.check_output(["git", "ls-tree", "-r", "--name-only", revision], cwd=repository, text=True).splitlines()
     required = {n for n in tree if n.startswith("apps/") and n.endswith(".py")}
     required.update({"requirements-dev.txt", "AGENTS.md"})
+    required.update(name for name in tree if name.startswith("apps/oa_approval/configs/") and name.endswith(".json"))
     action = batch._path(root, manifest["action_file"])
     packet = batch._object(root, action.with_name("review-packet.json"))
     flow = packet["workflow_key"]
@@ -152,6 +153,7 @@ def freeze_pair(baseline: Path, candidate: Path, plan: Path, *, repository: Path
     runtime_files = {Path(__file__).resolve(), HOST, Path(batch.__file__).resolve(),
                      Path(sys.executable).resolve(), local / "requirements-dev.txt"}
     runtime_files.update(path.resolve() for path in (local / "apps").rglob("*.py") if path.is_file())
+    runtime_files.update(path.resolve() for path in (local / "apps/oa_approval/configs").glob("*.json") if path.is_file())
     data["runtime_files"] = {str(path): batch._sha(path) for path in sorted(runtime_files)}
     data.update(source_revisions=revisions, source_roles=roles, manifests=manifests)
     # A provisional plan is used only by the offline source hosts, then removed.

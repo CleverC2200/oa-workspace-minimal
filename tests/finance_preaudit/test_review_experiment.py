@@ -35,7 +35,7 @@ def forbidden(*args, **kwargs):
 def sources(tmp_path_factory):
     root = tmp_path_factory.mktemp("sources")
     names = subprocess.check_output(["git", "ls-tree", "-r", "--name-only", CANDIDATE], cwd=ROOT, text=True).splitlines()
-    selected = [p for p in names if p.startswith("apps/") and p.endswith(".py") or p.startswith(".agents/skills/oa-finance-preaudit/") and p.endswith(".md") or p in {"requirements-dev.txt", "AGENTS.md"}]
+    selected = [p for p in names if p.startswith("apps/oa_approval/configs/") and p.endswith(".json") or p.startswith("apps/") and p.endswith(".py") or p.startswith(".agents/skills/oa-finance-preaudit/") and p.endswith(".md") or p in {"requirements-dev.txt", "AGENTS.md"}]
     result = {}
     for revision in (BASE, CANDIDATE):
         folder = root / revision
@@ -277,7 +277,7 @@ def test_expired_explicit_authorization_never_starts_reviewer(tmp_path, sources,
     assert not (after / "reviewer").exists()
 
 
-@pytest.mark.parametrize("missing", ["AGENTS.md", ".agents/skills/oa-finance-preaudit/references/flows/business-entertainment.md"])
+@pytest.mark.parametrize("missing", ["AGENTS.md", ".agents/skills/oa-finance-preaudit/references/flows/business-entertainment.md", "apps/oa_approval/configs/business_entertainment.json"])
 def test_unlisted_actual_instructions_cannot_be_used_by_source_host(tmp_path, sources, missing):
     from apps.oa_finance_preaudit import review_experiment
     before = arm(tmp_path, sources, "baseline", "business_entertainment", BASE)
@@ -292,7 +292,7 @@ def test_unlisted_actual_instructions_cannot_be_used_by_source_host(tmp_path, so
     assert not (after / "reviewer").exists()
 
 
-@pytest.mark.parametrize("module", ["flow_evals.py", "flow_engine.py"])
+@pytest.mark.parametrize("module", ["flow_evals.py", "flow_engine.py", "../oa_approval/configs/business_entertainment.json"])
 def test_local_report_dependency_drift_is_rejected_in_fresh_process(tmp_path, sources, monkeypatch, module):
     monkeypatch.setenv("OA_REVIEW_API_KEY", "offline-placeholder")
     path, auth, before, after = plan(tmp_path, sources)

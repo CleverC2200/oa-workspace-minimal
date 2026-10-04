@@ -10,6 +10,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from .flow_engine import WORKFLOW_KEYS
+from apps.oa_approval import flow as approval_flow
 
 
 SCENARIOS = (
@@ -899,6 +900,24 @@ def _historical_crosscheck(checklist: dict) -> str:
                 or not workflow["workflowRequestLogs"]
                 or not all(isinstance(log, dict) for log in workflow["workflowRequestLogs"])):
             raise ValueError("financial_history_binding_invalid")
+        try:
+            actual = approval_flow.workflow_identity(workflow)
+            handled_actual = approval_flow.workflow_identity(handled)
+            if (not actual["workflow_id"] or not actual["workflow_name"]
+                    or actual != handled_actual):
+                raise ValueError("financial_history_binding_invalid")
+            configs = approval_flow.load_all_configs()
+            selected = approval_flow.select_config_for_workflow(request, workflow, configs)
+            selected_handled = approval_flow.select_config_for_workflow(request, handled, configs)
+            selected_material = approval_flow.select_config_for_workflow(
+                request, {"workflowName": materials[0].get("workflow_name")}, configs)
+            if not (selected["flow_key"] == selected_handled["flow_key"]
+                    == selected_material["flow_key"] == materials[0].get("workflow_key")
+                    == checklist.get("workflow_key")):
+                raise ValueError("financial_history_binding_invalid")
+        except (RuntimeError, SystemExit, OSError, ValueError, KeyError, TypeError):
+            # Original IDs/names must remain in private artifacts, not exceptions.
+            raise ValueError("financial_history_binding_invalid") from None
     checks = checklist.get("historical_checks")
     expected_ids = {check["id"] for check in checklist["checks"]}
     if (not isinstance(checks, list) or len(checks) != len(expected_ids)
@@ -911,6 +930,11 @@ def _historical_crosscheck(checklist: dict) -> str:
     return "conflict" if any(check["outcome"] == "conflict" for check in checks) else "complete"
 
 
+def _flow_config_pins() -> dict:
+    return {str(path.resolve()): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(approval_flow.CONFIG_DIR.glob("*.json"))}
+
+
 def freeze_financial_expectations(checklist_reference: dict, destination: Path) -> dict:
     """Freeze source-based historical crosschecks now; no caller-provided time/signature."""
     checklist = _read_bound_artifact(checklist_reference)
@@ -920,7 +944,8 @@ def freeze_financial_expectations(checklist_reference: dict, destination: Path) 
     path = Path(destination).absolute()
     payload = {"schema_version": 1, "kind": "preaudit_expectations_freeze",
                "checklist_sha256": checklist_reference["sha256"],
-               "historical_crosscheck": status, "frozen_at": datetime.now().astimezone().isoformat()}
+               "historical_crosscheck": status, "frozen_at": datetime.now().astimezone().isoformat(),
+               "flow_configs": _flow_config_pins()}
     with path.open("x", encoding="utf-8") as stream:
         import os
         os.chmod(path, 0o600)
@@ -1074,6 +1099,7 @@ def build_financial_quality_report(reviews: object) -> dict:
                 frozen_before = (freeze.get("kind") == "preaudit_expectations_freeze"
                                  and freeze.get("checklist_sha256") == review["checklist"]["sha256"]
                                  and freeze.get("historical_crosscheck") == historical == "complete"
+                                 and freeze.get("flow_configs") == _flow_config_pins()
                                  and frozen.tzinfo is not None and started is not None
                                  and frozen <= started)
             except (KeyError, TypeError, ValueError) as error:

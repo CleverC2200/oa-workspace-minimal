@@ -34,7 +34,9 @@ def archive(
         pytest.fail("report must not call business ports")
 
     def collect(request, attempt):
-        material = {**_material(request), "workflow_key": workflow}
+        from apps.oa_approval import flow as approval_flow
+        config = next(config for config in approval_flow.load_all_configs() if config["flow_key"] == workflow)
+        material = {**_material(request), "workflow_key": workflow, "workflow_name": config["workflow_name"]}
         if business_value is not None:
             material["declared_fields"] = [
                 {"path": "declared_fields.period", "value": business_value}

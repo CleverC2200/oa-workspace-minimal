@@ -281,10 +281,7 @@ def _scene_reviews(tmp_path, source_kinds, monkeypatch):
             review[field] = _artifact(root, path.name, value)
         manifest = json.loads(Path(review["archive"]["file"]).read_text())
         material = json.loads(Path(next(iter(manifest["originals"]))).read_text())
-        history = _artifact(root, "original-context.json", {
-            "workflow": {"requestId": material["request_id"], "workflowRequestLogs": [{"remark": "同意"}]},
-            "handled_row": {"requestId": material["request_id"]},
-        })
+        history = _artifact(root, "original-context.json", _original_history(material))
         checklist["history_refs"] = [history]
         checklist["historical_checks"] = [{"id": "known_and_unknown_facts", "outcome": "uninformative",
             "basis": "original_material_and_rules", "reason": "历史泛泛同意，按原资料核对事实。"}]
@@ -309,10 +306,7 @@ def test_history_crosscheck_freezes_expectations_without_new_finance_signature(t
     review = reviews[0]
     manifest = json.loads(Path(review["archive"]["file"]).read_text())
     material = json.loads(Path(next(iter(manifest["originals"]))).read_text())
-    history = _artifact(tmp_path, "original-context.json", {
-        "workflow": {"requestId": material["request_id"], "workflowRequestLogs": [{"remark": "同意"}]},
-        "handled_row": {"requestId": material["request_id"]},
-    })
+    history = _artifact(tmp_path, "original-context.json", _original_history(material))
     checklist = json.loads(Path(review["checklist"]["file"]).read_text())
     checklist["history_refs"] = [history]
     checklist["historical_checks"] = [{"id": "known_and_unknown_facts", "outcome": "uninformative",
@@ -499,3 +493,63 @@ def test_consumable_missing_protocol_field_does_not_bypass_original_contract_gat
     acceptance = flow_evals.build_acceptance_report(samples, replay_report=REPLAY_OK, cli_samples=[], financial_reviews=reviews)
     assert acceptance["quality_gate"]["financial_quality_100"] is False
     assert acceptance["quality_gate"]["passed"] is False
+
+
+def test_same_request_real_other_flow_cannot_be_labelled_as_business(tmp_path):
+    from apps.oa_approval import flow
+    configs = flow.load_all_configs()
+    actual = next(config for config in configs if config["flow_key"] == "travel_expense")
+    material = _artifact(tmp_path, "material.json", {"request_id": "controlled-request",
+        "workflow_key": "business_entertainment", "workflow_name": actual["workflow_name"]})
+    raw = {"requestId": "controlled-request", "workflowId": actual["workflow_id"],
+           "workflowName": actual["workflow_name"]}
+    history = _artifact(tmp_path, "original-context.json", {
+        "workflow": {**raw, "workflowRequestLogs": [{"remark": "controlled historical record"}]},
+        "handled_row": raw,
+    })
+    rule = _artifact(tmp_path, "claimed-business-rule.json", {"workflow_key": "business_entertainment"})
+    checklist = _artifact(tmp_path, "wrong-flow-checklist.json", {
+        "workflow_key": "business_entertainment", "source_refs": [material], "rule_refs": [rule],
+        "history_refs": [history], "checks": [{"id": "known_fact", "expected": "原资料核对"}],
+        "historical_checks": [{"id": "known_fact", "outcome": "consistent",
+                               "basis": "original_material_and_rules", "reason": "independent controlled check"}],
+    })
+    with pytest.raises(ValueError, match="financial_history_binding_invalid"):
+        flow_evals.freeze_financial_expectations(checklist, tmp_path / "expectations.json")
+
+
+def _original_history(material, *, use_alias=False):
+    from apps.oa_approval import flow
+    config = next(config for config in flow.load_all_configs() if config["flow_key"] == material["workflow_key"])
+    name = config["workflow_name"]
+    if use_alias and config.get("workflow_name_aliases"):
+        name = config["workflow_name_aliases"][0]
+    row = {"requestId": material["request_id"], "workflowId": "controlled-current-definition-id",
+           "workflowName": name}
+    return {"workflow": {**row, "workflowRequestLogs": [{"remark": "controlled historical record"}]},
+            "handled_row": row}
+
+
+@pytest.mark.parametrize("use_alias", [False, True])
+def test_actual_definition_can_use_existing_exact_name_fallback_and_saved_alias(tmp_path, monkeypatch, use_alias):
+    from apps.oa_approval import flow
+    configs = flow.load_all_configs()
+    config = next(config for config in configs if config["flow_key"] == "business_entertainment")
+    if use_alias:
+        # Exercise a saved alias in the existing loader contract, not production edits.
+        config["workflow_name_aliases"] = ["controlled-saved-alias"]
+        monkeypatch.setattr(flow, "load_all_configs", lambda: configs)
+    material = {"request_id": "controlled-request", "workflow_key": config["flow_key"],
+                "workflow_name": config["workflow_name"]}
+    history = _original_history(material, use_alias=use_alias)
+    assert history["workflow"]["workflowId"] != config["workflow_id"]
+    source_ref = _artifact(tmp_path, "material.json", material)
+    history_ref = _artifact(tmp_path, "original-context.json", history)
+    rule = _artifact(tmp_path, "rule.json", {"controlled": "matched original rule"})
+    checklist = _artifact(tmp_path, "checklist.json", {"workflow_key": config["flow_key"],
+        "source_refs": [source_ref], "rule_refs": [rule], "history_refs": [history_ref],
+        "checks": [{"id": "known_fact", "expected": "independent original evidence"}],
+        "historical_checks": [{"id": "known_fact", "outcome": "consistent",
+                               "basis": "original_material_and_rules", "reason": "independent original evidence"}]})
+    frozen = flow_evals.freeze_financial_expectations(checklist, tmp_path / "expectations.json")
+    assert json.loads(Path(frozen["file"]).read_text())["historical_crosscheck"] == "complete"

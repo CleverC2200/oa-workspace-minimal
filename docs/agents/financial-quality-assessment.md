@@ -27,3 +27,5 @@
 正常简洁全通过意见无需逐笔展开退款；不能用旧“未展开退款即失败”理由单独判错。复杂目标保持在清单中：原图“使用零钱通支付”支持所显示的支出金额，主要未知是与本次费用的对应关系；不能仅因缺“支付成功”或流水号判支付失败。
 
 链接：[业务招待规则](../../.agents/skills/oa-finance-preaudit/references/flows/business-entertainment.md)、[验证层级](../../CONTRIBUTING.md#验证层级)、[质量检查](quality-checks.md)。
+
+原历史 context 还须按已有 flow 选择入口核验真实流程：原 workflow 和 handled 实际定义一致，material 的规范名或已保存别名也唯一映射到同一 flow key；不能仅用 caller workflow_key 或费用内容分类。沿用配置的精确名称/别名 fallback，配置历史 ID 与实际 ID 不同并不单独拒绝，也不修改配置。冻结记录保留实际匹配配置文件指纹；配置漂移不能追认原冻结资格。相关配置 JSON 同时进入宿主 runtime pin 和 calling-source Git pin。
