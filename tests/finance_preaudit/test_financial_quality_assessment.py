@@ -591,3 +591,24 @@ def test_full_scope_label_without_fixed_items_keeps_narrow_facts_unqualified(tmp
     assert case["complete_review_scope"] is False
     assert set(case["missing_review_items"]) == {"attachment_payment_evidence", "invoice_linkage", "budget"}
     assert report["eligible"] is False
+
+
+def test_same_configuration_bytes_transfer_between_source_checkouts_but_drift_does_not(tmp_path, monkeypatch):
+    import shutil
+    from apps.oa_approval import flow
+    first, second = tmp_path / 'source-one/configs', tmp_path / 'source-two/configs'
+    shutil.copytree(flow.CONFIG_DIR, first)
+    shutil.copytree(flow.CONFIG_DIR, second)
+    records = tmp_path / 'records'
+    records.mkdir()
+    monkeypatch.setattr(flow, 'CONFIG_DIR', first)
+    reviews = _scene_reviews(records, ['real_archive'] * 5, monkeypatch)
+    assert flow_evals.build_financial_quality_report(reviews)['eligible'] is True
+    monkeypatch.setattr(flow, 'CONFIG_DIR', second)
+    transferred = flow_evals.build_financial_quality_report(reviews)
+    assert transferred['eligible'] is True
+    changed = second / 'business_entertainment.json'
+    data = json.loads(changed.read_text())
+    data['controlled_snapshot_note'] = 'changed actual configuration bytes'
+    changed.write_text(json.dumps(data))
+    assert flow_evals.build_financial_quality_report(reviews)['eligible'] is False

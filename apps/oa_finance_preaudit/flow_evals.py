@@ -931,7 +931,7 @@ def _historical_crosscheck(checklist: dict) -> str:
 
 
 def _flow_config_pins() -> dict:
-    return {str(path.resolve()): hashlib.sha256(path.read_bytes()).hexdigest()
+    return {path.relative_to(approval_flow.CONFIG_DIR).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in sorted(approval_flow.CONFIG_DIR.glob("*.json"))}
 
 
