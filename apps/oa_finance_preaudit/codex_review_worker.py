@@ -15,13 +15,17 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import Callable, TextIO
+from typing import Callable, TextIO, TYPE_CHECKING
 
 from apps import json_artifact
 from apps.oa_approval import runtime_control, writer_outcomes
 
 from . import concurrency_control, decision_validation, manual_handoff, process_diagnostics, review_failure_evidence, review_output, review_context
 from .review_output import parse_json as _parse_decision_json
+
+
+if TYPE_CHECKING:
+    from .review_input import ReviewInput
 
 
 MODEL = review_failure_evidence.MODEL
@@ -331,7 +335,7 @@ def _small_marketing_attachment_terms_required(action_file: Path) -> bool:
     return flow_engine.small_marketing_requires_payment_attachments(material)
 
 
-def _prompt(action_file: Path) -> str:
+def _prompt(action_file: Path, *, reading_instruction: str | None = None) -> str:
     workflow_key = _action_workflow(action_file) or "travel_expense"
     _rule_version, workflow_name, rule_reference = _FINANCE_RULES[workflow_key]
     frozen_rule_version = _frozen_rule_version(action_file, workflow_key)
@@ -390,6 +394,11 @@ def _prompt(action_file: Path) -> str:
         and frozen_rule_version == "small_marketing_fee:2"
         else "最终只输出符合 flow-engine-contract“结构化审核决定”的单个 JSON 对象。"
     )
+    reading_instruction = reading_instruction or (
+        "完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由读取 "
+        "`references/result-contract.md`、`references/observation-contract.md`、"
+        f"`{rule_reference}`、动作引用的审核包、材料和准备页；"
+    )
     return f"""你是{workflow_name}生产预审的单据工作进程。用户当前明确授权本轮真实审批提交；这是受控生产工作进程，不是手工 preview。
 
 只处理这个已冻结动作：{action_file}
@@ -397,7 +406,7 @@ def _prompt(action_file: Path) -> str:
 {material_reading}
 
 要求：
-1. 完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由读取 `references/result-contract.md`、`references/observation-contract.md`、`{rule_reference}`、动作引用的审核包、材料和准备页；{workflow_requirement}{frozen_item_requirement}不得读取其他 attempt。
+1. {reading_instruction}{workflow_requirement}{frozen_item_requirement}不得读取其他 attempt。
 2. 不修改任何文件、项目代码、Skill、配置、授权清单或冻结材料；不得调用 `next-action`、`complete-review` 或任何 OA 写入，不得领取其他单据；不得读取现有审核决定、意见或 `review-output-*.txt` 失败原输出。
 3. 根据审核包中的固定审核项动态形成结构化决定。证据不足使用 `uncertain` 交财务判断，不得因为材料缺口卡住业务流程；身份、归属、冻结或授权不可信时停止。审核包为 `material_state=degraded` 时，`collection_gaps` 只说明自动读取没有完成，不得声称申请人未填写字段、未上传附件或单据没有发票；结论直接说明自动读取失败、对应项目未完成核对，请财务查看原单。
 4. {_OPINION_BREVITY_REQUIREMENT}结论内保留规则要求的具体金额、实际公司全称等必要业务原值；不得输出密钥、凭据或无关附件原文。宿主会校验并负责受控提交。
@@ -858,11 +867,21 @@ def _execute_codex_raw(
     schema_builder: Callable[[Path], dict] | None = None,
     decision_parser: Callable[[str], object] = _parse_decision_json,
     audit_directory: Path | None = None,
+    frozen_input: ReviewInput | None = None,
 ) -> CodexExecution:
     try:
         schema = schema_builder(action_file) if schema_builder else _decision_schema(action_file, read_only=read_only)
-        prompt = prompt_builder(action_file)
-    except ValueError:
+        if frozen_input is None and not read_only and _action_workflow(action_file) == "business_entertainment":
+            from . import review_input
+            frozen_input = review_input.prepare(action_file)
+        if frozen_input is not None:
+            frozen_input.validate(action_file)
+        prompt = (
+            _prompt(action_file, reading_instruction=frozen_input.instruction)
+            if frozen_input is not None and prompt_builder is _prompt
+            else prompt_builder(action_file)
+        )
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
         return CodexExecution(
             "codex_review_task_invalid", _unknown_usage(),
             process_state="not_started", decision_state="not_attempted",
@@ -895,6 +914,21 @@ def _execute_codex_raw(
             schema_file, schema,
         )
         command = _codex_command(project_root, schema_file, decision_file)
+        if frozen_input is not None:
+            try:
+                frozen_input.validate(action_file)
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+                output.close()
+                return CodexExecution(
+                    "codex_review_task_invalid", _unknown_usage(),
+                    process_state="not_started", decision_state="not_attempted",
+                )
+            command[2:2] = [part for path in frozen_input.images for part in ("--image", str(path))]
+            stderr_summary["input_delivery"] = {
+                "mode": "existing_reading_path" if frozen_input.fallback_reason else "complete_initial_input",
+                "fallback_reason": frozen_input.fallback_reason,
+                "images_supplied": len(frozen_input.images),
+            }
         if audit_directory:
             # The isolated home retains native tool receipts for this review only.
             command.remove("--ephemeral")
@@ -1428,7 +1462,10 @@ def _validated_task(task: dict) -> tuple[Path, Path, int]:
     }:
         raise ValueError("codex_review_task_invalid")
     project_root = Path(str(task["project_root"])).expanduser().resolve()
-    action_file = Path(str(task["action_file"])).expanduser().resolve()
+    requested_action = Path(str(task["action_file"])).expanduser().absolute()
+    if requested_action != requested_action.resolve():
+        raise ValueError("codex_review_task_invalid")
+    action_file = requested_action.resolve()
     timeout_seconds = task["timeout_seconds"]
     expected_root = project_root / "runtime" / "finance_preaudit_flows"
     workflow_key = _action_workflow(action_file)
