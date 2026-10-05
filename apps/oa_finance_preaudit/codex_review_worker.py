@@ -30,6 +30,8 @@ if TYPE_CHECKING:
 
 MODEL = review_failure_evidence.MODEL
 REASONING_EFFORT = review_failure_evidence.REASONING_EFFORT
+SSE_TRACE_ENV = "OA_REVIEW_SSE_TRACE"
+_SSE_TRACE_TARGET = "error,codex_api::sse=trace"
 _FINANCE_RULES = {
     "travel_expense": (
         "travel_expense:1",
@@ -209,7 +211,7 @@ Completer = Callable[[Path, dict], str | None]
 StopRequester = Callable[[], None]
 
 
-def _reviewer_environment(codex_home: Path | None = None) -> dict[str, str]:
+def _reviewer_environment(codex_home: Path | None = None, *, trace_sse: bool = False) -> dict[str, str]:
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -227,6 +229,8 @@ def _reviewer_environment(codex_home: Path | None = None) -> dict[str, str]:
         environment["CODEX_HOME"] = str(codex_home)
     # The host CLI shim must not start shared services inside a bounded review.
     environment["OCX_SHIM_BYPASS"] = "1"
+    if trace_sse:
+        environment["RUST_LOG"] = _SSE_TRACE_TARGET
     return environment
 
 
@@ -900,7 +904,17 @@ def _execute_codex_raw(
     audit_directory: Path | None = None,
     frozen_input: ReviewInput | None = None,
 ) -> CodexExecution:
+    trace_sse = os.environ.get(SSE_TRACE_ENV) == "1"
     try:
+        if trace_sse:
+            if read_only is not True or audit_directory is None:
+                raise ValueError("codex_review_task_invalid")
+            audit = Path(audit_directory)
+            if (not audit.is_absolute() or audit != audit.resolve()
+                    or not audit.is_dir() or stat.S_IMODE(audit.stat().st_mode) & 0o077
+                    or audit.is_relative_to(Path(project_root).resolve())
+                    or audit.is_relative_to(Path(__file__).resolve().parents[2])):
+                raise ValueError("codex_review_task_invalid")
         schema = schema_builder(action_file) if schema_builder else _decision_schema(action_file, read_only=read_only)
         if frozen_input is None and not read_only and _action_workflow(action_file) == "business_entertainment":
             from . import review_input
@@ -926,7 +940,9 @@ def _execute_codex_raw(
         codex_home = temporary_root / "codex-home"
         try:
             codex_home.mkdir(mode=0o700)
-            reviewer_environment = _reviewer_environment(codex_home)
+            reviewer_environment = _reviewer_environment(
+                codex_home, trace_sse=trace_sse,
+            )
         except (OSError, ValueError) as error:
             output.close()
             return CodexExecution(
