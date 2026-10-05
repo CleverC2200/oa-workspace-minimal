@@ -41,7 +41,7 @@ def test_actual_prompt_routes_final_expense_check_after_material_delivery(tmp_pa
 @pytest.mark.parametrize('wrong_binding', [False, True])
 @pytest.mark.parametrize('amount_status', ['uncertain', 'fail'])
 def test_both_reading_paths_deliver_common_rule_and_preserve_consumer_contract(tmp_path, monkeypatch, fallback, wrong_binding, amount_status):
-    engine, task = prepare(tmp_path, page_count=0, tail='synthetic-long-material' * 6000 if fallback else 'synthetic material')
+    engine, task = prepare(tmp_path, page_count=1, tail='synthetic-long-material' * 6000 if fallback else 'synthetic material')
     project = Path(task['project_root'])
     for name in DOCS:
         destination = project / SKILL / name
@@ -54,7 +54,7 @@ def test_both_reading_paths_deliver_common_rule_and_preserve_consumer_contract(t
         'items': [
             {'item_key': item['item_key'], 'status': 'uncertain' if index == 0 else amount_status if index == 3 else 'pass',
              'conclusion': '一条明细仍需核对费用对应。' if index == 0 else ('保留已确认异常；另一明细未知，不确定整单核销总额。' if amount_status == 'fail' else '一条支付用途仍待核，保留其他已确认部分。') if index == 3 else '当前固定项目按原规则核对。',
-             'evidence_refs': ['material:declared_fields'] if index else [],
+             'evidence_refs': ['material:declared_fields'] if index else ['material:prepared.images.resource-0.page-1'],
              'missing_evidence': ['一条明细费用对应关系尚未确认。'] if index in {0, 3} else []}
             for index, item in enumerate(packet['items'])]}
     if wrong_binding:
@@ -65,6 +65,16 @@ def test_both_reading_paths_deliver_common_rule_and_preserve_consumer_contract(t
 from pathlib import Path
 args=sys.argv[1:]
 prompt=sys.stdin.read()
+assert '不写已经核对过的明细' not in prompt
+assert '已确认可核销部分及其合计' in prompt
+assert 'overall=pass' in prompt
+final_check=prompt[prompt.rfind('形成最终四项决定前'):]
+assert '每条明细分别核对拟采用支付的费用对应' in final_check
+assert '未采用的额外支付' in final_check
+assert '不能仅凭支付成功、OA挂接或金额相等' in final_check
+assert 'material:resources.<resource_id>' in final_check
+assert 'material:prepared.images.<resource_id>.page-<页码>' in final_check
+assert '无需读取宿主校验源码来构造引用' in final_check
 project=Path(args[args.index('--cd')+1])
 relative=''' + repr(str(RULE)) + '''
 original=(project/relative).read_text()
@@ -105,6 +115,9 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'cached_inp
             replay_report={'accuracy': 1.0, 'format_compliance': 1.0, 'differences': []}, cli_samples=[])
         assert acceptance['cases'][0]['business_state'] == 'needs_human'
         assert acceptance['cases'][0]['write_state'] == 'not_requested'
+        assert acceptance['cases'][0]['quality']['resource_coverage'] == {
+            'applicable': True, 'covered': 1, 'total': 1,
+        }
         assert acceptance['applied'] is False
         # Offline wiring/consumer proof does not meet real-sample qualification.
         assert acceptance['sample_eligible'] is False

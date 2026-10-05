@@ -123,6 +123,14 @@ _OPINION_BREVITY_REQUIREMENT = (
     "输出前自检：任一通过项仍带日期、金额、地点或号码等细节，或明显超过一句话，"
     "必须先改写成一句结论再输出。"
 )
+_BUSINESS_ENTERTAINMENT_OPINION_REQUIREMENT = (
+    "表达要求（业务招待费）：正常项简明给结论，异常或未知只展开必要对象与事实，不写逐笔核对过程表。"
+    "金额展示按共享结果接口：overall=pass 时，前三项不展示金额，第4项只展示一次最终核销合计；"
+    "overall=needs_human 时，在相关项保留异常或缺口所必需的金额。"
+    "原资料确有已确认部分时，金额项必须保留已确认可核销部分及其合计，"
+    "不能因其他明细未知或要求简短而省去；没有已确认部分时不编造合计。"
+    "已确认的退款或超报影响仍须保留。相同事实不重复，预算固定政策句式原样保留。"
+)
 _GENERAL_EXPENSE_REQUIREMENT = (
     "仅对科目要求支付截图的明细，缺支付截图时先核对收款人名称与关联发票销售方，"
     "逐字完全一致则免支付截图；多笔收款或发票须按可信对应关系分别核验；"
@@ -338,6 +346,7 @@ def _small_marketing_attachment_terms_required(action_file: Path) -> bool:
 def _prompt(action_file: Path, *, reading_instruction: str | None = None) -> str:
     workflow_key = _action_workflow(action_file) or "travel_expense"
     _rule_version, workflow_name, rule_reference = _FINANCE_RULES[workflow_key]
+    opinion_requirement = _OPINION_BREVITY_REQUIREMENT
     frozen_rule_version = _frozen_rule_version(action_file, workflow_key)
     if workflow_key == "tpm_small_marketing_fee" and frozen_rule_version != _rule_version:
         raise ValueError("frozen_packet_changed")
@@ -372,11 +381,21 @@ def _prompt(action_file: Path, *, reading_instruction: str | None = None) -> str
     elif workflow_key == "tpm_small_marketing_fee":
         workflow_requirement = _TPM_SMALL_MARKETING_REQUIREMENT
     elif workflow_key == "business_entertainment":
+        opinion_requirement = _BUSINESS_ENTERTAINMENT_OPINION_REQUIREMENT
         workflow_requirement = (
             "只按本流程固定审核项判断；形成最终四项决定前，执行业务招待费规则包"
             "“核销前逐笔核对”与核销范围复核；evidence_refs 引用支持拟采用支出费用对应的原事实，"
             "missing_evidence 按各固定审核项保留仍未确认的必要事实或关系；"
-            "费用对应只要求尚未确认的必要关系，不能用泛泛的支付成功替代这一步；"
+            "每条明细分别核对拟采用支付的费用对应，不能仅凭支付成功、OA挂接或金额相等"
+            "就将该条费用纳入已确认范围；其他明细或支付分组已确认，不能替这条确认用途。"
+            "未采用的额外支付不单独成为已有充分证据支出的核销前置条件；"
+            "不要把真正待核明细的费用对应缺口换成额外款的用途缺口。"
+            "费用对应只要求尚未确认的必要关系；已有原商品、服务或结算资料充分支持的支付正常采用，"
+            "不新增日期、交易号或名称逐字一致要求。"
+            "引用材料字段时逐字使用 declared_fields.path，并加 material: 前缀；"
+            "资源引用使用 material:resources.<resource_id>，准备页引用使用 "
+            "material:prepared.images.<resource_id>.page-<页码>，标识与页码来自原材料，"
+            "不靠文件名或金额猜归属；无需读取宿主校验源码来构造引用。"
         )
     else:
         workflow_requirement = "只按该流程固定审核项判断，不得读取其他流程规则或证据；"
@@ -423,7 +442,7 @@ def _prompt(action_file: Path, *, reading_instruction: str | None = None) -> str
 1. {reading_instruction}{workflow_requirement}{frozen_item_requirement}不得读取其他 attempt。
 2. 不修改任何文件、项目代码、Skill、配置、授权清单或冻结材料；不得调用 `next-action`、`complete-review` 或任何 OA 写入，不得领取其他单据；不得读取现有审核决定、意见或 `review-output-*.txt` 失败原输出。
 3. 根据审核包中的固定审核项动态形成结构化决定。证据不足使用 `uncertain` 交财务判断，不得因为材料缺口卡住业务流程；身份、归属、冻结或授权不可信时停止。审核包为 `material_state=degraded` 时，`collection_gaps` 只说明自动读取没有完成，不得声称申请人未填写字段、未上传附件或单据没有发票；结论直接说明自动读取失败、对应项目未完成核对，请财务查看原单。
-4. {_OPINION_BREVITY_REQUIREMENT}结论内保留规则要求的具体金额、实际公司全称等必要业务原值；不得输出密钥、凭据或无关附件原文。{host_responsibility}
+4. {opinion_requirement}结论内保留规则要求的具体金额、实际公司全称等必要业务原值；不得输出密钥、凭据或无关附件原文。{host_responsibility}
 
 5. {output_requirement}JSON 之外不添加 Markdown、解释、日志或额外意见正文。
 """
