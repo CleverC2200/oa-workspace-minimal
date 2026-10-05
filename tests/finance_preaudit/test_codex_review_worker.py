@@ -349,7 +349,7 @@ def test_small_marketing_v2_worker_uses_six_item_requirements(
     )
     assert "item_key" not in attachment_schema["properties"]
     assert "item_key" not in attachment_schema["required"]
-    assert "小额市场费生产预审" in prompt
+    assert "小额市场费只读预审" in prompt
     assert "small-marketing-fee.md" in prompt
     assert "六项必须逐项" in prompt
     assert "逐字同时包含“支付截图”和“发票”" in prompt

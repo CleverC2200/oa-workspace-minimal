@@ -92,6 +92,9 @@ if argv[:2]==["debug","prompt-input"]:
  print(json.dumps([{"role":"user","content":data}]))
  sys.exit(0)
 prompt=sys.stdin.read()
+assert "只读预审" in prompt
+assert "用户当前明确授权本轮真实审批提交" not in prompt
+assert "负责受控提交" not in prompt
 direct=''' + repr(direct) + '''
 if direct:
  if ''' + repr(host_scope) + ''':
