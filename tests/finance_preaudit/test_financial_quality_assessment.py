@@ -631,3 +631,12 @@ def test_new_preparation_retains_rule_bytes_after_working_source_changes(tmp_pat
     assert Path(tmp_path / "checklist.json").read_bytes() == original
     with pytest.raises(FileExistsError):
         flow_evals.prepare_financial_checklist(prepared, tmp_path / "prepared-checklist.json")
+
+
+def test_report_preserves_passing_core_checks_when_disclosure_or_internal_facts_fail(tmp_path):
+    reviews = _review(tmp_path, {"core_amount_scope": "pass", "internal_payment_fact": "fail", "confirmed_amount_disclosure": "unverified"})
+    case = flow_evals.build_financial_quality_report(reviews)["cases"][0]
+    assert case["check_outcomes"] == {"core_amount_scope": "pass", "internal_payment_fact": "fail", "confirmed_amount_disclosure": "unverified"}
+    assert case["verdict"] == "fail"
+    assert case["failed_checks"] == ["internal_payment_fact"]
+    assert case["unverified_checks"] == ["confirmed_amount_disclosure"]

@@ -1152,6 +1152,7 @@ def build_financial_quality_report(reviews: object) -> dict:
                       "checklist_sha256": review["checklist"]["sha256"],
                       "assessment_sha256": review["assessment"]["sha256"],
                       "verdict": "fail" if failed else "unverified" if unknown else "pass",
+                      "check_outcomes": {check["id"]: check["outcome"] for check in checked},
                       "failed_checks": failed, "unverified_checks": unknown,
                       "financial_confirmed_before_replay": confirmed,
                       "result_reviewed_by_finance": result_reviewed_by_finance})

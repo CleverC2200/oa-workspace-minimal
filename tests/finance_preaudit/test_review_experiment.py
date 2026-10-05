@@ -34,10 +34,11 @@ def forbidden(*args, **kwargs):
 @pytest.fixture(scope="module")
 def sources(tmp_path_factory):
     root = tmp_path_factory.mktemp("sources")
-    names = subprocess.check_output(["git", "ls-tree", "-r", "--name-only", CANDIDATE], cwd=ROOT, text=True).splitlines()
-    selected = [p for p in names if p.startswith("apps/oa_approval/configs/") and p.endswith(".json") or p.startswith("apps/") and p.endswith(".py") or p.startswith(".agents/skills/oa-finance-preaudit/") and p.endswith(".md") or p in {"requirements-dev.txt", "AGENTS.md"}]
     result = {}
-    for revision in (BASE, CANDIDATE):
+    current = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    for revision in dict.fromkeys((BASE, CANDIDATE, current)):
+        names = subprocess.check_output(["git", "ls-tree", "-r", "--name-only", revision], cwd=ROOT, text=True).splitlines()
+        selected = [p for p in names if p.startswith("apps/oa_approval/configs/") and p.endswith(".json") or p.startswith("apps/") and p.endswith(".py") or p.startswith(".agents/skills/oa-finance-preaudit/") and p.endswith(".md") or p in {"requirements-dev.txt", "AGENTS.md"}]
         folder = root / revision
         for name in selected:
             raw = subprocess.run(["git", "show", revision + ":" + name], cwd=ROOT, capture_output=True)
@@ -423,3 +424,32 @@ def test_cancellation_after_prepare_output_never_proceeds_to_any_model(tmp_path,
     assert result["cli_starts"] == 0
     assert not (before / "reviewer").exists()
     assert not (after / "reviewer").exists()
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_current_candidate_source_host_consumes_preview_without_submission_claims(tmp_path, sources, monkeypatch, fallback):
+    from apps.oa_finance_preaudit import review_experiment
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "offline-placeholder")
+    current = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    tail = "synthetic original field " * 6000 if fallback else "synthetic original field"
+    before = arm(tmp_path, sources, "baseline", "business_entertainment", current, tail=tail)
+    after = arm(tmp_path, sources, "candidate", "business_entertainment", current, tail=tail)
+    cli = fake_cli(tmp_path)
+    path = tmp_path / "current-plan.json"
+    review_experiment.freeze_pair(before, after, path, repository=ROOT, reviewer=cli,
+        purpose="diagnostic", timeout_seconds=60, maximum_cli_starts=2)
+    authority = tmp_path / "offline-authorization.json"
+    save(authority, {"plan_sha256": sha(path), "maximum_cli_starts": 2,
+        "authority_reference": "controlled external subprocess regression", "oa_write_authorized": False})
+    result = review_experiment.run_pair(path, authority)
+    assert result["status"] == "observed", result
+    for name, root in (("baseline", before), ("candidate", after)):
+        prompt = (root / "reviewer/prompt.txt").read_text()
+        assert "只读预审" in prompt
+        assert "用户当前明确授权本轮真实审批提交" not in prompt
+        assert "负责受控提交" not in prompt
+        assert ("冻结数据：material" in prompt) is not fallback
+        assert result["trials"][name]["source"]["revision"] == current
+        assert result["trials"][name]["acceptance"]["preview"] == "verified_closed"
+        assert result["trials"][name]["financial_binding"]["status"] == "verified_consumed_correspondence"
+        assert result["trials"][name]["write_authorization"] is False
