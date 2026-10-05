@@ -440,6 +440,14 @@ def _native(root: Path, material: dict, usage: dict) -> tuple[dict, int | str, d
                 covered.update(p for p, h in expected.items() if h == assets[name])
     if usage.get("status") == "exact" and usage["reasoning_output_tokens"] == "unknown":
         usage["reasoning_output_tokens"] = reasoning
+    view_returned = sum(call in returned for call in calls)
+    manifest = _object(root, "manifest.json")
+    _sufficient, reused, _bound = _reading_coverage(root, manifest, material)
+    pages = dict(flow_engine._travel_pages(material))
+    directly_covered = set(covered)
+    for reference, representative in reused.items():
+        if pages[representative]["path"] in directly_covered:
+            covered.add(pages[reference]["path"])
     initial_delivered = len(initial_expected) if initial_expected and initial_frames == initial_expected and len(initial_expected) == len(expected) else 0
     return (
         {
@@ -452,7 +460,8 @@ def _native(root: Path, material: dict, usage: dict) -> tuple[dict, int | str, d
             "covered": max(len(covered), initial_delivered),
             "initial_delivered": initial_delivered,
             "initial_payloads_observed": len(initial_frames),
-            "view_returned": len(covered),
+            "view_returned": view_returned,
+            "unique_images": len(set(expected.values())),
             "observation": "instrumented_view_receipts" if covered else "not_established_initial_delivery_only" if initial_delivered else "not_established",
         },
         peak if peak is not None else "unknown",
@@ -473,8 +482,8 @@ def _native(root: Path, material: dict, usage: dict) -> tuple[dict, int | str, d
     )
 
 
-def _page_reading(root: Path, manifest: dict, material: dict) -> dict:
-    """Report explicit reading assertions without deciding business sufficiency."""
+def _reading_coverage(root: Path, manifest: dict, material: dict) -> tuple[set, dict, bool]:
+    """Resolve existing bound reading assertions against original page bytes."""
     pages = dict(flow_engine._travel_pages(material))
     structured = material.get("prepared", {}).get("structured_contents", [])
     text = {"material:prepared.structured_contents." + item["resource_id"] + ".key_text." + str(index): value
@@ -486,7 +495,7 @@ def _page_reading(root: Path, manifest: dict, material: dict) -> dict:
     bound = (assessment.get("source_revision") == manifest["source_revision"]
              and decision.exists()
              and assessment.get("financial_signoff_decision_sha256") == _sha(_path(root, decision)))
-    sufficient, reused = set(), set()
+    sufficient, reused = set(), {}
     if bound:
         for record in assessment.get("page_reading", []):
             if not isinstance(record, dict) or record.get("page_ref") not in pages or not isinstance(record.get("reason"), str) or not record["reason"].strip():
@@ -500,7 +509,14 @@ def _page_reading(root: Path, manifest: dict, material: dict) -> dict:
                 representative = record["representative_page_ref"]
                 h = flow_engine._verified_page_sha256(page)
                 if h and h == flow_engine._verified_page_sha256(pages[representative]) and representative != reference:
-                    reused.add(reference)
+                    reused[reference] = representative
+    return sufficient, reused, bound
+
+
+def _page_reading(root: Path, manifest: dict, material: dict) -> dict:
+    """Report explicit reading assertions without deciding business sufficiency."""
+    sufficient, reused, bound = _reading_coverage(root, manifest, material)
+    structured = material.get("prepared", {}).get("structured_contents", [])
     return {"structured_text_resources": len({item["resource_id"] for item in structured if item.get("document_type") == "pdf_text" and item.get("key_text")}),
             "reported_structured_sufficient_pages": len(sufficient),
             "reported_exact_duplicate_pages": len(reused),

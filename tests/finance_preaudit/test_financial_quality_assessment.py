@@ -612,3 +612,22 @@ def test_same_configuration_bytes_transfer_between_source_checkouts_but_drift_do
     data['controlled_snapshot_note'] = 'changed actual configuration bytes'
     changed.write_text(json.dumps(data))
     assert flow_evals.build_financial_quality_report(reviews)['eligible'] is False
+
+
+def test_new_preparation_retains_rule_bytes_after_working_source_changes(tmp_path):
+    review = _review(tmp_path, {"relationship_unknown_retained": "pass"})[0]
+    original = Path(review["checklist"]["file"]).read_bytes()
+    prepared = flow_evals.prepare_financial_checklist(review["checklist"], tmp_path / "prepared-checklist.json")
+    checklist = json.loads(Path(prepared["file"]).read_text())
+    assert checklist["rule_refs"] != json.loads(original)["rule_refs"]
+    (tmp_path / "rules.json").write_text("changed working rules")
+    assessment = json.loads(Path(review["assessment"]["file"]).read_text())
+    assessment["checklist_sha256"] = prepared["sha256"]
+    review["checklist"] = prepared
+    review["assessment"] = _artifact(tmp_path, "prepared-assessment.json", assessment)
+    report = flow_evals.build_financial_quality_report([review])
+    assert report["cases"][0]["verdict"] == "pass"
+    assert Path(json.loads(original)["rule_refs"][0]["file"]).read_text() == "changed working rules"
+    assert Path(tmp_path / "checklist.json").read_bytes() == original
+    with pytest.raises(FileExistsError):
+        flow_evals.prepare_financial_checklist(prepared, tmp_path / "prepared-checklist.json")

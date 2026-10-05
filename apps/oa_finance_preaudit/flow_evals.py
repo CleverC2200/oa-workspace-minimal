@@ -875,7 +875,7 @@ def _read_bound_artifact(reference: object, *, document: bool = True) -> object:
         raw = Path(path).read_bytes()
         if hashlib.sha256(raw).hexdigest() != digest:
             raise ValueError("financial_review_evidence_changed")
-        return json.loads(raw) if document else None
+        return json.loads(raw) if document else raw
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
         raise ValueError("financial_review_invalid") from error
 
@@ -933,6 +933,28 @@ def _historical_crosscheck(checklist: dict) -> str:
 def _flow_config_pins() -> dict:
     return {path.relative_to(approval_flow.CONFIG_DIR).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in sorted(approval_flow.CONFIG_DIR.glob("*.json"))}
+
+
+def prepare_financial_checklist(checklist_reference: dict, destination: Path) -> dict:
+    """Create a new preparation with exact rule bytes; never alter old references."""
+    import os
+    checklist = _read_bound_artifact(checklist_reference)
+    rules = [(ref, _read_bound_artifact(ref, document=False)) for ref in checklist["rule_refs"]]
+    path = Path(destination).absolute()
+    snapshot = path.with_name(path.stem + "-rules")
+    snapshot.mkdir(mode=0o700)
+    references = []
+    for index, (reference, raw) in enumerate(rules):
+        rule = snapshot / (str(index) + "-" + Path(reference["file"]).name)
+        with rule.open("xb") as stream:
+            os.chmod(rule, 0o400)
+            stream.write(raw)
+        references.append({"file": str(rule), "sha256": reference["sha256"]})
+    with path.open("x", encoding="utf-8") as stream:
+        os.chmod(path, 0o600)
+        json.dump({**checklist, "rule_refs": references}, stream, ensure_ascii=False, indent=2, allow_nan=False)
+        stream.write("\n")
+    return {"file": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
 def freeze_financial_expectations(checklist_reference: dict, destination: Path) -> dict:

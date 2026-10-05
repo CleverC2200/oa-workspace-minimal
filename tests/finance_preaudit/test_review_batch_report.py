@@ -25,7 +25,7 @@ def digest(path):
 
 def archive(
     tmp_path, usage=None, *, with_attachment=False, closed=True, business_value=None,
-    structured_pdf=False, workflow="travel_expense", request_id="synthetic",
+    structured_pdf=False, duplicate_images=False, workflow="travel_expense", request_id="synthetic",
 ):
     root = tmp_path / "batch"
     root.mkdir(mode=0o700)
@@ -68,6 +68,23 @@ def archive(
                 page.write_bytes(rendered.get_pixmap().tobytes("png"))
             material["resources"] = [{"request_id": request, "resource_id": "pdf", "source_resource_id": "pdf", "local_readonly_path": str(source)}]
             material["prepared"] = {"images": [{"resource_id": "pdf", "path": str(page), "kind": "pdf_page", "content_sha256": digest(page)}], "structured_contents": [{"resource_id": "pdf", "document_type": "pdf_text", "key_text": ["P1: Controlled invoice total 10.00"]}], "manifest": [{"resource_id": "pdf", "image_count": 1}]}
+        if duplicate_images:
+            import fitz
+            resources, images, entries = [], [], []
+            for index, color in enumerate((255, 255, 0)):
+                resource = "image-" + str(index)
+                source = attempt / "attachments" / (resource + ".png")
+                page = attempt / "prepared" / (resource + ".png")
+                pixmap = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 16, 16), False)
+                pixmap.clear_with(color)
+                source.write_bytes(pixmap.tobytes("png"))
+                page.write_bytes(source.read_bytes())
+                resources.append({"request_id": request, "resource_id": resource, "source_resource_id": resource,
+                                  "owner_detail_id": "row-" + str(index), "local_readonly_path": str(source)})
+                images.append({"resource_id": resource, "path": str(page), "kind": "image", "page_number": 1, "content_sha256": digest(page)})
+                entries.append({"resource_id": resource, "image_count": 1})
+            material["resources"] = resources
+            material["prepared"] = {"images": images, "manifest": entries, "structured_contents": []}
         return material
 
     engine = flow_engine.FlowEngine(
@@ -507,3 +524,41 @@ def test_original_schema_required_protocol_field_is_not_repaired_by_report(tmp_p
     report = review_batch_report.build_report(root)
     assert report["acceptance"]["final_contract"] == "rejected"
     assert report["usage"]["status"] == "exact"
+
+
+@pytest.mark.parametrize("reuse", ["valid", "unobserved", "different_bytes", "unbound"])
+def test_duplicate_page_reuse_reports_logical_coverage_without_extra_observations(tmp_path, reuse):
+    root = archive(tmp_path, closed=False, workflow="business_entertainment", duplicate_images=True)
+    manifest = json.loads((root / "manifest.json").read_text())
+    material = json.loads(Path(manifest["action_file"]).with_name("material.json").read_text())
+    pages = material["prepared"]["images"]
+    home = root / "reviewer/codex-home"
+    home.mkdir(mode=0o700)
+    events = []
+    for index in ([2] if reuse == "unobserved" else [0, 2]):
+        events += [{"type": "response_item", "payload": {"type": "function_call", "name": "view_image", "call_id": str(index), "arguments": json.dumps({"path": pages[index]["path"]})}},
+                   {"type": "response_item", "payload": {"type": "function_call_output", "call_id": str(index), "output": [{"type": "input_image", "image_url": "data:image/png;base64,controlled"}]}}]
+    trace = home / "session.jsonl"
+    trace.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+    trace.chmod(0o600)
+    audit = {"source_revision": "a" * 40, "financial_signoff_decision_sha256": digest(root / "reviewer/decision.json"),
+             "page_reading": [{"page_ref": "material:prepared.images.image-1.1", "method": "exact_duplicate",
+                               "representative_page_ref": "material:prepared.images.image-" + ("2" if reuse == "different_bytes" else "0") + ".1", "reason": "same frozen bytes, independent resource mappings"}]}
+    save(root / "semantic-audit.json", audit)
+    manifest["outputs"] = {str(root / "semantic-audit.json"): "0" * 64 if reuse == "unbound" else digest(root / "semantic-audit.json")}
+    save(root / "manifest.json", manifest)
+    save(root / "started.json", {"manifest_sha256": digest(root / "manifest.json")})
+    if reuse == "unbound":
+        with pytest.raises(ValueError, match="review_archive_invalid"):
+            review_batch_report.build_report(root)
+        return
+    original = {str(path): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    report = review_batch_report.build_report(root)
+    images = report["acceptance"]["original_images"]
+    assert images["expected"] == 3
+    assert images["unique_images"] == 2
+    assert images["view_returned"] == (1 if reuse == "unobserved" else 2)
+    assert images["covered"] == (3 if reuse == "valid" else 1 if reuse == "unobserved" else 2)
+    assert images["status"] == ("verified" if reuse == "valid" else "incomplete")
+    assert report["acceptance"]["page_reading"]["quality"] == "not_established_by_reading_report"
+    assert all(Path(path).read_bytes() == raw for path, raw in original.items())
