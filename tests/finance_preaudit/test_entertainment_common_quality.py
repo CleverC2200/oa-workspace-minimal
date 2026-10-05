@@ -123,3 +123,71 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'cached_inp
         assert acceptance['applied'] is False
         # Offline wiring/consumer proof does not meet real-sample qualification.
         assert acceptance['sample_eligible'] is False
+
+
+@pytest.mark.parametrize('fallback', [False, True])
+def test_detail_locations_survive_both_reading_paths_without_changing_evidence(tmp_path, monkeypatch, fallback):
+    fields = [
+        {'path': 'main[0].field[0]', 'value': '原主表值'},
+        {'path': 'detail[0].row[0].field[6]', 'value': None, 'read_status': 'unresolved'},
+        {'path': 'detail[0].row[6].field[6]', 'value': '原转款甲'},
+        {'path': 'detail[0].row[7].field[6]', 'value': '原转款乙', 'extra': False},
+        {'path': 'detail[0].row[8].field[6]', 'value': '原里程甲'},
+        {'path': 'detail[0].row[9].field[6]', 'value': '原里程乙'},
+        {'path': 'detail[1].row[0].field[0]', 'value': '其他表首行'},
+        {'path': 'detail[1].row[6].field[0]', 'value': '其他表第七行'},
+        {'path': 'unresolved-source', 'value': ['原数组值']},
+    ]
+    if fallback:
+        fields[0]['name'] = 'synthetic-long-material' * 6000
+    engine, task = prepare(tmp_path, page_count=0, declared_fields=fields)
+    action = Path(task['action_file'])
+    material_file = action.with_name('material.json')
+    frozen_bytes = material_file.read_bytes()
+    packet = json.loads(action.with_name('review-packet.json').read_text())
+    decision = {'schema_version': 1, 'kind': 'preaudit_review_decision',
+                'action_token': json.loads(action.read_text())['action_token'],
+                'workflow_key': 'business_entertainment', 'rule_version': packet['rule_version'],
+                'overall': 'needs_human', 'items': [
+                    {'item_key': item['item_key'], 'status': 'uncertain',
+                     'conclusion': '明细表1第7、8行费用对应待核；第9、10行实际支出待核。',
+                     'evidence_refs': ['material:detail[0].row[6].field[6]', 'material:detail[0].row[9].field[6]'],
+                     'missing_evidence': ['原明细的必要事实待核。']}
+                    for item in packet['items']]}
+    script = tmp_path / 'location-reviewer.py'
+    script.write_text('''import json,sys,subprocess
+from pathlib import Path
+args=sys.argv[1:];prompt=sys.stdin.read()
+source=Path(''' + repr(str(ROOT)) + ''')
+if ''' + repr(fallback) + ''':
+ text=subprocess.run([sys.executable,'-m','apps.oa_finance_preaudit.read_material',''' + repr(str(action)) + '''],cwd=source,capture_output=True,text=True,check=True).stdout
+else:
+ text=prompt
+ original=json.loads(prompt.split('冻结数据：material\\n\\n',1)[1].split('\\n\\n冻结输入原文结束。',1)[0])
+ assert original['declared_fields']==''' + repr(fields) + '''
+expected=['detail[0].row[0]：明细表1第1行','detail[0].row[6]：明细表1第7行',
+ 'detail[0].row[7]：明细表1第8行','detail[0].row[8]：明细表1第9行',
+ 'detail[0].row[9]：明细表1第10行','detail[1].row[0]：明细表2第1行',
+ 'detail[1].row[6]：明细表2第7行']
+assert 'declared_fields.path 完整字段路径（含 field[...]）' in prompt
+assert all(label in prompt for label in expected)
+assert all(label in text for label in expected)
+assert all(text.count(label)==1 for label in expected)
+assert 'main[0].field[0]：明细表' not in text
+assert 'unresolved-source：明细表' not in text
+assert 'evidence_refs' in prompt
+Path(args[args.index('--output-last-message')+1]).write_text(''' + repr(json.dumps(decision, ensure_ascii=False)) + ''')
+print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'cached_input_tokens':0,'output_tokens':5}}))
+''')
+    original = subprocess.Popen
+    monkeypatch.setattr(worker.subprocess, 'Popen', lambda command, **kwargs: original([sys.executable, str(script), *command[1:]], **kwargs))
+    monkeypatch.setenv('OA_REVIEW_API_KEY', 'offline-placeholder')
+    reviewed = worker.review(task)
+    assert reviewed['status'] == 'reviewed', reviewed
+    decision_file = tmp_path / 'location-decision.json'
+    json_artifact.write_json_atomic(decision_file, reviewed['decision'])
+    closed = engine.complete_review(action, decision_file)
+    assert closed['action'] == 'closed' and closed['write_state'] == 'not_requested'
+    assert json.loads(Path(closed['decision_file']).read_text()) == decision
+    assert decision['items'][0]['conclusion'] in Path(closed['remark_file']).read_text()
+    assert material_file.read_bytes() == frozen_bytes

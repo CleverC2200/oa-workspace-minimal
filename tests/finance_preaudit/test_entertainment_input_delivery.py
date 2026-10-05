@@ -18,7 +18,7 @@ def forbidden(*_args, **_kwargs):
     raise AssertionError("OA, authorization, submission and recovery are forbidden")
 
 
-def prepare(tmp_path, *, page_count=5, width=16, height=16, degraded=False, tail="完整尾值", image_format="png", page_specs=None):
+def prepare(tmp_path, *, page_count=5, width=16, height=16, degraded=False, tail="完整尾值", image_format="png", page_specs=None, declared_fields=None):
     root = tmp_path / "project"
 
     def collect(request_id, attempt):
@@ -43,7 +43,7 @@ def prepare(tmp_path, *, page_count=5, width=16, height=16, degraded=False, tail
             manifest.append({"resource_id": resource_id, "status": "image", "image_count": 1})
         return {"schema_version": 1, "kind": "preaudit_material", "request_id": request_id,
                 "workflow_key": "business_entertainment", "workflow_name": "业务招待费报销流程",
-                "declared_fields": [{"path": "detail[0].row[0].field[6]", "value": None,
+                "declared_fields": declared_fields if declared_fields is not None else [{"path": "detail[0].row[0].field[6]", "value": None,
                                      "read_status": "unresolved", "value_source": "none", "name": tail}],
                 "resources": resources, "prepared": {"images": images, "structured_contents": [], "manifest": manifest},
                 "authority_facts": [], "warnings": []}

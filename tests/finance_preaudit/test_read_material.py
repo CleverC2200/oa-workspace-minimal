@@ -11,8 +11,8 @@ from apps.oa_finance_preaudit import read_material, flow_engine
 def test_every_material_value_and_order_survives_readable_view():
     material = {
         "declared_fields": [
-            {"path": "row[0]", "value": "quoted\nvalue", "read_status": "unresolved"},
-            {"path": "row[1]", "value": None},
+            {"path": "detail[0].row[0].field[6]", "value": "quoted\nvalue", "read_status": "unresolved"},
+            {"path": "detail[0].row[6].field[6]", "value": None},
         ],
         "prepared": {"images": [
             {"path": "one.png", "spreadsheet_cell": "照片!B2"},
@@ -91,3 +91,10 @@ def test_reader_rejects_different_action_packet(tmp_path):
 
 def test_empty_prepared_mapping_remains_visible():
     assert "[material.prepared]\n{}" in read_material.render({"prepared": {}})
+
+
+@pytest.mark.parametrize('fields', [None, '原字符串', {'path': 'detail[0].row[0]'}])
+def test_readable_view_preserves_non_field_array_values_without_invented_locations(fields):
+    text = read_material.render({'declared_fields': fields})
+    assert json.dumps(fields, ensure_ascii=False, separators=(',', ':')) in text
+    assert '\n明细定位显示：' not in text
