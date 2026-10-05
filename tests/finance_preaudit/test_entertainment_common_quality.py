@@ -70,6 +70,8 @@ assert '已确认可核销部分及其合计' in prompt
 assert 'overall=pass' in prompt
 assert '通过的前置项只给已核验的关联或状态结果' in prompt
 assert '不能把不可读或未确认的日期概述为一致或接近' in prompt
+assert 'conclusion 不重复项目名、编号或状态符号' in prompt
+assert '不在意见中解释上传字段、稳定绑定、读取或宿主校验过程' in prompt
 final_check=prompt[prompt.rfind('形成最终四项决定前'):]
 assert '每条明细分别核对拟采用支付的费用对应' in final_check
 assert '未采用的额外支付' in final_check
