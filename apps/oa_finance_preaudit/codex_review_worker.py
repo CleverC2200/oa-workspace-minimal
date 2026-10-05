@@ -388,14 +388,8 @@ def _prompt(action_file: Path, *, reading_instruction: str | None = None) -> str
         opinion_requirement = _BUSINESS_ENTERTAINMENT_OPINION_REQUIREMENT
         workflow_requirement = (
             "只按本流程固定审核项判断；形成最终四项决定前，执行业务招待费规则包"
-            "“核销前逐笔核对”与核销范围复核；evidence_refs 引用支持拟采用支出费用对应的原事实，"
-            "missing_evidence 按各固定审核项保留仍未确认的必要事实或关系；"
-            "每条明细分别核对拟采用支付的费用对应，不能仅凭支付成功、OA挂接或金额相等"
-            "就将该条费用纳入已确认范围；其他明细或支付分组已确认，不能替这条确认用途。"
-            "未采用的额外支付不单独成为已有充分证据支出的核销前置条件；"
-            "不要把真正待核明细的费用对应缺口换成额外款的用途缺口。"
-            "费用对应只要求尚未确认的必要关系；已有原商品、服务或结算资料充分支持的支付正常采用，"
-            "不新增日期、交易号或名称逐字一致要求。"
+            "“核销前逐笔核对”：来源与适用范围 → 支付发生 → 费用对应 → 核销范围；"
+            "evidence_refs 定位各项原事实，missing_evidence 保留该项仍未确认的必要事实或关系；"
             "引用材料字段时逐字使用 declared_fields.path，并加 material: 前缀；"
             "资源引用使用 material:resources.<resource_id>，准备页引用使用 "
             "material:prepared.images.<resource_id>.page-<页码>，标识与页码来自原材料，"

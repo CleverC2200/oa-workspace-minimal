@@ -34,6 +34,7 @@
 | F-013 | 业务招待/金额孰低 | 同一明细稳定绑定多张支付凭证时应逐张核实并汇总，不能仅因多凭证而停止在“无法汇总” | 已采纳 | `flows/business-entertainment.md` 业务招待第 4 项 |
 | F-014 | 业务招待/金额孰低 | 同一支付凭证覆盖多条拆分明细时，稳定关系闭合后按支付分组只计一次，并如实表述分组而非虚构每行独立支付 | 已采纳 | `flows/business-entertainment.md` 业务招待第 4 项；`observation-contract.md` 页级精确重复 |
 | F-039 | 业务招待/支付与费用对应 | 支付发生与费用对应逐笔独立核对；个人已收款但用途未核不得纳入已确认核销，已有可信结算关系时正常采用；共享分组只证明组内分摊，不替其他款确认用途；保留已知金额和未知项 | 已采纳 | `flows/business-entertainment.md` 核销前逐笔核对；RC-056、RC-057、RC-058；共有路径消费回归及真实已办回放 |
+| F-040 | 业务招待/充分证据与来源适用范围 | 已有充分商品、服务或结算上下文正常采用，历史财务核定只作交叉，不替当前支出或本流程政策；当前字段读到不等于事实已核验 | 已采纳 | `flows/business-entertainment.md` 来源与适用范围、费用对应；RC-059、RC-060；两读取路径离线交付已验，联合修订真实回归待新额度 |
 | F-015 | 包装版面/输出与文字校对 | 每一版包装都按配料信息、过敏原信息、营养成分表信息、地址信息四块给出签字意见；四块检查关键文字错误及可选 Excel 差异，审核范围按 F-018 收敛 | 已采纳 | `flows/packaging-layout-approval.md` 包装固定四项；`audit-chinese-image-text/SKILL.md` OA 包装版面流程 |
 | F-016 | 包装版面/无 Excel 图片校对 | 没有 Excel 时仍须下载原图并完成图片自身校对；不得仅因无 Excel 把四项统一标为人工判断。原先要求每单覆盖审计和三路盲审的执行方式已由 F-018 收敛 | 已采纳 | `audit-chinese-image-text/SKILL.md` G0-G4；`output-contract.md` OA 签字意见投影；`flows/packaging-layout-approval.md` 包装固定四项 |
 | F-017 | 包装版面/Excel 来源说明 | 配料、过敏原、营养成分表和地址通常来自同一 Excel；Excel 是否提供及是否执行对照只在四项之后统一说明一次，实际差异仍写入受影响项目 | 已采纳 | `output-contract.md` OA 签字意见投影；`flows/packaging-layout-approval.md` 包装固定四项 |
