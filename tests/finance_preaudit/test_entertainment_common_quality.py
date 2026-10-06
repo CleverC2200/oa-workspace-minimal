@@ -161,6 +161,7 @@ def test_detail_locations_survive_both_reading_paths_without_changing_evidence(t
                      'evidence_refs': ['material:detail[0].row[6].field[6]', 'material:detail[0].row[9].field[6]'],
                      'missing_evidence': ['原明细的必要事实待核。']}
                     for item in packet['items']]}
+    reader_call = tmp_path / 'observed-reader-call.json'
     script = tmp_path / 'location-reviewer.py'
     script.write_text('''import json,sys,subprocess,shlex,re
 from pathlib import Path
@@ -169,8 +170,11 @@ source=Path(''' + repr(str(ROOT)) + ''')
 if ''' + repr(fallback) + ''':
  command=re.search(r'`(' + re.escape('python3 -B -m apps.oa_finance_preaudit.read_material ') + r'[^`]+)`',prompt)
  assert command, 'fallback did not deliver the actual lossless reader command'
+ budget=re.search(r'max_output_tokens=([0-9]+)',prompt)
+ assert budget, 'fallback caller has no explicit output budget'
  argv=shlex.split(command.group(1))
  assert argv==['python3','-B','-m','apps.oa_finance_preaudit.read_material',''' + repr(str(action)) + ''']
+ Path(''' + repr(str(reader_call)) + ''').write_text(json.dumps({'command':argv,'max_output_tokens':int(budget.group(1))}))
  text=subprocess.run([sys.executable,*argv[1:]],cwd=source,capture_output=True,text=True,check=True).stdout
 else:
  text=prompt
@@ -203,6 +207,11 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'cached_inp
     monkeypatch.setenv('OA_REVIEW_API_KEY', 'offline-placeholder')
     reviewed = worker.review(task)
     assert reviewed['status'] == 'reviewed', reviewed
+    if fallback:
+        # This caller records the requested parameter. Native budget adherence remains unverified.
+        observed = json.loads(reader_call.read_text())
+        assert observed['max_output_tokens'] == 60000
+        assert observed['command'][-1] == str(action)
     decision_file = tmp_path / 'location-decision.json'
     json_artifact.write_json_atomic(decision_file, reviewed['decision'])
     closed = engine.complete_review(action, decision_file)

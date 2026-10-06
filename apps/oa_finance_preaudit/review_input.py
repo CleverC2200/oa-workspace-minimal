@@ -130,7 +130,8 @@ class ReviewInput:
                     '沿用原读取路径，完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，'
                     '按其路由读取 `references/result-contract.md`、`references/observation-contract.md`、'
                     '`references/flows/business-entertainment.md`、动作引用的审核包和全部准备页；'
-                    '冻结材料先执行 `' + reader_command + '` 完整读取现有无损视图；'
+                    '冻结材料先用 `exec_command` 运行 `' + reader_command + '`，'
+                    '设置 `max_output_tokens=60000`，直接读取 stdout 中的完整无损视图；'
                     '视图保留全部原属性、读取状态及完整路径，明细行号与原字段就近显示；'
                     '若输出截断，按行分段继续读完。原图仍按原页面覆盖规则观察。\n\n'
                     + render_detail_locations(self.bundle['material']) + '\n\n')
