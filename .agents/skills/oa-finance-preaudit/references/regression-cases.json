@@ -865,6 +865,21 @@
       "expected_output": "确认小计仍220元；转账50元明确支出已确认而用途待核，里程支出和本流程适用口径分别未知，未确认款不并入；四项及预算策略保持，整体needs_human",
       "failure_mode": "把历史处置或字段读取可靠性当成当前事实与政策适用性的证明",
       "rule_ref": "flows/business-entertainment.md#来源与适用范围"
+    },
+    {
+      "id": "RC-061-entertainment-category-does-not-identify-current-expense",
+      "scope": "business_entertainment",
+      "audit_item": "attachment_payment_evidence;reimbursable_minimum",
+      "status": "confirmed",
+      "input_facts": [
+        "合成案例：申报明细甲为门店甲的招待费用，附件中的两笔支付90元和70元显示餐饮商户类别及付款完成，合计与申报160元相同，但现有原资料不能建立与甲的具体费用关系",
+        "另一已确认餐饮明细乙有其自己的原订单与实付40元；乙的订单不属于甲",
+        "发票关联与购买方可核，预算仍按既定策略暂不校验；没有甲的额外订单或结算资料"
+      ],
+      "incorrect_output": "凭餐饮类别与同额判甲用途已确认，声称已核对对应餐饮订单，或借用乙的订单后给整单200元通过",
+      "expected_output": "甲支付发生已确认而具体费用对应待核，第1及第4项uncertain，保留乙已确认可核销40元，整体needs_human；原商品或结算已充分证明的费用正常采用，不增加餐馆、同名、日期、交易号或独立订单统一门槛",
+      "failure_mode": "把可报销的商品类别当成具体申报费用的关系，或引用未出现及属于其他明细的订单",
+      "rule_ref": "flows/business-entertainment.md#费用对应"
     }
   ]
 }

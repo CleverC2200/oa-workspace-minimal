@@ -82,6 +82,10 @@ sections=['### 来源与适用范围', '### 支付发生', '### 费用对应', '
 assert all(section in received for section in sections)
 assert [received.index(section) for section in sections]==sorted(received.index(section) for section in sections)
 assert all(section not in final_check for section in sections)
+questions=['当前支付与本条申报费用是否为同一支出',
+ '该支出的原商品、服务或结算内容是否支持当前招待用途']
+assert all(question in received for question in questions)
+assert received.index(questions[0]) < received.index(questions[1])
 assert '历史财务核定结果只用于交叉复核' in received
 assert '食品商品' in received
 assert '已有原商品、服务或结算资料充分支持时正常采用' in received
