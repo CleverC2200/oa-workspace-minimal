@@ -16,9 +16,13 @@ scope 的 `native_contract` 引用已保存的 #379 证明。来源快照还须�
 
 当前授权绑定 scope SHA、薄调用者 SHA、明确授权来源、时限及原父累计授权引用。阶段、累计、诊断上限均取冻结数据，子授权不能扩大父授权的累计或诊断上限。baseline_execution_authorized 和 oa_write_authorized 均必须为 false，first_quality_or_format_failure_stops 必须为 true。凭据由原执行环境提供，模板不读取凭据文件。
 
-`prior_plans` 引用全部已发生调用的原计划，并声明 source_revision 及 diagnostic 分组。父授权的 includes_previous_starts 和 first_phase_authority 锚定原始前置调用。后续阶段还绑定 prior_phase_authority 与 prior_phase_scope，从前一授权及该 scope 的实际启动回执推导应有计划集合。不能省略旧失败或将换阶段视作计数归零。
+父授权旁的任务级首起点认领和当前阶段指针决定实际阶段链。原父授权、includes_previous_starts、first_phase_authority、旧 scope/auth 和历史回执保持原字节。没有这项登记时累计数为 unknown，普通 run 拒绝，不把缺文件当作新预算。
 
-每次计数核验原 started、cli-start 和计划指纹。未知启动保持 unknown 并阻止派发。已启动的同修订同单不能换阶段再跑。不存在当前有效授权、来源漂移、取消或回收未知时，入口拒绝或停止，不补跑。
+工程准备显式调用 `_bind_candidate_phase_parent(parent_reference, origin_scope_reference, origin_authority_reference)`，三个参数均为原文件的 `file + sha256`。已存在历史的任务须绑定已确认的旧阶段起点，按其原 prior_plans 与 scope 实际启动回执保存全部已发生计划引用；旧调用者未使用新协调器也不能从零开始。全新授权只能绑定明确的首阶段。起点未知或启动回执不可信时拒绝登记。该操作只创建任务状态，不授予运行权，也不创建新的业务 scope/auth。首认领不可覆盖或重新初始化。
+
+`prior_plans` 引用全部已发生调用的原计划，并声明 source_revision 及 diagnostic 分组。后续授权必须用 prior_phase_authority 和 prior_phase_scope 指向当前阶段指针的实际前序；缺失、错指或遗漏已发生计划都拒绝。每次累计从首起点及阶段链的原回执重新计数，不采用调用者自报的余额。新阶段认领、预算检查和本次执行在同一父授权的非阻塞锁内进行，并发调用拒绝；当前指针使用已有私有原子写入更新。
+
+每次计数核验原 started、cli-start 和计划指纹。历史启动还须由原 source report 确认来源绑定、exact 用量和已知退出码的终态；仅有启动1不能代替退出或回收证明，换修订也不能绕过此项。已确认退出的旧格式失败仍计入成本，不要求它成为格式或财务通过。未知启动保持 unknown 并阻止派发。已启动的同修订同单不能换阶段再跑。不存在当前有效授权、来源漂移、取消或回收未知时，入口拒绝或停止，不补跑。
 
 ## 逐单推进
 

@@ -111,7 +111,17 @@ def phase(tmp_path, phase_source, *, count=2, offset=0):
     return scope, authority, rows
 
 
-def invoke(scope, authority, alias):
+def invoke(scope, authority, alias, *, prepare_parent=True):
+    # Explicit engineering preparation for the freshly created synthetic grant.
+    # The actual caller never initializes an absent parent binding itself.
+    if prepare_parent:
+        parent = json.loads(authority.read_text())['parent_cumulative_authority']
+        origin, current, _lock = review_experiment._candidate_parent_paths(parent)
+        if not origin.exists() and not current.exists():
+            try:
+                review_experiment._bind_candidate_phase_parent(parent, ref(scope), ref(authority))
+            except ValueError:
+                pass
     environment = {k:v for k,v in os.environ.items() if k not in {'OA_REVIEW_API_KEY','OA_REVIEW_SSE_TRACE'}}
     environment['OA_REVIEW_API_KEY'] = 'offline-placeholder'
     output = subprocess.check_output([sys.executable,str(CALLER),str(ROOT),'run',str(scope),str(authority),alias], env=environment, cwd=ROOT, text=True)
@@ -255,6 +265,7 @@ def test_original_prior_receipt_consumes_global_budget_and_is_not_reset(tmp_path
     scope,authority,rows = phase(current_dir,phase_source,count=1,offset=10)
     auth = json.loads(authority.read_text())
     auth['cumulative_maximum_cli_starts'] = 1
+    auth['parent_cumulative_authority'] = json.loads(old_auth.read_text())['parent_cumulative_authority']
     auth['prior_plans'] = [{**old_rows[0]['plan'],'source_revision':json.loads(old_scope.read_text())['candidate'],'diagnostic':True}]
     auth['prior_phase_authority'] = ref(old_auth);auth['prior_phase_scope'] = ref(old_scope)
     current_scope = json.loads(scope.read_text())
@@ -266,6 +277,119 @@ def test_original_prior_receipt_consumes_global_budget_and_is_not_reset(tmp_path
     assert status(scope,authority)['budget']['global_cli_starts'] == 1
     assert Path(old_rows[0]['plan']['file']).read_bytes() == old_bytes
     assert not Path(json.loads(Path(rows[0]['plan']['file']).read_text())['arms']['candidate']).joinpath('cli-start.json').exists()
+
+
+def test_same_parent_cannot_reset_budget_by_omitting_previous_phase(tmp_path, phase_source):
+    old_dir, new_dir = tmp_path / 'old', tmp_path / 'new'
+    old_dir.mkdir(mode=0o700); new_dir.mkdir(mode=0o700)
+    old_scope, old_auth, old_rows = phase(old_dir, phase_source, count=1)
+    first = json.loads(old_auth.read_text())
+    parent = Path(first['parent_cumulative_authority']['file'])
+    grant = json.loads(parent.read_text()); grant['maximum_cli_starts'] = 1; save(parent, grant)
+    first.update(parent_cumulative_authority=ref(parent), cumulative_maximum_cli_starts=1)
+    save(old_auth, first)
+    assert invoke(old_scope, old_auth, 'T0')['phase_cli_starts'] == 1
+    audit(old_rows[0])
+    original = {p: p.read_bytes() for p in (parent, old_scope, old_auth, Path(old_rows[0]['plan']['file']))}
+    scope, authority, rows = phase(new_dir, phase_source, count=1, offset=10)
+    current = json.loads(scope.read_text())
+    current['prerequisites'] = [{**old_rows[0], 'audit_binding': ref(Path(old_rows[0]['plan']['file']).parent / 'candidate-audit-binding.private.json')}]
+    save(scope, current)
+    next_auth = json.loads(authority.read_text())
+    next_auth.update(scope_sha256=sha(scope), parent_cumulative_authority=ref(parent), cumulative_maximum_cli_starts=1)
+    save(authority, next_auth)
+
+    rejected = invoke(scope, authority, 'T0')
+
+    assert rejected['status'] == 'rejected', rejected
+    assert rejected['phase_cli_starts'] == 0
+    candidate = Path(json.loads(Path(rows[0]['plan']['file']).read_text())['arms']['candidate'])
+    assert not (candidate / 'cli-start.json').exists()
+    assert all(p.read_bytes() == raw for p, raw in original.items())
+
+
+def test_status_reports_untrusted_budget_before_pending_quality(tmp_path, phase_source):
+    scope, authority, _rows = phase(tmp_path, phase_source, count=2)
+    assert invoke(scope, authority, 'T0')['status'] == 'awaiting_independent_assessment'
+    value = json.loads(authority.read_text()); value['scope_sha256'] = 'f' * 64; save(authority, value)
+
+    current = status(scope, authority)
+
+    assert current['status'] == 'blocked'
+    assert current['blocker'] == 'budget_binding_unverified'
+
+
+def test_absent_parent_binding_is_unknown_not_zero_authority(tmp_path, phase_source):
+    scope, authority, rows = phase(tmp_path, phase_source, count=1)
+    rejected = invoke(scope, authority, 'T0', prepare_parent=False)
+    assert rejected['reason'] == 'parent_phase_binding_missing'
+    assert status(scope, authority)['budget']['global_cli_starts'] == 'unknown'
+    candidate = Path(json.loads(Path(rows[0]['plan']['file']).read_text())['arms']['candidate'])
+    assert not (candidate / 'cli-start.json').exists()
+
+
+def test_parent_lock_rejects_concurrent_stage_without_dispatch(tmp_path, phase_source):
+    scope, authority, rows = phase(tmp_path, phase_source, count=1)
+    parent = json.loads(authority.read_text())['parent_cumulative_authority']
+    review_experiment._bind_candidate_phase_parent(parent, ref(scope), ref(authority))
+    with review_experiment._candidate_parent_lock(parent):
+        rejected = invoke(scope, authority, 'T0', prepare_parent=False)
+    assert rejected['reason'] == 'parent_phase_busy'
+    assert not Path(rows[0]['plan']['file']).with_name('plan.json.started.json').exists()
+
+
+def test_explicit_old_origin_and_legal_continuation_preserve_original_budget(tmp_path, phase_source):
+    old_dir, new_dir = tmp_path / 'old', tmp_path / 'new'
+    old_dir.mkdir(mode=0o700); new_dir.mkdir(mode=0o700)
+    old_scope, old_auth, old_rows = phase(old_dir, phase_source, count=1)
+    assert invoke(old_scope, old_auth, 'T0')['phase_cli_starts'] == 1
+    audit(old_rows[0])
+    parent = json.loads(old_auth.read_text())['parent_cumulative_authority']
+    # Model the legacy caller: it has the same original receipts but no new registry.
+    origin, current, _lock = review_experiment._candidate_parent_paths(parent)
+    origin.unlink(); current.unlink()
+    originals = {p: p.read_bytes() for p in (Path(parent['file']), old_scope, old_auth, Path(old_rows[0]['plan']['file']))}
+    binding = review_experiment._bind_candidate_phase_parent(parent, ref(old_scope), ref(old_auth))
+    assert json.loads(Path(binding['file']).read_text())['original_started_plans'] == [old_rows[0]['plan']]
+    scope, authority, rows = phase(new_dir, phase_source, count=1, offset=10)
+    value = json.loads(scope.read_text())
+    value['prerequisites'] = [{**old_rows[0], 'audit_binding': ref(Path(old_rows[0]['plan']['file']).parent / 'candidate-audit-binding.private.json')}]
+    save(scope, value)
+    auth = json.loads(authority.read_text())
+    auth.update(scope_sha256=sha(scope), parent_cumulative_authority=parent,
+                prior_phase_authority=ref(old_auth), prior_phase_scope=ref(old_scope),
+                prior_plans=[{**old_rows[0]['plan'], 'source_revision': value['candidate'], 'diagnostic': True}])
+    save(authority, auth)
+    result = invoke(scope, authority, 'T0')
+    assert result['global_cli_starts'] == 2
+    assert all(p.read_bytes() == data for p, data in originals.items())
+    assert json.loads(current.read_text())['current']['file'] == str(scope.parent / 'candidate-phase-claim.private.json')
+
+
+@pytest.mark.parametrize('untrusted', ['unknown_process', 'missing_result'])
+def test_prior_start_alone_cannot_hide_unfinished_execution(tmp_path, phase_source, untrusted):
+    old_dir, new_dir = tmp_path / 'old', tmp_path / 'new'
+    old_dir.mkdir(mode=0o700); new_dir.mkdir(mode=0o700)
+    old_scope, old_auth, old_rows = phase(old_dir, phase_source, count=1)
+    assert invoke(old_scope, old_auth, 'T0')['phase_cli_starts'] == 1
+    plan = json.loads(Path(old_rows[0]['plan']['file']).read_text())
+    root = Path(plan['arms']['candidate'])
+    if untrusted == 'unknown_process':
+        result = json.loads((root / 'result.json').read_text())
+        result['execution']['process_state'] = 'unknown'
+        save(root / 'result.json', result)
+    else:
+        (root / 'result.json').unlink()
+    assert review_experiment._candidate_phase_start(Path(old_rows[0]['plan']['file']), plan) == 1
+    scope, authority, _rows = phase(new_dir, phase_source, count=1, offset=10)
+    auth = json.loads(authority.read_text())
+    auth.update(parent_cumulative_authority=json.loads(old_auth.read_text())['parent_cumulative_authority'],
+                prior_phase_authority=ref(old_auth), prior_phase_scope=ref(old_scope),
+                prior_plans=[{**old_rows[0]['plan'], 'source_revision': plan['source_revisions']['candidate'], 'diagnostic': True}])
+    save(authority, auth)
+    rejected = invoke(scope, authority, 'T0')
+    assert rejected['reason'] == 'prior_execution_untrusted'
+    assert rejected['phase_cli_starts'] == 0
 
 
 @pytest.mark.parametrize('final',['not JSON','cancel'])
@@ -327,7 +451,8 @@ def test_same_revision_failed_prior_cannot_be_resumed_in_a_new_phase(tmp_path,ph
     save(scope,value)
     auth = json.loads(authority.read_text())
     auth.update(scope_sha256=sha(scope),prior_phase_authority=ref(old_auth),prior_phase_scope=ref(old_scope),
-                prior_plans=[{**old_rows[0]['plan'],'source_revision':value['candidate'],'diagnostic':True}])
+                prior_plans=[{**old_rows[0]['plan'],'source_revision':value['candidate'],'diagnostic':True}],
+                parent_cumulative_authority=json.loads(old_auth.read_text())['parent_cumulative_authority'])
     save(authority,auth)
     original = Path(old_rows[0]['plan']['file']).parent/'quality.json'
     raw = original.read_bytes()

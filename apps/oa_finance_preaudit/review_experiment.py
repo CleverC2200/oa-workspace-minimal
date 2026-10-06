@@ -15,6 +15,8 @@ import os
 import signal
 import threading
 import time
+import fcntl
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -300,6 +302,138 @@ def run_pair(plan_file: Path, authorization_file: Path, *,
 
 # Private task coordination consumes the existing paired plans. It is not a
 # single-arm experiment protocol and grants no authority to resume old phases.
+def _candidate_parent_paths(parent_reference: dict) -> tuple[Path, Path, Path]:
+    from .flow_evals import _read_bound_artifact
+    _read_bound_artifact(parent_reference)
+    parent = Path(parent_reference['file'])
+    if parent != parent.resolve() or parent.parent.stat().st_mode & 0o077:
+        raise ValueError('parent_phase_binding_invalid')
+    return tuple(parent.with_name(parent.name + suffix) for suffix in (
+        '.phase-origin.private.json', '.phase-current.private.json', '.phase-lock.private'))
+
+
+@contextmanager
+def _candidate_parent_lock(parent_reference: dict):
+    _origin, _current, lock = _candidate_parent_paths(parent_reference)
+    descriptor = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        if os.fstat(descriptor).st_mode & 0o077:
+            raise ValueError('parent_phase_binding_invalid')
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError('parent_phase_busy') from None
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def _candidate_parent_anchor_plans(parent: dict) -> set:
+    from .flow_evals import _read_bound_artifact
+    included = parent.get('includes_previous_starts')
+    if type(included) is not int or included < 0:
+        raise ValueError('prior_budget_scope_invalid')
+    if not included:
+        return set()
+    first = _read_bound_artifact(parent['first_phase_authority'])
+    anchors = {(r['file'], r['sha256']) for r in first['prior_plans']}
+    if len(anchors) != included:
+        raise ValueError('prior_budget_scope_invalid')
+    return anchors
+
+
+def _candidate_phase_started_plans(scope: dict) -> set:
+    from .flow_evals import _read_bound_artifact
+    references = set()
+    for row in scope['cases']:
+        plan = _read_bound_artifact(row['plan'])
+        count = _candidate_phase_start(Path(row['plan']['file']), plan)
+        if count == 'unknown':
+            raise ValueError('prior_start_untrusted')
+        if count == 1:
+            references.add((row['plan']['file'], row['plan']['sha256']))
+    return references
+
+
+def _bind_candidate_phase_parent(parent_reference: dict, origin_scope: dict, origin_authority: dict) -> dict:
+    """Explicit task preparation only. Pin the known old/fresh origin, not run authority."""
+    from .flow_evals import _read_bound_artifact
+    with _candidate_parent_lock(parent_reference):
+        origin_file, current_file, _lock = _candidate_parent_paths(parent_reference)
+        if origin_file.exists() or current_file.exists():
+            raise ValueError('parent_phase_already_bound')
+        parent = _read_bound_artifact(parent_reference)
+        scope = _read_bound_artifact(origin_scope)
+        authority = _read_bound_artifact(origin_authority)
+        if (authority['scope_sha256'] != origin_scope['sha256']
+                or authority['parent_cumulative_authority'] != parent_reference):
+            raise ValueError('parent_phase_binding_invalid')
+        prior = {(r['file'], r['sha256']) for r in authority['prior_plans']}
+        if len(prior) != len(authority['prior_plans']) or not _candidate_parent_anchor_plans(parent).issubset(prior):
+            raise ValueError('prior_budget_scope_invalid')
+        prior.update(_candidate_phase_started_plans(scope))
+        for file, digest in prior:
+            plan = _read_bound_artifact({'file': file, 'sha256': digest})
+            if _candidate_phase_start(Path(file), plan) != 1:
+                raise ValueError('prior_start_untrusted')
+        value = {'schema_version': 1, 'kind': 'preaudit_private_phase_origin', 'parent': parent_reference,
+                 'scope': origin_scope, 'authority': origin_authority, 'previous': None,
+                 'original_started_plans': [{'file': file, 'sha256': digest} for file, digest in sorted(prior)],
+                 'new_execution_authority': False}
+        _save(origin_file, value)
+        origin_ref = {'file': str(origin_file), 'sha256': batch._sha(origin_file)}
+        _save(current_file, {'schema_version': 1, 'parent': parent_reference, 'origin': origin_ref, 'current': origin_ref})
+        return origin_ref
+
+
+def _candidate_parent_chain(authority: dict) -> tuple[dict, list[dict]]:
+    from .flow_evals import _read_bound_artifact
+    parent_reference = authority['parent_cumulative_authority']
+    origin_file, current_file, _lock = _candidate_parent_paths(parent_reference)
+    if not origin_file.exists() or not current_file.exists():
+        raise ValueError('parent_phase_binding_missing')
+    pointer = batch._object(current_file.parent, current_file)
+    origin_ref = {'file': str(origin_file), 'sha256': batch._sha(origin_file)}
+    if pointer['parent'] != parent_reference or pointer['origin'] != origin_ref:
+        raise ValueError('parent_phase_binding_invalid')
+    nodes, seen = [], set()
+    reference = pointer['current']
+    while reference is not None:
+        identity = (reference['file'], reference['sha256'])
+        if identity in seen:
+            raise ValueError('parent_phase_binding_invalid')
+        seen.add(identity)
+        node = _read_bound_artifact(reference)
+        prior_authority = _read_bound_artifact(node['authority'])
+        _read_bound_artifact(node['scope'])
+        if (node['parent'] != parent_reference or prior_authority['parent_cumulative_authority'] != parent_reference
+                or prior_authority['scope_sha256'] != node['scope']['sha256']):
+            raise ValueError('parent_phase_binding_invalid')
+        nodes.append(node)
+        if reference == origin_ref:
+            if node['previous'] is not None:
+                raise ValueError('parent_phase_binding_invalid')
+            return pointer, nodes
+        reference = node['previous']
+    raise ValueError('parent_phase_binding_invalid')
+
+
+def _claim_candidate_phase(scope_file: Path, authority_file: Path, authority: dict) -> None:
+    from apps.oa_approval import runtime_control
+    pointer, nodes = _candidate_parent_chain(authority)
+    current = nodes[0]
+    scope_ref = {'file': str(scope_file), 'sha256': batch._sha(scope_file)}
+    authority_ref = {'file': str(authority_file), 'sha256': batch._sha(authority_file)}
+    if current['scope'] == scope_ref and current['authority'] == authority_ref:
+        return
+    claim = scope_file.parent / 'candidate-phase-claim.private.json'
+    _save(claim, {'schema_version': 1, 'kind': 'preaudit_private_phase_claim', 'parent': authority['parent_cumulative_authority'],
+                  'scope': scope_ref, 'authority': authority_ref, 'previous': pointer['current'], 'new_execution_authority': False})
+    pointer['current'] = {'file': str(claim), 'sha256': batch._sha(claim)}
+    _origin, current_file, _lock = _candidate_parent_paths(authority['parent_cumulative_authority'])
+    runtime_control.write_control_bytes_atomic(current_file, (json.dumps(pointer, ensure_ascii=False) + '\n').encode())
+
+
 def _candidate_phase_rows(scope_file: Path) -> tuple[dict, list[tuple[dict, Path, dict]]]:
     from .flow_evals import _read_bound_artifact
     scope = batch._object(scope_file.parent, scope_file)
@@ -373,6 +507,26 @@ def _candidate_phase_authority(scope_file: Path, authority_file: Path, caller_fi
 def _run_candidate_phase(scope_file: Path, authority_file: Path, alias: str, *,
                          caller_file: Path, stop_requested: Callable[[], bool] = lambda: False,
                          execute: Callable[[Path], dict] | None = None) -> dict:
+    try:
+        authority_file = Path(authority_file).resolve()
+        authority = batch._object(authority_file.parent, authority_file)
+        with _candidate_parent_lock(authority['parent_cumulative_authority']):
+            return _run_candidate_phase_locked(scope_file, authority_file, alias, caller_file=caller_file,
+                                               stop_requested=stop_requested, execute=execute)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        try:
+            _scope, rows = _candidate_phase_rows(Path(scope_file).resolve())
+            counts = [_candidate_phase_start(path, plan) for _row, path, plan in rows]
+            starts = sum(counts) if all(type(count) is int for count in counts) else 'unknown'
+        except (OSError, ValueError, KeyError, TypeError):
+            starts = 'unknown'
+        return {'status': 'rejected', 'reason': str(error) if isinstance(error, ValueError) else 'candidate_phase_invalid',
+                'phase_cli_starts': starts, 'baseline_executed': False, 'new_execution_authority': False}
+
+
+def _run_candidate_phase_locked(scope_file: Path, authority_file: Path, alias: str, *,
+                                caller_file: Path, stop_requested: Callable[[], bool],
+                                execute: Callable[[Path], dict] | None) -> dict:
     scope_file, authority_file = Path(scope_file).resolve(), Path(authority_file).resolve()
     checks_started = time.monotonic()
     starts = 'unknown'
@@ -441,6 +595,7 @@ def _run_candidate_phase(scope_file: Path, authority_file: Path, alias: str, *,
         _valid_authority_time(authority)
         if stop_requested():
             raise ValueError('cancelled_before_start')
+        _claim_candidate_phase(scope_file, authority_file, authority)
         claim = plan_file.with_name(plan_file.name+'.started.json')
         _save(claim, {'plan_sha256':batch._sha(plan_file),'authority_sha256':batch._sha(authority_file),
                      'maximum_cli_starts':1,'scope_sha256':batch._sha(scope_file),'runner_sha256':batch._sha(caller_file),
@@ -485,30 +640,21 @@ def _candidate_phase_budget(authority: dict, rows: list) -> dict:
     from .flow_evals import _read_bound_artifact
     prior, diagnostic_prior = 0, 0
     parent = _read_bound_artifact(authority['parent_cumulative_authority'])
-    anchors = set()
-    included = parent.get('includes_previous_starts')
-    if type(included) is not int or included < 0:
-        raise ValueError('prior_budget_scope_invalid')
-    if included:
-        first = _read_bound_artifact(parent['first_phase_authority'])
-        anchors = {(r['file'],r['sha256']) for r in first['prior_plans']}
-        if len(anchors) != included:
-            raise ValueError('prior_budget_scope_invalid')
-    required = set(anchors)
-    if authority.get('prior_phase_authority') is not None:
-        previous = _read_bound_artifact(authority['prior_phase_authority'])
-        previous_scope = _read_bound_artifact(authority['prior_phase_scope'])
-        if (previous['scope_sha256'] != authority['prior_phase_scope']['sha256']
-                or previous['parent_cumulative_authority']['sha256'] != authority['parent_cumulative_authority']['sha256']):
-            raise ValueError('prior_budget_scope_invalid')
-        required.update((r['file'],r['sha256']) for r in previous['prior_plans'])
-        for row in previous_scope['cases']:
-            old = _read_bound_artifact(row['plan'])
-            count = _candidate_phase_start(Path(row['plan']['file']),old)
-            if count == 'unknown':
-                raise ValueError('prior_start_untrusted')
-            if count == 1:
-                required.add((row['plan']['file'],row['plan']['sha256']))
+    anchors = _candidate_parent_anchor_plans(parent)
+    _pointer, chain = _candidate_parent_chain(authority)
+    current = chain[0]
+    if authority['scope_sha256'] == current['scope']['sha256']:
+        if authority != _read_bound_artifact(current['authority']):
+            raise ValueError('phase_authority_drift')
+    elif (authority.get('prior_phase_authority') != current['authority']
+          or authority.get('prior_phase_scope') != current['scope']):
+        raise ValueError('prior_phase_binding_required')
+    required = {(r['file'], r['sha256']) for r in chain[-1]['original_started_plans']}
+    for node in chain:
+        if node['scope']['sha256'] != authority['scope_sha256']:
+            required.update(_candidate_phase_started_plans(_read_bound_artifact(node['scope'])))
+    current_paths = {str(path) for _row, path, _plan in rows}
+    required = {(file, digest) for file, digest in required if file not in current_paths}
     if {(r['file'],r['sha256']) for r in authority['prior_plans']} != required:
         raise ValueError('prior_budget_scope_invalid')
     seen = set()
@@ -526,6 +672,17 @@ def _candidate_phase_budget(authority: dict, rows: list) -> dict:
             raise ValueError('same_source_case_already_attempted')
         if _candidate_phase_start(path,plan) != 1:
             raise ValueError('prior_start_untrusted')
+        try:
+            report = batch.build_report(Path(plan['arms']['candidate']))
+            process = report['acceptance']['process']
+            if (report['usage']['status'] != 'exact' or process['state'] not in {'exited', 'cancelled', 'timed_out'}
+                    or type(process.get('exit_code')) is not int
+                    or report['source']['revision'] != reference['source_revision']
+                    or report['source']['archived_bytes'] != 'verified'
+                    or report['source']['role']['status'] != 'bound_runtime_record'):
+                raise ValueError('prior_execution_untrusted')
+        except (OSError, ValueError, KeyError, TypeError):
+            raise ValueError('prior_execution_untrusted') from None
         if any((Path(plan['arms']['baseline']) / name).exists() for name in ('started.json','cli-start.json','result.json')):
             raise ValueError('baseline_execution_forbidden')
         seen.add(path); prior += 1; diagnostic_prior += reference['diagnostic']
@@ -667,13 +824,28 @@ def _candidate_phase_status(scope_file: Path, authority_file: Path | None = None
     exhausted = next((field for field,limit in (('phase_cli_starts','maximum_cli_starts'),
         ('global_cli_starts','cumulative_maximum_cli_starts'),('diagnostic_cli_starts','candidate_diagnosis_limit'))
         if type(budget.get(field)) is int and type(limits.get(limit)) is int and budget[field] >= limits[limit]), None)
-    status = ('stopped' if stop is not None else 'blocked' if bad is not None or phase_count == 'unknown' or budget.get('binding_status') == 'unverified' or prerequisite['status'] in {'fail','unverified'}
-              else 'awaiting_independent_assessment' if pending is not None or prerequisite['status'] == 'pending'
-              else 'complete' if next_case is None else 'blocked' if exhausted else 'ready')
+    if stop is not None:
+        status, blocker = 'stopped', stop['reason']
+    elif bad is not None:
+        status, blocker = 'blocked', bad['state']
+    elif phase_count == 'unknown':
+        status, blocker = 'blocked', 'start_count_unknown'
+    elif budget.get('binding_status') == 'unverified':
+        status, blocker = 'blocked', 'budget_binding_unverified'
+    elif prerequisite['status'] in {'fail','unverified'}:
+        status, blocker = 'blocked', 'previous_quality_failure'
+    elif pending is not None or prerequisite['status'] == 'pending':
+        status, blocker = 'awaiting_independent_assessment', 'independent_quality_pending'
+    elif next_case is None:
+        status, blocker = 'complete', None
+    elif exhausted:
+        status, blocker = 'blocked', exhausted + '_exhausted'
+    else:
+        status, blocker = 'ready', None
     return {'schema_version':1,'kind':'preaudit_private_candidate_phase_status','candidate':scope['candidate'],
             'scope_sha256':batch._sha(scope_file),'status':status,'budget':budget,'cases':cases,
             'next_case':next_case if status == 'ready' else None,
-            'blocker':stop['reason'] if stop is not None else bad['state'] if bad else 'independent_quality_pending' if pending or prerequisite['status'] == 'pending' else 'previous_quality_failure' if prerequisite['status'] in {'fail','unverified'} else 'budget_binding_unverified' if budget.get('binding_status') == 'unverified' else exhausted + '_exhausted' if exhausted and next_case else None,
+            'blocker': blocker,
             'business_processing_seconds':{'status':'partial' if unknown_seconds else 'observed',
                 'observed_subtotal':sum(seconds),'unknown_attempts':unknown_seconds},
             'engineering_elapsed_seconds':'unknown','automated_preflight_seconds_observed':sum(preflight_seconds),
