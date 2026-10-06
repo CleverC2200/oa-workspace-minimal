@@ -30,6 +30,16 @@
 
 `python -m pytest tests/finance_preaudit/test_review_experiment.py tests/finance_preaudit/test_review_batch_report.py tests/finance_preaudit/test_review_cost_report.py tests/finance_preaudit/test_review_window_report.py -q` 使用受控外部进程，走实际 Worker → FlowEngine preview → 报告；不调用付费模型或 OA。现有 quality workflow 的 pytest/lint/hygiene/links 继续覆盖这些模块，未增加另一套检查平台。
 
+### 原生模型上下文检查
+
+已安装的固定 Codex CLI 0.160.0 可通过 `python -m scripts.quality native-contract --record /外部私有目录/native-contract.json` 检查。输出目录须已存在且仅当前用户可读，记录不能位于源码目录中或覆盖旧记录。入口不会安装或升级 CLI。缺少 CLI、版本未验证、运行失败或合同不完整时，记录为 `not_verified`，退出码为 1。
+
+检查用中性材料、空临时 HOME、合成密钥和固定 loopback 模拟服务，沿实际 Worker 只读调用、原生 CLI、FlowEngine preview 和已有资格报告运行。长 stdout 在 CLI 事件、下一模型请求和原生上下文中分别核对。默认历史预算截断必须被检测为不完整；招待费回退的双层60000预算须让全部798条合成字段及原文首尾完整到达。直接供给和其他流程保留默认预算，初始图片按实际编码字节核对。合法原对象按原消费者闭合，带英文前缀的原输出保持拒绝。每个原生进程最多60秒且沿 Worker 回收，不重试。
+
+记录绑定 CLI 路径、版本与二进制指纹、审核调用源码字节、有效调用配置和私有证据文件指纹。`python -m scripts.quality native-contract --record /外部私有目录/native-contract.json --reuse` 只核验已有记录，不进行模型协议调用。当前业务诊断派发可调用 `apps.oa_finance_preaudit.native_review_contract.readiness(record)`；仅 `status=verified` 且 `paid_dispatch_ready=true` 表示这项机制证明仍有效。源码、二进制、参数或证据变化后须重新检查，缺失或不可信的记录阻挡依赖该证明的派发。它不授予付费、OA或发布权限，计划、资料、授权与累计额度门继续独立核对。
+
+该检查没有真实业务材料或付费模型请求，不声称操作系统全外网隔离、真实供应商格式稳定、图片内容理解或财务正确。合成 preview 的业务样本资格保持不通过。对应 pytest 入口为 [原生合同回归](../../tests/finance_preaudit/test_native_review_contract.py)。原生 CLI 不在环境中时，显式 quality 检查仍记录未验证；pytest 的原生分支跳过不能代替这份证明。
+
 ## 运行与核对保护
 
 计划固定当前本地 apps Python 实现、宿主、driver、解释器和依赖清单；新进程加载前检查实际字节。calling-source 的项目指令和当前流程五份必需规则文档也必须在 Git 固定清单中，漏列不能用来绕过漂移检查。

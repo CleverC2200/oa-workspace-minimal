@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 from typing import Callable, TextIO, TYPE_CHECKING
+from urllib.parse import urlsplit
 
 from apps import json_artifact
 from apps.oa_approval import runtime_control, writer_outcomes
@@ -471,6 +472,7 @@ def _codex_command(
     decision_file: Path,
     *,
     tool_output_token_limit: int | None = None,
+    provider_base_url: str = "https://api.deepseek.com",
 ) -> list[str]:
     command = [
         "codex",
@@ -495,7 +497,7 @@ def _codex_command(
         "--config",
         (
             'model_providers.oa_deepseek={name="DeepSeek",'
-            'base_url="https://api.deepseek.com",wire_api="responses",'
+            f'base_url="{provider_base_url}",wire_api="responses",'
             'env_key="OA_REVIEW_API_KEY",requires_openai_auth=false}'
         ),
         # DeepSeek 的 Responses 实现是无状态的，必须关闭服务端响应存储。
@@ -908,9 +910,24 @@ def _execute_codex_raw(
     decision_parser: Callable[[str], object] = _parse_decision_json,
     audit_directory: Path | None = None,
     frozen_input: ReviewInput | None = None,
+    offline_api: tuple[str, dict[str, str]] | None = None,
 ) -> CodexExecution:
     trace_sse = os.environ.get(SSE_TRACE_ENV) == "1"
     try:
+        if offline_api is not None:
+            endpoint, isolated = offline_api
+            url = urlsplit(endpoint)
+            home = Path(isolated.get("HOME", ""))
+            if (read_only is not True or audit_directory is None
+                    or re.fullmatch(r"http://(?:127\.0\.0\.1|localhost):[0-9]{1,5}/?", endpoint) is None
+                    or url.scheme != "http" or url.hostname not in {"127.0.0.1", "localhost"}
+                    or url.port is None or url.path not in {"", "/"}
+                    or url.username is not None or url.password is not None or url.query or url.fragment
+                    or set(isolated) - {"HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "OA_REVIEW_API_KEY"}
+                    or isolated.get("OA_REVIEW_API_KEY") != "native-contract-placeholder"
+                    or not isolated.get("PATH") or not home.is_absolute() or home != home.resolve()
+                    or not home.is_dir() or stat.S_IMODE(home.stat().st_mode) & 0o077 or any(home.iterdir())):
+                raise ValueError("codex_review_task_invalid")
         if trace_sse:
             if read_only is not True or audit_directory is None:
                 raise ValueError("codex_review_task_invalid")
@@ -945,8 +962,9 @@ def _execute_codex_raw(
         codex_home = temporary_root / "codex-home"
         try:
             codex_home.mkdir(mode=0o700)
-            reviewer_environment = _reviewer_environment(
-                codex_home, trace_sse=trace_sse,
+            reviewer_environment = (
+                {**offline_api[1], "CODEX_HOME": str(codex_home), "OCX_SHIM_BYPASS": "1"}
+                if offline_api is not None else _reviewer_environment(codex_home, trace_sse=trace_sse)
             )
         except (OSError, ValueError) as error:
             output.close()
@@ -969,7 +987,11 @@ def _execute_codex_raw(
             project_root, schema_file, decision_file,
             **({"tool_output_token_limit": frozen_input.tool_output_token_limit}
                if frozen_input is not None and frozen_input.tool_output_token_limit is not None else {}),
+            **({"provider_base_url": offline_api[0]} if offline_api is not None else {}),
         )
+        if offline_api is not None:
+            command[2:2] = ["--skip-git-repo-check", "--config", 'web_search="disabled"',
+                            "--config", "mcp_servers={}", "--config", "tools.web_search=false"]
         if frozen_input is not None:
             try:
                 frozen_input.validate(action_file)
@@ -1028,6 +1050,8 @@ def _execute_codex_raw(
                 previous_sigterm_mask = None
 
         try:
+            if offline_api is not None:
+                stderr_summary["offline_native_command"] = list(command)
             process = subprocess.Popen(
                 command,
                 cwd=project_root,

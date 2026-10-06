@@ -278,9 +278,21 @@ def _event_body(path: Path) -> object:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="repository-quality")
-    parser.add_argument("check", choices=("skill", "hygiene", "format", "links", "pr", "yaml", "schema", "lint", "environment"))
+    parser.add_argument("check", choices=("skill", "hygiene", "format", "links", "pr", "yaml", "schema", "lint", "environment", "native-contract"))
     parser.add_argument("--event", type=Path)
+    parser.add_argument("--record", type=Path)
+    parser.add_argument("--reuse", action='store_true')
     args = parser.parse_args(argv)
+    if args.check == 'native-contract':
+        from apps.oa_finance_preaudit import native_review_contract
+        if args.record is None:
+            parser.error('native-contract requires --record outside the repository')
+        try:
+            result = native_review_contract.readiness(args.record) if args.reuse else native_review_contract.check(args.record)
+        except ValueError as error:
+            result = {'status': 'not_verified', 'reason': str(error), 'paid_dispatch_ready': False}
+        print(json.dumps({key: result.get(key) for key in ('status', 'reason', 'paid_dispatch_ready')}, ensure_ascii=False))
+        return 0 if result['status'] == 'verified' else 1
     files = tracked_files()
     if args.check == "skill":
         findings = check_skill()
