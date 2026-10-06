@@ -85,6 +85,10 @@ assert all(section not in final_check for section in sections)
 assert '历史财务核定结果只用于交叉复核' in received
 assert '食品商品' in received
 assert '已有原商品、服务或结算资料充分支持时正常采用' in received
+assert '申报金额只与同一已核定费用范围内的金额比较' in received
+assert '只有已确认某条费用申报高于其核销上限时' in received
+assert '必要范围仍待核且没有已确认超报时' in received
+assert '已确认超报与待核范围并存时' in received
 Path(''' + repr(str(observer)) + ''').write_text(received)
 schema=json.loads(Path(args[args.index('--output-schema')+1]).read_text())
 assert set(schema['required'])=={'schema_version','kind','action_token','workflow_key','rule_version','overall','items'}
