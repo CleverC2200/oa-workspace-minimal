@@ -48,6 +48,19 @@ def main():
     sys.path.insert(0, str(calling))
     from apps import json_artifact
     from apps.oa_finance_preaudit import codex_review_worker as worker, flow_engine
+    if mode == "native-readiness":
+        from apps.oa_finance_preaudit.native_review_contract import readiness
+        record_path = Path(sys.argv[4])
+        result = readiness(record_path)
+        if result["paid_dispatch_ready"]:
+            binding = json.loads(record_path.read_text())["binding"]
+            if (binding["cli_path"] != plan["reviewer"]
+                    or binding["cli_sha256"] != plan["reviewer_sha256"]
+                    or binding["source_files"]["scripts/review_experiment_host.py"] != plan["host_sha256"]):
+                result = {"status": "not_verified", "paid_dispatch_ready": False,
+                          "reason": "native_contract_not_current"}
+        print(json.dumps(result))
+        return
     action_path = Path(manifest["action_file"])
     engine = flow_engine.FlowEngine(root=action_path.parents[4], discover_candidates=unavailable, collect_material=unavailable, submit_frozen=unavailable, recover_frozen=unavailable)
     started_at = time.monotonic()
