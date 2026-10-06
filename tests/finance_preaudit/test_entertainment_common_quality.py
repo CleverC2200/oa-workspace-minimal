@@ -127,10 +127,13 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'cached_inp
 
 @pytest.mark.parametrize('fallback', [False, True])
 def test_detail_locations_survive_both_reading_paths_without_changing_evidence(tmp_path, monkeypatch, fallback):
+    tmp_path = tmp_path / "frozen source ' $(literal)"
+    tmp_path.mkdir()
     fields = [
         {'path': 'main[0].field[0]', 'value': '原主表值'},
         {'path': 'detail[0].row[0].field[6]', 'value': None, 'read_status': 'unresolved'},
-        {'path': 'detail[0].row[6].field[6]', 'value': '原转款甲'},
+        {'path': 'detail[0].row[6].field[6]', 'value': '原转款甲', 'name': '同名字段'},
+        {'path': 'detail[0].row[6].field[7]', 'value': {'原嵌套': [0, None]}, 'name': '同名字段'},
         {'path': 'detail[0].row[7].field[6]', 'value': '原转款乙', 'extra': False},
         {'path': 'detail[0].row[8].field[6]', 'value': '原里程甲'},
         {'path': 'detail[0].row[9].field[6]', 'value': '原里程乙'},
@@ -155,12 +158,16 @@ def test_detail_locations_survive_both_reading_paths_without_changing_evidence(t
                      'missing_evidence': ['原明细的必要事实待核。']}
                     for item in packet['items']]}
     script = tmp_path / 'location-reviewer.py'
-    script.write_text('''import json,sys,subprocess
+    script.write_text('''import json,sys,subprocess,shlex,re
 from pathlib import Path
 args=sys.argv[1:];prompt=sys.stdin.read()
 source=Path(''' + repr(str(ROOT)) + ''')
 if ''' + repr(fallback) + ''':
- text=subprocess.run([sys.executable,'-m','apps.oa_finance_preaudit.read_material',''' + repr(str(action)) + '''],cwd=source,capture_output=True,text=True,check=True).stdout
+ command=re.search(r'`(' + re.escape('python3 -B -m apps.oa_finance_preaudit.read_material ') + r'[^`]+)`',prompt)
+ assert command, 'fallback did not deliver the actual lossless reader command'
+ argv=shlex.split(command.group(1))
+ assert argv==['python3','-B','-m','apps.oa_finance_preaudit.read_material',''' + repr(str(action)) + ''']
+ text=subprocess.run([sys.executable,*argv[1:]],cwd=source,capture_output=True,text=True,check=True).stdout
 else:
  text=prompt
  original=json.loads(prompt.split('冻结数据：material\\n\\n',1)[1].split('\\n\\n冻结输入原文结束。',1)[0])
@@ -173,8 +180,16 @@ assert 'declared_fields.path 完整字段路径（含 field[...]）' in prompt
 assert all(label in prompt for label in expected)
 assert all(label in text for label in expected)
 assert all(text.count(label)==1 for label in expected)
+if ''' + repr(fallback) + ''':
+ for label in expected:
+  prefix=label.split('：',1)[0]
+  adjacent=text.split(label+'\\n',1)[1].splitlines()[0]
+  assert prefix+'.field[' in adjacent
+ assert '原转款甲' in text.split(expected[1]+'\\n',1)[1].splitlines()[0]
+ assert '原里程乙' in text.split(expected[4]+'\\n',1)[1].splitlines()[0]
 assert 'main[0].field[0]：明细表' not in text
 assert 'unresolved-source：明细表' not in text
+assert 'unresolved-source' in text and '原数组值' in text
 assert 'evidence_refs' in prompt
 Path(args[args.index('--output-last-message')+1]).write_text(''' + repr(json.dumps(decision, ensure_ascii=False)) + ''')
 print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'cached_input_tokens':0,'output_tokens':5}}))

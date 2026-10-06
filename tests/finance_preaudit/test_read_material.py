@@ -11,8 +11,10 @@ from apps.oa_finance_preaudit import read_material, flow_engine
 def test_every_material_value_and_order_survives_readable_view():
     material = {
         "declared_fields": [
-            {"path": "detail[0].row[0].field[6]", "value": "quoted\nvalue", "read_status": "unresolved"},
-            {"path": "detail[0].row[6].field[6]", "value": None},
+            {"path": "detail[0].row[0].field[6]", "name": "同名", "value": "quoted\nvalue", "read_status": "unresolved"},
+            {"path": "detail[0].row[6].field[6]", "name": "同名", "value": None},
+            {"path": "detail[0].row[6].field[7]", "name": "同名",
+             "value": {"nested": [False, 0, None]}, "extra": "保留属性"},
         ],
         "prepared": {"images": [
             {"path": "one.png", "spreadsheet_cell": "照片!B2"},

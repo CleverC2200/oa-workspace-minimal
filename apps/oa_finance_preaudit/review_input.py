@@ -13,6 +13,7 @@ import threading
 import platform
 import sys
 import json
+import shlex
 import math
 from pathlib import Path
 
@@ -122,10 +123,16 @@ class ReviewInput:
     @property
     def instruction(self) -> str:
         if self.fallback_reason:
+            # load accepts only action.json and validates its same-attempt material.json.
+            action_file = Path(self.bundle['review_packet']['material_file']).with_name('action.json')
+            reader_command = 'python3 -B -m apps.oa_finance_preaudit.read_material ' + shlex.quote(str(action_file))
             return ('完整输入直供已回退（' + self.fallback_reason + '）。'
                     '沿用原读取路径，完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，'
                     '按其路由读取 `references/result-contract.md`、`references/observation-contract.md`、'
-                    '`references/flows/business-entertainment.md`、动作引用的审核包、材料和全部准备页；\n\n'
+                    '`references/flows/business-entertainment.md`、动作引用的审核包和全部准备页；'
+                    '冻结材料先执行 `' + reader_command + '` 完整读取现有无损视图；'
+                    '视图保留全部原属性、读取状态及完整路径，明细行号与原字段就近显示；'
+                    '若输出截断，按行分段继续读完。原图仍按原页面覆盖规则观察。\n\n'
                     + render_detail_locations(self.bundle['material']) + '\n\n')
         return ('完整原文已随本条消息提供。宿主校验仅确认当前冻结身份、文件和资源映射一致，'
                 '不表示申报内容、实际支付或费用对应关系已经核验；业务判断仍须遵守下列完整原规则。'

@@ -13,6 +13,23 @@ def _json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
 
 
+_DETAIL_LOCATION_CONVENTION = (
+    '明细定位显示：原路径的表、行索引从0起，显示表、行号从1起；'
+    '各表分别计行；标签仅为行定位前缀，不证明业务事实。表单 evidence_refs 逐字使用原 '
+    'declared_fields.path 完整字段路径（含 field[...]），不是显示的行前缀。'
+)
+
+
+def _detail_location(path: object) -> tuple[str, str] | None:
+    if not isinstance(path, str):
+        return None
+    location = re.fullmatch(r'(detail\[(\d+)\]\.row\[(\d+)\])(?:\.field\[\d+\])?', path)
+    if location is None:
+        return None
+    original, table, row = location.groups()
+    return original, f'{original}：明细表{int(table) + 1}第{int(row) + 1}行'
+
+
 def render_detail_locations(material: dict) -> str:
     """Display original per-table row locations; never copy or judge their values."""
     fields = material.get('declared_fields')
@@ -20,19 +37,12 @@ def render_detail_locations(material: dict) -> str:
         return ''
     labels = {}
     for field in fields:
-        path = field.get('path') if isinstance(field, dict) else None
-        if not isinstance(path, str):
-            continue
-        location = re.fullmatch(r'(detail\[(\d+)\]\.row\[(\d+)\])(?:\.field\[\d+\])?', path)
-        if location:
-            original, table, row = location.groups()
-            labels[original] = f'{original}：明细表{int(table) + 1}第{int(row) + 1}行'
+        location = _detail_location(field.get('path')) if isinstance(field, dict) else None
+        if location is not None:
+            labels[location[0]] = location[1]
     if not labels:
         return ''
-    return ('明细定位显示：原路径的表、行索引从0起，显示表、行号从1起；'
-            '各表分别计行；标签仅为行定位前缀，不证明业务事实。表单 evidence_refs 逐字使用原 '
-            'declared_fields.path 完整字段路径（含 field[...]），不是显示的行前缀。\n'
-            + '\n'.join(labels.values()))
+    return _DETAIL_LOCATION_CONVENTION + '\n' + '\n'.join(labels.values())
 
 
 def render(material: dict) -> str:
@@ -49,7 +59,14 @@ def render(material: dict) -> str:
         ):
             keys = list(dict.fromkeys(key for row in value for key in row))
             lines.append('columns=' + _json(keys))
+            if path == 'material.declared_fields':
+                lines.append(_DETAIL_LOCATION_CONVENTION)
+            previous_location = None
             for index, row in enumerate(value):
+                location = _detail_location(row.get('path')) if path == 'material.declared_fields' else None
+                if location is not None and location[0] != previous_location:
+                    lines.append(location[1])
+                previous_location = location[0] if location is not None else None
                 # A separate list preserves absent keys vs explicit null values.
                 lines.append(f'{index}: ' + _json([row.get(key) for key in keys]))
                 absent = [key for key in keys if key not in row]
@@ -64,10 +81,6 @@ def render(material: dict) -> str:
                 section(f'material.prepared.{child}', data)
         else:
             section(f'material.{key}', value)
-            if key == 'declared_fields':
-                locations = render_detail_locations(material)
-                if locations:
-                    lines.append(locations)
     return '\n'.join(lines) + '\n'
 
 
