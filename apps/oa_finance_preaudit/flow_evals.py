@@ -1019,7 +1019,27 @@ def _financial_replay_binding(review: dict, checklist: dict, assessment: dict) -
             raise ValueError("financial_review_binding_invalid") from error
         if not same:
             raise ValueError("financial_review_binding_invalid")
-    return {**binding, "start": start, "final_contract": report["acceptance"]["final_contract"]}
+    return {**binding, "archive_manifest_sha256": fingerprint,
+            "start": start, "final_contract": report["acceptance"]["final_contract"]}
+
+
+def _expectations_timing(freeze: dict | None, checklist_sha256: str, start: dict) -> dict:
+    if freeze is None:
+        return {"status": "unknown", "reason": "expectations_not_bound"}
+    if (freeze.get("kind") != "preaudit_expectations_freeze"
+            or freeze.get("checklist_sha256") != checklist_sha256):
+        return {"status": "unverified", "reason": "freeze_binding_mismatch"}
+    if start.get("status") != "bound_source_host_receipt":
+        return {"status": "unknown", "reason": "replay_start_not_bound"}
+    try:
+        frozen = datetime.fromisoformat(freeze["frozen_at"])
+        started = datetime.fromisoformat(start["replay_started_at"])
+    except (KeyError, TypeError, ValueError):
+        return {"status": "unknown", "reason": "freeze_or_start_time_missing_or_invalid"}
+    if frozen.tzinfo is None or started.tzinfo is None:
+        return {"status": "unknown", "reason": "timezone_missing"}
+    return ({"status": "verified", "reason": "frozen_before_replay"} if frozen <= started
+            else {"status": "unverified", "reason": "frozen_after_replay_start"})
 
 
 def build_financial_quality_report(reviews: object) -> dict:
@@ -1111,21 +1131,15 @@ def build_financial_quality_report(reviews: object) -> dict:
             except (KeyError, TypeError, ValueError) as error:
                 raise ValueError("financial_review_invalid") from error
         historical = _historical_crosscheck(checklist)
-        frozen_before = False
-        if review.get("expectations") is not None:
-            freeze = _read_bound_artifact(review["expectations"])
-            try:
-                frozen = datetime.fromisoformat(freeze["frozen_at"])
-                started_value = binding["start"].get("replay_started_at")
-                started = datetime.fromisoformat(started_value) if started_value else None
-                frozen_before = (freeze.get("kind") == "preaudit_expectations_freeze"
-                                 and freeze.get("checklist_sha256") == review["checklist"]["sha256"]
-                                 and freeze.get("historical_crosscheck") == historical == "complete"
-                                 and freeze.get("flow_configs") == _flow_config_pins()
-                                 and frozen.tzinfo is not None and started is not None
-                                 and frozen <= started)
-            except (KeyError, TypeError, ValueError) as error:
-                raise ValueError("financial_review_invalid") from error
+        freeze = (_read_bound_artifact(review["expectations"])
+                  if review.get("expectations") is not None else None)
+        if freeze is not None and not isinstance(freeze, dict):
+            raise ValueError("financial_review_invalid")
+        timing = _expectations_timing(freeze, review["checklist"]["sha256"], binding["start"])
+        # Preserve the v1 qualification conjunction; timing alone cannot clear history/configuration.
+        frozen_before = bool(freeze is not None and timing["status"] == "verified"
+                             and freeze.get("historical_crosscheck") == historical == "complete"
+                             and freeze.get("flow_configs") == _flow_config_pins())
         workflow, scenario = checklist["workflow_key"], checklist["scenario"]
         if workflow == "business_entertainment" and checklist["source_kind"] == "real_archive":
             covered.add(scenario)
@@ -1143,10 +1157,12 @@ def build_financial_quality_report(reviews: object) -> dict:
                       "complete_review_scope": complete_scope,
                       "missing_review_items": sorted(set(required_items) - covered_items),
                       "historical_crosscheck": historical,
+                      "expectations_timing": timing,
                       "expectations_frozen_before_replay": frozen_before,
                       "result_audit_complete": result_audit_complete,
                       "binding_status": binding["status"],
                       "original_final_contract": binding.get("final_contract", "not_established"),
+                      "archive_manifest_sha256": binding.get("archive_manifest_sha256"),
                       "window_binding": window_binding,
                       "replay_start_status": binding["start"]["status"],
                       "checklist_sha256": review["checklist"]["sha256"],
@@ -1158,7 +1174,8 @@ def build_financial_quality_report(reviews: object) -> dict:
                       "result_reviewed_by_finance": result_reviewed_by_finance})
     confirmed = bool(cases) and all(case["financial_confirmed_before_replay"] for case in cases)
     missing = sorted(_FINANCIAL_SCENARIOS - covered)
-    return {"schema_version": 1, "kind": "preaudit_financial_quality_report",
+    return {"schema_version": 2, "kind": "preaudit_financial_quality_report",
+            "legacy_expectations_flag_semantics": "time_history_and_configuration_conjunction",
             "cases": cases, "financial_confirmation": "confirmed" if confirmed else "pending",
             "missing_entertainment_scenarios": missing,
             "eligible": bool(cases) and not missing and all(
@@ -1170,6 +1187,53 @@ def build_financial_quality_report(reviews: object) -> dict:
                 and case["verdict"] == "pass" and case["result_audit_complete"]
                 and case["historical_crosscheck"] == "complete"
                 and case["expectations_frozen_before_replay"] for case in cases)}
+
+
+def read_financial_quality_report(reference: dict) -> dict:
+    """Read saved quality evidence without recomputing its scores or qualification."""
+    report = _read_bound_artifact(reference)
+    semantics = "time_history_and_configuration_conjunction"
+    if (not isinstance(report, dict)
+            or report.get("kind") != "preaudit_financial_quality_report"
+            or type(report.get("schema_version")) is not int
+            or report["schema_version"] not in {1, 2}
+            or type(report.get("eligible")) is not bool
+            or not isinstance(report.get("cases"), list) or not report["cases"]
+            or (report["schema_version"] == 2
+                and report.get("legacy_expectations_flag_semantics") != semantics)):
+        raise ValueError("financial_quality_report_invalid")
+    cases = []
+    keys = set()
+    for case in report["cases"]:
+        if (not isinstance(case, dict) or not isinstance(case.get("item_key"), str)
+                or case["item_key"] in keys
+                or case.get("workflow_key") not in WORKFLOW_KEYS
+                or case.get("historical_crosscheck") not in {"complete", "conflict", "missing"}
+                or case.get("verdict") not in {"pass", "fail", "unverified"}
+                or type(case.get("expectations_frozen_before_replay")) is not bool):
+            raise ValueError("financial_quality_report_invalid")
+        keys.add(case["item_key"])
+        timing = case.get("expectations_timing")
+        if report["schema_version"] == 1:
+            timing = {"status": "unknown", "reason": "legacy_conjunction_no_separate_timing"}
+        elif (not isinstance(timing, dict)
+              or timing not in (
+                  {"status": "verified", "reason": "frozen_before_replay"},
+                  {"status": "unverified", "reason": "frozen_after_replay_start"},
+                  {"status": "unverified", "reason": "freeze_binding_mismatch"},
+                  {"status": "unknown", "reason": "expectations_not_bound"},
+                  {"status": "unknown", "reason": "replay_start_not_bound"},
+                  {"status": "unknown", "reason": "freeze_or_start_time_missing_or_invalid"},
+                  {"status": "unknown", "reason": "timezone_missing"},
+              )):
+            raise ValueError("financial_quality_report_invalid")
+        outcomes = case.get("check_outcomes")
+        if outcomes is not None and (not isinstance(outcomes, dict)
+                or any(not isinstance(key, str) or value not in {"pass", "fail", "unverified"}
+                       for key, value in outcomes.items())):
+            raise ValueError("financial_quality_report_invalid")
+        cases.append({**case, "expectations_timing": timing})
+    return {**report, "cases": cases, "legacy_expectations_flag_semantics": semantics}
 
 
 def build_acceptance_report(

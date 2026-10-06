@@ -20,6 +20,22 @@
 
 ## 报告资格
 
+新生成的财务质量报告使用 `schema_version=2`。业务决定、预期冻结和人工评估仍使用原格式。每个 case 的 `expectations_timing` 单独说明冻结时间是否早于可信启动回执，`historical_crosscheck` 保留原历史核对状态。提前冻结且历史冲突时，前者为 `verified`，后者为 `conflict`，资格仍为 false。
+
+| 时序状态 | reason | 含义 |
+| --- | --- | --- |
+| verified | frozen_before_replay | 清单指纹匹配，两个时间均有时区，冻结不晚于可信启动 |
+| unverified | frozen_after_replay_start | 冻结晚于可信启动 |
+| unverified | freeze_binding_mismatch | 冻结记录未绑定当前清单或类型不符 |
+| unknown | expectations_not_bound | 没有绑定冻结记录 |
+| unknown | replay_start_not_bound | 没有可信宿主启动回执 |
+| unknown | freeze_or_start_time_missing_or_invalid | 时间缺失或无效 |
+| unknown | timezone_missing | 冻结或启动时间没有时区 |
+
+文件指纹漂移仍直接拒绝评估，不生成时间通过结果。`expectations_frozen_before_replay` 保留旧的时间、历史及配置合取条件，报告以 `legacy_expectations_flag_semantics=time_history_and_configuration_conjunction` 明示该含义。配置漂移或历史冲突可使它为 false，即使独立时间状态通过。`eligible` 继续要求原完整场景、真实存档、完整核对、原生成合同、实际消费及全部原资格条件。
+
+`read_financial_quality_report(reference)` 只读取已绑定报告，不重算评分或资格。它接受 schema 1 和 2。schema 1 未独立记录时序证明，展示 `unknown` 与 `legacy_conjunction_no_separate_timing`，保留原合取标志及原 eligible。读取不会写回旧文件。
+
 返回每条事实结论、历史交叉核对、事前冻结、实际消费、来源种类和事后核对状态。五类业务招待场景为普通支付、多支付/退款/确认超报、关系不明、合法共享支付、已确认异常与其他未知并存。全部准入结果须来自真实存档、事前完成无未解冲突的交叉核对、真实闭合且逐项正确；混入合成结果不能通过。合成记录只证明工程行为。
 
 原验收入口还要求每个闭合样例都经过同一核对窗口。旧资源覆盖、格式、完整用量及提交安全门继续保留，无 financial_reviews 的旧报告不代表已经新增业务语义验收。

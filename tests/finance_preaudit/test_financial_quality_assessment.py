@@ -245,11 +245,15 @@ def test_missing_consumed_preview_remains_engineering_only(tmp_path):
 
 
 def test_unknown_actual_start_cannot_be_replaced_by_outer_timestamp(tmp_path):
-    report = flow_evals.build_financial_quality_report(_archived_review(tmp_path, trusted_start=False))
+    reviews = _archived_review(tmp_path, trusted_start=False)
+    reviews[0]["expectations"] = flow_evals.freeze_financial_expectations(
+        reviews[0]["checklist"], tmp_path / "expectations.json")
+    report = flow_evals.build_financial_quality_report(reviews)
     assert report["cases"][0]["verdict"] == "pass"
     assert report["cases"][0]["replay_start_status"] == "not_established"
     assert report["financial_confirmation"] == "pending"
     assert report["eligible"] is False
+    assert report["cases"][0]["expectations_timing"] == {"status": "unknown", "reason": "replay_start_not_bound"}
 
 
 def test_valid_bound_preview_keeps_post_run_financial_review_possible(tmp_path):
@@ -357,12 +361,21 @@ def test_historical_conflict_or_approval_only_basis_cannot_qualify(tmp_path, mon
     checklist["historical_checks"][0]["outcome"] = "conflict"
     ref = _artifact(tmp_path, "conflict-checklist.json", checklist)
     first["checklist"] = ref
-    first["expectations"] = flow_evals.freeze_financial_expectations(ref, tmp_path / "conflict-freeze.json")
+    class BeforeClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 3, 10, tzinfo=timezone.utc)
+    with monkeypatch.context() as clock:
+        clock.setattr(flow_evals, "datetime", BeforeClock)
+        first["expectations"] = flow_evals.freeze_financial_expectations(ref, tmp_path / "conflict-freeze.json")
     assessment = json.loads(Path(first["assessment"]["file"]).read_text())
     assessment["checklist_sha256"] = ref["sha256"]
     first["assessment"] = _artifact(tmp_path, "conflict-assessment.json", assessment)
     report = flow_evals.build_financial_quality_report(reviews)
+    assert report["schema_version"] == 2
     assert report["cases"][0]["historical_crosscheck"] == "conflict"
+    assert report["cases"][0]["expectations_timing"] == {"status": "verified", "reason": "frozen_before_replay"}
+    assert report["cases"][0]["expectations_frozen_before_replay"] is False
     assert report["eligible"] is False
     checklist["historical_checks"][0]["basis"] = "historical_agree_only"
     ref = _artifact(tmp_path, "agree-only-checklist.json", checklist)
@@ -380,6 +393,7 @@ def test_late_freeze_cannot_qualify_already_consumed_replay(tmp_path, monkeypatc
     reviews[0]["expectations"] = flow_evals.freeze_financial_expectations(
         reviews[0]["checklist"], tmp_path / "late-freeze.json")
     report = flow_evals.build_financial_quality_report(reviews)
+    assert report["cases"][0]["expectations_timing"] == {"status": "unverified", "reason": "frozen_after_replay_start"}
     assert report["cases"][0]["expectations_frozen_before_replay"] is False
     assert report["eligible"] is False
 
@@ -611,7 +625,10 @@ def test_same_configuration_bytes_transfer_between_source_checkouts_but_drift_do
     data = json.loads(changed.read_text())
     data['controlled_snapshot_note'] = 'changed actual configuration bytes'
     changed.write_text(json.dumps(data))
-    assert flow_evals.build_financial_quality_report(reviews)['eligible'] is False
+    drifted = flow_evals.build_financial_quality_report(reviews)
+    assert drifted['eligible'] is False
+    assert drifted['cases'][0]['expectations_timing']['status'] == 'verified'
+    assert drifted['cases'][0]['expectations_frozen_before_replay'] is False
 
 
 def test_new_preparation_retains_rule_bytes_after_working_source_changes(tmp_path):
@@ -640,3 +657,148 @@ def test_report_preserves_passing_core_checks_when_disclosure_or_internal_facts_
     assert case["verdict"] == "fail"
     assert case["failed_checks"] == ["internal_payment_fact"]
     assert case["unverified_checks"] == ["confirmed_amount_disclosure"]
+
+
+def test_window_displays_bound_freeze_timing_without_clearing_history_conflict(tmp_path, monkeypatch):
+    from apps.oa_finance_preaudit import review_window_report
+    from tests.finance_preaudit.test_review_window_report import select
+
+    reviews = _scene_reviews(tmp_path, ["real_archive"] * 5, monkeypatch)
+    first = reviews[0]
+    checklist = json.loads(Path(first["checklist"]["file"]).read_text())
+    checklist["historical_checks"][0]["outcome"] = "conflict"
+    first["checklist"] = _artifact(tmp_path, "conflict-checklist.json", checklist)
+    freeze = json.loads(Path(first["expectations"]["file"]).read_text())
+    freeze.update(checklist_sha256=first["checklist"]["sha256"], historical_crosscheck="conflict")
+    first["expectations"] = _artifact(tmp_path, "conflict-freeze.json", freeze)
+    assessment = json.loads(Path(first["assessment"]["file"]).read_text())
+    assessment["checklist_sha256"] = first["checklist"]["sha256"]
+    first["assessment"] = _artifact(tmp_path, "conflict-assessment.json", assessment)
+    quality = flow_evals.build_financial_quality_report(reviews)
+    reference = _artifact(tmp_path, "quality.json", quality)
+    originals = {Path(ref["file"]): Path(ref["file"]).read_bytes()
+                 for review in reviews for ref in (review["checklist"], review["assessment"], review["expectations"])}
+    selection = select(tmp_path, [Path(review["archive"]["file"]).parent for review in reviews])
+    document = json.loads(selection.read_text())
+    document["financial_quality_reports"] = [reference]
+    _artifact(selection.parent, selection.name, document)
+
+    window = review_window_report.build_window(selection)
+
+    display = window["financial_quality"]
+    assert display["status"] == "verified"
+    assert display["reports"][0]["reported_eligible"] is False
+    case = display["reports"][0]["cases"][0]
+    assert case["batch_index"] == 0
+    assert case["expectations_timing"]["status"] == "verified"
+    assert case["historical_crosscheck"] == "conflict"
+    assert case["expectations_frozen_before_replay"] is False
+    assert window["current"]["acceptance"]["full_financial_signoff"] == "not_established"
+    assert window["write_authorization"] is False
+    html = review_window_report.render_window(window)
+    assert "冻结时序" in html and "历史冲突" in html
+    assert all(path.read_bytes() == raw for path, raw in originals.items())
+
+
+@pytest.mark.parametrize("change,reason", [
+    ("missing", "expectations_not_bound"),
+    ("no_time", "freeze_or_start_time_missing_or_invalid"),
+    ("no_timezone", "timezone_missing"),
+    ("wrong_checklist", "freeze_binding_mismatch"),
+])
+def test_unproved_freeze_time_keeps_original_quality_gate_closed(tmp_path, monkeypatch, change, reason):
+    reviews = _scene_reviews(tmp_path, ["real_archive"] * 5, monkeypatch)
+    first = reviews[0]
+    freeze = json.loads(Path(first["expectations"]["file"]).read_text())
+    if change == "missing":
+        first.pop("expectations")
+    else:
+        if change == "no_time":
+            freeze.pop("frozen_at")
+        elif change == "no_timezone":
+            freeze["frozen_at"] = "2026-10-03T10:00:00"
+        else:
+            freeze["checklist_sha256"] = "f" * 64
+        first["expectations"] = _artifact(tmp_path, "unproved-freeze.json", freeze)
+    report = flow_evals.build_financial_quality_report(reviews)
+    assert report["cases"][0]["expectations_timing"]["reason"] == reason
+    assert report["cases"][0]["expectations_timing"]["status"] != "verified"
+    assert report["cases"][0]["historical_crosscheck"] == "complete"
+    assert report["cases"][0]["expectations_frozen_before_replay"] is False
+    assert report["eligible"] is False
+
+
+def test_freeze_digest_drift_rejects_quality_instead_of_relabelling_timing(tmp_path, monkeypatch):
+    reviews = _scene_reviews(tmp_path, ["real_archive"] * 5, monkeypatch)
+    Path(reviews[0]["expectations"]["file"]).write_text("{}")
+    with pytest.raises(ValueError, match="financial_review_evidence_changed"):
+        flow_evals.build_financial_quality_report(reviews)
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_window_keeps_saved_report_semantics_and_bytes(tmp_path, version):
+    from apps.oa_finance_preaudit import review_window_report
+    from tests.finance_preaudit.test_review_window_report import select
+
+    reviews = _archived_review(tmp_path)
+    quality = flow_evals.build_financial_quality_report(reviews)
+    quality["schema_version"] = version
+    if version == 1:
+        quality.pop("legacy_expectations_flag_semantics")
+        for case in quality["cases"]:
+            case.pop("expectations_timing")
+            case.pop("archive_manifest_sha256")
+    reference = _artifact(tmp_path, "saved-quality.json", quality)
+    saved = Path(reference["file"]).read_bytes()
+    selection = select(tmp_path, [Path(reviews[0]["archive"]["file"]).parent])
+    document = json.loads(selection.read_text())
+    document["financial_quality_reports"] = [reference]
+    _artifact(selection.parent, selection.name, document)
+
+    window = review_window_report.build_window(selection)
+
+    evidence = window["financial_quality"]["reports"][0]
+    assert evidence["status"] == "verified"
+    assert evidence["schema_version"] == version
+    assert evidence["reported_eligible"] is False
+    assert evidence["cases"][0]["expectations_timing"]["status"] == "unknown"
+    assert evidence["cases"][0]["expectations_timing"]["reason"] == (
+        "legacy_conjunction_no_separate_timing" if version == 1 else "expectations_not_bound")
+    assert evidence["cases"][0]["expectations_frozen_before_replay"] == quality["cases"][0]["expectations_frozen_before_replay"]
+    assert Path(reference["file"]).read_bytes() == saved
+
+
+@pytest.mark.parametrize("mismatch", ["window", "source", "key", "missing_window", "digest", "timing"])
+def test_window_does_not_attach_quality_from_wrong_or_unproved_source(tmp_path, mismatch):
+    from apps.oa_finance_preaudit import review_window_report
+    from tests.finance_preaudit.test_review_window_report import select
+
+    reviews = _archived_review(tmp_path)
+    quality = flow_evals.build_financial_quality_report(reviews)
+    quality["eligible"] = True  # A stored claim cannot grant window qualification.
+    case = quality["cases"][0]
+    if mismatch == "window":
+        case["window_binding"]["closed_at"] = "2025-01-01T00:00:00+00:00"
+    elif mismatch == "source":
+        case["archive_manifest_sha256"] = "f" * 64
+    elif mismatch == "key":
+        case["item_key"] = "f" * 64
+    elif mismatch == "missing_window":
+        case.pop("window_binding")
+    elif mismatch == "timing":
+        case["expectations_timing"] = {"status": "verified", "reason": "frozen_after_replay_start"}
+    reference = _artifact(tmp_path, "wrong-quality.json", quality)
+    if mismatch == "digest":
+        Path(reference["file"]).write_text("{}")
+    selection = select(tmp_path, [Path(reviews[0]["archive"]["file"]).parent])
+    document = json.loads(selection.read_text())
+    document["financial_quality_reports"] = [reference]
+    _artifact(selection.parent, selection.name, document)
+
+    window = review_window_report.build_window(selection)
+
+    assert window["financial_quality"]["status"] == "unverified"
+    assert "reported_eligible" not in window["financial_quality"]["reports"][0]
+    assert window["financial_quality"]["qualification"] == "not_granted_by_window"
+    assert window["current"]["acceptance"]["full_financial_signoff"] == "not_established"
+    assert window["current"]["new_execution_authority"] is False

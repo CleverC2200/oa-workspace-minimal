@@ -8,6 +8,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from . import (
+    flow_evals,
     flow_engine,
     review_batch_report as batch,
     review_context,
@@ -211,6 +212,51 @@ def _current(selection, reports):
     }
 
 
+def _financial_quality(selection, reports):
+    references = selection.get("financial_quality_reports")
+    result = {"status": "not_established", "reports": [],
+              "qualification": "not_granted_by_window"}
+    if references is None:
+        return result
+    if not isinstance(references, list) or not references:
+        return {**result, "status": "unverified", "reason": "quality_report_binding_missing"}
+    for reference in references:
+        try:
+            quality = flow_evals.read_financial_quality_report(reference)
+            cases = []
+            for case in quality["cases"]:
+                matches = []
+                for index, report in enumerate(reports):
+                    binding = report.get("financial_binding", {})
+                    metric = binding.get("case_metric")
+                    protected = case.get("window_binding")
+                    if (case["item_key"] == binding.get("item_key")
+                            and case["workflow_key"] == report["scope"]["workflow"]
+                            and isinstance(metric, dict) and isinstance(protected, dict)
+                            and set(protected) == {"closed_at", "stage_timestamps", "execution_state",
+                                                   "business_state", "write_state", "quality", "pipeline_evidence"}
+                            and protected == {field: metric.get(field) for field in protected}
+                            and (quality["schema_version"] == 1 or
+                                 case.get("archive_manifest_sha256") == report["archive_fingerprint"])):
+                        matches.append(index)
+                if len(matches) != 1:
+                    raise ValueError("quality_window_binding_mismatch")
+                cases.append({"batch_index": matches[0], **{field: case[field] for field in (
+                    "workflow_key", "expectations_timing", "historical_crosscheck",
+                    "expectations_frozen_before_replay", "verdict",
+                )}, **{field: case.get(field, "not_established") for field in (
+                    "binding_status", "original_final_contract", "result_audit_complete",
+                    "complete_review_scope", "check_outcomes",
+                )}})
+            result["reports"].append({"status": "verified", "schema_version": quality["schema_version"],
+                "legacy_expectations_flag_semantics": quality["legacy_expectations_flag_semantics"],
+                "reported_eligible": quality["eligible"], "cases": cases})
+        except (OSError, ValueError, TypeError, KeyError):
+            result["reports"].append({"status": "unverified", "reason": "quality_report_or_window_binding_unverified"})
+    result["status"] = "verified" if all(r["status"] == "verified" for r in result["reports"]) else "unverified"
+    return result
+
+
 def build_window(selection_file: Path) -> dict:
     """Validate every explicitly selected archive and preserve rejected contributions."""
     try:
@@ -296,6 +342,7 @@ def build_window(selection_file: Path) -> dict:
             },
             "comparison": comparison,
             "current": _current(selection, reports),
+            "financial_quality": _financial_quality(selection, reports),
             "history": [{"batch_index": i, **r} for i, r in enumerate(reports)],
             "write_authorization": False,
         }
@@ -424,6 +471,25 @@ def render_window(report: dict) -> str:
         + "；不授予执行权。</li>"
         for p in current["plans"]
     )
+    quality = report.get("financial_quality", {"status": "not_established", "reports": []})
+    timing_labels = {"verified": "执行前已冻结", "unverified": "未验证", "unknown": "未知"}
+    history_labels = {"complete": "历史核对完整", "conflict": "历史冲突", "missing": "缺少历史核对"}
+    quality_rows = []
+    for evidence in quality["reports"]:
+        for case in evidence.get("cases", []):
+            outcomes = case["check_outcomes"]
+            checks = (" / ".join(str(sum(value == state for value in outcomes.values()))
+                                  for state in ("pass", "fail", "unverified"))
+                      if isinstance(outcomes, dict) else "未知")
+            cells = (case["batch_index"] + 1, timing_labels[case["expectations_timing"]["status"]],
+                     history_labels[case["historical_crosscheck"]], case["binding_status"], checks, case["verdict"],
+                     case["expectations_frozen_before_replay"], evidence["reported_eligible"])
+            quality_rows.append("<tr>" + "".join("<td>" + text(c) + "</td>" for c in cells) + "</tr>")
+    quality_html = ('<section><h2>财务核对与冻结时序</h2><p>绑定状态：' + text(quality["status"])
+        + '。仅展示原报告，不授予资格。</p><div class="scroll"><table><thead><tr><th>批次</th><th>冻结时序</th>'
+        + '<th>历史核对</th><th>原消费绑定</th><th>事实通过 / 失败 / 未验证</th><th>事实结论</th><th>原冻结合取条件</th><th>原报告资格</th></tr></thead><tbody>'
+        + "".join(quality_rows) + '</tbody></table></div><p>原冻结标志同时包含时间、历史和配置条件。'
+        + '旧版报告无法单独证明冻结时序，显示未知。历史冲突仍阻止资格通过。</p></section>')
     return (
         """<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OA 窗口成本与当前状态</title><style>
 body{margin:0;background:#f5f7fa;color:#172439;font:15px/1.7 system-ui,-apple-system,sans-serif}main{max-width:1120px;margin:40px auto;padding:0 22px}h1{font-size:29px}h2{font-size:21px}section{background:#fff;border:1px solid #dae1eb;border-radius:10px;padding:20px 24px;margin:18px 0}table{border-collapse:collapse;width:100%;font-size:13px}th,td{padding:10px;border-bottom:1px solid #e0e5ed;text-align:left;vertical-align:top}thead{background:#eff3f8}.scroll{overflow:auto}small{color:#526177}code{overflow-wrap:anywhere}li{margin:5px 0}@media(max-width:700px){main{padding:0 12px}section{padding:14px}h1{font-size:25px}}</style><main><small>只读派生报告 · 不授予模型、OA 或发布权限</small><h1>窗口成本与当前验收状态</h1>
@@ -467,7 +533,7 @@ body{margin:0;background:#f5f7fa;color:#172439;font:15px/1.7 system-ui,-apple-sy
         + text(comparison.get("intent", "未指定"))
         + "</p><ul>"
         + errors
-        + "</ul></section><section><h2>当前所选来源与剩余差距</h2><p>所选修订：<code>"
+        + "</ul></section>" + quality_html + "<section><h2>当前所选来源与剩余差距</h2><p>所选修订：<code>"
         + text(current["selected_revision"])
         + "</code>；窗口内最新观察修订：<code>"
         + text(current["latest_observed_revision"])

@@ -16,6 +16,16 @@
 
 计时从本次输入准备开始，到相同 FlowEngine preview 消费完成结束；不包含 OA 取数/提交，也不推算供应商请求数或账单金额。初始图片实际递交、工具图片回执、结构化文本和精确重复复用分开呈现；递交不证明正确观察。财务质量由独立人工评估及现有质量门决定，准入和记账不代替业务判断。真实运行、可比用量、财务通过和生产加载仍是独立状态。
 
+窗口 selection 可选传入 `financial_quality_reports`，值为已保存财务质量报告的 `file + sha256` 引用列表。例如保留原 archives 与 current_archive，另加：
+
+```json
+{"financial_quality_reports": [{"file": "/absolute/private/quality.json", "sha256": "64位文件SHA-256"}]}
+```
+
+窗口只展示与所选档案唯一匹配的 case。匹配同时核验原 item_key、流程及完整 `window_binding`；schema 2 还核验新增的 `archive_manifest_sha256`。没有报告时状态为 `not_established`，引用、版本或窗口不可信时为 `unverified`。不将缺失绑定的原资格声明带入当前窗口。
+
+输出的 `financial_quality.reports` 分别提供原格式版本、冻结合取语义、`reported_eligible` 及每个 case 的 batch_index、冻结时序、历史状态、原消费绑定、原生成合同、原逐项 check_outcomes 和事实 verdict。旧 schema 1 的独立冻结时序显示未知。资格声明仅作原报告记录，`qualification=not_granted_by_window`，不改变现有验收、执行或写入授权。具体状态见[质量核对合同](financial-quality-assessment.md#报告资格)。
+
 ## 无凭据回归
 
 `python -m pytest tests/finance_preaudit/test_review_experiment.py tests/finance_preaudit/test_review_batch_report.py tests/finance_preaudit/test_review_cost_report.py tests/finance_preaudit/test_review_window_report.py -q` 使用受控外部进程，走实际 Worker → FlowEngine preview → 报告；不调用付费模型或 OA。现有 quality workflow 的 pytest/lint/hygiene/links 继续覆盖这些模块，未增加另一套检查平台。
