@@ -43,6 +43,26 @@ def test_real_native_fallback_reaches_worker_preview_with_all_original_fields(na
     assert result['paid_dispatch_ready'] is True
 
 
+def test_fallback_images_reach_next_request_in_original_encoded_order(native_record):
+    case = json.loads(native_record.read_text())['cases']['fallback']
+    assert case['tool_images_match_fixture'] is True
+    assert len(case['tool_image_sha256']) == 2
+    assert case['tool_image_sha256'][0] != case['tool_image_sha256'][1]
+    assert case['rollout_tool_image_sha256'] == case['tool_image_sha256']
+
+
+def test_missing_fallback_image_proof_cannot_be_reused(native_record, tmp_path):
+    from apps.oa_finance_preaudit import native_review_contract
+
+    value = json.loads(native_record.read_text())
+    value['cases']['fallback']['tool_images_match_fixture'] = False
+    value['cases']['fallback']['tool_image_sha256'] = []
+    record = tmp_path / 'missing-fallback-image.json'
+    record.write_text(json.dumps(value))
+    record.chmod(0o600)
+    assert native_review_contract.readiness(record)['status'] == 'not_verified'
+
+
 def test_default_history_truncation_is_caught_despite_complete_cli_stdout(native_record):
     case = json.loads(native_record.read_text())['cases']['default_truncation']
     assert case['cli_stdout_complete'] is True

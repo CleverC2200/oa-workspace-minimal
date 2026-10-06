@@ -68,10 +68,14 @@ def _verified_cases(cases: dict) -> bool:
     positive, negative = cases['fallback'], cases['default_truncation']
     return (positive['history_limit'] == 60000 and positive['model_context']['exact_stdout']
             and positive['model_context']['rollout_matches_next_request'] and positive['cli_stdout_complete']
+            and positive['tool_images_match_fixture']
+            and len(positive['tool_image_sha256']) == 2 and len(set(positive['tool_image_sha256'])) == 2
+            and positive['rollout_tool_image_sha256'] == positive['tool_image_sha256']
             and positive['consumer_preserved_original_object'] and positive['preview'] == 'verified_closed'
             and negative['status'] == 'not_verified' and negative['model_context']['truncated']
             and not negative['model_context']['exact_stdout']
             and negative['model_context']['rollout_matches_next_request'] and negative['cli_stdout_complete']
+            and negative['tool_images_match_fixture']
             and all(cases[name]['history_limit'] is None for name in ('direct', 'other_workflow', 'default_truncation', 'invalid_json'))
             and cases['direct']['inline_input_complete'] and cases['direct']['initial_images_match_fixture']
             and all(cases[name]['preview'] == 'verified_closed' for name in ('direct', 'other_workflow'))
@@ -90,17 +94,23 @@ def _fixture(root: Path, *, long: bool, workflow: str):
     fields[-1]['value'] += '|END_CANARY'
 
     def collect(request, attempt):
-        page = attempt / 'prepared/canary.png'
-        pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 16, 16), False)
-        pix.clear_with(255)
-        page.write_bytes(pix.tobytes('png'))
-        source = attempt / 'attachments/canary.png'
-        source.write_bytes(page.read_bytes())
+        resources, images, manifest = [], [], []
+        for index in range(2 if long else 1):
+            resource = 'neutral' if index == 0 else 'neutral-second'
+            page = attempt / 'prepared' / f'canary-{index}.png'
+            pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 16, 16), False)
+            pix.clear_with(255 if index == 0 else 127)
+            page.write_bytes(pix.tobytes('png'))
+            source = attempt / 'attachments' / page.name
+            source.write_bytes(page.read_bytes())
+            resources.append({'request_id': request, 'resource_id': resource, 'source_resource_id': resource,
+                              'local_readonly_path': str(source), 'owner_detail_id': f'neutral-row-{index}', 'source_system': 'oa'})
+            images.append({'resource_id': resource, 'path': str(page), 'kind': 'image', 'page_number': 1, 'content_sha256': _sha(page)})
+            manifest.append({'resource_id': resource, 'status': 'image', 'image_count': 1})
         return {'schema_version': 1, 'kind': 'preaudit_material', 'request_id': request,
                 'workflow_key': workflow, 'workflow_name': 'Neutral native contract', 'declared_fields': fields,
-                'resources': [{'request_id': request, 'resource_id': 'neutral', 'source_resource_id': 'neutral', 'local_readonly_path': str(source), 'owner_detail_id': 'neutral-row', 'source_system': 'oa'}],
-                'prepared': {'images': [{'resource_id': 'neutral', 'path': str(page), 'kind': 'image', 'page_number': 1, 'content_sha256': _sha(page)}],
-                             'structured_contents': [], 'manifest': [{'resource_id': 'neutral', 'status': 'image', 'image_count': 1}]},
+                'resources': resources,
+                'prepared': {'images': images, 'structured_contents': [], 'manifest': manifest},
                 'authority_facts': [], 'warnings': []}
 
     engine = flow_engine.FlowEngine(root=project / 'runtime/finance_preaudit_flows',
@@ -113,7 +123,7 @@ def _fixture(root: Path, *, long: bool, workflow: str):
 
 
 def _events(item: dict, schema: dict, *, tool: bool) -> bytes:
-    response = {'id': 'neutral-response-tool' if tool else 'neutral-response-final', 'object': 'response', 'status': 'completed',
+    response = {'id': 'neutral-response-' + item['id'], 'object': 'response', 'status': 'completed',
                 'model': worker.MODEL, 'output': [item], 'usage': {'input_tokens': 1, 'output_tokens': 1, 'total_tokens': 2},
                 'text': {'format': {'type': 'json_schema', 'name': 'codex_output_schema', 'strict': True, 'schema': schema}}}
     events = [{'type': 'response.created', 'response': {**response, 'status': 'in_progress', 'output': []}},
@@ -146,6 +156,8 @@ def _case(root: Path, binary: Path, name: str) -> dict:
     vendor_text = ('Neutral prefix\n' if name == 'invalid_json' else '') + json.dumps(obj, ensure_ascii=False)
     requests, errors = [], []
     reader_cmd = 'python3 -B -m apps.oa_finance_preaudit.read_material ' + shlex.quote(str(action))
+    pages = json.loads(action.with_name('material.json').read_text())['prepared']['images']
+    request_count = 2 + len(pages) if long else 1
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -154,7 +166,7 @@ def _case(root: Path, binary: Path, name: str) -> dict:
         def do_POST(self):
             try:
                 q = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-                if self.path != '/responses' or len(requests) >= (2 if long else 1):
+                if self.path != '/responses' or len(requests) >= request_count:
                     raise ValueError('unexpected_local_request')
                 if self.headers.get('Authorization') != 'Bearer ' + PLACEHOLDER:
                     raise ValueError('unexpected_authentication')
@@ -163,11 +175,17 @@ def _case(root: Path, binary: Path, name: str) -> dict:
                 if q.get('text', {}).get('format', {}).get('schema') != schema:
                     raise ValueError('schema_changed')
                 requests.append(q)
-                tool = long and len(requests) == 1
-                item = ({'id': 'neutral-tool', 'type': 'function_call', 'status': 'completed', 'name': 'exec_command', 'call_id': 'neutral-reader',
-                         'arguments': json.dumps({'cmd': reader_cmd, 'max_output_tokens': 60000, 'yield_time_ms': 1000})} if tool else
-                        {'id': 'neutral-final', 'type': 'message', 'status': 'completed', 'role': 'assistant', 'phase': 'final_answer',
-                         'content': [{'type': 'output_text', 'text': vendor_text, 'annotations': []}]})
+                tool = long and len(requests) < request_count
+                if tool and len(requests) == 1:
+                    item = {'id': 'neutral-tool', 'type': 'function_call', 'status': 'completed', 'name': 'exec_command', 'call_id': 'neutral-reader',
+                            'arguments': json.dumps({'cmd': reader_cmd, 'max_output_tokens': 60000, 'yield_time_ms': 1000})}
+                elif tool:
+                    index = len(requests) - 2
+                    item = {'id': f'neutral-view-{index}', 'type': 'function_call', 'status': 'completed', 'name': 'view_image',
+                            'call_id': f'neutral-view-{index}', 'arguments': json.dumps({'path': pages[index]['path']})}
+                else:
+                    item = {'id': 'neutral-final', 'type': 'message', 'status': 'completed', 'role': 'assistant', 'phase': 'final_answer',
+                            'content': [{'type': 'output_text', 'text': vendor_text, 'annotations': []}]}
                 body = _events(item, schema, tool=tool)
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/event-stream')
@@ -207,7 +225,7 @@ def _case(root: Path, binary: Path, name: str) -> dict:
         server.server_close()
         thread.join(timeout=2)
     json_artifact.write_json_atomic(root / 'requests.json', requests)
-    if errors or len(requests) != (2 if long else 1) or not executions or executions[0].process_state != 'exited':
+    if errors or len(requests) != request_count or not executions or executions[0].process_state != 'exited':
         raise ValueError('native_check_execution_unverified')
     closed = None
     if reviewed['status'] == 'completed':
@@ -217,19 +235,22 @@ def _case(root: Path, binary: Path, name: str) -> dict:
     json_artifact.write_json_atomic(root / 'acceptance.json', acceptance)
     output = ''
     rollout_output = ''
-    initial_images = []
+    rollout_images = []
     for f in (audit / 'codex-home').rglob('*.jsonl'):
         for line in f.read_text().splitlines():
             value = json.loads(line).get('payload', {})
             if value.get('type') == 'function_call_output' and value.get('call_id') == 'neutral-reader':
                 rollout_output = value['output']
+            if (value.get('type') == 'function_call_output'
+                    or value.get('type') == 'message' and value.get('role') == 'user'):
+                rollout_images.extend(_image_hashes([value]))
     if long:
         output = next(q['output'] for q in requests[-1]['input'] if q.get('type') == 'function_call_output' and q.get('call_id') == 'neutral-reader')
-    else:
-        for message in requests[0]['input']:
-            for part in message.get('content', []):
-                if part.get('type') == 'input_image':
-                    initial_images.append(hashlib.sha256(base64.b64decode(part['image_url'].split(',', 1)[1])).hexdigest())
+    initial_images = _image_hashes(requests[0]['input'])
+    expected_images = [_sha(Path(page['path'])) for page in pages]
+    tool_images = _image_hashes(requests[-1]['input']) if long else []
+    tool_images_match = long and tool_images == expected_images and all(
+        _image_hashes(requests[index + 2]['input']) == expected_images[:index + 1] for index in range(len(pages)))
     stdout = read_material.read(action) if long else ''
     field_section = stdout.split('[material.declared_fields]\n', 1)[1].split('\n[material.', 1)[0] if stdout else ''
     rows = [line for line in field_section.splitlines() if re.match(r'^\d+: ', line)]
@@ -250,15 +271,31 @@ def _case(root: Path, binary: Path, name: str) -> dict:
                                 'next_request_output_sha256': hashlib.sha256(output.encode()).hexdigest(),
                                 'rollout_output_sha256': hashlib.sha256(rollout_output.encode()).hexdigest()},
               'cli_stdout_complete': bool(stdout and cli_outputs and stdout in cli_outputs[0]['aggregated_output'] and cli_outputs[0]['exit_code'] == 0),
-              'initial_image_sha256': initial_images, 'initial_images_match_fixture': initial_images == [_sha(Path(p['path'])) for p in json.loads(action.with_name('material.json').read_text())['prepared']['images']],
+              'initial_image_sha256': initial_images, 'initial_images_match_fixture': initial_images == expected_images,
+              'tool_image_sha256': tool_images, 'rollout_tool_image_sha256': rollout_images if long else [],
+              'tool_images_match_fixture': tool_images_match,
+              'image_evidence_scope': 'Encoded-byte delivery and order only; not image understanding or financial acceptance.',
               'default_history_budget': name in {'direct', 'other_workflow', 'default_truncation', 'invalid_json'},
               'history_limit': limits[0] if limits else None,
               'inline_input_complete': bool(frozen and not long and review_input.render_inline(frozen.bundle) in request_text),
               'native_raw_equals_vendor': raw == vendor_text.encode(), 'native_final_sha256': hashlib.sha256(raw).hexdigest(),
               'sample_eligible': acceptance['sample_eligible']}
-    result['status'] = 'verified' if not long or result['model_context']['exact_stdout'] else 'not_verified'
+    result['status'] = 'verified' if not long or (result['model_context']['exact_stdout'] and tool_images_match) else 'not_verified'
     result['paid_dispatch_ready'] = result['status'] == 'verified'
     return result
+
+
+def _image_hashes(messages: list[dict]) -> list[str]:
+    hashes = []
+    for message in messages:
+        parts = message.get('content', [])
+        if message.get('type') == 'function_call_output' and isinstance(message.get('output'), list):
+            parts = message['output']
+        for part in parts:
+            if part.get('type') == 'input_image':
+                raw = base64.b64decode(part['image_url'].split(',', 1)[1], validate=True)
+                hashes.append(hashlib.sha256(raw).hexdigest())
+    return hashes
 
 
 def check(record: Path) -> dict:

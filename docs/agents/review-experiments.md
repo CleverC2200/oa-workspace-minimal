@@ -34,7 +34,7 @@
 
 已安装的固定 Codex CLI 0.160.0 可通过 `python -m scripts.quality native-contract --record /外部私有目录/native-contract.json` 检查。输出目录须已存在且仅当前用户可读，记录不能位于源码目录中或覆盖旧记录。入口不会安装或升级 CLI。缺少 CLI、版本未验证、运行失败或合同不完整时，记录为 `not_verified`，退出码为 1。
 
-检查用中性材料、空临时 HOME、合成密钥和固定 loopback 模拟服务，沿实际 Worker 只读调用、原生 CLI、FlowEngine preview 和已有资格报告运行。长 stdout 在 CLI 事件、下一模型请求和原生上下文中分别核对。默认历史预算截断必须被检测为不完整；招待费回退的双层60000预算须让全部798条合成字段及原文首尾完整到达。直接供给和其他流程保留默认预算，初始图片按实际编码字节核对。合法原对象按原消费者闭合，带英文前缀的原输出保持拒绝。每个原生进程最多60秒且沿 Worker 回收，不重试。
+检查用中性材料、空临时 HOME、合成密钥和固定 loopback 模拟服务，沿实际 Worker 只读调用、原生 CLI、FlowEngine preview 和已有资格报告运行。长 stdout 在 CLI 事件、下一模型请求和原生上下文中分别核对。默认历史预算截断必须被检测为不完整；招待费回退的双层60000预算须让全部798条合成字段及原文首尾完整到达。回退还实际用 `view_image` 逐张读取两张不同的中性准备页，每次返回后的下一请求与原生上下文都按实际编码字节和顺序核对，缺失图片不能通过。直接供给和其他流程保留默认预算，初始图片按实际编码字节核对。合法原对象按原消费者闭合，带英文前缀的原输出保持拒绝。每个原生进程最多60秒且沿 Worker 回收，不重试。
 
 记录绑定 CLI 路径、版本与二进制指纹、审核调用源码字节、有效调用配置和私有证据文件指纹。`python -m scripts.quality native-contract --record /外部私有目录/native-contract.json --reuse` 只核验已有记录，不进行模型协议调用。当前业务诊断派发可调用 `apps.oa_finance_preaudit.native_review_contract.readiness(record)`；仅 `status=verified` 且 `paid_dispatch_ready=true` 表示这项机制证明仍有效。源码、二进制、参数或证据变化后须重新检查，缺失或不可信的记录阻挡依赖该证明的派发。它不授予付费、OA或发布权限，计划、资料、授权与累计额度门继续独立核对。
 
