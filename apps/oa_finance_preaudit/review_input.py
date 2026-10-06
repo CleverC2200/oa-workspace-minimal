@@ -27,6 +27,7 @@ _ROOT = Path(__file__).resolve().parents[2]
 _SKILL = Path('.agents/skills/oa-finance-preaudit')
 # The existing original-text experiment's protection limit; never truncate.
 _INLINE_REVIEW_CHARS = 100_000
+_FALLBACK_TOOL_OUTPUT_TOKENS = 60_000
 # Preserve the existing Codex 0.160.0 image preparation used by view_image.
 _CLI_IMAGE_DIMENSION = 2048
 _HIGH_DETAIL_PATCHES = 2500
@@ -121,6 +122,10 @@ class ReviewInput:
     encoded_images: tuple[tuple[int, str], ...] = ()
 
     @property
+    def tool_output_token_limit(self) -> int | None:
+        return _FALLBACK_TOOL_OUTPUT_TOKENS if self.fallback_reason else None
+
+    @property
     def instruction(self) -> str:
         if self.fallback_reason:
             # load accepts only action.json and validates its same-attempt material.json.
@@ -131,7 +136,8 @@ class ReviewInput:
                     '按其路由读取 `references/result-contract.md`、`references/observation-contract.md`、'
                     '`references/flows/business-entertainment.md`、动作引用的审核包和全部准备页；'
                     '冻结材料先用 `exec_command` 运行 `' + reader_command + '`，'
-                    '设置 `max_output_tokens=60000`，直接读取 stdout 中的完整无损视图；'
+                    '设置 `max_output_tokens=' + str(self.tool_output_token_limit) + '`，'
+                    '直接读取 stdout 中的完整无损视图；'
                     '视图保留全部原属性、读取状态及完整路径，明细行号与原字段就近显示；'
                     '若输出截断，按行分段继续读完。原图仍按原页面覆盖规则观察。\n\n'
                     + render_detail_locations(self.bundle['material']) + '\n\n')

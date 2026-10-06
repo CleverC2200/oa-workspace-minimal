@@ -90,6 +90,7 @@ constants={k:v['const'] for k,v in schema['properties'].items() if 'const' in v}
 action=constants['action_token']
 workflow=constants['workflow_key']
 root=Path(args[args.index('--cd')+1]).parent
+Path(root,'observed-native-config.json').write_text(json.dumps([args[i+1] for i,a in enumerate(args[:-1]) if a in ('--config','-c')]))
 packet=json.loads(next((root/'runtime').rglob('review-packet.json')).read_text())
 items=[i['item_key'] for i in packet['items']]
 decision={**constants,'overall':'needs_human','items':[{'item_key':k,'status':'uncertain','conclusion':'请财务核对。','evidence_refs':[],'missing_evidence':['费用对应关系未确认。']} for k in items]}
@@ -453,3 +454,6 @@ def test_current_candidate_source_host_consumes_preview_without_submission_claim
         assert result["trials"][name]["acceptance"]["preview"] == "verified_closed"
         assert result["trials"][name]["financial_binding"]["status"] == "verified_consumed_correspondence"
         assert result["trials"][name]["write_authorization"] is False
+        native_configs = json.loads((root / "observed-native-config.json").read_text())
+        limits = [value for value in native_configs if value.startswith("tool_output_token_limit=")]
+        assert limits == (["tool_output_token_limit=60000"] if fallback else [])

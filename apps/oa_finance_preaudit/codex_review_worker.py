@@ -469,8 +469,10 @@ def _codex_command(
     project_root: Path,
     schema_file: Path,
     decision_file: Path,
+    *,
+    tool_output_token_limit: int | None = None,
 ) -> list[str]:
-    return [
+    command = [
         "codex",
         "exec",
         "--ephemeral",
@@ -509,6 +511,9 @@ def _codex_command(
         str(project_root),
         "-",
     ]
+    if tool_output_token_limit is not None:
+        command[2:2] = ["--config", f"tool_output_token_limit={tool_output_token_limit}"]
+    return command
 
 
 def _decision_schema(action_file: Path | None = None, *, read_only: bool = False) -> dict:
@@ -960,7 +965,11 @@ def _execute_codex_raw(
         json_artifact.write_json_atomic(
             schema_file, schema,
         )
-        command = _codex_command(project_root, schema_file, decision_file)
+        command = _codex_command(
+            project_root, schema_file, decision_file,
+            **({"tool_output_token_limit": frozen_input.tool_output_token_limit}
+               if frozen_input is not None and frozen_input.tool_output_token_limit is not None else {}),
+        )
         if frozen_input is not None:
             try:
                 frozen_input.validate(action_file)

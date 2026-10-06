@@ -172,11 +172,14 @@ if ''' + repr(fallback) + ''':
  assert command, 'fallback did not deliver the actual lossless reader command'
  budget=re.search(r'max_output_tokens=([0-9]+)',prompt)
  assert budget, 'fallback caller has no explicit output budget'
+ configs=[args[i+1] for i,arg in enumerate(args[:-1]) if arg in ('--config','-c')]
+ assert configs.count('tool_output_token_limit='+budget.group(1))==1
  argv=shlex.split(command.group(1))
  assert argv==['python3','-B','-m','apps.oa_finance_preaudit.read_material',''' + repr(str(action)) + ''']
  Path(''' + repr(str(reader_call)) + ''').write_text(json.dumps({'command':argv,'max_output_tokens':int(budget.group(1))}))
  text=subprocess.run([sys.executable,*argv[1:]],cwd=source,capture_output=True,text=True,check=True).stdout
 else:
+ assert not any('tool_output_token_limit=' in arg for arg in args)
  text=prompt
  original=json.loads(prompt.split('冻结数据：material\\n\\n',1)[1].split('\\n\\n冻结输入原文结束。',1)[0])
  assert original['declared_fields']==''' + repr(fields) + '''
@@ -219,3 +222,30 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'cached_inp
     assert json.loads(Path(closed['decision_file']).read_text()) == decision
     assert decision['items'][0]['conclusion'] in Path(closed['remark_file']).read_text()
     assert material_file.read_bytes() == frozen_bytes
+
+
+def test_entertainment_capacity_probe_keeps_native_output_limit_default(tmp_path, monkeypatch):
+    _engine, task = prepare(tmp_path, page_count=0, tail='synthetic-long-material' * 6000)
+    packet = json.loads(Path(task['action_file']).with_name('review-packet.json').read_text())
+    decision = {'schema_version': 1, 'kind': 'preaudit_review_decision',
+                'action_token': 'capacity-probe', 'workflow_key': 'business_entertainment',
+                'rule_version': packet['rule_version'], 'overall': 'needs_human',
+                'items': [{'item_key': item['item_key'], 'status': 'uncertain',
+                           'conclusion': '只读容量探测未形成业务判断。', 'evidence_refs': [],
+                           'missing_evidence': ['探测用途，不提交意见。']} for item in packet['items']]}
+    script = tmp_path / 'capacity-reviewer.py'
+    script.write_text('''import json,sys
+from pathlib import Path
+args=sys.argv[1:];sys.stdin.read()
+assert not any('tool_output_token_limit=' in arg for arg in args)
+Path(args[args.index('--output-last-message')+1]).write_text(''' + repr(json.dumps(decision, ensure_ascii=False)) + ''')
+print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'cached_input_tokens':0,'output_tokens':5}}))
+''')
+    original = subprocess.Popen
+    monkeypatch.setattr(worker.subprocess, 'Popen', lambda command, **kwargs: original([sys.executable, str(script), *command[1:]], **kwargs))
+    monkeypatch.setenv('OA_REVIEW_API_KEY', 'offline-placeholder')
+    result = worker.run_read_only(task)
+    assert result['status'] == 'completed'
+    assert result['write_state'] == 'not_requested'
+    assert result['decision_state'] == 'valid_object'
+    assert result['process_state'] == 'exited'

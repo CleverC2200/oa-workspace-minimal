@@ -64,8 +64,8 @@ def main():
     prompt = worker._prompt(action_path, **({"reading_instruction": frozen.instruction} if frozen is not None else {}))
     schema = worker._decision_schema(action_path)
     originals = worker._codex_command
-    def command(project, schema_path, decision_path):
-        result = originals(project, schema_path, decision_path)
+    def command(project, schema_path, decision_path, **options):
+        result = originals(project, schema_path, decision_path, **options)
         result[0] = plan["reviewer"]
         result.insert(2, "--skip-git-repo-check")
         return result
@@ -104,7 +104,7 @@ def main():
                     initial_hashes = [h for _size, h in measured[1]]
                     break
     delivery["initial_image_sha256"] = initial_hashes
-    prepared = {"conditions": {"workflow": action["workflow_key"], "sample": fingerprint({k: state[k] for k in ("request_id", "received_at")}), "material": fingerprint(comparison_material, relocate=False), "image_bytes": fingerprint([digest(Path(p["path"]).read_bytes()) for p in material["prepared"]["images"]]), "rules": fingerprint(rules), "schema": fingerprint(schema), "call_profile": fingerprint(command(calling, Path("{SCHEMA}"), Path("{DECISION}"))), "timeout_seconds": plan["timeout_seconds"], "timing_boundary": plan["timing_boundary"]}, "delivery": delivery, "input_sha256": fingerprint({"prompt": prompt, "images": [digest(p.read_bytes()) for p in frozen.images] if frozen else []}), "source_snapshot_sha256": digest(json.dumps(relative_sources, sort_keys=True, separators=(",", ":")).encode())}
+    prepared = {"conditions": {"workflow": action["workflow_key"], "sample": fingerprint({k: state[k] for k in ("request_id", "received_at")}), "material": fingerprint(comparison_material, relocate=False), "image_bytes": fingerprint([digest(Path(p["path"]).read_bytes()) for p in material["prepared"]["images"]]), "rules": fingerprint(rules), "schema": fingerprint(schema), "call_profile": fingerprint(command(calling, Path("{SCHEMA}"), Path("{DECISION}"), **({"tool_output_token_limit": frozen.tool_output_token_limit} if frozen and getattr(frozen, "tool_output_token_limit", None) is not None else {}))), "timeout_seconds": plan["timeout_seconds"], "timing_boundary": plan["timing_boundary"]}, "delivery": delivery, "input_sha256": fingerprint({"prompt": prompt, "images": [digest(p.read_bytes()) for p in frozen.images] if frozen else []}), "source_snapshot_sha256": digest(json.dumps(relative_sources, sort_keys=True, separators=(",", ":")).encode())}
     if mode == "prepare":
         print(json.dumps(prepared))
         return

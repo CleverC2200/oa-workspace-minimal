@@ -2012,9 +2012,10 @@ def test_read_only_schema_keeps_probe_token(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("read_only", [False, True])
-def test_process_receives_bound_token_schema(tmp_path: Path, monkeypatch, read_only: bool) -> None:
+@pytest.mark.parametrize("workflow_key", ["travel_expense", "general_expense"])
+def test_process_receives_bound_token_schema(tmp_path: Path, monkeypatch, read_only: bool, workflow_key: str) -> None:
     monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
-    task, action_file = _task(tmp_path)
+    task, action_file = _task(tmp_path, workflow_key=workflow_key)
     seen = []
 
     class Process:
@@ -2031,6 +2032,7 @@ def test_process_receives_bound_token_schema(tmp_path: Path, monkeypatch, read_o
             return self.returncode
 
     def popen(command, **_kwargs):
+        assert not any("tool_output_token_limit=" in arg for arg in command)
         schema = json.loads(Path(command[command.index("--output-schema") + 1]).read_text())
         seen.append(schema["properties"]["action_token"])
         return Process()
