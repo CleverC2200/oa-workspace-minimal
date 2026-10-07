@@ -15,7 +15,7 @@ def _json(value: object) -> str:
 
 _DETAIL_LOCATION_CONVENTION = (
     '明细定位显示：原路径的表、行索引从0起，显示表、行号从1起；'
-    '各表分别计行；标签仅为行定位前缀，不证明业务事实。表单 evidence_refs 逐字使用原 '
+    '各表分别计行；公开意见使用显示行号，标签不证明业务事实。表单 evidence_refs 逐字使用原 '
     'declared_fields.path 完整字段路径（含 field[...]），不是显示的行前缀。'
 )
 
@@ -27,7 +27,7 @@ def _detail_location(path: object) -> tuple[str, str] | None:
     if location is None:
         return None
     original, table, row = location.groups()
-    return original, f'{original}：明细表{int(table) + 1}第{int(row) + 1}行'
+    return original, f'明细表{int(table) + 1}第{int(row) + 1}行：{original}'
 
 
 def render_detail_locations(material: dict) -> str:

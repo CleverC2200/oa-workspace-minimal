@@ -108,6 +108,7 @@ def test_only_current_bound_native_proof_can_be_reused(native_record, tmp_path):
 
     assert quality.main(['native-contract', '--record', str(native_record), '--reuse']) == 0
     original = json.loads(native_record.read_text())
+    assert not any('/reviewer/codex-home/.tmp/' in path for path in original['artifacts'])
     for changed in ('cli_sha256', 'source_files', 'call_profiles'):
         copy = json.loads(native_record.read_text())
         copy['binding'][changed] = 'changed'

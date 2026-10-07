@@ -325,9 +325,12 @@ def check(record: Path) -> dict:
         except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError, StopIteration, subprocess.SubprocessError) as error:
             result['reason'] = str(error)
     if root is not None:
-        for path in root.rglob('*'):
-            if path.is_file() and not path.is_symlink():
-                path.chmod(0o600)
-        result['artifacts'] = {str(p): _sha(p) for p in root.rglob('*') if p.is_file() and not p.is_symlink()}
+        # CLI housekeeping clones are temporary, not request/response evidence.
+        retained = [p for p in root.rglob('*')
+                    if p.relative_to(root).parts[1:4] != ('reviewer', 'codex-home', '.tmp')
+                    and p.is_file() and not p.is_symlink()]
+        for path in retained:
+            path.chmod(0o600)
+        result['artifacts'] = {str(p): _sha(p) for p in retained}
     review_batch_report.write_private_report(result, record, evidence_roots=(ROOT,))
     return result

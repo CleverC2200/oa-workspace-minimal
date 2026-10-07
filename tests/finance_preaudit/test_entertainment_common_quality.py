@@ -187,17 +187,17 @@ else:
  text=prompt
  original=json.loads(prompt.split('冻结数据：material\\n\\n',1)[1].split('\\n\\n冻结输入原文结束。',1)[0])
  assert original['declared_fields']==''' + repr(fields) + '''
-expected=['detail[0].row[0]：明细表1第1行','detail[0].row[6]：明细表1第7行',
- 'detail[0].row[7]：明细表1第8行','detail[0].row[8]：明细表1第9行',
- 'detail[0].row[9]：明细表1第10行','detail[1].row[0]：明细表2第1行',
- 'detail[1].row[6]：明细表2第7行']
+expected=['明细表1第1行：detail[0].row[0]','明细表1第7行：detail[0].row[6]',
+ '明细表1第8行：detail[0].row[7]','明细表1第9行：detail[0].row[8]',
+ '明细表1第10行：detail[0].row[9]','明细表2第1行：detail[1].row[0]',
+ '明细表2第7行：detail[1].row[6]']
 assert 'declared_fields.path 完整字段路径（含 field[...]）' in prompt
 assert all(label in prompt for label in expected)
 assert all(label in text for label in expected)
 assert all(text.count(label)==1 for label in expected)
 if ''' + repr(fallback) + ''':
  for label in expected:
-  prefix=label.split('：',1)[0]
+  prefix=label.split('：',1)[1]
   adjacent=text.split(label+'\\n',1)[1].splitlines()[0]
   assert prefix+'.field[' in adjacent
  assert '原转款甲' in text.split(expected[1]+'\\n',1)[1].splitlines()[0]

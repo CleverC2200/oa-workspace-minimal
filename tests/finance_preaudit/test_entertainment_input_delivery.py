@@ -57,7 +57,7 @@ def prepare(tmp_path, *, page_count=5, width=16, height=16, degraded=False, tail
     return engine, {"project_root": str(root), "action_file": action["action_file"], "timeout_seconds": 60}
 
 
-def reviewer(monkeypatch, tmp_path, task, *, direct=True, image_count=5, unknown_usage=False, wrong_token=False, resource_evidence=False, probe_large=False, probe_invalid=False, host_scope=False):
+def reviewer(monkeypatch, tmp_path, task, *, direct=True, image_count=5, unknown_usage=False, wrong_token=False, resource_evidence=False, probe_large=False, probe_invalid=False, host_scope=False, fallback_context=False):
     """A real controllable subprocess, replacing the external paid CLI only."""
     # Resolve and fingerprint our controlled CLI through the production resolver.
     # Popen below supplies its real subprocess behavior; no installed Codex is used.
@@ -78,6 +78,10 @@ def reviewer(monkeypatch, tmp_path, task, *, direct=True, image_count=5, unknown
         decision["items"][0]["evidence_refs"] = ["material:prepared.images.resource-0.page-1"]
     if wrong_token:
         decision["action_token"] = "wrong-token"
+    rule_root = Path(worker.__file__).resolve().parents[2] / '.agents/skills/oa-finance-preaudit'
+    original_rules = [(rule_root / name).read_text() for name in (
+        'SKILL.md', 'references/result-contract.md', 'references/observation-contract.md',
+        'references/flow-engine-contract.md', 'references/flows/business-entertainment.md')]
     script = tmp_path / "reviewer.py"
     script.write_text('''import json,sys,base64
 from pathlib import Path
@@ -106,6 +110,10 @@ if direct:
  assert "冻结输入原文结束。" in prompt
 else:
  assert "冻结数据：material" not in prompt
+ if ''' + repr(fallback_context) + ''':
+  assert all(text in prompt for text in ''' + repr(original_rules) + ''')
+  assert "冻结数据：action" in prompt and "冻结数据：review_packet" in prompt
+  assert ''' + repr(action['action_token']) + ''' in prompt
 images=[argv[i+1] for i,x in enumerate(argv) if x=="--image"]
 assert len(images)==''' + str(image_count) + '''
 assert all(Path(p).read_bytes().startswith((b"\\x89PNG",b"\\xff\\xd8\\xff")) for p in images)
@@ -202,6 +210,14 @@ def test_text_limit_retains_existing_path_without_truncation(monkeypatch, tmp_pa
     assert closed["action"] == "closed"
     assert closed["write_state"] == "not_requested"
     assert len(calls) == 1
+
+
+def test_fallback_delivers_original_rules_and_task_before_material_read(monkeypatch, tmp_path):
+    engine, task = prepare(tmp_path, tail="原值" * 60_000)
+    reviewer(monkeypatch, tmp_path, task, direct=False, image_count=0, fallback_context=True)
+    closed = close(engine, task, worker.review(task))
+    assert closed["action"] == "closed"
+    assert closed["write_state"] == "not_requested"
 
 
 def test_different_image_preparation_uses_existing_path(monkeypatch, tmp_path):
