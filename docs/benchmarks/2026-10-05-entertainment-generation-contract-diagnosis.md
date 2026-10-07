@@ -63,3 +63,13 @@
 已查看[官方 CLI 0.160.0 发布记录](https://learn.chatgpt.com/docs/changelog)：其中没有建立与本次英文前言、Schema 约束或响应流组装相同根因的证据。此有限检索不能证明不存在其他问题，也不构成升级、换模型或换供应商的依据。本次未执行升级。
 
 新增离线接线回归覆盖只读私有归档启用、非只读与非私有拒绝、默认关闭、两层 execute-only 传递、原前言拒绝与消息留存；实际 source-bound 执行验证使用受控外部 CLI，不调用真实供应商。接线随当前新修订冻结，不能把已停止的旧 `2023069` 批次或其未用额度迁移为新修订的执行授权。格式缺陷和真实金融验收仍待独立授权后的证据。
+
+## 2026-10-07 角色与终态协议修订
+
+最新 I26 的实际服务端 SSE 最后一个 message 标为 final_answer，包含英文覆盖说明和 JSON；其文本与落盘逐字一致。该响应回显 json_schema、strict=true 和与保存对象一致的 Schema。原消费者拒绝是正确行为，不能用提取内嵌对象改变结果。
+
+同一原生进程 session_meta 保留了约20751字符的通用编程代理基础指令，其中要求工具前前言和长任务进度。这与单据工作进程终态仅交付 JSON 的职责存在冲突，但尚不能认定它是供应商失约的唯一原因。
+
+本修订只对 business_entertainment 的 Worker 使用 [worker-role.md](../../.agents/skills/oa-finance-preaudit/references/worker-role.md)。通过 [OpenAI Docs model_instructions_file](https://learn.chatgpt.com/docs/config-file/config-reference) 替换通用基础指令，并在这次子进程中将 project_doc_max_bytes 设为0，隔离开发仓库的编程指令。原冻结任务仍携带完整 Skill、证据和业务规则；不修改全局配置、AGENTS、业务 Schema、模型、high、材料及工具预算。
+
+来源宿主把角色文件加入实际调用和输入指纹。角色文件随 calling-source 保留，Git 字节及原生证明继续绑定源码。新原生检查核对实际首请求的短角色已交付且通用前言已消失，原非法输出继续拒绝，不做输出清洗。这些零付费结果只证明替换和接线，真实供应商在长工具链上是否遵守终态合同仍须独立验证，不能提前关闭#376。

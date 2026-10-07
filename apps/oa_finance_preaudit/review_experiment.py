@@ -54,6 +54,9 @@ def _verify_sources(root: Path, repository: Path) -> dict:
     docs = ("SKILL.md", "references/result-contract.md", "references/observation-contract.md",
             "references/flow-engine-contract.md", batch.worker._FINANCE_RULES[flow][2])
     required.update(".agents/skills/oa-finance-preaudit/" + name for name in docs)
+    role_document = ".agents/skills/oa-finance-preaudit/references/worker-role.md"
+    if flow == "business_entertainment" and role_document in tree:
+        required.add(role_document)
     if not required.issubset(relative):
         raise ValueError(ERROR)
     for name, expected in relative.items():

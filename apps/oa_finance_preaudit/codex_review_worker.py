@@ -466,6 +466,15 @@ def _read_only_prompt(action_file: Path) -> str:
 """
 
 
+def _worker_role_file(action_file: Path) -> Path | None:
+    if _action_workflow(action_file) != "business_entertainment":
+        return None
+    path = Path(__file__).resolve().parents[2] / ".agents/skills/oa-finance-preaudit/references/worker-role.md"
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("codex_review_task_invalid")
+    return path
+
+
 def _codex_command(
     project_root: Path,
     schema_file: Path,
@@ -473,6 +482,7 @@ def _codex_command(
     *,
     tool_output_token_limit: int | None = None,
     provider_base_url: str = "https://api.deepseek.com",
+    model_instructions_file: Path | None = None,
 ) -> list[str]:
     command = [
         "codex",
@@ -515,6 +525,9 @@ def _codex_command(
     ]
     if tool_output_token_limit is not None:
         command[2:2] = ["--config", f"tool_output_token_limit={tool_output_token_limit}"]
+    if model_instructions_file is not None:
+        command[2:2] = ["--config", "model_instructions_file=" + json.dumps(str(model_instructions_file)),
+                        "--config", "project_doc_max_bytes=0"]
     return command
 
 
@@ -938,6 +951,7 @@ def _execute_codex_raw(
                     or audit.is_relative_to(Path(__file__).resolve().parents[2])):
                 raise ValueError("codex_review_task_invalid")
         schema = schema_builder(action_file) if schema_builder else _decision_schema(action_file, read_only=read_only)
+        role_file = _worker_role_file(action_file)
         if frozen_input is None and not read_only and _action_workflow(action_file) == "business_entertainment":
             from . import review_input
             frozen_input = review_input.prepare(action_file)
@@ -988,6 +1002,7 @@ def _execute_codex_raw(
             **({"tool_output_token_limit": frozen_input.tool_output_token_limit}
                if frozen_input is not None and frozen_input.tool_output_token_limit is not None else {}),
             **({"provider_base_url": offline_api[0]} if offline_api is not None else {}),
+            **({"model_instructions_file": role_file} if role_file is not None else {}),
         )
         if offline_api is not None:
             command[2:2] = ["--skip-git-repo-check", "--config", 'web_search="disabled"',

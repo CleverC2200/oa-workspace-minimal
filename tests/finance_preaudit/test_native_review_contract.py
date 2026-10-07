@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import shutil
 
 import pytest
@@ -41,6 +42,20 @@ def test_real_native_fallback_reaches_worker_preview_with_all_original_fields(na
     assert case['consumer_preserved_original_object'] is True
     assert case['process_state'] == 'exited'
     assert result['paid_dispatch_ready'] is True
+
+
+def test_business_worker_replaces_coding_preambles_in_actual_native_request(native_record):
+    result = json.loads(native_record.read_text())
+    request_file = next(Path(p) for p in result['artifacts'] if p.endswith('/fallback/requests.json'))
+    first = json.loads(request_file.read_text())[0]
+    instructions = first.get('instructions', '') + '\n' + '\n'.join(
+        part.get('text', '') for message in first['input']
+        for part in message.get('content', []) if part.get('type') == 'input_text')
+    assert '你是受限的 OA 财务预审工作进程。' in instructions
+    assert 'Before making tool calls, send a brief preamble' not in instructions
+    assert '## Sharing progress updates' not in instructions
+    assert first['text']['format']['schema'] == json.loads(
+        next(Path(p) for p in result['artifacts'] if p.endswith('/fallback/reviewer/decision-schema.json')).read_text())
 
 
 def test_fallback_images_reach_next_request_in_original_encoded_order(native_record):

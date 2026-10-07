@@ -38,7 +38,7 @@ def _identity(binary: Path) -> dict:
     return {'cli_path': str(binary), 'cli_sha256': _sha(binary), 'cli_version': version,
             'source_files': {str(p.relative_to(ROOT)): _sha(p) for p in sorted(paths)},
             'call_profiles': {name: worker._codex_command(Path('{PROJECT}'), Path('{SCHEMA}'), Path('{DECISION}'), **options)
-                              for name, options in [('direct', {}), ('fallback', {'tool_output_token_limit': review_input._FALLBACK_TOOL_OUTPUT_TOKENS})]}}
+                              for name, options in [('direct', {'model_instructions_file': Path('{WORKER_ROLE}')}), ('fallback', {'tool_output_token_limit': review_input._FALLBACK_TOOL_OUTPUT_TOKENS, 'model_instructions_file': Path('{WORKER_ROLE}')})]}}
 
 
 def readiness(record: Path) -> dict:
@@ -80,6 +80,7 @@ def _verified_cases(cases: dict) -> bool:
             and cases['direct']['inline_input_complete'] and cases['direct']['initial_images_match_fixture']
             and all(cases[name]['preview'] == 'verified_closed' for name in ('direct', 'other_workflow'))
             and cases['invalid_json']['invalid_original_rejected']
+            and all(cases[name]['bounded_role_delivered'] for name in ('fallback', 'default_truncation', 'direct', 'invalid_json'))
             and all(c['process_state'] == 'exited' and c['native_raw_equals_vendor'] and not c['sample_eligible'] for c in cases.values()))
 
 
@@ -261,6 +262,9 @@ def _case(root: Path, binary: Path, name: str) -> dict:
     limits = [int(q.split('=', 1)[1]) for q in configuration if q.startswith('tool_output_token_limit=')]
     request_text = '\n'.join(part.get('text', '') for message in requests[0]['input'] for part in message.get('content', []) if part.get('type') == 'input_text')
     result = {'process_state': reviewed['process_state'], 'preview': preview,
+              'bounded_role_delivered': bool(workflow == 'business_entertainment'
+                  and (ROOT / '.agents/skills/oa-finance-preaudit/references/worker-role.md').read_text().strip() in requests[0].get('instructions', '')
+                  and 'Before making tool calls, send a brief preamble' not in requests[0].get('instructions', '')),
               'consumer_preserved_original_object': bool(closed and json.loads(Path(closed['decision_file']).read_text()) == obj),
               'invalid_original_rejected': name == 'invalid_json' and reviewed['status'] == 'failed' and reviewed['decision_state'] == 'unreadable' and raw == vendor_text.encode(),
               'model_context': {'exact_stdout': bool(stdout and stdout in output), 'field_rows_matched': sum(line in output.splitlines() for line in rows),
