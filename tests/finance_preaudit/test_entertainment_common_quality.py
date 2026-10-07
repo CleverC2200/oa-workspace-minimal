@@ -68,7 +68,8 @@ final_check=prompt[prompt.rfind('形成最终四项决定前'):]
 assert '来源与适用范围' in final_check
 assert '第1项“附件完整性/支付证据”' in final_check
 assert '支付发生与费用对应' in final_check
-assert '本项使用 uncertain，并保留已确认支出' in final_check
+assert '原事实与本条招待上下文已充分支持时正常采用' in final_check
+assert '必要关系未明时使用 uncertain，保留已确认支出' in final_check
 assert '第4项“金额孰低核销”承接' in final_check
 assert 'material:resources.<resource_id>' in final_check
 assert 'material:prepared.images.<resource_id>.page-<页码>' in final_check

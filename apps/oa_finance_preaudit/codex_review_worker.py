@@ -394,7 +394,9 @@ def _prompt(action_file: Path, *, reading_instruction: str | None = None) -> str
         workflow_requirement = (
             "只按本流程固定审核项判断；形成最终四项决定前，"
             "第1项“附件完整性/支付证据”完成原规则的来源与适用范围、支付发生与费用对应核对；"
-            "必要费用关系仍待核时，本项使用 uncertain，并保留已确认支出。"
+            "按原商品、服务或结算内容及参与方角色判断："
+            "原事实与本条招待上下文已充分支持时正常采用；"
+            "必要关系未明时使用 uncertain，保留已确认支出。"
             "第4项“金额孰低核销”承接已确认范围和必要未知，保留小计及已知异常；"
             "evidence_refs 定位各项原事实，missing_evidence 保留该项仍未确认的必要事实或关系；"
             "引用材料字段时逐字使用 declared_fields.path，并加 material: 前缀；"
