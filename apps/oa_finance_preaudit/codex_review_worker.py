@@ -404,8 +404,7 @@ def _prompt(action_file: Path, *, reading_instruction: str | None = None) -> str
             "第4项“金额孰低核销”承接已确认范围和必要未知，保留小计及已知异常；"
             "evidence_refs 定位各项原事实，missing_evidence 保留该项仍未确认的必要事实或关系；"
             "引用材料字段时逐字使用 declared_fields.path，并加 material: 前缀；"
-            "资源引用使用 material:resources.<resource_id>，准备页引用使用 "
-            "material:prepared.images.<resource_id>.page-<页码>，标识与页码来自原材料，"
+            "资源引用使用 material:resources.<resource_id>，标识来自原材料，"
             "不靠文件名或金额猜归属；无需读取宿主校验源码来构造引用。"
         )
     else:

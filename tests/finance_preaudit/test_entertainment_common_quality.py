@@ -75,7 +75,7 @@ assert '发票归属、购买方与发票金额' in final_check
 assert '第3项“预算”执行原暂不校验策略' in final_check
 assert '第4项“金额孰低核销”承接' in final_check
 assert 'material:resources.<resource_id>' in final_check
-assert 'material:prepared.images.<resource_id>.page-<页码>' in final_check
+assert 'material:prepared.images.<resource_id>.page-<页码>' not in final_check
 assert '无需读取宿主校验源码来构造引用' in final_check
 project=Path(args[args.index('--cd')+1])
 relative=''' + repr(str(RULE)) + '''
