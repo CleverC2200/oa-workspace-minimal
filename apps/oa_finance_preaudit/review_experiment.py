@@ -722,7 +722,7 @@ def _candidate_phase_quality(row: dict, path: Path, report: dict) -> dict:
         projection = review_window_report._financial_quality({'financial_quality_reports':[refs['quality_report']]},[report])
         if projection['status'] != 'verified':
             raise ValueError('quality_window_binding_mismatch')
-        keys = {'payment_sources','invoice_identity','budget_policy','minimum'}
+        keys = {check['id'] for check in checklist['checks']}
         complete = (case['binding_status'] == 'verified_consumed_correspondence'
                     and case['original_final_contract'] == 'verified_snapshot_schema'
                     and case['result_audit_complete'] is True and case['complete_review_scope'] is True

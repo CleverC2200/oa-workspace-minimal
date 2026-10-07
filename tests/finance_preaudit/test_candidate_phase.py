@@ -62,7 +62,7 @@ def phase_source(tmp_path_factory):
     return repository, revision, cli, record
 
 
-def phase(tmp_path, phase_source, *, count=2, offset=0):
+def phase(tmp_path, phase_source, *, count=2, offset=0, check_ids=None, checked_items=None):
     repository, revision, cli, proof = phase_source
     rows = []
     for index in range(count):
@@ -89,13 +89,13 @@ def phase(tmp_path, phase_source, *, count=2, offset=0):
         root = arms[1]
         manifest = json.loads((root/'manifest.json').read_text())
         packet = json.loads(Path(manifest['action_file']).with_name('review-packet.json').read_text())
-        ids = ('payment_sources','invoice_identity','budget_policy','minimum')
+        ids = check_ids or ('payment_sources','invoice_identity','budget_policy','minimum')
         checklist = directory/'checklist.json'
         rule_names = ('SKILL.md','references/result-contract.md','references/observation-contract.md','references/flow-engine-contract.md','references/flows/business-entertainment.md')
         save(checklist, {'schema_version':1,'workflow_key':'business_entertainment','source_kind':'synthetic','scenario':'ordinary_payment',
                         'review_scope':'complete_financial_review','source_refs':[ref(Path(p)) for p in manifest['originals']],
                         'rule_refs':[ref(root/'calling-source/.agents/skills/oa-finance-preaudit'/name) for name in rule_names],
-                        'checks':[{'id':name,'item_key':item['item_key'],'expected':'Controlled original expectation, not real financial acceptance.'} for name,item in zip(ids,packet['items'])]})
+                        'checks':[{'id':name,'item_key':key,'expected':'Controlled original expectation, not real financial acceptance.'} for name,key in zip(ids,checked_items or [item['item_key'] for item in packet['items']])]})
         freeze = flow_evals.freeze_financial_expectations(ref(checklist),directory/'expectations.json')
         rows.append({'alias':f'T{index}','plan':ref(plan),'stable_identity_sha256':json.loads(plan.read_text())['preparations']['candidate']['conditions']['sample'],
                      'checklist':ref(checklist),'expectations':freeze})
@@ -154,8 +154,8 @@ def audit(row, *, failure=None):
     report = review_batch_report.build_report(root)
     manifest = json.loads((root/'manifest.json').read_text())
     action = Path(manifest['action_file'])
-    ids = ('payment_sources','invoice_identity','budget_policy','minimum')
     checklist = Path(row['checklist']['file'])
+    ids = [check['id'] for check in json.loads(checklist.read_text())['checks']]
     assessment = plan_file.parent/'assessment.json'
     save(assessment, {'schema_version':1,'method':'independent_manual','reviewer_role':'historical_crosscheck','reviewer_record':'controlled-only',
                      'reviewed_at':datetime.now(timezone.utc).isoformat(),'item_key':report['financial_binding']['item_key'],
@@ -187,6 +187,27 @@ def test_actual_caller_dispatches_once_then_waits_for_independent_quality(tmp_pa
     assert second['global_cli_starts'] == 2
     assert second['diagnostic_cli_starts'] == 2
     assert invoke(scope, authority, 'T0')['reason'] == 'candidate_already_started'
+
+
+def test_original_check_ids_do_not_block_complete_four_item_audit(tmp_path, phase_source):
+    ids = ('all_payments_and_fee_relations', 'all_invoice_links_and_parties',
+           'existing_budget_policy', 'net_minimum_and_partial_unknown')
+    scope, authority, rows = phase(tmp_path, phase_source, check_ids=ids)
+    assert invoke(scope, authority, 'T0')['status'] == 'awaiting_independent_assessment'
+    audit(rows[0])
+    result = invoke(scope, authority, 'T1')
+    assert result['status'] == 'awaiting_independent_assessment', result
+    assert result['phase_cli_starts'] == 2
+
+
+def test_four_check_ids_cannot_replace_four_distinct_audited_items(tmp_path, phase_source):
+    scope, authority, rows = phase(tmp_path, phase_source,
+                                   checked_items=['attachment_payment_evidence'] * 4)
+    assert invoke(scope, authority, 'T0')['status'] == 'awaiting_independent_assessment'
+    audit(rows[0])
+    result = invoke(scope, authority, 'T1')
+    assert result['reason'] == 'previous_quality_failure', result
+    assert result['phase_cli_starts'] == 1
 
 
 def status(scope, authority):
