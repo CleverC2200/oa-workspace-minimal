@@ -48,6 +48,7 @@ def phase_source(tmp_path_factory):
     revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repository, text=True).strip()
     identity = json.loads(subprocess.check_output([sys.executable, '-c', 'import json,sys;from pathlib import Path;from apps.oa_finance_preaudit.native_review_contract import _identity;print(json.dumps(_identity(Path(sys.argv[1]))))', str(cli)], cwd=repository, text=True))
     common = {'process_state':'exited','native_raw_equals_vendor':True,'sample_eligible':False,
+              'bounded_role_delivered':True,
               'history_limit':None, 'preview':'verified_closed'}
     cases = {name: dict(common) for name in ('fallback','default_truncation','direct','other_workflow','invalid_json')}
     cases['fallback'].update(tool_images_match_fixture=True, tool_image_sha256=['a'*64,'b'*64], rollout_tool_image_sha256=['a'*64,'b'*64],history_limit=60000, model_context={'exact_stdout':True,'rollout_matches_next_request':True}, cli_stdout_complete=True, consumer_preserved_original_object=True)
