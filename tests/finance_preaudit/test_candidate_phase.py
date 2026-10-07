@@ -51,7 +51,11 @@ def phase_source(tmp_path_factory):
               'bounded_role_delivered':True,
               'history_limit':None, 'preview':'verified_closed'}
     cases = {name: dict(common) for name in ('fallback','default_truncation','direct','other_workflow','invalid_json')}
-    cases['fallback'].update(tool_images_match_fixture=True, tool_image_sha256=['a'*64,'b'*64], rollout_tool_image_sha256=['a'*64,'b'*64],history_limit=60000, model_context={'exact_stdout':True,'rollout_matches_next_request':True}, cli_stdout_complete=True, consumer_preserved_original_object=True)
+    cases['fallback'].update(tool_images_match_fixture=True, initial_images_match_fixture=True,
+                            initial_and_tool_image_detail_match=True,
+                            tool_image_sha256=['a'*64,'b'*64], rollout_tool_image_sha256=['a'*64,'b'*64],
+                            history_limit=60000, model_context={'exact_stdout':True,'rollout_matches_next_request':True},
+                            cli_stdout_complete=True, consumer_preserved_original_object=True)
     cases['default_truncation'].update(tool_images_match_fixture=True,status='not_verified', model_context={'truncated':True,'exact_stdout':False,'rollout_matches_next_request':True}, cli_stdout_complete=True)
     cases['direct'].update(inline_input_complete=True, initial_images_match_fixture=True)
     cases['invalid_json']['invalid_original_rejected'] = True

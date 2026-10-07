@@ -69,6 +69,8 @@ def _verified_cases(cases: dict) -> bool:
     return (positive['history_limit'] == 60000 and positive['model_context']['exact_stdout']
             and positive['model_context']['rollout_matches_next_request'] and positive['cli_stdout_complete']
             and positive['tool_images_match_fixture']
+            and positive['initial_images_match_fixture']
+            and positive['initial_and_tool_image_detail_match']
             and len(positive['tool_image_sha256']) == 2 and len(set(positive['tool_image_sha256'])) == 2
             and positive['rollout_tool_image_sha256'] == positive['tool_image_sha256']
             and positive['consumer_preserved_original_object'] and positive['preview'] == 'verified_closed'
@@ -99,7 +101,7 @@ def _fixture(root: Path, *, long: bool, workflow: str):
         for index in range(2 if long else 1):
             resource = 'neutral' if index == 0 else 'neutral-second'
             page = attempt / 'prepared' / f'canary-{index}.png'
-            pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 16, 16), False)
+            pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 2400, 1800), False)
             pix.clear_with(255 if index == 0 else 127)
             page.write_bytes(pix.tobytes('png'))
             source = attempt / 'attachments' / page.name
@@ -242,16 +244,20 @@ def _case(root: Path, binary: Path, name: str) -> dict:
             value = json.loads(line).get('payload', {})
             if value.get('type') == 'function_call_output' and value.get('call_id') == 'neutral-reader':
                 rollout_output = value['output']
-            if (value.get('type') == 'function_call_output'
-                    or value.get('type') == 'message' and value.get('role') == 'user'):
+            if value.get('type') == 'function_call_output':
                 rollout_images.extend(_image_hashes([value]))
     if long:
         output = next(q['output'] for q in requests[-1]['input'] if q.get('type') == 'function_call_output' and q.get('call_id') == 'neutral-reader')
     initial_images = _image_hashes(requests[0]['input'])
-    expected_images = [_sha(Path(page['path'])) for page in pages]
-    tool_images = _image_hashes(requests[-1]['input']) if long else []
+    measured = review_input._native_image_sizes(tuple(Path(page['path']) for page in pages))
+    if measured is None:
+        raise ValueError('neutral_image_payload_not_verified')
+    expected_images = [digest for _size, digest in measured[1]]
+    tool_messages = [q for q in requests[-1]['input'] if q.get('type') == 'function_call_output']
+    tool_images = _image_hashes(tool_messages) if long else []
     tool_images_match = long and tool_images == expected_images and all(
-        _image_hashes(requests[index + 2]['input']) == expected_images[:index + 1] for index in range(len(pages)))
+        _image_hashes([q for q in requests[index + 2]['input'] if q.get('type') == 'function_call_output'])
+        == expected_images[:index + 1] for index in range(len(pages)))
     stdout = read_material.read(action) if long else ''
     field_section = stdout.split('[material.declared_fields]\n', 1)[1].split('\n[material.', 1)[0] if stdout else ''
     rows = [line for line in field_section.splitlines() if re.match(r'^\d+: ', line)]
@@ -276,6 +282,9 @@ def _case(root: Path, binary: Path, name: str) -> dict:
                                 'rollout_output_sha256': hashlib.sha256(rollout_output.encode()).hexdigest()},
               'cli_stdout_complete': bool(stdout and cli_outputs and stdout in cli_outputs[0]['aggregated_output'] and cli_outputs[0]['exit_code'] == 0),
               'initial_image_sha256': initial_images, 'initial_images_match_fixture': initial_images == expected_images,
+              'initial_and_tool_image_detail_match': bool(long and initial_images == tool_images
+                  and [part.get('detail') for part in _image_parts(requests[0]['input'])]
+                  == [part.get('detail') for part in _image_parts(tool_messages)]),
               'tool_image_sha256': tool_images, 'rollout_tool_image_sha256': rollout_images if long else [],
               'tool_images_match_fixture': tool_images_match,
               'image_evidence_scope': 'Encoded-byte delivery and order only; not image understanding or financial acceptance.',
@@ -289,17 +298,19 @@ def _case(root: Path, binary: Path, name: str) -> dict:
     return result
 
 
-def _image_hashes(messages: list[dict]) -> list[str]:
-    hashes = []
+def _image_parts(messages: list[dict]):
     for message in messages:
         parts = message.get('content', [])
         if message.get('type') == 'function_call_output' and isinstance(message.get('output'), list):
             parts = message['output']
         for part in parts:
             if part.get('type') == 'input_image':
-                raw = base64.b64decode(part['image_url'].split(',', 1)[1], validate=True)
-                hashes.append(hashlib.sha256(raw).hexdigest())
-    return hashes
+                yield part
+
+
+def _image_hashes(messages: list[dict]) -> list[str]:
+    return [hashlib.sha256(base64.b64decode(part['image_url'].split(',', 1)[1], validate=True)).hexdigest()
+            for part in _image_parts(messages)]
 
 
 def check(record: Path) -> dict:

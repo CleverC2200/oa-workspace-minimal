@@ -101,7 +101,7 @@ def main():
     rules = {d: (calling / ".agents/skills/oa-finance-preaudit" / d).read_text() for d in docs}
     delivery = {"mode": "complete_initial_input" if frozen and not frozen.fallback_reason else "existing_reading_path", "fallback_reason": frozen.fallback_reason if frozen else None, "images_supplied": len(frozen.images) if frozen else 0}
     initial_hashes = []
-    if frozen and not frozen.fallback_reason:
+    if frozen and frozen.images:
         if frozen.encoded_images:
             initial_hashes = [h for _size, h in frozen.encoded_images]
         else:

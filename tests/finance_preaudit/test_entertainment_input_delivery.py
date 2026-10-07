@@ -205,24 +205,36 @@ def test_untrusted_inputs_never_start_reviewer(monkeypatch, tmp_path, change):
 
 def test_text_limit_retains_existing_path_without_truncation(monkeypatch, tmp_path):
     engine, task = prepare(tmp_path, tail="原值" * 60_000)
-    calls = reviewer(monkeypatch, tmp_path, task, direct=False, image_count=0)
+    calls = reviewer(monkeypatch, tmp_path, task, direct=False, image_count=5)
     closed = close(engine, task, worker.review(task))
     assert closed["action"] == "closed"
     assert closed["write_state"] == "not_requested"
     assert len(calls) == 1
 
 
+def test_text_limit_keeps_all_initial_images_within_native_image_limits(monkeypatch, tmp_path):
+    engine, task = prepare(tmp_path, page_count=34, tail="原值" * 60_000)
+    calls = reviewer(monkeypatch, tmp_path, task, direct=False, image_count=34, fallback_context=True)
+    reviewed = worker.review(task)
+    assert sum(argument == "--image" for argument in calls[-1]) == 34
+    closed = close(engine, task, reviewed)
+    assert closed["action"] == "closed"
+    assert closed["write_state"] == "not_requested"
+
+
 def test_fallback_delivers_original_rules_and_task_before_material_read(monkeypatch, tmp_path):
     engine, task = prepare(tmp_path, tail="原值" * 60_000)
-    reviewer(monkeypatch, tmp_path, task, direct=False, image_count=0, fallback_context=True)
+    reviewer(monkeypatch, tmp_path, task, direct=False, image_count=5, fallback_context=True)
     closed = close(engine, task, worker.review(task))
     assert closed["action"] == "closed"
     assert closed["write_state"] == "not_requested"
 
 
-def test_different_image_preparation_uses_existing_path(monkeypatch, tmp_path):
-    engine, task = prepare(tmp_path, width=2048, height=2048)
-    calls = reviewer(monkeypatch, tmp_path, task, direct=False, image_count=0)
+@pytest.mark.parametrize("long_text", [False, True])
+def test_wide_images_keep_native_initial_delivery(monkeypatch, tmp_path, long_text):
+    engine, task = prepare(tmp_path, width=2048, height=2048,
+                           tail="原值" * 60_000 if long_text else "完整尾值")
+    calls = reviewer(monkeypatch, tmp_path, task, direct=not long_text, image_count=5)
     closed = close(engine, task, worker.review(task))
     assert closed["action"] == "closed"
     assert closed["write_state"] == "not_requested"
@@ -251,15 +263,15 @@ def test_conflicting_decision_is_rejected_by_existing_consumer(monkeypatch, tmp_
 
 
 def test_delivery_receipt_reports_fallback_separately(monkeypatch, tmp_path):
-    engine, task = prepare(tmp_path, width=2048, height=2048)
-    reviewer(monkeypatch, tmp_path, task, direct=False, image_count=0)
+    engine, task = prepare(tmp_path, tail="原值" * 60_000)
+    reviewer(monkeypatch, tmp_path, task, direct=False, image_count=5)
     closed = close(engine, task, worker.review(task))
     assert closed["action"] == "closed"
     files = list(Path(task["action_file"]).parent.glob("review-process-*.json"))
     assert len(files) == 1
     diagnostic = json.loads(files[0].read_text())
     assert diagnostic["input_delivery"] == {"mode": "existing_reading_path",
-        "fallback_reason": "image_preparation_differs", "images_supplied": 0}
+        "fallback_reason": "text_limit", "images_supplied": 5}
 
 
 def test_original_page_references_remain_consumable(monkeypatch, tmp_path):
@@ -329,13 +341,26 @@ def test_incomplete_native_render_retains_all_pages_on_existing_path(monkeypatch
     assert len([call for call in calls if call[1:3] == ["debug", "prompt-input"]]) == 1
 
 
-def test_capacity_measurement_cannot_clear_image_preparation_difference(monkeypatch, tmp_path):
+def test_capacity_measurement_keeps_mixed_native_image_formats(monkeypatch, tmp_path):
     engine, task = prepare(tmp_path, page_count=2, page_specs=[(1200,2800,"jpeg"),(2048,2048,"png")])
-    calls = reviewer(monkeypatch, tmp_path, task, direct=False, image_count=0)
+    calls = reviewer(monkeypatch, tmp_path, task, image_count=2)
     closed = close(engine, task, worker.review(task))
     assert closed["action"] == "closed"
     assert closed["write_state"] == "not_requested"
-    assert not [call for call in calls if call[1:3] == ["debug","prompt-input"]]
+    assert len([call for call in calls if call[1:3] == ["debug","prompt-input"]]) == 1
+
+
+@pytest.mark.parametrize("long_text", [False, True])
+def test_image_count_limit_still_uses_tool_reading(monkeypatch, tmp_path, long_text):
+    from apps.oa_finance_preaudit import review_input
+
+    engine, task = prepare(tmp_path, page_count=6,
+                           tail="原值" * 60_000 if long_text else "完整尾值")
+    monkeypatch.setattr(review_input, "_MAX_IMAGES", 5)
+    reviewer(monkeypatch, tmp_path, task, direct=False, image_count=0)
+    closed = close(engine, task, worker.review(task))
+    assert closed["action"] == "closed"
+    assert closed["write_state"] == "not_requested"
 
 
 def test_cancel_during_native_measurement_reaps_owned_tree(tmp_path):

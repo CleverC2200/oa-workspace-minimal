@@ -30,7 +30,6 @@ _INLINE_REVIEW_CHARS = 100_000
 _FALLBACK_TOOL_OUTPUT_TOKENS = 60_000
 # Preserve the existing Codex 0.160.0 image preparation used by view_image.
 _CLI_IMAGE_DIMENSION = 2048
-_HIGH_DETAIL_PATCHES = 2500
 # DeepSeek Responses inline limits, verified 2026-10-04 (docs/guides/vision).
 _MAX_IMAGES = 600
 _MAX_IMAGE_BYTES = 32 * 1024 * 1024
@@ -134,7 +133,11 @@ class ReviewInput:
             reader_command = 'python3 -B -m apps.oa_finance_preaudit.read_material ' + shlex.quote(str(action_file))
             return ('完整输入直供已回退（' + self.fallback_reason + '）。'
                     '本条消息已完整提供当前流程的原规则、动作和审核包，直接使用这些原文；'
-                    '无需重复打开规则或任务文件、检查宿主实现。材料与全部准备页仍沿用原读取路径；'
+                    '无需重复打开规则或任务文件、检查宿主实现。'
+                    + ('全部准备图已随本条消息提供，顺序与 prepared.images 一致；'
+                       '直接按原页面覆盖规则观察附图，必要复核仍可用原看图工具；'
+                       if self.images else '全部准备页仍沿用原看图读取路径；')
+                    + '冻结材料仍沿用原读取路径；'
                     '冻结材料先用 `exec_command` 运行 `' + reader_command + '`，'
                     '设置 `max_output_tokens=' + str(self.tool_output_token_limit) + '`，'
                     '直接读取 stdout 中的完整无损视图；'
@@ -307,13 +310,11 @@ def prepare(action_file: Path) -> ReviewInput:
     bundle = load(action_file)
     text = render_inline(bundle)
     images = tuple(Path(page['path']) for page in bundle['material']['prepared']['images'])
-    reason = None
-    if len(text) > _INLINE_REVIEW_CHARS:
-        reason = 'text_limit'
-    elif len(images) > _MAX_IMAGES:
-        reason = 'image_count_limit'
+    text_reason = 'text_limit' if len(text) > _INLINE_REVIEW_CHARS else None
+    reason = 'image_count_limit' if len(images) > _MAX_IMAGES else None
     protected_reason = reason
-    encoded_bytes = len(json.dumps(text, ensure_ascii=False).encode('utf-8')) + _REQUEST_RESERVE_BYTES
+    supplied_text = render_inline(bundle, include_material=False) if text_reason else text
+    encoded_bytes = len(json.dumps(supplied_text, ensure_ascii=False).encode('utf-8')) + _REQUEST_RESERVE_BYTES
     for path in images:
         raw = path.read_bytes()
         pixmap = fitz.Pixmap(path)
@@ -322,13 +323,10 @@ def prepare(action_file: Path) -> ReviewInput:
                      or (raw.startswith(b'RIFF') and raw[8:12] == b'WEBP'))
         if not supported:
             protected_reason = protected_reason or 'image_encoding_not_preserved'
-        # Initial LocalImage and default view_image share the 2048 resize. If
-        # high detail would additionally apply its patch cap, retain that old path.
+        # Fixed CLI initial images and view_image both encode with high detail
+        # and the same 2048 resize, verified by the native wide-image contract.
         scale = min(1, _CLI_IMAGE_DIMENSION / max(pixmap.width, pixmap.height))
         width, height = math.ceil(pixmap.width * scale), math.ceil(pixmap.height * scale)
-        patches = ((width + 31) // 32) * ((height + 31) // 32)
-        if patches > _HIGH_DETAIL_PATCHES:
-            protected_reason = protected_reason or 'image_preparation_differs'
         if len(raw) > _MAX_IMAGE_BYTES:
             reason = reason or 'image_bytes_limit'
         bound = _encoded_size_bound(raw, width, height, resized=scale < 1)
@@ -350,8 +348,8 @@ def prepare(action_file: Path) -> ReviewInput:
             measured = None
         if measured is not None:
             codec, encodings = measured
-            encoded_bytes = len(json.dumps(text, ensure_ascii=False).encode('utf-8')) + _REQUEST_RESERVE_BYTES
+            encoded_bytes = len(json.dumps(supplied_text, ensure_ascii=False).encode('utf-8')) + _REQUEST_RESERVE_BYTES
             encoded_bytes += sum(4 * ((size + 2) // 3) + 256 for size, _ in encodings)
             reason = ('image_bytes_limit' if any(size > _MAX_IMAGE_BYTES for size, _ in encodings)
                       else 'request_bytes_limit' if encoded_bytes > _MAX_REQUEST_BYTES else None)
-    return ReviewInput(bundle, text, () if reason else images, reason, codec, encodings)
+    return ReviewInput(bundle, text, () if reason else images, text_reason or reason, codec, encodings)
