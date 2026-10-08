@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import copy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import subprocess
 from pathlib import Path
 
@@ -41,14 +41,15 @@ def _environment(tmp_path: Path) -> tuple[Path, Path, dict]:
     stop.write_bytes(b"stop_requested\n")
     stop.chmod(0o600)
     info = stop.stat()
-    completed = datetime.now(timezone.utc).isoformat()
+    completed_time = datetime.now(timezone.utc)
+    completed = completed_time.isoformat()
     manifest = {"kind": "preaudit_controller_run_manifest", "state": "failed",
                 "run_id": "a" * 32, "children_reaped": True,
                 "controller_pid": 99999999, "controller_instance_id": "c" * 32, "code_revision": "b" * 40,
                 "completed_at": completed}
     manifest_ref = _write(target / "runtime/control/rolling-controller-manifest.json", manifest)
     snapshot = {"schema_version": 1, "kind": "preaudit_runtime_status",
-                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "generated_at": (completed_time + timedelta(seconds=3)).isoformat(),
                 "controller_handoff": {"manifest_state": "failed", "children_reaped": True,
                                        "controller_active": False, "writer_active": False,
                                        "active_request_writers": 0, "restart_mode": "fresh_process", "restart_verified": True, "code_revision": "b" * 40},
@@ -66,6 +67,7 @@ def _environment(tmp_path: Path) -> tuple[Path, Path, dict]:
     conflict["reconciliation"]["findings"] = [{"category": "pending_handled_conflict"}]
     conflict_ref = _write(tmp_path / "original-conflict-status.json", conflict)
     controller_receipt = {**manifest, "kind": "preaudit_controller_execution", "state": "exited",
+                          "completed_at": (completed_time + timedelta(seconds=1)).isoformat(),
                           "controller_state": "failed", "exit_code": 1,
                           "owner_task_id": "00000000-0000-0000-0000-000000000001",
                           "invocation_id": "d" * 32,
@@ -73,7 +75,8 @@ def _environment(tmp_path: Path) -> tuple[Path, Path, dict]:
     call_id = "call_original"
     call = {"type": "response_item", "payload": {"type": "custom_tool_call", "call_id": call_id,
             "name": "exec", "input": 'text(await tools.write_stdin({session_id:11476,chars:""}));'}}
-    result = {"type": "response_item", "payload": {"type": "custom_tool_call_output", "call_id": call_id,
+    result = {"type": "response_item", "timestamp": (completed_time + timedelta(seconds=2)).isoformat(),
+              "payload": {"type": "custom_tool_call_output", "call_id": call_id,
               "output": [{"text": "Script completed"}, {"text": json.dumps({"exit_code": 1, "output": json.dumps(controller_receipt)})}]}}
     source = tmp_path / "original.jsonl"
     stop_call = {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "exec",
@@ -99,6 +102,10 @@ def _environment(tmp_path: Path) -> tuple[Path, Path, dict]:
     evidence = tmp_path / "binding.json"
     _write(evidence, binding)
     snapshot["controller_handoff"].update(controller_active=True, active_request_writers=1)
+    from tests.finance_preaudit.test_maintenance_runtime import live_snapshot
+    proof = live_snapshot()
+    snapshot['maintenance_current_inputs'] = proof['maintenance_current_inputs']
+    snapshot['maintenance_status_file'] = proof['maintenance_status_file']
     return target, evidence, snapshot
 
 
@@ -118,6 +125,40 @@ def test_manual_stop_requires_original_evidence_and_records_recovery(tmp_path):
     assert receipt["original_exit_code"] == 1
     assert receipt["original_run_id"] == "a" * 32
     assert receipt["phase"] == "cleared"
+
+
+@pytest.mark.parametrize("phase", ["receipt_before_manifest", "tool_before_receipt", "tool_after_closure", "receipt_naive", "tool_missing"])
+def test_manual_stop_rejects_untrusted_phase_timeline(tmp_path, phase):
+    from apps.oa_finance_preaudit.manual_stop_recovery import recover_manual_stop
+    target, evidence, snapshot = _environment(tmp_path)
+    binding = json.loads(evidence.read_text())
+    terminal = json.loads(Path(binding['original_exit']['path']).read_text())
+    source = Path(terminal['source_file']['path'])
+    rows = [json.loads(line) for line in source.read_text().splitlines()]
+    event = rows[-1]
+    envelope = json.loads(event['payload']['output'][-1]['text'])
+    receipt = json.loads(envelope['output'])
+    manifest = json.loads(Path(binding['manifest']['path']).read_text())
+    completed = datetime.fromisoformat(manifest['completed_at'])
+    if phase == 'receipt_before_manifest':
+        receipt['completed_at'] = (completed - timedelta(seconds=1)).isoformat()
+    elif phase == 'receipt_naive':
+        receipt['completed_at'] = completed.replace(tzinfo=None).isoformat()
+    elif phase == 'tool_before_receipt':
+        event['timestamp'] = completed.isoformat()
+    elif phase == 'tool_after_closure':
+        event['timestamp'] = (completed + timedelta(seconds=4)).isoformat()
+    else:
+        event.pop('timestamp')
+    envelope['output'] = json.dumps(receipt)
+    event['payload']['output'][-1]['text'] = json.dumps(envelope)
+    source.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
+    terminal['source_file']['sha256'] = hashlib.sha256(source.read_bytes()).hexdigest()
+    binding['original_exit'] = _write(Path(binding['original_exit']['path']), terminal)
+    _write(evidence, binding)
+    with pytest.raises(ValueError, match='manual_stop_recovery_blocked'):
+        recover_manual_stop(target_root=target, evidence_file=evidence, confirmed=True, check_live=lambda: snapshot)
+    assert (target / 'runtime/stop-preaudit.flag').read_bytes() == b'stop_requested\n'
 
 
 @pytest.mark.parametrize("changed", ["reason", "replacement", "permission", "env",

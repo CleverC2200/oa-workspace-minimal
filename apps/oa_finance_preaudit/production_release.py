@@ -95,6 +95,25 @@ def candidate_configuration_findings(root: Path, revision: str) -> list[str]:
         return production_config.repository_findings(candidate)
 
 
+def _observed_revision(root: Path) -> str | None:
+    try:
+        revision = _git(root, 'rev-parse', 'HEAD')
+    except RuntimeError:
+        return None
+    return revision if _REVISION.fullmatch(revision) else None
+
+
+def _failed_release(root: Path, before: str | None, expected: str, requested: bool, error: Exception) -> dict:
+    after = _observed_revision(root)
+    state = 'unknown' if before is None or after is None else ('not_updated' if after == before else 'updated')
+    return {'schema_version': 1, 'kind': 'production_source_release', 'status': 'blocked',
+            'code': str(error), 'write_state': 'not_requested', 'before_revision': before,
+            'after_revision': after, 'revision': after, 'expected_revision': expected,
+            'requested_revision': expected, 'source_sync_requested': requested,
+            'source_sync_state': state, 'next_process_ready': False,
+            'production_acceptance': 'not_verified'}
+
+
 def release_source(
     target_root: Path, *, expected_revision: str, confirmed_sync: bool = False,
     expected_origin: str = ORIGIN, automation: ProductionAutomation | None = None,
@@ -129,45 +148,55 @@ def release_source(
     manifest = runtime_control.read_control_bytes(manifest_file)
     if manifest is None:
         raise RuntimeError('production_release_manifest_missing')
-    with maintenance_runtime.target_runtime_leases(root):
-        _assert_no_stop(root)
-        snapshot = live(root)
-        maintenance_runtime.assert_live_safe(snapshot)
-        if runtime_control.read_control_bytes(manifest_file) != manifest:
-            raise RuntimeError('production_release_manifest_changed')
-        if _source(root, expected_revision, expected_origin) != before:
-            raise RuntimeError('production_release_source_changed')
-        _assert_no_stop(root)
-        findings = configuration(root, expected_revision)
-        if findings:
-            raise RuntimeError('production_release_configuration_invalid:' + ','.join(findings))
-        if confirmed_sync:
-            _git(root, 'merge', '--ff-only', expected_revision)
+    sync_started = False
+    try:
+        with maintenance_runtime.target_runtime_leases(root):
+            _assert_no_stop(root)
             snapshot = live(root)
             maintenance_runtime.assert_live_safe(snapshot)
-            if check_configuration is None:
-                from . import production_config
-                findings = production_config.repository_findings(root)
-                if findings:
-                    raise RuntimeError('production_release_configuration_invalid:' + ','.join(findings))
-        _assert_no_stop(root)
-        after = _source(root, expected_revision, expected_origin, synchronized=confirmed_sync)
-        findings = configuration(root, expected_revision)
-        if findings:
-            raise RuntimeError('production_release_configuration_invalid:' + ','.join(findings))
-        if runtime_control.read_control_bytes(manifest_file) != manifest:
-            raise RuntimeError('production_release_manifest_changed')
-        return {
-            'schema_version': 1, 'kind': 'production_source_release',
-            'status': 'synced' if confirmed_sync else 'ready',
-            'before_revision': before, 'revision': after,
-            'expected_revision': expected_revision, 'write_state': 'not_requested',
-            'source_sync_requested': confirmed_sync,
-            'next_process_ready': confirmed_sync,
-            'production_acceptance': 'not_verified',
-            'status_file': snapshot.get('maintenance_status_file'),
-            'continuation': snapshot['reconciliation']['continuation'],
-        }
+            if runtime_control.read_control_bytes(manifest_file) != manifest:
+                raise RuntimeError('production_release_manifest_changed')
+            if _source(root, expected_revision, expected_origin) != before:
+                raise RuntimeError('production_release_source_changed')
+            _assert_no_stop(root)
+            findings = configuration(root, expected_revision)
+            if findings:
+                raise RuntimeError('production_release_configuration_invalid:' + ','.join(findings))
+            if confirmed_sync:
+                sync_started = True
+                _git(root, 'merge', '--ff-only', expected_revision)
+                snapshot = live(root)
+                maintenance_runtime.assert_live_safe(snapshot)
+                if check_configuration is None:
+                    from . import production_config
+                    findings = production_config.repository_findings(root)
+                    if findings:
+                        raise RuntimeError('production_release_configuration_invalid:' + ','.join(findings))
+            _assert_no_stop(root)
+            after = _source(root, expected_revision, expected_origin, synchronized=confirmed_sync)
+            findings = configuration(root, expected_revision)
+            if findings:
+                raise RuntimeError('production_release_configuration_invalid:' + ','.join(findings))
+            if runtime_control.read_control_bytes(manifest_file) != manifest:
+                raise RuntimeError('production_release_manifest_changed')
+            return {
+                'schema_version': 1, 'kind': 'production_source_release',
+                'status': 'synced' if confirmed_sync else 'ready',
+                'before_revision': before, 'revision': after, 'after_revision': after,
+                'requested_revision': expected_revision,
+                'source_sync_state': 'updated' if after != before else 'not_updated',
+                'expected_revision': expected_revision, 'write_state': 'not_requested',
+                'source_sync_requested': confirmed_sync,
+                'next_process_ready': confirmed_sync,
+                'production_acceptance': 'not_verified',
+                'status_file': snapshot.get('maintenance_status_file'),
+                'current_input_proof': snapshot.get('maintenance_current_inputs'),
+                'continuation': snapshot['reconciliation']['continuation'],
+            }
+    except (OSError, ValueError, RuntimeError) as error:
+        if not sync_started:
+            raise
+        return _failed_release(root, before, expected_revision, confirmed_sync, error)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -179,16 +208,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--production-project-id', required=True)
     parser.add_argument('--expected-schedule', required=True)
     args = parser.parse_args(argv)
+    before = _observed_revision(args.target_root)
     try:
         automation = ProductionAutomation(args.automation_file,
                                           args.production_project_id, args.expected_schedule)
         payload = release_source(args.target_root, expected_revision=args.expected_revision,
                                  confirmed_sync=args.confirm_sync == 'YES', automation=automation)
     except (OSError, ValueError, RuntimeError) as error:
-        print(json.dumps({'status': 'blocked', 'code': str(error), 'write_state': 'not_requested'}))
+        print(json.dumps(_failed_release(args.target_root, before, args.expected_revision, args.confirm_sync == 'YES', error)))
         return 1
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-    return 0
+    return 1 if payload['status'] == 'blocked' else 0
 
 
 if __name__ == '__main__':

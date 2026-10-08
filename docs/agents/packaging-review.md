@@ -10,7 +10,7 @@
 
 新回执记录模型、effort、供应商和 `requested_service_tier`。该档位字段是命令请求设置，不表示已经获得供应商实际服务档位遥测。历史 DeepSeek 和旧 OpenAI 证据保持原模型与 `high`，新模型只接受 `medium`；模型与 effort 不匹配时拒绝。
 
-宿主只生成引用/类型合同，不做图片分类或业务判断。Schema 覆盖包装页、非包装页、不确定页、多版本及有无 Excel；空属性对象在调用前拒绝。结果只接受一个纯 JSON 或唯一 `json` 围栏，拆封只改格式，不更改字段。非 JSON、多围栏和不匹配 Schema 保留原输出并失败。包装版本 ID 由共享合同约束为 1～80 个 ASCII 字母、数字、点、下划线或短横线；非包装和不确定页继续使用 null。中文、空串、超长值和尾部换行在草稿 Schema 校验阶段拒绝。宿主仅通过现有 `review_decision.bind_frozen_fields` 补齐协议绑定字段，并在前后核对冻结资料。绑定后调用 `FlowEngine.validate_review_decision`，复用提交消费者的项目、整体结论、逐页分类、版本覆盖、Excel 和补充项完整合同；该入口不续期授权，不改写 attempt，也不生成提交产物。校验失败返回 `packaging_review_contract_invalid`，原模型输出保留，不修复无效业务字段。
+宿主只生成引用/类型合同，不做图片分类或业务判断。Schema 覆盖包装页、非包装页、不确定页、多版本及有无 Excel；空属性对象在调用前拒绝。结果只接受一个纯 JSON 或唯一 `json` 围栏，拆封只改格式，不更改字段。非 JSON、多围栏和不匹配 Schema 保留原输出并失败。包装版本 ID 由共享合同约束为 1～80 个 ASCII 字母、数字、点、下划线或短横线；非包装和不确定页继续使用 null。原生 Schema 使用供应商支持的普通锚定正则，不含 lookaround；本地草稿解析和提交消费者继续用同一正则的 fullmatch，拒绝中文、空串、超长值和尾部换行。宿主仅通过现有 `review_decision.bind_frozen_fields` 补齐协议绑定字段，并在前后核对冻结资料。绑定后调用 `FlowEngine.validate_review_decision`，复用提交消费者的项目、整体结论、逐页分类、版本覆盖、Excel 和补充项完整合同；该入口不续期授权，不改写 attempt，也不生成提交产物。校验失败返回 `packaging_review_contract_invalid`，原模型输出保留，不修复无效业务字段。
 
 `draft_ready` 和 `contract_validation=passed` 表示草稿绑定后已通过完整只读合同校验，**不表示已提交、业务通过或图片阅读已验证**。`tool_receipt_files` 只是原生记录的路径；必须按真实 tool call/output、页面路径与版本核对实际查看及必要复核，记录缺口，不能凭文件存在、event 计数或模型自述证明已阅读。`semantic_acceptance=not_checked` 保持到独立业务验收。Schema/正常路径离线测试不证明供应商实际接受全部形状。
 

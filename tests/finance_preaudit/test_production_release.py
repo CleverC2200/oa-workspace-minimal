@@ -65,6 +65,62 @@ def test_release_preflight_retains_leases_across_real_ff_and_readbacks(productio
     assert git(root, 'rev-parse', 'HEAD') == expected
 
 
+def test_release_reports_actual_source_after_post_sync_live_failure(production, monkeypatch, capsys):
+    root, remote, before = production
+    source = remote.parent / 'source'
+    git(remote.parent, 'clone', '-q', str(remote), str(source))
+    (source / 'source.txt').write_text('second')
+    git(source, 'add', '.')
+    git(source, 'commit', '-qm', 'second')
+    git(source, 'push', '-q')
+    git(root, 'fetch', '-q', 'origin')
+    expected = git(source, 'rev-parse', 'HEAD')
+    calls = 0
+    def live(target):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError('maintenance_live_status_failed')
+        return live_snapshot()
+    result = production_release.release_source(root, expected_revision=expected, expected_origin=str(remote),
+        confirmed_sync=True, check_live=live, check_configuration=lambda *_: [])
+    assert result['status'] == 'blocked'
+    assert result['source_sync_state'] == 'updated'
+    assert result['before_revision'] == before
+    assert result['after_revision'] == result['requested_revision'] == expected
+    assert result['code'] == 'maintenance_live_status_failed'
+    assert result['next_process_ready'] is False
+    assert result['production_acceptance'] == 'not_verified'
+    assert git(root, 'rev-parse', 'HEAD') == expected
+    monkeypatch.setattr(production_release, 'release_source', lambda *_args, **_kwargs: result)
+    assert production_release.main(['--target-root', str(root), '--expected-revision', expected, '--confirm-sync', 'YES',
+        '--automation-file', str(root / 'not-opened.toml'), '--production-project-id', 'production',
+        '--expected-schedule', 'preserved']) == 1
+    import json
+    assert json.loads(capsys.readouterr().out) == result
+
+
+@pytest.mark.parametrize('unknown', [False, True])
+def test_post_sync_failure_reports_unchanged_or_unreadable_head(production, unknown):
+    root, remote, expected = production
+    calls = 0
+    def live(target):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            if unknown:
+                (target / '.git').rename(target / 'moved-git')
+            raise RuntimeError('maintenance_live_status_failed')
+        return live_snapshot()
+    result = production_release.release_source(root, expected_revision=expected, expected_origin=str(remote),
+        confirmed_sync=True, check_live=live, check_configuration=lambda *_: [])
+    assert result['status'] == 'blocked'
+    assert result['source_sync_state'] == ('unknown' if unknown else 'not_updated')
+    assert result['before_revision'] == expected
+    assert result['after_revision'] == (None if unknown else expected)
+    assert result['next_process_ready'] is False
+
+
 @pytest.mark.parametrize('scenario,code', [
     ('stop', 'production_release_stop_requested'),
     ('environment_stop', 'production_release_stop_requested'),
@@ -154,7 +210,12 @@ def test_public_cli_returns_small_blocked_receipt_for_stop(production, capsys):
         '--expected-schedule', 'preserved'])
     result = json.loads(capsys.readouterr().out)
     assert exit_code == 1
-    assert result == {'status': 'blocked', 'code': 'production_release_stop_requested', 'write_state': 'not_requested'}
+    assert result['status'] == 'blocked'
+    assert result['code'] == 'production_release_stop_requested'
+    assert result['write_state'] == 'not_requested'
+    assert result['before_revision'] == result['after_revision'] == expected
+    assert result['source_sync_state'] == 'not_updated'
+    assert result['production_acceptance'] == 'not_verified'
 
 
 def test_release_refuses_diverged_clean_main(production):

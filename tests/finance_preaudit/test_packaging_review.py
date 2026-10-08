@@ -213,6 +213,19 @@ def test_draft_schema_rejects_invalid_package_version_id(tmp_path, version_id):
         reviewer.parse_draft(json.dumps(body), reviewer.draft_schema(packet))
 
 
+def test_native_draft_schema_uses_regex_without_unsupported_lookaround(tmp_path):
+    path = action(tmp_path)
+    packet = json.loads(path.with_name('review-packet.json').read_text())
+    schema = reviewer.draft_schema(packet)
+    pattern = schema['properties']['visual_review']['properties']['pages']['items']['properties']['package_version_id']['pattern']
+    assert '(?' not in pattern
+
+
+def test_provider_schema_rejects_known_unsupported_lookaround_before_execution():
+    with pytest.raises(ValueError, match='review_schema_unsupported_pattern'):
+        reviewer.check_provider_schema({'type': 'string', 'pattern': r'^[A-Z]+(?![\s\S])'})
+
+
 def test_readonly_consumer_validation_preserves_bound_decision_and_attempt(tmp_path):
     from copy import deepcopy
     from apps.oa_finance_preaudit import decision_validation, flow_engine

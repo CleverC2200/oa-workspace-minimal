@@ -75,7 +75,19 @@ def _source_revision(target: Path) -> str:
     return git("rev-parse", "HEAD")
 
 
-def _verify_original_exit(terminal: dict, manifest: dict, binding: dict) -> None:
+def _aware_time(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError(BLOCKED)
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError(BLOCKED) from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(BLOCKED)
+    return parsed
+
+
+def _verify_original_exit(terminal: dict, manifest: dict, binding: dict, observed: datetime) -> None:
     """Verify the actual process result in the original tool event, not its wrapper."""
     raw = _bound_bytes(terminal["source_file"], private=False)
     if type(terminal.get("source_line")) is not int or terminal["source_line"] < 1:
@@ -168,8 +180,10 @@ def _verify_original_exit(terminal: dict, manifest: dict, binding: dict) -> None
         or receipt.get("controller_instance_id") != manifest.get("controller_instance_id")
         or receipt.get("controller_pid") != manifest.get("controller_pid")
         or receipt.get("code_revision") != manifest.get("code_revision")
-        or receipt.get("controller_state") != manifest.get("state")
-        or receipt.get("completed_at") != manifest.get("completed_at")):
+        or receipt.get("controller_state") != manifest.get("state")):
+        raise ValueError(BLOCKED)
+    if not (_aware_time(manifest.get("completed_at")) <= _aware_time(receipt.get("completed_at"))
+            <= _aware_time(event.get("timestamp")) <= observed):
         raise ValueError(BLOCKED)
     original_manifest = Path(binding["original_manifest"]["path"])
     if (receipt.get("owner_task_id") != metadata[0].get("id")
@@ -219,22 +233,22 @@ def _original_evidence(target: Path, binding: dict) -> tuple[dict, dict]:
         or (manifest["state"] == "completed" and terminal["exit_code"] != 0)
         or (manifest["state"] == "failed" and terminal["exit_code"] == 0)):
         raise ValueError(BLOCKED)
-    completed = datetime.fromisoformat(manifest["completed_at"])
-    observed = datetime.fromisoformat(original["generated_at"])
-    if completed.tzinfo is None or observed.tzinfo is None or observed < completed:
+    completed = _aware_time(manifest.get("completed_at"))
+    observed = _aware_time(original.get("generated_at"))
+    if observed < completed:
         raise ValueError(BLOCKED)
-    conflict_at = datetime.fromisoformat(conflict["generated_at"])
+    conflict_at = _aware_time(conflict.get("generated_at"))
     stop_at = datetime.fromtimestamp(binding["stop"]["mtime_ns"] / 1_000_000_000, tz=timezone.utc)
     if conflict_at.tzinfo is None or not conflict_at <= stop_at <= completed <= observed:
         raise ValueError(BLOCKED)
     from .maintenance_runtime import assert_live_safe
-    assert_live_safe(original, maintenance_leases_held=False)
+    assert_live_safe(original, maintenance_leases_held=False, original_closure=True)
     if (conflict.get("kind") != "preaudit_runtime_status"
         or conflict.get("reconciliation", {}).get("continuation", {}).get("status") != "blocked"
         or not any(row.get("category") == "pending_handled_conflict"
                    for row in conflict.get("reconciliation", {}).get("findings", []) if isinstance(row, dict))):
         raise ValueError(BLOCKED)
-    _verify_original_exit(terminal, manifest, binding)
+    _verify_original_exit(terminal, manifest, binding, observed)
 
     pid = manifest.get("controller_pid")
     if type(pid) is not int or pid <= 0:
@@ -295,6 +309,7 @@ def recover_manual_stop(
                        "binding_sha256": hashlib.sha256(raw_binding).hexdigest(), "binding": binding,
                        "original_run_id": manifest["run_id"], "original_exit_code": terminal["exit_code"],
                        "current_status_file": current.get("maintenance_status_file"),
+                       "current_input_proof": current.get("maintenance_current_inputs"),
                        "live_continuation": current["reconciliation"]["continuation"],
                        "write_state": "not_requested", "stop_cleared": False}
             def record() -> None:

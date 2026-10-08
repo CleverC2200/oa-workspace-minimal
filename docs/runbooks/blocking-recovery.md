@@ -104,7 +104,7 @@ Writer 被停止门拦在提交之前时，仅精确签名边界为 `writer_pref
 - `manifest` 和 `original_manifest` 均包含绝对 `path`、原始字节 `sha256`，分别指向当前 rolling-controller-manifest 和原执行目录 controller-manifest。两份内容必须同轮终态且 children_reaped=true。
 - `original_conflict_status` 绑定原 blocked、存在 pending_handled_conflict 的完整状态文件；`original_status` 绑定原控制器终态后的完整收尾状态文件。两者均使用 `path`、`sha256`，不能用当前新快照替代。
 - `original_exit` 使用 `path`、`sha256` 绑定 `preaudit_original_controller_exit` 记录。该记录必须包含实际 `exit_code`、`process_session_id`、`run_id`、`terminal=true`、`children_reaped=true`，以及原会话 `source_file` 的 `path/sha256`、`source_line`、`source_call_id`。
-- `stop_source` 包含原停止调用的 `line`、`call_id`，引用同一原会话文件。维护核对原 `request_stop()` 调用、实际退出 0 的停止结果、无原因码和对应冲突文件；再核对原会话 cwd、任务 id，以及实际 write_stdin 进程退出与嵌套执行回执的轮次、实例、PID、修订和终态。`Script completed` 不作为进程退出证据。原会话只读源允许当前用户所有且组和其他用户不可写，私有维护证据仍须 0600。
+- `stop_source` 包含原停止调用的 `line`、`call_id`，引用同一原会话文件。维护核对原 `request_stop()` 调用、实际退出 0 的停止结果、无原因码和对应冲突文件；再核对原会话 cwd、任务 id，以及实际 write_stdin 进程退出与嵌套执行回执的轮次、实例、PID、修订和终态。保留各阶段原时间，严格核对带时区的 manifest.completed_at ≤ supervisor.completed_at ≤ 原工具输出 timestamp ≤ 原收尾 status.generated_at；这些阶段无须同时结束。`Script completed` 不作为进程退出证据。原会话只读源允许当前用户所有且组和其他用户不可写，私有维护证据仍须 0600。
 
 证据与原工具终态、文件 bytes/SHA 已核实后，按当前明确授权运行：
 
@@ -116,6 +116,6 @@ python -m apps.oa_finance_preaudit.manual_stop_recovery \
   --confirm-reconciled YES
 ```
 
-维护持有生产非阻塞 controller 和 global Writer 租约，拒绝环境停止、路径覆盖、活动请求 Writer、不可信权限、原标记替换或原证据改变。锁内等待生产只读 status 实际退出 0，并核对完整文件回执。身份、认证、授权、冻结和 continuation 必须可信，当前未知写入或 pending/handled 冲突阻断；可信单项隔离可保留。通过后先 fsync 保存 0600 validated 回执，复查原证据与标记，再精确清除并保存 cleared 结果。
+维护持有生产非阻塞 controller 和 global Writer 租约，拒绝环境停止、路径覆盖、活动请求 Writer、不可信权限、原标记替换或原证据改变。锁内等待生产只读 status 实际退出 0，并核对完整文件回执。目标解释器另调用既有只读策略及冻结校验器，要求当前 write-policy 覆盖六财务和包装、当前待审本地冻结资料完整，并绑定本次 status SHA。原收尾状态保留旧字段兼容，不补造新证明。当前身份、认证、授权、冻结和 continuation 必须可信，当前未知写入或 pending/handled 冲突阻断；可信单项隔离可保留。通过后先 fsync 保存 0600 validated 回执，复查原证据与标记，再精确清除并保存 cleared 结果。
 
 结果必须同时读取 `status`、`stop_cleared`、`receipt_file` 和 `write_state`。`maintenance_completion_failed` 或 `audit_completion_failed` 表示维护结束有异常，清除可能已经发生；先核对回执和实际停止状态，不重复执行或声称仍未清除。恢复标记成功不代表生产审核验收成功。随后使用统一生产发布预检，同步通过后只有下一独立进程才加载新版本。

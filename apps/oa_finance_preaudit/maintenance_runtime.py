@@ -18,7 +18,7 @@ def assert_target_environment(target_root: Path) -> None:
     """Reject control path overrides rather than operate on a different runtime."""
     for key in ('OA_FROZEN_WRITER_LOCK_FILE', 'OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE',
                 'OA_FINANCE_PREAUDIT_STOP_FILE', 'OA_FINANCE_PREAUDIT_RUNTIME_ROOT',
-                'OA_FINANCE_PREAUDIT_FLOW_ROOT', 'GIT_DIR', 'GIT_WORK_TREE'):
+                'OA_FINANCE_PREAUDIT_FLOW_ROOT', 'OA_FINANCE_PREAUDIT_WRITE_POLICY', 'GIT_DIR', 'GIT_WORK_TREE'):
         if os.environ.get(key):
             raise RuntimeError('maintenance_runtime_override')
     if target_root.is_symlink() or not target_root.is_dir():
@@ -47,7 +47,8 @@ def target_runtime_leases(target_root: Path) -> Iterator[None]:
         raise RuntimeError('maintenance_runtime_active') from error
 
 
-def assert_live_safe(payload: dict, *, maintenance_leases_held: bool = True) -> None:
+def assert_live_safe(payload: dict, *, maintenance_leases_held: bool = True,
+                     original_closure: bool = False) -> None:
     """Require complete live identity/authentication and trusted continuation evidence."""
     if not isinstance(payload, dict) or any(
             not isinstance(payload.get(key), dict)
@@ -86,8 +87,6 @@ def assert_live_safe(payload: dict, *, maintenance_leases_held: bool = True) -> 
             or not controller_handoff._recovery_reconciliation_is_trusted(reconciled)
             or not isinstance(reconciled.get('findings'), list)):
         raise RuntimeError('maintenance_reconciliation_untrusted')
-    # Continuation verifies isolation/frozen state and authorization contracts; retain
-    # a separate explicit current-write gate even if a caller supplies malformed counts.
     for finding in reconciled['findings']:
         if not isinstance(finding, dict):
             raise RuntimeError('maintenance_reconciliation_untrusted')
@@ -97,6 +96,122 @@ def assert_live_safe(payload: dict, *, maintenance_leases_held: bool = True) -> 
                 or (finding.get('category') == 'pending_not_handled'
                     and finding.get('local_write_state') in {'unknown', 'submitting', 'submitted'})):
             raise RuntimeError('maintenance_current_write_unresolved')
+    if not original_closure:
+        from .production_config import FINANCE_WORKFLOWS
+        proof = payload.get('maintenance_current_inputs')
+        receipt = payload.get('maintenance_status_file')
+        if (not isinstance(proof, dict) or not isinstance(receipt, dict)
+                or proof.get('kind') != 'preaudit_maintenance_current_inputs'
+                or proof.get('status') != 'verified' or proof.get('read_only') is not True
+                or proof.get('write_state') != 'not_requested'
+                or not isinstance(receipt.get('sha256'), str) or len(receipt['sha256']) != 64
+                or any(character not in '0123456789abcdef' for character in receipt['sha256'])
+                or not isinstance(proof.get('policy_sha256'), str) or len(proof['policy_sha256']) != 64
+                or any(character not in '0123456789abcdef' for character in proof['policy_sha256'])
+                or proof.get('status_sha256') != receipt.get('sha256')
+                or not isinstance(proof.get('authorized_workflows'), list)
+                or any(not isinstance(value, str) for value in proof['authorized_workflows'])
+                or sorted(proof.get('authorized_workflows') or []) != sorted((*FINANCE_WORKFLOWS, 'packaging_layout_approval'))
+                or type(proof.get('pending_frozen_count')) is not int or proof['pending_frozen_count'] < 0
+                or type(proof.get('validated_frozen_count')) is not int
+                or proof['validated_frozen_count'] != proof['pending_frozen_count']):
+            raise RuntimeError('maintenance_current_inputs_untrusted')
+        if proof['pending_frozen_count'] != sum(row.get('category') == 'pending_not_handled' for row in reconciled['findings']):
+            raise RuntimeError('maintenance_current_inputs_untrusted')
+
+
+# This fixed bridge imports only validators already installed in the target tree.
+# It never calls an OA port, renews a grant, persists state, or imports candidate code.
+_CURRENT_INPUTS_READER = r'''
+import hashlib, json, os, stat, sys
+from pathlib import Path
+from apps.oa_approval import auth
+from apps.oa_finance_preaudit import flow_engine, production_write, reconciliation, item_failure
+root = Path.cwd().resolve()
+path, expected_hash, workflows_json = sys.argv[1:]
+required = set(json.loads(workflows_json))
+code = 'maintenance_current_inputs_untrusted'
+try:
+    if any(not Path(module.__file__).resolve().is_relative_to(root) for module in (flow_engine, production_write, reconciliation, item_failure)):
+        raise ValueError()
+    raw = Path(path).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_hash:
+        raise ValueError()
+    snapshot = json.loads(raw)
+    policy = root / 'runtime/control/write-policy.json'
+    code = 'maintenance_authorization_untrusted'
+    auth.load_local_env()
+    configured_policy = os.environ.get('OA_FINANCE_PREAUDIT_WRITE_POLICY')
+    if configured_policy and Path(configured_policy).expanduser().absolute() != policy:
+        raise ValueError()
+    metadata = policy.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
+        raise ValueError()
+    if policy.is_symlink() or not required.issubset(production_write._authorized_workflows(policy)):
+        raise ValueError()
+    policy_bytes = policy.read_bytes()
+    policy_hash = hashlib.sha256(policy_bytes).hexdigest()
+    code = 'maintenance_frozen_inputs_untrusted'
+    flows = root / 'runtime/finance_preaudit_flows'
+    states = reconciliation.latest_states(flows)
+    by_key = {(s['workflow_key'], s['case_key'], s['attempt']): s for s in states}
+    pending = [item for item in snapshot['reconciliation']['findings'] if item['category'] == 'pending_not_handled']
+    validated = 0
+    for item in pending:
+        state = by_key[(item['workflow_key'], item['item_key'], item['attempt'])]
+        attempt = flows / state['workflow_key'] / 'cases' / state['case_key'] / ('attempt-' + str(state['attempt']))
+        if state['execution_state'] == 'review_required':
+            if not flow_engine.FlowEngine.resumable_review(flows, state):
+                raise ValueError()
+        elif state['execution_state'] == 'needs_admin':
+            if not (item_failure.isolated(attempt, state) or reconciliation._trusted_quarantine(flows, state)):
+                raise ValueError()
+            if state.get('material_file') is not None or state.get('review_packet_file') is not None:
+                flow_engine._validate_frozen_review_inputs(attempt_root=attempt, state=state, workflow_key=state['workflow_key'])
+        else:
+            raise ValueError()
+        validated += 1
+    current_policy = policy.lstat()
+    if ((metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns, metadata.st_mode)
+            != (current_policy.st_dev, current_policy.st_ino, current_policy.st_mtime_ns, current_policy.st_mode)
+            or policy.read_bytes() != policy_bytes or Path(path).read_bytes() != raw or reconciliation.latest_states(flows) != states):
+        raise ValueError()
+    print(json.dumps({'kind':'preaudit_maintenance_current_inputs','status':'verified','read_only':True,
+        'write_state':'not_requested','target_root':str(root),'status_sha256':expected_hash,
+        'policy_sha256':policy_hash,'authorized_workflows':sorted(required),
+        'pending_frozen_count':len(pending),'validated_frozen_count':validated}))
+except (OSError, ValueError, RuntimeError, KeyError, TypeError):
+    print(json.dumps({'status':'blocked','error_code':code}))
+    raise SystemExit(1)
+'''
+
+
+def read_current_inputs(target_root: Path, receipt: dict) -> dict:
+    """Obtain current policy/frozen proof from the target's existing validators."""
+    from .production_config import FINANCE_WORKFLOWS
+    target_root = Path(target_root).expanduser().absolute()
+    assert_target_environment(target_root)
+    if (target_root / '.venv').is_symlink() or not (target_root / '.venv/bin/python').is_file():
+        raise RuntimeError('maintenance_interpreter_untrusted')
+    environment = dict(os.environ)
+    environment.pop('PYTHONPATH', None)
+    environment.pop('PYTHONHOME', None)
+    try:
+        result = subprocess.run([str(target_root / '.venv/bin/python'), '-B', '-E', '-c', _CURRENT_INPUTS_READER,
+            receipt['path'], receipt['sha256'], json.dumps([*FINANCE_WORKFLOWS, 'packaging_layout_approval'])],
+            cwd=target_root, env=environment, capture_output=True, text=True, check=False, timeout=300)
+        if len(result.stdout.encode()) > 1_000_000:
+            raise RuntimeError('maintenance_current_inputs_untrusted')
+        proof = json.loads(result.stdout)
+        if result.returncode:
+            code = proof.get('error_code') if isinstance(proof, dict) else None
+            raise RuntimeError(code if code in {'maintenance_authorization_untrusted', 'maintenance_frozen_inputs_untrusted'}
+                               else 'maintenance_current_inputs_untrusted')
+        if not isinstance(proof, dict) or proof.get('target_root') != str(target_root.resolve()):
+            raise RuntimeError('maintenance_current_inputs_untrusted')
+        return proof
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        raise RuntimeError('maintenance_current_inputs_untrusted') from error
 
 
 def read_live_status(target_root: Path) -> dict:
@@ -138,6 +253,7 @@ def read_live_status(target_root: Path) -> dict:
         if not isinstance(payload, dict):
             raise RuntimeError('maintenance_live_receipt_invalid')
         payload['maintenance_status_file'] = receipt
+        payload['maintenance_current_inputs'] = read_current_inputs(target_root, receipt)
         return payload
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         raise RuntimeError('maintenance_live_status_failed') from error
