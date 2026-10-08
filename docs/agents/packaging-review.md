@@ -1,5 +1,7 @@
 # 包装只读审核入口
 
+新草稿通过 `supplementary_checks` 承载四项之外的逐位置关键文字异常；空数组表示没有补充异常。完整字段、页引用和整体结论规则见[FlowEngine 补充校对合同](../../.agents/skills/oa-finance-preaudit/references/flow-engine-contract.md)。该通道只承载审核者形成的观察，宿主不生成疑点。
+
 已有同轮 `action=review_required` 的冻结包装 V2 材料时，调用 `python -m apps.oa_finance_preaudit.packaging_review --action-file <绝对 action.json 路径>`。缺材料的恢复/领取仍使用原受控入口和独立授权。本入口不领取、恢复、提交或告警，不修改冻结 attempt；开发测试使用脱敏离线材料。
 
 审核进程沿用独立 `OA_REVIEW_API_KEY`、DeepSeek 模型及 read-only sandbox，隔离 OpenAI/Codex 宿主凭据。默认 900 秒、只可在 60～3600 秒内调整；超时和取消由原进程组回收实现处理。此次审核的空 `CODEX_HOME` 与 stdout、stderr、原决定、Schema 保存在独占的 `runtime/control/packaging-reviews/<id>/`。此入口保留原生会话记录，所以不使用会丢弃原生工具记录的 ephemeral 选项；独立 home 不读取其他聊天。

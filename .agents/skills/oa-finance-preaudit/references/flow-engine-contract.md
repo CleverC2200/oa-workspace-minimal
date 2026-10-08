@@ -94,7 +94,7 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
 - `pass` 和 `fail` 至少有一个 `evidence_refs`；唯一例外是 V2 包装流程确认全部页面均为 `non_packaging` 的跳过分支，内部四项不绑定图片证据。
 - `uncertain` 至少有一个 `missing_evidence`。
 - 差旅完整材料采用 `full_coverage_without_trusted_item_relation` 路由时，页面引用只记录覆盖范围；`uncertain` 的 `missing_evidence` 除页面引用外还必须包含当前审核项具体缺失的事实或关系，只有页面引用的决定无效。
-- 任一项目为 `fail` 或 `uncertain` 时，`overall` 必须为 `needs_human`；全部为 `pass` 时必须为 `pass`。
+- 任一固定项目或包装补充项为 `fail` 或 `uncertain` 时，`overall` 必须为 `needs_human`；固定项目全部为 `pass` 且无包装补充异常时必须为 `pass`。
 - 不增加 requestId、人员、公司、写入模式、意见文本或其他字段。
 
 包装流程的决定还必须增加一个 `excel_comparison`。未提供 Excel 时固定为 `{"status":"not_provided","resource_id":null,"mappings":[]}`。存在 Excel 时，`mappings` 必须按四项顺序逐项给出 `item_key`、可解析到同一结构化 Excel `key_text` 索引的 `cell_refs`，以及 `match`、`different` 或 `uncertain` 比较结果；相同 cell ref 还要进入对应项目的 `evidence_refs`。脚本逐条验证资源、索引、项目状态和四项映射后才渲染 Excel 对照尾行，不根据附件存在自行推断完成。
@@ -122,6 +122,22 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
 - 只要存在 `packaging_layout` 就使用 `outcome=reviewed` 并审核包装页；存在 `uncertain` 时也必须使用 `reviewed`，整体结论为 `needs_human`，且不确定页引用必须进入至少一个 `uncertain` 项的 `missing_evidence`。
 - 只有全部页面均为 `non_packaging` 时允许 `outcome=all_non_packaging`。此时四项保留为内部 `pass` 结构以维持统一执行与回执合同，但 `evidence_refs` 和 `missing_evidence` 均为空；`excel_comparison.status` 使用 `not_applicable`，OA 意见只渲染 `AI审核结论：非包装版面，跳过审核。`。
 - V1 冻结包装审核包仍按原决定合同闭合；新审核包会在 action、state 和 review packet 中同时固定 V2 标记，任一标记缺失或不一致均停止，不能把 V2 决定降级成 V1 绕过视觉覆盖校验。
+
+包装 V2 的四项之外异常使用 `supplementary_checks`，新只读审核草稿始终提供此数组，无异常时为 `[]`。已冻结的旧决定未携带该字段时按空数组兼容；V1 和六类财务不接受此字段。
+
+```json
+{
+  "supplementary_checks": [
+    {
+      "page_ref": "原样复制对应冻结页面引用",
+      "status": "fail 或 uncertain",
+      "conclusion": "版本或区域定位及实际疑点，保留单行"
+    }
+  ]
+}
+```
+
+每个异常位置单独记录，来源必须是本次已观察的包装页；分类为 `uncertain` 的页面只允许 `uncertain` 补充项，`non_packaging` 页不提供补充证据。空结论、重复位置与结论、额外字段及不可解析的页引用在写入前拒绝。补充异常独立影响整体结论，固定四项数量、顺序和状态不变。宿主仅校验和渲染审核者的观察，在四项之后合并为唯一一行 `补充校对`，逐条保留定位及疑点；Excel 对照保持末行。全部非包装分支只接受空数组并保持原单句意见。
 
 V1 包装决定必须用 `material:prepared.images.<resource_id>.page-<number>` 在 `evidence_refs` 或 `missing_evidence` 中覆盖每一页；V2 改由 `visual_review.pages` 完成逐页分类覆盖，并把包装页声明的固定项逐项绑定到对应证据或缺口。脚本会先验证图片可读、manifest 页数与准备页一致，再验证视觉分类、版本四项矩阵和证据绑定；采集脚本不得生成图片观察、分类或校对结论。
 

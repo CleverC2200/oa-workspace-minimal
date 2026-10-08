@@ -1450,6 +1450,44 @@ def _validate_packaging_visual_review(
     return outcome
 
 
+def _packaging_supplementary_line(checks: object, visual_review: dict) -> str | None:
+    if not isinstance(checks, list):
+        raise decision_validation.InvalidDecision("packaging_supplementary_checks")
+    if not checks:
+        return None
+    if visual_review["outcome"] != "reviewed":
+        raise decision_validation.InvalidDecision("packaging_supplementary_checks")
+    classifications = {
+        page["page_ref"]: page["classification"]
+        for page in visual_review["pages"]
+    }
+    seen = set()
+    rendered = []
+    for check in checks:
+        if not isinstance(check, dict) or set(check) != {"page_ref", "status", "conclusion"}:
+            raise decision_validation.InvalidDecision("packaging_supplementary_checks")
+        page_ref = check["page_ref"]
+        status = check["status"]
+        conclusion = check["conclusion"]
+        if (
+            not isinstance(page_ref, str)
+            or status not in ("fail", "uncertain")
+            or not isinstance(conclusion, str)
+            or not conclusion.strip()
+            or len(conclusion.strip().splitlines()) != 1
+        ):
+            raise decision_validation.InvalidDecision("packaging_supplementary_checks")
+        classification = classifications.get(page_ref)
+        if classification != "packaging_layout" and not (classification == "uncertain" and status == "uncertain"):
+            raise decision_validation.InvalidDecision("packaging_supplementary_checks")
+        identity = (page_ref, conclusion.strip())
+        if identity in seen:
+            raise decision_validation.InvalidDecision("packaging_supplementary_checks")
+        seen.add(identity)
+        rendered.append(f"{'❌' if status == 'fail' else '⚠️'} {conclusion.strip()}")
+    return "补充校对：" + "；".join(rendered)
+
+
 def _packaging_excel_contents(material: dict) -> tuple[set[str], dict[str, list[str]]]:
     resources = material.get("resources")
     prepared = material.get("prepared")
@@ -3904,6 +3942,7 @@ class FlowEngine:
             )
         decision = _read_object(decision_file, code="review_decision_unreadable")
         is_handoff = decision.get("kind") == manual_handoff.KIND
+        packaging_supplementary_line: str | None = None
         if is_handoff:
             if not allow_manual_handoff and recovered_submission_result is None:
                 raise decision_validation.InvalidDecision("decision_kind")
@@ -3940,6 +3979,8 @@ class FlowEngine:
                 expected_fields.add("excel_comparison")
                 if packaging_v2:
                     expected_fields.add("visual_review")
+                    if "supplementary_checks" in decision:
+                        expected_fields.add("supplementary_checks")
             # Keep the original short-circuit order; record only fixed reason codes.
             if set(decision) != expected_fields:
                 raise decision_validation.InvalidDecision("decision_fields")
@@ -4076,6 +4117,9 @@ class FlowEngine:
                         items=normalized_items,
                         overall=decision.get("overall"),
                     )
+                    packaging_supplementary_line = _packaging_supplementary_line(
+                        decision.get("supplementary_checks", []), decision["visual_review"],
+                    )
                 elif not page_refs.issubset(covered_page_refs):
                     raise ValueError("review_decision_invalid")
                 covered_page_count = len(page_refs)
@@ -4202,7 +4246,7 @@ class FlowEngine:
                 covered_page_count = len(covered_pages)
                 total_page_count = int(routing["before_page_count"])
 
-            needs_human = any(item["status"] != "pass" for item in normalized_items)
+            needs_human = bool(packaging_supplementary_line) or any(item["status"] != "pass" for item in normalized_items)
             expected_overall = "needs_human" if needs_human else "pass"
             if decision["overall"] != expected_overall:
                 raise decision_validation.InvalidDecision("overall_mismatch")
@@ -4233,6 +4277,8 @@ class FlowEngine:
                     f"{status_mark[item['status']]} {number}、{expected['name']}："
                     f"{item['conclusion'].strip()}"
                 )
+            if packaging_supplementary_line is not None:
+                lines.append(packaging_supplementary_line)
             if packaging_excel_notice is not None:
                 lines.append(packaging_excel_notice)
         remark_file = action_path.with_name("remark.txt")
