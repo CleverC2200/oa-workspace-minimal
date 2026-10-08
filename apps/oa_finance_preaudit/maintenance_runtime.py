@@ -17,7 +17,8 @@ from . import controller_handoff
 def assert_target_environment(target_root: Path) -> None:
     """Reject control path overrides rather than operate on a different runtime."""
     for key in ('OA_FROZEN_WRITER_LOCK_FILE', 'OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE',
-                'OA_FINANCE_PREAUDIT_STOP_FILE', 'OA_FINANCE_PREAUDIT_RUNTIME_ROOT'):
+                'OA_FINANCE_PREAUDIT_STOP_FILE', 'OA_FINANCE_PREAUDIT_RUNTIME_ROOT',
+                'OA_FINANCE_PREAUDIT_FLOW_ROOT', 'GIT_DIR', 'GIT_WORK_TREE'):
         if os.environ.get(key):
             raise RuntimeError('maintenance_runtime_override')
     if target_root.is_symlink() or not target_root.is_dir():
@@ -102,7 +103,7 @@ def read_live_status(target_root: Path) -> dict:
     environment = dict(os.environ)
     environment.pop('PYTHONPATH', None)
     environment.pop('PYTHONHOME', None)
-    evidence_dir = Path(tempfile.mkdtemp(prefix='oa-maintenance-status-'))
+    evidence_dir = Path(tempfile.mkdtemp(prefix='oa-maintenance-status-')).resolve()
     evidence_file = evidence_dir / 'status.json'
     try:
         result = subprocess.run(
