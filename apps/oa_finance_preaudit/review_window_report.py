@@ -247,10 +247,14 @@ def _financial_quality(selection, reports):
                 )}, **{field: case.get(field, "not_established") for field in (
                     "binding_status", "original_final_contract", "result_audit_complete",
                     "complete_review_scope", "check_outcomes",
-                )}})
+                )}, **({field: case[field] for field in (
+                    "history_scope_resolution", "window_expectations_qualified",
+                )} if quality["schema_version"] == 3 else {})})
             result["reports"].append({"status": "verified", "schema_version": quality["schema_version"],
                 "legacy_expectations_flag_semantics": quality["legacy_expectations_flag_semantics"],
-                "reported_eligible": quality["eligible"], "cases": cases})
+                "reported_eligible": quality["eligible"], "cases": cases,
+                **({field: quality[field] for field in ("qualification_semantics", "legacy_eligible")}
+                   if quality["schema_version"] == 3 else {})})
         except (OSError, ValueError, TypeError, KeyError):
             result["reports"].append({"status": "unverified", "reason": "quality_report_or_window_binding_unverified"})
     result["status"] = "verified" if all(r["status"] == "verified" for r in result["reports"]) else "unverified"
@@ -487,13 +491,15 @@ def render_window(report: dict) -> str:
                       if isinstance(outcomes, dict) else "未知")
             cells = (case["batch_index"] + 1, timing_labels[case["expectations_timing"]["status"]],
                      history_labels[case["historical_crosscheck"]], case["binding_status"], checks, case["verdict"],
-                     case["expectations_frozen_before_replay"], evidence["reported_eligible"])
+                     case["expectations_frozen_before_replay"],
+                     case.get("history_scope_resolution", {}).get("status", "未单列"),
+                     case.get("window_expectations_qualified", "未单列"), evidence["reported_eligible"])
             quality_rows.append("<tr>" + "".join("<td>" + text(c) + "</td>" for c in cells) + "</tr>")
     quality_html = ('<section><h2>财务核对与冻结时序</h2><p>绑定状态：' + text(quality["status"])
         + '。仅展示原报告，不授予资格。</p><div class="scroll"><table><thead><tr><th>批次</th><th>冻结时序</th>'
-        + '<th>历史核对</th><th>原消费绑定</th><th>事实通过 / 失败 / 未验证</th><th>事实结论</th><th>原冻结合取条件</th><th>原报告资格</th></tr></thead><tbody>'
+        + '<th>历史核对</th><th>原消费绑定</th><th>事实通过 / 失败 / 未验证</th><th>事实结论</th><th>原冻结合取条件</th><th>新窗口历史解释</th><th>新窗口预期资格</th><th>原报告资格</th></tr></thead><tbody>'
         + "".join(quality_rows) + '</tbody></table></div><p>原冻结标志同时包含时间、历史和配置条件。'
-        + '旧版报告无法单独证明冻结时序，显示未知。历史冲突仍阻止资格通过。</p></section>')
+        + '旧版报告无法单独证明冻结时序，显示未知。旧历史冲突保持原记录；schema 3 单列事前绑定的人工范围解释和新窗口预期资格。未解决冲突仍阻止资格通过。</p></section>')
     return (
         """<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OA 窗口成本与当前状态</title><style>
 body{margin:0;background:#f5f7fa;color:#172439;font:15px/1.7 system-ui,-apple-system,sans-serif}main{max-width:1120px;margin:40px auto;padding:0 22px}h1{font-size:29px}h2{font-size:21px}section{background:#fff;border:1px solid #dae1eb;border-radius:10px;padding:20px 24px;margin:18px 0}table{border-collapse:collapse;width:100%;font-size:13px}th,td{padding:10px;border-bottom:1px solid #e0e5ed;text-align:left;vertical-align:top}thead{background:#eff3f8}.scroll{overflow:auto}small{color:#526177}code{overflow-wrap:anywhere}li{margin:5px 0}@media(max-width:700px){main{padding:0 12px}section{padding:14px}h1{font-size:25px}}</style><main><small>只读派生报告 · 不授予模型、OA 或发布权限</small><h1>窗口成本与当前验收状态</h1>
