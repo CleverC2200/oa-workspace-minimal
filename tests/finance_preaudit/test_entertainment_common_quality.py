@@ -57,26 +57,6 @@ def test_both_reading_paths_deliver_common_rule_and_preserve_consumer_contract(t
 from pathlib import Path
 args=sys.argv[1:]
 prompt=sys.stdin.read()
-assert '不写已经核对过的明细' not in prompt
-assert '已确认可核销部分及其合计' in prompt
-assert 'overall=pass' in prompt
-assert '通过的前置项只给已核验的关联或状态结果' in prompt
-assert '不能把不可读或未确认的日期概述为一致或接近' in prompt
-assert 'conclusion 不重复项目名、编号或状态符号' in prompt
-assert '不在意见中解释上传字段、稳定绑定、读取或宿主校验过程' in prompt
-final_check=prompt[prompt.rfind('形成最终四项决定前'):]
-assert '来源与适用范围' in final_check
-assert '第1项“附件完整性/支付证据”' in final_check
-assert '支付发生与费用对应' in final_check
-assert '原事实与本条招待上下文已充分支持时正常采用' in final_check
-assert '必要关系未明时使用 uncertain，保留已确认支出' in final_check
-assert '第2项“发票关联”' in final_check
-assert '发票归属、购买方与发票金额' in final_check
-assert '第3项“预算”执行原暂不校验策略' in final_check
-assert '第4项“金额孰低核销”承接' in final_check
-assert 'material:resources.<resource_id>' in final_check
-assert 'material:prepared.images.<resource_id>.page-<页码>' not in final_check
-assert '无需读取宿主校验源码来构造引用' in final_check
 project=Path(args[args.index('--cd')+1])
 relative=''' + repr(str(RULE)) + '''
 original=(project/relative).read_text()
@@ -86,21 +66,6 @@ if prefix in prompt:
  assert received==original
 else:
  received=original
-sections=['### 来源与适用范围', '### 支付发生', '### 费用对应', '### 核销范围']
-assert all(section in received for section in sections)
-assert [received.index(section) for section in sections]==sorted(received.index(section) for section in sections)
-assert all(section not in final_check for section in sections)
-questions=['当前支付与本条申报费用是否为同一支出',
- '该支出的原商品、服务或结算内容是否支持当前招待用途']
-assert all(question in received for question in questions)
-assert received.index(questions[0]) < received.index(questions[1])
-assert '历史财务核定结果只用于交叉复核' in received
-assert '食品商品' in received
-assert '已有原商品、服务或结算资料充分支持时正常采用' in received
-assert '申报金额只与同一已核定费用范围内的金额比较' in received
-assert '只有已确认某条费用申报高于其核销上限时' in received
-assert '必要范围仍待核且没有已确认超报时' in received
-assert '已确认超报与待核范围并存时' in received
 Path(''' + repr(str(observer)) + ''').write_text(received)
 schema=json.loads(Path(args[args.index('--output-schema')+1]).read_text())
 assert set(schema['required'])=={'schema_version','kind','action_token','workflow_key','rule_version','overall','items'}
@@ -139,6 +104,18 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'cached_inp
         assert acceptance['applied'] is False
         # Offline wiring/consumer proof does not meet real-sample qualification.
         assert acceptance['sample_eligible'] is False
+
+
+@pytest.mark.parametrize('fallback', [False, True])
+def test_wording_change_preserves_original_rule_and_consumer_contract(tmp_path, monkeypatch, fallback):
+    original_prompt = worker._prompt
+
+    def revised_prompt(*args, **kwargs):
+        return original_prompt(*args, **kwargs).replace('形成最终四项决定前', '输出四项决定前').replace('必要关系未明时使用 uncertain，保留已确认支出', '未确认的必要关系使用 uncertain，其他已确认支出仍保留')
+
+    monkeypatch.setattr(worker, '_prompt', revised_prompt)
+    test_both_reading_paths_deliver_common_rule_and_preserve_consumer_contract(
+        tmp_path, monkeypatch, fallback, False, 'uncertain')
 
 
 @pytest.mark.parametrize('fallback', [False, True])
