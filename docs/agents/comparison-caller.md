@@ -22,9 +22,13 @@ comparison-caller.private.py
 
 最终 scope 固定二十个银行身份、候选与生产提交、两个原生证明、900 秒和单侧最多一次。每行包含 `plan`、`checklist`、`expectations`、`baseline_checklist`、`baseline_expectations`；两侧原资料和原规则各自匹配，四项期待均在运行前冻结。复用侧继续引用原 checklist/freeze，不能用新准备替换原期待。
 
+新准备还在 `conditions.call_identity` 冻结原 Worker 命令实际声明的模型、供应商、推理强度和请求服务档位，两侧必须一致。供应商取自 `model_provider`，不由模型名推定。原命令未声明服务档位时记录 `not_configured`，不补写默认值。宿主在启动时将同一身份写入新 manifest；报告核对其与绑定的原准备一致，再展示 `source.requested_service_tier`。旧准备、manifest 和报告结构保持兼容。
+
 每个 `reuse` 侧需完整原件包：`plan`、`arm`、`manifest`、`report`、`quality`、`assessment`、`checklist`、`freeze`，以及必要时的 `report_field`。新目标 plan 与来源计划分开，不复制旧输出。`snapshot_audit` 仅沿用既有生产跨日期审计，候选源码快照不能借它放行差异。同源同单已有启动只能引用合格原件，不能重复启动。来源九例含原二十中的八例及额外混合例时，最终新增侧数是二十个生产侧加十二个未启动候选侧，合计三十二。
 
 调用形式为 `python <caller> <repository> <configuration> <readiness|validate|run> <request>`。调用者不加载密钥文件。只有全部准入通过后的真实执行，才检查调用环境是否提供已有 reviewer 凭据，并由原宿主处理。
+
+OpenAI 原生认证沿原 Worker 使用当前环境的 `HOME`、`PATH` 和显式 `CODEX_HOME`；宿主保留原 `CODEX_HOME`，不读取或复制认证文件，不创建另一个账户入口。旧 DeepSeek 环境变量仍可用于旧冻结源码，但不代表新 OpenAI 调用使用该密钥。
 
 `readiness` 只展示八项条件及各自缺口。它不 claim、不授予财务资格、不授权运行。`validate` 在原父锁下重新核验。`run` 使用相同核验，再 claim 并仅遍历 `pending_arms`。旧侧使用引用，不复制旧输出，不再次消费。已启动但无法确认归属的侧计为 unknown，不能自动补跑。原父链继续计入复用侧的原始成本；最终窗口中新启动的候选侧不会转算为来源诊断消耗。
 
@@ -35,5 +39,7 @@ comparison-caller.private.py
 旧外置原件适配器和所有历史资料封存不改。当前原件校验迁入上述单一模块，旧 schema 1/2 资格条件保持原样。schema 3 必须按原 freeze、解释记录和独立 assessment 重建质量报告，确认新窗口资格；旧 conflict、旧合取标志及 legacy eligible 保留。
 
 原生没有提供推理 Token 时保留 `unknown`。复用仍要求输入、缓存、输出及总量精确并对应原终态记录；推理维度只在原终态及对应 rollout 都未提供时保持未知。已提供的值必须为非布尔整数、处于输出量内，并与报告一致。
+
+回执读取兼容旧 `reviewer/codex-home` 和当前 Worker 保留的 `reviewer/tool-receipts`。后者逐文件核验原宿主结果中的 SHA-256；存在保留文件清单时还核对完整文件集合。计量仍保持 input 包含 cache、output 包含 reasoning，不重复相加，也不因回执迁移授予来源或财务资格。
 
 本地 CLI fixture 回归仅证明进程、只读消费、计数、拒绝及停止行为。它不证明真实模型输入，也不提供财务资格、真实二十单结果或生产验收。

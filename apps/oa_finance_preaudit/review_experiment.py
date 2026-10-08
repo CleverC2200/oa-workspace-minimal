@@ -81,7 +81,7 @@ def _host(plan: Path, name: str, *, execute: bool = False,
             raise ValueError("host_drift")
     if batch._sha(host) != value["host_sha256"]:
         raise ValueError("host_drift")
-    environment = {k: v for k, v in os.environ.items() if k in {"HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "OA_REVIEW_API_KEY", "SSL_CERT_DIR", "SSL_CERT_FILE"}}
+    environment = {k: v for k, v in os.environ.items() if k in {"HOME", "PATH", "CODEX_HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "OA_REVIEW_API_KEY", "SSL_CERT_DIR", "SSL_CERT_FILE"}}
     if execute and os.environ.get(batch.worker.SSE_TRACE_ENV) == "1":
         environment[batch.worker.SSE_TRACE_ENV] = "1"
     environment["PYTHONDONTWRITEBYTECODE"] = "1"

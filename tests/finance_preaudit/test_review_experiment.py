@@ -15,6 +15,7 @@ from tests.finance_preaudit.test_flow_engine_submission import _material
 ROOT = Path(__file__).resolve().parents[2]
 BASE = "280fc829e7f30d13d399790e8c8adfc7a7d5612b"
 CANDIDATE = "0ab87dc990d87ff1da30f352b71a289a241426b1"
+OPENAI_PRODUCTION = "627f2cad54937544828ba4c3af44d5117c672c1a"
 
 
 def save(path, value):
@@ -31,12 +32,27 @@ def forbidden(*args, **kwargs):
     pytest.fail("OA, Writer, recovery and paid CLI are forbidden")
 
 
+def isolated_reviewer_environment(tmp_path):
+    home = tmp_path / "isolated-reviewer-home"
+    native = home / ".codex"
+    native.mkdir(parents=True, exist_ok=True, mode=0o700)
+    home.chmod(0o700)
+    native.chmod(0o700)
+    return {"HOME": str(home), "CODEX_HOME": str(native)}
+
+
+@pytest.fixture(autouse=True)
+def isolated_reviewer(tmp_path, monkeypatch):
+    for key, value in isolated_reviewer_environment(tmp_path).items():
+        monkeypatch.setenv(key, value)
+
+
 @pytest.fixture(scope="module")
 def sources(tmp_path_factory):
     root = tmp_path_factory.mktemp("sources")
     result = {}
     current = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    for revision in dict.fromkeys((BASE, CANDIDATE, current)):
+    for revision in dict.fromkeys((BASE, CANDIDATE, OPENAI_PRODUCTION, current)):
         names = subprocess.check_output(["git", "ls-tree", "-r", "--name-only", revision], cwd=ROOT, text=True).splitlines()
         selected = [p for p in names if p.startswith("apps/oa_approval/configs/") and p.endswith(".json") or p.startswith("apps/") and p.endswith(".py") or p.startswith(".agents/skills/oa-finance-preaudit/") and p.endswith(".md") or p in {"requirements-dev.txt", "AGENTS.md"}]
         folder = root / revision
@@ -81,7 +97,7 @@ def arm(tmp_path, sources, name, workflow, revision, *, tail="", mismatch=False,
 
 def fake_cli(tmp_path, *, final="valid", usage=True):
     script = tmp_path / "external-reviewer"
-    script.write_text("#!" + sys.executable + "\n" + '''import json,sys,os,base64
+    script.write_text("#!" + sys.executable + "\n" + '''import json,sys,os,base64,sqlite3
 from pathlib import Path
 args=sys.argv[1:]
 prompt=sys.stdin.read()
@@ -90,7 +106,8 @@ constants={k:v['const'] for k,v in schema['properties'].items() if 'const' in v}
 action=constants['action_token']
 workflow=constants['workflow_key']
 root=Path(args[args.index('--cd')+1]).parent
-Path(root,'observed-native-config.json').write_text(json.dumps([args[i+1] for i,a in enumerate(args[:-1]) if a in ('--config','-c')]))
+configs=[args[i+1] for i,a in enumerate(args[:-1]) if a in ('--config','-c')]
+Path(root,'observed-native-config.json').write_text(json.dumps(configs))
 packet=json.loads(next((root/'runtime').rglob('review-packet.json')).read_text())
 items=[i['item_key'] for i in packet['items']]
 decision={**constants,'overall':'needs_human','items':[{'item_key':k,'status':'uncertain','conclusion':'请财务核对。','evidence_refs':[],'missing_evidence':['费用对应关系未确认。']} for k in items]}
@@ -98,7 +115,19 @@ raw=json.dumps(decision) if ''' + repr(final) + ''' == 'valid' else ''' + repr(f
 Path(args[args.index('--output-last-message')+1]).write_text(raw)
 images=[args[i+1] for i,a in enumerate(args) if a=='--image']
 content=[{'type':'input_image','image_url':'data:image/png;base64,'+base64.b64encode(Path(p).read_bytes()).decode()} for p in images]
-Path(os.environ['CODEX_HOME'],'session.jsonl').write_text(json.dumps({'type':'response_item','payload':{'type':'message','role':'user','content':content}})+'\\n')
+identifier='12345678-1234-1234-1234-123456789abc'
+store=next((json.loads(value.partition('=')[2]) for value in configs if value.startswith('sqlite_home=')),None)
+rollout=Path(os.environ['CODEX_HOME'])/('sessions/'+identifier+'.jsonl' if store else 'session.jsonl')
+rollout.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+provider=next(json.loads(value.partition('=')[2]) for value in configs if value.startswith('model_provider='))
+rollout.write_text(json.dumps({'type':'session_meta','payload':{'id':identifier,'cwd':args[args.index('--cd')+1],'model_provider':provider}})+'\\n'+json.dumps({'type':'response_item','payload':{'type':'message','role':'user','content':content}})+'\\n')
+rollout.chmod(0o600)
+if store:
+ Path(store).mkdir(parents=True,exist_ok=True,mode=0o700)
+ with sqlite3.connect(str(Path(store)/'state_5.sqlite')) as database:
+  database.execute('CREATE TABLE threads (id TEXT,cwd TEXT,rollout_path TEXT)')
+  database.execute('INSERT INTO threads VALUES (?,?,?)',(identifier,args[args.index('--cd')+1],str(rollout)))
+ print(json.dumps({'type':'thread.started','thread_id':identifier}),flush=True)
 print(json.dumps({'type':'turn.completed',**({'usage':{'input_tokens':100,'cached_input_tokens':20,'output_tokens':10}} if ''' + repr(usage) + ''' else {})}),flush=True)
 if ''' + repr(final) + ''' == 'cancel':
  import signal,time
@@ -146,9 +175,61 @@ def test_real_treatment_reaches_preview_and_exact_report(tmp_path, sources, monk
         assert report["usage"].get("total_tokens") == 110, {"report": report, "stderr": (before / "reviewer/stderr.log").read_text()}
         assert report["acceptance"]["preview"] == "verified_closed"
         assert report["timing"]["boundary"] == "input_preparation_to_preview_consumption"
+        assert report["source"]["provider"] == "deepseek"
+        assert report["source"]["requested_service_tier"] == "not_configured"
     assert "冻结数据：material" in (after / "reviewer/prompt.txt").read_text()
     assert "冻结数据：material" not in (before / "reviewer/prompt.txt").read_text()
     assert review_experiment.run_pair(path, auth)["cli_starts"] == 0
+
+
+def test_openai_production_preparation_binds_actual_command_identity(tmp_path, sources):
+    from apps.oa_finance_preaudit import review_experiment
+    before = arm(tmp_path, sources, "baseline", "business_entertainment", OPENAI_PRODUCTION)
+    after = arm(tmp_path, sources, "candidate", "business_entertainment", OPENAI_PRODUCTION)
+    path = tmp_path / "openai-plan.json"
+    plan = review_experiment.freeze_pair(before, after, path, repository=ROOT,
+        reviewer=fake_cli(tmp_path), purpose="diagnostic", timeout_seconds=60,
+        maximum_cli_starts=2)
+    for preparation in plan["preparations"].values():
+        assert preparation["conditions"]["call_identity"] == {
+            "model": "gpt-6.1-sol", "provider": "openai", "reasoning_effort": "medium",
+            "requested_service_tier": "default"}
+    assert not any((root / "started.json").exists() for root in (before, after))
+
+
+def test_host_preserves_explicit_native_credential_store_without_reading_it(tmp_path, monkeypatch):
+    from apps.oa_finance_preaudit import review_experiment
+    host = tmp_path / "neutral-host.py"
+    host.write_text("import os,json\nprint(json.dumps({'selected':os.environ.get('CODEX_HOME')}))\n")
+    host.chmod(0o600)
+    plan = tmp_path / "host-plan.json"
+    save(plan, {"runtime_files": {}, "host_sha256": sha(host),
+                "timeout_seconds": 1, "arms": {"candidate": str(tmp_path)}})
+    native_home = str(tmp_path / "explicit-native-store")
+    monkeypatch.setenv("CODEX_HOME", native_home)
+    result = review_experiment._host(plan, "candidate", host_file=host)
+    assert result == {"selected": native_home}
+    assert not Path(native_home).exists()
+
+
+def test_model_configuration_difference_stops_before_any_cli(tmp_path, sources):
+    from apps.oa_finance_preaudit import review_experiment
+    before = arm(tmp_path, sources, "baseline", "business_entertainment", BASE)
+    after = arm(tmp_path, sources, "candidate", "business_entertainment", OPENAI_PRODUCTION)
+    plan = tmp_path / "different-profile.json"
+    prepared = review_experiment.freeze_pair(before, after, plan, repository=ROOT,
+        reviewer=fake_cli(tmp_path), purpose="diagnostic", timeout_seconds=60,
+        maximum_cli_starts=2)
+    identities = [prepared["preparations"][arm]["conditions"]["call_identity"]
+                  for arm in ("baseline", "candidate")]
+    assert identities[0] != identities[1]
+    authority = tmp_path / "authority.json"
+    save(authority, {"plan_sha256": sha(plan), "maximum_cli_starts": 2,
+         "authority_reference": "controlled source comparison", "oa_write_authorized": False})
+    result = review_experiment.run_pair(plan, authority)
+    assert result["reason"] == "comparison_conditions_mismatch"
+    assert result["cli_starts"] == 0
+    assert not any((root / "cli-start.json").exists() for root in (before, after))
 
 
 @pytest.mark.parametrize("final", ["not JSON", "[]", "null"])

@@ -292,6 +292,34 @@ def _usage(events: list[dict]) -> dict:
     }
 
 
+def _native_receipt_paths(root: Path) -> list[Path]:
+    """Read old private homes and the current host's bound retained rollout."""
+    paths = []
+    for name in ("codex-home", "tool-receipts"):
+        directory = root / "reviewer" / name
+        if not directory.exists():
+            continue
+        if directory != directory.resolve() or not directory.is_dir():
+            raise ValueError(ERROR)
+        receipts = sorted(directory.rglob("*.jsonl"))
+        if name == "tool-receipts":
+            result = _object(root, "result.json")
+            files = result.get("output_files", {})
+            for path in receipts:
+                if files.get(str(path)) != _sha(_path(root, path)):
+                    raise ValueError(ERROR)
+            declared = result.get("stderr_summary", {}).get("tool_receipt_files")
+            if declared is not None and (
+                not isinstance(declared, list)
+                or not all(isinstance(item, str) for item in declared)
+                or len(declared) != len(set(declared))
+                or set(declared) != {str(path.relative_to(root / "reviewer")) for path in receipts}
+            ):
+                raise ValueError(ERROR)
+        paths.extend(receipts)
+    return paths
+
+
 def _native(root: Path, material: dict, usage: dict) -> tuple[dict, int | str, dict]:
     images = material.get("prepared", {}).get("images", [])
     expected = {
@@ -317,11 +345,9 @@ def _native(root: Path, material: dict, usage: dict) -> tuple[dict, int | str, d
     manifest = _object(root, "manifest.json")
     prepared_input = _bound_object(root, manifest, "input-delivery.json") or {}
     initial_expected = prepared_input.get("delivery", {}).get("initial_image_sha256", [])
-    home = root / "reviewer/codex-home"
-    if home.exists():
-        if home != home.resolve() or not home.is_dir():
-            raise ValueError(ERROR)
-        for p in home.rglob("*.jsonl"):
+    receipt_paths = _native_receipt_paths(root)
+    if receipt_paths:
+        for p in receipt_paths:
             for event in _events(root, p):
                 frames += 1
                 try:
@@ -765,6 +791,15 @@ def _build(root: Path) -> dict:
         root, manifest, started, result, packet, material, sources, source_root
     )
     model = manifest.get("model")
+    preparation = _bound_object(root, manifest, "input-delivery.json") or {}
+    identity = preparation.get("conditions", {}).get("call_identity")
+    if identity is not None:
+        keys = {"model", "provider", "reasoning_effort", "requested_service_tier"}
+        if (not isinstance(identity, dict) or set(identity) != keys
+                or any(not isinstance(identity[key], str) or not identity[key] for key in keys)
+                or any(manifest.get(key) != identity[key] for key in keys)
+                or native["provider"] not in {"unknown", identity["provider"]}):
+            raise ValueError(ERROR)
     elapsed = result.get("elapsed_seconds")
     return {
         "schema_version": 1,
@@ -783,6 +818,8 @@ def _build(root: Path) -> dict:
             "reasoning_effort": manifest.get("reasoning_effort")
             if manifest.get("reasoning_effort") in {"low", "medium", "high"}
             else "unknown",
+            **({"requested_service_tier": identity["requested_service_tier"]}
+               if identity is not None else {}),
         },
         "scope": {
             "workflow": packet["workflow_key"],
