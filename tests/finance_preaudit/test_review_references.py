@@ -19,7 +19,7 @@ from apps.oa_finance_preaudit import review_experiment as experiment, review_ref
 from tests.finance_preaudit.test_candidate_phase import phase_source  # noqa: F401
 from tests.finance_preaudit.test_financial_quality_assessment import _original_history
 from tests.finance_preaudit.test_flow_engine_submission import _material
-from tests.finance_preaudit.test_review_experiment import forbidden, save
+from tests.finance_preaudit.test_review_experiment import forbidden, isolated_reviewer_environment, save
 
 
 def _read(reference):
@@ -38,15 +38,24 @@ def _review(refs):
             'expectations': refs['freeze']}
 
 
-def _consumed_reference(tmp_path, phase_source, monkeypatch, *, schema=3, execute=True, reasoning=6):
+def _consumed_reference(tmp_path, phase_source, monkeypatch, *, schema=3, execute=True, reasoning=6,
+                        receipts="codex-home"):
     repository, revision, shared_cli, _proof = phase_source
+    for key, value in isolated_reviewer_environment(shared_cli.parent).items():
+        monkeypatch.setenv(key, value)
     cli = tmp_path / 'neutral-reviewer'
     usage = {'input_tokens': 100, 'cached_input_tokens': 20, 'output_tokens': 10}
     if reasoning is not None:
         usage['reasoning_output_tokens'] = reasoning
-    cli.write_text(shared_cli.read_text() + "\nwith Path(os.environ['CODEX_HOME'],'session.jsonl').open('a') as record:\n"
+    cli.write_text(shared_cli.read_text() + "\nwith rollout.open('a') as record:\n"
                    " record.write(json.dumps({'type':'event_msg','payload':{'type':'token_count',"
                    "'info':{'total_token_usage':" + repr(usage) + "}}})+'\\n')\n")
+    if receipts == "tool-receipts":
+        with cli.open("a") as stream:
+            stream.write("if not store:\n source=rollout\n"
+                         "destination=Path(args[args.index('--output-last-message')+1]).parent/'tool-receipts/session.jsonl'\n"
+                         "if not store:\n destination.parent.mkdir(mode=0o700)\n"
+                         " destination.write_bytes(source.read_bytes());destination.chmod(0o600);source.unlink()\n")
     cli.chmod(0o700)
     config = next(c for c in approval_flow.load_all_configs()
                   if c['flow_key'] == 'business_entertainment')
@@ -213,6 +222,30 @@ def test_reasoning_receipt_may_be_absent_but_never_invalid(tmp_path, phase_sourc
     else:
         with pytest.raises(references.ReferenceRejected, match='reference_reasoning_usage_invalid'):
             references.original_record(refs)
+
+
+@pytest.mark.parametrize("reasoning", [None, 6, -1, 11, True, "unknown"])
+def test_retained_rollout_reasoning_is_exact_or_truly_absent(
+        tmp_path, phase_source, monkeypatch, reasoning):
+    refs, _resolution = _consumed_reference(
+        tmp_path, phase_source, monkeypatch, schema=2, reasoning=reasoning,
+        receipts="tool-receipts")
+    before = {Path(ref['file']): Path(ref['file']).read_bytes()
+              for ref in refs.values() if isinstance(ref, dict)}
+    if reasoning is None or type(reasoning) is int and reasoning == 6:
+        record = references.original_record(refs)
+        assert record['report']['usage']['reasoning_output_tokens'] == (
+            'unknown' if reasoning is None else 6)
+        assert record['report']['usage']['total_tokens'] == 110
+        assert record['reported_eligible'] is False
+        assert record['report']['source']['model'] == 'gpt-6.1-sol'
+        assert record['report']['source']['provider'] == 'openai'
+        assert record['report']['source']['reasoning_effort'] == 'medium'
+        assert record['report']['source']['requested_service_tier'] == 'default'
+    else:
+        with pytest.raises(references.ReferenceRejected, match='reference_reasoning_usage_invalid'):
+            references.original_record(refs)
+    assert all(path.read_bytes() == raw for path, raw in before.items())
 
 
 @pytest.mark.parametrize('schema', [1, 2])

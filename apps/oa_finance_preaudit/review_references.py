@@ -76,8 +76,7 @@ def _reasoning_receipts(root, usage, raw_usage):
         value = event.get('usage')
         if event.get('type') == 'turn.completed' and isinstance(value, dict) and 'reasoning_output_tokens' in value:
             observed.append(value['reasoning_output_tokens'])
-    home = root / 'reviewer/codex-home'
-    for path in home.rglob('*.jsonl') if home.exists() else []:
+    for path in batch._native_receipt_paths(root):
         for event in batch._events(root, path):
             payload = event.get('payload', {})
             if not isinstance(payload, dict) or event.get('type') != 'event_msg' or payload.get('type') != 'token_count':
@@ -238,7 +237,8 @@ def match_target(target_plan_ref, arm, refs, snapshot_audit_ref=None):
             "target_role_mismatch")
     require(target["reviewer_sha256"] == original["reviewer_sha256"]
             and sha(target["reviewer"]) == target["reviewer_sha256"], "target_native_mismatch")
-    model_keys = ("model", "provider", "reasoning_effort")
+    model_keys = ("model", "provider", "reasoning_effort") + (
+        ("requested_service_tier",) if "requested_service_tier" in record["manifest"] else ())
     present = [key in target_manifest for key in model_keys]
     require(all(present) or not any(present), "target_model_identity_partial")
     if all(present):

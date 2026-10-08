@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 import time
 import signal
+import tomllib
 from dataclasses import asdict
 from datetime import datetime, timezone
 
@@ -27,6 +28,34 @@ def save(path, value):
 
 def unavailable(*args, **kwargs):
     raise AssertionError("business_ports_forbidden")
+
+
+def call_identity(command):
+    """Project explicit frozen CLI settings; a model name never selects a provider."""
+    models = [command[index + 1] for index, argument in enumerate(command[:-1])
+              if argument in {"--model", "-m"}]
+    settings = {}
+    for index, argument in enumerate(command[:-1]):
+        if argument not in {"--config", "-c"}:
+            continue
+        override = command[index + 1]
+        key = override.partition("=")[0].strip()
+        if key not in {"model", "model_provider", "model_reasoning_effort", "service_tier"}:
+            continue
+        if key in settings:
+            raise ValueError("call_identity_ambiguous")
+        settings.update(tomllib.loads(override))
+    if (len(models) != 1 or "model" in settings or not models[0]
+            or settings.get("model_provider") not in {"oa_deepseek", "deepseek", "openai"}
+            or settings.get("model_reasoning_effort") not in {"low", "medium", "high"}):
+        raise ValueError("call_identity_unverified")
+    service = settings.get("service_tier", "not_configured")
+    if not isinstance(service, str) or not service:
+        raise ValueError("call_identity_unverified")
+    return {"model": models[0],
+            "provider": {"oa_deepseek": "deepseek", "deepseek": "deepseek", "openai": "openai"}[settings["model_provider"]],
+            "reasoning_effort": settings["model_reasoning_effort"],
+            "requested_service_tier": service}
 
 
 def main():
@@ -139,7 +168,9 @@ def main():
     call_options = {"tool_output_token_limit": frozen.tool_output_token_limit} if frozen and getattr(frozen, "tool_output_token_limit", None) is not None else {}
     if role_file is not None:
         call_options["model_instructions_file"] = role_file
-    prepared = {"conditions": {"workflow": action["workflow_key"], "sample": fingerprint({k: state[k] for k in ("request_id", "received_at")}), "material": fingerprint(comparison_material, relocate=False), "image_bytes": fingerprint([digest(Path(p["path"]).read_bytes()) for p in material["prepared"]["images"]]), "rules": fingerprint(rules), "schema": fingerprint(schema), "call_profile": fingerprint(command(calling, Path("{SCHEMA}"), Path("{DECISION}"), **call_options)), "timeout_seconds": plan["timeout_seconds"], "timing_boundary": plan["timing_boundary"]}, "delivery": delivery, "input_sha256": fingerprint({"prompt": prompt, "images": [digest(p.read_bytes()) for p in frozen.images] if frozen else [], **({"worker_role": role_file.read_text()} if role_file is not None else {})}), "source_snapshot_sha256": digest(json.dumps(relative_sources, sort_keys=True, separators=(",", ":")).encode())}
+    profile = command(calling, Path("{SCHEMA}"), Path("{DECISION}"), **call_options)
+    identity = call_identity(profile)
+    prepared = {"conditions": {"workflow": action["workflow_key"], "sample": fingerprint({k: state[k] for k in ("request_id", "received_at")}), "material": fingerprint(comparison_material, relocate=False), "image_bytes": fingerprint([digest(Path(p["path"]).read_bytes()) for p in material["prepared"]["images"]]), "rules": fingerprint(rules), "schema": fingerprint(schema), "call_profile": fingerprint(profile), "call_identity": identity, "timeout_seconds": plan["timeout_seconds"], "timing_boundary": plan["timing_boundary"]}, "delivery": delivery, "input_sha256": fingerprint({"prompt": prompt, "images": [digest(p.read_bytes()) for p in frozen.images] if frozen else [], **({"worker_role": role_file.read_text()} if role_file is not None else {})}), "source_snapshot_sha256": digest(json.dumps(relative_sources, sort_keys=True, separators=(",", ":")).encode())}
     if mode == "prepare":
         print(json.dumps(prepared))
         return
@@ -157,7 +188,7 @@ def main():
     for filename, value in (("runtime-source.json", runtime), ("generation-schema.json", schema), ("input-delivery.json", prepared)):
         save(root / filename, value)
         manifest["inputs"][str(root / filename)] = digest((root / filename).read_bytes())
-    manifest.update(source_role=role, model=worker.MODEL, provider="deepseek", reasoning_effort=worker.REASONING_EFFORT, maximum_cli_starts=1, maximum_seconds=plan["timeout_seconds"])
+    manifest.update(source_role=role, **identity, maximum_cli_starts=1, maximum_seconds=plan["timeout_seconds"])
     # This is a fresh, unstarted run manifest; no old archive is rewritten.
     (root / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
     save(root / "started.json", {"manifest_sha256": digest((root / "manifest.json").read_bytes()), "source_role": role, "source_revision": manifest["source_revision"], "source_snapshot_sha256": prepared["source_snapshot_sha256"], "replay_started_at": datetime.now(timezone.utc).isoformat()})

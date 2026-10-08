@@ -403,9 +403,10 @@ def test_no_terminal_or_ambiguous_json_cannot_claim_exact_usage(tmp_path, raw):
         assert review_batch_report.build_report(root)["usage"]["status"] == "unknown"
 
 
-def test_native_context_peak_is_not_cumulative_input_or_provider_count(tmp_path):
+@pytest.mark.parametrize("receipts", ["codex-home", "tool-receipts"])
+def test_native_context_peak_is_not_cumulative_input_or_provider_count(tmp_path, receipts):
     root = archive(tmp_path)
-    log = root / "reviewer/codex-home/session.jsonl"
+    log = root / "reviewer" / receipts / "session.jsonl"
     save(
         log,
         {
@@ -424,11 +425,55 @@ def test_native_context_peak_is_not_cumulative_input_or_provider_count(tmp_path)
             },
         },
     )
+    if receipts == "tool-receipts":
+        result = json.loads((root / "result.json").read_text())
+        result["output_files"] = {str(log): digest(log)}
+        result["stderr_summary"] = {"tool_receipt_files": ["tool-receipts/session.jsonl"]}
+        save(root / "result.json", result)
     report = review_batch_report.build_report(root)
     assert report["usage"]["total_tokens"] == 15
     assert report["usage"]["reasoning_output_tokens"] == 3
     assert report["interactions"]["observed_max_step_input"] == 7
     assert report["interactions"]["provider_requests"] == "unknown"
+
+
+@pytest.mark.parametrize("fault", ["changed_bytes", "unlisted", "duplicate", "foreign"])
+def test_retained_rollout_must_match_original_host_hash_and_file_list(tmp_path, fault):
+    root = archive(tmp_path)
+    log = root / "reviewer/tool-receipts/session.jsonl"
+    save(log, {"type": "event_msg", "payload": {"type": "agent_message"}})
+    result = json.loads((root / "result.json").read_text())
+    result["output_files"] = {str(log): digest(log)}
+    declared = ["tool-receipts/session.jsonl"]
+    if fault == "changed_bytes":
+        log.write_text('{}\n')
+    elif fault == "unlisted":
+        declared = []
+    elif fault == "duplicate":
+        declared *= 2
+    else:
+        declared = ["../foreign.jsonl"]
+    result["stderr_summary"] = {"tool_receipt_files": declared}
+    save(root / "result.json", result)
+    with pytest.raises(ValueError, match="review_archive_invalid"):
+        review_batch_report.build_report(root)
+
+
+@pytest.mark.parametrize("field", ["model", "provider", "reasoning_effort", "requested_service_tier"])
+def test_report_cannot_substitute_manifest_identity_for_frozen_command(tmp_path, field):
+    root = archive(tmp_path)
+    manifest = json.loads((root / "manifest.json").read_text())
+    identity = {"model": "gpt-6.1-sol", "provider": "openai", "reasoning_effort": "medium",
+                "requested_service_tier": "default"}
+    delivery = root / "input-delivery.json"
+    save(delivery, {"conditions": {"call_identity": identity}})
+    manifest["inputs"][str(delivery)] = digest(delivery)
+    manifest.update(identity)
+    manifest[field] = "changed"
+    save(root / "manifest.json", manifest)
+    save(root / "started.json", {"manifest_sha256": digest(root / "manifest.json")})
+    with pytest.raises(ValueError, match="review_archive_invalid"):
+        review_batch_report.build_report(root)
 
 
 def test_partial_mismatch_cannot_expose_exact_subtotal(tmp_path):

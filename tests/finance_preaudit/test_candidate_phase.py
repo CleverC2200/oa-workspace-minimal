@@ -10,9 +10,11 @@ import sys
 
 import pytest
 
-from apps.oa_finance_preaudit import flow_engine, flow_evals, review_experiment
+from apps.oa_finance_preaudit import flow_engine, flow_evals, native_review_contract, review_experiment
 from tests.finance_preaudit.test_flow_engine_submission import _material
-from tests.finance_preaudit.test_review_experiment import fake_cli, forbidden, save, sha
+from tests.finance_preaudit.test_review_experiment import (
+    fake_cli, forbidden, isolated_reviewer_environment, save, sha,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 CALLER = ROOT / 'docs/agents/templates/candidate-phase.private.py'
@@ -23,9 +25,13 @@ def ref(path):
 
 
 @pytest.fixture(scope='module')
-def phase_source(tmp_path_factory):
+def phase_source(tmp_path_factory, request):
     # Controlled native identity/proof is an external fixture. It does not prove native I/O.
     parent = tmp_path_factory.mktemp('phase-source')
+    environment = pytest.MonkeyPatch()
+    request.addfinalizer(environment.undo)
+    for key, value in isolated_reviewer_environment(parent).items():
+        environment.setenv(key, value)
     repository = parent / 'repo'
     repository.mkdir()
     for name in ('apps', '.agents/skills/oa-finance-preaudit'):
@@ -35,7 +41,7 @@ def phase_source(tmp_path_factory):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes((ROOT / name).read_bytes())
     cli = fake_cli(parent)
-    code = cli.read_text().replace('args=sys.argv[1:]', "args=sys.argv[1:]\nif args==['--version']:\n print('codex-cli 0.160.0');sys.exit(0)")
+    code = cli.read_text().replace('args=sys.argv[1:]', "args=sys.argv[1:]\nif args==['--version']:\n print(" + repr(native_review_contract.VERSION) + ");sys.exit(0)")
     code = code.replace("raw=json.dumps(decision) if 'valid' == 'valid' else 'valid'", "policy=json.loads((root/'simulate.json').read_text()) if (root/'simulate.json').exists() else {}\nraw=json.dumps(decision) if policy.get('final','valid')=='valid' else policy['final']")
     code = code.replace("if 'valid' == 'cancel':", "if policy.get('final') == 'cancel':")
     cli.write_text(code)
@@ -128,6 +134,8 @@ def invoke(scope, authority, alias, *, prepare_parent=True):
             except ValueError:
                 pass
     environment = {k:v for k,v in os.environ.items() if k not in {'OA_REVIEW_API_KEY','OA_REVIEW_SSE_TRACE'}}
+    plan = json.loads(Path(json.loads(Path(scope).read_text())['cases'][0]['plan']['file']).read_text())
+    environment.update(isolated_reviewer_environment(Path(plan['reviewer']).parent))
     environment['OA_REVIEW_API_KEY'] = 'offline-placeholder'
     output = subprocess.check_output([sys.executable,str(CALLER),str(ROOT),'run',str(scope),str(authority),alias], env=environment, cwd=ROOT, text=True)
     return json.loads(output)
