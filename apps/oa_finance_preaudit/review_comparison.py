@@ -60,6 +60,20 @@ def _terminal(plan, arm, report):
           'comparison_output_rejected')
 
 
+def _require_reviewer_authentication(plan_reference, pending):
+    """Use the frozen, revalidated native identity; Worker owns actual auth."""
+    plan = _read(plan_reference)
+    keys = {'model', 'provider', 'reasoning_effort', 'requested_service_tier'}
+    for arm in pending:
+        identity = plan['preparations'][arm]['conditions'].get('call_identity')
+        _need(isinstance(identity, dict) and set(identity) == keys
+              and all(isinstance(value, str) and value.strip() for value in identity.values())
+              and identity['provider'] in {'openai', 'deepseek'}, 'reviewer_identity_unverified')
+        if identity['provider'] == 'deepseek':
+            # Presence only; never read or copy a provider key or native account.
+            _need('OA_REVIEW_API_KEY' in os.environ, 'reviewer_credentials_unavailable')
+
+
 def _execute_pending_pair(plan_file: Path, selection: dict, authority: dict, *,
                           revalidate: Callable[[], None],
                           stop_requested: Callable[[], bool] = lambda: False) -> dict:
@@ -479,12 +493,16 @@ class _ComparisonCaller:
         self._verify_runtime()
         authority = _read(authority_ref)
         parent = _read(authority['parent_cumulative_authority'])
+        # Preserve the original 70 window and the explicitly approved 76 window.
         _need(authority['scope_sha256'] == scope_ref['sha256'] and authority['scope_file'] == scope_ref['file']
              and authority['runner_sha256'] == batch._sha(self.caller_file)
              and authority['phase'] == 'final_production_code_comparison'
              and authority['oa_write_authorized'] is False and parent['oa_write_authorized'] is False
              and authority['cumulative_maximum_cli_starts'] == parent['maximum_cli_starts'] == 120
-             and authority['candidate_diagnosis_limit'] == parent['phase_limits']['candidate_diagnosis'] == 70
+             and type(authority['candidate_diagnosis_limit']) is int
+             and type(parent['phase_limits']['candidate_diagnosis']) is int
+             and authority['candidate_diagnosis_limit'] == parent['phase_limits']['candidate_diagnosis']
+             and authority['candidate_diagnosis_limit'] in {70, 76}
              and type(authority['maximum_cli_starts']) is int and 0 < authority['maximum_cli_starts'] <= 40
              and parent['same_source_model_retries'] is False
              and parent['quality_failure_stops_revision_expansion'] is True
@@ -644,8 +662,8 @@ class _ComparisonCaller:
                             budget=budget, actual_native_dispatch_enabled=True,
                             automated_preflight_seconds=round(time.monotonic() - started, 6), **progress)
             _need(not stop_requested(), 'cancelled_before_start')
-            # Presence is checked only after admission. Values are never read here.
-            _need('OA_REVIEW_API_KEY' in os.environ, 'reviewer_credentials_unavailable')
+            # The admitted native identity selects its original authentication contract.
+            _require_reviewer_authentication(row['plan'], pending)
             scope_file, authority_file = Path(request['scope']['file']), Path(request['authority']['file'])
             self.authority_for(request['scope'], request['authority'])
             self.verify_scope(request['scope'])

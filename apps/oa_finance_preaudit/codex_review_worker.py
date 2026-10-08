@@ -1096,7 +1096,6 @@ def _execute_codex_raw(
         )
         if offline_api is not None:
             command[2:2] = ["--config", "openai_base_url=" + json.dumps(offline_api[0]),
-                            "--config", "disable_response_storage=true",
                             "--skip-git-repo-check", "--config", 'web_search="disabled"',
                             "--config", "mcp_servers={}", "--config", "tools.web_search=false"]
         if frozen_input is not None:

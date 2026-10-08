@@ -251,7 +251,6 @@ def _native_image_sizes(images: tuple[Path, ...]):
             '-c', f'model="{worker.MODEL}"', '-c', f'model_reasoning_effort="{worker.REASONING_EFFORT}"',
             '-c', 'model_provider="openai"', '-c', 'service_tier="default"',
             '-c', 'openai_base_url="http://127.0.0.1:1"',
-            '-c', 'disable_response_storage=true',
             '-c', 'approval_policy="never"', '-c', 'sandbox_mode="read-only"']
     args.extend(part for path in images for part in ('--image', str(path)))
     environment = {k: v for k, v in os.environ.items()
