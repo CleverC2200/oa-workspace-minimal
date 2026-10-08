@@ -65,12 +65,14 @@ def assert_live_safe(payload: dict, *, maintenance_leases_held: bool = True) -> 
     if maintenance_leases_held and (
             handoff.get('controller_active') is not True
             or handoff.get('writer_active') is not False
-            or handoff.get('active_request_writers') != 1):
+            or type(handoff.get('active_request_writers')) is not int
+            or handoff['active_request_writers'] != 1):
         raise RuntimeError('maintenance_runtime_active')
     if not maintenance_leases_held and (
             handoff.get('controller_active') is not False
             or handoff.get('writer_active') is not False
-            or handoff.get('active_request_writers') != 0):
+            or type(handoff.get('active_request_writers')) is not int
+            or handoff['active_request_writers'] != 0):
         raise RuntimeError('maintenance_runtime_active')
     reconciled = payload.get('reconciliation', {})
     if (reconciled.get('kind') != 'preaudit_reconciliation'
