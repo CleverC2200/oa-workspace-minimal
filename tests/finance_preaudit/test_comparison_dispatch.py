@@ -241,7 +241,7 @@ def test_baseline_next_pair_requires_complete_independent_audit(tmp_path, phase_
     baseline_checklist, baseline_expectations = row['checklist'], row['expectations']
     if unique is not None:
         original = json.loads(Path(row['checklist']['file']).read_text())
-        original['business_scope_unique'] = False if unique == 'late' else unique
+        original['business_scope_is_unique'] = False if unique == 'late' else unique
         name = path.parent / 'baseline-checklist.json'
         save(name, original)
         baseline_checklist = ref(name)
@@ -337,7 +337,7 @@ def test_explicit_baseline_scope_unknown_cannot_hide_unobserved_original_image(t
     checklist = tmp_path / 'baseline-checklist.json'
     save(checklist, {'schema_version': 1, 'workflow_key': 'business_entertainment',
                     'source_kind': 'synthetic', 'scenario': 'ordinary_payment',
-                    'review_scope': 'complete_financial_review', 'business_scope_unique': False,
+                    'review_scope': 'complete_financial_review', 'business_scope_is_unique': False,
                     'source_refs': [ref(Path(p)) for p in manifest['originals']],
                     'rule_refs': [ref(before / 'calling-source/.agents/skills/oa-finance-preaudit' / name)
                                   for name in names],
