@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -45,6 +46,23 @@ def main():
         if digest(Path(p).read_bytes()) != expected:
             raise ValueError("input_drift")
     calling = root / "calling-source"
+    if mode == "native-readiness" and name == "baseline" and manifest.get("source_role") == "production_code_replay":
+        # The verifier is external tooling. Application imports stay in immutable
+        # source children, so old production need not contain this new verifier.
+        verifier = Path(__file__).resolve().parents[1] / "apps/oa_finance_preaudit/baseline_native_contract.py"
+        spec = importlib.util.spec_from_file_location("oa_baseline_verifier", verifier)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        result = module.readiness(Path(sys.argv[4]), source=calling,
+            source_revision=manifest["source_revision"], host_file=Path(__file__).resolve(),
+            binary=Path(plan["reviewer"]), source_files=relative_sources)
+        if result["baseline_comparison_ready"] and (result["binding"]["cli_sha256"] != plan["reviewer_sha256"]
+                or result["binding"]["host_sha256"] != plan["host_sha256"]):
+            result = {"status": "not_verified", "baseline_comparison_ready": False,
+                "paid_dispatch_ready": False, "input_complete": False, "sample_eligible": False,
+                "reason": "baseline_contract_not_current"}
+        print(json.dumps(result))
+        return
     sys.path.insert(0, str(calling))
     from apps import json_artifact
     from apps.oa_finance_preaudit import codex_review_worker as worker, flow_engine

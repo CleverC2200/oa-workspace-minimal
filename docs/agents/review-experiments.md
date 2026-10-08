@@ -40,6 +40,14 @@
 
 该检查没有真实业务材料或付费模型请求，不声称操作系统全外网隔离、真实供应商格式稳定、图片内容理解或财务正确。合成 preview 的业务样本资格保持不通过。对应 pytest 入口为 [原生合同回归](../../tests/finance_preaudit/test_native_review_contract.py)。原生 CLI 不在环境中时，显式 quality 检查仍记录未验证；pytest 的原生分支跳过不能代替这份证明。
 
+### 旧生产配置的原生观察
+
+旧生产源码可以没有当前检查器。开发侧 `baseline_native_contract.check(record, source=..., repository=..., source_revision=..., host_file=..., binary=..., source_files=...)` 单独检查冻结的 `calling-source`，不向旧源码复制模块。`source_files` 是档案 manifest 的完整相对路径与 SHA-256 映射；检查先与该 Git 修订逐文件核对。独立子进程只加载旧 Worker、FlowEngine、规则和原参数，通过假密钥和 loopback 服务观察默认长文本读取、两张中性图片、原 JSON 消费及非法原输出拒绝。子进程和原生 CLI 不重试，取消沿各自所有者回收。
+
+记录绑定旧源码全量指纹、原调用配置、CLI、开发侧检查器、宿主及实际证据。`readiness(record, source=..., source_revision=..., host_file=..., binary=..., source_files=...)` 仅重验绑定。宿主仅在 baseline 的 `production_code_replay` 角色使用外置检查器，candidate 保留上节完整合同。
+
+成功状态是 `verified_baseline_observation`，`baseline_comparison_ready=true` 只表示原配置行为已核实。记录必须保留默认历史预算和实际截断，`input_complete=false`、`sample_eligible=false`、`paid_dispatch_ready=false`。它不把旧配置缺陷改称完整输入，也不授予模型调用、OA、来源质量或发布资格。配对派发仍独立检查授权、范围、资料、累计额度和终态。缺少记录、源码、参数、宿主、CLI或证据漂移时该观察不可复用。无原生 CLI 的受控外部进程回归见[基线观察测试](../../tests/finance_preaudit/test_baseline_native_contract.py)，这类回归不替代安装 CLI 的实际证明。
+
 ## 运行与核对保护
 
 计划固定当前本地 apps Python 实现、宿主、driver、解释器和依赖清单；新进程加载前检查实际字节。calling-source 的项目指令和当前流程五份必需规则文档也必须在 Git 固定清单中，漏列不能用来绕过漂移检查。
