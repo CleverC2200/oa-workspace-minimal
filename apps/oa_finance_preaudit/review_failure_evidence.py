@@ -6,10 +6,7 @@ import os
 from pathlib import Path
 
 
-MODEL = "gpt-6.1-sol"
-REASONING_EFFORT = "medium"
-MODEL_PROVIDER = "openai"
-SERVICE_TIER = "default"
+from .production_config import MODEL, REASONING_EFFORT, MODEL_PROVIDER, SERVICE_TIER
 # Frozen historical evidence keeps the model and effort used by that invocation.
 LEGACY_MODELS = frozenset({"gpt-5.6-terra"})
 ALTERNATE_MODELS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
