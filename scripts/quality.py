@@ -278,7 +278,7 @@ def _event_body(path: Path) -> object:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="repository-quality")
-    parser.add_argument("check", choices=("skill", "hygiene", "format", "links", "pr", "yaml", "schema", "lint", "environment"))
+    parser.add_argument("check", choices=("skill", "hygiene", "format", "links", "pr", "yaml", "schema", "lint", "environment", "production-config"))
     parser.add_argument("--event", type=Path)
     args = parser.parse_args(argv)
     files = tracked_files()
@@ -297,6 +297,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.check == "environment":
         from scripts.dev_environment import check_configuration
         findings = check_configuration(PROJECT_ROOT)
+    elif args.check == "production-config":
+        from apps.oa_finance_preaudit.production_config import repository_findings
+        findings = repository_findings(PROJECT_ROOT)
     elif args.check == "lint":
         return subprocess.call([sys.executable, '-m', 'ruff', 'check', 'apps', 'scripts', 'tests'], cwd=PROJECT_ROOT)
     else:
