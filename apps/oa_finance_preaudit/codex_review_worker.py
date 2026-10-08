@@ -937,8 +937,10 @@ def _visual_aux_directory(directory: Path):
         path = directory / 'visual-aux'
         with runtime_control.pinned_directory(path) as descriptor:
             def private():
-                metadata = os.fstat(descriptor)
-                return metadata.st_uid == os.getuid() and stat.S_IMODE(metadata.st_mode) == 0o700
+                return all(
+                    metadata.st_uid == os.getuid() and stat.S_IMODE(metadata.st_mode) == 0o700
+                    for metadata in (os.fstat(parent), os.fstat(descriptor))
+                )
             if not private():
                 raise ValueError('codex_visual_aux_untrusted')
             yield path

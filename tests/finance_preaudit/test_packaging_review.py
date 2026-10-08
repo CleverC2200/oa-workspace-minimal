@@ -474,3 +474,35 @@ def test_packaging_review_rejects_untrusted_aux_owner_before_native_launch(tmp_p
     result = reviewer.review(path, project_root=tmp_path, timeout_seconds=60)
     assert result['status'] == 'failed' and result['decision_file'] is None
     assert launches == []
+
+
+@pytest.mark.parametrize('damage', ['mode', 'owner'])
+def test_packaging_review_rejects_audit_parent_drift_at_completion(tmp_path, monkeypatch, damage):
+    path = action(tmp_path)
+    packet = json.loads(path.with_name('review-packet.json').read_text())
+    before = {p.name:p.read_bytes() for p in path.parent.glob('*.json')}
+    captured = []
+    def observe(_command, directory):
+        captured.append(directory)
+    def change():
+        directory = captured[0]
+        if damage == 'mode':
+            directory.chmod(0o777)
+        else:
+            real_fstat = os.fstat
+            parent_inode = directory.stat().st_ino
+            def changed_owner(descriptor):
+                metadata = real_fstat(descriptor)
+                if metadata.st_ino == parent_inode:
+                    values = list(metadata)
+                    values[4] = metadata.st_uid + 1
+                    return os.stat_result(values)
+                return metadata
+            monkeypatch.setattr(reviewer.worker.os, 'fstat', changed_owner)
+        assert stat.S_IMODE((directory/'visual-aux').stat().st_mode) == 0o700
+    fake_process(monkeypatch, json.dumps(draft(packet)), native_home=tmp_path/'native-auth',
+                 inspect_start=observe, after=change)
+    result = reviewer.review(path, project_root=tmp_path, timeout_seconds=60)
+    assert result['status'] == 'failed' and result['decision_file'] is None
+    assert result['business_fields_changed'] is False
+    assert {p.name:p.read_bytes() for p in path.parent.glob('*.json')} == before
