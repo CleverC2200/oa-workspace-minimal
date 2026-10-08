@@ -335,10 +335,25 @@ def clear_failure_stop(
     return _clear_stop(payload, expected_identity=expected_identity)
 
 
+def clear_manual_stop(
+    *, target: Path, expected_identity: tuple[int, int, int],
+) -> bool:
+    """Clear an exact manual marker after audited, lease-held stop recovery.
+
+    This file operation grants no recovery authority. Callers must first bind
+    original terminal evidence and complete live reconciliation under both leases.
+    """
+    if (len(expected_identity) != 3
+        or any(type(value) is not int or value < 0 for value in expected_identity)):
+        raise ValueError("stop_identity_invalid")
+    return _clear_stop(b"stop_requested\n", expected_identity=expected_identity, target=target)
+
+
 def _clear_stop(
     expected_payload: bytes,
     *,
     expected_identity: tuple[int, int, int] | None = None,
+    target: Path | None = None,
 ) -> bool:
     """Remove one controller-owned stop marker whose payload matches exactly."""
     raw = str(
@@ -346,7 +361,7 @@ def _clear_stop(
     ).strip().lower()
     if raw in {"1", "true", "yes", "y", "on"}:
         return False
-    target = stop_file().expanduser()
+    target = Path(target or stop_file()).expanduser()
     if not target.is_absolute():
         target = PROJECT_ROOT / target
     target = Path(os.path.abspath(target))

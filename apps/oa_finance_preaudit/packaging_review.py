@@ -60,9 +60,11 @@ def draft_schema(packet: dict) -> dict:
 
 
 def check_provider_schema(schema: dict) -> None:
-    """Reject the empty-object shape that this supplier refused in practice."""
+    """Reject the empty-object and lookaround shapes refused by this supplier."""
     if schema.get('type') == 'object' and not schema.get('properties'):
         raise ValueError('review_schema_empty_object')
+    if isinstance(schema.get('pattern'), str) and re.search(r'\(\?[=!<]', schema['pattern']):
+        raise ValueError('review_schema_unsupported_pattern')
     for value in schema.values():
         if isinstance(value, dict):
             check_provider_schema(value)
@@ -98,6 +100,10 @@ def parse_draft(raw: str, schema: dict) -> dict:
                 raise ValueError('packaging_review_json_ambiguous')
         draft = json.loads(block.group(1), object_pairs_hook=unique_fields)
     if not isinstance(draft, dict) or list(Draft202012Validator(schema).iter_errors(draft)):
+        raise ValueError('packaging_review_schema_invalid')
+    if any(page['package_version_id'] is not None
+           and packaging_contract.PACKAGE_VERSION_ID.fullmatch(page['package_version_id']) is None
+           for page in draft['visual_review']['pages']):
         raise ValueError('packaging_review_schema_invalid')
     return draft
 

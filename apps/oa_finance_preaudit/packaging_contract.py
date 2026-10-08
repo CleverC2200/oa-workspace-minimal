@@ -2,8 +2,8 @@
 import re
 
 
-# JSON Schema patterns search rather than fullmatch; reject trailing newlines too.
-PACKAGE_VERSION_ID_PATTERN = r"^[0-9A-Za-z._-]{1,80}(?![\s\S])"
+# Native schema supports plain anchors; local fullmatch rejects trailing newlines.
+PACKAGE_VERSION_ID_PATTERN = r"^[0-9A-Za-z._-]{1,80}$"
 PACKAGE_VERSION_ID_SCHEMA = {
     "type": ["string", "null"],
     "pattern": PACKAGE_VERSION_ID_PATTERN,

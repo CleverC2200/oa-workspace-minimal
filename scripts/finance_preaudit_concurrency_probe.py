@@ -38,6 +38,7 @@ from apps.oa_finance_preaudit import (
     prepare_failure,
     prepare_trace,
     process_pool,
+    production_config,
     production_pending,
     reconciliation,
     runtime_maintenance,
@@ -131,16 +132,7 @@ ITEM_LOCAL_MATERIAL_FAILURE_DETAILS = (
     runtime_maintenance.ITEM_LOCAL_MATERIAL_FAILURE_DETAILS
 )
 SESSION_BLOCKING_FAILURE_CODES = flow_engine.SESSION_BLOCKING_FAILURE_CODES
-ROLLING_WORKFLOW_KEYS = frozenset(
-    {
-        "travel_expense",
-        "business_entertainment",
-        "business_support_fee",
-        "small_marketing_fee",
-        "tpm_small_marketing_fee",
-        "general_expense",
-    }
-)
+ROLLING_WORKFLOW_KEYS = frozenset(production_config.FINANCE_WORKFLOWS)
 _OA_TIMEZONE = ZoneInfo("Asia/Shanghai")
 _SESSION_ALERT_PRIORITY = (
     "oa_execution_identity_login_failed",
