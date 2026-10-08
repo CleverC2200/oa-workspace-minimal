@@ -66,6 +66,19 @@ def test_fallback_images_reach_next_request_in_original_encoded_order(native_rec
     assert case['rollout_tool_image_sha256'] == case['tool_image_sha256']
 
 
+def test_real_native_gpt_profile_and_receipts_remain_bound_without_real_credentials(native_record):
+    result = json.loads(native_record.read_text())
+    assert all('model_provider="openai"' in command and 'service_tier="default"' in command
+               and command[command.index('--model') + 1] == 'gpt-6.1-sol'
+               and 'model_reasoning_effort="medium"' in command
+               for command in result['binding']['call_profiles'].values())
+    request_file = next(Path(path) for path in result['artifacts'] if path.endswith('/fallback/requests.json'))
+    assert all(request['model'] == 'gpt-6.1-sol' and request['reasoning']['effort'] == 'medium'
+               for request in json.loads(request_file.read_text()))
+    assert any('/reviewer/tool-receipts/' in path for path in result['artifacts'])
+    assert not any(path.endswith('/auth.json') or '/home/' in path for path in result['artifacts'])
+
+
 def test_missing_fallback_image_proof_cannot_be_reused(native_record, tmp_path):
     from apps.oa_finance_preaudit import native_review_contract
 

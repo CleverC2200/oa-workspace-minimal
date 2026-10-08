@@ -14,6 +14,7 @@ from tests.finance_preaudit.test_review_experiment import sources
 
 BASE = '280fc829e7f30d13d399790e8c8adfc7a7d5612b'
 PRODUCTION = 'dd55792abf891121d8ceb4f9a8528a39b48432b6'
+GPT_PRODUCTION = '627f2cad54937544828ba4c3af44d5117c672c1a'
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -75,17 +76,47 @@ while True:
 
 
 @pytest.fixture
-def production_source(tmp_path):
+def production_source(tmp_path, request):
+    revision = getattr(request, 'param', PRODUCTION)
     source = tmp_path / 'production-source'
-    names = subprocess.check_output(['git', 'ls-tree', '-r', '--name-only', PRODUCTION], cwd=ROOT, text=True).splitlines()
+    names = subprocess.check_output(['git', 'ls-tree', '-r', '--name-only', revision], cwd=ROOT, text=True).splitlines()
     for name in names:
         if (name.startswith('apps/') and name.endswith(('.py', '.json'))
                 or name.startswith('.agents/skills/oa-finance-preaudit/') and name.endswith('.md')
                 or name in {'AGENTS.md', 'requirements-dev.txt'}):
             path = source / name
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(subprocess.check_output(['git', 'show', PRODUCTION + ':' + name], cwd=ROOT))
+            path.write_bytes(subprocess.check_output(['git', 'show', revision + ':' + name], cwd=ROOT))
     return source
+
+
+@pytest.mark.parametrize('production_source', [GPT_PRODUCTION], indirect=True)
+def test_native_gpt_baseline_keeps_original_profile_and_uses_only_isolated_receipts(
+        tmp_path, production_source):
+    from apps.oa_finance_preaudit import baseline_native_contract as baseline, review_input
+
+    binary = review_input._native_codex_file()
+    if binary is None:
+        pytest.skip('installed native CLI unavailable; no native claim made')
+    tmp_path.chmod(0o700)
+    record = tmp_path / 'gpt-observation.json'
+    result = baseline.check(record, source=production_source, repository=ROOT,
+        source_revision=GPT_PRODUCTION, host_file=ROOT / 'scripts/review_experiment_host.py', binary=binary)
+    assert result['baseline_comparison_ready'] is True, result
+    profile = result['binding']['call_profiles']
+    assert profile['model'] == 'gpt-6.1-sol'
+    assert profile['reasoning_effort'] == 'medium'
+    assert 'model_provider="openai"' in profile['original']
+    assert 'service_tier="default"' in profile['original']
+    assert not any('model_providers.openai=' in argument for argument in profile['original'])
+    assert result['cases']['default_reading']['model_context']['truncated'] is True
+    assert result['cases']['default_reading']['history_limit'] is None
+    assert result['cases']['invalid_json']['invalid_original_rejected'] is True
+    assert any('/reviewer/tool-receipts/' in path for path in result['artifacts'])
+    assert not any(path.endswith('/auth.json') or '/reviewer/codex-home/' in path for path in result['artifacts'])
+    assert all(result[flag] is False for flag in ('paid_dispatch_ready', 'input_complete', 'sample_eligible'))
+    assert baseline.readiness(record, source=production_source, source_revision=GPT_PRODUCTION,
+        host_file=ROOT / 'scripts/review_experiment_host.py', binary=binary)['baseline_comparison_ready'] is True
 
 
 def test_current_production_still_uses_its_own_default_protocol(tmp_path, production_source, local_protocol_cli):
@@ -105,6 +136,7 @@ def test_current_production_still_uses_its_own_default_protocol(tmp_path, produc
     assert result['input_complete'] is False
 
 
+@pytest.mark.parametrize('production_source', [PRODUCTION, GPT_PRODUCTION], indirect=True)
 def test_cancelled_baseline_child_reaps_original_workers_independent_cli(tmp_path, production_source):
     """Exercise the original Worker with a local waiting CLI and real SIGTERM."""
     driver = tmp_path / 'cancel-driver.py'

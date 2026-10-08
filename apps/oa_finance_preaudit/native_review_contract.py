@@ -89,8 +89,14 @@ def _verified_cases(cases: dict) -> bool:
 def _fixture(root: Path, *, long: bool, workflow: str):
     project = root / 'project'
     project.mkdir()
-    # Only current application code is reachable from the neutral tool working directory.
-    (project / 'apps').symlink_to(ROOT / 'apps', target_is_directory=True)
+    # The original production permission profile denies the user's Codex home.
+    # A development worktree may live there, so keep the neutral project's code
+    # bytes inside its own readable directory instead of broadening permissions.
+    for path in (ROOT / 'apps').rglob('*'):
+        if path.is_file() and path.suffix in {'.py', '.json'}:
+            target = project / path.relative_to(ROOT)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(path.read_bytes())
     fields = [{'path': f'detail[0].row[{i}].field[0]', 'value': f'CANARY_FIELD_{i:04d}|' + '0123456789' * 14,
                'read_status': 'synthetic', 'nullable': None, 'flag': False} for i in range(798 if long else 2)]
     fields[0]['value'] = 'BEGIN_CANARY|' + fields[0]['value']
@@ -148,8 +154,17 @@ def _case(root: Path, binary: Path, name: str) -> dict:
     request_count = 2 + len(pages) if long else 1
 
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+
         def log_message(self, *_args):
             pass
+
+        def do_GET(self):
+            # Exercise the built-in provider's HTTP fallback. The synthetic
+            # endpoint implements Responses SSE and declines native WebSockets.
+            self.send_response(426)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
 
         def do_POST(self):
             try:
@@ -183,6 +198,7 @@ def _case(root: Path, binary: Path, name: str) -> dict:
             except (ValueError, KeyError, TypeError) as error:
                 errors.append(str(error))
                 self.send_response(400)
+                self.send_header('Content-Length', '0')
                 self.end_headers()
 
     server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
@@ -192,7 +208,7 @@ def _case(root: Path, binary: Path, name: str) -> dict:
     for path in (home, bin_dir, audit):
         path.mkdir(mode=0o700)
     (bin_dir / 'codex').symlink_to(binary)
-    isolated = {'HOME': str(home), 'PATH': str(bin_dir) + ':' + str(Path(sys.executable).parent) + ':/usr/bin:/bin', 'OA_REVIEW_API_KEY': PLACEHOLDER}
+    isolated = {'HOME': str(home), 'PATH': str(bin_dir) + ':' + str(Path(sys.executable).parent) + ':/usr/bin:/bin'}
     executions = []
     diagnostics = {}
 
@@ -224,7 +240,7 @@ def _case(root: Path, binary: Path, name: str) -> dict:
     output = ''
     rollout_output = ''
     rollout_images = []
-    for f in (audit / 'codex-home').rglob('*.jsonl'):
+    for f in (audit / 'tool-receipts').glob('*.jsonl'):
         for line in f.read_text().splitlines():
             value = json.loads(line).get('payload', {})
             if value.get('type') == 'function_call_output' and value.get('call_id') == 'neutral-reader':
@@ -252,10 +268,13 @@ def _case(root: Path, binary: Path, name: str) -> dict:
     configuration = [command[i + 1] for i, arg in enumerate(command[:-1]) if arg in {'--config', '-c'}]
     limits = [int(q.split('=', 1)[1]) for q in configuration if q.startswith('tool_output_token_limit=')]
     request_text = '\n'.join(part.get('text', '') for message in requests[0]['input'] for part in message.get('content', []) if part.get('type') == 'input_text')
+    role_text = requests[0].get('instructions', '') + '\n' + '\n'.join(
+        part.get('text', '') for message in requests[0]['input'] if message.get('role') == 'developer'
+        for part in message.get('content', []) if part.get('type') == 'input_text')
     result = {'process_state': reviewed['process_state'], 'preview': preview,
               'bounded_role_delivered': bool(workflow == 'business_entertainment'
-                  and (ROOT / '.agents/skills/oa-finance-preaudit/references/worker-role.md').read_text().strip() in requests[0].get('instructions', '')
-                  and 'Before making tool calls, send a brief preamble' not in requests[0].get('instructions', '')),
+                  and (ROOT / '.agents/skills/oa-finance-preaudit/references/worker-role.md').read_text().strip() in role_text
+                  and 'Before making tool calls, send a brief preamble' not in role_text),
               'consumer_preserved_original_object': bool(closed and json.loads(Path(closed['decision_file']).read_text()) == obj),
               'invalid_original_rejected': name == 'invalid_json' and reviewed['status'] == 'failed' and reviewed['decision_state'] == 'unreadable' and raw == vendor_text.encode(),
               'model_context': {'exact_stdout': bool(stdout and stdout in output), 'field_rows_matched': sum(line in output.splitlines() for line in rows),
@@ -306,6 +325,7 @@ def check(record: Path) -> dict:
                 raise ValueError('native_cli_version_unverified')
             root = Path(tempfile.mkdtemp(prefix='native-contract-', dir=record.parent))
             cases = {name: _case(root / name, binary, name) for name in ('fallback', 'default_truncation', 'direct', 'other_workflow', 'invalid_json')}
+            result['cases'] = cases
             if not _verified_cases(cases):
                 raise ValueError('native_review_contract_failed')
             result.update(status='verified', reason=None, paid_dispatch_ready=True, cases=cases,
@@ -315,7 +335,7 @@ def check(record: Path) -> dict:
     if root is not None:
         # CLI housekeeping clones are temporary, not request/response evidence.
         retained = [p for p in root.rglob('*')
-                    if p.relative_to(root).parts[1:4] != ('reviewer', 'codex-home', '.tmp')
+                    if p.relative_to(root).parts[1:3] != ('reviewer', 'codex-home')
                     and p.is_file() and not p.is_symlink()]
         for path in retained:
             path.chmod(0o600)

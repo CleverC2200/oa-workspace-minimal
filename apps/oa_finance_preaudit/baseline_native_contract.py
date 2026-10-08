@@ -206,6 +206,7 @@ def check(record: Path, *, source: Path, repository: Path, source_revision: str,
         result['reason'] = str(error)
     if root is not None:
         retained = [p for p in root.rglob('*') if p.is_file() and not p.is_symlink()
+                    and p.relative_to(root).parts[1] != 'home'
                     and p.relative_to(root).parts[1:4] != ('reviewer', 'codex-home', '.tmp')]
         for path in retained:
             path.chmod(0o600)
@@ -281,12 +282,22 @@ def _case(source: Path, root: Path, binary: Path, name: str) -> dict:
     vendor = ('Neutral prefix\n' if name == 'invalid_json' else '') + json.dumps(obj, ensure_ascii=False)
     pages = json.loads(action_file.with_name('material.json').read_text())['prepared']['images']
     requests, errors, commands, executions = [], [], [], []
+    native_auth = 'model_provider="openai"' in worker._codex_command(source, Path('{SCHEMA}'), Path('{DECISION}'))
     count = 2 + len(pages) if long else 1
     reader = 'python3 -B -m apps.oa_finance_preaudit.read_material ' + shlex.quote(str(action_file))
 
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+
         def log_message(self, *_args):
             pass
+
+        def do_GET(self):
+            # The local fixture implements Responses SSE only. Let the native
+            # built-in provider use its normal HTTP fallback after WS refusal.
+            self.send_response(426)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
 
         def do_POST(self):
             try:
@@ -318,6 +329,7 @@ def _case(source: Path, root: Path, binary: Path, name: str) -> dict:
             except (ValueError, KeyError, TypeError) as error:
                 errors.append(str(error))
                 self.send_response(400)
+                self.send_header('Content-Length', '0')
                 self.end_headers()
 
     server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
@@ -326,6 +338,11 @@ def _case(source: Path, root: Path, binary: Path, name: str) -> dict:
     home, audit = root / 'home', root / 'reviewer'
     home.mkdir(mode=0o700)
     audit.mkdir(mode=0o700)
+    if native_auth:
+        (home / '.codex').mkdir(mode=0o700)
+        # The built-in provider uses its native credential format, with only a
+        # public fixture sentinel. No existing authentication store is consulted.
+        _save(home / '.codex/auth.json', {'OPENAI_API_KEY': PLACEHOLDER})
     original_command = worker._codex_command
     original_profile = original_command(source, Path('{SCHEMA}'), Path('{DECISION}'))
 
@@ -334,9 +351,17 @@ def _case(source: Path, root: Path, binary: Path, name: str) -> dict:
         expected = ('model_providers.oa_deepseek={name="DeepSeek",'
             'base_url="https://api.deepseek.com",wire_api="responses",'
             'env_key="OA_REVIEW_API_KEY",requires_openai_auth=false}')
-        if result.count(expected) != 1:
-            raise ValueError('baseline_provider_profile_unverified')
-        result[result.index(expected)] = expected.replace('https://api.deepseek.com', f'http://127.0.0.1:{server.server_port}')
+        if native_auth:
+            if (result.count('model_provider="openai"') != 1
+                    or result.count('service_tier="default"') != 1
+                    or worker.MODEL != 'gpt-6.1-sol' or worker.REASONING_EFFORT != 'medium'
+                    or any(argument.startswith('model_providers.') for argument in result)):
+                raise ValueError('baseline_provider_profile_unverified')
+            result[2:2] = ['--config', f'openai_base_url="http://127.0.0.1:{server.server_port}"']
+        else:
+            if result.count(expected) != 1:
+                raise ValueError('baseline_provider_profile_unverified')
+            result[result.index(expected)] = expected.replace('https://api.deepseek.com', f'http://127.0.0.1:{server.server_port}')
         result[0] = str(binary)
         result.insert(2, '--skip-git-repo-check')
         # The original Worker removes --ephemeral when retaining audit evidence.
@@ -347,7 +372,9 @@ def _case(source: Path, root: Path, binary: Path, name: str) -> dict:
     worker._codex_command = command
     # Only the synthetic key is put into this isolated child environment.
     os.environ.clear()
-    os.environ.update(HOME=str(home), PATH=str(Path(sys.executable).parent) + ':/usr/bin:/bin', OA_REVIEW_API_KEY=PLACEHOLDER)
+    os.environ.update(HOME=str(home), PATH=str(Path(sys.executable).parent) + ':/usr/bin:/bin')
+    if not native_auth:
+        os.environ['OA_REVIEW_API_KEY'] = PLACEHOLDER
 
     def executor(project_root, file, seconds):
         if executions:
@@ -375,7 +402,8 @@ def _case(source: Path, root: Path, binary: Path, name: str) -> dict:
     acceptance = flow_evals.build_acceptance_report(runtime_maintenance.status(action_file.parents[4])['case_metrics'], replay_report={}, cli_samples=[])
     json_artifact.write_json_atomic(root / 'acceptance.json', acceptance)
     rollout_output, rollout_images = '', []
-    for file in (audit / 'codex-home').rglob('*.jsonl'):
+    receipts = audit / ('tool-receipts' if native_auth else 'codex-home')
+    for file in receipts.rglob('*.jsonl'):
         for line in file.read_text().splitlines():
             value = json.loads(line).get('payload', {})
             if value.get('type') == 'function_call_output':
