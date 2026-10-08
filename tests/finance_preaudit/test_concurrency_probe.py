@@ -7248,13 +7248,18 @@ def test_dispatcher_adaptive_capacity_increases_inside_continuous_fifo(
     maximum_writers = 0
     active_reviews = 0
     maximum_reviews = 0
+    review_entries = 0
+    first_cohort = threading.Barrier(start)
 
     def review(_task: dict) -> dict:
-        nonlocal active_reviews, maximum_reviews
+        nonlocal active_reviews, maximum_reviews, review_entries
         with writer_lock:
+            review_entries += 1
+            entry = review_entries
             active_reviews += 1
             maximum_reviews = max(maximum_reviews, active_reviews)
-        time.sleep(0.01)
+        if entry <= start:
+            first_cohort.wait(timeout=10)
         with writer_lock:
             active_reviews -= 1
         return {
@@ -7328,7 +7333,7 @@ def test_dispatcher_adaptive_capacity_increases_inside_continuous_fifo(
     }
     assert writes == action_files
     assert maximum_writers == 1
-    assert 1 < maximum_reviews <= maximum
+    assert start <= maximum_reviews <= maximum
 
 
 def test_dispatcher_adaptive_window_keeps_worst_heartbeat_health(
