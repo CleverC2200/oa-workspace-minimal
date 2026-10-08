@@ -47,8 +47,8 @@ python3 -m apps.oa_finance_preaudit.cli next-action \
 - 每项包含 `status`、简明 `conclusion`、`evidence_refs` 和 `missing_evidence`；
 - `pass`、`fail` 必须有可回查证据，`uncertain` 必须写明缺口；
 - `required_uncertain_items` 中的项目只能是 `uncertain`，结论要用财务可理解的语言说明具体缺口和需其判断的事项，不得只复制错误码或套用单一固定句；
-- 任一项目为 `fail` 或 `uncertain` 时，`overall=needs_human`；全部为 `pass` 时，`overall=pass`；
-- 包装决定增加合同规定的 `excel_comparison`，并覆盖每个冻结图片页。
+- 任一项目为 `fail` 或 `uncertain` 时，`overall=needs_human`；固定项目全部为 `pass` 且无包装补充异常时，`overall=pass`；
+- 包装决定增加合同规定的 `excel_comparison`，覆盖每个冻结图片页，并按合同逐位置记录四项之外的补充异常；补充异常使整体为 `needs_human`，固定四项保持各自结论。
 
 业务 `fail` 和 `uncertain` 是正常预审结果，不代表批准、退回或技术失败。
 

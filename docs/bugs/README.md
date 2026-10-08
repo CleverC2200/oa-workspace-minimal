@@ -16,6 +16,7 @@
 
 | 领域 | 症状 / 搜索词 | 主记录或历史组件 | 回归 / 经验入口 |
 |---|---|---|---|
+| 包装补充校对 | 四项之外异常遗漏、储存/警示文字、整体结论、Excel 尾行 | [#383](https://github.com/CleverC2200/oa-workspace-minimal/issues/383) | [决定/消费回归](../../tests/finance_preaudit/test_packaging_supplementary_checks.py)、[补充合同](../../.agents/skills/oa-finance-preaudit/references/flow-engine-contract.md)；工程检查与生产语义验收分开 |
 | 调度与交接 | 终态丢失、孤立 running、Unknown process id、提前判卡死、旧窗口派单 | [#325 重复交接症状记录](https://github.com/CleverC2200/oa-workspace-minimal/issues/325)；留证工程 [#326](https://github.com/CleverC2200/oa-workspace-minimal/issues/326)；相关组件 [#150](https://github.com/CleverC2200/oa-workspace-minimal/issues/150)、[#202](https://github.com/CleverC2200/oa-workspace-minimal/issues/202) | [执行与原会话回归](../../tests/finance_preaudit/test_controller_execution.py)、[交接回归](../../tests/finance_preaudit/test_controller_handoff.py)、[隔离排障与恢复](../agents/quarantine-repair.md)；组件实现不代表所有退出原因已解决 |
 | 观测与输出 | 状态 JSON 截断、完整文件、摘要门禁 | [#311](https://github.com/CleverC2200/oa-workspace-minimal/issues/311) | [完整状态输出回归](../../tests/finance_preaudit/test_status_output_file.py) |
 | 商旅准备 | browser.close、Playwright 生命周期、真实准备 watchdog | [#313](https://github.com/CleverC2200/oa-workspace-minimal/issues/313)；诊断能力 [#304](https://github.com/CleverC2200/oa-workspace-minimal/issues/304) | [浏览器生命周期回归](../../tests/finance_preaudit/test_travel_browser_lifecycle.py)、[阶段采样回归](../../tests/finance_preaudit/test_prepare_trace.py)、[采集契约](../../tests/finance_preaudit/test_collect_case_contract.py)；关闭警告单独不能证明卡死 |
