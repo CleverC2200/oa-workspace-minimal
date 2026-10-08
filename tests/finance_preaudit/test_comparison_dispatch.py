@@ -202,8 +202,12 @@ def test_next_pair_waits_for_independent_quality_after_actual_preview(tmp_path, 
     directory = tmp_path / 'first'
     directory.mkdir(mode=0o700)
     path, _auth, _before, _after = plan(directory, sources, purpose='diagnostic')
-    _execute_pending_pair(path, {'target_plan_ref': ref(path), 'reused_originals': {},
-                                 'pending_arms': ['baseline', 'candidate']}, {}, revalidate=lambda: None)
+    result = _execute_pending_pair(path, {'target_plan_ref': ref(path), 'reused_originals': {},
+                                        'pending_arms': ['baseline', 'candidate']}, {}, revalidate=lambda: None)
+    assert result['new_cli_starts'] == 2
+    assert result['status'] == 'awaiting_independent_assessment'
+    assert all(result['reports'][arm]['acceptance']['preview'] == 'verified_closed'
+               for arm in ('baseline', 'candidate'))
     adapter = tmp_path / 'neutral-adapter.py'
     adapter.write_text('"""No financial qualification or dispatch in this fixture."""\n')
     adapter.chmod(0o600)
@@ -211,7 +215,7 @@ def test_next_pair_waits_for_independent_quality_after_actual_preview(tmp_path, 
     target = {'alias': 'second', 'plan': ref(path)}
     scope = {'cases': [{'alias': 'first', 'plan': ref(path)}, target]}
 
-    with pytest.raises(ValueError, match='previous_quality_pending'):
+    with pytest.raises(ValueError, match='^previous_baseline_quality_pending$'):
         caller._previous_quality(scope, target)
 
 
