@@ -49,6 +49,7 @@ def _git(root: Path, *args: str) -> str:
 
 def _source(root: Path, expected_revision: str, expected_origin: str, *, synchronized: bool = False) -> str:
     if (root.name != 'oa-workspace-minimal' or root.is_symlink()
+            or (root / '.git').is_symlink() or not (root / '.git').is_dir()
             or Path(_git(root, 'rev-parse', '--show-toplevel')).resolve() != root.resolve()
             or _git(root, 'rev-parse', '--git-common-dir') != '.git'):
         raise RuntimeError('production_release_clone_required')

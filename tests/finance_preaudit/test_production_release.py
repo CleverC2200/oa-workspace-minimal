@@ -167,3 +167,14 @@ def test_release_refuses_diverged_clean_main(production):
             expected_origin=str(remote), confirmed_sync=True, check_live=lambda target: live_snapshot(),
             check_configuration=lambda target, revision: [])
     assert git(root, 'rev-parse', 'HEAD') != expected
+
+
+def test_release_rejects_shared_git_directory(production):
+    root, remote, expected = production
+    shared = root.parent / 'shared.git'
+    (root / '.git').rename(shared)
+    (root / '.git').symlink_to(shared, target_is_directory=True)
+    with pytest.raises(RuntimeError, match='production_release_clone_required'):
+        production_release.release_source(root, expected_revision=expected,
+            expected_origin=str(remote), check_live=lambda target: live_snapshot(),
+            check_configuration=lambda target, revision: [])
