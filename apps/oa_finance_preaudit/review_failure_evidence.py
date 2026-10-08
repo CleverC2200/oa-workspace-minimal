@@ -28,6 +28,21 @@ def model_effort_matches(model: object, effort: object) -> bool:
     return model_matches(model) and effort == MODEL_EFFORTS[model]
 
 
+def read_model_identity(value: object) -> dict | None:
+    """Validate invocation identity without adding settings to historical evidence."""
+    if not isinstance(value, dict) or not model_effort_matches(value.get("model"), value.get("reasoning_effort")):
+        return None
+    identity = {"model": value["model"], "reasoning_effort": value["reasoning_effort"]}
+    settings = {"model_provider": MODEL_PROVIDER, "requested_service_tier": SERVICE_TIER}
+    if value["model"] == MODEL:
+        if any(value.get(key) != expected for key, expected in settings.items()):
+            return None
+        identity.update(settings)
+    elif any(key in value for key in settings):
+        return None
+    return identity
+
+
 def valid_attempt_codes(codes: object) -> bool:
     if not isinstance(codes, list) or not codes:
         return False
@@ -86,25 +101,18 @@ def receipt_matches(
         )
     ):
         return False
+    identity = read_model_identity(value)
+    if identity is None:
+        return False
     expected = receipt_payload(
         action_token=action_token,
         workflow_key=workflow_key,
         failure_code=actual_failure_code,
         attempt_error_codes=actual_attempt_codes,
+        model=identity["model"],
+        reasoning_effort=identity["reasoning_effort"],
     )
-    if not model_effort_matches(value.get("model"), value.get("reasoning_effort")):
-        return False
-    if value["model"] != MODEL:
-        expected.pop("model_provider")
-        expected.pop("requested_service_tier")
-    expected["model"] = value["model"]
-    expected["reasoning_effort"] = value["reasoning_effort"]
-    if set(value) != set(expected):
-        return False
-    return all(
-        model_matches(value.get(key)) if key == "model" else value.get(key) == wanted
-        for key, wanted in expected.items()
-    )
+    return value == expected
 
 
 def read_receipt(path: Path) -> dict | None:

@@ -27,6 +27,8 @@ from .review_output import parse_json as _parse_decision_json
 
 MODEL = review_failure_evidence.MODEL
 REASONING_EFFORT = review_failure_evidence.REASONING_EFFORT
+_NATIVE_RECEIPT_MAX_BYTES = 32 * 1024 * 1024
+_NATIVE_RECEIPT_HEADER_MAX_BYTES = 1024 * 1024
 _FINANCE_RULES = {
     "travel_expense": (
         "travel_expense:1",
@@ -243,14 +245,41 @@ def _retain_native_tool_receipt(output: TextIO, *, native_home: Path, store: Pat
             or not source.resolve(strict=True).is_relative_to(sessions.resolve(strict=True))
             or any(path.is_symlink() for path in (source, *source.parents))):
         raise ValueError("codex_tool_receipt_unavailable")
-    with source.open("rb") as stream:
-        header = stream.readline()
-        metadata = json.loads(header)
-        payload = metadata.get("payload") if isinstance(metadata, dict) else None
-        if (not isinstance(payload, dict) or metadata.get("type") != "session_meta"
-                or payload.get("id") != identifier or payload.get("cwd") != str(project_root)):
-            raise ValueError("codex_tool_receipt_unavailable")
-        raw = header + stream.read()
+    with runtime_control.pinned_directory(source.parent) as parent:
+        before = os.stat(source.name, dir_fd=parent, follow_symlinks=False)
+        descriptor = os.open(source.name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             dir_fd=parent)
+        try:
+            opened = os.fstat(descriptor)
+            def identity(value):
+                return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+            if (not stat.S_ISREG(opened.st_mode) or identity(opened) != identity(before)
+                    or not 0 < opened.st_size <= _NATIVE_RECEIPT_MAX_BYTES):
+                raise ValueError("codex_tool_receipt_unavailable")
+            with os.fdopen(descriptor, "rb", buffering=0, closefd=False) as stream:
+                header = stream.readline(_NATIVE_RECEIPT_HEADER_MAX_BYTES + 1)
+                if len(header) > _NATIVE_RECEIPT_HEADER_MAX_BYTES or not header.endswith(b"\n"):
+                    raise ValueError("codex_tool_receipt_unavailable")
+                metadata = json.loads(header)
+                payload = metadata.get("payload") if isinstance(metadata, dict) else None
+                if (not isinstance(payload, dict) or metadata.get("type") != "session_meta"
+                        or payload.get("id") != identifier or payload.get("cwd") != str(project_root)):
+                    raise ValueError("codex_tool_receipt_unavailable")
+                chunks = [header]
+                remaining = _NATIVE_RECEIPT_MAX_BYTES + 1 - len(header)
+                while remaining:
+                    chunk = stream.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                raw = b"".join(chunks)
+            current = os.stat(source.name, dir_fd=parent, follow_symlinks=False)
+            if (len(raw) != opened.st_size or identity(os.fstat(descriptor)) != identity(opened)
+                    or not stat.S_ISREG(current.st_mode) or identity(current) != identity(opened)):
+                raise ValueError("codex_tool_receipt_unavailable")
+        finally:
+            os.close(descriptor)
     relative = f"tool-receipts/{identifier}.jsonl"
     directory = target / "tool-receipts"
     directory.mkdir(mode=0o700)
@@ -1075,7 +1104,7 @@ def _execute_codex_raw(
                             store=temporary_root / "native-state", project_root=project_root,
                             target=temporary_root,
                         )
-                except (OSError, ValueError, TypeError, KeyError, sqlite3.Error):
+                except (OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error):
                     stderr_summary["tool_receipt_files"] = []
                     stderr_summary["tool_receipt_unavailable"] = True
 
@@ -1297,12 +1326,10 @@ def _is_bounded_failure(
 ) -> bool:
     if not isinstance(value, dict):
         return False
-    settings = {"model_provider", "requested_service_tier"} if value.get("model") == MODEL else set()
-    if set(value) != settings | {
+    identity = review_failure_evidence.read_model_identity(value)
+    if identity is None or set(value) != set(identity) | {
         "schema_version",
         "kind",
-        "model",
-        "reasoning_effort",
         "process_attempts",
         "process_retries",
         "token_usage",
@@ -1316,9 +1343,6 @@ def _is_bounded_failure(
     return (
         value.get("schema_version") == 1
         and value.get("kind") == "preaudit_review_worker_result"
-        and review_failure_evidence.model_effort_matches(value.get("model"), value.get("reasoning_effort"))
-        and (not settings or (value.get("model_provider") == review_failure_evidence.MODEL_PROVIDER
-                              and value.get("requested_service_tier") == review_failure_evidence.SERVICE_TIER))
         and type(value.get("process_attempts")) is int
         and value.get("process_attempts") in allowed_attempts
         and type(value.get("process_retries")) is int
@@ -1738,13 +1762,13 @@ def complete_review_result(
     codex_events = reviewed.get("codex_events") if isinstance(reviewed, dict) else None
     model = reviewed.get("model") if isinstance(reviewed, dict) else None
     effort = reviewed.get("reasoning_effort") if isinstance(reviewed, dict) else None
-    identity_valid = review_failure_evidence.model_effort_matches(model, effort)
-    identity = {"model": model if review_failure_evidence.model_matches(model) else None,
-                "reasoning_effort": effort if isinstance(effort, str) and effort in {"medium", "high"} else None}
-    if model == MODEL:
-        identity.update(model_provider=reviewed.get("model_provider"),
-                        requested_service_tier=reviewed.get("requested_service_tier"))
-        identity_valid = identity_valid and identity["model_provider"] == review_failure_evidence.MODEL_PROVIDER and identity["requested_service_tier"] == review_failure_evidence.SERVICE_TIER
+    identity = review_failure_evidence.read_model_identity(reviewed)
+    identity_valid = identity is not None
+    if identity is None:
+        identity = {
+            "model": model if review_failure_evidence.model_matches(model) else None,
+            "reasoning_effort": effort if isinstance(effort, str) and effort in {"medium", "high"} else None,
+        }
     known_attempts = (
         attempts
         if isinstance(attempts, int)

@@ -2233,3 +2233,24 @@ def test_parent_completion_preserves_legacy_model_identity_in_new_timing(tmp_pat
     assert result["model"] == timing["model"] == "deepseek-v4-flash"
     assert result["reasoning_effort"] == timing["reasoning_effort"] == "high"
     assert "requested_service_tier" not in timing
+
+
+@pytest.mark.parametrize("change", [
+    {"model_provider": "oa_deepseek"}, {"requested_service_tier": "priority"},
+    {"model_provider": None}, {"requested_service_tier": None},
+    {"model": "deepseek-v4-flash", "reasoning_effort": "high"},
+])
+def test_parent_completion_rejects_provider_tier_or_mixed_historical_identity(tmp_path, change):
+    task, action_file = _task(tmp_path)
+    reviewed = codex_review_worker.review(task, executor=lambda *_: codex_review_worker.CodexExecution(
+        None, {"status": "unknown"}, decision={"kind": "preaudit_review_decision"},
+        event_counts={"turn.completed": 1}, event_status="recorded",
+    ))
+    reviewed.update(change)
+    stopped = []
+    result = codex_review_worker.complete_review_result(action_file, reviewed,
+        completer=lambda *_: pytest.fail("invalid identity must not enter completion"),
+        request_stop=lambda: stopped.append(True))
+    assert result["error_code"] == "codex_review_result_invalid"
+    assert result["write_state"] == "not_requested" and stopped == [True]
+    assert not action_file.with_name("agent-timing.json").exists()

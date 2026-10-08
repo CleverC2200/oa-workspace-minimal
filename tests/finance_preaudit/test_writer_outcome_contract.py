@@ -514,6 +514,8 @@ def test_mixed_batch_continues_after_verified_rejection(tmp_path: Path, monkeypa
         action = json.loads(Path(task["action_file"]).read_text())
         return {
             "status": "reviewed", "decision": _decision(action),
+            "model": "gpt-6.1-sol", "reasoning_effort": "medium",
+            "model_provider": "openai", "requested_service_tier": "default",
             "process_attempts": 1, "process_retries": 0, "agent_wall_seconds": 1,
             "token_usage": {"status": "unknown"},
             "codex_events": {"status": "unknown", "attempts": 1,

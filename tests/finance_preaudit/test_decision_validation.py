@@ -89,6 +89,8 @@ def test_parent_does_not_retry_diagnostic_failure(tmp_path: Path, monkeypatch) -
     result = codex_review_worker.complete_review_result(
         path,
         {"status": "reviewed", "decision": {}, "process_attempts": 1,
+         "model": "gpt-6.1-sol", "reasoning_effort": "medium",
+         "model_provider": "openai", "requested_service_tier": "default",
          "agent_wall_seconds": 1, "token_usage": {"status": "unknown"},
          "codex_events": {"status": "recorded", "attempts": 1,
                           "recorded_attempts": 1, "unknown_attempts": 0,
