@@ -25,7 +25,7 @@ Spec 审查核对业务规则、审核项职责及预期是否一致。金融规
 
 `history_refs` 引用原 `original-context.json`。核对其原工作流与已办行的 requestId 是否均与原 material 的 request_id 一致，并保留真实 workflowRequestLogs。不能仅贴一个“已办”标签。每个检查同时记录 `historical_checks`：`consistent`、`conflict` 或 `uninformative`，依据必须是 `original_material_and_rules`，说明历史记录与原事实如何对应。历史泛泛“同意”、空意见或旧 AI 预审不能单独成为真值；宿主只验证这些显式记录，不按文字关键词判业务正确。
 
-调用 `freeze_financial_expectations(checklist_reference, destination)` 独占创建私有冻结记录，使用实际宿主时间，绑定清单指纹。保留冲突及缺失状态；它们不能取得准入资格。冻结记录和预期不得进入受试模型工作目录。已有回放后才冻结的预期不能追认该次为事前合格试验。
+调用 `freeze_financial_expectations(checklist_reference, destination)` 独占创建私有冻结记录，使用实际宿主时间，绑定清单指纹。未解决冲突及缺失状态不能取得准入资格。已解释的历史范围差异只按下方新窗口合同单列处理，原冲突状态保留。冻结记录和预期不得进入受试模型工作目录。已有回放后才冻结的预期不能追认该次为事前合格试验。
 
 ## 回放后：原决定及实际消费输出核对
 
@@ -37,7 +37,19 @@ Spec 审查核对业务规则、审核项职责及预期是否一致。金融规
 
 ## 报告资格
 
-新生成的财务质量报告使用 `schema_version=2`。业务决定、预期冻结和人工评估仍使用原格式。每个 case 的 `expectations_timing` 单独说明冻结时间是否早于可信启动回执，`historical_crosscheck` 保留原历史核对状态。提前冻结且历史冲突时，前者为 `verified`，后者为 `conflict`，资格仍为 false。
+没有独立历史范围解释的新财务质量报告使用 `schema_version=2`。业务决定和人工评估仍使用原格式。每个 case 的 `expectations_timing` 单独说明冻结时间是否早于可信启动回执，`historical_crosscheck` 保留原历史核对状态。提前冻结且存在未解决历史冲突时，前者为 `verified`，后者为 `conflict`，资格仍为 false。
+
+### 新窗口的历史范围解释
+
+在用户明确授权后，未来新窗口可以单列认可有原证据支持的历史范围差异。独立人工记录使用 `schema_version=1`、`kind=preaudit_history_scope_resolution`、`method=independent_manual`、`reviewer_role=historical_crosscheck`、真实 `reviewer_record`、带时区 `reviewed_at` 和 `accepted_for=new_window_only`。它绑定当前用户决定的 `decision_ref`、新清单 `checklist_sha256` 及清单全部 `source_refs`、`rule_refs`、`history_refs`。
+
+记录的 `checks` 必须恰好覆盖所有原 `conflict` 检查。每项显式填写 `id`、`decision=explained_scope_difference`、具体 `historical_difference`、当前原资料与规则的 `original_basis` 和 `reason`。宿主验证绑定、覆盖和时序，不从文本关键词、历史金额或模型结论推断认可。历史审批范围不能代替当前支出事实或政策，不要求新增财务签字。
+
+调用 `freeze_financial_expectations(checklist_reference, destination, history_resolution=reference)` 在新的私有位置独占创建 schema 2 冻结记录。解释的核对时间不得晚于宿主实际冻结时间。记录绑定漂移、漏掉未解决冲突、身份不符或声称追认旧窗口时，冻结拒绝。冻结早于可信回放启动且配置指纹一致，才满足新窗口的预期资格。
+
+包含该解释的质量报告使用 `schema_version=3` 和 `qualification_semantics=original_history_or_explained_scope_difference_before_replay`。原 `historical_crosscheck=conflict` 和 `expectations_frozen_before_replay=false` 保留。每个 case 另列 `history_scope_resolution` 状态及解释记录指纹、`window_expectations_qualified`。未冲突检查显示 `not_required`，未解决冲突显示 `unresolved`，独立认可的范围差异显示 `explained_scope_difference`。
+
+schema 3 的 `eligible` 使用该明确的新窗口合同，`legacy_eligible` 另列旧合取条件的结果。完整审核范围、全部事实核对、真实来源、完整场景、原生成合同、实际消费、准确源码与配置及真正事前冻结等其余条件保留。合成结果、事后冻结或未解决冲突仍不合格。旧报告、清单、评分、时间和 eligible 原字节不改；新增解释不能追认旧调用为事前合格试验。
 
 | 时序状态 | reason | 含义 |
 | --- | --- | --- |
@@ -49,9 +61,9 @@ Spec 审查核对业务规则、审核项职责及预期是否一致。金融规
 | unknown | freeze_or_start_time_missing_or_invalid | 时间缺失或无效 |
 | unknown | timezone_missing | 冻结或启动时间没有时区 |
 
-文件指纹漂移仍直接拒绝评估，不生成时间通过结果。`expectations_frozen_before_replay` 保留旧的时间、历史及配置合取条件，报告以 `legacy_expectations_flag_semantics=time_history_and_configuration_conjunction` 明示该含义。配置漂移或历史冲突可使它为 false，即使独立时间状态通过。`eligible` 继续要求原完整场景、真实存档、完整核对、原生成合同、实际消费及全部原资格条件。
+文件指纹漂移仍直接拒绝评估，不生成时间通过结果。`expectations_frozen_before_replay` 保留旧的时间、历史及配置合取条件，报告以 `legacy_expectations_flag_semantics=time_history_and_configuration_conjunction` 明示该含义。配置漂移或历史冲突可使它为 false，即使独立时间状态通过。schema 1、2 的 eligible 继续使用原资格条件，schema 3 只将已解释且事前绑定的历史范围差异单列处理。
 
-`read_financial_quality_report(reference)` 只读取已绑定报告，不重算评分或资格。它接受 schema 1 和 2。schema 1 未独立记录时序证明，展示 `unknown` 与 `legacy_conjunction_no_separate_timing`，保留原合取标志及原 eligible。读取不会写回旧文件。
+`read_financial_quality_report(reference)` 只读取已绑定报告，不重算评分或资格。它接受 schema 1、2、3，并核对 schema 3 的新状态与时序声明是否矛盾。schema 1 未独立记录时序证明，展示 `unknown` 与 `legacy_conjunction_no_separate_timing`，保留原合取标志及原 eligible。读取不会写回旧文件，也不为 schema 1、2 导入新窗口资格。
 
 返回每条事实结论、历史交叉核对、事前冻结、实际消费、来源种类和事后核对状态。五类业务招待场景为普通支付、多支付/退款/确认超报、关系不明、合法共享支付、已确认异常与其他未知并存。全部准入结果须来自真实存档、事前完成无未解冲突的交叉核对、真实闭合且逐项正确；混入合成结果不能通过。合成记录只证明工程行为。
 
