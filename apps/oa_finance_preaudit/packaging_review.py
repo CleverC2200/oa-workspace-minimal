@@ -12,7 +12,7 @@ from uuid import uuid4
 from jsonschema import Draft202012Validator
 
 from apps.oa_approval import auth, runtime_control
-from . import codex_review_worker as worker, flow_engine, review_decision
+from . import codex_review_worker as worker, decision_validation, flow_engine, packaging_contract, review_decision
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -46,7 +46,7 @@ def draft_schema(packet: dict) -> dict:
             'pages': {**array(obj({
                 'page_ref': choice(refs),
                 'classification': choice(['packaging_layout', 'non_packaging', 'uncertain']),
-                'package_version_id': {'type': ['string', 'null']},
+                'package_version_id': dict(packaging_contract.PACKAGE_VERSION_ID_SCHEMA),
                 'item_keys': array(choice(keys)),
             })), 'minItems': len(refs)},
         }),
@@ -102,13 +102,20 @@ def parse_draft(raw: str, schema: dict) -> dict:
     return draft
 
 
+def _readonly_engine(project_root: Path) -> flow_engine.FlowEngine:
+    def unavailable(*_args, **_kwargs):
+        raise ValueError('read_only_port_unavailable')
+    return flow_engine.FlowEngine(
+        root=project_root / 'runtime' / 'finance_preaudit_flows',
+        discover_candidates=unavailable, collect_material=unavailable,
+    )
+
+
 def _open(action_file: Path, project_root: Path) -> tuple[dict, dict, dict]:
     root = project_root / 'runtime' / 'finance_preaudit_flows'
     if any(path.is_symlink() for path in (action_file, *action_file.parents)):
         raise ValueError('frozen_packet_changed')
-    def unavailable(*_args, **_kwargs):
-        raise ValueError('read_only_port_unavailable')
-    reader = flow_engine.FlowEngine(root=root, discover_candidates=unavailable, collect_material=unavailable)
+    reader = _readonly_engine(project_root)
     action, state, packet = reader._open_attempt(action_file)
     if (action['workflow_key'] != 'packaging_layout_approval'
             or action.get('action') != 'review_required'
@@ -174,9 +181,26 @@ def review(action_file: Path, *, project_root: Path = PROJECT_ROOT, timeout_seco
         if stderr.get('collection_failed'):
             error = 'codex_process_diagnostic_failed'
         decision_file = None
+        contract_validation = 'not_checked'
+        validation_code = None
         if not error:
             try:
                 decision = review_decision.bind_frozen_fields(action_file, execution.decision)
+            except (OSError, RuntimeError, ValueError):
+                error = 'packaging_review_assembly_failed'
+            else:
+                contract_validation = 'failed'
+                try:
+                    _readonly_engine(project_root).validate_review_decision(action_file, decision)
+                except (OSError, RuntimeError, ValueError) as invalid:
+                    error = 'packaging_review_contract_invalid'
+                    validation_code = (invalid.validation_code
+                                       if isinstance(invalid, decision_validation.InvalidDecision)
+                                       else 'unspecified')
+                else:
+                    contract_validation = 'passed'
+        if not error:
+            try:
                 target = directory / 'bound-decision.json'
                 runtime_control.write_control_bytes_atomic(target, (json.dumps(decision, ensure_ascii=False) + '\n').encode())
             except (OSError, RuntimeError, ValueError):
@@ -192,6 +216,9 @@ def review(action_file: Path, *, project_root: Path = PROJECT_ROOT, timeout_seco
             'tool_receipt_files': stderr.get('tool_receipt_files', []),
             'model': worker.MODEL, 'reasoning_effort': worker.REASONING_EFFORT,
             'model_provider': 'openai', 'requested_service_tier': 'default',
+            'contract_validation': contract_validation,
+            'decision_validation_code': validation_code,
+
             'semantic_acceptance': 'not_checked',
         }
         try:

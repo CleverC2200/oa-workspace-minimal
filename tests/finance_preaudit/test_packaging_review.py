@@ -92,6 +92,8 @@ def test_official_entry_retains_raw_receipts_and_binds_protocol_only(tmp_path, m
     result = reviewer.review(path, project_root=tmp_path, timeout_seconds=60)
     assert result['status'] == 'draft_ready' and result['write_state'] == 'not_requested'
     assert result['semantic_acceptance'] == 'not_checked'
+    assert result['contract_validation'] == 'passed'
+    assert result['decision_validation_code'] is None
     directory = Path(result['evidence_directory'])
     assert directory.joinpath('decision.json').read_text() == raw
     assert directory.joinpath('stderr.log').read_text() == 'original stderr\n'
@@ -199,3 +201,86 @@ def test_native_receipt_mismatch_fails_without_copying_other_chat(tmp_path, monk
     assert result['status'] == 'failed' and result['error_code'] == 'codex_tool_receipt_unavailable'
     assert result['tool_receipt_files'] == [] and result['decision_file'] is None
     assert not Path(result['evidence_directory']).joinpath('tool-receipts').exists()
+
+
+@pytest.mark.parametrize('version_id', ['包装-A', '', 'v' * 81, 'version-1\n'])
+def test_draft_schema_rejects_invalid_package_version_id(tmp_path, version_id):
+    path = action(tmp_path)
+    packet = json.loads(path.with_name('review-packet.json').read_text())
+    body = draft(packet)
+    body['visual_review']['pages'][0]['package_version_id'] = version_id
+    with pytest.raises(ValueError, match='packaging_review_schema_invalid'):
+        reviewer.parse_draft(json.dumps(body), reviewer.draft_schema(packet))
+
+
+def test_readonly_consumer_validation_preserves_bound_decision_and_attempt(tmp_path):
+    from copy import deepcopy
+    from apps.oa_finance_preaudit import decision_validation, flow_engine
+    from tests.finance_preaudit.test_flow_engine_packaging import _decision, _passing_items
+
+    root = tmp_path / 'runtime' / 'finance_preaudit_flows'
+    calls = []
+    current = _engine(root, calls=calls).next_action(WORKFLOW_KEY)
+    path = Path(current['action_file'])
+    bound = _decision(current, _passing_items())
+    original = deepcopy(bound)
+    before = {str(p.relative_to(root)): p.read_bytes() for p in root.rglob('*') if p.is_file()}
+
+    def unavailable(*_args, **_kwargs):
+        pytest.fail('readonly validation called an authorization or OA port')
+
+    reader = flow_engine.FlowEngine(
+        root=root, discover_candidates=unavailable, collect_material=unavailable,
+        authorization_source=unavailable, authorization_verifier=unavailable,
+        submit_frozen=unavailable,
+    )
+    reader.validate_review_decision(path, bound)
+    assert bound == original
+    assert calls == []
+    assert {str(p.relative_to(root)): p.read_bytes() for p in root.rglob('*') if p.is_file()} == before
+
+    bound['visual_review']['pages'].append(deepcopy(bound['visual_review']['pages'][0]))
+    invalid_original = deepcopy(bound)
+    with pytest.raises(decision_validation.InvalidDecision, match='review_decision_invalid'):
+        reader.validate_review_decision(path, bound)
+    assert bound == invalid_original
+    assert {str(p.relative_to(root)): p.read_bytes() for p in root.rglob('*') if p.is_file()} == before
+
+
+@pytest.mark.parametrize('invalid,validation_code', [
+    ('duplicate_page', 'packaging_visual_contract'),
+    ('item_order', 'item_values'),
+    ('overall', 'packaging_overall_mismatch'),
+    ('excel', 'unspecified'),
+    ('supplementary', 'packaging_supplementary_checks'),
+])
+def test_schema_valid_contract_failure_never_becomes_ready(tmp_path, monkeypatch, invalid, validation_code):
+    from copy import deepcopy
+    path = action(tmp_path)
+    packet = json.loads(path.with_name('review-packet.json').read_text())
+    body = draft(packet)
+    if invalid == 'duplicate_page':
+        body['visual_review']['pages'].append(deepcopy(body['visual_review']['pages'][0]))
+    elif invalid == 'item_order':
+        body['items'][0], body['items'][1] = body['items'][1], body['items'][0]
+    elif invalid == 'overall':
+        body['overall'] = 'needs_human'
+    elif invalid == 'excel':
+        body['excel_comparison']['status'] = 'not_provided'
+    else:
+        body['supplementary_checks'] = [{
+            'page_ref': body['visual_review']['pages'][0]['page_ref'],
+            'status': 'uncertain', 'conclusion': '测试补充异常',
+        }]
+    raw = json.dumps(body, ensure_ascii=False)
+    assert reviewer.parse_draft(raw, reviewer.draft_schema(packet)) == body
+    before = {str(p.relative_to(path.parent)): p.read_bytes() for p in path.parent.rglob('*') if p.is_file()}
+    fake_process(monkeypatch, raw, native_home=tmp_path / 'native-auth')
+    result = reviewer.review(path, project_root=tmp_path, timeout_seconds=60)
+    assert result['status'] == 'failed'
+    assert result['error_code'] == 'packaging_review_contract_invalid'
+    assert result['contract_validation'] == 'failed'
+    assert result['decision_validation_code'] == validation_code
+    assert result['decision_file'] is None
+    assert Path(result['evidence_directory']).joinpath('decision.json').read_text() == raw
+    assert {str(p.relative_to(path.parent)): p.read_bytes() for p in path.parent.rglob('*') if p.is_file()} == before
