@@ -957,7 +957,49 @@ def prepare_financial_checklist(checklist_reference: dict, destination: Path) ->
     return {"file": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
-def freeze_financial_expectations(checklist_reference: dict, destination: Path) -> dict:
+_HISTORY_SCOPE_SEMANTICS = "original_history_or_explained_scope_difference_before_replay"
+
+
+def _history_scope_resolution(reference: dict, checklist_reference: dict, checklist: dict,
+                              frozen_at: str) -> dict:
+    """Validate an explicit human scope explanation, never infer it from financial text."""
+    record = _read_bound_artifact(reference)
+    if (not isinstance(record, dict) or record.get("schema_version") != 1
+            or record.get("kind") != "preaudit_history_scope_resolution"
+            or record.get("method") != "independent_manual"
+            or record.get("reviewer_role") != "historical_crosscheck"
+            or not isinstance(record.get("reviewer_record"), str) or not record["reviewer_record"].strip()
+            or record.get("accepted_for") != "new_window_only"
+            or record.get("checklist_sha256") != checklist_reference["sha256"]):
+        raise ValueError("financial_history_resolution_invalid")
+    for field in ("source_refs", "rule_refs", "history_refs"):
+        if record.get(field) != checklist.get(field):
+            raise ValueError("financial_history_resolution_invalid")
+        for ref in record[field]:
+            _read_bound_artifact(ref, document=False)
+    _read_bound_artifact(record.get("decision_ref"))
+    conflicts = {check["id"] for check in checklist["historical_checks"]
+                 if check["outcome"] == "conflict"}
+    checks = record.get("checks")
+    if (not conflicts or not isinstance(checks, list) or len(checks) != len(conflicts)
+            or any(not isinstance(check, dict) for check in checks)
+            or {check.get("id") for check in checks} != conflicts
+            or any(check.get("decision") != "explained_scope_difference"
+                   or any(not isinstance(check.get(field), str) or not check[field].strip()
+                          for field in ("historical_difference", "original_basis", "reason"))
+                   for check in checks)):
+        raise ValueError("financial_history_resolution_invalid")
+    try:
+        reviewed, frozen = datetime.fromisoformat(record["reviewed_at"]), datetime.fromisoformat(frozen_at)
+        if reviewed.tzinfo is None or frozen.tzinfo is None or reviewed > frozen:
+            raise ValueError("financial_history_resolution_invalid")
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("financial_history_resolution_invalid") from None
+    return {"status": "explained_scope_difference", "record_sha256": reference["sha256"]}
+
+
+def freeze_financial_expectations(checklist_reference: dict, destination: Path, *,
+                                  history_resolution: dict | None = None) -> dict:
     """Freeze source-based historical crosschecks now; no caller-provided time/signature."""
     checklist = _read_bound_artifact(checklist_reference)
     for ref in checklist["source_refs"] + checklist["rule_refs"]:
@@ -968,6 +1010,10 @@ def freeze_financial_expectations(checklist_reference: dict, destination: Path) 
                "checklist_sha256": checklist_reference["sha256"],
                "historical_crosscheck": status, "frozen_at": datetime.now().astimezone().isoformat(),
                "flow_configs": _flow_config_pins()}
+    if history_resolution is not None:
+        _history_scope_resolution(history_resolution, checklist_reference, checklist, payload["frozen_at"])
+        payload.update(schema_version=2, qualification_semantics=_HISTORY_SCOPE_SEMANTICS,
+                       history_resolution=history_resolution)
     with path.open("x", encoding="utf-8") as stream:
         import os
         os.chmod(path, 0o600)
@@ -1140,6 +1186,18 @@ def build_financial_quality_report(reviews: object) -> dict:
         frozen_before = bool(freeze is not None and timing["status"] == "verified"
                              and freeze.get("historical_crosscheck") == historical == "complete"
                              and freeze.get("flow_configs") == _flow_config_pins())
+        resolution = {"status": "not_required" if historical == "complete" else "unresolved"}
+        has_resolution = bool(freeze is not None and freeze.get("history_resolution") is not None)
+        if has_resolution:
+            if (freeze.get("schema_version") != 2
+                    or freeze.get("qualification_semantics") != _HISTORY_SCOPE_SEMANTICS):
+                raise ValueError("financial_history_resolution_invalid")
+            resolution = _history_scope_resolution(freeze["history_resolution"], review["checklist"],
+                                                   checklist, freeze["frozen_at"])
+        window_qualified = bool(frozen_before or (
+            has_resolution and timing["status"] == "verified"
+            and freeze.get("historical_crosscheck") == historical == "conflict"
+            and freeze.get("flow_configs") == _flow_config_pins()))
         workflow, scenario = checklist["workflow_key"], checklist["scenario"]
         if workflow == "business_entertainment" and checklist["source_kind"] == "real_archive":
             covered.add(scenario)
@@ -1159,6 +1217,8 @@ def build_financial_quality_report(reviews: object) -> dict:
                       "historical_crosscheck": historical,
                       "expectations_timing": timing,
                       "expectations_frozen_before_replay": frozen_before,
+                      **({"history_scope_resolution": resolution,
+                          "window_expectations_qualified": window_qualified} if has_resolution else {}),
                       "result_audit_complete": result_audit_complete,
                       "binding_status": binding["status"],
                       "original_final_contract": binding.get("final_contract", "not_established"),
@@ -1174,19 +1234,30 @@ def build_financial_quality_report(reviews: object) -> dict:
                       "result_reviewed_by_finance": result_reviewed_by_finance})
     confirmed = bool(cases) and all(case["financial_confirmed_before_replay"] for case in cases)
     missing = sorted(_FINANCIAL_SCENARIOS - covered)
-    return {"schema_version": 2, "kind": "preaudit_financial_quality_report",
+    evidence_eligible = bool(cases) and not missing and all(
+        case["source_kind"] == "real_archive" and case["complete_review_scope"]
+        and case["binding_status"] == "verified_consumed_correspondence"
+        and case["original_final_contract"] == "verified_snapshot_schema"
+        and case["window_binding"] is not None
+        and case["verdict"] == "pass" and case["result_audit_complete"] for case in cases)
+    legacy_eligible = evidence_eligible and all(
+        case["historical_crosscheck"] == "complete" and case["expectations_frozen_before_replay"]
+        for case in cases)
+    version = 3 if any("history_scope_resolution" in case for case in cases) else 2
+    if version == 3:
+        for case in cases:
+            case.setdefault("history_scope_resolution", {
+                "status": "not_required" if case["historical_crosscheck"] == "complete" else "unresolved"})
+            case.setdefault("window_expectations_qualified", case["expectations_frozen_before_replay"])
+    return {"schema_version": version, "kind": "preaudit_financial_quality_report",
             "legacy_expectations_flag_semantics": "time_history_and_configuration_conjunction",
+            **({"qualification_semantics": _HISTORY_SCOPE_SEMANTICS,
+                "legacy_eligible": legacy_eligible} if version == 3 else {}),
             "cases": cases, "financial_confirmation": "confirmed" if confirmed else "pending",
             "missing_entertainment_scenarios": missing,
-            "eligible": bool(cases) and not missing and all(
-                case["source_kind"] == "real_archive"
-                and case["complete_review_scope"]
-                and case["binding_status"] == "verified_consumed_correspondence"
-                and case["original_final_contract"] == "verified_snapshot_schema"
-                and case["window_binding"] is not None
-                and case["verdict"] == "pass" and case["result_audit_complete"]
-                and case["historical_crosscheck"] == "complete"
-                and case["expectations_frozen_before_replay"] for case in cases)}
+            "eligible": evidence_eligible and all(
+                case.get("window_expectations_qualified", case["expectations_frozen_before_replay"])
+                for case in cases)}
 
 
 def read_financial_quality_report(reference: dict) -> dict:
@@ -1196,11 +1267,15 @@ def read_financial_quality_report(reference: dict) -> dict:
     if (not isinstance(report, dict)
             or report.get("kind") != "preaudit_financial_quality_report"
             or type(report.get("schema_version")) is not int
-            or report["schema_version"] not in {1, 2}
+            or report["schema_version"] not in {1, 2, 3}
             or type(report.get("eligible")) is not bool
             or not isinstance(report.get("cases"), list) or not report["cases"]
-            or (report["schema_version"] == 2
+            or (report["schema_version"] in {2, 3}
                 and report.get("legacy_expectations_flag_semantics") != semantics)):
+        raise ValueError("financial_quality_report_invalid")
+    if report["schema_version"] == 3 and (
+            report.get("qualification_semantics") != _HISTORY_SCOPE_SEMANTICS
+            or type(report.get("legacy_eligible")) is not bool):
         raise ValueError("financial_quality_report_invalid")
     cases = []
     keys = set()
@@ -1213,6 +1288,25 @@ def read_financial_quality_report(reference: dict) -> dict:
                 or type(case.get("expectations_frozen_before_replay")) is not bool):
             raise ValueError("financial_quality_report_invalid")
         keys.add(case["item_key"])
+        if report["schema_version"] == 3:
+            resolution = case.get("history_scope_resolution")
+            if (type(case.get("window_expectations_qualified")) is not bool
+                    or not isinstance(resolution, dict)
+                    or resolution.get("status") not in {"not_required", "unresolved", "explained_scope_difference"}
+                    or (resolution["status"] == "explained_scope_difference"
+                        and (case["historical_crosscheck"] != "conflict"
+                             or case["expectations_frozen_before_replay"] is not False
+                             or not isinstance(resolution.get("record_sha256"), str)
+                             or len(resolution["record_sha256"]) != 64
+                             or any(char not in "0123456789abcdef" for char in resolution["record_sha256"])))
+                    or (resolution["status"] == "not_required" and case["historical_crosscheck"] != "complete")
+                    or (resolution["status"] == "unresolved" and case["historical_crosscheck"] == "complete")
+                    or (case["window_expectations_qualified"]
+                        and (case.get("expectations_timing") != {"status": "verified", "reason": "frozen_before_replay"}
+                             or resolution["status"] == "unresolved"
+                             or (resolution["status"] == "not_required"
+                                 and case["expectations_frozen_before_replay"] is not True)))):
+                raise ValueError("financial_quality_report_invalid")
         timing = case.get("expectations_timing")
         if report["schema_version"] == 1:
             timing = {"status": "unknown", "reason": "legacy_conjunction_no_separate_timing"}
