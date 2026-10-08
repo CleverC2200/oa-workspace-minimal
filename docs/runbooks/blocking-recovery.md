@@ -88,3 +88,34 @@ Writer 被停止门拦在提交之前时，仅精确签名边界为 `writer_pref
 分别报告指定恢复项、实际提交回执与后查、人工接管、隔离、未领取、当前未决写入以及进程/Writer 回收。连续两轮相同技术故障须检查同一修复任务的进度，不重复发起失败处理。告警只使用已有授权渠道和稳定错误码，原细码落盘，unknown/started 不表示送达、不自动重发。
 
 发布同步及新进程门禁、未知写入和原证据留存见[隔离排障与恢复](../agents/quarantine-repair.md)。
+
+## 程序产生的无原因停止维护
+
+`stop_requested\n` 只说明停止标记没有原因码，不能据此判断是用户主动停止。若原定时任务因 `production_reconciliation_blocked` 写入该标记，先追查原冲突、等待原控制器终态并完成子进程回收。当前冲突消失只满足恢复检查，不证明原根因已修复。模型资格和已授权恢复范围由本轮维护负责人核实，历史 unknown 保留，不重放单据或伪造人工接管。
+
+新增维护入口 `apps.oa_finance_preaudit.manual_stop_recovery` 只写私有审计回执并精确清除绑定的普通停止标记。它不执行 OA 提交，不改 attempt、授权、冻结或控制器历史。带原因码的停止继续使用匹配的既有处置入口，其中 `writer_result_unknown` 使用原 `stop_recovery` 合同。
+
+引导维护可以从已审查、CI 通过且合并到远端 main 的干净候选运行。候选 `HEAD`、本地已核实的 `origin/main` 和明确指定的发布 SHA 必须相同。维护显式指定生产根，使用候选自身 Python 执行维护代码，并由生产已有 `.venv/bin/python`、生产 cwd 执行现行官方只读 status 子进程。不得用 PYTHONPATH 导入候选到生产 Python，不链接生产依赖或 runtime 到开发树，也不得绕过停止门先同步生产代码。
+
+维护证据包为当前用户所有的 0600 JSON，`schema_version=1`、`kind=preaudit_manual_stop_recovery_binding`。以下字段均必填：
+
+- `target_root`、`target_revision` 绑定唯一、干净、可核实的生产 main。
+- `stop` 包含原标记的 `device`、`inode`、`mtime_ns` 和原始字节 `sha256`。不能用维护时重新读取的标记身份替代原记录。
+- `manifest` 和 `original_manifest` 均包含绝对 `path`、原始字节 `sha256`，分别指向当前 rolling-controller-manifest 和原执行目录 controller-manifest。两份内容必须同轮终态且 children_reaped=true。
+- `original_conflict_status` 绑定原 blocked、存在 pending_handled_conflict 的完整状态文件；`original_status` 绑定原控制器终态后的完整收尾状态文件。两者均使用 `path`、`sha256`，不能用当前新快照替代。
+- `original_exit` 使用 `path`、`sha256` 绑定 `preaudit_original_controller_exit` 记录。该记录必须包含实际 `exit_code`、`process_session_id`、`run_id`、`terminal=true`、`children_reaped=true`，以及原会话 `source_file` 的 `path/sha256`、`source_line`、`source_call_id`。
+- `stop_source` 包含原停止调用的 `line`、`call_id`，引用同一原会话文件。维护核对原 `request_stop()` 调用、实际退出 0 的停止结果、无原因码和对应冲突文件；再核对原会话 cwd、任务 id，以及实际 write_stdin 进程退出与嵌套执行回执的轮次、实例、PID、修订和终态。`Script completed` 不作为进程退出证据。原会话只读源允许当前用户所有且组和其他用户不可写，私有维护证据仍须 0600。
+
+证据与原工具终态、文件 bytes/SHA 已核实后，按当前明确授权运行：
+
+```bash
+python -m apps.oa_finance_preaudit.manual_stop_recovery \
+  --target-root "$production_root" \
+  --evidence-file "$private_binding_file" \
+  --expected-candidate-revision "$reviewed_release_sha" \
+  --confirm-reconciled YES
+```
+
+维护持有生产非阻塞 controller 和 global Writer 租约，拒绝环境停止、路径覆盖、活动请求 Writer、不可信权限、原标记替换或原证据改变。锁内等待生产只读 status 实际退出 0，并核对完整文件回执。身份、认证、授权、冻结和 continuation 必须可信，当前未知写入或 pending/handled 冲突阻断；可信单项隔离可保留。通过后先 fsync 保存 0600 validated 回执，复查原证据与标记，再精确清除并保存 cleared 结果。
+
+结果必须同时读取 `status`、`stop_cleared`、`receipt_file` 和 `write_state`。`maintenance_completion_failed` 或 `audit_completion_failed` 表示维护结束有异常，清除可能已经发生；先核对回执和实际停止状态，不重复执行或声称仍未清除。恢复标记成功不代表生产审核验收成功。随后使用统一生产发布预检，同步通过后只有下一独立进程才加载新版本。
