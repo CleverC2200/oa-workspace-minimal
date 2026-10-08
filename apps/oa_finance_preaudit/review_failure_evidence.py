@@ -6,15 +6,15 @@ import os
 from pathlib import Path
 
 
-MODEL = "deepseek-v4-flash"
-REASONING_EFFORT = "high"
-# 历史冻结证据（审核失败回执、agent 时序、worker 结果）写入过 OpenAI 模型名。
-# 只放宽读取校验，不改变新证据写入的模型名，保证既有隔离项与历史 attempt 仍可对账。
+MODEL = "gpt-6.1-sol"
+REASONING_EFFORT = "medium"
+MODEL_PROVIDER = "openai"
+SERVICE_TIER = "default"
+# Frozen historical evidence keeps the model and effort used by that invocation.
 LEGACY_MODELS = frozenset({"gpt-5.6-terra"})
-# 同一供应商的其它可用模型：将来切换模型时不至于让既有冻结证据立即失效。
-# deepseek-v4-pro 无视觉能力，不能用于看图审核；仅为已写入的冻结证据保留可校验性。
-ALTERNATE_MODELS = frozenset({"deepseek-v4-pro"})
+ALTERNATE_MODELS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
 ACCEPTED_MODELS = frozenset({MODEL}) | ALTERNATE_MODELS | LEGACY_MODELS
+MODEL_EFFORTS = {MODEL: REASONING_EFFORT, **{model: "high" for model in LEGACY_MODELS | ALTERNATE_MODELS}}
 PROCESS_FAILURE_CODES = frozenset(
     {"codex_process_failed", "codex_process_incomplete", "codex_process_timeout"}
 )
@@ -22,6 +22,10 @@ PROCESS_FAILURE_CODES = frozenset(
 
 def model_matches(value: object) -> bool:
     return isinstance(value, str) and value in ACCEPTED_MODELS
+
+
+def model_effort_matches(model: object, effort: object) -> bool:
+    return model_matches(model) and effort == MODEL_EFFORTS[model]
 
 
 def valid_attempt_codes(codes: object) -> bool:
@@ -40,14 +44,17 @@ def receipt_payload(
     workflow_key: str,
     failure_code: str,
     attempt_error_codes: list[str],
+    model: str = MODEL,
+    reasoning_effort: str = REASONING_EFFORT,
 ) -> dict:
     return {
         "schema_version": 1,
         "kind": "preaudit_review_failure",
         "action_token": action_token,
         "workflow_key": workflow_key,
-        "model": MODEL,
-        "reasoning_effort": REASONING_EFFORT,
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+        **({"model_provider": MODEL_PROVIDER, "requested_service_tier": SERVICE_TIER} if model == MODEL else {}),
         "process_attempts": len(attempt_error_codes),
         "process_retries": len(attempt_error_codes) - 1,
         "failure_code": failure_code,
@@ -85,6 +92,13 @@ def receipt_matches(
         failure_code=actual_failure_code,
         attempt_error_codes=actual_attempt_codes,
     )
+    if not model_effort_matches(value.get("model"), value.get("reasoning_effort")):
+        return False
+    if value["model"] != MODEL:
+        expected.pop("model_provider")
+        expected.pop("requested_service_tier")
+    expected["model"] = value["model"]
+    expected["reasoning_effort"] = value["reasoning_effort"]
     if set(value) != set(expected):
         return False
     return all(
