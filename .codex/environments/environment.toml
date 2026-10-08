@@ -25,6 +25,11 @@ icon = "tool"
 command = ".venv/bin/python -B -m scripts.dev_environment verify --tests tests/finance_preaudit/test_dev_environment.py"
 
 [[actions]]
+name = "聚焦执行回执回归"
+icon = "tool"
+command = ".venv/bin/python -B -m scripts.dev_environment verify --tests tests/finance_preaudit/test_execution_readback.py"
+
+[[actions]]
 name = "完整离线验收"
 icon = "tool"
 command = ".venv/bin/python -B -m scripts.dev_environment verify --full"

@@ -20,6 +20,10 @@ python3 -B -m scripts.dev_environment preflight
 不开放依赖准备或验证。依赖准备及验证还要求 `codex/` 开发分支。目录角色是操作检查，不能代替业务权限门禁。
 
 预检检查 git、uv、RTK、`.venv` 的实际 Python 3.11、全部 `requirements-dev.txt` 固定版本、依赖目录和模块来源。
+简要输出直接显示实际 `module_origin` 和该项目 CodeGraph 新鲜度；环境缺失时来源保持 unknown。
+需要完整路径和修订供审核工具使用时执行 `python3 -B -m scripts.dev_environment --json preflight`，
+采用输出中的 `source.root`、`source.branch`、`source.head`、`environment.executable` 和 `environment.module_origin`。
+源码检索和审核工具须针对这个实际工作树，不能只凭文件名或另一个分支的行号定位。
 共享 uv 解释器/包缓存合法；虚拟环境链接、系统 site-packages、链接到外部的可写依赖或 runtime 不合法。
 模块来源检查不导入应用、不加载认证，不把相同文件名当同一源码。探针用 `-S` 禁用 site 初始化，
 也不传入业务环境变量。未知启动钩子须检查；uv 当前原生引导文件只按已核验字节和指纹识别，
@@ -36,11 +40,12 @@ python3 -B -m scripts.dev_environment prepare
 不更新版本或锁文件，不复制生产 runtime/venv；已有不安全或不兼容环境需先人工检查，不自动删除重建。
 缺 uv 或命令失败保留非零状态，不能声称准备成功。
 
-“静态检查”“聚焦环境回归”“完整离线验收”直接复用 `scripts.quality` 和 pytest：
+“静态检查”、“聚焦环境回归”、“聚焦执行回执回归”和“完整离线验收”直接复用 `scripts.quality` 和 pytest：
 
 ```bash
 .venv/bin/python -B -m scripts.dev_environment verify --check lint --check schema
 .venv/bin/python -B -m scripts.dev_environment verify --tests tests/finance_preaudit/test_dev_environment.py
+.venv/bin/python -B -m scripts.dev_environment verify --tests tests/finance_preaudit/test_execution_readback.py
 .venv/bin/python -B -m scripts.dev_environment verify --full
 ```
 
@@ -59,6 +64,13 @@ python3 -B -m scripts.dev_environment prepare
 
 CodeGraph 记录明确项目、分支、HEAD，索引新鲜度固定为未核验；预检不创建或更新图谱。
 跨文件查询前用图谱工具核对该项目和修订；缺索引或无法核验时使用源码检索，不能借用其他分支的图谱证明发布源码。
+
+读取审核参考时先通过[财务预审 Skill](../../.agents/skills/oa-finance-preaudit/SKILL.md)确认审核包 `workflow_key`，
+再从[结果接口与流程路由](../../.agents/skills/oa-finance-preaudit/references/result-contract.md)只加载匹配流程规则，
+完整读取[证据阅读规则](../../.agents/skills/oa-finance-preaudit/references/observation-contract.md)。
+包装流程同时加载[中文图片文字校对](../../.agents/skills/audit-chinese-image-text/SKILL.md)。
+实际单据的 next-action、complete-review 和 OA 写入仍需独立授权，预检和离线测试不调用它们。
+原执行的只读进度及终态命令见[控制器执行回执](controller-execution.md#只读进度等待与终态取回)。
 
 `python -m scripts.quality environment` 在现有质量 CI 中校验配置；环境命令行为回归随现有全树测试执行。
 配置/命令测试通过不代表原生桌面按钮已现场验收，更不代表真实业务或生产恢复。
