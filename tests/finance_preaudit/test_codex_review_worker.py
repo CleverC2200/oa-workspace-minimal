@@ -786,6 +786,7 @@ def test_codex_command_pins_openai_medium_standard_and_json_output(tmp_path: Pat
     assert permissions["extends"] == ":read-only"
     assert permissions["filesystem"][str(tmp_path)] == "read"
     assert "deny" in permissions["filesystem"].values()
+    assert "write" not in permissions["filesystem"].values()
     assert 'default_permissions="oa-reviewer"' in command
     assert 'history.persistence="none"' in command
     assert 'approval_policy="never"' in command

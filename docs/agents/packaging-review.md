@@ -6,6 +6,8 @@
 
 审核进程默认通过原生 OpenAI 认证使用 `gpt-6.1-sol / medium`，命令显式请求 `service_tier="default"`，不开 Fast/priority。`--ignore-user-config` 不加载全局用户配置，记忆注入、记忆生成和全局 history 保存关闭；不修改用户配置或自动化。认证保留在原 `CODEX_HOME` 的凭据存储，审核工具沿只读权限配置拒绝读取该目录，凭据不复制进运行目录，也不作为命令参数或证据输出。
 
+每次包装调用由 Worker 在自身独占证据目录创建 `visual-aux/`，权限为 0700，并在进程结束前复核目录身份、归属和私有权限。仅该子目录允许模型创建当前冻结原图的无损辅助裁图，其他目录、原图、action/state、冻结资料、源码和其他审计文件继续只读。模型使用 PIL 等工具保存 PNG 裁图，再用既有 `view_image` 读取文件路径；禁止 OCR 及 Shell Base64 分块传图。裁图沿用原版本和 `page_ref`，仅辅助读取，不成为新业务原始证据。调用者不传任意可写路径；普通 Worker 和无审计调用保持原权限。
+
 默认 900 秒，只可在 60～3600 秒内调整；超时和取消由原进程组回收处理。本次 stdout、stderr、原决定和 Schema 保存在独占的 `runtime/control/packaging-reviews/<id>/`。原生会话保留开启，状态数据库和日志目录隔离到该证据目录。宿主只用本次 `thread.started` 的 UUID 查询本次数据库，验证原生会话的 ID 和项目路径，再复制这一份工具记录到 `tool-receipts/`；不扫描或读取其他聊天。宿主固定父目录，以不跟随链接、非阻塞方式打开，只接受普通文件；元数据首行上限 1 MiB，完整记录上限 32 MiB，并核对打开前后的文件身份、大小和时间戳。缺失、FIFO、损坏、超限、读取中被替换或不能关联当前调用的记录统一返回 `codex_tool_receipt_unavailable`，不进入 `draft_ready`；原输出仍保留，不把空工具记录当成图片阅读证据。
 
 新回执记录模型、effort、供应商和 `requested_service_tier`。该档位字段是命令请求设置，不表示已经获得供应商实际服务档位遥测。历史 DeepSeek 和旧 OpenAI 证据保持原模型与 `high`，新模型只接受 `medium`；模型与 effort 不匹配时拒绝。

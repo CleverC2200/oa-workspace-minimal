@@ -39,7 +39,7 @@ def test_real_child_timeout_records_stage_and_reaps(tmp_path: Path, monkeypatch)
     monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
     path = _action(tmp_path)
     monkeypatch.setattr(worker, "_decision_schema", lambda _, **_kwargs: {})
-    monkeypatch.setattr(worker, "_codex_command", lambda *_: [sys.executable, "-c",
+    monkeypatch.setattr(worker, "_codex_command", lambda *_, visual_aux=None: [sys.executable, "-c",
         'import sys,time; print(\'{"type":"turn.started"}\',flush=True); '
         'print("private retry connection",file=sys.stderr,flush=True); time.sleep(30)'])
     result = worker._execute_codex(tmp_path, path, 0.2, prompt_builder=lambda _: "synthetic")
@@ -84,7 +84,7 @@ def test_stdout_disconnect_survives_timeout_without_raw_error(tmp_path, monkeypa
     monkeypatch.setattr(worker, "_decision_schema", lambda _, **_kwargs: {})
     event = {"type": "error", "message": "Reconnecting... 2/5 (stream disconnected before completion: websocket closed by server before response.completed) private-secret"}
     script = f"import time; print({json.dumps(event)!r}, flush=True); time.sleep(30)"
-    monkeypatch.setattr(worker, "_codex_command", lambda *_: [sys.executable, "-c", script])
+    monkeypatch.setattr(worker, "_codex_command", lambda *_, visual_aux=None: [sys.executable, "-c", script])
     result = worker._execute_codex(tmp_path, path, 0.2, prompt_builder=lambda _: "synthetic")
     assert result.error_code == "codex_process_timeout"
     text = next(tmp_path.glob("review-process-*.json")).read_text()

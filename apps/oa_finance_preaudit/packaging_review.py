@@ -170,7 +170,7 @@ def review(action_file: Path, *, project_root: Path = PROJECT_ROOT, timeout_seco
             execution = worker._execute_codex_raw(
                 project_root, action_file, timeout_seconds, read_only=True, stderr_summary=stderr,
                 prompt_builder=lambda _: prompt, schema_builder=lambda _: schema,
-                decision_parser=lambda raw: parse_draft(raw, schema), audit_directory=directory,
+                decision_parser=lambda raw: parse_draft(raw, schema), audit_directory=directory, allow_visual_aux=True,
             )
         except (OSError, RuntimeError, ValueError):
             execution = worker.CodexExecution('packaging_review_execution_failed', worker._unknown_usage())

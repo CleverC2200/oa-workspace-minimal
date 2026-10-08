@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 import json
 import math
 import os
@@ -498,10 +498,13 @@ def _codex_command(
     project_root: Path,
     schema_file: Path,
     decision_file: Path,
+    *, visual_aux: Path | None = None,
 ) -> list[str]:
     native_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
     readable = (project_root, native_home / "skills", native_home / "RTK.md", native_home / "BUILD_EFFICIENCY.md")
     filesystem = {str(native_home): "deny", **{str(path): "read" for path in readable}}
+    if visual_aux is not None:
+        filesystem[str(visual_aux)] = "write"
     permissions = 'permissions.oa-reviewer={extends=":read-only",filesystem={' + ",".join(
         json.dumps(path) + "=" + json.dumps(access) for path, access in filesystem.items()
     ) + '}}'
@@ -923,6 +926,28 @@ def _execute_codex(
     return execution
 
 
+@contextmanager
+def _visual_aux_directory(directory: Path):
+    """Create and pin the only writable directory for a readonly packaging review."""
+    with runtime_control.pinned_directory(directory) as parent:
+        metadata = os.fstat(parent)
+        if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
+            raise ValueError('codex_visual_aux_untrusted')
+        os.mkdir('visual-aux', mode=0o700, dir_fd=parent)
+        path = directory / 'visual-aux'
+        with runtime_control.pinned_directory(path) as descriptor:
+            def private():
+                return all(
+                    metadata.st_uid == os.getuid() and stat.S_IMODE(metadata.st_mode) == 0o700
+                    for metadata in (os.fstat(parent), os.fstat(descriptor))
+                )
+            if not private():
+                raise ValueError('codex_visual_aux_untrusted')
+            yield path
+            if not private():
+                raise ValueError('codex_visual_aux_untrusted')
+
+
 def _execute_codex_raw(
     project_root: Path,
     action_file: Path,
@@ -934,8 +959,13 @@ def _execute_codex_raw(
     schema_builder: Callable[[Path], dict] | None = None,
     decision_parser: Callable[[str], object] = _parse_decision_json,
     audit_directory: Path | None = None,
+    allow_visual_aux: bool = False,
 ) -> CodexExecution:
     try:
+        if type(allow_visual_aux) is not bool or (allow_visual_aux and (
+                not read_only or audit_directory is None
+                or json.loads(action_file.read_text()).get('workflow_key') != 'packaging_layout_approval')):
+            raise ValueError('codex_review_task_invalid')
         schema = schema_builder(action_file) if schema_builder else _decision_schema(action_file, read_only=read_only)
         prompt = prompt_builder(action_file)
     except ValueError:
@@ -947,8 +977,15 @@ def _execute_codex_raw(
     output = ((audit_directory / "events.jsonl").open("x+", encoding="utf-8")
               if audit_directory else tempfile.TemporaryFile(mode="w+", encoding="utf-8"))
     workspace = nullcontext(str(audit_directory)) if audit_directory else tempfile.TemporaryDirectory(prefix="oa-preaudit-codex-")
-    with workspace as temporary:
+    with workspace as temporary, ExitStack() as visual_leases:
         temporary_root = Path(temporary)
+        visual_aux = None
+        if allow_visual_aux:
+            visual_aux = visual_leases.enter_context(_visual_aux_directory(temporary_root))
+            prompt += f"""
+本轮唯一可写辅助裁图目录：{visual_aux}
+仅允许在此目录创建当前冻结原图的无损辅助裁图；目录外的项目、原图、冻结资料、其他审计文件和配置均不得修改。使用 PIL 等工具把必要的裁图保存为 PNG，再用既有 view_image 读取该文件路径。保留原图归属、版本和原页引用；裁图只辅助看图，不替代原页覆盖。禁止 OCR；禁止通过 Shell 输出 Base64 或分块拼接 Base64 传图，不用 base64 文本充当图片阅读。无法从原图或必要裁图可靠读取时明确失败或不确定，不猜测。
+"""
         try:
             reviewer_environment = _reviewer_environment()
         except (OSError, ValueError) as error:
@@ -963,7 +1000,7 @@ def _execute_codex_raw(
         json_artifact.write_json_atomic(
             schema_file, schema,
         )
-        command = _codex_command(project_root, schema_file, decision_file)
+        command = _codex_command(project_root, schema_file, decision_file, visual_aux=visual_aux)
         if audit_directory:
             # Authentication stays native; the isolated DB indexes this review only.
             command.remove("--ephemeral")
