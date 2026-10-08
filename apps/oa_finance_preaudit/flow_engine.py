@@ -1685,7 +1685,7 @@ class FlowEngine:
         timing = _read_object(timing_path, code="agent_timing_invalid")
         if (
             set(timing)
-            != {
+            != ({"model_provider", "requested_service_tier"} if timing.get("model") == review_failure_evidence.MODEL else set()) | {
                 "schema_version",
                 "kind",
                 "action_token",
@@ -1700,8 +1700,11 @@ class FlowEngine:
             or timing.get("kind") != "preaudit_agent_timing"
             or timing.get("action_token") != action.get("action_token")
             or timing.get("workflow_key") != action.get("workflow_key")
-            or not review_failure_evidence.model_matches(timing.get("model"))
-            or timing.get("reasoning_effort") != "high"
+            or not review_failure_evidence.model_effort_matches(timing.get("model"), timing.get("reasoning_effort"))
+            or (timing.get("model") == review_failure_evidence.MODEL and (
+                timing.get("model_provider") != review_failure_evidence.MODEL_PROVIDER
+                or timing.get("requested_service_tier") != review_failure_evidence.SERVICE_TIER
+            ))
             or not isinstance(timing.get("wall_seconds"), int)
             or isinstance(timing.get("wall_seconds"), bool)
             or timing["wall_seconds"] < 0

@@ -129,7 +129,7 @@ def _prompt(action_file: Path, packet: dict, material: dict) -> str:
             page_paths[f'material:prepared.images.{resource_id}.page-{number}'] = image['path']
     if list(page_paths) != packet['packaging_visual_contract']['page_refs']:
         raise ValueError('packaging_page_coverage')
-    return f'''你是本单独立 DeepSeek 包装文字审核者，只读审核 {action_file} 的冻结资料。
+    return f'''你是本单独立包装文字审核者，只读审核 {action_file} 的冻结资料。
 读取其 review_packet_file 和 material_file，读取 .agents/skills/oa-finance-preaudit/SKILL.md、references/observation-contract.md、references/result-contract.md、references/flows/packaging-layout-approval.md 和 references/flow-engine-contract.md 的包装 V2 合同；执行 .agents/skills/audit-chinese-image-text/SKILL.md 的适用闸门及复核。历史问题集不作为当前单据预期答案。
 完整逐页用 view_image 看以下原图，禁止 OCR。文件名、格式、顺序不能决定包装分类；无法真实查看必须明确失败，不能改判非包装。执行必要的低置信复核；只校对文字，不做法规审核或证号真伪判断。
 {json.dumps(page_paths, ensure_ascii=False)}
@@ -169,6 +169,8 @@ def review(action_file: Path, *, project_root: Path = PROJECT_ROOT, timeout_seco
             error = 'frozen_packet_changed'
         if not error and execution.decision is None:
             error = 'codex_decision_invalid'
+        if not error and stderr.get('tool_receipt_unavailable'):
+            error = 'codex_tool_receipt_unavailable'
         if stderr.get('collection_failed'):
             error = 'codex_process_diagnostic_failed'
         decision_file = None
@@ -187,7 +189,9 @@ def review(action_file: Path, *, project_root: Path = PROJECT_ROOT, timeout_seco
             'write_state': 'not_requested', 'business_fields_changed': False,
             'action_file': str(action_file), 'decision_file': str(decision_file) if decision_file else None,
             'evidence_directory': str(directory),
-            'tool_receipt_files': [str(path.relative_to(directory)) for path in sorted(directory.glob('codex-home/sessions/**/*.jsonl'))],
+            'tool_receipt_files': stderr.get('tool_receipt_files', []),
+            'model': worker.MODEL, 'reasoning_effort': worker.REASONING_EFFORT,
+            'model_provider': 'openai', 'requested_service_tier': 'default',
             'semantic_acceptance': 'not_checked',
         }
         try:

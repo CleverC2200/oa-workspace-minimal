@@ -4,7 +4,11 @@
 
 已有同轮 `action=review_required` 的冻结包装 V2 材料时，调用 `python -m apps.oa_finance_preaudit.packaging_review --action-file <绝对 action.json 路径>`。缺材料的恢复/领取仍使用原受控入口和独立授权。本入口不领取、恢复、提交或告警，不修改冻结 attempt；开发测试使用脱敏离线材料。
 
-审核进程沿用独立 `OA_REVIEW_API_KEY`、DeepSeek 模型及 read-only sandbox，隔离 OpenAI/Codex 宿主凭据。默认 900 秒、只可在 60～3600 秒内调整；超时和取消由原进程组回收实现处理。此次审核的空 `CODEX_HOME` 与 stdout、stderr、原决定、Schema 保存在独占的 `runtime/control/packaging-reviews/<id>/`。此入口保留原生会话记录，所以不使用会丢弃原生工具记录的 ephemeral 选项；独立 home 不读取其他聊天。
+审核进程默认通过原生 OpenAI 认证使用 `gpt-6.1-sol / medium`，命令显式请求 `service_tier="default"`，不开 Fast/priority。`--ignore-user-config` 不加载全局用户配置，记忆注入、记忆生成和全局 history 保存关闭；不修改用户配置或自动化。认证保留在原 `CODEX_HOME` 的凭据存储，审核工具沿只读权限配置拒绝读取该目录，凭据不复制进运行目录，也不作为命令参数或证据输出。
+
+默认 900 秒，只可在 60～3600 秒内调整；超时和取消由原进程组回收处理。本次 stdout、stderr、原决定和 Schema 保存在独占的 `runtime/control/packaging-reviews/<id>/`。原生会话保留开启，状态数据库和日志目录隔离到该证据目录。宿主只用本次 `thread.started` 的 UUID 查询本次数据库，验证原生会话的 ID 和项目路径，再复制这一份工具记录到 `tool-receipts/`；不扫描或读取其他聊天。原生记录不能关联当前调用时失败，不把空工具记录当成图片阅读证据。
+
+新回执记录模型、effort、供应商和 `requested_service_tier`。该档位字段是命令请求设置，不表示已经获得供应商实际服务档位遥测。历史 DeepSeek 和旧 OpenAI 证据保持原模型与 `high`，新模型只接受 `medium`；模型与 effort 不匹配时拒绝。
 
 宿主只生成引用/类型合同，不做图片分类或业务判断。Schema 覆盖包装页、非包装页、不确定页、多版本及有无 Excel；空属性对象在调用前拒绝。结果只接受一个纯 JSON 或唯一 `json` 围栏，拆封只改格式，不更改字段。非 JSON、多围栏和不匹配 Schema 保留原输出并失败。宿主仅通过现有 `review_decision.bind_frozen_fields` 补齐协议绑定字段，并在前后核对冻结资料。
 

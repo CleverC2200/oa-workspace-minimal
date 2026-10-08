@@ -42,30 +42,41 @@ def test_schema_and_unique_fence_preserve_business_fields(tmp_path, excel):
         reviewer.check_provider_schema({'type': 'array', 'items': {'type': 'object', 'properties': {}}})
 
 
-def fake_process(monkeypatch, body, *, after=None):
+def fake_process(monkeypatch, body, *, native_home, after=None):
     monkeypatch.setenv('OA_REVIEW_API_KEY', 'unit-test-key')
     monkeypatch.setenv('OPENAI_API_KEY', 'host-key-not-for-review')
     monkeypatch.setenv('CODEX_API_KEY', 'host-key-not-for-review')
+    native_home.mkdir()
+    monkeypatch.setenv('CODEX_HOME', str(native_home))
+    kwargs_cwd = None
     class Process:
         pid = 12345
         returncode = 0
         stderr = io.StringIO('original stderr\n')
         def __init__(self, command, **kwargs):
+            nonlocal kwargs_cwd
+            kwargs_cwd = kwargs['cwd']
             assert '--ephemeral' not in command
-            assert kwargs['env'].get('OA_REVIEW_API_KEY') == 'unit-test-key'
+            assert 'OA_REVIEW_API_KEY' not in kwargs['env']
             assert 'OPENAI_API_KEY' not in kwargs['env'] and 'CODEX_API_KEY' not in kwargs['env']
             assert not list(Path(kwargs['env']['CODEX_HOME']).iterdir())
             self.target = Path(command[command.index('--output-last-message')+1])
             self.stdout = kwargs['stdout']
             self.home = Path(kwargs['env']['CODEX_HOME'])
+            self.store = Path(next(value.split('=', 1)[1].strip(chr(34)) for value in command if value.startswith('sqlite_home=')))
         def communicate(self, *, input, timeout):
             assert 'view_image' in input and timeout == 60
-            self.stdout.write('{"type":"turn.completed"}\n')
+            self.stdout.write('{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000001"}\n{"type":"turn.completed"}\n')
             self.stdout.flush()
             self.target.write_text(body)
-            native = self.home / 'sessions' / 'test.jsonl'
+            native = self.home / 'sessions' / 'own.jsonl'
             native.parent.mkdir()
-            native.write_text('{"type":"response_item","payload":{"type":"function_call","name":"view_image"}}\n')
+            native.write_text(json.dumps({'type': 'session_meta', 'payload': {'id': '00000000-0000-0000-0000-000000000001', 'cwd': str(kwargs_cwd)}}) + '\n' + '{"type":"response_item","payload":{"type":"function_call","name":"view_image"}}\n')
+            import sqlite3
+            self.store.mkdir()
+            with sqlite3.connect(self.store / 'state_5.sqlite') as database:
+                database.execute('CREATE TABLE threads (id TEXT, cwd TEXT, rollout_path TEXT)')
+                database.execute('INSERT INTO threads VALUES (?, ?, ?)', ('00000000-0000-0000-0000-000000000001', str(kwargs_cwd), str(native)))
             if after: after()
         def poll(self): return self.returncode
     monkeypatch.setattr(reviewer.worker.subprocess, 'Popen', Process)
@@ -77,14 +88,14 @@ def test_official_entry_retains_raw_receipts_and_binds_protocol_only(tmp_path, m
     packet = json.loads(path.with_name('review-packet.json').read_text())
     body = draft(packet)
     raw = '说明\n```json\n' + json.dumps(body, ensure_ascii=False) + '\n```'
-    fake_process(monkeypatch, raw)
+    fake_process(monkeypatch, raw, native_home=tmp_path / 'native-auth')
     result = reviewer.review(path, project_root=tmp_path, timeout_seconds=60)
     assert result['status'] == 'draft_ready' and result['write_state'] == 'not_requested'
     assert result['semantic_acceptance'] == 'not_checked'
     directory = Path(result['evidence_directory'])
     assert directory.joinpath('decision.json').read_text() == raw
     assert directory.joinpath('stderr.log').read_text() == 'original stderr\n'
-    assert result['tool_receipt_files'] == ['codex-home/sessions/test.jsonl']
+    assert result['tool_receipt_files'] == ['tool-receipts/00000000-0000-0000-0000-000000000001.jsonl']
     bound = json.loads(Path(result['decision_file']).read_text())
     assert {key: bound[key] for key in body} == body
     assert {p.name: p.read_bytes() for p in path.parent.glob('*.json')} == before
@@ -95,7 +106,7 @@ def test_failure_keeps_original_output_without_mutating_attempt(tmp_path, monkey
     path = action(tmp_path)
     packet = json.loads(path.with_name('review-packet.json').read_text())
     raw = 'not json' if failure == 'malformed' else json.dumps(draft(packet))
-    fake_process(monkeypatch, raw, after=(lambda: path.with_name('material.json').write_text('{}'))
+    fake_process(monkeypatch, raw, native_home=tmp_path / 'native-auth', after=(lambda: path.with_name('material.json').write_text('{}'))
                  if failure == 'frozen_changed' else None)
     result = reviewer.review(path, project_root=tmp_path, timeout_seconds=60)
     assert result['status'] == 'failed' and result['decision_file'] is None
@@ -138,14 +149,16 @@ def test_draft_shapes_reach_existing_completion_consumer(tmp_path, classificatio
     assert result['business_state'] == ('needs_human' if classification == 'uncertain' else 'pass')
 
 
-def test_missing_key_diagnostic_is_returned_without_host_auth(tmp_path, monkeypatch):
+def test_packaging_receipt_records_current_model_without_deepseek_key(tmp_path, monkeypatch):
     path = action(tmp_path)
+    packet = json.loads(path.with_name('review-packet.json').read_text())
+    fake_process(monkeypatch, json.dumps(draft(packet)), native_home=tmp_path / 'native-auth')
     monkeypatch.delenv('OA_REVIEW_API_KEY', raising=False)
-    monkeypatch.setenv('OPENAI_API_KEY', 'host-only')
     result = reviewer.review(path, project_root=tmp_path, timeout_seconds=60)
-    assert result['error_code'] == 'oa_review_api_key_missing'
-    assert result['process_state'] == 'start_failed'
-    assert Path(result['evidence_directory']).joinpath('review-receipt.json').is_file()
+    assert result['status'] == 'draft_ready'
+    assert result['model'] == 'gpt-6.1-sol' and result['reasoning_effort'] == 'medium'
+    assert result['model_provider'] == 'openai' and result['requested_service_tier'] == 'default'
+    assert not Path(result['evidence_directory']).joinpath('auth.json').exists()
 
 
 def test_audit_timeout_retains_events_and_reaps_real_child(tmp_path, monkeypatch):
@@ -166,10 +179,23 @@ def test_audit_timeout_retains_events_and_reaps_real_child(tmp_path, monkeypatch
 def test_binding_failure_still_returns_completed_process_receipt(tmp_path, monkeypatch):
     path = action(tmp_path)
     packet = json.loads(path.with_name('review-packet.json').read_text())
-    fake_process(monkeypatch, json.dumps(draft(packet)))
+    fake_process(monkeypatch, json.dumps(draft(packet)), native_home=tmp_path / 'native-auth')
     def fail(*_args): raise ValueError('frozen_packet_changed')
     monkeypatch.setattr(reviewer.review_decision, 'bind_frozen_fields', fail)
     result = reviewer.review(path, project_root=tmp_path, timeout_seconds=60)
     assert result['error_code'] == 'packaging_review_assembly_failed'
     assert result['exit_code'] == 0 and result['decision_file'] is None
     assert Path(result['evidence_directory']).joinpath('review-receipt.json').is_file()
+
+
+@pytest.mark.parametrize("native_content", ["", '{"type":"session_meta","payload":{"id":"foreign","cwd":"foreign"}}\nprivate other chat body'])
+def test_native_receipt_mismatch_fails_without_copying_other_chat(tmp_path, monkeypatch, native_content):
+    path = action(tmp_path)
+    packet = json.loads(path.with_name('review-packet.json').read_text())
+    native_home = tmp_path / 'native-auth'
+    fake_process(monkeypatch, json.dumps(draft(packet)), native_home=native_home,
+                 after=lambda: native_home.joinpath('sessions/own.jsonl').write_text(native_content))
+    result = reviewer.review(path, project_root=tmp_path, timeout_seconds=60)
+    assert result['status'] == 'failed' and result['error_code'] == 'codex_tool_receipt_unavailable'
+    assert result['tool_receipt_files'] == [] and result['decision_file'] is None
+    assert not Path(result['evidence_directory']).joinpath('tool-receipts').exists()
