@@ -19,6 +19,7 @@ def draft(packet):
         {'item_key': item['item_key'], 'status': 'pass', 'conclusion': '测试结论',
          'evidence_refs': [], 'missing_evidence': []} for item in packet['items']],
         'excel_comparison': {'status': 'not_applicable', 'resource_id': None, 'mappings': []},
+        'supplementary_checks': [],
         'visual_review': {'outcome': 'all_non_packaging', 'pages': [
             {'page_ref': ref, 'classification': 'non_packaging', 'package_version_id': None, 'item_keys': []}
             for ref in packet['packaging_visual_contract']['page_refs']]}}
@@ -126,6 +127,7 @@ def test_draft_shapes_reach_existing_completion_consumer(tmp_path, classificatio
                   'classification':'uncertain','package_version_id':None,'item_keys':[]}]}
     original = _decision(current, items, excel=excel, visual_review=visual)
     body = {key:original[key] for key in ['overall', 'items', 'excel_comparison', 'visual_review']}
+    body['supplementary_checks'] = []
     parsed = reviewer.parse_draft(json.dumps(body), reviewer.draft_schema(packet))
     bound = reviewer.review_decision.bind_frozen_fields(path, parsed)
     target = tmp_path / 'consumer-decision.json'

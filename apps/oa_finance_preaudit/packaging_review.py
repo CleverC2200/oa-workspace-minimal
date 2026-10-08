@@ -50,6 +50,9 @@ def draft_schema(packet: dict) -> dict:
                 'item_keys': array(choice(keys)),
             })), 'minItems': len(refs)},
         }),
+        'supplementary_checks': array(obj({
+            'page_ref': choice(refs), 'status': choice(['fail', 'uncertain']), 'conclusion': text,
+        })),
     })
     Draft202012Validator.check_schema(schema)
     check_provider_schema(schema)
@@ -131,6 +134,7 @@ def _prompt(action_file: Path, packet: dict, material: dict) -> str:
 完整逐页用 view_image 看以下原图，禁止 OCR。文件名、格式、顺序不能决定包装分类；无法真实查看必须明确失败，不能改判非包装。执行必要的低置信复核；只校对文字，不做法规审核或证号真伪判断。
 {json.dumps(page_paths, ensure_ascii=False)}
 按像素逐页分类 packaging_layout/non_packaging/uncertain；多版本独立覆盖四项，保留原页顺序和原协议引用。非包装和不确定页的版本为null、item_keys=[]；不确定页进入至少一项uncertain的missing_evidence。全部非包装才all_non_packaging，内部四项pass且证据为空、Excel not_applicable；无Excel时not_provided；有Excel按可信关联逐字对照。四项顺序遵守冻结packet。
+对规则要求纳入的储存条件、食用方法、警示语关键文字完成校对。四项之外的实际异常逐位置写入supplementary_checks，每条包含原页page_ref、fail或uncertain和单行conclusion，结论保留版本或区域定位；没有异常时为[]。不硬塞进固定四项，不复制正常宣传文案。非包装页不得生成补充项；分类uncertain的页面只允许uncertain补充项。任一补充项使overall=needs_human，但不修改独立四项状态。
 只输出schema规定的JSON业务草稿，宿主只装配冻结协议字段。业务判断只由你形成。只使用本次供应商配置；不调用OA、不领取、不恢复、不提交，不运行next-action/complete-review/告警，不修改冻结资料或项目文件。'''
 
 
