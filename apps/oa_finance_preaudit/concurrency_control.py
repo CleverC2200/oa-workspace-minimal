@@ -8,9 +8,9 @@ import threading
 from typing import Callable
 
 
-# Production review capacity deliberately starts at two workers.  A one-worker
-# mode is useful for manual recovery, but is not part of the adaptive policy.
-CAPACITY_STEPS = (2, 4, 6, 8, 10, 12)
+# Three workers is an additional start capacity. Legacy starts and pressure
+# fallback retain their existing even-numbered steps.
+CAPACITY_STEPS = (2, 3, 4, 6, 8, 10, 12)
 _MEMORY_PERCENT = re.compile(r"free percentage:\s*([0-9]{1,3})%")
 
 
@@ -77,7 +77,7 @@ def sample_local_health(
 
 def _lower_capacity(current_capacity: int) -> int:
     index = CAPACITY_STEPS.index(current_capacity)
-    return CAPACITY_STEPS[max(0, index - 1)]
+    return 2 if current_capacity in {3, 4} else CAPACITY_STEPS[max(0, index - 1)]
 
 
 def decide_capacity(
@@ -190,7 +190,7 @@ def decide_capacity(
         }
     return {
         "action": "increase",
-        "next_capacity": CAPACITY_STEPS[index + 1],
+        "next_capacity": 4 if current_capacity == 2 else CAPACITY_STEPS[index + 1],
         "healthy_windows": 0,
         "reason": "healthy_window_threshold",
     }

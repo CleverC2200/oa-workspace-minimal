@@ -4492,6 +4492,15 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
     }
 
 
+def _validate_rolling_capacity(capacity: int, max_capacity: int) -> None:
+    if (
+        capacity not in concurrency_control.CAPACITY_STEPS
+        or max_capacity not in concurrency_control.CAPACITY_STEPS
+        or capacity > max_capacity
+    ):
+        raise ValueError("production_rolling_capacity_invalid")
+
+
 def run_rolling_drain(
     *,
     capacity: int,
@@ -4506,6 +4515,7 @@ def run_rolling_drain(
     confirm_stale_children_reaped: bool = False,
     authorized_recovery_once: bool = False,
 ) -> dict:
+    _validate_rolling_capacity(capacity, max_capacity)
     recovery_queue = tuple(
         Path(path).expanduser().resolve() for path in recovery_action_files
     )
@@ -4854,12 +4864,7 @@ def _run_rolling_drain_locked(
         or recovery_count < 0
     ):
         raise ValueError("production_rolling_capacity_invalid")
-    if adaptive and (
-        capacity not in concurrency_control.CAPACITY_STEPS
-        or max_capacity not in concurrency_control.CAPACITY_STEPS
-        or capacity > max_capacity
-    ):
-        raise ValueError("production_rolling_capacity_invalid")
+    _validate_rolling_capacity(capacity, max_capacity)
     if runtime_control.stop_requested():
         raise ValueError("production_probe_stopped")
     started_at = time.monotonic()
@@ -5316,6 +5321,10 @@ def _verified_active_controller() -> dict | None:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="finance-preaudit-concurrency-probe")
     parser.add_argument("--capacity", type=int, default=2)
+    parser.add_argument(
+        "--max-capacity", type=int,
+        help="生产审核并发上限，未指定时沿用 12 槽上限",
+    )
     parser.add_argument("--confirm-write", choices=("YES",))
     parser.add_argument("--read-only", action="store_true")
     parser.add_argument(
@@ -5362,6 +5371,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 or args.workflow
                 or args.confirm_stale_children_reaped
                 or args.recover_confirmed_no_write_once
+                or args.max_capacity is not None
             ):
                 raise ValueError("read_only_probe_scheduler_invalid")
             payload = (
@@ -5381,6 +5391,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.drain:
             raise ValueError("production_legacy_scheduler_removed")
         else:
+            if args.max_capacity is not None:
+                _validate_rolling_capacity(args.capacity, args.max_capacity)
             rolling_args = {
                 "capacity": args.capacity,
                 "adaptive": args.adaptive,
@@ -5390,6 +5402,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     else ROLLING_WORKFLOW_KEYS
                 ),
             }
+            if args.max_capacity is not None:
+                rolling_args["max_capacity"] = args.max_capacity
             if args.recover_action_file:
                 rolling_args["recovery_action_files"] = tuple(
                     args.recover_action_file

@@ -103,7 +103,7 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
 
 内部并发使用有界、可复用的 Python 进程池，保持同一流程一个控制入口。子进程只执行一个单据动作；普通异常、进程崩溃、单任务超时、批次超时和人工停止分别输出稳定错误码，不携带异常正文，也不自动重试。每 15 秒只采集可用内存、按 CPU 归一化负载、宿主线程数、活动 Worker 和最老任务年龄；单任务 960 秒仍未返回时终止该进程池和任务拥有的独立 Codex 进程组，下一轮只使用全新进程池。进程池容量、Codex 会话槽和商旅浏览器资源槽分别配置和测量；资源槽继续提供跨进程硬上限。
 
-离线稳定性门固定覆盖容量 `1/2/4/8/10/12`、进程复用、失败隔离、任务超时回收、强制停止和重复单据单飞。弹性审核从 6 槽开始，连续两个完整健康窗口才按 `1 → 2 → 6 → 8 → 10 → 12` 提升一级；持续资源压力每次心跳降一级，最低 1 槽；CPU 负载高本身不再判为 critical，可用内存低于 12% 仍立即停止；健康采样未知时保留队列并暂停新工作，恢复后继续，资源等待不转人工；技术失败、容量完成数不一致或本机 critical 立即止损。材料领取与采集仍由单调度器串行，OA 提交仍由全局锁固定为 1，因此提升的是 AI 审核槽，不是浏览器或写入并发。离线通过不代表生产写入已启用。完整决策和递增/回退规则见 [ADR 0010](docs/adr/0010-bounded-process-pool.md)。
+离线稳定性门覆盖进程复用、失败隔离、任务超时回收、强制停止和重复单据单飞。当前生产调度显式从 3 槽开始，上限为 6；连续两个完整健康窗口才按 `3 → 4 → 6` 提升一级。代码支持 `2/3/4/6/8/10/12`，未指定参数仍沿用起始 2、最高 12 的历史默认。原偶数起点保留 `2 → 4 → 6 → 8 → 10 → 12` 升档和 `4 → 2` 降档，新增 3 槽受压也降到 2；限流直接降到 2。持续资源压力每次心跳降一级；可用内存低于 12% 仍立即停止，CPU 高负载本身不判为 critical。健康采样未知时保留队列并暂停新工作，恢复后继续，资源等待不转人工；技术失败或容量完成数不一致立即止损。材料领取与采集仍由单调度器串行，OA 提交仍由全局锁固定为 1，因此提升的是 AI 审核槽。离线通过不代表生产写入已启用。完整决策和历史验证见 [ADR 0010](docs/adr/0010-bounded-process-pool.md)。
 
 生产滚动控制器不属于五个手工 JSON CLI 命令，也不创建定时任务。它先对六类财务流程完成只读对账，再由单调度器按 OA 操作时间串行发现和冻结材料；包装不进入该滚动池。每个 Codex 工作进程只审核一单，宿主按认领顺序在完成边界再次验证单据 capability 后通过全局单写提交。使用时仍要求本地流程授权清单和当前人工确认：
 
@@ -134,12 +134,12 @@ python3 -m scripts.finance_preaudit_concurrency_probe \
 
 首轮真实写入递增验证中，容量 `1/2/4/6` 均完成；旧版容量 `8` 出现一次 Codex 进程退出码为 0、但业务动作未完成的 `codex_process_incomplete`。结构化只读复验使用同一组 20 个冻结样本，容量 `8/10/12` 均为 20/20 有效决定，证明旧故障不是 8 槽资源上限，而是旧版让 Agent 同时承担判断和动作完成时的语义完成缺陷。当前只读审核验证上限为 `12`，尚未触达边界；这不代表材料采集或 OA 写入已验证到 12 并发，OA 写入仍固定串行。真实停止文件不会由测试或代码自动清除。
 
-生产弹性滚动入口仍受当前授权、写策略、停止文件和显式确认约束。它只把 AI 审核槽从 6 逐级提升，单调度器和单写锁不变：
+生产弹性滚动入口仍受当前授权、写策略、停止文件和显式确认约束。它只把 AI 审核槽从 3 按健康窗口提升到最高 6，单调度器和单写锁不变。`--max-capacity` 只用于生产滚动入口，不能与 `--read-only` 混用：
 
 ```bash
 python3 -m scripts.finance_preaudit_concurrency_probe \
   --rolling --adaptive \
-  --capacity 6 \
+  --capacity 3 --max-capacity 6 \
   --confirm-write YES
 ```
 
@@ -173,7 +173,7 @@ python3 -m scripts.finance_preaudit_concurrency_probe \
 
 ```bash
 python3 -m scripts.finance_preaudit_concurrency_probe \
-  --rolling --capacity 6 --confirm-write YES \
+  --rolling --capacity 3 --max-capacity 6 --confirm-write YES \
   --recover-action-file /absolute/path/to/first/action.json \
   --recover-action-file /absolute/path/to/second/action.json
 ```

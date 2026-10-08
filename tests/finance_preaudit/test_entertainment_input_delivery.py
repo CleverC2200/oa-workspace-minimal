@@ -87,6 +87,10 @@ def reviewer(monkeypatch, tmp_path, task, *, direct=True, image_count=5, unknown
 from pathlib import Path
 argv=sys.argv[1:]
 if argv[:2]==["debug","prompt-input"]:
+ assert 'model_provider="openai"' in argv
+ assert 'service_tier="default"' in argv
+ assert 'openai_base_url="http://127.0.0.1:1"' in argv
+ assert not any("model_providers.openai" in argument or "deepseek" in argument or "model_context_window" in argument for argument in argv)
  images=[argv[i+1] for i,x in enumerate(argv) if x=="--image"]
  data=[{"type":"input_image","image_url":"data:image/png;base64,"+base64.b64encode(Path(p).read_bytes()).decode()} for p in images]
  if ''' + repr(probe_large) + ''':
@@ -96,6 +100,12 @@ if argv[:2]==["debug","prompt-input"]:
  print(json.dumps([{"role":"user","content":data}]))
  sys.exit(0)
 prompt=sys.stdin.read()
+assert argv[argv.index("--model")+1]=="gpt-6.1-sol"
+assert 'model_reasoning_effort="medium"' in argv
+assert 'model_provider="openai"' in argv
+assert 'service_tier="default"' in argv
+assert not any("deepseek" in argument or "OA_REVIEW_API_KEY" in argument for argument in argv)
+assert not __import__("os").environ.get("OA_REVIEW_API_KEY")
 assert "只读预审" in prompt
 assert "用户当前明确授权本轮真实审批提交" not in prompt
 assert "负责受控提交" not in prompt

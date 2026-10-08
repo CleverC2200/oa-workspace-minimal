@@ -294,6 +294,7 @@ def check_configuration(root):
     expected = {initial + 'preflight', initial + 'prepare',
                 prefix + 'verify --check lint --check schema',
                 prefix + 'verify --tests tests/finance_preaudit/test_dev_environment.py',
+                prefix + 'verify --tests tests/finance_preaudit/test_execution_readback.py',
                 prefix + 'verify --full'}
     try:
         value = tomllib.loads((root / '.codex/environments/environment.toml').read_text())
@@ -381,11 +382,15 @@ def emit(report, as_json):
     environment = report.get('environment', {})
     if environment:
         print(f"environment={environment['status']} | interpreter={environment.get('executable', 'missing')} | requirements={environment['requirements_sha256']}")
+        print(f"module_origin={environment.get('module_origin') or 'unknown'}")
         if 'probe' in environment:
             print(f"interpreter probe: exit={environment['probe']['exit_code']}")
             for stream in ('stdout', 'stderr'):
                 if environment['probe'].get(stream):
                     print(environment['probe'][stream], end='')
+    graph = report.get('codegraph', {})
+    if graph:
+        print(f"codegraph={graph['freshness']} | project={graph['project']} | next={graph['next_step']}")
     for reason in report.get('reasons', []):
         print(reason)
     if report.get('failure_evidence'):

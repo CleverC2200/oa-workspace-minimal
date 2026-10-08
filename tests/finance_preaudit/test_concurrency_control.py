@@ -55,6 +55,34 @@ def test_two_healthy_windows_upgrade_one_verified_step() -> None:
     }
 
 
+def test_three_slots_upgrade_to_four_and_preserve_two_slot_fallback() -> None:
+    first = concurrency_control.decide_capacity(
+        current_capacity=3, healthy_windows=0, wave=_wave(), host=HEALTHY,
+    )
+    second = concurrency_control.decide_capacity(
+        current_capacity=3, healthy_windows=first["healthy_windows"],
+        wave=_wave(), host=HEALTHY,
+    )
+    pressure = concurrency_control.decide_capacity(
+        current_capacity=3, healthy_windows=1, wave=_wave(),
+        host={**HEALTHY, "status": "pressure"},
+    )
+    legacy_pressure = concurrency_control.decide_capacity(
+        current_capacity=4, healthy_windows=1, wave=_wave(),
+        host={**HEALTHY, "status": "pressure"},
+    )
+    limited = concurrency_control.decide_capacity(
+        current_capacity=3, healthy_windows=1, wave=_wave(rate_limit_events=1),
+        host=HEALTHY,
+    )
+
+    assert first["action"] == "hold"
+    assert second["action"] == "increase"
+    assert second["next_capacity"] == 4
+    assert pressure["next_capacity"] == legacy_pressure["next_capacity"] == 2
+    assert limited["next_capacity"] == 2
+
+
 def test_pressure_decreases_one_step_and_technical_failure_stops() -> None:
     pressure = concurrency_control.decide_capacity(
         current_capacity=12,

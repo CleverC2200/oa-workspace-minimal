@@ -11,6 +11,7 @@ import re
 import signal
 import shlex
 import stat
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -33,6 +34,8 @@ MODEL = review_failure_evidence.MODEL
 REASONING_EFFORT = review_failure_evidence.REASONING_EFFORT
 SSE_TRACE_ENV = "OA_REVIEW_SSE_TRACE"
 _SSE_TRACE_TARGET = "error,codex_api::sse=trace"
+_NATIVE_RECEIPT_MAX_BYTES = 32 * 1024 * 1024
+_NATIVE_RECEIPT_HEADER_MAX_BYTES = 1024 * 1024
 _FINANCE_RULES = {
     "travel_expense": (
         "travel_expense:1",
@@ -99,7 +102,7 @@ _REVIEWER_ENVIRONMENT_KEYS = frozenset(
         "LC_ALL",
         "LC_CTYPE",
         "LOGNAME",
-        "OA_REVIEW_API_KEY",
+        "CODEX_HOME",
         "PATH",
         "SHELL",
         "SSL_CERT_DIR",
@@ -212,27 +215,97 @@ Completer = Callable[[Path, dict], str | None]
 StopRequester = Callable[[], None]
 
 
-def _reviewer_environment(codex_home: Path | None = None, *, trace_sse: bool = False) -> dict[str, str]:
+def _reviewer_environment(*, trace_sse: bool = False) -> dict[str, str]:
     environment = {
-        key: value
-        for key, value in os.environ.items()
+        key: value for key, value in os.environ.items()
         if key in _REVIEWER_ENVIRONMENT_KEYS
     }
     if not environment.get("HOME") or not environment.get("PATH"):
         raise ValueError("codex_reviewer_environment_invalid")
-    review_key = environment.get("OA_REVIEW_API_KEY", "").strip()
-    if not review_key:
-        raise ValueError("oa_review_api_key_missing")
-    environment["OA_REVIEW_API_KEY"] = review_key
-    if codex_home is not None:
-        if not codex_home.is_absolute() or codex_home.is_symlink() or not codex_home.is_dir():
-            raise ValueError("codex_reviewer_environment_invalid")
-        environment["CODEX_HOME"] = str(codex_home)
-    # The host CLI shim must not start shared services inside a bounded review.
+    # Native authentication stays in its original credential store. No credential
+    # file or provider key is copied into an attempt or packaging evidence directory.
+    environment["CODEX_HOME"] = environment.get("CODEX_HOME") or str(Path(environment["HOME"]) / ".codex")
     environment["OCX_SHIM_BYPASS"] = "1"
     if trace_sse:
         environment["RUST_LOG"] = _SSE_TRACE_TARGET
     return environment
+
+
+def _retain_native_tool_receipt(output: TextIO, *, native_home: Path, store: Path, project_root: Path, target: Path) -> list[str]:
+    """Copy only this invocation's native rollout, resolved through its own DB."""
+    if store.is_symlink() or not store.is_relative_to(target):
+        raise ValueError("codex_tool_receipt_unavailable")
+    output.seek(0)
+    identifiers = set()
+    for line in output:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "thread.started":
+            identifiers.add(event.get("thread_id"))
+    if len(identifiers) != 1:
+        raise ValueError("codex_tool_receipt_unavailable")
+    identifier = identifiers.pop()
+    if not isinstance(identifier, str) or not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", identifier):
+        raise ValueError("codex_tool_receipt_unavailable")
+    paths = []
+    for database in store.glob("state_*.sqlite"):
+        if database.is_symlink() or not re.fullmatch(r"state_\d+\.sqlite", database.name):
+            continue
+        with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
+            paths.extend(row[0] for row in connection.execute(
+                "SELECT rollout_path FROM threads WHERE id = ? AND cwd = ?",
+                (identifier, str(project_root)),
+            ))
+    if len(paths) != 1:
+        raise ValueError("codex_tool_receipt_unavailable")
+    source = Path(paths[0])
+    sessions = native_home / "sessions"
+    if (not source.is_absolute() or not source.is_relative_to(sessions)
+            or not source.resolve(strict=True).is_relative_to(sessions.resolve(strict=True))
+            or any(path.is_symlink() for path in (source, *source.parents))):
+        raise ValueError("codex_tool_receipt_unavailable")
+    with runtime_control.pinned_directory(source.parent) as parent:
+        before = os.stat(source.name, dir_fd=parent, follow_symlinks=False)
+        descriptor = os.open(source.name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             dir_fd=parent)
+        try:
+            opened = os.fstat(descriptor)
+            def identity(value):
+                return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+            if (not stat.S_ISREG(opened.st_mode) or identity(opened) != identity(before)
+                    or not 0 < opened.st_size <= _NATIVE_RECEIPT_MAX_BYTES):
+                raise ValueError("codex_tool_receipt_unavailable")
+            with os.fdopen(descriptor, "rb", buffering=0, closefd=False) as stream:
+                header = stream.readline(_NATIVE_RECEIPT_HEADER_MAX_BYTES + 1)
+                if len(header) > _NATIVE_RECEIPT_HEADER_MAX_BYTES or not header.endswith(b"\n"):
+                    raise ValueError("codex_tool_receipt_unavailable")
+                metadata = json.loads(header)
+                payload = metadata.get("payload") if isinstance(metadata, dict) else None
+                if (not isinstance(payload, dict) or metadata.get("type") != "session_meta"
+                        or payload.get("id") != identifier or payload.get("cwd") != str(project_root)):
+                    raise ValueError("codex_tool_receipt_unavailable")
+                chunks = [header]
+                remaining = _NATIVE_RECEIPT_MAX_BYTES + 1 - len(header)
+                while remaining:
+                    chunk = stream.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                raw = b"".join(chunks)
+            current = os.stat(source.name, dir_fd=parent, follow_symlinks=False)
+            if (len(raw) != opened.st_size or identity(os.fstat(descriptor)) != identity(opened)
+                    or not stat.S_ISREG(current.st_mode) or identity(current) != identity(opened)):
+                raise ValueError("codex_tool_receipt_unavailable")
+        finally:
+            os.close(descriptor)
+    relative = f"tool-receipts/{identifier}.jsonl"
+    directory = target / "tool-receipts"
+    directory.mkdir(mode=0o700)
+    runtime_control.write_control_bytes_atomic(target / relative, raw)
+    return [relative]
 
 
 def _page_routing_instruction(action_file: Path) -> str:
@@ -497,9 +570,14 @@ def _codex_command(
     decision_file: Path,
     *,
     tool_output_token_limit: int | None = None,
-    provider_base_url: str = "https://api.deepseek.com",
     model_instructions_file: Path | None = None,
 ) -> list[str]:
+    native_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    readable = (project_root, native_home / "skills", native_home / "RTK.md", native_home / "BUILD_EFFICIENCY.md")
+    filesystem = {str(native_home): "deny", **{str(path): "read" for path in readable}}
+    permissions = 'permissions.oa-reviewer={extends=":read-only",filesystem={' + ",".join(
+        json.dumps(path) + "=" + json.dumps(access) for path, access in filesystem.items()
+    ) + '}}'
     command = [
         "codex",
         "exec",
@@ -510,27 +588,24 @@ def _codex_command(
         "never",
         "--model",
         MODEL,
-        "--sandbox",
-        "read-only",
+        "--config",
+        'default_permissions="oa-reviewer"',
+        "--config",
+        permissions,
+        "--config",
+        'history.persistence="none"',
         "--config",
         'approval_policy="never"',
         "--config",
         f'model_reasoning_effort="{REASONING_EFFORT}"',
-        # 审核与小时调度使用同一供应商（DeepSeek），避免 OpenAI 账号限流把整批单据打成隔离；
-        # 密钥只从环境变量读取，不写入命令行或冻结证据。
         "--config",
-        'model_provider="oa_deepseek"',
+        'model_provider="openai"',
         "--config",
-        (
-            'model_providers.oa_deepseek={name="DeepSeek",'
-            f'base_url="{provider_base_url}",wire_api="responses",'
-            'env_key="OA_REVIEW_API_KEY",requires_openai_auth=false}'
-        ),
-        # DeepSeek 的 Responses 实现是无状态的，必须关闭服务端响应存储。
+        'service_tier="default"',
         "--config",
-        "disable_response_storage=true",
+        "memories.use_memories=false",
         "--config",
-        "model_context_window=1000000",
+        "memories.generate_memories=false",
         "--output-schema",
         str(schema_file),
         "--output-last-message",
@@ -952,8 +1027,7 @@ def _execute_codex_raw(
                     or url.scheme != "http" or url.hostname not in {"127.0.0.1", "localhost"}
                     or url.port is None or url.path not in {"", "/"}
                     or url.username is not None or url.password is not None or url.query or url.fragment
-                    or set(isolated) - {"HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "OA_REVIEW_API_KEY"}
-                    or isolated.get("OA_REVIEW_API_KEY") != "native-contract-placeholder"
+                    or set(isolated) - {"HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR"}
                     or not isolated.get("PATH") or not home.is_absolute() or home != home.resolve()
                     or not home.is_dir() or stat.S_IMODE(home.stat().st_mode) & 0o077 or any(home.iterdir())):
                 raise ValueError("codex_review_task_invalid")
@@ -989,22 +1063,23 @@ def _execute_codex_raw(
     workspace = nullcontext(str(audit_directory)) if audit_directory else tempfile.TemporaryDirectory(prefix="oa-preaudit-codex-")
     with workspace as temporary:
         temporary_root = Path(temporary)
-        codex_home = temporary_root / "codex-home"
         try:
-            codex_home.mkdir(mode=0o700)
-            reviewer_environment = (
-                {**offline_api[1], "CODEX_HOME": str(codex_home), "OCX_SHIM_BYPASS": "1"}
-                if offline_api is not None else _reviewer_environment(codex_home, trace_sse=trace_sse)
-            )
+            if offline_api is not None:
+                codex_home = temporary_root / "codex-home"
+                codex_home.mkdir(mode=0o700)
+                # Public synthetic fixture only; never copy native credentials.
+                fixture_auth = codex_home / "auth.json"
+                json_artifact.write_json_atomic(fixture_auth, {"OPENAI_API_KEY": "native-contract-placeholder"})
+                fixture_auth.chmod(0o600)
+                reviewer_environment = {**offline_api[1], "CODEX_HOME": str(codex_home), "OCX_SHIM_BYPASS": "1"}
+                if trace_sse:
+                    reviewer_environment["RUST_LOG"] = _SSE_TRACE_TARGET
+            else:
+                reviewer_environment = _reviewer_environment(trace_sse=trace_sse)
         except (OSError, ValueError) as error:
             output.close()
             return CodexExecution(
-                (
-                    "oa_review_api_key_missing"
-                    if isinstance(error, ValueError)
-                    and str(error) == "oa_review_api_key_missing"
-                    else "codex_process_start_failed"
-                ),
+                "codex_process_start_failed",
                 _unknown_usage(),
                 process_state="start_failed", decision_state="not_attempted",
             )
@@ -1017,11 +1092,12 @@ def _execute_codex_raw(
             project_root, schema_file, decision_file,
             **({"tool_output_token_limit": frozen_input.tool_output_token_limit}
                if frozen_input is not None and frozen_input.tool_output_token_limit is not None else {}),
-            **({"provider_base_url": offline_api[0]} if offline_api is not None else {}),
             **({"model_instructions_file": role_file} if role_file is not None else {}),
         )
         if offline_api is not None:
-            command[2:2] = ["--skip-git-repo-check", "--config", 'web_search="disabled"',
+            command[2:2] = ["--config", "openai_base_url=" + json.dumps(offline_api[0]),
+                            "--config", "disable_response_storage=true",
+                            "--skip-git-repo-check", "--config", 'web_search="disabled"',
                             "--config", "mcp_servers={}", "--config", "tools.web_search=false"]
         if frozen_input is not None:
             try:
@@ -1041,8 +1117,10 @@ def _execute_codex_raw(
                 "images_supplied": len(frozen_input.images),
             }
         if audit_directory:
-            # The isolated home retains native tool receipts for this review only.
+            # Authentication stays native; the isolated DB indexes this review only.
             command.remove("--ephemeral")
+            command[-1:-1] = ["--config", "sqlite_home=" + json.dumps(str(temporary_root / "native-state")),
+                               "--config", "log_dir=" + json.dumps(str(temporary_root / "native-logs"))]
             (temporary_root / "prompt.txt").write_text(prompt, encoding="utf-8")
         process: subprocess.Popen | None = None
         previous_sigterm: object | None = None
@@ -1172,6 +1250,18 @@ def _execute_codex_raw(
                 stderr_reader.join(timeout=1)
             if stderr_reader.is_alive() or stderr_failed:
                 stderr_summary["collection_failed"] = True
+            if audit_directory:
+                try:
+                    with (temporary_root / "events.jsonl").open(encoding="utf-8") as native_events:
+                        stderr_summary["tool_receipt_files"] = _retain_native_tool_receipt(
+                            native_events, native_home=Path(reviewer_environment["CODEX_HOME"]),
+                            store=temporary_root / "native-state", project_root=project_root,
+                            target=temporary_root,
+                        )
+                except (OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error):
+                    stderr_summary["tool_receipt_files"] = []
+                    stderr_summary["tool_receipt_unavailable"] = True
+
         usage = _parse_token_usage(output)
         event_counts = _parse_event_counts(output)
         event_status = _event_status(output, event_counts)
@@ -1338,6 +1428,8 @@ def _base_result(*, attempts: int, usages: list[dict]) -> dict:
         "kind": "preaudit_review_worker_result",
         "model": MODEL,
         "reasoning_effort": REASONING_EFFORT,
+        "model_provider": review_failure_evidence.MODEL_PROVIDER,
+        "requested_service_tier": review_failure_evidence.SERVICE_TIER,
         "process_attempts": attempts,
         "process_retries": max(0, attempts - 1),
         "token_usage": _merge_usage(usages),
@@ -1386,11 +1478,12 @@ def _is_bounded_failure(
     allowed_attempts: set[int],
     error_codes: set[str] | frozenset[str],
 ) -> bool:
-    if not isinstance(value, dict) or set(value) != {
+    if not isinstance(value, dict):
+        return False
+    identity = review_failure_evidence.read_model_identity(value)
+    if identity is None or set(value) != set(identity) | {
         "schema_version",
         "kind",
-        "model",
-        "reasoning_effort",
         "process_attempts",
         "process_retries",
         "token_usage",
@@ -1404,8 +1497,6 @@ def _is_bounded_failure(
     return (
         value.get("schema_version") == 1
         and value.get("kind") == "preaudit_review_worker_result"
-        and review_failure_evidence.model_matches(value.get("model"))
-        and value.get("reasoning_effort") == REASONING_EFFORT
         and type(value.get("process_attempts")) is int
         and value.get("process_attempts") in allowed_attempts
         and type(value.get("process_retries")) is int
@@ -1472,10 +1563,11 @@ def _write_review_failure_receipt(
         workflow_key=action["workflow_key"],
         failure_code=reviewed["error_code"],
         attempt_error_codes=attempt_error_codes,
+        model=reviewed["model"], reasoning_effort=reviewed["reasoning_effort"],
     )
     if os.path.lexists(receipt_file):
-        if review_failure_evidence.receipt_matches(
-            review_failure_evidence.read_receipt(receipt_file),
+        if review_failure_evidence.read_receipt(receipt_file) == payload and review_failure_evidence.receipt_matches(
+            payload,
             action_token=action_token,
             workflow_key=action["workflow_key"],
             failure_code=reviewed["error_code"],
@@ -1486,8 +1578,8 @@ def _write_review_failure_receipt(
         # 与本次失败码序列不一致。归档旧回执保留证据，再写本次回执；
         # 否则整个审核失败记账会失败，表现为 codex_review_failure_evidence_invalid。
         existing = review_failure_evidence.read_receipt(receipt_file)
-        if existing is None or not review_failure_evidence.valid_attempt_codes(
-            existing.get("attempt_error_codes")
+        if not review_failure_evidence.receipt_matches(existing,
+            action_token=action_token, workflow_key=action["workflow_key"],
         ):
             return False
         try:
@@ -1511,7 +1603,11 @@ def _write_agent_timing(
     wall_seconds: float,
     attempts: int,
     token_usage: dict,
+    identity: dict | None = None,
 ) -> bool:
+    identity = identity or {"model": MODEL, "reasoning_effort": REASONING_EFFORT,
+                            "model_provider": review_failure_evidence.MODEL_PROVIDER,
+                            "requested_service_tier": review_failure_evidence.SERVICE_TIER}
     timing_file = action_file.with_name("agent-timing.json")
     if timing_file.is_symlink():
         return False
@@ -1536,8 +1632,7 @@ def _write_agent_timing(
                 "kind": "preaudit_agent_timing",
                 "action_token": action_token,
                 "workflow_key": action["workflow_key"],
-                "model": MODEL,
-                "reasoning_effort": REASONING_EFFORT,
+                **identity,
                 "wall_seconds": max(0, int(wall_seconds)),
                 "process_attempts": attempts,
                 "token_usage": usage,
@@ -1822,6 +1917,15 @@ def complete_review_result(
     attempts = reviewed.get("process_attempts") if isinstance(reviewed, dict) else None
     wall_seconds = reviewed.get("agent_wall_seconds") if isinstance(reviewed, dict) else None
     codex_events = reviewed.get("codex_events") if isinstance(reviewed, dict) else None
+    model = reviewed.get("model") if isinstance(reviewed, dict) else None
+    effort = reviewed.get("reasoning_effort") if isinstance(reviewed, dict) else None
+    identity = review_failure_evidence.read_model_identity(reviewed)
+    identity_valid = identity is not None
+    if identity is None:
+        identity = {
+            "model": model if review_failure_evidence.model_matches(model) else None,
+            "reasoning_effort": effort if isinstance(effort, str) and effort in {"medium", "high"} else None,
+        }
     known_attempts = (
         attempts
         if isinstance(attempts, int)
@@ -1830,7 +1934,8 @@ def complete_review_result(
         else 0
     )
     if (
-        reviewed.get("status") != "reviewed"
+        not identity_valid
+        or reviewed.get("status") != "reviewed"
         or not isinstance(decision, dict)
         or not isinstance(usage, dict)
         or not isinstance(attempts, int)
@@ -1845,8 +1950,7 @@ def complete_review_result(
         return {
             "schema_version": 1,
             "kind": "preaudit_review_worker_result",
-            "model": MODEL,
-            "reasoning_effort": REASONING_EFFORT,
+            **identity,
             "process_attempts": known_attempts,
             "process_retries": max(0, known_attempts - 1),
             "token_usage": dict(usage) if isinstance(usage, dict) else _unknown_usage(),
@@ -1864,8 +1968,7 @@ def complete_review_result(
     base = {
         "schema_version": 1,
         "kind": "preaudit_review_worker_result",
-        "model": MODEL,
-        "reasoning_effort": REASONING_EFFORT,
+        **identity,
         "process_attempts": attempts,
         "process_retries": max(0, attempts - 1),
         "token_usage": dict(usage),
@@ -1893,7 +1996,7 @@ def complete_review_result(
         action_file,
         wall_seconds=wall_seconds,
         attempts=attempts,
-        token_usage=usage,
+        token_usage=usage, identity=identity,
     ):
         return failed("agent_timing_write_failed")
     completion_error = completer(action_file, decision)

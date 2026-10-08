@@ -30,7 +30,8 @@ _INLINE_REVIEW_CHARS = 100_000
 _FALLBACK_TOOL_OUTPUT_TOKENS = 60_000
 # Preserve the existing Codex 0.160.0 image preparation used by view_image.
 _CLI_IMAGE_DIMENSION = 2048
-# DeepSeek Responses inline limits, verified 2026-10-04 (docs/guides/vision).
+# Conservative application delivery bounds, retained from the earlier experiment.
+# These values are not OpenAI service capacity or model context limits.
 _MAX_IMAGES = 600
 _MAX_IMAGE_BYTES = 32 * 1024 * 1024
 _MAX_REQUEST_BYTES = 48 * 1024 * 1024
@@ -248,15 +249,19 @@ def _native_image_sizes(images: tuple[Path, ...]):
     fingerprint = _binary_sha256(binary)
     args = [str(binary), 'debug', 'prompt-input', 'capacity-probe',
             '-c', f'model="{worker.MODEL}"', '-c', f'model_reasoning_effort="{worker.REASONING_EFFORT}"',
-            '-c', 'model_provider="oa_deepseek"',
-            '-c', 'model_providers.oa_deepseek={name="DeepSeek",base_url="http://127.0.0.1:1",wire_api="responses",requires_openai_auth=false}',
-            '-c', 'disable_response_storage=true', '-c', 'model_context_window=1000000',
+            '-c', 'model_provider="openai"', '-c', 'service_tier="default"',
+            '-c', 'openai_base_url="http://127.0.0.1:1"',
+            '-c', 'disable_response_storage=true',
             '-c', 'approval_policy="never"', '-c', 'sandbox_mode="read-only"']
     args.extend(part for path in images for part in ('--image', str(path)))
     environment = {k: v for k, v in os.environ.items()
                    if k in {'HOME', 'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TMPDIR', 'TZ'}}
     with tempfile.TemporaryDirectory(prefix='oa-native-image-size-') as home, tempfile.TemporaryFile() as output:
-        environment.update(CODEX_HOME=home, OCX_SHIM_BYPASS='1')
+        environment.update(HOME=home, CODEX_HOME=home, OCX_SHIM_BYPASS='1')
+        # A public fixture satisfies built-in provider setup, without native auth.
+        fixture_auth = Path(home) / 'auth.json'
+        fixture_auth.write_text(json.dumps({'OPENAI_API_KEY': 'native-contract-placeholder'}))
+        fixture_auth.chmod(0o600)
         process = None
         previous = signal.getsignal(signal.SIGTERM)
         mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
