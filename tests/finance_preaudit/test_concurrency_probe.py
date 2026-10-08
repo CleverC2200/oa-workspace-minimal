@@ -4027,6 +4027,64 @@ def test_production_cli_defaults_to_two_adaptive_slots(monkeypatch, capsys) -> N
     capsys.readouterr()
 
 
+def test_production_cli_passes_three_slot_start_and_six_slot_ceiling(monkeypatch, capsys) -> None:
+    calls = []
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe, "run_rolling_drain",
+        lambda **kwargs: calls.append(kwargs) or {"status": "completed"},
+    )
+    assert finance_preaudit_concurrency_probe.main([
+        "--rolling", "--capacity", "3", "--max-capacity", "6", "--confirm-write", "YES",
+    ]) == 0
+    assert calls[0]["capacity"] == 3
+    assert calls[0]["max_capacity"] == 6
+    assert calls[0]["adaptive"] is True
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize("capacity,maximum", [(3, 1), (3, 5), (6, 4), (3, 14)])
+def test_production_cli_rejects_invalid_ceiling_before_controller(
+    monkeypatch, capsys, capacity, maximum,
+) -> None:
+    calls = []
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe, "run_rolling_drain",
+        lambda **kwargs: calls.append(kwargs) or {"status": "completed"},
+    )
+    assert finance_preaudit_concurrency_probe.main([
+        "--capacity", str(capacity), "--max-capacity", str(maximum), "--confirm-write", "YES",
+    ]) == 1
+    assert json.loads(capsys.readouterr().out)["error_code"] == "production_rolling_capacity_invalid"
+    assert calls == []
+
+
+def test_read_only_cli_rejects_production_ceiling_before_model_probe(monkeypatch, capsys) -> None:
+    calls = []
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe, "run_adaptive_read_only_probe",
+        lambda **kwargs: calls.append(kwargs) or {"status": "completed"},
+    )
+    assert finance_preaudit_concurrency_probe.main([
+        "--read-only", "--capacity", "3", "--max-capacity", "6",
+    ]) == 1
+    assert json.loads(capsys.readouterr().out)["error_code"] == "read_only_probe_scheduler_invalid"
+    assert calls == []
+
+
+def test_rolling_rejects_invalid_ceiling_before_acquiring_controller_lease(tmp_path, monkeypatch) -> None:
+    lock_file = tmp_path / "controller.lock"
+    monkeypatch.setenv("OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE", str(lock_file))
+    calls = []
+    with finance_preaudit_concurrency_probe.runtime_control.global_controller_lease():
+        with pytest.raises(ValueError, match="^production_rolling_capacity_invalid$"):
+            finance_preaudit_concurrency_probe.run_rolling_drain(
+                capacity=3, max_capacity=2, adaptive=True,
+                live_status=lambda: calls.append("live_status") or {},
+            )
+    assert calls == []
+    assert not lock_file.exists()
+
+
 def test_production_cli_alerts_on_session_failure_without_masking_it(
     monkeypatch,
     capsys,
@@ -7156,9 +7214,12 @@ def test_pipeline_evidence_suffix_advances_across_controller_runs(
     }
 
 
+@pytest.mark.parametrize("start,maximum", [(6, 10), (3, 6)])
 def test_dispatcher_adaptive_capacity_increases_inside_continuous_fifo(
     tmp_path: Path,
     monkeypatch,
+    start,
+    maximum,
 ) -> None:
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.runtime_control,
@@ -7182,8 +7243,20 @@ def test_dispatcher_adaptive_capacity_increases_inside_continuous_fifo(
         for index in range(100)
     ]
     writes: list[Path] = []
+    writer_lock = threading.Lock()
+    active_writers = 0
+    maximum_writers = 0
+    active_reviews = 0
+    maximum_reviews = 0
 
     def review(_task: dict) -> dict:
+        nonlocal active_reviews, maximum_reviews
+        with writer_lock:
+            active_reviews += 1
+            maximum_reviews = max(maximum_reviews, active_reviews)
+        time.sleep(0.01)
+        with writer_lock:
+            active_reviews -= 1
         return {
             "status": "reviewed",
             "business_state": "not_available",
@@ -7203,7 +7276,14 @@ def test_dispatcher_adaptive_capacity_increases_inside_continuous_fifo(
         }
 
     def complete(action: Path, reviewed: dict) -> dict:
+        nonlocal active_writers, maximum_writers
+        with writer_lock:
+            active_writers += 1
+            maximum_writers = max(maximum_writers, active_writers)
+        time.sleep(0.001)
         writes.append(action)
+        with writer_lock:
+            active_writers -= 1
         return {
             **reviewed,
             "status": "completed",
@@ -7214,7 +7294,7 @@ def test_dispatcher_adaptive_capacity_increases_inside_continuous_fifo(
 
     result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
         100,
-        6,
+        start,
         project_root=tmp_path,
         renew_actions=lambda paths: paths,
         review_worker=review,
@@ -7230,26 +7310,25 @@ def test_dispatcher_adaptive_capacity_increases_inside_continuous_fifo(
             "cpu_count": 10,
         },
         adaptive=True,
-        max_capacity=10,
+        max_capacity=maximum,
     )
 
     assert result.completed == 100
-    assert result.recommended_capacity == 10
-    assert [item["action"] for item in result.capacity_decisions] == [
-        "hold",
-        "increase",
-        "hold",
-        "increase",
-        "hold",
-        "hold",
-    ]
+    assert result.recommended_capacity == maximum
+    assert result.capacity_decisions[0]["next_capacity"] == start
+    assert [item["next_capacity"] for item in result.capacity_decisions
+            if item["action"] == "increase"] == ([8, 10] if start == 6 else [4, 6])
+    assert all(item["next_capacity"] <= maximum for item in result.capacity_decisions)
+    assert max(item["active_workers"] for item in result.runtime_samples) <= maximum
     assert result.capacity_decisions[-1] == {
         "action": "hold",
-        "next_capacity": 10,
+        "next_capacity": maximum,
         "healthy_windows": 1,
         "reason": "configured_maximum",
     }
     assert writes == action_files
+    assert maximum_writers == 1
+    assert 1 < maximum_reviews <= maximum
 
 
 def test_dispatcher_adaptive_window_keeps_worst_heartbeat_health(
