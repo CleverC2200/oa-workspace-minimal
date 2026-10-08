@@ -72,5 +72,26 @@ CodeGraph 记录明确项目、分支、HEAD，索引新鲜度固定为未核验
 实际单据的 next-action、complete-review 和 OA 写入仍需独立授权，预检和离线测试不调用它们。
 原执行的只读进度及终态命令见[控制器执行回执](controller-execution.md#只读进度等待与终态取回)。
 
+## 定位文档与核对命令
+
+在预检报告的实际工作树根目录定位已有文档，操作 GitHub 前读取本机对应子命令帮助：
+
+```bash
+rg --files docs/agents
+gh issue comment --help
+gh issue close --help
+```
+
+已授权补充验收并关闭 Issue 时，先把完整多行评论保存到 `.scratch/issue-comment.md`，
+使用 `--body-file` 保留换行。确认评论成功后，再单独执行关闭命令：
+
+```bash
+gh issue comment <编号> --repo CleverC2200/oa-workspace-minimal --body-file .scratch/issue-comment.md
+gh issue close <编号> --repo CleverC2200/oa-workspace-minimal --reason completed
+```
+
+`gh issue close` 的 `--comment` 接受字符串，不提供 `--comment-file`。
+关闭条件及尚缺生产验收时的处理沿用[Issue 追踪](issue-tracker.md)，不因本地测试通过直接关闭。
+
 `python -m scripts.quality environment` 在现有质量 CI 中校验配置；环境命令行为回归随现有全树测试执行。
 配置/命令测试通过不代表原生桌面按钮已现场验收，更不代表真实业务或生产恢复。
