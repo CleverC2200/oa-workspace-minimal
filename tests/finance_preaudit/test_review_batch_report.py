@@ -197,6 +197,41 @@ def test_report_verifies_archived_source_and_usage_without_live_checkout(tmp_pat
     assert all(Path(p).read_bytes() == v for p, v in before.items())
 
 
+def test_operation_reuses_complete_archive_validation_and_isolates_consumers(tmp_path, monkeypatch):
+    root = archive(tmp_path)
+    evidence = root / "calling-source/apps/example.py"
+    reads = []
+    original = Path.open
+
+    def observe(path, mode="r", *args, **kwargs):
+        if path == evidence and mode == "rb":
+            reads.append(path)
+        return original(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", observe)
+    reports = review_batch_report._VerifiedReports()
+    first = reports.read(root)
+    first["usage"]["total_tokens"] = 999
+    second = reports.read(root)
+
+    assert second["usage"]["total_tokens"] == 15
+    assert len(reads) == 1
+    assert second["acceptance"]["preview"] == "verified_closed"
+
+
+def test_invalid_archive_is_not_retained_as_an_operation_report(tmp_path):
+    root = archive(tmp_path)
+    evidence = root / "calling-source/apps/example.py"
+    original = evidence.read_bytes()
+    evidence.write_text("changed evidence")
+    reports = review_batch_report._VerifiedReports()
+    with pytest.raises(ValueError, match="review_archive_invalid"):
+        reports.read(root)
+    evidence.write_bytes(original)
+
+    assert reports.read(root)["usage"]["total_tokens"] == 15
+
+
 @pytest.mark.parametrize(
     "usage",
     [

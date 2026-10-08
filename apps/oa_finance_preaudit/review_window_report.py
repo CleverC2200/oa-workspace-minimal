@@ -259,13 +259,17 @@ def _financial_quality(selection, reports):
 
 def build_window(selection_file: Path) -> dict:
     """Validate every explicitly selected archive and preserve rejected contributions."""
+    return _build_window(selection_file, batch._VerifiedReports())
+
+
+def _build_window(selection_file: Path, verified: batch._VerifiedReports) -> dict:
     try:
         selection, roots = _selection(selection_file)
         reports = []
         for root in roots:
             try:
                 reports.append(
-                    {"status": "verified_archive", **batch.build_report(root)}
+                    {"status": "verified_archive", **verified.read(root)}
                 )
             except ValueError:
                 reports.append(_rejected())

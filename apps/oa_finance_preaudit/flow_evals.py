@@ -976,7 +976,7 @@ def freeze_financial_expectations(checklist_reference: dict, destination: Path) 
     return {"file": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
-def _financial_replay_binding(review: dict, checklist: dict, assessment: dict) -> dict:
+def _financial_replay_binding(review: dict, checklist: dict, assessment: dict, *, verified=None) -> dict:
     """Consume the archive reporter's validated machine facts, never a caller label."""
     unknown = {"status": "not_established", "start": {"status": "not_established"}}
     reference = review.get("archive")
@@ -988,7 +988,7 @@ def _financial_replay_binding(review: dict, checklist: dict, assessment: dict) -
         raise ValueError("financial_review_binding_invalid")
     from .review_batch_report import build_report
 
-    report = build_report(path.parent)
+    report = build_report(path.parent) if verified is None else verified.read(path.parent)
     binding = report["financial_binding"]
     fingerprint = report["archive_fingerprint"]
     if (fingerprint != reference["sha256"]

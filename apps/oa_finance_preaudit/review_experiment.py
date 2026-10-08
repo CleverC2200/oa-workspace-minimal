@@ -535,6 +535,7 @@ def _run_candidate_phase_locked(scope_file: Path, authority_file: Path, alias: s
     starts = 'unknown'
     dispatching = False
     rows = []
+    verified = batch._VerifiedReports()
     try:
         scope, rows = _candidate_phase_rows(scope_file)
         counts = [_candidate_phase_start(path, plan) for _row, path, plan in rows]
@@ -554,8 +555,8 @@ def _run_candidate_phase_locked(scope_file: Path, authority_file: Path, alias: s
         index = [value[0]['alias'] for value in rows].index(alias)
         if counts[index] != 0:
             raise ValueError('candidate_already_started')
-        budget = _candidate_phase_budget(authority, rows)
-        prerequisite = _candidate_phase_prerequisites(scope,authority)
+        budget = _candidate_phase_budget(authority, rows, verified=verified)
+        prerequisite = _candidate_phase_prerequisites(scope,authority, verified=verified)
         if prerequisite['status'] == 'pending':
             raise ValueError('previous_quality_pending')
         if prerequisite['status'] != 'pass':
@@ -567,8 +568,8 @@ def _run_candidate_phase_locked(scope_file: Path, authority_file: Path, alias: s
         for previous,previous_path,previous_plan in rows[:index]:
             if not (Path(previous_plan['arms']['candidate'])/'result.json').exists():
                 raise ValueError('previous_quality_pending')
-            prior_report = batch.build_report(Path(previous_plan['arms']['candidate']))
-            quality = _candidate_phase_quality(previous,previous_path,prior_report)
+            prior_report = verified.read(Path(previous_plan['arms']['candidate']))
+            quality = _candidate_phase_quality(previous,previous_path,prior_report, verified=verified)
             if quality['status'] == 'pending':
                 raise ValueError('previous_quality_pending')
             if quality['status'] != 'pass':
@@ -605,11 +606,13 @@ def _run_candidate_phase_locked(scope_file: Path, authority_file: Path, alias: s
                      **budget,'started_at':datetime.now(timezone.utc).isoformat(),
                      'automated_preflight_seconds':time.monotonic()-checks_started})
         dispatching = True
-        _write_candidate_phase_status(scope_file,authority_file)
+        _write_candidate_phase_status(scope_file,authority_file, verified=verified)
+        # Native execution can change archive evidence. No preflight report survives it.
+        verified = batch._VerifiedReports()
         try:
             result = execute(plan_file) if execute is not None else _host(plan_file,'candidate',execute=True)
-            report = batch.build_report(Path(plan['arms']['candidate']))
-            budget = _candidate_phase_budget(authority,rows)
+            report = verified.read(Path(plan['arms']['candidate']))
+            budget = _candidate_phase_budget(authority,rows, verified=verified)
             closed = (report['acceptance']['preview'] == 'verified_closed'
                       and report['acceptance']['final_contract'] == 'verified_snapshot_schema')
             trusted = (result['cli_starts'] == 1 and _observed_cli_start(plan,'candidate') == 1
@@ -621,7 +624,7 @@ def _run_candidate_phase_locked(scope_file: Path, authority_file: Path, alias: s
             _save(plan_file.parent/'candidate-result.private.json',outcome)
             if not closed or not trusted:
                 _candidate_phase_stop(scope_file,alias,'format_failure' if not closed else 'execution_or_usage_untrusted')
-            _write_candidate_phase_status(scope_file,authority_file)
+            _write_candidate_phase_status(scope_file,authority_file, verified=verified)
             return outcome
         except BaseException:
             _candidate_phase_stop(scope_file,alias,'dispatch_or_report_interruption')
@@ -631,7 +634,7 @@ def _run_candidate_phase_locked(scope_file: Path, authority_file: Path, alias: s
             counts = [_candidate_phase_start(path,plan) for _row,path,plan in rows]
             starts = sum(counts) if all(type(count) is int for count in counts) else 'unknown'
         try:
-            _write_candidate_phase_status(scope_file,authority_file)
+            _write_candidate_phase_status(scope_file,authority_file, verified=verified)
         except (OSError,ValueError,KeyError,TypeError):
             pass
         return {'status':'stopped' if dispatching else 'rejected',
@@ -639,8 +642,9 @@ def _run_candidate_phase_locked(scope_file: Path, authority_file: Path, alias: s
                 'phase_cli_starts':starts,'baseline_executed':False,'new_execution_authority':False}
 
 
-def _candidate_phase_budget(authority: dict, rows: list) -> dict:
+def _candidate_phase_budget(authority: dict, rows: list, *, verified: batch._VerifiedReports | None = None) -> dict:
     from .flow_evals import _read_bound_artifact
+    verified = verified or batch._VerifiedReports()
     prior, diagnostic_prior = 0, 0
     parent = _read_bound_artifact(authority['parent_cumulative_authority'])
     anchors = _candidate_parent_anchor_plans(parent)
@@ -676,7 +680,7 @@ def _candidate_phase_budget(authority: dict, rows: list) -> dict:
         if _candidate_phase_start(path,plan) != 1:
             raise ValueError('prior_start_untrusted')
         try:
-            report = batch.build_report(Path(plan['arms']['candidate']))
+            report = verified.read(Path(plan['arms']['candidate']))
             process = report['acceptance']['process']
             if (report['usage']['status'] != 'exact' or process['state'] not in {'exited', 'cancelled', 'timed_out'}
                     or type(process.get('exit_code')) is not int
@@ -697,7 +701,7 @@ def _candidate_phase_budget(authority: dict, rows: list) -> dict:
             'diagnostic_cli_starts':diagnostic_prior+starts}
 
 
-def _candidate_phase_quality(row: dict, path: Path, report: dict) -> dict:
+def _candidate_phase_quality(row: dict, path: Path, report: dict, *, verified: batch._VerifiedReports | None = None) -> dict:
     from . import flow_evals, review_window_report
     audit_file = path.parent / 'candidate-audit-binding.private.json'
     if row.get('audit_binding') is None and not audit_file.exists():
@@ -718,7 +722,7 @@ def _candidate_phase_quality(row: dict, path: Path, report: dict) -> dict:
         checklist = flow_evals._read_bound_artifact(row['checklist'])
         plan = batch._object(path.parent,path)
         flow_evals._financial_replay_binding({'item_key':case['item_key'],
-            'archive':{'file':str(Path(plan['arms']['candidate'])/'manifest.json'), 'sha256':report['archive_fingerprint']}}, checklist, assessment)
+            'archive':{'file':str(Path(plan['arms']['candidate'])/'manifest.json'), 'sha256':report['archive_fingerprint']}}, checklist, assessment, verified=verified)
         projection = review_window_report._financial_quality({'financial_quality_reports':[refs['quality_report']]},[report])
         if projection['status'] != 'verified':
             raise ValueError('quality_window_binding_mismatch')
@@ -745,9 +749,11 @@ def _candidate_phase_stop(scope_file: Path, alias: str, reason: str) -> None:
                        'stopped_at':datetime.now(timezone.utc).isoformat(),'new_execution_authority':False})
 
 
-def _candidate_phase_status(scope_file: Path, authority_file: Path | None = None) -> dict:
+def _candidate_phase_status(scope_file: Path, authority_file: Path | None = None, *,
+                            verified: batch._VerifiedReports | None = None) -> dict:
     """Read original receipts and audits; no readiness run, key access or dispatch."""
     scope_file = Path(scope_file).resolve()
+    verified = verified or batch._VerifiedReports()
     scope, rows = _candidate_phase_rows(scope_file)
     cases = []
     counts = []
@@ -772,8 +778,8 @@ def _candidate_phase_status(scope_file: Path, authority_file: Path | None = None
             pid = batch._object(root,'cli-start.json').get('pid','not_established')
         if (root/'result.json').exists():
             try:
-                report = batch.build_report(root)
-                quality = _candidate_phase_quality(row,path,report)
+                report = verified.read(root)
+                quality = _candidate_phase_quality(row,path,report, verified=verified)
                 process = report['acceptance']['process']['state']
                 if (report['acceptance']['final_contract'] != 'verified_snapshot_schema'
                         or report['acceptance']['preview'] != 'verified_closed'):
@@ -809,8 +815,8 @@ def _candidate_phase_status(scope_file: Path, authority_file: Path | None = None
             authority = batch._object(Path(authority_file).resolve().parent,Path(authority_file).resolve())
             if authority['scope_sha256'] != batch._sha(scope_file):
                 raise ValueError('authorization_not_bound')
-            budget = _candidate_phase_budget(authority,rows)
-            prerequisite = _candidate_phase_prerequisites(scope,authority)
+            budget = _candidate_phase_budget(authority,rows, verified=verified)
+            prerequisite = _candidate_phase_prerequisites(scope,authority, verified=verified)
             budget['reported_limits'] = {field:authority.get(field,'unknown') for field in (
                 'maximum_cli_starts','cumulative_maximum_cli_starts','candidate_diagnosis_limit')}
         except (OSError,ValueError,KeyError,TypeError):
@@ -868,7 +874,8 @@ def _finish_candidate_phase(scope_file: Path, authority_file: Path) -> dict:
             flow_evals._read_bound_artifact(reference,document=False)
         return flow_evals._read_bound_artifact(bound['report'])
     scope,rows = _candidate_phase_rows(scope_file)
-    state = _candidate_phase_status(scope_file,authority_file)
+    verified = batch._VerifiedReports()
+    state = _candidate_phase_status(scope_file,authority_file, verified=verified)
     if state['status'] not in {'stopped','complete','blocked'}:
         raise ValueError('phase_not_terminal')
     authority = batch._object(authority_file.parent,authority_file)
@@ -892,7 +899,7 @@ def _finish_candidate_phase(scope_file: Path, authority_file: Path) -> dict:
     _save(selection,{'schema_version':1,'archives':archives,'current_archive':len(archives)-1,
                      'financial_quality_reports':state['quality_reports']} if state['quality_reports'] else
                     {'schema_version':1,'archives':archives,'current_archive':len(archives)-1})
-    window = review_window_report.build_window(selection)
+    window = review_window_report._build_window(selection,verified)
     report = {'schema_version':1,'kind':'preaudit_private_candidate_phase_report','phase':state,'window':window}
     target = root/'phase-report.private.json'
     _save(target,report)
@@ -918,16 +925,19 @@ def _finish_candidate_phase(scope_file: Path, authority_file: Path) -> dict:
     return report
 
 
-def _write_candidate_phase_status(scope_file: Path, authority_file: Path) -> None:
+def _write_candidate_phase_status(scope_file: Path, authority_file: Path, *,
+                                  verified: batch._VerifiedReports | None = None) -> None:
     from apps.json_artifact import write_json_atomic
     target = scope_file.parent/'phase-status.private.json'
-    write_json_atomic(target,_candidate_phase_status(scope_file,authority_file),indent=2)
+    write_json_atomic(target,_candidate_phase_status(scope_file,authority_file, verified=verified),indent=2)
     os.chmod(target,0o600)
 
 
-def _candidate_phase_prerequisites(scope: dict, authority: dict) -> dict:
+def _candidate_phase_prerequisites(scope: dict, authority: dict, *,
+                                   verified: batch._VerifiedReports | None = None) -> dict:
     """Read same revision's earlier quality without changing its report or score."""
     from .flow_evals import _read_bound_artifact
+    verified = verified or batch._VerifiedReports()
     prerequisites = scope.get('prerequisites',[])
     for reference in authority['prior_plans']:
         if reference['source_revision'] != scope['candidate']:
@@ -938,8 +948,8 @@ def _candidate_phase_prerequisites(scope: dict, authority: dict) -> dict:
             return {'status':'pending','reason':'previous_quality_pending'}
         row = matches[0]
         plan = _read_bound_artifact(row['plan'])
-        report = batch.build_report(Path(plan['arms']['candidate']))
-        quality = _candidate_phase_quality(row,Path(row['plan']['file']),report)
+        report = verified.read(Path(plan['arms']['candidate']))
+        quality = _candidate_phase_quality(row,Path(row['plan']['file']),report, verified=verified)
         if quality['status'] != 'pass':
             return {'status':quality['status'],'case':row['alias'],'reason':'previous_quality_failure'}
     return {'status':'pass'}

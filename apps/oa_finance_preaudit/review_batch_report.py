@@ -894,6 +894,19 @@ def build_report(archive: Path) -> dict:
         raise ValueError(ERROR) from None
 
 
+class _VerifiedReports:
+    """One operation's fully validated reports; discard across native execution."""
+
+    def __init__(self) -> None:
+        self._reports: dict[Path, dict] = {}
+
+    def read(self, archive: Path) -> dict:
+        root = Path(archive).expanduser().absolute()
+        if root not in self._reports:
+            self._reports[root] = build_report(root)
+        return deepcopy(self._reports[root])
+
+
 def write_private_text(
     content: str, target: Path, *, evidence_roots: tuple[Path, ...]
 ) -> None:

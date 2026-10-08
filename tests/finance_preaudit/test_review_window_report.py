@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from apps.oa_finance_preaudit import review_window_report
+from apps.oa_finance_preaudit import review_batch_report, review_window_report
 from tests.finance_preaudit.test_review_batch_report import archive, digest, save
 from tests.finance_preaudit.test_review_cost_report import pair
 
@@ -53,6 +53,56 @@ def test_complete_window_keeps_failure_and_limited_success(tmp_path):
     assert report["comparison"]["status"] == "not_comparable"
     assert report["current"]["production_loaded"] == "not_established"
     assert str(tmp_path) not in json.dumps(report)
+
+
+def test_window_consumes_operation_report_without_revalidating_archive(tmp_path, monkeypatch):
+    root = archive(tmp_path)
+    selection = select(tmp_path, [root])
+    evidence = root / "calling-source/apps/example.py"
+    reads = []
+    original = Path.open
+
+    def observe(path, mode="r", *args, **kwargs):
+        if path == evidence and mode == "rb":
+            reads.append(path)
+        return original(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", observe)
+    reports = review_batch_report._VerifiedReports()
+    reports.read(root)
+    window = review_window_report._build_window(selection, reports)
+
+    assert window["history"][0]["acceptance"]["preview"] == "verified_closed"
+    assert len(reads) == 1
+
+
+@pytest.mark.parametrize("drift", ["content", "permissions", "symlink"])
+def test_next_window_operation_rejects_drift_in_bound_plugin_output(tmp_path, drift):
+    root = archive(tmp_path)
+    plugin = root / "reviewer/codex-home/plugins/controlled.py"
+    save(plugin, {"controlled": "original plugin evidence"})
+    plugin.parent.chmod(0o700)
+    plugin.parent.parent.chmod(0o700)
+    result = json.loads((root / "result.json").read_text())
+    result["output_files"] = {str(plugin): digest(plugin)}
+    save(root / "result.json", result)
+    selection = select(tmp_path, [root])
+    assert review_window_report.build_window(selection)["history"][0]["status"] == "verified_archive"
+
+    if drift == "content":
+        plugin.write_text("changed plugin evidence")
+    elif drift == "permissions":
+        plugin.chmod(0o644)
+    else:
+        target = plugin.with_name("other.py")
+        target.write_bytes(plugin.read_bytes())
+        target.chmod(0o600)
+        plugin.unlink()
+        plugin.symlink_to(target)
+
+    window = review_window_report.build_window(selection)
+    assert window["history"][0]["status"] == "rejected"
+    assert window["usage"]["status"] == "unknown"
 
 
 def test_unknown_contribution_cannot_be_called_total_cost(tmp_path):

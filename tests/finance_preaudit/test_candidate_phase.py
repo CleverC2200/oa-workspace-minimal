@@ -364,7 +364,7 @@ def test_parent_lock_rejects_concurrent_stage_without_dispatch(tmp_path, phase_s
     assert not Path(rows[0]['plan']['file']).with_name('plan.json.started.json').exists()
 
 
-def test_explicit_old_origin_and_legal_continuation_preserve_original_budget(tmp_path, phase_source):
+def test_explicit_old_origin_and_legal_continuation_preserve_original_budget(tmp_path, phase_source, monkeypatch):
     old_dir, new_dir = tmp_path / 'old', tmp_path / 'new'
     old_dir.mkdir(mode=0o700); new_dir.mkdir(mode=0o700)
     old_scope, old_auth, old_rows = phase(old_dir, phase_source, count=1)
@@ -390,6 +390,57 @@ def test_explicit_old_origin_and_legal_continuation_preserve_original_budget(tmp
     assert result['global_cli_starts'] == 2
     assert all(p.read_bytes() == data for p, data in originals.items())
     assert json.loads(current.read_text())['current']['file'] == str(scope.parent / 'candidate-phase-claim.private.json')
+    audit(rows[0])
+    roots = [Path(json.loads(Path(row['plan']['file']).read_text())['arms']['candidate'])
+             for row in (old_rows[0], rows[0])]
+    evidence = [root / 'calling-source/requirements-dev.txt' for root in roots]
+    reads = {path: 0 for path in evidence}
+    original_open = Path.open
+
+    def observe(path, mode='r', *args, **kwargs):
+        if path in reads and mode == 'rb':
+            reads[path] += 1
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'open', observe)
+    closed = review_experiment._finish_candidate_phase(scope, authority)
+    assert closed['phase']['budget']['global_cli_starts'] == 2
+    assert closed['window']['usage']['total_tokens'] == 220
+    assert list(reads.values()) == [1, 1]
+    evidence[0].write_text('changed prior archived source')
+    refreshed = review_experiment._candidate_phase_status(scope, authority)
+    assert refreshed['budget']['binding_status'] == 'unverified'
+
+
+def test_native_execution_discards_preflight_reports_before_rechecking_prior_budget(tmp_path, phase_source, monkeypatch):
+    old_dir, new_dir = tmp_path / 'old', tmp_path / 'new'
+    old_dir.mkdir(mode=0o700); new_dir.mkdir(mode=0o700)
+    old_scope, old_auth, old_rows = phase(old_dir, phase_source, count=1)
+    assert invoke(old_scope, old_auth, 'T0')['phase_cli_starts'] == 1
+    audit(old_rows[0])
+    scope, authority, _rows = phase(new_dir, phase_source, count=1, offset=10)
+    value = json.loads(scope.read_text())
+    value['prerequisites'] = [{**old_rows[0], 'audit_binding': ref(Path(old_rows[0]['plan']['file']).parent / 'candidate-audit-binding.private.json')}]
+    save(scope, value)
+    auth = json.loads(authority.read_text())
+    auth.update(scope_sha256=sha(scope),
+                parent_cumulative_authority=json.loads(old_auth.read_text())['parent_cumulative_authority'],
+                prior_phase_authority=ref(old_auth), prior_phase_scope=ref(old_scope),
+                prior_plans=[{**old_rows[0]['plan'], 'source_revision': value['candidate'], 'diagnostic': True}])
+    save(authority, auth)
+    old_root = Path(json.loads(Path(old_rows[0]['plan']['file']).read_text())['arms']['candidate'])
+    monkeypatch.setenv('OA_REVIEW_API_KEY', 'offline-placeholder')
+
+    def external_execute(plan_file):
+        result = review_experiment._host(plan_file, 'candidate', execute=True)
+        (old_root / 'calling-source/requirements-dev.txt').write_text('changed during native execution')
+        return result
+
+    outcome = review_experiment._run_candidate_phase(scope, authority, 'T0', caller_file=CALLER,
+                                                    execute=external_execute)
+    assert outcome['status'] == 'stopped'
+    assert outcome['reason'] == 'prior_execution_untrusted'
+    assert outcome['phase_cli_starts'] == 1
 
 
 @pytest.mark.parametrize('untrusted', ['unknown_process', 'missing_result'])
