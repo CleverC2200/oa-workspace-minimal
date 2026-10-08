@@ -32,7 +32,7 @@ OA GET 及已有白名单只读 POST 的网络连接异常最多重试一次，�
 
 ```bash
 .venv/bin/python -m scripts.finance_preaudit_concurrency_probe \
-  --rolling --adaptive --capacity 6 --confirm-write YES \
+  --rolling --adaptive --capacity 3 --max-capacity 6 --confirm-write YES \
   --recover-confirmed-no-write-once YES
 ```
 
