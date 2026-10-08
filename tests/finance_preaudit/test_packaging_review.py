@@ -1,5 +1,8 @@
 import io
 import json
+import os
+import stat
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -42,7 +45,7 @@ def test_schema_and_unique_fence_preserve_business_fields(tmp_path, excel):
         reviewer.check_provider_schema({'type': 'array', 'items': {'type': 'object', 'properties': {}}})
 
 
-def fake_process(monkeypatch, body, *, native_home, after=None):
+def fake_process(monkeypatch, body, *, native_home, after=None, inspect_start=None):
     monkeypatch.setenv('OA_REVIEW_API_KEY', 'unit-test-key')
     monkeypatch.setenv('OPENAI_API_KEY', 'host-key-not-for-review')
     monkeypatch.setenv('CODEX_API_KEY', 'host-key-not-for-review')
@@ -64,6 +67,8 @@ def fake_process(monkeypatch, body, *, native_home, after=None):
             self.stdout = kwargs['stdout']
             self.home = Path(kwargs['env']['CODEX_HOME'])
             self.store = Path(next(value.split('=', 1)[1].strip(chr(34)) for value in command if value.startswith('sqlite_home=')))
+            self.command = command
+            if inspect_start: inspect_start(command, self.target.parent)
         def communicate(self, *, input, timeout):
             assert 'view_image' in input and timeout == 60
             self.stdout.write('{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000001"}\n{"type":"turn.completed"}\n')
@@ -386,3 +391,86 @@ def test_native_receipt_replaced_after_open_is_not_retained(tmp_path, monkeypatc
     assert replaced == [True]
     assert result['status'] == 'failed' and result['error_code'] == 'codex_tool_receipt_unavailable'
     assert result['tool_receipt_files'] == [] and result['decision_file'] is None
+
+
+def test_packaging_review_grants_only_its_private_visual_aux_directory(tmp_path, monkeypatch):
+    path = action(tmp_path)
+    packet = json.loads(path.with_name('review-packet.json').read_text())
+    before = {p.name:p.read_bytes() for p in path.parent.glob('*.json')}
+    seen = []
+    def observe(command, directory):
+        aux = directory / 'visual-aux'
+        metadata = aux.lstat()
+        assert stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == os.getuid()
+        assert stat.S_IMODE(metadata.st_mode) == 0o700
+        profile = tomllib.loads(next(v for v in command if v.startswith('permissions.oa-reviewer=')))['permissions']['oa-reviewer']
+        assert profile['extends'] == ':read-only'
+        assert {k:v for k,v in profile['filesystem'].items() if v == 'write'} == {str(aux):'write'}
+        assert profile['filesystem'][str(tmp_path)] == 'read'
+        for protected in (path, path.with_name('state.json'), path.with_name('material.json'),
+                          path.with_name('review-packet.json'), directory/'decision-schema.json',
+                          directory/'events.jsonl', directory/'other-visual-aux', tmp_path/'other-audit/visual-aux'):
+            assert not protected.is_relative_to(aux)
+            assert str(protected) not in {k for k,v in profile['filesystem'].items() if v == 'write'}
+        assert command[command.index('--model')+1] == 'gpt-6.1-sol'
+        assert 'model_reasoning_effort="medium"' in command and 'service_tier="default"' in command
+        seen.append(aux)
+    fake_process(monkeypatch, json.dumps(draft(packet)), native_home=tmp_path/'native-auth', inspect_start=observe)
+    result = reviewer.review(path, project_root=tmp_path, timeout_seconds=60)
+    assert result['status'] == 'draft_ready' and result['business_fields_changed'] is False
+    assert seen == [Path(result['evidence_directory'])/'visual-aux']
+    assert {p.name:p.read_bytes() for p in path.parent.glob('*.json')} == before
+    prompt = Path(result['evidence_directory']).joinpath('prompt.txt').read_text()
+    assert str(seen[0]) in prompt and 'Base64' in prompt and 'view_image' in prompt and '无损' in prompt
+
+
+@pytest.mark.parametrize('damage', ['mode', 'replacement', 'symlink'])
+def test_packaging_review_rejects_changed_visual_aux_directory(tmp_path, monkeypatch, damage):
+    path = action(tmp_path)
+    packet = json.loads(path.with_name('review-packet.json').read_text())
+    before = {p.name:p.read_bytes() for p in path.parent.glob('*.json')}
+    captured = []
+    def observe(_command, directory):
+        captured.append(directory/'visual-aux')
+    def change():
+        aux = captured[0]
+        if damage == 'mode':
+            aux.chmod(0o777)
+        else:
+            aux.rename(aux.with_name('original-visual-aux'))
+            if damage == 'replacement': aux.mkdir(mode=0o700)
+            else: aux.symlink_to(tmp_path, target_is_directory=True)
+    fake_process(monkeypatch, json.dumps(draft(packet)), native_home=tmp_path/'native-auth',
+                 inspect_start=observe, after=change)
+    result = reviewer.review(path, project_root=tmp_path, timeout_seconds=60)
+    assert result['status'] == 'failed' and result['decision_file'] is None
+    assert result['business_fields_changed'] is False
+    assert {p.name:p.read_bytes() for p in path.parent.glob('*.json')} == before
+
+
+def test_packaging_calls_have_distinct_visual_aux_write_scopes(tmp_path, monkeypatch):
+    path = action(tmp_path)
+    packet = json.loads(path.with_name('review-packet.json').read_text())
+    scopes = []
+    def observe(command, directory):
+        filesystem = tomllib.loads(next(v for v in command if v.startswith('permissions.oa-reviewer=')))['permissions']['oa-reviewer']['filesystem']
+        scopes.append({k for k,v in filesystem.items() if v == 'write'})
+        assert scopes[-1] == {str(directory/'visual-aux')}
+    for call in range(2):
+        fake_process(monkeypatch, json.dumps(draft(packet)), native_home=tmp_path/f'native-auth-{call}', inspect_start=observe)
+        result = reviewer.review(path, project_root=tmp_path, timeout_seconds=60)
+        assert result['status'] == 'draft_ready'
+    assert len(scopes) == 2 and scopes[0].isdisjoint(scopes[1])
+
+
+def test_packaging_review_rejects_untrusted_aux_owner_before_native_launch(tmp_path, monkeypatch):
+    path = action(tmp_path)
+    packet = json.loads(path.with_name('review-packet.json').read_text())
+    launches = []
+    fake_process(monkeypatch, json.dumps(draft(packet)), native_home=tmp_path/'native-auth',
+                 inspect_start=lambda *_args: launches.append(True))
+    current_uid = os.getuid()
+    monkeypatch.setattr(reviewer.worker.os, 'getuid', lambda: current_uid + 1)
+    result = reviewer.review(path, project_root=tmp_path, timeout_seconds=60)
+    assert result['status'] == 'failed' and result['decision_file'] is None
+    assert launches == []
