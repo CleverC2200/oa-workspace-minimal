@@ -215,10 +215,20 @@ def test_next_pair_waits_for_independent_quality_after_actual_preview(tmp_path, 
         caller._previous_quality(scope, target)
 
 
-@pytest.mark.parametrize('role, outcome, expected', [('engineering_draft', 'pass', 'unverified'),
-                                                    ('historical_crosscheck', 'pass', 'pass'),
-                                                    ('historical_crosscheck', 'fail', 'fail')])
-def test_baseline_next_pair_requires_complete_independent_audit(tmp_path, phase_source, monkeypatch, role, outcome, expected):
+@pytest.mark.parametrize('role, outcome, expected, unique', [('engineering_draft', 'pass', 'unverified', None),
+                                                    ('historical_crosscheck', 'pass', 'pass', None),
+                                                    ('historical_crosscheck', 'fail', 'fail', None),
+                                                    pytest.param('historical_crosscheck', 'unverified', 'unverified', False,
+                                                                 id='business_scope_unknown'),
+                                                    pytest.param('historical_crosscheck', 'unverified', 'unverified', True,
+                                                                 id='business_scope_unique_unknown_stops'),
+                                                    pytest.param('historical_crosscheck', 'unverified', 'unverified', None,
+                                                                 id='business_scope_unmarked_unknown_stops'),
+                                                    pytest.param('historical_crosscheck', 'unverified', 'unverified', 'late',
+                                                                 id='business_scope_late_unknown_stops'),
+                                                    pytest.param('engineering_draft', 'unverified', 'unverified', False,
+                                                                 id='business_scope_missing_independent_audit_stops')])
+def test_baseline_next_pair_requires_complete_independent_audit(tmp_path, phase_source, monkeypatch, role, outcome, expected, unique):
     from apps.oa_finance_preaudit import flow_evals, review_batch_report as batch
     from apps.oa_finance_preaudit.review_comparison import _ComparisonCaller
     from tests.finance_preaudit.test_review_experiment import save
@@ -228,12 +238,24 @@ def test_baseline_next_pair_requires_complete_independent_audit(tmp_path, phase_
     row = rows[0]
     path = Path(row['plan']['file'])
     plan_value = json.loads(path.read_text())
+    baseline_checklist, baseline_expectations = row['checklist'], row['expectations']
+    if unique is not None:
+        original = json.loads(Path(row['checklist']['file']).read_text())
+        original['business_scope_unique'] = False if unique == 'late' else unique
+        name = path.parent / 'baseline-checklist.json'
+        save(name, original)
+        baseline_checklist = ref(name)
+        baseline_expectations = flow_evals.freeze_financial_expectations(
+            baseline_checklist, path.parent / 'baseline-expectations.json')
     e._save(path.with_name(path.name + '.started.json'), {'plan_sha256': ref(path)['sha256']})
     e._host(path, 'baseline', execute=True)
+    if unique == 'late':
+        baseline_expectations = flow_evals.freeze_financial_expectations(
+            baseline_checklist, path.parent / 'late-baseline-expectations.json')
     root = Path(plan_value['arms']['baseline'])
     report = batch.build_report(root)
     action = Path(json.loads((root / 'manifest.json').read_text())['action_file'])
-    checklist = json.loads(Path(row['checklist']['file']).read_text())
+    checklist = json.loads(Path(baseline_checklist['file']).read_text())
     assessment = path.parent / 'baseline-assessment.json'
     save(assessment, {'schema_version': 1, 'method': 'independent_manual',
                      'reviewer_role': role, 'reviewer_record': 'controlled-only',
@@ -241,7 +263,7 @@ def test_baseline_next_pair_requires_complete_independent_audit(tmp_path, phase_
                      'item_key': report['financial_binding']['item_key'],
                      'archive_manifest_sha256': ref(root / 'manifest.json')['sha256'],
                      'result_sha256': ref(root / 'result.json')['sha256'],
-                     'checklist_sha256': row['checklist']['sha256'],
+                     'checklist_sha256': baseline_checklist['sha256'],
                      'output_refs': [ref(p) for p in [root / 'result.json', root / 'reviewer/decision.json',
                                      action.with_name('review-decision.json'), action.with_name('remark.txt'),
                                      action.with_name('execution-receipt.json')]],
@@ -251,16 +273,20 @@ def test_baseline_next_pair_requires_complete_independent_audit(tmp_path, phase_
     quality = path.parent / 'baseline-quality.json'
     save(quality, flow_evals.build_financial_quality_report([{
         'item_key': report['financial_binding']['item_key'], 'archive': ref(root / 'manifest.json'),
-        'checklist': row['checklist'], 'assessment': ref(assessment), 'expectations': row['expectations']}]))
+        'checklist': baseline_checklist, 'assessment': ref(assessment), 'expectations': baseline_expectations}]))
     save(path.parent / 'baseline-audit-binding.private.json', {
         'quality_report': ref(quality), 'assessment': ref(assessment),
-        'checklist': row['checklist'], 'expectations': row['expectations']})
-    row.update(baseline_checklist=row['checklist'], baseline_expectations=row['expectations'])
+        'checklist': baseline_checklist, 'expectations': baseline_expectations})
+    row.update(baseline_checklist=baseline_checklist, baseline_expectations=baseline_expectations)
 
     actual = _ComparisonCaller._baseline_quality(row, path, report)
 
     assert actual['status'] == expected
     assert actual.get('audit_complete') is (role == 'historical_crosscheck')
+    if unique is False and role == 'historical_crosscheck':
+        assert actual['comparison_audit'] == 'verified_business_scope_unknown'
+        assert actual['status'] == 'unverified'
+        assert json.loads(quality.read_text())['eligible'] is False
     # An independently confirmed production defect stays in the comparison.
     # Candidate quality still must pass before the next pair can advance.
     e._host(path, 'candidate', execute=True)
@@ -272,11 +298,90 @@ def test_baseline_next_pair_requires_complete_independent_audit(tmp_path, phase_
     caller = _ComparisonCaller(caller_file=Path(__file__), identity_bank={}, adapter_file=ref(adapter))
     target = {'alias': 'second', 'plan': row['plan']}
     scope = {'cases': [row, target]}
-    if role == 'engineering_draft':
+    if role == 'engineering_draft' or outcome == 'unverified' and unique is not False:
         with pytest.raises(ValueError, match='previous_baseline_quality_unverified'):
             caller._previous_quality(scope, target)
     else:
         caller._previous_quality(scope, target)
+    if unique is False and role == 'historical_crosscheck':
+        assessment_file = path.parent / 'assessment.json'
+        candidate_assessment = json.loads(assessment_file.read_text())
+        for check in candidate_assessment['checks']:
+            check['outcome'] = 'unverified'
+        unknown_assessment = path.parent / 'candidate-unknown-assessment.json'
+        save(unknown_assessment, candidate_assessment)
+        candidate_report = batch.build_report(Path(plan_value['arms']['candidate']))
+        unknown_quality = path.parent / 'candidate-unknown-quality.json'
+        save(unknown_quality, flow_evals.build_financial_quality_report([{
+            'item_key': candidate_report['financial_binding']['item_key'],
+            'archive': ref(Path(plan_value['arms']['candidate']) / 'manifest.json'),
+            'checklist': row['checklist'], 'assessment': ref(unknown_assessment), 'expectations': row['expectations']}]))
+        save(path.parent / 'candidate-audit-binding.private.json', {
+            'quality_report': ref(unknown_quality), 'assessment': ref(unknown_assessment), 'checklist': row['checklist']})
+        with pytest.raises(ValueError, match='previous_quality_unverified'):
+            caller._previous_quality(scope, target)
+
+
+def test_explicit_baseline_scope_unknown_cannot_hide_unobserved_original_image(tmp_path, sources, monkeypatch):
+    from apps.oa_finance_preaudit import flow_evals, review_batch_report as batch
+    from apps.oa_finance_preaudit.review_comparison import _ComparisonCaller
+    from tests.finance_preaudit.test_review_experiment import save
+
+    monkeypatch.setenv('OA_REVIEW_API_KEY', 'offline-placeholder')
+    path, _authority, before, _after = plan(tmp_path, sources, purpose='diagnostic', image=True)
+    manifest = json.loads((before / 'manifest.json').read_text())
+    action = Path(manifest['action_file'])
+    packet = json.loads(action.with_name('review-packet.json').read_text())
+    names = ('SKILL.md', 'references/result-contract.md', 'references/observation-contract.md',
+             'references/flow-engine-contract.md', 'references/flows/business-entertainment.md')
+    checklist = tmp_path / 'baseline-checklist.json'
+    save(checklist, {'schema_version': 1, 'workflow_key': 'business_entertainment',
+                    'source_kind': 'synthetic', 'scenario': 'ordinary_payment',
+                    'review_scope': 'complete_financial_review', 'business_scope_unique': False,
+                    'source_refs': [ref(Path(p)) for p in manifest['originals']],
+                    'rule_refs': [ref(before / 'calling-source/.agents/skills/oa-finance-preaudit' / name)
+                                  for name in names],
+                    'checks': [{'id': item['item_key'], 'item_key': item['item_key'],
+                                'expected': 'Controlled business scope is explicitly not unique.'}
+                               for item in packet['items']]})
+    expectations = flow_evals.freeze_financial_expectations(ref(checklist), tmp_path / 'baseline-expectations.json')
+    e._save(path.with_name(path.name + '.started.json'), {'plan_sha256': ref(path)['sha256']})
+    e._host(path, 'baseline', execute=True)
+    report = batch.build_report(before)
+    assert report['acceptance']['original_images']['status'] == 'incomplete'
+    assessment = tmp_path / 'baseline-assessment.json'
+    save(assessment, {'schema_version': 1, 'method': 'independent_manual',
+                     'reviewer_role': 'historical_crosscheck', 'reviewer_record': 'controlled-only',
+                     'reviewed_at': datetime.now(timezone.utc).isoformat(),
+                     'item_key': report['financial_binding']['item_key'],
+                     'archive_manifest_sha256': ref(before / 'manifest.json')['sha256'],
+                     'result_sha256': ref(before / 'result.json')['sha256'], 'checklist_sha256': ref(checklist)['sha256'],
+                     'output_refs': [ref(p) for p in [before / 'result.json', before / 'reviewer/decision.json',
+                                     action.with_name('review-decision.json'), action.with_name('remark.txt'),
+                                     action.with_name('execution-receipt.json')]],
+                     'checks': [{'id': item['item_key'], 'outcome': 'unverified',
+                                 'reason': 'Controlled old business scope has no unique result.'}
+                                for item in packet['items']]})
+    quality = tmp_path / 'baseline-quality.json'
+    save(quality, flow_evals.build_financial_quality_report([{
+        'item_key': report['financial_binding']['item_key'], 'archive': ref(before / 'manifest.json'),
+        'checklist': ref(checklist), 'assessment': ref(assessment), 'expectations': expectations}]))
+    save(path.parent / 'baseline-audit-binding.private.json', {
+        'quality_report': ref(quality), 'assessment': ref(assessment), 'checklist': ref(checklist),
+        'expectations': expectations})
+    row = {'alias': 'first', 'plan': ref(path), 'baseline_checklist': ref(checklist),
+           'baseline_expectations': expectations}
+    target = {'alias': 'second', 'plan': ref(path)}
+    adapter = tmp_path / 'neutral-adapter.py'
+    adapter.write_text('"""No reference selection or financial qualification."""\n')
+    adapter.chmod(0o600)
+    caller = _ComparisonCaller(caller_file=Path(__file__), identity_bank={}, adapter_file=ref(adapter))
+
+    with pytest.raises(ValueError, match='previous_baseline_images_unverified'):
+        caller._previous_quality({'cases': [row, target]}, target)
+
+    assert json.loads(quality.read_text())['cases'][0]['verdict'] == 'unverified'
+    assert json.loads(quality.read_text())['eligible'] is False
 
 
 @pytest.mark.parametrize('fault, reason', [
