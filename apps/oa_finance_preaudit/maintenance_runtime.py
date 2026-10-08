@@ -160,13 +160,27 @@ try:
     for item in pending:
         state = by_key[(item['workflow_key'], item['item_key'], item['attempt'])]
         attempt = flows / state['workflow_key'] / 'cases' / state['case_key'] / ('attempt-' + str(state['attempt']))
-        if state['execution_state'] == 'review_required':
+        if state['execution_state'] == 'collecting':
+            reader = flow_engine.FlowEngine(root=flows, discover_candidates=None, collect_material=None)
+            if (not reader._attempt_identity_matches(attempt, state, require_material=False)
+                    or state.get('write_state') != 'not_requested' or state.get('write_authorized') is not False
+                    or state.get('mode') not in {'preview', 'controlled_write'}
+                    or state.get('action') != 'collecting'
+                    or json.loads((attempt / 'action.json').read_bytes()) != state
+                    or any(os.path.lexists(attempt / name) for name in ('writer-boundary.json', 'execution-receipt.json',
+                        'review-decision.json', 'remark.txt', 'submission-envelope.json'))):
+                raise ValueError()
+        elif state['execution_state'] == 'review_required':
             if not flow_engine.FlowEngine.resumable_review(flows, state):
                 raise ValueError()
         elif state['execution_state'] == 'needs_admin':
-            if not (item_failure.isolated(attempt, state) or reconciliation._trusted_quarantine(flows, state)):
+            isolated = item_failure.isolated(attempt, state)
+            if not (isolated or reconciliation._trusted_quarantine(flows, state)):
                 raise ValueError()
-            if state.get('material_file') is not None or state.get('review_packet_file') is not None:
+            # A verified item receipt binds the failure artifacts and proves no write;
+            # a material failure cannot also promise a valid frozen material bundle.
+            material_failure = isolated and state.get('reason') == 'material_collection_failed'
+            if not material_failure and (state.get('material_file') is not None or state.get('review_packet_file') is not None):
                 flow_engine._validate_frozen_review_inputs(attempt_root=attempt, state=state, workflow_key=state['workflow_key'])
         else:
             raise ValueError()

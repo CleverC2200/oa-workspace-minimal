@@ -67,6 +67,12 @@ def test_current_gate_requires_real_readonly_authorization_and_frozen_proof():
 
 @pytest.mark.parametrize('scenario,code', [
     ('valid_preview', None),
+    ('valid_collecting', None),
+    ('damaged_collecting_identity', 'maintenance_frozen_inputs_untrusted'),
+    ('collecting_writer_artifact', 'maintenance_frozen_inputs_untrusted'),
+    ('isolated_material_failure', None),
+    ('damaged_nonmaterial_isolation', 'maintenance_frozen_inputs_untrusted'),
+    ('damaged_material_failure_receipt', 'maintenance_frozen_inputs_untrusted'),
     ('missing_policy', 'maintenance_authorization_untrusted'),
     ('missing_packaging_authorization', 'maintenance_authorization_untrusted'),
     ('unsafe_policy', 'maintenance_authorization_untrusted'),
@@ -88,8 +94,26 @@ def test_target_owned_current_validators_check_policy_and_pending_frozen_preview
     interpreter.write_text('#!/bin/sh\nexec "' + sys.executable + '" "$@"\n')
     interpreter.chmod(0o700)
     flows = tmp_path / 'runtime/finance_preaudit_flows'
-    action = _engine(flows, 'preview-current-inputs').next_action('travel_expense')
-    path = Path(action['action_file'])
+    engine = _engine(flows, 'preview-current-inputs')
+    if 'collecting' in scenario:
+        monkeypatch.setattr(engine, '_prepare_attempt', lambda _root: (_ for _ in ()).throw(SystemExit('pause-before-collect')))
+        with pytest.raises(SystemExit, match='pause-before-collect'):
+            engine.next_action('travel_expense')
+        path = next(flows.glob('travel_expense/cases/*/attempt-1/action.json'))
+        if scenario == 'collecting_writer_artifact':
+            path.with_name('writer-boundary.json').write_text('{}')
+    else:
+        action = engine.next_action('travel_expense')
+        path = Path(action['action_file'])
+        if 'material_failure' in scenario:
+            path.with_name('material.json').write_text('{}')
+            engine._persist_attempt_needs_admin(path, 'material_collection_failed',
+                failure_details={'failure_detail_code': 'attachment_download_failed'})
+            if scenario == 'damaged_material_failure_receipt':
+                path.with_name('manual-review-receipt.json').write_text('{}')
+    if scenario == 'damaged_nonmaterial_isolation':
+        path.with_name('material.json').write_text('{}')
+        engine._persist_attempt_needs_admin(path, 'codex_decision_invalid')
     state = json.loads(path.with_name('state.json').read_text())
     if scenario == 'damaged_preview_material':
         path.with_name('material.json').write_text('{}')
@@ -109,6 +133,9 @@ def test_target_owned_current_validators_check_policy_and_pending_frozen_preview
     snapshot = {'reconciliation': reconciliation.reconcile(flows,
         pending_rows=[{'request_id': state['request_id'], 'received_at': state['received_at'], 'workflow_key': 'travel_expense'}],
         handled_rows=[])}
+    if scenario == 'damaged_collecting_identity':
+        state['request_id'] = 'another-request'
+        path.with_name('state.json').write_text(json.dumps(state))
     status_file = tmp_path / 'status.json'
     raw = json.dumps(snapshot).encode()
     status_file.write_bytes(raw)

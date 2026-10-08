@@ -12,6 +12,7 @@ import secrets
 import re
 import stat
 import subprocess
+import sys
 from typing import Callable
 
 from apps.oa_approval import runtime_control
@@ -35,6 +36,16 @@ def _payload(record: dict) -> dict:
 
 
 def _private_bytes(path: Path, *, max_bytes: int = 32_000_000, private: bool = True) -> bytes:
+    # Preserve literal paths in invocation/hash bindings. Only the OS-owned macOS
+    # /tmp alias is translated for no-follow reads; all remaining links stay unsafe.
+    alias_metadata = None
+    if sys.platform == 'darwin' and path.parts[:2] == ('/', 'tmp'):
+        alias = Path('/tmp')
+        alias_metadata = alias.lstat()
+        if stat.S_ISLNK(alias_metadata.st_mode):
+            if alias_metadata.st_uid != 0 or os.readlink(alias) not in {'private/tmp', '/private/tmp'}:
+                raise ValueError(BLOCKED)
+            path = Path('/private/tmp').joinpath(*path.parts[2:])
     info = path.lstat()
     if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
         or info.st_mode & (0o077 if private else 0o022)):
@@ -42,6 +53,12 @@ def _private_bytes(path: Path, *, max_bytes: int = 32_000_000, private: bool = T
     raw = runtime_control.read_control_bytes(path, max_bytes=max_bytes)
     if raw is None:
         raise ValueError(BLOCKED)
+    if alias_metadata is not None:
+        current_alias = Path('/tmp').lstat()
+        if any(getattr(current_alias, field) != getattr(alias_metadata, field) for field in (
+            'st_dev', 'st_ino', 'st_mtime_ns', 'st_mode', 'st_uid',
+        )):
+            raise ValueError(BLOCKED)
     current = path.lstat()
     if (info.st_dev, info.st_ino, info.st_mtime_ns) != (
         current.st_dev, current.st_ino, current.st_mtime_ns

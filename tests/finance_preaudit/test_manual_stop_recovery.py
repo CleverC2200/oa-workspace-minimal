@@ -278,3 +278,77 @@ def test_cli_rejects_unverified_candidate_without_clearing(tmp_path, capsys):
     result = json.loads(capsys.readouterr().out)
     assert result["stop_cleared"] is False
     assert (target / "runtime/stop-preaudit.flag").exists()
+
+
+def test_original_evidence_accepts_system_tmp_alias_without_changing_literal_binding(tmp_path):
+    from apps.oa_finance_preaudit import manual_stop_recovery
+    physical = Path('/private/tmp')
+    if not Path('/tmp').is_symlink() or Path('/tmp').resolve() != physical:
+        pytest.skip('macOS system tmp alias required')
+    target, evidence, _snapshot = _environment(tmp_path)
+    # Move references under the actual trusted system alias; keep the invocation's literal strings.
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix='oa-original-evidence-', dir='/tmp') as directory:
+        alias = Path('/tmp') / Path(directory).name
+        literal = alias / 'binding.json'
+        binding = json.loads(evidence.read_text())
+        old_conflict_path = binding['original_conflict_status']['path']
+        for key in ('original_status', 'original_conflict_status'):
+            value = json.loads(Path(binding[key]['path']).read_text())
+            binding[key] = _write(alias / (key + '.json'), value)
+        terminal_value = json.loads(Path(binding['original_exit']['path']).read_text())
+        source = Path(terminal_value['source_file']['path']).read_text().replace(
+            old_conflict_path, binding['original_conflict_status']['path'])
+        source_file = alias / 'original-source.jsonl'
+        source_file.write_text(source)
+        source_file.chmod(0o600)
+        terminal_value['source_file'] = {'path':str(source_file), 'sha256':hashlib.sha256(source.encode()).hexdigest()}
+        binding['original_exit'] = _write(alias / 'original-exit.json', terminal_value)
+        _write(literal, binding)
+        parsed = json.loads(manual_stop_recovery._private_bytes(literal))
+        manifest, terminal = manual_stop_recovery._original_evidence(target, parsed)
+        assert terminal['exit_code'] == 1
+        assert manifest['children_reaped'] is True
+        assert parsed['original_exit']['path'].startswith('/tmp/')
+        assert (target / 'runtime/stop-preaudit.flag').exists()
+
+
+@pytest.mark.parametrize('link', ['parent', 'file'])
+def test_original_private_evidence_rejects_non_system_symlinks(tmp_path, link):
+    from apps.oa_finance_preaudit import manual_stop_recovery
+    folder = tmp_path / 'actual'
+    _write(folder / 'evidence.json', {'trusted': True})
+    if link == 'parent':
+        (tmp_path / 'alias').symlink_to(folder, target_is_directory=True)
+        path = tmp_path / 'alias/evidence.json'
+    else:
+        path = tmp_path / 'evidence.json'
+        path.symlink_to(folder / 'evidence.json')
+    with pytest.raises((ValueError, RuntimeError)):
+        manual_stop_recovery._private_bytes(path)
+
+
+def test_private_evidence_rejects_file_replacement_during_read(tmp_path, monkeypatch):
+    from apps.oa_finance_preaudit import manual_stop_recovery
+    path = tmp_path / 'evidence.json'
+    _write(path, {'trusted': True})
+    real_read = manual_stop_recovery.runtime_control.read_control_bytes
+    def replace_after_read(target, **kwargs):
+        raw = real_read(target, **kwargs)
+        replacement = tmp_path / 'replacement.json'
+        _write(replacement, {'trusted': True})
+        replacement.replace(target)
+        return raw
+    monkeypatch.setattr(manual_stop_recovery.runtime_control, 'read_control_bytes', replace_after_read)
+    with pytest.raises(ValueError, match='manual_stop_recovery_blocked'):
+        manual_stop_recovery._private_bytes(path)
+
+
+def test_private_evidence_rejects_untrusted_tmp_alias(tmp_path, monkeypatch):
+    from apps.oa_finance_preaudit import manual_stop_recovery
+    if not Path('/tmp').is_symlink():
+        pytest.skip('system tmp alias required')
+    monkeypatch.setattr(manual_stop_recovery.sys, 'platform', 'darwin')
+    monkeypatch.setattr(manual_stop_recovery.os, 'readlink', lambda _path: '/untrusted/tmp')
+    with pytest.raises(ValueError, match='manual_stop_recovery_blocked'):
+        manual_stop_recovery._private_bytes(Path('/tmp/never-read.json'))
