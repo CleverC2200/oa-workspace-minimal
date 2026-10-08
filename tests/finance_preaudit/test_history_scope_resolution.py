@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from apps.oa_finance_preaudit import flow_evals
+from tests.finance_preaudit.source_review_fixture import source_review
 from tests.finance_preaudit.test_financial_quality_assessment import _artifact, _scene_reviews
 
 
@@ -54,7 +55,8 @@ def _resolved_reviews(tmp_path, monkeypatch, *, source_kind="real_archive", late
     with monkeypatch.context() as clock:
         clock.setattr(flow_evals, "datetime", FrozenClock)
         review["expectations"] = flow_evals.freeze_financial_expectations(
-            review["checklist"], root / "new-window-expectations.json", history_resolution=resolution)
+            review["checklist"], root / "new-window-expectations.json", history_resolution=resolution,
+            source_review=source_review(root, review["checklist"]) if source_kind == "real_archive" else None)
     assessment = json.loads(Path(review["assessment"]["file"]).read_text())
     assessment["checklist_sha256"] = review["checklist"]["sha256"]
     review["assessment"] = _artifact(root, "new-window-assessment.json", assessment)
@@ -226,6 +228,7 @@ def test_freeze_rejects_incomplete_or_unbound_manual_explanation(tmp_path, monke
     changed = _artifact(root, "invalid-resolution.json", record)
     destination = root / "rejected-freeze.json"
     with pytest.raises(ValueError, match="financial_history_resolution_invalid"):
-        flow_evals.freeze_financial_expectations(first["checklist"], destination, history_resolution=changed)
+        flow_evals.freeze_financial_expectations(first["checklist"], destination, history_resolution=changed,
+            source_review=source_review(root, first["checklist"]))
     assert not destination.exists()
     assert all(path.read_bytes() == raw for path, raw in originals.items())

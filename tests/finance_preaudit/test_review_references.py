@@ -16,6 +16,7 @@ import pytest
 from apps.oa_approval import flow as approval_flow
 from apps.oa_finance_preaudit import flow_engine, flow_evals, review_batch_report as batch
 from apps.oa_finance_preaudit import review_experiment as experiment, review_references as references
+from tests.finance_preaudit.source_review_fixture import source_review
 from tests.finance_preaudit.test_candidate_phase import phase_source  # noqa: F401
 from tests.finance_preaudit.test_financial_quality_assessment import _original_history
 from tests.finance_preaudit.test_flow_engine_submission import _material
@@ -96,7 +97,7 @@ def _consumed_reference(tmp_path, phase_source, monkeypatch, *, schema=3, execut
     rules = ('SKILL.md', 'references/result-contract.md', 'references/observation-contract.md',
              'references/flow-engine-contract.md', 'references/flows/business-entertainment.md')
     checks = [{'id': item['item_key'], 'item_key': item['item_key'],
-               'expected': 'Controlled neutral expectation, not real financial acceptance.'}
+               'expected': 'Controlled neutral expectation, not real financial acceptance.', 'expected_status': 'pass'}
               for item in packet['items']]
     assert len(checks) == 4
     checklist = _write(tmp_path / 'checklist.json', {'schema_version': 1,
@@ -127,7 +128,8 @@ def _consumed_reference(tmp_path, phase_source, monkeypatch, *, schema=3, execut
                 'original_basis': 'Controlled original evidence supports a narrower scope.',
                 'reason': 'The old scope and conflict are retained.'}]})
     freeze = flow_evals.freeze_financial_expectations(
-        checklist, tmp_path / 'expectations.json', history_resolution=resolution)
+        checklist, tmp_path / 'expectations.json', history_resolution=resolution,
+        source_review=source_review(tmp_path, checklist))
     refs = {'plan': references.reference(plan), 'arm': 'candidate',
             'manifest': references.reference(root / 'manifest.json'),
             'checklist': checklist, 'freeze': freeze}
@@ -278,6 +280,11 @@ def test_new_window_cannot_reuse_drifted_or_unbound_originals(
         else:
             freeze['frozen_at'] = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
         refs['freeze'] = _write(tmp_path / 'changed-freeze.json', freeze)
+        if fault == 'late':
+            # A new original-review declaration rejects a future freeze before report projection.
+            with pytest.raises(ValueError, match='financial_source_review_invalid'):
+                flow_evals.build_financial_quality_report([_review(refs)])
+            return
         refs['quality'] = _write(tmp_path / 'changed-quality.json',
             flow_evals.build_financial_quality_report([_review(refs)]))
     elif fault == 'projection':

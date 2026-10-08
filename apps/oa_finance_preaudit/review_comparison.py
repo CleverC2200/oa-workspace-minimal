@@ -360,6 +360,9 @@ class _ComparisonCaller:
                   'financial_history_resolution_invalid')
             flow_evals._history_scope_resolution(freeze['history_resolution'], checklist_ref,
                                                 checklist, freeze['frozen_at'])
+        if not (root / 'result.json').exists() or freeze.get('source_review') is not None:
+            flow_evals._validate_source_review(freeze.get('source_review'), checklist_ref,
+                                              checklist, freeze['frozen_at'])
 
     def verify_scope(self, scope_ref):
         scope = _read(scope_ref)

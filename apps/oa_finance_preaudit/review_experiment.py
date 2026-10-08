@@ -558,6 +558,11 @@ def _run_candidate_phase_locked(scope_file: Path, authority_file: Path, alias: s
         index = [value[0]['alias'] for value in rows].index(alias)
         if counts[index] != 0:
             raise ValueError('candidate_already_started')
+        from . import flow_evals
+        checklist = flow_evals._read_bound_artifact(row['checklist'])
+        freeze = flow_evals._read_bound_artifact(row['expectations'])
+        flow_evals._validate_source_review(freeze.get('source_review'), row['checklist'],
+                                          checklist, freeze['frozen_at'])
         budget = _candidate_phase_budget(authority, rows, verified=verified)
         prerequisite = _candidate_phase_prerequisites(scope,authority, verified=verified)
         if prerequisite['status'] == 'pending':

@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from apps.oa_finance_preaudit import flow_evals
+from tests.finance_preaudit.source_review_fixture import source_review
 
 
 def _artifact(root, name, value):
@@ -282,7 +283,7 @@ def _scene_reviews(tmp_path, source_kinds, monkeypatch, *, complete_review=True)
             packet = json.loads(Path(source["action_file"]).with_name("review-packet.json").read_text())
             checklist["review_scope"] = "complete_financial_review"
             checklist["checks"] = [{"id": item["item_key"], "item_key": item["item_key"],
-                "expected": "controlled independent complete-item expectation"} for item in packet["items"]]
+                "expected": "controlled independent complete-item expectation", "expected_status": "pass"} for item in packet["items"]]
         review["checklist"] = _artifact(root, "bound-checklist.json", checklist)
         for field in ("assessment", "confirmation"):
             path = Path(review[field]["file"])
@@ -302,7 +303,10 @@ def _scene_reviews(tmp_path, source_kinds, monkeypatch, *, complete_review=True)
                 return datetime(2026, 10, 3, 10, tzinfo=timezone.utc)
         with monkeypatch.context() as clock:
             clock.setattr(flow_evals, "datetime", FrozenClock)
-            review["expectations"] = flow_evals.freeze_financial_expectations(review["checklist"], root / "expectations.json")
+            review["expectations"] = flow_evals.freeze_financial_expectations(
+                review["checklist"], root / "expectations.json",
+                source_review=source_review(root, review["checklist"])
+                if complete_review and kind == "real_archive" else None)
         value = json.loads(Path(review["assessment"]["file"]).read_text())
         value.update(checklist_sha256=review["checklist"]["sha256"], reviewer_role="historical_crosscheck")
         value["checks"] = [{"id": check["id"], "outcome": "pass", "reason": "controlled independent complete-item result audit"} for check in checklist["checks"]]
@@ -367,7 +371,8 @@ def test_historical_conflict_or_approval_only_basis_cannot_qualify(tmp_path, mon
             return datetime(2026, 10, 3, 10, tzinfo=timezone.utc)
     with monkeypatch.context() as clock:
         clock.setattr(flow_evals, "datetime", BeforeClock)
-        first["expectations"] = flow_evals.freeze_financial_expectations(ref, tmp_path / "conflict-freeze.json")
+        first["expectations"] = flow_evals.freeze_financial_expectations(
+            ref, tmp_path / "conflict-freeze.json", source_review=source_review(tmp_path, ref))
     assessment = json.loads(Path(first["assessment"]["file"]).read_text())
     assessment["checklist_sha256"] = ref["sha256"]
     first["assessment"] = _artifact(tmp_path, "conflict-assessment.json", assessment)
@@ -391,7 +396,8 @@ def test_late_freeze_cannot_qualify_already_consumed_replay(tmp_path, monkeypatc
             return datetime(2026, 10, 5, 10, tzinfo=timezone.utc)
     monkeypatch.setattr(flow_evals, "datetime", LateClock)
     reviews[0]["expectations"] = flow_evals.freeze_financial_expectations(
-        reviews[0]["checklist"], tmp_path / "late-freeze.json")
+        reviews[0]["checklist"], tmp_path / "late-freeze.json",
+        source_review=source_review(tmp_path, reviews[0]["checklist"]))
     report = flow_evals.build_financial_quality_report(reviews)
     assert report["cases"][0]["expectations_timing"] == {"status": "unverified", "reason": "frozen_after_replay_start"}
     assert report["cases"][0]["expectations_frozen_before_replay"] is False
@@ -495,7 +501,9 @@ def test_consumable_missing_protocol_field_does_not_bypass_original_contract_gat
             return datetime(2026, 10, 3, 10, tzinfo=timezone.utc)
     with monkeypatch.context() as clock:
         clock.setattr(flow_evals, "datetime", FrozenClock)
-        review["expectations"] = flow_evals.freeze_financial_expectations(review["checklist"], tmp_path / "contract-freeze.json")
+        review["expectations"] = flow_evals.freeze_financial_expectations(
+            review["checklist"], tmp_path / "contract-freeze.json",
+            source_review=source_review(tmp_path, review["checklist"]))
     assessment = json.loads(Path(review["assessment"]["file"]).read_text())
     assessment.update(archive_manifest_sha256=review["archive"]["sha256"], result_sha256=digest(root / "result.json"),
                       checklist_sha256=review["checklist"]["sha256"])
@@ -590,12 +598,10 @@ def test_full_scope_label_without_fixed_items_keeps_narrow_facts_unqualified(tmp
     checklist["review_scope"] = "complete_financial_review"
     checklist["checks"][0]["item_key"] = "reimbursable_minimum"
     review["checklist"] = _artifact(tmp_path, "partial-full-scope.json", checklist)
-    class FrozenClock(datetime):
-        @classmethod
-        def now(cls, tz=None): return datetime(2026, 10, 3, 10, tzinfo=timezone.utc)
-    with monkeypatch.context() as clock:
-        clock.setattr(flow_evals, "datetime", FrozenClock)
-        review["expectations"] = flow_evals.freeze_financial_expectations(review["checklist"], tmp_path / "scope-freeze.json")
+    # Preserve an already-saved legacy freeze; a new incomplete four-item freeze is rejected.
+    freeze = json.loads(Path(review["expectations"]["file"]).read_text())
+    freeze["checklist_sha256"] = review["checklist"]["sha256"]
+    review["expectations"] = _artifact(tmp_path, "legacy-scope-freeze.json", freeze)
     assessment = json.loads(Path(review["assessment"]["file"]).read_text())
     assessment["checklist_sha256"] = review["checklist"]["sha256"]
     review["assessment"] = _artifact(tmp_path, "partial-scope-assessment.json", assessment)
@@ -669,6 +675,7 @@ def test_window_displays_bound_freeze_timing_without_clearing_history_conflict(t
     checklist["historical_checks"][0]["outcome"] = "conflict"
     first["checklist"] = _artifact(tmp_path, "conflict-checklist.json", checklist)
     freeze = json.loads(Path(first["expectations"]["file"]).read_text())
+    freeze.pop("source_review")  # Saved legacy timing/history display remains readable.
     freeze.update(checklist_sha256=first["checklist"]["sha256"], historical_crosscheck="conflict")
     first["expectations"] = _artifact(tmp_path, "conflict-freeze.json", freeze)
     assessment = json.loads(Path(first["assessment"]["file"]).read_text())
@@ -710,6 +717,7 @@ def test_unproved_freeze_time_keeps_original_quality_gate_closed(tmp_path, monke
     reviews = _scene_reviews(tmp_path, ["real_archive"] * 5, monkeypatch)
     first = reviews[0]
     freeze = json.loads(Path(first["expectations"]["file"]).read_text())
+    freeze.pop("source_review")  # Exercise legacy unproved timing, without new review declarations.
     if change == "missing":
         first.pop("expectations")
     else:

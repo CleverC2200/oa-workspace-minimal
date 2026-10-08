@@ -27,6 +27,20 @@ Spec 审查核对业务规则、审核项职责及预期是否一致。金融规
 
 调用 `freeze_financial_expectations(checklist_reference, destination)` 独占创建私有冻结记录，使用实际宿主时间，绑定清单指纹。未解决冲突及缺失状态不能取得准入资格。已解释的历史范围差异只按下方新窗口合同单列处理，原冲突状态保留。冻结记录和预期不得进入受试模型工作目录。已有回放后才冻结的预期不能追认该次为事前合格试验。
 
+### 业务招待完整真实试验的原事实前件
+
+新 `business_entertainment`、`source_kind=real_archive`、`review_scope=complete_financial_review` 冻结必须提供 `source_review` 的绝对路径与 SHA-256 引用：先准备清单，再独立直接看原页，最后调用 `freeze_financial_expectations(checklist_reference, destination, source_review=reference)`。仅有附件指纹和旧 `historical_checks` 不足以冻结。其他流程、合成工程例和有限事实核对不强加这份业务招待合同。
+
+人工记录使用 `schema_version=1`、`kind=preaudit_original_fact_review`、`method=independent_manual`、`observation_method=direct_original_pages`、`reviewer_role=original_fact_review`、真实非空 `reviewer_record` 及带时区 `reviewed_at`。复核时间不得晚于实际冻结，冻结不得晚于当前时间。记录精确绑定准备后的 `checklist_sha256`、全部 `source_refs`、`rule_refs`、`history_refs`，清单存在 `original_source_refs` 时也逐字绑定。`material_ref` 必须是清单 `source_refs` 中的原引用；不按文件名选择材料，不接受外部未绑定材料。
+
+`pages` 完整覆盖原 material 的 `prepared.images`，每页填写原 `resource_id`、`path`、`content_sha256`、资源的原 `owner_detail_id`、`source_field_path` 及非空 `basis`。`observation=direct` 表示直接读原页；`exact_duplicate` 必须引用已直接读过且 SHA 完全相同的代表页，引用字段为 `resource_id/path/content_sha256`。重复页仍保留每个原归属，不能把两行同 SHA 的页合为一行。当前入口不支持 `structured_sufficient` 声明。
+
+`detail_rows` 按原 `declared_fields.path` 中的 `detail[t].row[r]` 唯一集合完整覆盖，不能按显示编号或金额配行。每行的 `page_refs` 恰好列出该原归属下的全部页，字段为 `resource_id/path/content_sha256`；另分别声明 `payment_occurrence` 与 `fee_relationship`，各含 `status=confirmed/unknown/not_applicable` 和非空原事实 `basis`。支付已确认、费用关系未知是有效结论；非费用明细可明确声明不适用。
+
+`checks` 恰好覆盖四项固定检查，逐项 `id`、`item_key`、非空字符串 `expected_status` 与准备清单一致，并填写 `agreement=consistent` 及原事实、原规则的非空 `reason`。预期描述保留原清单格式，包括 `needs_human` 或范围条件描述，不转换为模型状态枚举。`consistent` 表示冻结预期受到原事实与规则支持，不表示单据业务通过。原基线清单明确 `business_scope_is_unique=false` 时可填写 `scope_unresolved`，保留该旧规则下的范围未唯一；不能套用候选新增规则强选范围。
+
+宿主只验证这些人工声明的绑定、覆盖和时序，不推断金额真值，也不机械证明核对者读图正确。新 pending 候选与最终对照派发复用同一校验，缺前件时在 CLI 启动前拒绝。新报告回查已绑定的前件；旧冻结、旧报告读取和原评分、eligible 保持兼容，不补前件、不升格，也不能用旧读取兼容路径派发新试验。`source_review` 不进入 Worker 输入、业务规则或模型工作目录。
+
 ## 回放后：原决定及实际消费输出核对
 
 逐项评估用 `method=independent_manual`、`reviewer_role=historical_crosscheck`、真实核对记录及带时区 reviewed_at 记录。每项明确填写 pass/fail/unverified 与理由，不只比较状态。工程草稿可使用 engineering_draft；旧 finance 格式兼容保留，但签字不能替代当前要求的原历史记录交叉核对。
