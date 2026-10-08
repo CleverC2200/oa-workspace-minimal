@@ -553,7 +553,12 @@ class _ComparisonCaller:
                 else:
                     # Trustworthy baseline defects are comparison evidence.
                     # An incomplete original audit cannot admit the next case.
-                    _need(quality.get('audit_complete') is True and quality['status'] in {'pass', 'fail'},
+                    _need(report['acceptance']['original_images']['status'] in {'verified', 'not_applicable'},
+                          'previous_baseline_images_unverified')
+                    comparison_unknown = (quality['status'] == 'unverified'
+                                          and quality.get('comparison_audit') == 'verified_business_scope_unknown')
+                    _need(quality.get('audit_complete') is True
+                          and (quality['status'] in {'pass', 'fail'} or comparison_unknown),
                           'previous_baseline_quality_' + quality['status'])
         raise ValueError('scope_case_not_found')
 
@@ -580,7 +585,15 @@ class _ComparisonCaller:
                     and case['original_final_contract'] == 'verified_snapshot_schema'
                     and case['result_audit_complete'] is True
                     and case['complete_review_scope'] is True)
+        checklist = _read(refs['checklist'])
+        scoped_unknown = (complete and case['verdict'] == 'unverified'
+                          and checklist.get('business_scope_unique') is False
+                          and case['expectations_timing']['status'] == 'verified'
+                          and report['acceptance']['original_images']['status'] in {'verified', 'not_applicable'})
+        if scoped_unknown:
+            _terminal(_read(row['plan']), 'baseline', report)
         return {'status': case['verdict'] if complete else 'unverified', 'audit_complete': complete,
+                'comparison_audit': 'verified_business_scope_unknown' if scoped_unknown else 'not_established',
                 'quality_report': refs['quality_report']}
 
     def _same_source_attempt(self, authority, row, pending):

@@ -403,6 +403,10 @@ def _case(source: Path, root: Path, binary: Path, name: str) -> dict:
 
 
 if __name__ == '__main__':
+    # The parent blocks SIGTERM while assigning child ownership. Restore signal
+    # delivery before the original Worker can take ownership of its CLI group.
+    if hasattr(signal, 'pthread_sigmask'):
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
     # Script directory has no apps package; baseline is the only application root.
     source_root = Path(sys.argv[2]).resolve()
     sys.path.insert(0, str(source_root))

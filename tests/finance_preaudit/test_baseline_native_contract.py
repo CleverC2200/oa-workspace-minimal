@@ -1,9 +1,12 @@
 """Baseline protocol observations never grant full-input or financial qualification."""
 import json
+import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -71,9 +74,8 @@ while True:
     return binary
 
 
-def test_current_production_still_uses_its_own_default_protocol(tmp_path, local_protocol_cli):
-    from apps.oa_finance_preaudit import baseline_native_contract as baseline
-
+@pytest.fixture
+def production_source(tmp_path):
     source = tmp_path / 'production-source'
     names = subprocess.check_output(['git', 'ls-tree', '-r', '--name-only', PRODUCTION], cwd=ROOT, text=True).splitlines()
     for name in names:
@@ -83,6 +85,13 @@ def test_current_production_still_uses_its_own_default_protocol(tmp_path, local_
             path = source / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(subprocess.check_output(['git', 'show', PRODUCTION + ':' + name], cwd=ROOT))
+    return source
+
+
+def test_current_production_still_uses_its_own_default_protocol(tmp_path, production_source, local_protocol_cli):
+    from apps.oa_finance_preaudit import baseline_native_contract as baseline
+
+    source = production_source
     tmp_path.chmod(0o700)
     result = baseline.check(tmp_path / 'production-observation.json', source=source,
         repository=ROOT, source_revision=PRODUCTION,
@@ -94,6 +103,61 @@ def test_current_production_still_uses_its_own_default_protocol(tmp_path, local_
     assert result['cases']['default_reading']['history_limit'] is None
     assert result['cases']['default_reading']['model_context']['truncated'] is True
     assert result['input_complete'] is False
+
+
+def test_cancelled_baseline_child_reaps_original_workers_independent_cli(tmp_path, production_source):
+    """Exercise the original Worker with a local waiting CLI and real SIGTERM."""
+    driver = tmp_path / 'cancel-driver.py'
+    child_pid_file, cli_pid_file = tmp_path / 'child-pid.json', tmp_path / 'cli-pid.json'
+    binary = tmp_path / 'waiting-cli'
+    binary.write_text('#!' + sys.executable + '\n' +
+        'import json,os,time\nfrom pathlib import Path\n' +
+        'Path(' + repr(str(cli_pid_file)) + ').write_text(json.dumps({"pid":os.getpid(),'
+        '"parent":os.getppid(),"group":os.getpgrp()}))\n' +
+        'while True: time.sleep(.1)\n')
+    binary.chmod(0o700)
+    driver.write_text('''import json,subprocess,sys
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from apps.oa_finance_preaudit import baseline_native_contract as baseline
+original=subprocess.Popen
+def start(command,**kwargs):
+ process=original(command,**kwargs)
+ Path(sys.argv[5]).write_text(json.dumps(process.pid))
+ return process
+subprocess.Popen=start
+baseline._child(Path(sys.argv[2]),mode='case',root=Path(sys.argv[3]),binary=Path(sys.argv[4]),case='invalid_json')
+''')
+    process = subprocess.Popen([sys.executable, '-B', str(driver), str(ROOT), str(production_source),
+        str(tmp_path / 'cancel-case'), str(binary), str(child_pid_file)], cwd=ROOT,
+        env={'PATH': str(Path(sys.executable).parent) + ':/usr/bin:/bin', 'PYTHONDONTWRITEBYTECODE': '1'},
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        deadline = time.monotonic() + 15
+        while not cli_pid_file.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(.02)
+        assert cli_pid_file.exists(), process.communicate(timeout=1)
+        cli = json.loads(cli_pid_file.read_text())
+        child_pid = json.loads(child_pid_file.read_text())
+        assert cli['parent'] == child_pid
+        assert cli['group'] == cli['pid'] and cli['group'] != child_pid
+        process.terminate()
+        assert process.wait(timeout=15) == 128 + signal.SIGTERM
+        for pid in (child_pid, cli['pid']):
+            with pytest.raises(ProcessLookupError):
+                os.kill(pid, 0)
+    finally:
+        for receipt in (cli_pid_file, child_pid_file):
+            if receipt.exists():
+                value = json.loads(receipt.read_text())
+                pid = value['pid'] if isinstance(value, dict) else value
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=15)
 
 
 def test_source_host_reads_external_baseline_proof_with_exact_archive_binding(

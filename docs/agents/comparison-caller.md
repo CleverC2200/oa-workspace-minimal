@@ -28,7 +28,7 @@ comparison-caller.private.py
 
 `readiness` 只展示八项条件及各自缺口。它不 claim、不授予财务资格、不授权运行。`validate` 在原父锁下重新核验。`run` 使用相同核验，再 claim 并仅遍历 `pending_arms`。旧侧使用引用，不复制旧输出，不再次消费。已启动但无法确认归属的侧计为 unknown，不能自动补跑。原父链继续计入复用侧的原始成本；最终窗口中新启动的候选侧不会转算为来源诊断消耗。
 
-新侧的实际结果与原始成本保存在 `comparison-execution.private.json`。格式拒绝、取消、未知启动或回收不明停止另一侧，保留已产生的结果。成功消费仍是 `awaiting_independent_assessment`。候选沿现有独立 audit binding；新基线需自身原规则、checklist、expectations 与独立 audit binding，不能借用候选核对。基线 audit binding 的 checklist/expectations 必须与 scope 相同。前单待核时不开始下一单；候选事实失败或未验证停止扩样。可信、闭合且完成独立核对的生产事实失败保留为对照缺陷；缺少完整审计、身份或消费不可信仍停止。调用者另返回 `automated_preflight_seconds`，Worker 输入准备至 preview 的原业务耗时保持原计量边界。
+新侧的实际结果与原始成本保存在 `comparison-execution.private.json`。格式拒绝、取消、未知启动或回收不明停止另一侧，保留已产生的结果。成功消费仍是 `awaiting_independent_assessment`。候选沿现有独立 audit binding；新基线需自身原规则、checklist、expectations 与独立 audit binding，不能借用候选核对。基线 audit binding 的 checklist/expectations 必须与 scope 相同。前单待核时不开始下一单；候选事实失败或未验证停止扩样。可信、闭合且完成独立核对的生产事实失败保留为对照缺陷。生产业务口径未知只有在原基线 checklist 的 `business_scope_unique=false` 于运行前冻结、独立四项审计完整、原身份/消费/计量及图片观测可信时才能继续；保留原 `unverified/eligible`，不计入质量有效配对或改善。缺少这些证据仍停止。调用者另返回 `automated_preflight_seconds`，Worker 输入准备至 preview 的原业务耗时保持原计量边界。
 
 候选原生证明必须由候选归档源码验证。当前生产源码缺少新候选检查器时，由独立基线验证器导入原生产 Worker/FlowEngine 核对外置证明，绑定完整原源码、宿主、CLI 和原生观察。通过仅表示 `baseline_comparison_ready=true`；完整输入、付费派发就绪及样本资格标志仍为 false，生产原提示、Schema 和默认历史预算保持可观测。
 
