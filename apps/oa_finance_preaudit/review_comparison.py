@@ -587,7 +587,7 @@ class _ComparisonCaller:
                     and case['complete_review_scope'] is True)
         checklist = _read(refs['checklist'])
         scoped_unknown = (complete and case['verdict'] == 'unverified'
-                          and checklist.get('business_scope_unique') is False
+                          and checklist.get('business_scope_is_unique') is False
                           and case['expectations_timing']['status'] == 'verified'
                           and report['acceptance']['original_images']['status'] in {'verified', 'not_applicable'})
         if scoped_unknown:
