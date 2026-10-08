@@ -49,7 +49,13 @@ def target_runtime_leases(target_root: Path) -> Iterator[None]:
 
 def assert_live_safe(payload: dict, *, maintenance_leases_held: bool = True) -> None:
     """Require complete live identity/authentication and trusted continuation evidence."""
-    live = payload.get('live_check', {})
+    if not isinstance(payload, dict) or any(
+            not isinstance(payload.get(key), dict)
+            for key in ('live_check', 'controller_handoff', 'reconciliation')):
+        raise RuntimeError('maintenance_live_evidence_invalid')
+    live = payload['live_check']
+    if any(not isinstance(live.get(key), dict) for key in ('credentials', 'oa', 'web_session')):
+        raise RuntimeError('maintenance_live_evidence_invalid')
     if (live.get('credentials', {}).get('status') != 'ok'
             or live.get('oa', {}).get('authentication') != 'ok'
             or live.get('oa', {}).get('execution_identity') != 'verified'
@@ -118,7 +124,9 @@ def read_live_status(target_root: Path) -> dict:
         if result.returncode != 0:
             raise RuntimeError('maintenance_live_status_failed')
         summary = json.loads(result.stdout)
-        receipt = summary.get('status_file', {})
+        if not isinstance(summary, dict) or not isinstance(summary.get('status_file'), dict):
+            raise RuntimeError('maintenance_live_receipt_invalid')
+        receipt = summary['status_file']
         if receipt.get('path') != str(evidence_file):
             raise RuntimeError('maintenance_live_receipt_invalid')
         raw = runtime_control.read_control_bytes(evidence_file, max_bytes=64 * 1024 * 1024)

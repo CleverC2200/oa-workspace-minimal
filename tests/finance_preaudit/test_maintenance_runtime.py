@@ -85,7 +85,7 @@ def test_target_override_is_rejected(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize('mode,code', [('hash', 'maintenance_live_receipt_invalid'),
-                                     ('exit', 'maintenance_live_status_failed')])
+                                     ('exit', 'maintenance_live_status_failed'), ('valid', None)])
 def test_read_live_status_requires_terminal_success_and_exact_receipt(tmp_path, mode, code):
     import sys
     interpreter = tmp_path / '.venv/bin/python'
@@ -101,5 +101,18 @@ def test_read_live_status_requires_terminal_success_and_exact_receipt(tmp_path, 
         '"sha256":' + ('"wrong"' if mode == 'hash' else 'hashlib.sha256(raw).hexdigest()') + '}}))\n'
         'raise SystemExit(' + ('2' if mode == 'exit' else '0') + ')\n')
     interpreter.chmod(0o700)
-    with pytest.raises(RuntimeError, match=code):
-        maintenance_runtime.read_live_status(tmp_path)
+    if code is None:
+        payload = maintenance_runtime.read_live_status(tmp_path)
+        assert payload['schema_version'] == 1
+        assert payload['maintenance_status_file']['bytes'] == len(b'{"schema_version":1}\n')
+    else:
+        with pytest.raises(RuntimeError, match=code):
+            maintenance_runtime.read_live_status(tmp_path)
+
+
+@pytest.mark.parametrize('section', ['live_check', 'controller_handoff', 'reconciliation'])
+def test_live_safety_rejects_incomplete_sections_with_stable_code(section):
+    snapshot = live_snapshot()
+    snapshot[section] = None
+    with pytest.raises(RuntimeError, match='maintenance_live_evidence_invalid'):
+        maintenance_runtime.assert_live_safe(snapshot)

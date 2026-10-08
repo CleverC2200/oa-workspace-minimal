@@ -155,3 +155,15 @@ def test_public_cli_returns_small_blocked_receipt_for_stop(production, capsys):
     result = json.loads(capsys.readouterr().out)
     assert exit_code == 1
     assert result == {'status': 'blocked', 'code': 'production_release_stop_requested', 'write_state': 'not_requested'}
+
+
+def test_release_refuses_diverged_clean_main(production):
+    root, remote, expected = production
+    (root / 'source.txt').write_text('local-only')
+    git(root, 'add', '.')
+    git(root, 'commit', '-qm', 'diverged')
+    with pytest.raises(RuntimeError, match='production_release_not_fast_forward'):
+        production_release.release_source(root, expected_revision=expected,
+            expected_origin=str(remote), confirmed_sync=True, check_live=lambda target: live_snapshot(),
+            check_configuration=lambda target, revision: [])
+    assert git(root, 'rev-parse', 'HEAD') != expected

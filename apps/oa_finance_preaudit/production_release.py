@@ -25,14 +25,14 @@ class ProductionAutomation:
     project_id: str
     schedule: str
 
-    def findings(self) -> list[str]:
+    def findings(self, production_root: Path) -> list[str]:
         from . import production_config
         raw = runtime_control.read_control_bytes(self.file)
         if raw is None:
             raise RuntimeError('production_release_automation_missing')
         configuration = tomllib.loads(raw.decode('utf-8'))
         return production_config.automation_findings(configuration,
-            production_project_id=self.project_id, expected_schedule=self.schedule)
+            production_project_id=self.project_id, expected_schedule=self.schedule, production_root=production_root)
 
 
 def _git(root: Path, *args: str) -> str:
@@ -117,7 +117,7 @@ def release_source(
         if automation is None:
             raise RuntimeError('production_release_automation_required')
         def configuration(target: Path, revision: str) -> list[str]:
-            return [*candidate_configuration_findings(target, revision), *automation.findings()]
+            return [*candidate_configuration_findings(target, revision), *automation.findings(target)]
     else:
         configuration = check_configuration
     findings = configuration(root, expected_revision)
