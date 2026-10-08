@@ -40,6 +40,16 @@ scope 的 `native_contract` 引用已保存的 #379 证明。来源快照还须�
 
 ## 验证边界
 
+### 配对对照的完整准备检查
+
+任务调用者可通过 `review_experiment._comparison_readiness` 一次检查 scope、authority、source_quality、financial_qualification、selection、budget、native_contract 和 dispatch_wiring。调用者接入各项既有的绑定校验，成功返回 None，失败抛出原校验异常。缺少检查或任一检查未验证时，整体为 blocked；各项独立执行并记录耗时，不能在首个失败后隐藏其余缺口。
+
+全部前件通过只表示 prerequisites_verified。检查结果不创建 claim、不授予执行权限，也不能替代真实运行前锁内重新校验。缺少最终范围、财务资格或实际派发接线时，应分别呈现，不将原生合同通过或离线编排通过升级为二十单可执行。
+
+`tests/finance_preaudit/test_comparison_readiness.py` 和 `test_offline_pair_transport.py` 纳入现有 quality workflow 的 pytest。离线编排复用父锁、阶段认领和来源宿主调用，显式传入固定本地 fixture host，使用独立本地进程回执。它不加载业务凭据、不执行真实模型侧，输出财务资格为 false。其继承计数仅为显式离线测试输入，不能进入真实启动账。
+
+原始材料、业务身份、实际授权和质量评估继续放在私有目录；仓库回归使用中性资料，覆盖重复认领、预算、准备漂移、时限、取消和子进程回收。测试不依赖任务路径或真实历史次数。
+
 `tests/finance_preaudit/test_candidate_phase.py` 经同一薄私有调用者、冻结来源宿主、受控外部进程及实际 FlowEngine preview 验证推进、拒绝、停测和计量。原生证明与可执行文件在该调度回归中是受控依赖，只证明接线；#379 的真实原生 loopback 检查单独证明模型上下文。两者均不代表真实财务判断、供应商稳定性或生产验收。
 
 关联[受控对照](review-experiments.md)、[质量核对](financial-quality-assessment.md)和[验证层级](../../CONTRIBUTING.md#验证层级)。本票工程交付不关闭 #369 的业务失败、#366 的二十样本要求或原 No-Go。

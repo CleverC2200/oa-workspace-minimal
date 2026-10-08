@@ -70,13 +70,16 @@ def _verify_sources(root: Path, repository: Path) -> dict:
 
 
 def _host(plan: Path, name: str, *, execute: bool = False,
-          native_record: Path | None = None) -> dict:
+          native_record: Path | None = None, host_file: Path | None = None) -> dict:
+    host = HOST if host_file is None else Path(host_file)
+    if host != host.resolve() or not host.is_file():
+        raise ValueError("host_drift")
     value = batch._object(plan.parent, plan)
     for path, expected in value["runtime_files"].items():
         file = Path(path)
         if file != file.resolve() or batch._sha(file) != expected:
             raise ValueError("host_drift")
-    if batch._sha(HOST) != value["host_sha256"]:
+    if batch._sha(host) != value["host_sha256"]:
         raise ValueError("host_drift")
     environment = {k: v for k, v in os.environ.items() if k in {"HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "OA_REVIEW_API_KEY", "SSL_CERT_DIR", "SSL_CERT_FILE"}}
     if execute and os.environ.get(batch.worker.SSE_TRACE_ENV) == "1":
@@ -96,7 +99,7 @@ def _host(plan: Path, name: str, *, execute: bool = False,
     previous = signal.signal(signal.SIGTERM, cancel)
     try:
         try:
-            command = [sys.executable, str(HOST), str(plan), name,
+            command = [sys.executable, str(host), str(plan), name,
                        "native-readiness" if native_record is not None else "execute" if execute else "prepare"]
             if native_record is not None:
                 command.append(str(native_record))
@@ -953,3 +956,143 @@ def _candidate_phase_prerequisites(scope: dict, authority: dict, *,
         if quality['status'] != 'pass':
             return {'status':quality['status'],'case':row['alias'],'reason':'previous_quality_failure'}
     return {'status':'pass'}
+
+
+def _comparison_readiness(checks: dict[str, Callable[[], None]]) -> dict:
+    """Inspect every prerequisite independently. Never claim, authorize or dispatch.
+
+    Task callers supply their existing bound validators. This snapshot does not
+    replace the locked validation immediately before an actual run.
+    """
+    required = ('scope', 'authority', 'source_quality', 'financial_qualification',
+                'selection', 'budget', 'native_contract', 'dispatch_wiring')
+    if not isinstance(checks, dict) or set(checks) - set(required):
+        raise ValueError('comparison_readiness_checks_invalid')
+    results = {}
+    for name in required:
+        started = time.monotonic()
+        result = {'status': 'unverified', 'reason': 'check_not_supplied'}
+        if name in checks:
+            try:
+                if not callable(checks[name]) or checks[name]() is not None:
+                    raise ValueError('check_result_invalid')
+                result = {'status': 'verified'}
+            except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+                result = {'status': 'unverified', 'reason': str(error) or type(error).__name__}
+        result['seconds'] = round(time.monotonic() - started, 6)
+        results[name] = result
+    blocking = [name for name in required if results[name]['status'] != 'verified']
+    return {'status': 'blocked' if blocking else 'prerequisites_verified', 'checks': results,
+            'blocking_checks': blocking, 'execution_authority_granted': False,
+            'requires_run_time_revalidation': True, 'new_model_starts': 0, 'new_oa_writes': 0}
+
+
+def _run_offline_pair_transport(request: dict, *, fixture_root: Path, host_file: Path,
+                                caller_file: Path, progress: dict | None = None) -> dict:
+    """Same caller entry and parent lock/claim, isolated local process receipts.
+
+    No adapter or financial prerequisite is replaced with a forged pass. This
+    route exercises orchestration only and returns financial eligibility false.
+    """
+    from .flow_evals import _read_bound_artifact
+    def need(condition, reason):
+        if not condition:
+            raise ValueError(reason)
+    def offline_path(path):
+        path = Path(path)
+        need(path == path.resolve() and path.is_relative_to(fixture_root.resolve())
+             and not path.is_symlink(), 'offline_fixture_path_forbidden')
+        return path
+    def read(reference):
+        offline_path(reference['file'])
+        raw = _read_bound_artifact(reference, document=False)
+        return batch._decode(raw.decode('utf-8'))
+    progress = progress if progress is not None else {'phase_claim_written': False}
+    need('OA_REVIEW_API_KEY' not in os.environ, 'offline_credential_environment_forbidden')
+    need(request['kind'] == 'offline_transport_route' and request['financial_qualification'] is False
+         and request['model_dispatch'] is False and request['oa_write_authorized'] is False,
+         'offline_transport_contract_invalid')
+    scope_file = offline_path(request['scope']['file'])
+    authority_file = offline_path(request['authority']['file'])
+    scope, authority = read(request['scope']), read(request['authority'])
+    for reference in (authority['parent_cumulative_authority'], authority['prior_phase_scope'], authority['prior_phase_authority']):
+        offline_path(reference['file'])
+    _valid_authority_time(authority)
+    need(authority['runner_sha256'] == batch._sha(caller_file) and authority['scope_sha256'] == request['scope']['sha256']
+         and authority['scope_file'] == request['scope']['file']
+         and authority['oa_write_authorized'] is False, 'authorization_not_bound')
+    host = Path(request['host']['file'])
+    need(host == host_file and host == host.resolve() and not host.is_symlink()
+         and batch._sha(host) == request['host']['sha256'], 'host_drift')
+    need(all(type(request[k]) is int and request[k] >= 0
+             for k in ('inherited_global_starts', 'inherited_diagnostic_starts')), 'offline_count_invalid')
+    with _candidate_parent_lock(authority['parent_cumulative_authority']):
+        _pointer, chain = _candidate_parent_chain(authority)
+        current = chain[0]
+        if current['scope'] == request['scope']:
+            need(current['authority'] == request['authority'], 'phase_authority_drift')
+        else:
+            need(authority['prior_phase_scope'] == current['scope']
+                 and authority['prior_phase_authority'] == current['authority'], 'prior_phase_binding_required')
+        need(len({r['alias'] for r in scope['cases']}) == len(scope['cases']), 'scope_duplicate_case')
+        row = next((r for r in scope['cases'] if r['alias'] == request['alias']), None)
+        need(row is not None, 'scope_case_not_found')
+        plan_file = offline_path(row['plan']['file'])
+        plan = read(row['plan'])
+        pending = request['pending_arms']
+        need(isinstance(pending, list) and pending and len(pending) == len(set(pending))
+             and set(pending) <= set(('baseline', 'candidate')), 'duplicate_or_unknown_side')
+        need(set(plan['arms']) == set(('baseline', 'candidate')) and plan['host_sha256'] == request['host']['sha256'], 'host_drift')
+        need(not request.get('cancel_before_start'), 'cancelled_before_start')
+        claim = plan_file.with_name(plan_file.name + '.started.json')
+        need(not claim.exists(), 'pair_already_owned')
+        phase_observed = sum((offline_path(read(r['plan'])['arms'][arm]) / 'local-process-start.json').exists()
+                             for r in scope['cases'] for arm in ('baseline', 'candidate'))
+        need(request['inherited_global_starts'] + phase_observed + len(pending) <= authority['cumulative_maximum_cli_starts']
+             and request['inherited_diagnostic_starts'] <= authority['candidate_diagnosis_limit'], 'start_budget_exhausted')
+        need(phase_observed + len(pending) <= authority['maximum_cli_starts'], 'phase_budget_exhausted')
+        for arm in pending:
+            root = offline_path(plan['arms'][arm])
+            need(not any((root / n).exists() for n in ('started.json', 'cli-start.json', 'result.json', 'local-process-start.json')), 'pending_arm_already_owned')
+        results = {}
+        # Real prepare calls occur before any phase or pair claim.
+        for arm in pending:
+            current_preparation = _host(plan_file, arm, execute=False, host_file=host_file)
+            need(current_preparation == plan['preparations'][arm], 'prepared_input_drift')
+        read(request['scope'])
+        read(request['authority'])
+        read(row['plan'])
+        phase_claim = scope_file.parent / 'candidate-phase-claim.private.json'
+        existed = phase_claim.exists()
+        try:
+            _claim_candidate_phase(scope_file, authority_file, authority)
+        finally:
+            progress['phase_claim_written'] = not existed and phase_claim.exists()
+        _save(claim, {'plan_sha256': batch._sha(plan_file), 'kind': 'offline_local_process_claim', 'not_model_start': True})
+        for arm in pending:
+            read(request['scope'])
+            read(request['authority'])
+            read(row['plan'])
+            _valid_authority_time(authority)
+            # Dynamic recheck under the same parent lock, before every side.
+            observed = sum((offline_path(read(r['plan'])['arms'][name]) / 'local-process-start.json').exists()
+                           for r in scope['cases'] for name in ('baseline', 'candidate'))
+            need(request['inherited_global_starts'] + observed < authority['cumulative_maximum_cli_starts']
+                 and observed < authority['maximum_cli_starts'], 'start_budget_exhausted')
+            _save(offline_path(plan['arms'][arm]) / 'local-process-start.json', {'kind': 'offline_transport_attempt', 'not_model_start': True})
+            results[arm] = _host(plan_file, arm, execute=False, host_file=host_file)
+            need(results[arm].get('financial_qualification') is False
+                 and results[arm].get('new_model_starts') == 0
+                 and results[arm].get('fixture_only') is True
+                 and results[arm].get('child_reaped') is True
+                 and type(results[arm].get('child_exit_code')) is int
+                 and results[arm].get('process_state') in {'exited', 'timed_out', 'cancelled'}, 'offline_process_receipt_invalid')
+            if results[arm]['process_state'] != 'exited':
+                return dict(status='offline_transport_stopped', new_model_starts=0, new_oa_writes=0,
+                             local_process_results=results,
+                             phase_claim_written=progress['phase_claim_written'], not_started=[n for n in pending if n not in results],
+                             inherited_counts_are_offline_test_inputs=True, financial_qualification=False)
+        return dict(status='offline_transport_observed', new_model_starts=0, new_oa_writes=0,
+                     dispatched_local_process_arms=list(results),
+                     local_process_results=results, phase_claim_written=progress['phase_claim_written'],
+                     financial_qualification=False, inherited_counts_are_offline_test_inputs=True)
