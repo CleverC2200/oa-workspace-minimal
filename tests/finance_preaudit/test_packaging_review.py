@@ -284,3 +284,92 @@ def test_schema_valid_contract_failure_never_becomes_ready(tmp_path, monkeypatch
     assert result['decision_file'] is None
     assert Path(result['evidence_directory']).joinpath('decision.json').read_text() == raw
     assert {str(p.relative_to(path.parent)): p.read_bytes() for p in path.parent.rglob('*') if p.is_file()} == before
+
+
+def test_native_fifo_receipt_returns_failure_within_finite_host_deadline(tmp_path):
+    import subprocess
+    import sys
+    code = '''
+import json
+import os
+from pathlib import Path
+import pytest
+from tests.finance_preaudit.test_packaging_review import action, draft, fake_process
+from apps.oa_finance_preaudit import packaging_review as reviewer
+root = Path(__import__('sys').argv[1])
+path = action(root)
+packet = json.loads(path.with_name('review-packet.json').read_text())
+home = root / 'native-auth'
+def replace_receipt():
+    target = home / 'sessions' / 'own.jsonl'
+    target.unlink()
+    os.mkfifo(target)
+with pytest.MonkeyPatch.context() as patch:
+    fake_process(patch, json.dumps(draft(packet)), native_home=home, after=replace_receipt)
+    result = reviewer.review(path, project_root=root, timeout_seconds=60)
+print(json.dumps(result))
+'''
+    try:
+        completed = subprocess.run([sys.executable, '-c', code, str(tmp_path)],
+                                   capture_output=True, text=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        pytest.fail('native FIFO receipt blocked the review host beyond its finite deadline')
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result['status'] == 'failed'
+    assert result['error_code'] == 'codex_tool_receipt_unavailable'
+    assert result['tool_receipt_files'] == [] and result['decision_file'] is None
+
+
+@pytest.mark.parametrize('damage', ['missing', 'directory', 'symlink', 'oversized', 'oversized_header', 'malformed_header'])
+def test_damaged_native_receipt_fails_before_draft_ready(tmp_path, monkeypatch, damage):
+    path = action(tmp_path)
+    packet = json.loads(path.with_name('review-packet.json').read_text())
+    home = tmp_path / 'native-auth'
+    raw = json.dumps(draft(packet))
+    def damage_receipt():
+        native = home / 'sessions' / 'own.jsonl'
+        if damage == 'oversized':
+            with native.open('ab') as stream:
+                stream.truncate(32 * 1024 * 1024 + 1)
+        elif damage == 'oversized_header':
+            native.write_bytes(b' ' * (1024 * 1024 + 1) + b'\n')
+        elif damage == 'malformed_header':
+            native.write_text('not json\n')
+        else:
+            native.unlink()
+            if damage == 'directory':
+                native.mkdir()
+            elif damage == 'symlink':
+                unrelated = home / 'sessions' / 'unrelated.jsonl'
+                unrelated.write_text('unrelated private content')
+                native.symlink_to(unrelated)
+    fake_process(monkeypatch, raw, native_home=home, after=damage_receipt)
+    result = reviewer.review(path, project_root=tmp_path, timeout_seconds=60)
+    assert result['status'] == 'failed' and result['error_code'] == 'codex_tool_receipt_unavailable'
+    assert result['tool_receipt_files'] == [] and result['decision_file'] is None
+    assert Path(result['evidence_directory']).joinpath('decision.json').read_text() == raw
+
+
+def test_native_receipt_replaced_after_open_is_not_retained(tmp_path, monkeypatch):
+    import os
+    path = action(tmp_path)
+    packet = json.loads(path.with_name('review-packet.json').read_text())
+    home = tmp_path / 'native-auth'
+    fake_process(monkeypatch, json.dumps(draft(packet)), native_home=home)
+    original_open = os.open
+    replaced = []
+    def replace_after_open(file, flags, *args, **kwargs):
+        descriptor = original_open(file, flags, *args, **kwargs)
+        if file == 'own.jsonl':
+            native = home / 'sessions' / 'own.jsonl'
+            replacement = native.with_name('replacement.jsonl')
+            replacement.write_bytes(native.read_bytes())
+            os.replace(replacement, native)
+            replaced.append(True)
+        return descriptor
+    monkeypatch.setattr(os, 'open', replace_after_open)
+    result = reviewer.review(path, project_root=tmp_path, timeout_seconds=60)
+    assert replaced == [True]
+    assert result['status'] == 'failed' and result['error_code'] == 'codex_tool_receipt_unavailable'
+    assert result['tool_receipt_files'] == [] and result['decision_file'] is None
