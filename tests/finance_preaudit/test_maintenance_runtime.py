@@ -82,3 +82,24 @@ def test_target_override_is_rejected(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match='maintenance_runtime_override'):
         with maintenance_runtime.target_runtime_leases(tmp_path):
             pass
+
+
+@pytest.mark.parametrize('mode,code', [('hash', 'maintenance_live_receipt_invalid'),
+                                     ('exit', 'maintenance_live_status_failed')])
+def test_read_live_status_requires_terminal_success_and_exact_receipt(tmp_path, mode, code):
+    import sys
+    interpreter = tmp_path / '.venv/bin/python'
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text('#!' + sys.executable + '\n'
+        'import sys,json,hashlib\n'
+        'from pathlib import Path\n'
+        'target=Path(sys.argv[sys.argv.index("--output-file")+1])\n'
+        'raw=b"{\\\"schema_version\\\":1}\\n"\n'
+        'target.write_bytes(raw)\n'
+        'target.chmod(0o600)\n'
+        'print(json.dumps({"status_file":{"path":str(target),"bytes":len(raw),'
+        '"sha256":' + ('"wrong"' if mode == 'hash' else 'hashlib.sha256(raw).hexdigest()') + '}}))\n'
+        'raise SystemExit(' + ('2' if mode == 'exit' else '0') + ')\n')
+    interpreter.chmod(0o700)
+    with pytest.raises(RuntimeError, match=code):
+        maintenance_runtime.read_live_status(tmp_path)
