@@ -1,6 +1,6 @@
 # 小时生产调度手册
 
-本手册与 `config/automations/oa-skill-prompt.txt` 是待发布的调度配置候选。启用前须按 [发布约定](../../CONTRIBUTING.md#开发与生产隔离及发布) 完成代码及手册发布、生产同步和只读核验，再通过原生 automation_update 更新现有自动化并回读。当前本地文件不表示生产已经加载。保留实际外层模型、推理级别、频率、状态、通知偏好、项目和目录；业务审核仍使用独立 DeepSeek。
+本手册与 `config/automations/oa-skill-prompt.txt` 是待发布的调度配置候选。启用前须按 [发布约定](../../CONTRIBUTING.md#开发与生产隔离及发布) 完成代码及手册发布、生产同步和只读核验，再通过原生 automation_update 更新现有自动化并回读。当前本地文件不表示生产已经加载。保留实际外层模型、推理级别、频率、状态、通知偏好、项目和目录；审核默认 model=gpt-6.1-sol reasoning_effort=medium model_provider=openai service_tier=default。使用现有原生 OpenAI 认证，普通服务档，不开加速；不调用 codex login、不复制认证、不改全局配置。历史 DeepSeek 回执保留原供应商身份，不改写为当前配置。
 
 每轮必读“每轮启动与实时对账”；结束必读“结束对账与超期”和“清窗与留存”。其他章节仅在对应条件出现时读取，且原安全边界始终适用。
 
@@ -19,6 +19,12 @@ status_dir=$(mktemp -d /tmp/oa-status.XXXXXX) &&
 
 继续须凭据、OA 接口与专用浏览器会话正常、执行身份 verified、授权与冻结可信、所有控制器和 Writer 空闲、上一轮终态及子进程回收可信。continuation 须 status=ready、blocking_reasons={}、isolated_pending为非负整数且等于pending_quarantined、scope与计数一致。code_matches_current=false 若只表示已终态旧版本清单，且当前 Git干净同步、ready_for_start=true、children_reaped=true、restart_verified=true，其余门禁可信，可由 fresh process加载新版；不复用旧进程。不因笼统 degraded 或可信隔离数量停止其他待办。
 
+生产审核初始 3 槽、最高 6 槽，六类财务共享该池，材料准备和全局 Writer 均为 1。门禁通过后只调用一次：
+
+```bash
+.venv/bin/python -m scripts.finance_preaudit_run --owner-task-id <当前任务真实UUID> -- --rolling --adaptive --capacity 3 --max-capacity 6 --confirm-write YES --recover-confirmed-no-write-once YES --workflow travel_expense --workflow business_entertainment --workflow business_support_fee --workflow small_marketing_fee --workflow tpm_small_marketing_fee --workflow general_expense
+```
+
 ## 停止隔离与有限恢复
 
 停止标记只按项目现行受控恢复入口处理。普通 controller_cycle_stop 在确认可靠回收后由控制器收尾；残余、人工、环境或带具体失败原因的停止门不得手工删除、改文件或用清告警代替恢复。身份、待办已办冲突、损坏冻结/边界、当前未知写入、活动 Writer或未回收进程继续硬停止。
@@ -29,7 +35,7 @@ status_dir=$(mktemp -d /tmp/oa-status.XXXXXX) &&
 
 ## 包装待审核
 
-财务终态及结束门禁可信后，才处理包装：.venv/bin/python -m apps.oa_finance_preaudit.cli next-action --workflow packaging_layout_approval --mode controlled-write --confirm-write YES。closed/not_available 即包装无工作，不看图、不生成决定、不调用完成入口。review_required 按当前冻结包逐页直接观察原图，不用OCR；承载单位/地址/许可证等固定项的外箱也需审核，不根据文件名、扩展名或字段自动分类，不跨版本拼证据。按 Skill 的必要条件独立复核；不能保持 DeepSeek配置时把受影响项交人工，不能改用OpenAI认证。调用 `.venv/bin/python -m apps.oa_finance_preaudit.packaging_review --action-file <当前动作>`，等待其原 session 实际终态，按 [包装只读审核](../agents/packaging-review.md) 核对草稿、原始工具回执、逐页覆盖及必要复核。draft_ready 不表示已看图或已提交；缺真实工具证据或语义未确认时停在人工处置，禁止靠模型自述放行。宿主已仅绑定冻结协议，业务字段不改；核对后才使用原 complete-review --action-file ... --decision-file <回执的决定文件> --confirm-write YES。装配不改变业务结论，无效决定不写OA；包装缺失/不可读材料停止当前包装。不重提已提交意见。
+财务终态及结束门禁可信后，才处理包装：.venv/bin/python -m apps.oa_finance_preaudit.cli next-action --workflow packaging_layout_approval --mode controlled-write --confirm-write YES。closed/not_available 即包装无工作，不看图、不生成决定、不调用完成入口。review_required 按当前冻结包逐页直接观察原图，不用OCR；承载单位/地址/许可证等固定项的外箱也需审核，不根据文件名、扩展名或字段自动分类，不跨版本拼证据。按 Skill 的必要条件独立复核；原生 OpenAI 认证或配置失信时停止当前包装，不改用其他供应商。调用 `.venv/bin/python -m apps.oa_finance_preaudit.packaging_review --action-file <当前动作>`，等待其原 session 实际终态，按 [包装只读审核](../agents/packaging-review.md) 核对草稿、原始工具回执、逐页覆盖及必要复核。draft_ready 不表示已看图或已提交；缺真实工具证据或语义未确认时停在人工处置，禁止靠模型自述放行。宿主已仅绑定冻结协议，业务字段不改；核对后才使用原 complete-review --action-file ... --decision-file <回执的决定文件> --confirm-write YES。装配不改变业务结论，无效决定不写OA；包装缺失/不可读材料停止当前包装。不重提已提交意见。
 
 ## 结束对账与超期
 
