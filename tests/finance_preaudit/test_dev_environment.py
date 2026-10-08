@@ -85,6 +85,17 @@ def test_native_preflight_is_readonly_and_reports_real_checkout(tmp_path):
     assert all(p.read_bytes() == value for p, value in before.items())
 
 
+def test_concise_preflight_shows_actual_module_and_graph_source(tmp_path):
+    root = checkout(tmp_path)
+    venv(root)
+    result = subprocess.run([sys.executable, '-B', str(SCRIPT), '--root', str(root),
+                             'preflight', '--baseline', 'main'], cwd=root, capture_output=True, text=True)
+    assert result.returncode == 0
+    assert 'module_origin=' + str(root / 'apps/oa_finance_preaudit/__init__.py') in result.stdout
+    assert 'codegraph=not_verified | project=' + str(root) in result.stdout
+    assert 'source_search' in result.stdout
+
+
 @pytest.mark.parametrize('scenario,reason', [
     ('interpreter', 'interpreter_missing'), ('dependencies', 'dependencies_missing_or_mismatched'),
     ('shared_venv', 'shared_virtual_environment'), ('shared_packages', 'shared_writable_dependencies'),

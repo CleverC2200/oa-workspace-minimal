@@ -10,4 +10,34 @@
 
 启动竞争后，只有本次子进程退出0、确认没有本轮镜像且原输出完整验证正常活动控制器门禁时，才记录 result=skipped；此时不能认领他人 run、进入包装或清窗。存在但损坏/不匹配的镜像仍 blocked，不能靠 skipped 输出覆盖坏证据。
 
+## 只读进度、等待与终态取回
+
+从启动回执复制 `receipt_file`、`owner_task_id` 和父目录的 `invocation_id`。在同一源码工作树执行以下命令。
+读取入口不加载 `.env`、认证或刷新会话。控制目录有自定义配置时，须沿用原运行的
+`OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE` 环境变量；不能靠读取业务认证配置猜测目录。
+
+```bash
+python3 -B -m scripts.dev_environment --json preflight
+python3 -B -m scripts.finance_preaudit_run --owner-task-id <原任务 UUID> --receipt-file <原 execution.json 路径> --invocation-id <原 invocation_id> --progress
+python3 -B -m scripts.finance_preaudit_run --owner-task-id <原任务 UUID> --receipt-file <原 execution.json 路径> --invocation-id <原 invocation_id> --progress --wait-seconds 30
+python3 -B -m scripts.finance_preaudit_run --owner-task-id <原任务 UUID> --receipt-file <原 execution.json 路径> --invocation-id <原 invocation_id> --retrieve-result
+```
+
+`--wait-seconds` 只轮询这份原回执，范围为0到60秒，默认0。它不启动、停止、重试、重新认领或回收控制器。
+原工具绑定已保存时可追加 `--tool-session-id <原工具 ID>`，要求精确匹配；未绑定且不指定时如实报告 unknown，
+不把 caller_reported_tool_result 当独立的工具服务证明。中断后仍可读取，但 waiting 不代表进程仍存活，
+也不授权新启动；未知终态继续按[隔离排障与恢复](quarantine-repair.md)处理。
+
+入口验证拥有者、调用 ID、清单 PID/轮次/开始时间、修订、回收状态和原 stdout/stderr 的 SHA-256。
+新回执还保存镜像清单指纹；历史回执没有该字段时继续核对原有字段和日志指纹，不补写历史证据。
+符号链接、非普通文件、重复 JSON 字段、损坏或漂移证据均返回非零；缺清单、未退出或未回收不能报告 completed。
+完成轮次返回0；仍等待返回2；不可信、失败或未回收返回1。可信 skipped 返回0，只表示原监督进程已退出且未接管，
+其 `terminal=true` 不证明另一个控制器已终态，`children_reaped` 保持 unknown。
+
+`--progress` 仅输出执行摘要，不带单据、客户或原日志正文。`--retrieve-result` 在可信终态返回 `controller_stdout`；
+原输出超过1 MiB时返回 `controller_stdout_file`、已验证指纹、大小及 `output_omitted=size_limit`。
+日志按64 KiB块计算哈希，每份最多64 MiB；超过该上限或读取中漂移时拒绝取回。控制 JSON 各限1 MiB。
+这些限制约束本地读取工作量，不是业务运行超时。文件指针需保留为本地证据，后续读取仍应核对给出的 SHA-256，
+原始结果可能含业务内容，不上传、提交 Git 或贴进 Issue。取回结果不加载审核规则，也不修改历史业务判断。
+
 回执不授予恢复、清警报或新的 OA 写入权限。原始输出仅本地留存，不提交 Git 或上传 Issue。父 Bug #325 的历史退出触发者仍待证实；本地回归不代替发布及正常生产轮次验收。

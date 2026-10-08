@@ -12,7 +12,7 @@ from uuid import uuid4
 from jsonschema import Draft202012Validator
 
 from apps.oa_approval import auth, runtime_control
-from . import codex_review_worker as worker, flow_engine, review_decision
+from . import codex_review_worker as worker, decision_validation, flow_engine, packaging_contract, review_decision
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -46,7 +46,7 @@ def draft_schema(packet: dict) -> dict:
             'pages': {**array(obj({
                 'page_ref': choice(refs),
                 'classification': choice(['packaging_layout', 'non_packaging', 'uncertain']),
-                'package_version_id': {'type': ['string', 'null']},
+                'package_version_id': dict(packaging_contract.PACKAGE_VERSION_ID_SCHEMA),
                 'item_keys': array(choice(keys)),
             })), 'minItems': len(refs)},
         }),
@@ -102,13 +102,20 @@ def parse_draft(raw: str, schema: dict) -> dict:
     return draft
 
 
+def _readonly_engine(project_root: Path) -> flow_engine.FlowEngine:
+    def unavailable(*_args, **_kwargs):
+        raise ValueError('read_only_port_unavailable')
+    return flow_engine.FlowEngine(
+        root=project_root / 'runtime' / 'finance_preaudit_flows',
+        discover_candidates=unavailable, collect_material=unavailable,
+    )
+
+
 def _open(action_file: Path, project_root: Path) -> tuple[dict, dict, dict]:
     root = project_root / 'runtime' / 'finance_preaudit_flows'
     if any(path.is_symlink() for path in (action_file, *action_file.parents)):
         raise ValueError('frozen_packet_changed')
-    def unavailable(*_args, **_kwargs):
-        raise ValueError('read_only_port_unavailable')
-    reader = flow_engine.FlowEngine(root=root, discover_candidates=unavailable, collect_material=unavailable)
+    reader = _readonly_engine(project_root)
     action, state, packet = reader._open_attempt(action_file)
     if (action['workflow_key'] != 'packaging_layout_approval'
             or action.get('action') != 'review_required'
@@ -129,7 +136,7 @@ def _prompt(action_file: Path, packet: dict, material: dict) -> str:
             page_paths[f'material:prepared.images.{resource_id}.page-{number}'] = image['path']
     if list(page_paths) != packet['packaging_visual_contract']['page_refs']:
         raise ValueError('packaging_page_coverage')
-    return f'''你是本单独立 DeepSeek 包装文字审核者，只读审核 {action_file} 的冻结资料。
+    return f'''你是本单独立包装文字审核者，只读审核 {action_file} 的冻结资料。
 读取其 review_packet_file 和 material_file，读取 .agents/skills/oa-finance-preaudit/SKILL.md、references/observation-contract.md、references/result-contract.md、references/flows/packaging-layout-approval.md 和 references/flow-engine-contract.md 的包装 V2 合同；执行 .agents/skills/audit-chinese-image-text/SKILL.md 的适用闸门及复核。历史问题集不作为当前单据预期答案。
 完整逐页用 view_image 看以下原图，禁止 OCR。文件名、格式、顺序不能决定包装分类；无法真实查看必须明确失败，不能改判非包装。执行必要的低置信复核；只校对文字，不做法规审核或证号真伪判断。
 {json.dumps(page_paths, ensure_ascii=False)}
@@ -169,12 +176,31 @@ def review(action_file: Path, *, project_root: Path = PROJECT_ROOT, timeout_seco
             error = 'frozen_packet_changed'
         if not error and execution.decision is None:
             error = 'codex_decision_invalid'
+        if not error and stderr.get('tool_receipt_unavailable'):
+            error = 'codex_tool_receipt_unavailable'
         if stderr.get('collection_failed'):
             error = 'codex_process_diagnostic_failed'
         decision_file = None
+        contract_validation = 'not_checked'
+        validation_code = None
         if not error:
             try:
                 decision = review_decision.bind_frozen_fields(action_file, execution.decision)
+            except (OSError, RuntimeError, ValueError):
+                error = 'packaging_review_assembly_failed'
+            else:
+                contract_validation = 'failed'
+                try:
+                    _readonly_engine(project_root).validate_review_decision(action_file, decision)
+                except (OSError, RuntimeError, ValueError) as invalid:
+                    error = 'packaging_review_contract_invalid'
+                    validation_code = (invalid.validation_code
+                                       if isinstance(invalid, decision_validation.InvalidDecision)
+                                       else 'unspecified')
+                else:
+                    contract_validation = 'passed'
+        if not error:
+            try:
                 target = directory / 'bound-decision.json'
                 runtime_control.write_control_bytes_atomic(target, (json.dumps(decision, ensure_ascii=False) + '\n').encode())
             except (OSError, RuntimeError, ValueError):
@@ -187,7 +213,12 @@ def review(action_file: Path, *, project_root: Path = PROJECT_ROOT, timeout_seco
             'write_state': 'not_requested', 'business_fields_changed': False,
             'action_file': str(action_file), 'decision_file': str(decision_file) if decision_file else None,
             'evidence_directory': str(directory),
-            'tool_receipt_files': [str(path.relative_to(directory)) for path in sorted(directory.glob('codex-home/sessions/**/*.jsonl'))],
+            'tool_receipt_files': stderr.get('tool_receipt_files', []),
+            'model': worker.MODEL, 'reasoning_effort': worker.REASONING_EFFORT,
+            'model_provider': 'openai', 'requested_service_tier': 'default',
+            'contract_validation': contract_validation,
+            'decision_validation_code': validation_code,
+
             'semantic_acceptance': 'not_checked',
         }
         try:

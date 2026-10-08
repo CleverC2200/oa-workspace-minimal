@@ -313,8 +313,9 @@ def test_preview_never_calls_submitter_and_cannot_be_promoted_by_decision(
     assert receipt["write_state"] == "not_requested"
 
 
+@pytest.mark.parametrize("model,effort", [("gpt-5.6-terra", "high"), ("deepseek-v4-flash", "high"), ("gpt-6.1-sol", "medium")])
 def test_agent_timing_receipt_binds_exact_review_time_and_tokens(
-    tmp_path: Path,
+    tmp_path: Path, model: str, effort: str,
 ) -> None:
     engine = _engine(tmp_path, "recorded-request")
     action = engine.next_action("travel_expense")
@@ -325,8 +326,9 @@ def test_agent_timing_receipt_binds_exact_review_time_and_tokens(
             "kind": "preaudit_agent_timing",
             "action_token": action["action_token"],
             "workflow_key": "travel_expense",
-            "model": "gpt-5.6-terra",
-            "reasoning_effort": "high",
+            "model": model,
+            "reasoning_effort": effort,
+            **({"model_provider": "openai", "requested_service_tier": "default"} if model == "gpt-6.1-sol" else {}),
             "wall_seconds": 123,
             "process_attempts": 1,
             "token_usage": {
@@ -351,7 +353,7 @@ def test_agent_timing_receipt_binds_exact_review_time_and_tokens(
     )
 
     assert review["wall_seconds"] == 123
-    assert review["model"] == "gpt-5.6-terra"
+    assert review["model"] == model
     assert review["token_usage"] == {
         "status": "exact",
         "input_tokens": 100,
@@ -754,3 +756,21 @@ def test_reconciliation_only_resumes_valid_unsubmitted_review(tmp_path: Path, mu
     }], handled_rows=[])
     assert report["continuation"]["status"] == ("ready" if mutation is None else "blocked")
     assert before == {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+
+@pytest.mark.parametrize("model,effort", [("gpt-6.1-sol", "high"), ("deepseek-v4-flash", "medium"), ("gpt-5.6-terra", "medium")])
+def test_completion_rejects_timing_model_effort_mismatch_before_output(tmp_path, model, effort):
+    engine = _engine(tmp_path, "recorded-request")
+    action = engine.next_action("travel_expense")
+    json_artifact.write_json_atomic(Path(action["action_file"]).with_name("agent-timing.json"), {
+        "schema_version": 1, "kind": "preaudit_agent_timing", "action_token": action["action_token"],
+        "workflow_key": "travel_expense", "model": model, "reasoning_effort": effort,
+        **({"model_provider": "openai", "requested_service_tier": "default"} if model == "gpt-6.1-sol" else {}),
+        "wall_seconds": 123, "process_attempts": 1, "token_usage": {"status": "unknown"},
+    })
+    decision_file = tmp_path / "timed-decision.json"
+    json_artifact.write_json_atomic(decision_file, _decision(action))
+    result = engine.complete_review(Path(action["action_file"]), decision_file)
+    assert result["reason"] == "agent_timing_invalid"
+    assert not Path(action["action_file"]).with_name("review-decision.json").exists()
+    assert not Path(action["action_file"]).with_name("remark.txt").exists()
