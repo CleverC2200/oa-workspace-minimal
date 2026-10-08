@@ -61,6 +61,11 @@ def assert_live_safe(payload: dict, *, maintenance_leases_held: bool = True) -> 
             or handoff.get('restart_mode') != 'fresh_process'
             or handoff.get('restart_verified') is not True):
         raise RuntimeError('maintenance_handoff_untrusted')
+    if maintenance_leases_held and (
+            handoff.get('controller_active') is not True
+            or handoff.get('writer_active') is not False
+            or handoff.get('active_request_writers') != 1):
+        raise RuntimeError('maintenance_runtime_active')
     if not maintenance_leases_held and (
             handoff.get('controller_active') is not False
             or handoff.get('writer_active') is not False
