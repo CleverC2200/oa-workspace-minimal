@@ -998,8 +998,160 @@ def _history_scope_resolution(reference: dict, checklist_reference: dict, checkl
     return {"status": "explained_scope_difference", "record_sha256": reference["sha256"]}
 
 
+def _source_review_inventory(material_reference: dict, checklist: dict) -> tuple[set[str], dict]:
+    """Bind original page/row identities without evaluating any financial statement."""
+    error = "financial_source_review_invalid"
+    if material_reference not in checklist["source_refs"]:
+        raise ValueError(error)
+    material = _read_bound_artifact(material_reference)
+    if not isinstance(material, dict):
+        raise ValueError(error)
+    prepared = material.get("prepared")
+    if (not isinstance(prepared, dict) or not isinstance(prepared.get("images"), list)
+            or not isinstance(material.get("resources"), list)
+            or not isinstance(material.get("declared_fields"), list)
+            or any(not isinstance(field, dict) for field in material["declared_fields"])):
+        raise ValueError(error)
+    from .read_material import _detail_location
+
+    locations = {location[0] for field in material["declared_fields"]
+                 if (location := _detail_location(field.get("path"))) is not None}
+    identity_fields = ("resource_id", "path", "content_sha256", "owner_detail_id", "source_field_path")
+    page_ref_fields = identity_fields[:3]
+    original_pages = {}
+    for image in prepared["images"]:
+        if not isinstance(image, dict):
+            raise ValueError(error)
+        resources = [resource for resource in material["resources"] if isinstance(resource, dict)
+                     and resource.get("resource_id") == image.get("resource_id")]
+        if len(resources) != 1:
+            raise ValueError(error)
+        resource = resources[0]
+        identity = tuple(image.get(field) if field in page_ref_fields else resource.get(field)
+                         for field in identity_fields)
+        if (any(not isinstance(value, str) or not value for value in identity[:3])
+                or any(value is not None and not isinstance(value, str) for value in identity[3:])
+                or identity in original_pages):
+            raise ValueError(error)
+        location = _detail_location(resource.get("source_field_path"))
+        if location is not None and (resource.get("owner_detail_id") != location[0]
+                                     or location[0] not in locations):
+            raise ValueError(error)
+        _read_bound_artifact({"file": image["path"], "sha256": image["content_sha256"]}, document=False)
+        original_pages[identity] = image
+    return locations, original_pages
+
+
+def _validate_source_review(reference: dict | None, checklist_reference: dict,
+                            checklist: dict, frozen_at: str) -> None:
+    """Check a human's original-fact coverage and bindings, never financial truth."""
+    if reference is None:
+        if (checklist.get("workflow_key") == "business_entertainment"
+                and checklist.get("source_kind") == "real_archive"
+                and checklist.get("review_scope") == "complete_financial_review"):
+            raise ValueError("financial_source_review_required")
+        return
+    record = _read_bound_artifact(reference)
+    error = "financial_source_review_invalid"
+    if (not isinstance(record, dict) or record.get("schema_version") != 1
+            or record.get("kind") != "preaudit_original_fact_review"
+            or record.get("method") != "independent_manual"
+            or record.get("observation_method") != "direct_original_pages"
+            or record.get("reviewer_role") != "original_fact_review"
+            or not isinstance(record.get("reviewer_record"), str) or not record["reviewer_record"].strip()
+            or record.get("checklist_sha256") != checklist_reference["sha256"]):
+        raise ValueError(error)
+    try:
+        reviewed, frozen = datetime.fromisoformat(record["reviewed_at"]), datetime.fromisoformat(frozen_at)
+        if (reviewed.tzinfo is None or frozen.tzinfo is None
+                or reviewed > frozen or frozen > datetime.now().astimezone()):
+            raise ValueError(error)
+    except (KeyError, TypeError, ValueError):
+        raise ValueError(error) from None
+    fields = ["source_refs", "rule_refs", "history_refs"]
+    if "original_source_refs" in checklist:
+        fields.append("original_source_refs")
+    for field in fields:
+        if record.get(field) != checklist.get(field, []):
+            raise ValueError(error)
+        for ref in record[field]:
+            _read_bound_artifact(ref, document=False)
+    expected, checked = checklist.get("checks"), record.get("checks")
+    if (not isinstance(expected, list) or not expected or not isinstance(checked, list)
+            or len(checked) != len(expected)
+            or any(not isinstance(check, dict) or not isinstance(check.get("id"), str)
+                   or not check["id"] or not isinstance(check.get("item_key"), str) or not check["item_key"]
+                   or not isinstance(check.get("expected_status"), str) or not check["expected_status"].strip()
+                   for check in expected)
+            or len({check["id"] for check in expected}) != len(expected)
+            or any(not isinstance(check, dict) or not isinstance(check.get("id"), str) for check in checked)
+            or {check.get("id") for check in checked} != {check["id"] for check in expected}):
+        raise ValueError(error)
+    if checklist.get("workflow_key") == "business_entertainment" and (
+            len(expected) != 4 or {check["item_key"] for check in expected}
+            != {"attachment_payment_evidence", "invoice_linkage", "budget", "reimbursable_minimum"}):
+        raise ValueError(error)
+    for check in checked:
+        original = next(item for item in expected if item["id"] == check["id"])
+        if (check.get("item_key") != original["item_key"]
+                or check.get("expected_status") != original["expected_status"]
+                or check.get("agreement") not in {"consistent", "scope_unresolved"}
+                or (check["agreement"] == "scope_unresolved"
+                    and checklist.get("business_scope_is_unique") is not False)
+                or not isinstance(check.get("reason"), str) or not check["reason"].strip()):
+            raise ValueError(error)
+    locations, original_pages = _source_review_inventory(record.get("material_ref"), checklist)
+    identity_fields = ("resource_id", "path", "content_sha256", "owner_detail_id", "source_field_path")
+    page_ref_fields = identity_fields[:3]
+    observed = record.get("pages")
+    if not isinstance(observed, list) or len(observed) != len(original_pages):
+        raise ValueError(error)
+    observed_pages = {}
+    for page in observed:
+        if (not isinstance(page, dict)
+                or any(not isinstance(page.get(field), str) or not page[field] for field in page_ref_fields)
+                or any(page.get(field) is not None and not isinstance(page[field], str)
+                       for field in identity_fields[3:])
+                or page.get("observation") not in {"direct", "exact_duplicate"}
+                or not isinstance(page.get("basis"), str) or not page["basis"].strip()):
+            raise ValueError(error)
+        identity = tuple(page.get(field) for field in identity_fields)
+        if identity not in original_pages or identity in observed_pages:
+            raise ValueError(error)
+        observed_pages[identity] = page
+    for identity, page in observed_pages.items():
+        if page["observation"] == "exact_duplicate":
+            representative = page.get("representative")
+            if (not isinstance(representative, dict) or set(representative) != set(page_ref_fields)
+                    or not any({field: other[field] for field in page_ref_fields} == representative
+                               and other["observation"] == "direct"
+                               and other["content_sha256"] == identity[2] for other in observed)):
+                raise ValueError(error)
+    rows = record.get("detail_rows")
+    if (not isinstance(rows, list) or len(rows) != len(locations)
+            or any(not isinstance(row, dict) or not isinstance(row.get("path"), str) for row in rows)
+            or {row["path"] for row in rows} != locations):
+        raise ValueError(error)
+    for row in rows:
+        refs = row.get("page_refs")
+        if (not isinstance(refs, list)
+                or any(not isinstance(ref, dict) or set(ref) != set(page_ref_fields)
+                       or any(not isinstance(ref[field], str) for field in page_ref_fields) for ref in refs)):
+            raise ValueError(error)
+        identities = {tuple(ref[field] for field in page_ref_fields) for ref in refs}
+        owned = {identity[:3] for identity in original_pages if identity[3] == row["path"]}
+        if len(identities) != len(refs) or identities != owned:
+            raise ValueError(error)
+        for field in ("payment_occurrence", "fee_relationship"):
+            fact = row.get(field)
+            if (not isinstance(fact, dict) or fact.get("status") not in {"confirmed", "unknown", "not_applicable"}
+                    or not isinstance(fact.get("basis"), str) or not fact["basis"].strip()):
+                raise ValueError(error)
+
+
 def freeze_financial_expectations(checklist_reference: dict, destination: Path, *,
-                                  history_resolution: dict | None = None) -> dict:
+                                  history_resolution: dict | None = None,
+                                  source_review: dict | None = None) -> dict:
     """Freeze source-based historical crosschecks now; no caller-provided time/signature."""
     checklist = _read_bound_artifact(checklist_reference)
     for ref in checklist["source_refs"] + checklist["rule_refs"]:
@@ -1010,6 +1162,9 @@ def freeze_financial_expectations(checklist_reference: dict, destination: Path, 
                "checklist_sha256": checklist_reference["sha256"],
                "historical_crosscheck": status, "frozen_at": datetime.now().astimezone().isoformat(),
                "flow_configs": _flow_config_pins()}
+    _validate_source_review(source_review, checklist_reference, checklist, payload["frozen_at"])
+    if source_review is not None:
+        payload["source_review"] = source_review
     if history_resolution is not None:
         _history_scope_resolution(history_resolution, checklist_reference, checklist, payload["frozen_at"])
         payload.update(schema_version=2, qualification_semantics=_HISTORY_SCOPE_SEMANTICS,
@@ -1181,6 +1336,8 @@ def build_financial_quality_report(reviews: object) -> dict:
                   if review.get("expectations") is not None else None)
         if freeze is not None and not isinstance(freeze, dict):
             raise ValueError("financial_review_invalid")
+        if freeze is not None and freeze.get("source_review") is not None:
+            _validate_source_review(freeze["source_review"], review["checklist"], checklist, freeze.get("frozen_at"))
         timing = _expectations_timing(freeze, review["checklist"]["sha256"], binding["start"])
         # Preserve the v1 qualification conjunction; timing alone cannot clear history/configuration.
         frozen_before = bool(freeze is not None and timing["status"] == "verified"
