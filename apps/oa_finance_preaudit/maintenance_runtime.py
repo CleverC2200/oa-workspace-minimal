@@ -126,13 +126,93 @@ _CURRENT_INPUTS_READER = r'''
 import hashlib, json, os, stat, sys
 from pathlib import Path
 from apps.oa_approval import auth
-from apps.oa_finance_preaudit import flow_engine, production_write, reconciliation, item_failure
+from apps.oa_finance_preaudit import flow_engine, production_write, reconciliation, item_failure, recovery_receipt
 root = Path.cwd().resolve()
 path, expected_hash, workflows_json = sys.argv[1:]
 required = set(json.loads(workflows_json))
 code = 'maintenance_current_inputs_untrusted'
+
+def validate_collecting(flows, attempt, state):
+    reader = flow_engine.FlowEngine(root=flows, discover_candidates=None, collect_material=None)
+    if (not reader._attempt_identity_matches(attempt, state, require_material=False)
+            or state.get('write_state') != 'not_requested' or state.get('write_authorized') is not False
+            or state.get('mode') not in {'preview', 'controlled_write'} or state.get('action') != 'collecting'
+            or any(os.path.lexists(attempt / name) for name in ('writer-boundary.json', 'execution-receipt.json',
+                'review-decision.json', 'remark.txt', 'submission-envelope.json'))):
+        raise ValueError()
+    claim_state = dict(state)
+    if (state.get('recovered_from_attempt') is not None or state.get('recovery_receipt_fingerprint') is not None
+            or os.path.lexists(attempt / recovery_receipt.NAME)):
+        if recovery_receipt.projection(attempt, state).get('receipt_status') != 'verified':
+            raise ValueError()
+        # begin() binds only state to the source-attempt receipt after writing claim.
+        claim_state.pop('recovery_receipt_fingerprint', None)
+    action = flow_engine._read_object(attempt / 'action.json', code='persistent_state_invalid')
+    fields = ('material_file', 'review_packet_file', 'material_fingerprint', 'evidence_fingerprint')
+    frozen = {key: state.get(key) for key in fields}
+    has_frozen = any(value is not None for value in frozen.values())
+    if action.get('execution_state') == 'collecting':
+        # Preparation enriches only state with the four frozen fields; the original
+        # claim, including any recovery provenance, remains unchanged in action.
+        if claim_state != action and (not has_frozen or claim_state != {**action, **frozen}):
+            raise ValueError()
+    elif action.get('execution_state') == 'review_required':
+        # action is written immediately before state. The saved collecting state
+        # remains unwritten; validate this exact public action contract, not a grant.
+        mode = action.get('mode')
+        fingerprint = action.get('authorization_fingerprint')
+        token = action.get('action_token')
+        if (not has_frozen or mode not in {'preview', 'controlled_write'}
+                or not isinstance(fingerprint, str) or not fingerprint.startswith('sha256:')
+                or not isinstance(token, str) or not token):
+            raise ValueError()
+        expected = flow_engine._action_payload(action='review_required', execution_state='review_required',
+            business_state='not_available', write_state='authorized' if mode == 'controlled_write' else 'not_requested',
+            workflow_key=state['workflow_key'], mode=mode, write_authorized=mode == 'controlled_write',
+            authorization_fingerprint=fingerprint, action_token=token, action_file=str(attempt / 'action.json'),
+            state_file=str(attempt / 'state.json'), review_packet_file=str(attempt / 'review-packet.json'),
+            events_file=str(attempt / 'observability.json'), case_key=state['case_key'], attempt=state['attempt'],
+            **({'rule_version':flow_engine._FLOW_SPECS[state['workflow_key']]['rule_version']}
+                if state['workflow_key'] in flow_engine._EXPLICIT_RULE_VERSION_WORKFLOWS else {}),
+            **{key:state[key] for key in ('recovered_from_attempt', 'recovery_reason', 'recovery_no_write_evidence') if key in state})
+        if action != expected:
+            raise ValueError()
+    else:
+        raise ValueError()
+    validation_state = state
+    if state['workflow_key'] in flow_engine._EXPLICIT_RULE_VERSION_WORKFLOWS:
+        version = flow_engine._FLOW_SPECS[state['workflow_key']]['rule_version']
+        if state.get('rule_version') not in (None, version):
+            raise ValueError()
+        # Preparation emits the current packet before persisting rule_version in
+        # review_required state. Validate that current contract without writing it.
+        validation_state = {**state, 'rule_version':version}
+    if has_frozen:
+        flow_engine._validate_frozen_review_inputs(attempt_root=attempt, state=validation_state, workflow_key=state['workflow_key'])
+    else:
+        # Bundle and packet can be complete before their paths/hashes reach state.
+        # Verify these files using installed validators without persisting a projection.
+        material = attempt / 'material.json'
+        packet = attempt / 'review-packet.json'
+        if os.path.lexists(material):
+            if not flow_engine._managed_existing_path(material, flows):
+                raise ValueError()
+            verified = flow_engine._validate_material_bundle(material, expected_request_id=state['request_id'],
+                attachment_root=attempt / 'attachments', prepared_root=attempt / 'prepared')
+            contents = flow_engine._read_object(material, code='frozen_material_changed')
+            if contents.get('workflow_key') != state['workflow_key']:
+                raise ValueError()
+            flow_engine._validate_flow_material(state['workflow_key'], contents)
+            if os.path.lexists(packet):
+                projection = {**validation_state, 'material_file':str(material), 'review_packet_file':str(packet),
+                    'material_fingerprint':verified['material_fingerprint'],
+                    'evidence_fingerprint':flow_engine._evidence_fingerprint(contents)}
+                flow_engine._validate_frozen_review_inputs(attempt_root=attempt, state=projection, workflow_key=state['workflow_key'])
+        elif os.path.lexists(packet):
+            raise ValueError()
+
 try:
-    if any(not Path(module.__file__).resolve().is_relative_to(root) for module in (flow_engine, production_write, reconciliation, item_failure)):
+    if any(not Path(module.__file__).resolve().is_relative_to(root) for module in (flow_engine, production_write, reconciliation, item_failure, recovery_receipt)):
         raise ValueError()
     raw = Path(path).read_bytes()
     if hashlib.sha256(raw).hexdigest() != expected_hash:
@@ -161,15 +241,7 @@ try:
         state = by_key[(item['workflow_key'], item['item_key'], item['attempt'])]
         attempt = flows / state['workflow_key'] / 'cases' / state['case_key'] / ('attempt-' + str(state['attempt']))
         if state['execution_state'] == 'collecting':
-            reader = flow_engine.FlowEngine(root=flows, discover_candidates=None, collect_material=None)
-            if (not reader._attempt_identity_matches(attempt, state, require_material=False)
-                    or state.get('write_state') != 'not_requested' or state.get('write_authorized') is not False
-                    or state.get('mode') not in {'preview', 'controlled_write'}
-                    or state.get('action') != 'collecting'
-                    or json.loads((attempt / 'action.json').read_bytes()) != state
-                    or any(os.path.lexists(attempt / name) for name in ('writer-boundary.json', 'execution-receipt.json',
-                        'review-decision.json', 'remark.txt', 'submission-envelope.json'))):
-                raise ValueError()
+            validate_collecting(flows, attempt, state)
         elif state['execution_state'] == 'review_required':
             if not flow_engine.FlowEngine.resumable_review(flows, state):
                 raise ValueError()
