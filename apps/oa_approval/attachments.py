@@ -653,37 +653,38 @@ def _headless_chrome_download(url: str, name: str) -> str:
         return f"Playwright 不可用: {str(err).strip()[:120]}"
 
     timeout_ms = _browser_timeout_ms(_headless_download_timeout_sec())
-    browser = None
     try:
         with sync_playwright() as playwright:
-            launch_kwargs: Dict[str, Any] = {"headless": True}
-            if Path(CHROME_BIN).exists():
-                launch_kwargs["executable_path"] = CHROME_BIN
-            browser = playwright.chromium.launch(**launch_kwargs)
-            context = browser.new_context(accept_downloads=True, storage_state=state)
-            page = context.new_page()
-            with page.expect_download(timeout=timeout_ms) as download_info:
-                try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-                except Exception as err:
-                    if "net::ERR_ABORTED" not in str(err):
-                        raise
-            download = download_info.value
-            target = _unique_download_path(download.suggested_filename or name)
-            download.save_as(str(target))
-            return ""
+            browser = None
+            try:
+                launch_kwargs: Dict[str, Any] = {"headless": True}
+                if Path(CHROME_BIN).exists():
+                    launch_kwargs["executable_path"] = CHROME_BIN
+                browser = playwright.chromium.launch(**launch_kwargs)
+                context = browser.new_context(accept_downloads=True, storage_state=state)
+                page = context.new_page()
+                with page.expect_download(timeout=timeout_ms) as download_info:
+                    try:
+                        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    except Exception as err:
+                        if "net::ERR_ABORTED" not in str(err):
+                            raise
+                download = download_info.value
+                target = _unique_download_path(download.suggested_filename or name)
+                download.save_as(str(target))
+                return ""
+            finally:
+                if browser is not None:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
     except Exception as err:
         detail = str(err).strip()[:300]
         code = detect_oa_download_fail_code(detail)
         if code:
             return _download_block_message(code, name)
         return detail or "headless download failed"
-    finally:
-        if browser is not None:
-            try:
-                browser.close()
-            except Exception:
-                pass
 
 
 def _launch_visible_chrome_download(url: str, name: str) -> str:
