@@ -969,9 +969,14 @@ def _comparison_readiness(checks: dict[str, Callable[[], None]]) -> dict:
     Task callers supply their existing bound validators. This snapshot does not
     replace the locked validation immediately before an actual run.
     """
-    required = ('scope', 'authority', 'source_quality', 'financial_qualification',
+    # Legacy qualification inspections keep their full-cohort gate. The actual
+    # readonly caller names its separate original-expectations check explicitly.
+    if not isinstance(checks, dict):
+        raise ValueError('comparison_readiness_checks_invalid')
+    gate = 'source_expectations' if 'source_expectations' in checks else 'financial_qualification'
+    required = ('scope', 'authority', 'source_quality', gate,
                 'selection', 'budget', 'native_contract', 'dispatch_wiring')
-    if not isinstance(checks, dict) or set(checks) - set(required):
+    if set(checks) - set(required):
         raise ValueError('comparison_readiness_checks_invalid')
     results = {}
     for name in required:

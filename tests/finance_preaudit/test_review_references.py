@@ -40,7 +40,7 @@ def _review(refs):
 
 
 def _consumed_reference(tmp_path, phase_source, monkeypatch, *, schema=3, execute=True, reasoning=6,
-                        receipts="codex-home"):
+                        receipts="codex-home", request_id='controlled-reference', scenario='ordinary_payment'):
     repository, revision, shared_cli, _proof = phase_source
     for key, value in isolated_reviewer_environment(shared_cli.parent).items():
         monkeypatch.setenv(key, value)
@@ -67,7 +67,7 @@ def _consumed_reference(tmp_path, phase_source, monkeypatch, *, schema=3, execut
         shutil.copytree(repository, root / 'calling-source', ignore=shutil.ignore_patterns('.git'))
         engine = flow_engine.FlowEngine(
             root=root / 'runtime/finance_preaudit_flows',
-            discover_candidates=lambda key: [{'request_id': 'controlled-reference',
+            discover_candidates=lambda key: [{'request_id': request_id,
                 'received_at': '2026-10-04T00:00:00+00:00', 'workflow_key': key}],
             collect_material=lambda request, attempt: {**_material(request),
                 'workflow_key': 'business_entertainment', 'workflow_name': config['workflow_name']},
@@ -102,7 +102,7 @@ def _consumed_reference(tmp_path, phase_source, monkeypatch, *, schema=3, execut
     assert len(checks) == 4
     checklist = _write(tmp_path / 'checklist.json', {'schema_version': 1,
         'workflow_key': 'business_entertainment', 'source_kind': 'real_archive',
-        'scenario': 'ordinary_payment', 'review_scope': 'complete_financial_review',
+        'scenario': scenario, 'review_scope': 'complete_financial_review',
         'source_refs': [references.reference(Path(p)) for p in manifest['originals']],
         'rule_refs': [references.reference(root / 'calling-source/.agents/skills/oa-finance-preaudit' / p)
                       for p in rules], 'checks': checks, 'history_refs': [history],

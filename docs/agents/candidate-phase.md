@@ -46,6 +46,12 @@ scope 的 `native_contract` 引用已保存的 #379 证明。来源快照还须�
 
 全部前件通过只表示 prerequisites_verified。检查结果不创建 claim、不授予执行权限，也不能替代真实运行前锁内重新校验。缺少最终范围、财务资格或实际派发接线时，应分别呈现，不将原生合同通过或离线编排通过升级为二十单可执行。
 
+当前原20实际版本对照由 `_ComparisonCaller.readonly_start_ready(request, scope)` 核完整冻结控制阶段。控制阶段必须同修订、同原父授权链、实际启动一次并完成只读消费，全部独立四项核对通过；关闭报告、汇总质量及执行前冻结必须精确对应原档案。来源报告的 `eligible=false` 保持，完整来源资格仍由 `full_source_qualification` 按原场景、历史、冻结、消费及事实门核验。
+
+当前只读调用者的 readiness 使用 `source_expectations` 检查名，并返回 `readiness_kind=readonly_comparison_start`、财务资格未授予及原20未完成。旧 `_comparison_readiness` 的 `financial_qualification` 调用保持严格语义。原20身份、两侧原材料及金标、来源、原生证明、授权和额度仍是独立前件。初次前检核验全部候选 Git 快照；每个实际 side 继续由原 transport 和来源宿主核验源码，Native 前后重读同一完整控制阶段准备状态。
+
+薄配对调用者的 `quality` 模式只读调用 `final_financial_qualification(request)`。它要求原20双侧全部实际终态、候选四项核对全通过及基线独立审计完整。可信的基线业务缺陷或显式原业务范围未知保留为对照证据。完整原20质量报告与额外控制的金融资格 cohort 分别输出；额外控制只可取同修订、同父授权的当前控制档案，原20已复用档案只能计一次。全部五类场景仍由原质量生成器核验，不更改金标 scenario。额外控制不加入原20性能窗口或公开 effect 协议；财务 cohort 合格也不授予生产验收或执行权限。
+
 `tests/finance_preaudit/test_comparison_readiness.py` 和 `test_offline_pair_transport.py` 纳入现有 quality workflow 的 pytest。离线编排复用父锁、阶段认领和来源宿主调用，显式传入固定本地 fixture host，使用独立本地进程回执。它不加载业务凭据、不执行真实模型侧，输出财务资格为 false。其继承计数仅为显式离线测试输入，不能进入真实启动账。
 
 原始材料、业务身份、实际授权和质量评估继续放在私有目录；仓库回归使用中性资料，覆盖重复认领、预算、准备漂移、时限、取消和子进程回收。测试不依赖任务路径或真实历史次数。

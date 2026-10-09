@@ -140,6 +140,7 @@ def _execute_pending_pair(plan_file: Path, selection: dict, authority: dict, *,
                   and output['execution']['process_state'] != 'cancelled',
                   'cancelled_during_review')
             _terminal(plan, arm, report)
+            revalidate()
         result = dict(status='awaiting_independent_assessment', new_cli_starts=starts,
                       reports=reports, raw_results=raw_results, dispatched_arms=dispatched, not_started=[],
                       financial_qualification=False, benefit='not_established', oa_writes=0)
@@ -375,6 +376,9 @@ class _ComparisonCaller:
         bank = _read(scope['identity_bank'])
         bank_rows = bank['cases'] if isinstance(bank, dict) else bank
         identities = {r['alias']: r for r in bank_rows}
+        _need(len(bank_rows) == len(identities) == 20
+              and set(identities) == {row['alias'] for row in scope['cases']},
+              'original_twenty_identity_scope_mismatch')
         _need(len({r['alias'] for r in scope['cases']}) == 20
               and len({r['stable_identity_sha256'] for r in scope['cases']}) == 20,
               'scope_duplicate_case')
@@ -421,12 +425,17 @@ class _ComparisonCaller:
         _need(source_scope['candidate'] == scope['candidate']
              and source_authority['scope_sha256'] == prerequisites['source_scope']['sha256']
              and source_closed['scope_sha256'] == prerequisites['source_scope']['sha256'], 'source_revision_binding_invalid')
+        _need(source_authority['oa_write_authorized'] is False
+              and source_authority['baseline_execution_authorized'] is False
+              and source_authority['first_quality_or_format_failure_stops'] is True,
+              'source_authority_contract_invalid')
         # Recompute per-record quality; a terminal closed phase is not a pass.
         actual = e._candidate_phase_status(Path(prerequisites['source_scope']['file']), verified=verified)
         _need(source_closed['report'] == prerequisites['source_phase'], 'source_closed_report_mismatch')
         saved = _read(prerequisites['source_phase'])
         phase = saved['phase']
         _need(phase['candidate'] == actual['candidate'] and phase['cases'] == actual['cases'], 'source_report_projection_changed')
+        _need(phase['status'] == actual['status'] == 'complete', 'source_phase_not_complete')
         _need(actual['candidate'] == scope['candidate']
              and len(actual['cases']) == len(source_scope['cases']) > 0
              and all(c['state'] == 'quality_passed' and c['cli_starts'] == 1
@@ -441,6 +450,11 @@ class _ComparisonCaller:
         quality = flow_evals.read_financial_quality_report(request['prerequisites']['financial_qualification'])
         _need(quality['eligible'] is True and not quality['missing_entertainment_scenarios'],
              'full_source_financial_qualification_missing')
+        self._source_quality_projection(request)
+
+    def _source_quality_projection(self, request):
+        """Keep the source cohort's exact original scores and pre-run expectations."""
+        quality = flow_evals.read_financial_quality_report(request['prerequisites']['financial_qualification'])
         source_scope = _read(request['prerequisites']['source_scope'])
         original_cases = {}
         for row, path, _plan in _pair_rows(source_scope):
@@ -470,10 +484,22 @@ class _ComparisonCaller:
                       'source_quality_window_mismatch')
             else:
                 _need(case == original, 'source_quality_window_mismatch')
+        return quality
 
     def qualified_source(self, request, scope, *, verified=None):
-        self.source_quality(request, scope, verified=verified)
+        """Legacy full-cohort qualification remains distinct from readonly admission."""
+        self.readonly_start_ready(request, scope, verified=verified)
         self.full_source_qualification(request)
+        self._candidate_sources(scope)
+
+    def readonly_start_ready(self, request, scope, *, verified=None):
+        """Validate the entire frozen control phase, without granting cohort eligibility."""
+        self.source_quality(request, scope, verified=verified)
+        quality = self._source_quality_projection(request)
+        return {'status': 'readonly_start_ready', 'source_reported_eligible': quality['eligible'],
+                'financial_qualification': False, 'new_model_starts': 0, 'new_oa_writes': 0}
+
+    def _candidate_sources(self, scope):
         # QA records bind original immutable source. New caller/report optimizations
         # cannot silently make old source-host bytes interchangeable with new bytes.
         for row, _path, plan in _pair_rows(scope):
@@ -642,7 +668,8 @@ class _ComparisonCaller:
             pending = selection['pending_arms']
             _need(pending, 'pair_already_observed_no_retry')
             verified = batch._VerifiedReports()
-            self.qualified_source(request, scope, verified=verified)
+            source_ready = self.readonly_start_ready(request, scope, verified=verified)
+            self._candidate_sources(scope)
             try:
                 self._previous_quality(scope, row, verified=verified)
             except ValueError as error:
@@ -663,6 +690,8 @@ class _ComparisonCaller:
             if not run:
                 return dict(status='validated_references_only', selection=selection,
                             budget=budget, actual_native_dispatch_enabled=True,
+                            readonly_comparison_start=source_ready, financial_qualification=False,
+                            financial_twenty_complete=False,
                             automated_preflight_seconds=round(time.monotonic() - started, 6), **progress)
             _need(not stop_requested(), 'cancelled_before_start')
             # The admitted native identity selects its original authentication contract.
@@ -692,8 +721,7 @@ class _ComparisonCaller:
                 if observed != operation_starts:
                     operation_reports = batch._VerifiedReports()
                     operation_starts = observed
-                self.source_quality(request, current_scope, verified=operation_reports)
-                self.full_source_qualification(request)
+                self.readonly_start_ready(request, current_scope, verified=operation_reports)
                 current_plan = _read(row['plan'])
                 remaining = sum(_side_count(plan_file, current_plan, arm) == 0 for arm in pending)
                 self._budget(current_authority, current_scope, request, remaining, verified=operation_reports)
@@ -710,7 +738,13 @@ class _ComparisonCaller:
             result['phase_claim_written'] = progress['phase_claim_written']
             result['automated_preflight_seconds'] = round(preflight_seconds, 6)
             try:
-                result['budget'] = _parent_budget(authority, scope, request['scope'])
+                # Success has just passed the last post-Native revalidation,
+                # which discarded pre-Native reports. Only the pair summary
+                # outside the archives has been saved since that fresh read.
+                # Failed or interrupted execution still needs a new reader.
+                final_reports = (operation_reports if result['status'] == 'awaiting_independent_assessment'
+                                 else batch._VerifiedReports())
+                result['budget'] = _parent_budget(authority, scope, request['scope'], verified=final_reports)
             except (OSError, ValueError, KeyError, TypeError):
                 result['budget'] = {'status': 'unverified', 'global_cli_starts': 'unknown'}
             return result
@@ -740,11 +774,12 @@ class _ComparisonCaller:
 
         def source_quality():
             target = _read(request['scope']) if request.get('scope') else _read(request['prerequisites']['source_scope'])
-            self.source_quality(request, target, verified=verified)
+            self.readonly_start_ready(request, target, verified=verified)
+            self._candidate_sources(target)
 
         checks = {
             'scope': scope, 'authority': authority, 'source_quality': source_quality,
-            'financial_qualification': lambda: self.full_source_qualification(request),
+            'source_expectations': lambda: self._source_quality_projection(request),
             'selection': selection,
             'budget': lambda: self._budget(authority(), scope(), request, len(selection()['pending_arms']), verified=verified),
             'native_contract': lambda: self.native_ready(row(), scope(), selection()),
@@ -755,6 +790,78 @@ class _ComparisonCaller:
             return run
 
         return {**e._comparison_readiness({name: inspect(check) for name, check in checks.items()}), 'actual_native_dispatch_enabled': True,
+                'readiness_kind': 'readonly_comparison_start',
                 'new_model_starts': 0, 'new_oa_writes': 0,
                 'financial_qualification_granted': False, 'financial_twenty_complete': False,
                 'production_acceptance': False}
+
+    def final_financial_qualification(self, request):
+        """Rebuild the original twenty and a separate unique control cohort.
+
+        Additional source controls can complete financial scenario coverage only
+        after every original pair is observed and independently audited. They do
+        not change the performance sample, original twenty eligibility or effect.
+        """
+        authority = self.authority_for(request['scope'], request['authority'])
+        with e._candidate_parent_lock(authority['parent_cumulative_authority']):
+            scope = self.verify_scope(request['scope'])
+            _need(not (Path(request['scope']['file']).parent / 'batch-stop.private.json').exists(),
+                  'phase_already_stopped')
+            verified = batch._VerifiedReports()
+            self.readonly_start_ready(request, scope, verified=verified)
+            reviews, baseline_outcomes = {}, []
+            for row, path, plan in _pair_rows(scope):
+                for arm in ARMS:
+                    root = Path(plan['arms'][arm])
+                    reused = row.get('reuse', {}).get(arm)
+                    if reused is not None:
+                        self.adapter.match_target(row['plan'], arm, reused, row.get('snapshot_audit'))
+                    else:
+                        _need(_side_count(path, plan, arm) == 1, 'final_twenty_incomplete')
+                    report = verified.read(root)
+                    _terminal(plan, arm, report)
+                    if arm == 'baseline':
+                        quality = self._baseline_quality(row, path, report)
+                        scoped_unknown = (quality['status'] == 'unverified'
+                                          and quality.get('comparison_audit') == 'verified_business_scope_unknown')
+                        _need(quality.get('audit_complete') is True
+                              and (quality['status'] in {'pass', 'fail'} or scoped_unknown)
+                              and report['acceptance']['original_images']['status'] in {'verified', 'not_applicable'},
+                              'final_baseline_audit_incomplete')
+                        baseline_outcomes.append({'alias': row['alias'], **quality})
+                        continue
+                    if reused is not None:
+                        audit = {'quality_report': reused['quality'], 'assessment': reused['assessment']}
+                    else:
+                        quality = e._candidate_phase_quality(row, path, report, verified=verified)
+                        _need(quality['status'] == 'pass', 'final_candidate_quality_not_passed')
+                        audit = (_read(row['audit_binding']) if row.get('audit_binding') else
+                                 batch._object(path.parent, 'candidate-audit-binding.private.json'))
+                    case = flow_evals.read_financial_quality_report(audit['quality_report'])['cases'][0]
+                    _need(case['source_kind'] == 'real_archive' and case['item_key'] not in reviews,
+                          'final_candidate_identity_or_source_invalid')
+                    reviews[case['item_key']] = {'item_key': case['item_key'], 'archive': _ref(root / 'manifest.json'),
+                        'checklist': row['checklist'], 'assessment': audit['assessment'], 'expectations': row['expectations']}
+            twenty = flow_evals.build_financial_quality_report(list(reviews.values()))
+            source_scope = _read(request['prerequisites']['source_scope'])
+            additional = []
+            for row, path, plan in _pair_rows(source_scope):
+                audit = (_read(row['audit_binding']) if row.get('audit_binding') else
+                         batch._object(path.parent, 'candidate-audit-binding.private.json'))
+                case = flow_evals.read_financial_quality_report(audit['quality_report'])['cases'][0]
+                review = {'item_key': case['item_key'], 'archive': _ref(Path(plan['arms']['candidate']) / 'manifest.json'),
+                          'checklist': row['checklist'], 'assessment': audit['assessment'], 'expectations': row['expectations']}
+                if case['item_key'] in reviews:
+                    _need(review == reviews[case['item_key']], 'control_duplicate_not_original_reference')
+                else:
+                    reviews[case['item_key']] = review
+                    additional.append(row['alias'])
+            cohort = flow_evals.build_financial_quality_report(list(reviews.values()))
+            budget = self._budget(authority, scope, request, 0, verified=verified)
+            qualified = cohort['eligible'] is True and not cohort['missing_entertainment_scenarios']
+            return {'status': 'financial_control_cohort_qualified' if qualified else 'financial_cohort_ineligible',
+                    'financial_twenty_complete': True, 'financial_qualification': qualified,
+                    'original_twenty_quality': twenty, 'baseline_audits': baseline_outcomes,
+                    'financial_control_cohort': {'quality': cohort, 'additional_controls': additional},
+                    'budget': budget, 'performance_sample_count': 20,
+                    'production_acceptance': False, 'new_model_starts': 0, 'new_oa_writes': 0}

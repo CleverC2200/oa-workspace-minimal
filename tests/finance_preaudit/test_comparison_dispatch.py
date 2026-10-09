@@ -36,6 +36,27 @@ def test_only_selected_pending_side_consumes_local_cli_and_preview(tmp_path, sou
     assert json.loads((after / 'result.json').read_text())['write_state'] == 'not_requested'
 
 
+def test_last_native_side_rechecks_bound_readiness_after_actual_output(tmp_path, sources, monkeypatch):
+    from apps.oa_finance_preaudit.review_comparison import _execute_pending_pair
+
+    monkeypatch.setenv('OA_REVIEW_API_KEY', 'offline-placeholder')
+    path, _authority, _before, after = plan(tmp_path, sources, purpose='diagnostic')
+    selection = {'target_plan_ref': ref(path), 'reused_originals': {}, 'pending_arms': ['candidate']}
+
+    def bound_readiness():
+        if (after / 'result.json').exists():
+            raise ValueError('source_readiness_changed_after_native')
+
+    result = _execute_pending_pair(path, selection, {}, revalidate=bound_readiness)
+
+    assert result['status'] == 'stopped'
+    assert result['reason'] == 'source_readiness_changed_after_native'
+    assert result['new_cli_starts'] == 1
+    assert result['dispatched_arms'] == ['candidate']
+    assert result['financial_qualification'] is False
+    assert result['oa_writes'] == 0
+
+
 def test_first_output_rejection_charges_attempt_and_stops_other_side(tmp_path, sources, monkeypatch):
     from apps.oa_finance_preaudit.review_comparison import _execute_pending_pair
 

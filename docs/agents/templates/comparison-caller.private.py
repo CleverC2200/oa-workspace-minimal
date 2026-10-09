@@ -35,13 +35,15 @@ caller = _ComparisonCaller(caller_file=Path(__file__),
                            reference_module=configuration['reference_module'])
 request_path = Path(request_file).absolute()
 request = batch._object(request_path.parent, request_path)
-if mode in {'validate', 'run'}:
+if mode in {'validate', 'run', 'quality'}:
     authority = _read_bound_artifact(request['authority'])
     if authority.get('caller_configuration_sha256') != hashlib.sha256(configuration_file.read_bytes()).hexdigest():
         raise ValueError('comparison_configuration_not_authorized')
 try:
     if mode == 'readiness':
         result = caller.inspect_readiness(request)
+    elif mode == 'quality':
+        result = caller.final_financial_qualification(request)
     elif mode in {'validate', 'run'}:
         result = caller.validate_or_run(request, run=mode == 'run')
     else:
