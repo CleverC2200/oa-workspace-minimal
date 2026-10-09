@@ -79,7 +79,9 @@ def test_transport(family, address):
         workers.submit(channel.connect, address).result()
 ''')
     assert result.returncode == 1, result.stdout + result.stderr
-    assert result.stdout.count('offline_network_forbidden') == 2
+    failures = [line for line in result.stdout.splitlines()
+                if line.startswith('offline_network_forbidden:')]
+    assert len(failures) == 2, result.stdout + result.stderr
     assert '2 failed' in result.stdout
     assert not (tmp_path / 'transport-reached').exists()
 
