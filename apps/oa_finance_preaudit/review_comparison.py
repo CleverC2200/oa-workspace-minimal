@@ -522,7 +522,7 @@ class _ComparisonCaller:
         self._verify_runtime()
         authority = _read(authority_ref)
         parent = _read(authority['parent_cumulative_authority'])
-        # Preserve the original 70 window and the explicitly approved 76 window.
+        # Preserve the original 70/76 windows and the approved 80 amendment.
         _need(authority['scope_sha256'] == scope_ref['sha256'] and authority['scope_file'] == scope_ref['file']
              and authority['runner_sha256'] == batch._sha(self.caller_file)
              and authority['phase'] == 'final_production_code_comparison'
@@ -531,7 +531,7 @@ class _ComparisonCaller:
              and type(authority['candidate_diagnosis_limit']) is int
              and type(parent['phase_limits']['candidate_diagnosis']) is int
              and authority['candidate_diagnosis_limit'] == parent['phase_limits']['candidate_diagnosis']
-             and authority['candidate_diagnosis_limit'] in {70, 76}
+             and authority['candidate_diagnosis_limit'] in {70, 76, 80}
              and type(authority['maximum_cli_starts']) is int and 0 < authority['maximum_cli_starts'] <= 40
              and parent['same_source_model_retries'] is False
              and parent['quality_failure_stops_revision_expansion'] is True

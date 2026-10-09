@@ -92,10 +92,11 @@ def bound_authority(tmp_path, *, authority_limit=76, parent_limit=76):
     return caller, ref(scope), ref(authority)
 
 
-def test_final_authority_accepts_bound_approved_76_without_new_starts(tmp_path):
-    caller, scope, authority = bound_authority(tmp_path)
+@pytest.mark.parametrize('diagnosis_limit', [76, 80])
+def test_final_authority_accepts_bound_approved_limit_without_new_starts(tmp_path, diagnosis_limit):
+    caller, scope, authority = bound_authority(tmp_path, authority_limit=diagnosis_limit, parent_limit=diagnosis_limit)
     result = caller.authority_for(scope, authority)
-    assert result['candidate_diagnosis_limit'] == 76
+    assert result['candidate_diagnosis_limit'] == diagnosis_limit
     assert result['cumulative_maximum_cli_starts'] == 120
     assert not (tmp_path / 'candidate-phase-claim.private.json').exists()
 
@@ -105,7 +106,8 @@ def test_original_bound_70_authority_remains_readable(tmp_path):
     assert caller.authority_for(scope, authority)['candidate_diagnosis_limit'] == 70
 
 
-@pytest.mark.parametrize('authority_limit,parent_limit', [(76, 70), (70, 76), (75, 75), (77, 77),
+@pytest.mark.parametrize('authority_limit,parent_limit', [(76, 70), (70, 76), (80, 76), (76, 80),
+                                                         (75, 75), (77, 77), (81, 81),
                                                          (120, 120), (76.0, 76), (76, 76.0)])
 def test_final_authority_rejects_mismatch_or_unapproved_limit(tmp_path, authority_limit, parent_limit):
     caller, scope, authority = bound_authority(tmp_path, authority_limit=authority_limit, parent_limit=parent_limit)
