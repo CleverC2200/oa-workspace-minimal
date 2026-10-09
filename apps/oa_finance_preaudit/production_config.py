@@ -114,8 +114,7 @@ def _source_findings(root: Path) -> list[str]:
             findings.append("production_config_reviewer_drift")
     command = next((node for node in sources["codex_review_worker"].body
                     if isinstance(node, ast.FunctionDef) and node.name == "_codex_command"), None)
-    returns = [node.value for node in command.body if isinstance(node, ast.Return)] if command else []
-    arguments = returns[0].elts if len(returns) == 1 and isinstance(returns[0], ast.List) else []
+    arguments = _native_arguments(command)
     literals = [node.value if isinstance(node, ast.Constant) else None for node in arguments]
     settings = [arguments[index + 1] for index, value in enumerate(literals[:-1]) if value == "--config"]
     strings = [node.value for node in settings if isinstance(node, ast.Constant) and isinstance(node.value, str)]
@@ -133,6 +132,46 @@ def _source_findings(root: Path) -> list[str]:
     if workflows is None or ast.dump(workflows) != ast.dump(expected):
         findings.append("production_config_workflows_drift:source")
     return findings
+
+
+def _native_arguments(command: ast.FunctionDef | None) -> list[ast.expr]:
+    if command is None:
+        return []
+    if any((isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))
+            and node.id in {'MODEL', 'REASONING_EFFORT'})
+           or (isinstance(node, ast.arg) and node.arg in {'MODEL', 'REASONING_EFFORT'})
+           for node in ast.walk(command)):
+        return []
+    returns = [node for node in ast.walk(command) if isinstance(node, ast.Return)]
+    if len(returns) != 1 or returns[0] is not command.body[-1]:
+        return []
+    value = returns[0].value
+    if isinstance(value, ast.List):
+        return value.elts
+    if not isinstance(value, ast.Name) or value.id != 'command':
+        return []
+    definitions = [node for node in command.body if isinstance(node, ast.Assign)
+                   and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                   and node.targets[0].id == 'command' and isinstance(node.value, ast.List)]
+    if len(definitions) != 1:
+        return []
+    index = command.body.index(definitions[0])
+    before = command.body[:index]
+    if any(isinstance(node, ast.Name) and node.id == 'command'
+           for statement in before for node in ast.walk(statement)):
+        return []
+    # Only the existing optional reading settings may be inserted into this list.
+    allowed = [ast.dump(node) for node in ast.parse('''
+if tool_output_token_limit is not None:
+    command[2:2] = ["--config", f"tool_output_token_limit={tool_output_token_limit}"]
+if model_instructions_file is not None:
+    command[2:2] = ["--config", "model_instructions_file=" + json.dumps(str(model_instructions_file)),
+                    "--config", "project_doc_max_bytes=0"]
+''').body]
+    mutations = [ast.dump(node) for node in command.body[index + 1:-1]]
+    if mutations != [node for node in allowed if node in mutations]:
+        return []
+    return definitions[0].value.elts
 
 
 def repository_findings(root: Path) -> list[str]:

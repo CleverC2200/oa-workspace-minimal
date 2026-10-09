@@ -792,6 +792,94 @@
             "expected_output": "对应项目使用 uncertain，只说明自动读取失败、未完成核对，请财务查看原单；不推断申请人是否填写或上传",
             "failure_mode": "把系统未读取到材料错误表述为申请人没有提供材料",
             "rule_ref": "flows/tpm-small-marketing-fee.md;SKILL.md#2-读取证据"
-        }
+        },
+    {
+      "id": "RC-056-entertainment-paid-is-not-expense-confirmed",
+      "scope": "business_entertainment",
+      "audit_item": "attachment_payment_evidence;reimbursable_minimum",
+      "status": "confirmed",
+      "input_facts": [
+        "合成案例：明细甲个人转账80元已收款，页面仅昵称、金额与收款状态，原材料无费用用途或代付结算说明",
+        "明细乙丙稳定绑定同一份精确重复餐馆付款150元，同交易、业务上下文一致，拆分申报120与30；另一餐饮明细丁实付与申报20元",
+        "四行发票、购买方及预算既定口径可核，历史审批曾同意全部250元，但没有新增甲的用途说明"
+      ],
+      "incorrect_output": "共享付款正确只算一次后，凭甲已收款和同额发票申报判整单250元核销通过",
+      "expected_output": "支付证据与金额项uncertain，定位甲费用用途待核；保留共享150及丁20的已确认170元，不把个人款80纳入已确认部分；发票、预算仍按原规则pass，整体needs_human",
+      "failure_mode": "把支付发生当费用对应，或把共享分组通过扩张到独立款",
+      "rule_ref": "flows/business-entertainment.md#核销前逐笔核对"
+    },
+    {
+      "id": "RC-057-entertainment-confirmed-personal-settlement-is-usable",
+      "scope": "business_entertainment",
+      "audit_item": "attachment_payment_evidence;reimbursable_minimum",
+      "status": "confirmed",
+      "input_facts": [
+        "合成案例：个人转账80元已收款，当前费用原结算说明明确该收款人为本次餐饮代付人，原订单、商户和结算金额能唯一对应当前明细",
+        "发票买方与公司相符，申报、票和实际支出均80元，其他必要事实明确，无退款重复"
+      ],
+      "incorrect_output": "仅因个人收款或商户品牌名称不同要求补件，或自动把金额判未知",
+      "expected_output": "已有可信用途及结算关系充分时正常采用，原固定四项按规则输出，金额孰低80元；不新增姓名逐字匹配、统一日期或额外补件要求",
+      "failure_mode": "修复漏判时把所有个人收款变成未知",
+      "rule_ref": "flows/business-entertainment.md#核销前逐笔核对"
+    },
+    {
+      "id": "RC-058-entertainment-preserve-paid-fact-when-purpose-unknown",
+      "scope": "business_entertainment",
+      "audit_item": "attachment_payment_evidence;reimbursable_minimum",
+      "status": "confirmed",
+      "input_facts": [
+        "合成案例：明细甲的原账单能确认支出65元，但原材料仍不能确认该支出用于本次费用；明细乙的支付、发票和申报40元及费用对应均已确认",
+        "金额、来源和支出事实可读，未发现退款或失败；未知仅为甲的费用对应关系"
+      ],
+      "incorrect_output": "把已确认支出与用途一并写成支付发生及费用对应均未确认，或只写整单不能核销而遗漏乙的已确认金额",
+      "expected_output": "第1项明确甲支出已确认而费用对应待核；missing_evidence只保留真实必要缺口，不要求统一补日期或交易号；第4项保留已确认可核销40元，甲待财务核实，其他固定项按原事实处理",
+      "failure_mode": "后一步用途未知覆盖前一步已确认的支付事实，或省略已确认核销范围",
+      "rule_ref": "flows/business-entertainment.md#核销前逐笔核对"
+    },
+    {
+      "id": "RC-059-entertainment-sufficient-goods-and-merchant-context",
+      "scope": "business_entertainment",
+      "audit_item": "attachment_payment_evidence;reimbursable_minimum",
+      "status": "confirmed",
+      "input_facts": [
+        "合成案例：来访招待明细甲为食品商品，原交易说明生鲜商品及成功实付32元，与当前来访招待事由和资源归属共同支持用途；票和申报均32元",
+        "明细乙餐饮平台订单成功实付80元，原餐饮商品与申报门店上下文充分；平台、商户法人、门店品牌及个人经营者显示名称各有实际角色，票和申报均80元",
+        "无失败、退款或重复；必要费用对应已由当前资料确认"
+      ],
+      "incorrect_output": "仅因食品不是餐馆消费或商户法人、品牌与个人经营名称不同，将用途置未知，追加用途证明并无法核定金额",
+      "expected_output": "采用已有充分商品与商户业务上下文，甲乙正常按孰低核销合计112元；其他固定项按原事实及预算策略处理；不编造别名，不新增餐馆、同名、日期或交易号统一条件",
+      "failure_mode": "无依据扩大必要关系核对，误伤原资料已充分证明的正常招待费用",
+      "rule_ref": "flows/business-entertainment.md#费用对应"
+    },
+    {
+      "id": "RC-060-entertainment-historical-amount-does-not-prove-current-expense",
+      "scope": "business_entertainment",
+      "audit_item": "attachment_payment_evidence;reimbursable_minimum",
+      "status": "confirmed",
+      "input_facts": [
+        "合成案例：当前资料充分确认餐饮净支出、关联票及申报220元；另一已收款转账50元没有费用用途说明",
+        "两条里程记录只有起止里程照片，没有当前支出凭证或本业务招待流程适用政策依据；后续财务审核字段曾填核定40元",
+        "历史核定字段读取状态present，但无新增原支付或政策资料"
+      ],
+      "incorrect_output": "用历史核定40元替代原里程支出及适用政策证明，纳入确认小计260元，或因一处未知把已知220元抹去",
+      "expected_output": "确认小计仍220元；转账50元明确支出已确认而用途待核，里程支出和本流程适用口径分别未知，未确认款不并入；四项及预算策略保持，整体needs_human",
+      "failure_mode": "把历史处置或字段读取可靠性当成当前事实与政策适用性的证明",
+      "rule_ref": "flows/business-entertainment.md#来源与适用范围"
+    },
+    {
+      "id": "RC-061-entertainment-category-does-not-identify-current-expense",
+      "scope": "business_entertainment",
+      "audit_item": "attachment_payment_evidence;reimbursable_minimum",
+      "status": "confirmed",
+      "input_facts": [
+        "合成案例：申报明细甲为门店甲的招待费用，附件中的两笔支付90元和70元显示餐饮商户类别及付款完成，合计与申报160元相同，但现有原资料不能建立与甲的具体费用关系",
+        "另一已确认餐饮明细乙有其自己的原订单与实付40元；乙的订单不属于甲",
+        "发票关联与购买方可核，预算仍按既定策略暂不校验；没有甲的额外订单或结算资料"
+      ],
+      "incorrect_output": "凭餐饮类别与同额判甲用途已确认，声称已核对对应餐饮订单，或借用乙的订单后给整单200元通过",
+      "expected_output": "甲支付发生已确认而具体费用对应待核，第1及第4项uncertain，保留乙已确认可核销40元，整体needs_human；原商品或结算已充分证明的费用正常采用，不增加餐馆、同名、日期、交易号或独立订单统一门槛",
+      "failure_mode": "把可报销的商品类别当成具体申报费用的关系，或引用未出现及属于其他明细的订单",
+      "rule_ref": "flows/business-entertainment.md#费用对应"
+    }
   ]
 }
