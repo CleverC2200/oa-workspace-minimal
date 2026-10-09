@@ -28,3 +28,23 @@ Schema 通过不代表完整决定合同通过，也不代表真实视觉/财务
 权限0600；stdout 给出报告字节数与 SHA。保存失败返回非零，不能视为成功报告。报告不进入 Git、Issue、PR 或未脱敏终端。
 
 本入口不改变供应商、自动重试或审批调度。诊断、工程回归、模型业务验收及生产提交验收分别记录。
+
+## 关联发票材料覆盖
+
+排查“已关联却报缺票”时，用同一只读模块查看原 attempt 的 `material.json`：
+
+```bash
+.venv/bin/python -m apps.oa_finance_preaudit.review_diagnostics \
+  --material-file /absolute/path/to/material.json \
+  --output-file /absolute/path/outside-evidence/report.json
+```
+
+材料源须为普通私有文件，权限0600；拒绝符号链接、非普通文件与超大输入。报告沿用上方外置、文件不已存在及0600约定。材料模式与原输出模式互斥，不接受 `--action-file`，不连接 OA、不调用模型、不创建 attempt、不修改原材料。
+
+摘要只输出资料指纹、字节数、固定状态与覆盖计数。不会输出票号、金额、公司、姓名、账号、令牌、正文、URL或原失败信息。逐票来源一致计数仅说明冻结材料中的来源路径指向当前关联字段，且显示票号及已读发票号码相符；`source_verification=not_performed` 表示没有再次核验 OA、发票云或冻结指纹。此处没有业务通过结论。
+
+`legacy_not_recorded` 表示旧材料没有扩展记录，`not_recorded` 表示采集器未记录扩展内容。两者都不代表申请人没提供发票。`read_failed`、`unknown`、逐票来源不一致与字段 `not_provided` 分别保留。材料整体降级的 `collection_gap_count` 只统计缺口，不打印原错误文字。
+
+文件记录计数不证明文件下载、正文读取或归属之外的审核适用性。当前采集合同的正文状态是 `not_read`；其他未定义的正文状态进入 unknown，不推断已读。普通附件存在也不自动计入关联发票正文覆盖。先看同一关联条目的权威字段覆盖，再定位具体正文缺口；有购买方不代表金额、票种或其他内容均已传给审核者。
+
+当前生产版本用生产项目的 `git rev-parse HEAD` 及实时 `status` 核对，不用旧截图或本地测试版本代替。原输出工具事实的活动/归档定位见[原会话证据导航](session-evidence.md)。工程回归与真实模型审核质量分别验收。

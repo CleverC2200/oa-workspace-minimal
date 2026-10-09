@@ -189,16 +189,115 @@ def _save_report(path: Path, action: Path, result: dict) -> dict:
     return {"sha256": hashlib.sha256(body).hexdigest(), "bytes": len(body)}
 
 
+_INVOICE_FIELDS = ("invoice_number", "invoice_type", "invoice_type_code", "issue_date", "total", "buyer", "seller")
+
+
+def inspect_material(material_file: Path) -> dict:
+    result = {"schema_version": 1, "kind": "preaudit_invoice_material_diagnostic", "read_only": True,
+              "write_state": "not_requested", "business_acceptance": "not_verified",
+              "production_acceptance": "not_verified", "source_verification": "not_performed"}
+    try:
+        raw = _read(Path(material_file))
+        material = json.loads(raw)
+        if not isinstance(material, dict) or material.get("kind") != "preaudit_material" or material.get("schema_version") != 1:
+            raise DiagnosticInputError("diagnostic_material_invalid")
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {**result, "status": "blocked", "reason": "diagnostic_material_invalid"}
+    except DiagnosticInputError as error:
+        return {**result, "status": "blocked", "reason": str(error)}
+    coverage = {"status": "recorded", "entries": 0, "source_consistent_entries": 0,
+                "source_inconsistent_entries": 0, "read_failed_entries": 0, "unknown_entries": 0,
+                "file_records": 0, "body_read_entries": 0, "body_not_read_entries": 0, "body_unknown_entries": 0,
+                "field_coverage": {name: {"present": 0, "not_provided": 0, "unknown": 0} for name in _INVOICE_FIELDS}}
+    declared = material.get("declared_fields")
+    linked_fields = {
+        field.get("path"): set(re.findall(r"[0-9]+", field["value"]))
+        for field in (declared if isinstance(declared, list) else [])
+        if isinstance(field, dict) and isinstance(field.get("path"), str)
+        and isinstance(field.get("value"), str) and field.get("read_status") == "present"
+        and (field.get("name") == "发票号码" or (field.get("name") == "关联发票" and field.get("code") == "glfp"))
+        and re.fullmatch(r"[0-9]+(?:\s*[,，;；]\s*[0-9]+)*", field["value"].strip())
+    }
+    coverage["linked_field_count"] = len(linked_fields)
+    evidence = material.get("invoice_evidence")
+    if evidence is None:
+        coverage["status"] = "legacy_not_recorded"
+    elif (not isinstance(evidence, dict) or evidence.get("schema_version") != 1
+          or evidence.get("source") != "invoice_cloud" or not isinstance(evidence.get("invoices"), list)):
+        coverage["status"] = "unknown"
+    else:
+        state = evidence.get("read_status")
+        if state in ("not_applicable", "not_recorded") and not evidence["invoices"]:
+            coverage["status"] = state
+        elif state != "content_read":
+            coverage["status"] = "read_failed" if state == "failed" else "unknown"
+        else:
+            for invoice in evidence["invoices"]:
+                coverage["entries"] += 1
+                if not isinstance(invoice, dict):
+                    coverage["unknown_entries"] += 1
+                    continue
+                if invoice.get("read_status") == "failed":
+                    coverage["read_failed_entries"] += 1
+                    continue
+                if invoice.get("read_status") != "content_read":
+                    coverage["unknown_entries"] += 1
+                    continue
+                number = invoice.get("invoice_no")
+                paths = invoice.get("source_field_paths")
+                fields = invoice.get("fields")
+                number_field = fields.get("invoice_number") if isinstance(fields, dict) else None
+                consistent = (
+                    isinstance(number, str) and bool(re.fullmatch(r"[0-9]+", number))
+                    and isinstance(paths, list) and bool(paths)
+                    and all(isinstance(path, str) and number in linked_fields.get(path, set()) for path in paths)
+                    and isinstance(number_field, dict)
+                    and number_field.get("read_status") in ("present", "not_provided")
+                    and (number_field.get("read_status") != "present" or number_field.get("value") == number)
+                )
+                if not consistent:
+                    coverage["source_inconsistent_entries"] += 1
+                    continue
+                coverage["source_consistent_entries"] += 1
+                for name in _INVOICE_FIELDS:
+                    field = fields.get(name)
+                    state = field.get("read_status") if isinstance(field, dict) else None
+                    value = field.get("value") if isinstance(field, dict) else None
+                    valid = (state == "present" and isinstance(value, str) and bool(value.strip())) or (state == "not_provided" and value == "")
+                    coverage["field_coverage"][name][state if valid else "unknown"] += 1
+                files = invoice.get("files")
+                if isinstance(files, list) and invoice.get("file_records_status") == "present":
+                    coverage["file_records"] += sum(
+                        isinstance(file, dict) and isinstance(file.get("file_id"), str) and bool(file["file_id"].strip())
+                        and file.get("read_status") == "record_present"
+                        for file in files
+                    )
+                coverage["body_not_read_entries"] += invoice.get("body_read_status") == "not_read"
+                coverage["body_unknown_entries"] += invoice.get("body_read_status") != "not_read"
+    gaps = material.get("collection_gaps")
+    result["collection_gap_count"] = len(gaps) if isinstance(gaps, list) else 0
+    result.update(status="inspected", material_sha256=hashlib.sha256(raw).hexdigest(), material_bytes=len(raw),
+                  invoice_evidence=coverage)
+    return result
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--raw-output-file", type=Path, required=True)
-    parser.add_argument("--action-file", type=Path, required=True)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--raw-output-file", type=Path)
+    group.add_argument("--material-file", type=Path)
+    parser.add_argument("--action-file", type=Path)
     parser.add_argument("--output-file", type=Path)
     args = parser.parse_args(argv)
-    result = replay(args.raw_output_file, args.action_file)
+    if args.raw_output_file is not None and args.action_file is None:
+        parser.error("--action-file is required with --raw-output-file")
+    if args.material_file is not None and args.action_file is not None:
+        parser.error("--action-file is only valid with --raw-output-file")
+    result = (inspect_material(args.material_file) if args.material_file is not None
+              else replay(args.raw_output_file, args.action_file))
     if args.output_file is not None:
         try:
-            result["report"] = _save_report(args.output_file, args.action_file, result)
+            result["report"] = _save_report(args.output_file, args.material_file or args.action_file, result)
         except DiagnosticInputError as error:
             result.update(status="blocked", report={"status": "failed", "reason": str(error)})
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
