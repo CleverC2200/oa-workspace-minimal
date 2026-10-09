@@ -19,7 +19,7 @@ import fitz
 from apps import json_artifact
 from apps.oa_approval import writer_outcomes
 
-from . import decision_validation, item_failure, manual_handoff, observability, packaging_contract, review_failure_evidence, submission, tpm_price_reference
+from . import company_comparison, decision_validation, item_failure, manual_handoff, observability, packaging_contract, review_failure_evidence, submission, tpm_price_reference
 
 
 SCHEMA_VERSION = 1
@@ -693,6 +693,12 @@ def _review_packet_constraints(workflow_key: str, material: dict) -> dict:
             constraints["packaging_visual_contract"] = (
                 _packaging_visual_contract(material)
             )
+        if workflow_key == "tpm_small_marketing_fee":
+            comparison = material.get("company_comparison_contract")
+            if comparison is not None:
+                if comparison != company_comparison.freeze(material):
+                    raise ValueError("material_bundle_schema_invalid")
+                constraints["company_comparison_contract"] = comparison
         return constraints
     if workflow_key not in _FINANCE_WORKFLOW_KEYS:
         raise ValueError("material_bundle_schema_invalid")
@@ -1299,7 +1305,15 @@ def _accepted_tpm_small_marketing_packets(
     if action is not None and action.get("rule_version") != version:
         raise ValueError("frozen_packet_changed")
     if version == _TPM_SMALL_MARKETING_RULE_VERSION:
+        if "company_comparison_contract" in expected_packet:
+            if type(state.get("company_comparison_contract_version")) is not int or state["company_comparison_contract_version"] != 1:
+                raise ValueError("frozen_packet_changed")
+            return [expected_packet]
+        if state.get("company_comparison_contract_version") is not None:
+            raise ValueError("frozen_packet_changed")
         return [expected_packet]
+    expected_packet = dict(expected_packet)
+    expected_packet.pop("company_comparison_contract", None)
     if action is None and version == "tpm_small_marketing_fee:3":
         return [{**expected_packet, "rule_version": version}]
     if action is not None or version not in (None, "tpm_small_marketing_fee:2"):
@@ -1613,6 +1627,8 @@ def _validate_review_decision(action: dict, packet: dict, quality_material: dict
         "overall",
         "items",
     }
+    if "company_comparison_contract" in packet:
+        expected_fields.add("company_comparison")
     if action["workflow_key"] == "packaging_layout_approval":
         expected_fields.add("excel_comparison")
         if packaging_v2:
@@ -1725,6 +1741,10 @@ def _validate_review_decision(action: dict, packet: dict, quality_material: dict
             quality_material,
         ):
             decision["overall"] = "needs_human"
+    if "company_comparison_contract" in packet:
+        company_item = next(item for item in normalized_items if item["item_key"] == "entity_consistency")
+        company_comparison.validate(packet["company_comparison_contract"], quality_material,
+                                    decision.get("company_comparison"), company_item)
     covered_page_refs = {
         value
         for item in normalized_items
@@ -3018,6 +3038,10 @@ class FlowEngine:
                 material["tpm_price_reference"] = tpm_price_reference.snapshot(
                     self._root.parent / tpm_price_reference.REFERENCE_PATH
                 )
+            if workflow_key == "tpm_small_marketing_fee":
+                comparison = company_comparison.freeze(material)
+                if comparison is not None:
+                    material = {**material, "company_comparison_contract": comparison}
             try:
                 material_file = attempt_root / "material.json"
                 json_artifact.write_json_atomic(material_file, material, indent=2)
@@ -3052,6 +3076,8 @@ class FlowEngine:
                         else {}
                     ),
                 }
+                if "company_comparison_contract" in packet:
+                    claim["company_comparison_contract_version"] = 1
                 packet_file = attempt_root / "review-packet.json"
                 json_artifact.write_json_atomic(packet_file, packet, indent=2)
                 claim = {
@@ -3143,6 +3169,8 @@ class FlowEngine:
                 "material_file": str(material_file),
                 "material_fingerprint": verified["material_fingerprint"],
                 "evidence_fingerprint": evidence_fingerprint,
+                **({"company_comparison_contract_version": 1}
+                   if "company_comparison_contract" in packet else {}),
                 **(
                     {"rule_version": spec["rule_version"]}
                     if workflow_key in _EXPLICIT_RULE_VERSION_WORKFLOWS

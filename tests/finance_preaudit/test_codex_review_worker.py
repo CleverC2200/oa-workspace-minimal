@@ -2090,7 +2090,7 @@ def test_tpm_prompt_keeps_passing_conclusions_short_and_direct(tmp_path):
     assert "通过项只写一句给审批人的结论" in prompt
     assert "不复述取证过程" in prompt
     assert "核销项直接写最终核销金额" in prompt
-    assert "支付公司项直接写应使用的公司全称" in prompt
+    assert "支付公司项先写实际报销公司、支付公司与发票购买方全称及比较结果" in prompt
     assert "每个审核项只写一句给审批人的结论" in prompt
     assert "输出前自检" in prompt
 

@@ -153,7 +153,7 @@ _TPM_SMALL_MARKETING_REQUIREMENT = (
     "材料里有可看原图而没有引用图片内容时，第 1 项不得判通过并须写明缺口；"
     "通过项也必须输出。通过项只写一句给审批人的结论，不复述取证过程、图片覆盖、字段、"
     "文件路径、豁免推理或发票挂票位置；发票项只写金额与报销金额的结果，核销项直接写最终核销金额，"
-    "支付公司项直接写应使用的公司全称。按当前流程的实际证据审核，缺口和冲突说明具体对象与事实；"
+    "支付公司项先写实际报销公司、支付公司与发票购买方全称及比较结果，再写应使用的公司全称。按当前流程的实际证据审核，缺口和冲突说明具体对象与事实；"
     "不得把程序未读取到附件等同于申请人未上传。AI只给意见，不批准、不退回；"
     "财务口径以预算科目为准：先读各明细行预算科目，再按该科目要求核对；不要逐个科目铺陈过程。"
     "第 1 项通过时结论写“附件完整。”，确认缺件时按行写“第 N 行缺少 XXX，请补充。”，无法核对时说明具体原因并请财务核实，"
@@ -162,7 +162,12 @@ _TPM_SMALL_MARKETING_REQUIREMENT = (
     "结论写“关联发票未读取到关联记录，请财务核对原单。”，不得用附件名称、附件内发票号或金额相等替代关联关系。"
     "第 3 项默认写“按 X 元核销。”；只有支付截图、发票与盖章版制作清单（仅终端建设费-终端形象制作费）金额不一致"
     "或涉及清单总额时，才写成“支付截图 A 元、发票 B 元、清单总额 C 元，按 X 元核销。”。"
-    "第 4 项写“使用 XXX（发票购买方）账户支付。”。"
+    "第 4 项不得仅给账户支付建议而判一致。zfgs 是实际支付公司，zfgswb 是支付公司文本，zfzhmc 是支付账户名称，"
+    "bxgs 是报销公司；zfgs2 仅是辅助支付公司2，kpgs 是开票公司，均不得替代实际支付公司或 invoice_cloud 发票购买方。"
+    "读取审核包 company_comparison_contract 时，逐条保留 role、原值及来源，在 company_comparison.observed_refs 中完整引用，"
+    "reason 列出各已读原值并说明辅助与实际字段冲突；不得忽略不同原值、展开简称或模糊匹配，仅统一括号和首尾空白。"
+    "result 为 match/mismatch/unknown，分别对应第四项 pass/fail/uncertain；公司原值缺失、未解析或购买方不可核实使用 unknown。"
+    "第四项通过结论必须包含报销公司、支付公司、购买方各实际全称与一致性结论；支付账户或文本原值不同时也保留差异。"
     "第 1 项同时审核终端建设费-终端形象制作费的制作单价：读取冻结的 material.tpm_price_reference，"
     "按规则包逐项核对编码、名称、规格和单位，使用 H 列含税指导价，不按发票税率换算，不含安装运输。"
     "数量、样式继续核对；高于、低于指导价的差异全部在第 1 项简短标注，不设容差，价格差异或无法比价使用 uncertain，"
@@ -541,6 +546,25 @@ def _codex_command(
     ]
 
 
+def _frozen_company_comparison(action_file: Path | None, workflow_key: str) -> dict | None:
+    if action_file is None or workflow_key != "tpm_small_marketing_fee":
+        return None
+    try:
+        packet = json.loads(action_file.with_name("review-packet.json").read_text())
+    except (OSError, ValueError):
+        raise ValueError("codex_review_task_invalid") from None
+    if isinstance(packet, dict) and "company_comparison_contract" not in packet:
+        return None
+    from .flow_engine import FlowEngine
+    reader = FlowEngine(root=action_file.parents[4], discover_candidates=lambda _: (),
+                        collect_material=lambda *_: {})
+    try:
+        _, _, packet = reader._open_attempt(action_file)
+    except (OSError, ValueError):
+        raise ValueError("codex_review_task_invalid") from None
+    return packet.get("company_comparison_contract")
+
+
 def _decision_schema(action_file: Path | None = None, *, read_only: bool = False) -> dict:
     action_token = "capacity-probe"
     if action_file is not None and not read_only:
@@ -630,7 +654,7 @@ def _decision_schema(action_file: Path | None = None, *, read_only: bool = False
             "required": list(frozen_item_keys),
             "properties": item_schemas,
         }
-    return {
+    result = {
         "type": "object",
         "additionalProperties": False,
         "required": [
@@ -652,6 +676,12 @@ def _decision_schema(action_file: Path | None = None, *, read_only: bool = False
             "items": items_schema,
         },
     }
+    contract = _frozen_company_comparison(action_file, workflow_key)
+    if contract is not None:
+        from . import company_comparison
+        result["required"].append("company_comparison")
+        result["properties"]["company_comparison"] = company_comparison.schema(contract)
+    return result
 
 
 def _normalize_decision(action_file: Path, decision: dict) -> dict:
