@@ -154,3 +154,32 @@ def test_native_command_cannot_shadow_the_authorized_model(repository):
     source = path.read_text().replace('    command = [\n', '    MODEL = "other-model"\n    command = [\n', 1)
     path.write_text(source)
     assert 'production_config_native_settings_drift' in production_config.repository_findings(repository)
+
+
+@pytest.mark.parametrize('binding', [
+    'from apps.oa_finance_preaudit.production_config import REASONING_EFFORT as MODEL',
+    'from apps.oa_finance_preaudit.production_config import MODEL_PROVIDER as MODEL',
+    'from apps.oa_finance_preaudit.production_config import MODEL as REASONING_EFFORT',
+    'from another_module import MODEL',
+    'from another_module import REASONING_EFFORT',
+    'import json as MODEL',
+    'import json as REASONING_EFFORT',
+    'import MODEL.submodule',
+    'import REASONING_EFFORT.submodule',
+])
+def test_native_command_rejects_imported_identity_bindings(repository, binding):
+    path = repository / 'apps/oa_finance_preaudit/codex_review_worker.py'
+    source = path.read_text().replace('    command = [\n', f'    {binding}\n    command = [\n', 1)
+    path.write_text(source)
+    assert 'production_config_native_settings_drift' in production_config.repository_findings(repository)
+
+
+@pytest.mark.parametrize('binding', [
+    'import json',
+    'from apps.oa_finance_preaudit.production_config import MODEL_PROVIDER as unused_provider',
+])
+def test_native_command_preserves_identity_with_unrelated_imports(repository, binding):
+    path = repository / 'apps/oa_finance_preaudit/codex_review_worker.py'
+    source = path.read_text().replace('    command = [\n', f'    {binding}\n    command = [\n', 1)
+    path.write_text(source)
+    assert production_config.repository_findings(repository) == []

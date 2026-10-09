@@ -142,6 +142,10 @@ def _native_arguments(command: ast.FunctionDef | None) -> list[ast.expr]:
            or (isinstance(node, ast.arg) and node.arg in {'MODEL', 'REASONING_EFFORT'})
            for node in ast.walk(command)):
         return []
+    if any((alias.asname or alias.name.split('.')[0]) in {'MODEL', 'REASONING_EFFORT'}
+           for node in ast.walk(command) if isinstance(node, (ast.Import, ast.ImportFrom))
+           for alias in node.names):
+        return []
     returns = [node for node in ast.walk(command) if isinstance(node, ast.Return)]
     if len(returns) != 1 or returns[0] is not command.body[-1]:
         return []
