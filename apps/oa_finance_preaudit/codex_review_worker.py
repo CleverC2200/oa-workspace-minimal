@@ -16,7 +16,8 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import Callable, TextIO
+from typing import Callable, TextIO, TYPE_CHECKING
+from urllib.parse import urlsplit
 
 from apps import json_artifact
 from apps.oa_approval import runtime_control, writer_outcomes
@@ -25,8 +26,14 @@ from . import concurrency_control, decision_validation, manual_handoff, process_
 from .review_output import parse_json as _parse_decision_json
 
 
+if TYPE_CHECKING:
+    from .review_input import ReviewInput
+
+
 MODEL = review_failure_evidence.MODEL
 REASONING_EFFORT = review_failure_evidence.REASONING_EFFORT
+SSE_TRACE_ENV = "OA_REVIEW_SSE_TRACE"
+_SSE_TRACE_TARGET = "error,codex_api::sse=trace"
 _NATIVE_RECEIPT_MAX_BYTES = 32 * 1024 * 1024
 _NATIVE_RECEIPT_HEADER_MAX_BYTES = 1024 * 1024
 _FINANCE_RULES = {
@@ -122,6 +129,18 @@ _OPINION_BREVITY_REQUIREMENT = (
     "输出前自检：任一通过项仍带日期、金额、地点或号码等细节，或明显超过一句话，"
     "必须先改写成一句结论再输出。"
 )
+_BUSINESS_ENTERTAINMENT_OPINION_REQUIREMENT = (
+    "表达要求（业务招待费）：正常项简明给结论，异常或未知只展开必要对象与事实，不写逐笔核对过程表。"
+    "宿主负责固定输出骨架，conclusion 不重复项目名、编号或状态符号；"
+    "不在意见中解释上传字段、稳定绑定、读取或宿主校验过程，证据定位保留在原 evidence_refs 中。"
+    "通过的前置项只给已核验的关联或状态结果，不罗列正常日期、金额、地点或号码清单；"
+    "不能把不可读或未确认的日期概述为一致或接近，不按日期猜费用对应，也不新增日期一致或补件条件。"
+    "金额展示按共享结果接口：overall=pass 时，前三项不展示金额，第4项只展示一次最终核销合计；"
+    "overall=needs_human 时，在相关项保留异常或缺口所必需的金额。"
+    "原资料确有已确认部分时，金额项必须保留已确认可核销部分及其合计，"
+    "不能因其他明细未知或要求简短而省去；没有已确认部分时不编造合计。"
+    "已确认的退款或超报影响仍须保留。相同事实不重复，预算固定政策句式原样保留。"
+)
 _GENERAL_EXPENSE_REQUIREMENT = (
     "仅对科目要求支付截图的明细，缺支付截图时先核对收款人名称与关联发票销售方，"
     "逐字完全一致则免支付截图；多笔收款或发票须按可信对应关系分别核验；"
@@ -196,7 +215,7 @@ Completer = Callable[[Path, dict], str | None]
 StopRequester = Callable[[], None]
 
 
-def _reviewer_environment() -> dict[str, str]:
+def _reviewer_environment(*, trace_sse: bool = False) -> dict[str, str]:
     environment = {
         key: value for key, value in os.environ.items()
         if key in _REVIEWER_ENVIRONMENT_KEYS
@@ -207,6 +226,8 @@ def _reviewer_environment() -> dict[str, str]:
     # file or provider key is copied into an attempt or packaging evidence directory.
     environment["CODEX_HOME"] = environment.get("CODEX_HOME") or str(Path(environment["HOME"]) / ".codex")
     environment["OCX_SHIM_BYPASS"] = "1"
+    if trace_sse:
+        environment["RUST_LOG"] = _SSE_TRACE_TARGET
     return environment
 
 
@@ -404,9 +425,10 @@ def _small_marketing_attachment_terms_required(action_file: Path) -> bool:
     return flow_engine.small_marketing_requires_payment_attachments(material)
 
 
-def _prompt(action_file: Path) -> str:
+def _prompt(action_file: Path, *, reading_instruction: str | None = None) -> str:
     workflow_key = _action_workflow(action_file) or "travel_expense"
     _rule_version, workflow_name, rule_reference = _FINANCE_RULES[workflow_key]
+    opinion_requirement = _OPINION_BREVITY_REQUIREMENT
     frozen_rule_version = _frozen_rule_version(action_file, workflow_key)
     if workflow_key == "tpm_small_marketing_fee" and frozen_rule_version != _rule_version:
         raise ValueError("frozen_packet_changed")
@@ -440,6 +462,37 @@ def _prompt(action_file: Path) -> str:
         )
     elif workflow_key == "tpm_small_marketing_fee":
         workflow_requirement = _TPM_SMALL_MARKETING_REQUIREMENT
+    elif workflow_key == "business_entertainment":
+        opinion_requirement = _BUSINESS_ENTERTAINMENT_OPINION_REQUIREMENT
+        workflow_requirement = (
+            "只按本流程固定审核项判断；形成最终四项决定前，先核对当前明细原资料中的支付事实与费用对应，再确定采用范围；"
+            "第1项“附件完整性/支付证据”对每笔当前付款独立完成原规则的来源与适用范围、支付发生与费用对应核对；"
+            "本项同时按原规则核对净支付金额，包括优惠、退款的唯一关系与状态、独立多凭证及共享支付计数；"
+            "分别按原资料确认当前支付与本条申报是否为同一支出，以及原商品、服务或结算内容是否支持当前招待用途；"
+            "上述必要事实均确认后，原事实与本条招待上下文已充分支持时正常采用；参与方按实际角色理解；"
+            "必要关系未明时使用 uncertain，保留已确认支出。"
+            "未闭合的必要费用关系不纳入已确认核销范围；未采用额外付款的未知不成为已有充分证据费用的前置条件；"
+            "费用对应未知不改变原资料已确认的支付发生、状态或金额。"
+            "已支付金额不等于已核定净支付；第1项汇总当前明细各独立付款的已确认事实与具体未知，另列已确认采用范围；"
+            "独立已确认付款的费用或代付关系仍未知时，即使未采用也保留支付状态、具体未知及可定位关系，不能只留下证据引用；"
+            "金额按共享结果接口展示，需人工判断时保留定位未知所必需的金额；"
+            "未采用额外付款的金额不追加已确认核销范围；"
+            "同额或同明细不能代替重复关系，多页同一支付事实、精确重复及共享支付仍按原规则只计一次；"
+            "净支付、退款或费用对应的必要事实与关系仍未确认时，本项使用 uncertain，并保留具体缺口和已确认支出。"
+            "支付本身未确认时仍如实保留该未知；"
+            "原资料未展示的商品或服务内容说明为未核实，不能称已证明不符。"
+            "第2项“发票关联”按原关联明细核对发票归属、购买方与发票金额；"
+            "本项保留发票自身的必要缺口；支付、净支付、退款或费用对应的未知由第1项判断，"
+            "同一费用的发票与支付金额差异由第4项按原孰低规则处理。"
+            "第3项“预算”执行原暂不校验策略。"
+            "第4项“金额孰低核销”承接第1项逐条核定的同一采用范围和必要未知，保留小计及已知异常；"
+            "按原规则在同一已核定费用范围内取实际净支付、发票与申报金额孰低；"
+            "第1项的必要未知在本项说明核销影响，不能用已支付金额代替未核定净支付。"
+            "evidence_refs 定位各项原事实，missing_evidence 保留该项仍未确认的必要事实或关系；"
+            "引用材料字段时逐字使用 declared_fields.path，并加 material: 前缀；"
+            "资源引用使用 material:resources.<resource_id>，标识来自原材料，"
+            "不靠文件名或金额猜归属；无需读取宿主校验源码来构造引用。"
+        )
     else:
         workflow_requirement = "只按该流程固定审核项判断，不得读取其他流程规则或证据；"
     material_reading = (
@@ -463,17 +516,29 @@ def _prompt(action_file: Path) -> str:
         and frozen_rule_version == "small_marketing_fee:2"
         else "最终只输出符合 flow-engine-contract“结构化审核决定”的单个 JSON 对象。"
     )
-    return f"""你是{workflow_name}生产预审的单据工作进程。用户当前明确授权本轮真实审批提交；这是受控生产工作进程，不是手工 preview。
+    reading_instruction = reading_instruction or (
+        "完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由读取 "
+        "`references/result-contract.md`、`references/observation-contract.md`、"
+        f"`{rule_reference}`、动作引用的审核包、材料和准备页；"
+    )
+    preview = json.loads(action_file.read_text(encoding="utf-8")).get("mode") == "preview"
+    execution_context = (
+        f"你是{workflow_name}只读预审的单据工作进程。本次为 preview，只审核冻结资料，不授权真实 OA 提交；业务审核标准与生产一致。"
+        if preview else
+        f"你是{workflow_name}生产预审的单据工作进程。用户当前明确授权本轮真实审批提交；这是受控生产工作进程，不是手工 preview。"
+    )
+    host_responsibility = "宿主只校验并生成本地 preview 意见，不写 OA。" if preview else "宿主会校验并负责受控提交。"
+    return f"""{execution_context}
 
 只处理这个已冻结动作：{action_file}
 {fallback_routing}
 {material_reading}
 
 要求：
-1. 完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由读取 `references/result-contract.md`、`references/observation-contract.md`、`{rule_reference}`、动作引用的审核包、材料和准备页；{workflow_requirement}{frozen_item_requirement}不得读取其他 attempt。
+1. {reading_instruction}{workflow_requirement}{frozen_item_requirement}不得读取其他 attempt。
 2. 不修改任何文件、项目代码、Skill、配置、授权清单或冻结材料；不得调用 `next-action`、`complete-review` 或任何 OA 写入，不得领取其他单据；不得读取现有审核决定、意见或 `review-output-*.txt` 失败原输出。
 3. 根据审核包中的固定审核项动态形成结构化决定。证据不足使用 `uncertain` 交财务判断，不得因为材料缺口卡住业务流程；身份、归属、冻结或授权不可信时停止。审核包为 `material_state=degraded` 时，`collection_gaps` 只说明自动读取没有完成，不得声称申请人未填写字段、未上传附件或单据没有发票；结论直接说明自动读取失败、对应项目未完成核对，请财务查看原单。
-4. {_OPINION_BREVITY_REQUIREMENT}结论内保留规则要求的具体金额、实际公司全称等必要业务原值；不得输出密钥、凭据或无关附件原文。宿主会校验并负责受控提交。
+4. {opinion_requirement}结论内保留规则要求的具体金额、实际公司全称等必要业务原值；不得输出密钥、凭据或无关附件原文。{host_responsibility}
 
 5. {output_requirement}JSON 之外不添加 Markdown、解释、日志或额外意见正文。
 """
@@ -494,11 +559,23 @@ def _read_only_prompt(action_file: Path) -> str:
 """
 
 
+def _worker_role_file(action_file: Path) -> Path | None:
+    if _action_workflow(action_file) != "business_entertainment":
+        return None
+    path = Path(__file__).resolve().parents[2] / ".agents/skills/oa-finance-preaudit/references/worker-role.md"
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("codex_review_task_invalid")
+    return path
+
+
 def _codex_command(
     project_root: Path,
     schema_file: Path,
     decision_file: Path,
-    *, visual_aux: Path | None = None,
+    *,
+    visual_aux: Path | None = None,
+    tool_output_token_limit: int | None = None,
+    model_instructions_file: Path | None = None,
 ) -> list[str]:
     native_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
     readable = (project_root, native_home / "skills", native_home / "RTK.md", native_home / "BUILD_EFFICIENCY.md")
@@ -508,7 +585,7 @@ def _codex_command(
     permissions = 'permissions.oa-reviewer={extends=":read-only",filesystem={' + ",".join(
         json.dumps(path) + "=" + json.dumps(access) for path, access in filesystem.items()
     ) + '}}'
-    return [
+    command = [
         "codex",
         "exec",
         "--ephemeral",
@@ -544,6 +621,12 @@ def _codex_command(
         str(project_root),
         "-",
     ]
+    if tool_output_token_limit is not None:
+        command[2:2] = ["--config", f"tool_output_token_limit={tool_output_token_limit}"]
+    if model_instructions_file is not None:
+        command[2:2] = ["--config", "model_instructions_file=" + json.dumps(str(model_instructions_file)),
+                        "--config", "project_doc_max_bytes=0"]
+    return command
 
 
 def _decision_schema(action_file: Path | None = None, *, read_only: bool = False) -> dict:
@@ -960,15 +1043,50 @@ def _execute_codex_raw(
     decision_parser: Callable[[str], object] = _parse_decision_json,
     audit_directory: Path | None = None,
     allow_visual_aux: bool = False,
+    frozen_input: ReviewInput | None = None,
+    offline_api: tuple[str, dict[str, str]] | None = None,
 ) -> CodexExecution:
+    trace_sse = os.environ.get(SSE_TRACE_ENV) == "1"
     try:
         if type(allow_visual_aux) is not bool or (allow_visual_aux and (
                 not read_only or audit_directory is None
                 or json.loads(action_file.read_text()).get('workflow_key') != 'packaging_layout_approval')):
             raise ValueError('codex_review_task_invalid')
+        if offline_api is not None:
+            endpoint, isolated = offline_api
+            url = urlsplit(endpoint)
+            home = Path(isolated.get("HOME", ""))
+            if (read_only is not True or audit_directory is None
+                    or re.fullmatch(r"http://(?:127\.0\.0\.1|localhost):[0-9]{1,5}/?", endpoint) is None
+                    or url.scheme != "http" or url.hostname not in {"127.0.0.1", "localhost"}
+                    or url.port is None or url.path not in {"", "/"}
+                    or url.username is not None or url.password is not None or url.query or url.fragment
+                    or set(isolated) - {"HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR"}
+                    or not isolated.get("PATH") or not home.is_absolute() or home != home.resolve()
+                    or not home.is_dir() or stat.S_IMODE(home.stat().st_mode) & 0o077 or any(home.iterdir())):
+                raise ValueError("codex_review_task_invalid")
+        if trace_sse:
+            if read_only is not True or audit_directory is None:
+                raise ValueError("codex_review_task_invalid")
+            audit = Path(audit_directory)
+            if (not audit.is_absolute() or audit != audit.resolve()
+                    or not audit.is_dir() or stat.S_IMODE(audit.stat().st_mode) & 0o077
+                    or audit.is_relative_to(Path(project_root).resolve())
+                    or audit.is_relative_to(Path(__file__).resolve().parents[2])):
+                raise ValueError("codex_review_task_invalid")
         schema = schema_builder(action_file) if schema_builder else _decision_schema(action_file, read_only=read_only)
-        prompt = prompt_builder(action_file)
-    except ValueError:
+        role_file = _worker_role_file(action_file)
+        if frozen_input is None and not read_only and _action_workflow(action_file) == "business_entertainment":
+            from . import review_input
+            frozen_input = review_input.prepare(action_file)
+        if frozen_input is not None:
+            frozen_input.validate(action_file)
+        prompt = (
+            _prompt(action_file, reading_instruction=frozen_input.instruction)
+            if frozen_input is not None and prompt_builder is _prompt
+            else prompt_builder(action_file)
+        )
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
         return CodexExecution(
             "codex_review_task_invalid", _unknown_usage(),
             process_state="not_started", decision_state="not_attempted",
@@ -987,7 +1105,18 @@ def _execute_codex_raw(
 仅允许在此目录创建当前冻结原图的无损辅助裁图；目录外的项目、原图、冻结资料、其他审计文件和配置均不得修改。使用 PIL 等工具把必要的裁图保存为 PNG，再用既有 view_image 读取该文件路径。保留原图归属、版本和原页引用；裁图只辅助看图，不替代原页覆盖。禁止 OCR；禁止通过 Shell 输出 Base64 或分块拼接 Base64 传图，不用 base64 文本充当图片阅读。无法从原图或必要裁图可靠读取时明确失败或不确定，不猜测。
 """
         try:
-            reviewer_environment = _reviewer_environment()
+            if offline_api is not None:
+                codex_home = temporary_root / "codex-home"
+                codex_home.mkdir(mode=0o700)
+                # Public synthetic fixture only; never copy native credentials.
+                fixture_auth = codex_home / "auth.json"
+                json_artifact.write_json_atomic(fixture_auth, {"OPENAI_API_KEY": "native-contract-placeholder"})
+                fixture_auth.chmod(0o600)
+                reviewer_environment = {**offline_api[1], "CODEX_HOME": str(codex_home), "OCX_SHIM_BYPASS": "1"}
+                if trace_sse:
+                    reviewer_environment["RUST_LOG"] = _SSE_TRACE_TARGET
+            else:
+                reviewer_environment = _reviewer_environment(trace_sse=trace_sse)
         except (OSError, ValueError) as error:
             output.close()
             return CodexExecution(
@@ -1000,7 +1129,34 @@ def _execute_codex_raw(
         json_artifact.write_json_atomic(
             schema_file, schema,
         )
-        command = _codex_command(project_root, schema_file, decision_file, visual_aux=visual_aux)
+        command = _codex_command(
+            project_root, schema_file, decision_file,
+            **({"visual_aux": visual_aux} if visual_aux is not None else {}),
+            **({"tool_output_token_limit": frozen_input.tool_output_token_limit}
+               if frozen_input is not None and frozen_input.tool_output_token_limit is not None else {}),
+            **({"model_instructions_file": role_file} if role_file is not None else {}),
+        )
+        if offline_api is not None:
+            command[2:2] = ["--config", "openai_base_url=" + json.dumps(offline_api[0]),
+                            "--skip-git-repo-check", "--config", 'web_search="disabled"',
+                            "--config", "mcp_servers={}", "--config", "tools.web_search=false"]
+        if frozen_input is not None:
+            try:
+                frozen_input.validate(action_file)
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+                output.close()
+                return CodexExecution(
+                    "codex_review_task_invalid", _unknown_usage(),
+                    process_state="not_started", decision_state="not_attempted",
+                )
+            if frozen_input.codec is not None:
+                command[0] = str(frozen_input.codec[0])
+            command[2:2] = [part for path in frozen_input.images for part in ("--image", str(path))]
+            stderr_summary["input_delivery"] = {
+                "mode": "existing_reading_path" if frozen_input.fallback_reason else "complete_initial_input",
+                "fallback_reason": frozen_input.fallback_reason,
+                "images_supplied": len(frozen_input.images),
+            }
         if audit_directory:
             # Authentication stays native; the isolated DB indexes this review only.
             command.remove("--ephemeral")
@@ -1044,6 +1200,8 @@ def _execute_codex_raw(
                 previous_sigterm_mask = None
 
         try:
+            if offline_api is not None:
+                stderr_summary["offline_native_command"] = list(command)
             process = subprocess.Popen(
                 command,
                 cwd=project_root,
@@ -1553,7 +1711,10 @@ def _validated_task(task: dict) -> tuple[Path, Path, int]:
     }:
         raise ValueError("codex_review_task_invalid")
     project_root = Path(str(task["project_root"])).expanduser().resolve()
-    action_file = Path(str(task["action_file"])).expanduser().resolve()
+    requested_action = Path(str(task["action_file"])).expanduser().absolute()
+    if requested_action != requested_action.resolve():
+        raise ValueError("codex_review_task_invalid")
+    action_file = requested_action.resolve()
     timeout_seconds = task["timeout_seconds"]
     expected_root = project_root / "runtime" / "finance_preaudit_flows"
     workflow_key = _action_workflow(action_file)

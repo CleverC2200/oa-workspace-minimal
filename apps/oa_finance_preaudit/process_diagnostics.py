@@ -99,6 +99,16 @@ def record(action_file: Path, *, execution, elapsed_seconds: float, stderr: dict
         "stderr_signals": sorted({code for code in stderr.get("stderr_signals", [])
                                   if isinstance(code, str) and code in _SIGNAL_TERMS}),
     }
+    delivery = stderr.get("input_delivery")
+    if isinstance(delivery, dict):
+        modes = {"existing_reading_path", "complete_initial_input"}
+        reasons = {None, "text_limit", "image_count_limit", "image_encoding_not_preserved",
+                   "image_preparation_differs", "image_bytes_limit", "request_bytes_limit", "encoded_size_not_verified"}
+        if (delivery.get("mode") not in modes or delivery.get("fallback_reason") not in reasons
+                or type(delivery.get("images_supplied")) is not int
+                or delivery["images_supplied"] < 0):
+            raise ValueError("process_diagnostic_invalid")
+        payload["input_delivery"] = {key: delivery[key] for key in ("mode", "fallback_reason", "images_supplied")}
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
     target = path.with_name(f"review-process-{digest}.json")
     if target.is_symlink():

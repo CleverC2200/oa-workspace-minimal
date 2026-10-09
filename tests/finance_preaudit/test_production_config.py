@@ -113,3 +113,73 @@ def test_unused_default_tier_string_cannot_hide_actual_priority_setting(reposito
     text = text.replace("    native_home = Path", "    unused = 'service_tier=\"default\"'\n    native_home = Path", 1)
     path.write_text(text)
     assert "production_config_native_settings_drift" in production_config.repository_findings(repository)
+
+
+@pytest.mark.parametrize('construction', ['direct', 'variable', 'optional'])
+def test_repository_accepts_review_command_construction(repository, construction):
+    path = repository / "apps/oa_finance_preaudit/codex_review_worker.py"
+    source = path.read_text()
+    start = source.index("\ndef _codex_command(")
+    end = source.index("\ndef _decision_schema(", start)
+    function = source[start:end]
+    optional = function.index('    if tool_output_token_limit is not None:')
+    if construction == 'direct':
+        function = function[:optional].replace('    command = [\n', '    return [\n', 1)
+    elif construction == 'variable':
+        function = function[:optional] + '    return command\n\n'
+    path.write_text(source[:start] + function + source[end:])
+    assert production_config.repository_findings(repository) == []
+
+
+@pytest.mark.parametrize('before,after', [
+    ('        MODEL,', '        "other-model",'),
+    ('\'model_provider="openai"\'', '\'model_provider="other"\''),
+    ('\'service_tier="default"\'', '\'service_tier="priority"\''),
+    ('f\'model_reasoning_effort="{REASONING_EFFORT}"\'', '\'model_reasoning_effort="high"\''),
+    ('f"tool_output_token_limit={tool_output_token_limit}"', '\'service_tier="priority"\''),
+    ('    return command\n', '    command.extend(["--model", "other-model"])\n    return command\n'),
+    ('    return command\n', '    return tuple(command)\n'),
+    ('    return command\n', '    if project_root:\n        return []\n    return command\n'),
+])
+def test_assembled_native_command_drift_and_unknown_paths_are_rejected(repository, before, after):
+    path = repository / 'apps/oa_finance_preaudit/codex_review_worker.py'
+    source = path.read_text()
+    assert before in source
+    path.write_text(source.replace(before, after, 1))
+    assert 'production_config_native_settings_drift' in production_config.repository_findings(repository)
+
+
+def test_native_command_cannot_shadow_the_authorized_model(repository):
+    path = repository / 'apps/oa_finance_preaudit/codex_review_worker.py'
+    source = path.read_text().replace('    command = [\n', '    MODEL = "other-model"\n    command = [\n', 1)
+    path.write_text(source)
+    assert 'production_config_native_settings_drift' in production_config.repository_findings(repository)
+
+
+@pytest.mark.parametrize('binding', [
+    'from apps.oa_finance_preaudit.production_config import REASONING_EFFORT as MODEL',
+    'from apps.oa_finance_preaudit.production_config import MODEL_PROVIDER as MODEL',
+    'from apps.oa_finance_preaudit.production_config import MODEL as REASONING_EFFORT',
+    'from another_module import MODEL',
+    'from another_module import REASONING_EFFORT',
+    'import json as MODEL',
+    'import json as REASONING_EFFORT',
+    'import MODEL.submodule',
+    'import REASONING_EFFORT.submodule',
+])
+def test_native_command_rejects_imported_identity_bindings(repository, binding):
+    path = repository / 'apps/oa_finance_preaudit/codex_review_worker.py'
+    source = path.read_text().replace('    command = [\n', f'    {binding}\n    command = [\n', 1)
+    path.write_text(source)
+    assert 'production_config_native_settings_drift' in production_config.repository_findings(repository)
+
+
+@pytest.mark.parametrize('binding', [
+    'import json',
+    'from apps.oa_finance_preaudit.production_config import MODEL_PROVIDER as unused_provider',
+])
+def test_native_command_preserves_identity_with_unrelated_imports(repository, binding):
+    path = repository / 'apps/oa_finance_preaudit/codex_review_worker.py'
+    source = path.read_text().replace('    command = [\n', f'    {binding}\n    command = [\n', 1)
+    path.write_text(source)
+    assert production_config.repository_findings(repository) == []

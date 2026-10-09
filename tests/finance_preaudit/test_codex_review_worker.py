@@ -349,7 +349,7 @@ def test_small_marketing_v2_worker_uses_six_item_requirements(
     )
     assert "item_key" not in attachment_schema["properties"]
     assert "item_key" not in attachment_schema["required"]
-    assert "小额市场费生产预审" in prompt
+    assert "小额市场费只读预审" in prompt
     assert "small-marketing-fee.md" in prompt
     assert "六项必须逐项" in prompt
     assert "逐字同时包含“支付截图”和“发票”" in prompt
@@ -2021,9 +2021,10 @@ def test_read_only_schema_keeps_probe_token(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("read_only", [False, True])
-def test_process_receives_bound_token_schema(tmp_path: Path, monkeypatch, read_only: bool) -> None:
+@pytest.mark.parametrize("workflow_key", ["travel_expense", "general_expense"])
+def test_process_receives_bound_token_schema(tmp_path: Path, monkeypatch, read_only: bool, workflow_key: str) -> None:
     monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
-    task, action_file = _task(tmp_path)
+    task, action_file = _task(tmp_path, workflow_key=workflow_key)
     seen = []
 
     class Process:
@@ -2040,6 +2041,7 @@ def test_process_receives_bound_token_schema(tmp_path: Path, monkeypatch, read_o
             return self.returncode
 
     def popen(command, **_kwargs):
+        assert not any("tool_output_token_limit=" in arg for arg in command)
         schema = json.loads(Path(command[command.index("--output-schema") + 1]).read_text())
         seen.append(schema["properties"]["action_token"])
         return Process()
