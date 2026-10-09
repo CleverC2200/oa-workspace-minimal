@@ -155,7 +155,7 @@ def test_confirmed_feedback_and_regressions_stay_sanitized() -> None:
                 "核对当前单据 OA“关联发票”及发票金额",
                 "同一发票去重计入",
                 "不要求逐行重复挂票",
-                "一致即按对公支付免支付截图",
+                "六类财务共用规则",
                 "不追加清单盖章要求",
                 "排除重复截图",
                 "不设置容差",
@@ -251,3 +251,26 @@ def test_shared_reading_distinguishes_display_differences_from_missing_facts():
     assert "仅统一中英文括号并去掉首尾空白" in tpm
     assert "不得改字、展开简称或做模糊匹配" in contract
     assert "先检查同一事实是否已由其他可信字段或附件确认" in contract
+
+
+def test_six_finance_flows_share_payment_screenshot_rule():
+    shared = (REFERENCE_ROOT / "payment-screenshot-exemption.md").read_text(encoding="utf-8")
+    routing = RESULT_CONTRACT.read_text(encoding="utf-8")
+    assert "payment-screenshot-exemption.md" in routing
+    for name in ("差旅费", "业务招待费", "业务支持费", "小额市场费", "TPM 小额市场费", "通用费用"):
+        assert name in shared
+    for requirement in (
+        "逐字完全一致", "按可信对应关系分别核验", "无需再取实际付款凭据证明截图豁免",
+        "缺截图本身不足以判 `fail`", "其他必需材料确认缺失", "豁免不证明已经实际支付",
+        "申请/申报金额仍是申请/申报金额", "仅比较该流程其他已确认且同范围的金额",
+        "支付失败、退款或金额冲突仍按真实事实报告",
+        "invoice_document_reference_unresolved", "不能声称申请人未上传",
+    ):
+        assert requirement in shared
+    cases = {case["id"] for case in json.loads(REGRESSION_CASES.read_text())["cases"]}
+    assert {
+        "RC-056-finance-company-payment-exemption",
+        "RC-057-finance-multiple-payees-untrusted-mapping",
+        "RC-058-finance-seller-missing-or-different",
+        "RC-059-finance-other-materials-and-document-read-gap",
+    } <= cases

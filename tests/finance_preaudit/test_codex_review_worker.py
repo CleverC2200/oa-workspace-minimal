@@ -303,23 +303,10 @@ def test_general_expense_worker_uses_bound_rule_pack(tmp_path: Path) -> None:
     assert "page_routing" not in prompt
 
 
-@pytest.mark.parametrize(
-    "requirement",
-    (
-        "缺支付截图时先核对收款人名称与关联发票销售方",
-        "逐字完全一致则免支付截图",
-        "名称或关联关系无法核实时，对该缺口使用 uncertain",
-        "不得用购买方、合同乙方或发票文件名代替销售方",
-        "确认名称不一致后按规则核验人员关系和补充材料",
-        "豁免仅免支付截图，其他必需附件仍须核验",
-    ),
-)
-def test_general_expense_prompt_carries_payment_exemption(
-    tmp_path: Path, requirement: str,
-) -> None:
-    # Wiring check only: this does not evaluate an AI business decision.
+def test_general_expense_prompt_uses_shared_payment_exemption(tmp_path: Path) -> None:
     _, action_file = _task(tmp_path, workflow_key="general_expense")
-    assert requirement in codex_review_worker._prompt(action_file)
+    assert "完整读取 `references/payment-screenshot-exemption.md`" in codex_review_worker._prompt(action_file)
+    assert "确认名称不一致后按规则核验人员关系和补充材料" in codex_review_worker._prompt(action_file)
 
 
 def test_small_marketing_v2_worker_uses_six_item_requirements(

@@ -792,6 +792,60 @@
             "expected_output": "对应项目使用 uncertain，只说明自动读取失败、未完成核对，请财务查看原单；不推断申请人是否填写或上传",
             "failure_mode": "把系统未读取到材料错误表述为申请人没有提供材料",
             "rule_ref": "flows/tpm-small-marketing-fee.md;SKILL.md#2-读取证据"
-        }
+        },
+    {
+      "id": "RC-056-finance-company-payment-exemption",
+      "scope": "six-finance-flows",
+      "audit_item": "attachment;payment;amount",
+      "status": "confirmed",
+      "input_facts": [
+        "合成案例：六类财务中任一费用只有一个收款人示例纸品有限公司，当前关联发票销售方逐字同名，关联可信",
+        "支付截图未提供，其他必需材料完整；申报100元、发票100元，未提供实际支付状态"
+      ],
+      "incorrect_output": "要求补支付截图或实际支付凭据证明豁免，或写成已实际支付100元",
+      "expected_output": "附件项可通过，对公付款免支付截图；仅比较该流程其他已确认且同范围的申报和发票金额，不把100元写成实付",
+      "failure_mode": "已确认对公付款仍被重复要求截图或凭空认定实付",
+      "rule_ref": "payment-screenshot-exemption.md"
+    },
+    {
+      "id": "RC-057-finance-multiple-payees-untrusted-mapping",
+      "scope": "six-finance-flows",
+      "audit_item": "attachment;payment;amount",
+      "status": "confirmed",
+      "input_facts": [
+        "合成案例：两位收款人、两张发票，其中一组同名，第二组只有相似金额，没有可信对应关系"
+      ],
+      "incorrect_output": "整单均按同名免截图",
+      "expected_output": "第二组对应关系uncertain，记录缺口；第一组已核实事实保留，不按金额推定其他组豁免",
+      "failure_mode": "把一组同名扩展到未核实费用",
+      "rule_ref": "payment-screenshot-exemption.md"
+    },
+    {
+      "id": "RC-058-finance-seller-missing-or-different",
+      "scope": "six-finance-flows",
+      "audit_item": "attachment;payment;amount",
+      "status": "confirmed",
+      "input_facts": [
+        "合成案例甲：当前发票购买方已读取、销售方缺失，支付截图未提供",
+        "合成案例乙：收款人与关联发票销售方明确不同名"
+      ],
+      "incorrect_output": "用购买方、合同乙方或文件名代替销售方豁免，或仅因缺截图判甲fail",
+      "expected_output": "甲为uncertain，说明销售方未核实；乙不豁免，按当前流程人员关系和补充材料规则继续核验",
+      "failure_mode": "缺失主体被补猜或明确不同名被放过",
+      "rule_ref": "payment-screenshot-exemption.md"
+    },
+    {
+      "id": "RC-059-finance-other-materials-and-document-read-gap",
+      "scope": "six-finance-flows",
+      "audit_item": "attachment;payment;amount",
+      "status": "confirmed",
+      "input_facts": [
+        "合成案例：同名豁免已成立，另有必需照片确认缺失；发票文档字段已关联但只有文档ID，当前接口无可下载文件，发票云主体已读取"
+      ],
+      "incorrect_output": "因截图豁免把附件项全部判通过，或把文档未读取写成未上传，并作废已核实销售方",
+      "expected_output": "照片确认缺失仍按fail；正文未覆盖事实保留读取缺口；可信发票主体继续采用，不声称申请人未上传",
+      "failure_mode": "豁免扩大到其他材料或把系统读取限制归责申请人",
+      "rule_ref": "payment-screenshot-exemption.md"
+    }
   ]
 }

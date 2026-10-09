@@ -60,7 +60,7 @@ def _invoice_refs(
     refs: List[Dict[str, str]] = []
     invalid_invoice_numbers: List[str] = []
     has_misaligned_refs = False
-    seen: set[str] = set()
+    seen: dict[str, str] = {}
     for field in fields:
         name = str(field.get("name") or "").strip()
         if linked_detail_only and (
@@ -69,9 +69,20 @@ def _invoice_refs(
             or str(field.get("table") or "") != "detail_0"
         ):
             continue
-        if not linked_detail_only and name != "发票号码":
+        if not linked_detail_only and name != "发票号码" and not (
+            name == "关联发票"
+            and str(field.get("field_name") or "").strip() == "glfp"
+            and re.fullmatch(r"detail_\d+", str(field.get("table") or ""))
+        ):
             continue
-        data_ids = re.findall(r"\d+", str(field.get("raw_value") or ""))
+        raw_value = str(field.get("raw_value") or "").strip()
+        if name == "关联发票" and any(
+            value and not re.fullmatch(r"[0-9]+(?:\s*[,，;；]\s*[0-9]+)*", value)
+            for value in (raw_value, str(field.get("value") or "").strip())
+        ):
+            has_misaligned_refs = True
+            continue
+        data_ids = re.findall(r"\d+", raw_value)
         invoice_numbers = re.findall(r"\d+", str(field.get("value") or ""))
         if (data_ids or invoice_numbers) and len(data_ids) != len(invoice_numbers):
             has_misaligned_refs = True
@@ -79,8 +90,11 @@ def _invoice_refs(
             continue
         for data_id, invoice_no in zip(data_ids, invoice_numbers):
             if data_id in seen:
+                if seen[data_id] != invoice_no:
+                    has_misaligned_refs = True
+                    invalid_invoice_numbers.extend((seen[data_id], invoice_no))
                 continue
-            seen.add(data_id)
+            seen[data_id] = invoice_no
             refs.append({"data_id": data_id, "invoice_no": invoice_no})
     return refs, invalid_invoice_numbers, has_misaligned_refs
 
