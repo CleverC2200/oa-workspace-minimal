@@ -28,11 +28,25 @@ ITEM_KEYS = (
 )
 
 
+def _company_fields() -> list[dict]:
+    return [{"code": code, "name": name, "path": f"main[0].field[{index}]",
+             "value": "测试公司", "read_status": "present", "value_source": "display"}
+            for index, (code, name) in enumerate((("zfgs", "支付公司"), ("bxgs", "报销公司")))]
+
+
+def _company_facts() -> list[dict]:
+    return [{"source": "invoice_cloud", "name": "发票购买方", "value": "测试公司", "subject_ref": "test-invoice"}]
+
+
 def _engine(
     tmp_path: Path,
     *,
     declared_fields: object | None = None,
 ) -> flow_engine.FlowEngine:
+    current_fields = list(declared_fields) if isinstance(declared_fields, list) else []
+    if not any(row.get("code") == "glfp" for row in current_fields):
+        current_fields.append({"path": "detail[0].row[0].field[17]", "name": "关联发票", "code": "glfp",
+                               "read_status": "present", "value": "12345678901234567890"})
     return flow_engine.FlowEngine(
         root=tmp_path / "runtime" / "finance_preaudit_flows",
         discover_candidates=lambda workflow_key: [
@@ -48,16 +62,14 @@ def _engine(
             "request_id": request_id,
             "workflow_key": WORKFLOW_KEY,
             "workflow_name": "TPM小额市场费用报销申请流程",
-            "declared_fields": (
-                {} if declared_fields is None else declared_fields
-            ),
+            "declared_fields": current_fields + _company_fields(),
             "resources": [],
             "prepared": {
                 "images": [],
                 "structured_contents": [],
                 "manifest": [],
             },
-            "authority_facts": [],
+            "authority_facts": _company_facts(),
             "warnings": [],
         },
     )
@@ -82,7 +94,7 @@ def _decision(action: dict, *, conclusion: str) -> dict:
                 ),
             }
         )
-    return {
+    decision = {
         "schema_version": 1,
         "kind": "preaudit_review_decision",
         "action_token": action["action_token"],
@@ -91,6 +103,12 @@ def _decision(action: dict, *, conclusion: str) -> dict:
         "overall": "needs_human",
         "items": items,
     }
+    packet = json.loads(Path(action["review_packet_file"]).read_text())
+    if "company_comparison_contract" in packet:
+        decision["company_comparison"] = {"observed_refs": [row["evidence_ref"] for row in packet["company_comparison_contract"]["records"]],
+                                          "result": "match", "reason": "报销公司测试公司、支付公司测试公司、购买方测试公司一致。"}
+        decision["items"][-1]["conclusion"] = decision["company_comparison"]["reason"]
+    return decision
 
 
 def _image_engine(tmp_path: Path) -> flow_engine.FlowEngine:
@@ -115,7 +133,7 @@ def _image_engine(tmp_path: Path) -> flow_engine.FlowEngine:
             "request_id": request_id,
             "workflow_key": WORKFLOW_KEY,
             "workflow_name": "TPM小额市场费用报销申请流程",
-            "declared_fields": [
+            "declared_fields": _company_fields() + [
                 {
                     "code": "subject",
                     "name": "预算科目",
@@ -160,7 +178,7 @@ def _image_engine(tmp_path: Path) -> flow_engine.FlowEngine:
                     }
                 ],
             },
-            "authority_facts": [],
+            "authority_facts": _company_facts(),
             "warnings": [],
         }
 
@@ -194,6 +212,7 @@ def _all_pass_decision(action: dict, *, attachment_refs: list[str]) -> dict:
         "material:resources.111",
         *attachment_refs,
     ]
+    decision["items"][-1]["conclusion"] = decision["company_comparison"]["reason"]
     return decision
 
 
@@ -395,6 +414,7 @@ def test_tpm_public_remark_keeps_all_four_checks(tmp_path: Path, all_pass: bool)
         decision["overall"] = "pass"
         for item in decision["items"]:
             item.update(status="pass", conclusion="已核对", evidence_refs=["material:declared_fields.expense_subject"], missing_evidence=[])
+        decision["items"][-1]["conclusion"] = decision["company_comparison"]["reason"]
     decision_file = tmp_path / "decision.json"
     decision_file.write_text(json.dumps(decision, ensure_ascii=False))
     closed = engine.complete_review(Path(action["action_file"]), decision_file)

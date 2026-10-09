@@ -91,7 +91,11 @@ def test_ready_catalog_allows_first_item_and_keeps_amount(tmp_path: Path) -> Non
     path = tmp_path / "runtime" / "reference" / "tpm-price-reference.json"
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps(_catalog(tmp_path)))
-    engine = _engine(tmp_path, declared_fields=_material()["declared_fields"])
+    fields = _material()["declared_fields"] + [{
+        "code": "glfp", "name": "关联发票", "path": "detail[0].row[0].field[17]",
+        "read_status": "present", "value": "12345678901234567890",
+    }]
+    engine = _engine(tmp_path, declared_fields=fields)
     action = engine.next_action(WORKFLOW_KEY)
     decision = _decision(action, conclusion="附件完整。")
     decision["overall"] = "pass"

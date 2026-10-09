@@ -19,7 +19,7 @@ import fitz
 from apps import json_artifact
 from apps.oa_approval import writer_outcomes
 
-from . import decision_validation, item_failure, manual_handoff, observability, packaging_contract, review_failure_evidence, submission, tpm_price_reference
+from . import company_comparison, fuel_trip_observation, decision_validation, item_failure, manual_handoff, observability, packaging_contract, review_failure_evidence, submission, tpm_price_reference
 
 
 SCHEMA_VERSION = 1
@@ -170,6 +170,10 @@ _TPM_IMAGE_EVIDENCE_PREFIX = "material:prepared.images."
 _TPM_SUBJECT_FIELD_CODE = "yskm"
 _TPM_LINKED_INVOICE_FIELD_CODE = "glfp"
 _TPM_LINKED_INVOICE_ITEM = "linked_invoice_receipt"
+_INVOICE_LINKAGE_WORKFLOWS = frozenset(
+    {"business_entertainment", "general_expense", "tpm_small_marketing_fee"}
+)
+_INVOICE_LINKAGE_CONTRACT = "oa_record:1"
 _TPM_SUBJECT_EVIDENCE_GAP = "未核对预算科目对应的附件要求，请财务核对原单。"
 _TPM_LINKED_INVOICE_GAP = "关联发票未读取到关联记录，请财务核对原单。"
 _TPM_IMAGE_EVIDENCE_GAP = (
@@ -408,23 +412,37 @@ def enforce_tpm_subject_evidence(items: list[dict], material: dict) -> bool:
     return False
 
 
-def enforce_tpm_linked_invoice_evidence(items: list[dict], material: dict) -> bool:
-    """OA「关联发票」全部未解析时，第 2 项不得判通过（财务口径）。"""
-    rows = [row for row in (material.get("declared_fields") or ())
-            if isinstance(row, dict) and str(row.get("code") or "") == _TPM_LINKED_INVOICE_FIELD_CODE]
-    if not rows:
+def enforce_linked_invoice_evidence(
+    items: list[dict], material: dict, *, item_key: str, require_record: bool = False
+) -> bool:
+    """Missing OA relationship evidence cannot be replaced by invoice contents."""
+    rows = [
+        row for row in (material.get("declared_fields") or ())
+        if isinstance(row, dict) and str(row.get("code") or "") == _TPM_LINKED_INVOICE_FIELD_CODE
+    ]
+    if not rows and not require_record:
         return False
-    if any(str(row.get("read_status") or "") == "present" and str(row.get("value") or "").strip()
-           for row in rows):
+    if any(
+        str(row.get("read_status") or "") == "present" and str(row.get("value") or "").strip()
+        for row in rows
+    ):
         return False
     for item in items:
-        if item.get("item_key") != _TPM_LINKED_INVOICE_ITEM:
+        if item.get("item_key") != item_key:
             continue
         if item.get("status") != "pass":
             return False
         _downgrade_tpm_item(item, _TPM_LINKED_INVOICE_GAP)
         return True
     return False
+
+
+def enforce_tpm_linked_invoice_evidence(items: list[dict], material: dict) -> bool:
+    return enforce_linked_invoice_evidence(
+        items, material,
+        item_key=_TPM_LINKED_INVOICE_ITEM,
+        require_record=material.get("invoice_linkage_contract") == _INVOICE_LINKAGE_CONTRACT,
+    )
 
 
 def _validate_small_marketing_conclusions(
@@ -684,15 +702,29 @@ def _review_packet_constraints(workflow_key: str, material: dict) -> dict:
             )
         ):
             raise ValueError("material_bundle_schema_invalid")
+    if fuel_trip_observation.MARKER in material and (
+        fuel_trip_observation.binding(material)
+        != fuel_trip_observation.freeze_contract(workflow_key, material)
+    ):
+        raise ValueError("material_bundle_schema_invalid")
     if not raw_gaps:
         constraints = {
             "material_state": "complete",
             "required_uncertain_items": [],
+            **fuel_trip_observation.freeze_contract(workflow_key, material),
         }
+        if material.get("invoice_linkage_contract") == _INVOICE_LINKAGE_CONTRACT:
+            constraints["invoice_linkage_contract"] = _INVOICE_LINKAGE_CONTRACT
         if workflow_key == "packaging_layout_approval":
             constraints["packaging_visual_contract"] = (
                 _packaging_visual_contract(material)
             )
+        if workflow_key == "tpm_small_marketing_fee":
+            comparison = material.get("company_comparison_contract")
+            if comparison is not None:
+                if comparison != company_comparison.freeze(material):
+                    raise ValueError("material_bundle_schema_invalid")
+                constraints["company_comparison_contract"] = comparison
         return constraints
     if workflow_key not in _FINANCE_WORKFLOW_KEYS:
         raise ValueError("material_bundle_schema_invalid")
@@ -1181,7 +1213,9 @@ def _validate_frozen_review_inputs(
         ),
     }
     accepted_packets = [expected_packet]
-    if workflow_key == "packaging_layout_approval":
+    if workflow_key == "travel_expense":
+        accepted_packets = fuel_trip_observation.accepted_packets(expected_packet, state, material=material)
+    elif workflow_key == "packaging_layout_approval":
         accepted_packets = _accepted_packaging_packets(expected_packet, state)
     elif workflow_key == "small_marketing_fee":
         accepted_packets = _accepted_small_marketing_packets(expected_packet, state)
@@ -1299,7 +1333,15 @@ def _accepted_tpm_small_marketing_packets(
     if action is not None and action.get("rule_version") != version:
         raise ValueError("frozen_packet_changed")
     if version == _TPM_SMALL_MARKETING_RULE_VERSION:
+        if "company_comparison_contract" in expected_packet:
+            if type(state.get("company_comparison_contract_version")) is not int or state["company_comparison_contract_version"] != 1:
+                raise ValueError("frozen_packet_changed")
+            return [expected_packet]
+        if state.get("company_comparison_contract_version") is not None:
+            raise ValueError("frozen_packet_changed")
         return [expected_packet]
+    expected_packet = dict(expected_packet)
+    expected_packet.pop("company_comparison_contract", None)
     if action is None and version == "tpm_small_marketing_fee:3":
         return [{**expected_packet, "rule_version": version}]
     if action is not None or version not in (None, "tpm_small_marketing_fee:2"):
@@ -1613,6 +1655,10 @@ def _validate_review_decision(action: dict, packet: dict, quality_material: dict
         "overall",
         "items",
     }
+    if "company_comparison_contract" in packet:
+        expected_fields.add("company_comparison")
+    if packet.get(fuel_trip_observation.MARKER) is not None:
+        expected_fields.add(fuel_trip_observation.FIELD)
     if action["workflow_key"] == "packaging_layout_approval":
         expected_fields.add("excel_comparison")
         if packaging_v2:
@@ -1683,6 +1729,12 @@ def _validate_review_decision(action: dict, packet: dict, quality_material: dict
             raise decision_validation.InvalidDecision("item_values")
         normalized_items.append(dict(item))
 
+    if action["workflow_key"] in _INVOICE_LINKAGE_WORKFLOWS:
+        model_overall = (
+            "needs_human" if any(item["status"] != "pass" for item in normalized_items) else "pass"
+        )
+        if decision["overall"] != model_overall:
+            raise decision_validation.InvalidDecision("overall_mismatch")
     required_uncertain_items = set(packet["required_uncertain_items"])
     if any(
         item["item_key"] in required_uncertain_items
@@ -1725,6 +1777,26 @@ def _validate_review_decision(action: dict, packet: dict, quality_material: dict
             quality_material,
         ):
             decision["overall"] = "needs_human"
+    if "company_comparison_contract" in packet:
+        company_item = next(item for item in normalized_items if item["item_key"] == "entity_consistency")
+        company_comparison.validate(packet["company_comparison_contract"], quality_material,
+                                    decision.get("company_comparison"), company_item)
+    if action["workflow_key"] in {"business_entertainment", "general_expense"}:
+        if enforce_linked_invoice_evidence(
+            normalized_items, quality_material,
+            item_key="invoice_linkage",
+            require_record=packet.get("invoice_linkage_contract") == _INVOICE_LINKAGE_CONTRACT,
+        ):
+            decision["overall"] = "needs_human"
+    if packet.get(fuel_trip_observation.MARKER) is not None:
+        fuel_trip_observation.validate(
+            decision.get(fuel_trip_observation.FIELD),
+            contract=packet[fuel_trip_observation.MARKER],
+            item=next(item for item in normalized_items if item["item_key"] == "fuel_subsidy"),
+            pages=tuple((ref, {"content_sha256": _verified_page_sha256(image)})
+                        for ref, image in _travel_pages(quality_material)),
+            declared_fields=quality_material.get("declared_fields"),
+        )
     covered_page_refs = {
         value
         for item in normalized_items
@@ -2351,6 +2423,7 @@ class FlowEngine:
             events_file=str(attempt_root / "observability.json"),
             case_key=attempt_root.parent.name,
             attempt=_attempt_number(attempt_root),
+            **fuel_trip_observation.binding(state),
         )
         json_artifact.write_json_atomic(action_path, closed, indent=2)
         json_artifact.write_json_atomic(
@@ -2368,6 +2441,8 @@ class FlowEngine:
                 "envelope_fingerprint": receipt["envelope_fingerprint"],
                 "receipt_fingerprint": _file_fingerprint(receipt_file),
                 "submission_token_sha256": receipt["submission_token_sha256"],
+                **({"company_comparison_contract_version": state["company_comparison_contract_version"]}
+                   if "company_comparison_contract_version" in state else {}),
             },
             indent=2,
         )
@@ -2908,12 +2983,8 @@ class FlowEngine:
         }
         accepted_packets = [expected_packet]
         if workflow_key == "travel_expense":
-            accepted_packets.append(
-                {
-                    **expected_packet,
-                    "page_routing": _review_packet_routing(workflow_key, material),
-                }
-            )
+            expected_packet["page_routing"] = _review_packet_routing(workflow_key, material)
+            accepted_packets = fuel_trip_observation.accepted_packets(expected_packet, state, material=material, action=action)
         elif workflow_key == "packaging_layout_approval":
             accepted_packets = _accepted_packaging_packets(
                 expected_packet,
@@ -3018,6 +3089,13 @@ class FlowEngine:
                 material["tpm_price_reference"] = tpm_price_reference.snapshot(
                     self._root.parent / tpm_price_reference.REFERENCE_PATH
                 )
+            if workflow_key == "tpm_small_marketing_fee":
+                comparison = company_comparison.freeze(material)
+                if comparison is not None:
+                    material = {**material, "company_comparison_contract": comparison}
+            if workflow_key in _INVOICE_LINKAGE_WORKFLOWS:
+                material["invoice_linkage_contract"] = _INVOICE_LINKAGE_CONTRACT
+            material.update(fuel_trip_observation.freeze_contract(workflow_key, material))
             try:
                 material_file = attempt_root / "material.json"
                 json_artifact.write_json_atomic(material_file, material, indent=2)
@@ -3052,6 +3130,8 @@ class FlowEngine:
                         else {}
                     ),
                 }
+                if "company_comparison_contract" in packet:
+                    claim["company_comparison_contract_version"] = 1
                 packet_file = attempt_root / "review-packet.json"
                 json_artifact.write_json_atomic(packet_file, packet, indent=2)
                 claim = {
@@ -3060,6 +3140,7 @@ class FlowEngine:
                     "review_packet_file": str(packet_file),
                     "material_fingerprint": verified["material_fingerprint"],
                     "evidence_fingerprint": evidence_fingerprint,
+                    **fuel_trip_observation.binding(packet),
                 }
                 json_artifact.write_json_atomic(state_path, claim, indent=2)
             except Exception as error:
@@ -3134,6 +3215,7 @@ class FlowEngine:
                     else {}
                 ),
                 **recovery_metadata,
+                **fuel_trip_observation.binding(packet),
             )
             state = {
                 **action,
@@ -3143,6 +3225,8 @@ class FlowEngine:
                 "material_file": str(material_file),
                 "material_fingerprint": verified["material_fingerprint"],
                 "evidence_fingerprint": evidence_fingerprint,
+                **({"company_comparison_contract_version": 1}
+                   if "company_comparison_contract" in packet else {}),
                 **(
                     {"rule_version": spec["rule_version"]}
                     if workflow_key in _EXPLICIT_RULE_VERSION_WORKFLOWS
@@ -4517,6 +4601,7 @@ class FlowEngine:
             events_file=action["events_file"],
             case_key=action["case_key"],
             attempt=action["attempt"],
+            **fuel_trip_observation.binding(state),
         )
         json_artifact.write_json_atomic(action_path, closed, indent=2)
         json_artifact.write_json_atomic(
@@ -4535,6 +4620,8 @@ class FlowEngine:
                 "receipt_fingerprint": _file_fingerprint(receipt_file),
                 "no_write_evidence": receipt["no_write_evidence"],
                 "submission_token_sha256": receipt["submission_token_sha256"],
+                **({"company_comparison_contract_version": state["company_comparison_contract_version"]}
+                   if "company_comparison_contract_version" in state else {}),
             },
             indent=2,
         )

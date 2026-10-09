@@ -32,7 +32,10 @@ def _material(request_id: str, workflow_key: str = WORKFLOW_KEY) -> dict:
         "request_id": request_id,
         "workflow_key": workflow_key,
         "workflow_name": "业务招待费报销流程",
-        "declared_fields": [],
+        "declared_fields": [{
+            "path": "detail[0].row[0].field[17]", "name": "关联发票", "code": "glfp",
+            "read_status": "present", "value": "12345678901234567890",
+        }],
         "resources": [],
         "prepared": {"images": [], "structured_contents": [], "manifest": []},
         "authority_facts": [],

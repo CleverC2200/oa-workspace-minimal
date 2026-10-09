@@ -846,6 +846,46 @@
       "expected_output": "照片确认缺失仍按fail；正文未覆盖事实保留读取缺口；可信发票主体继续采用，不声称申请人未上传",
       "failure_mode": "豁免扩大到其他材料或把系统读取限制归责申请人",
       "rule_ref": "payment-screenshot-exemption.md"
+    },
+    {
+      "id": "RC-060-uploaded-invoice-is-not-oa-association",
+      "scope": "business_entertainment;general_expense;tpm_small_marketing_fee",
+      "audit_item": "invoice_linkage;linked_invoice_receipt",
+      "status": "confirmed",
+      "input_facts": [
+        "合成案例：上传附件包含可读发票 PDF，OA 关联发票字段未解析，未取得其他可信关联记录"
+      ],
+      "incorrect_output": "因读到发票附件而声称 OA 已关联发票并判通过，或把字段读取失败写成申请人未关联",
+      "expected_output": "关联待核，说明未读取到可信关联记录，请财务查看原单；已经读取的票面事实仍保留",
+      "failure_mode": "把附件内容存在与 OA 关联状态混为同一事实",
+      "rule_ref": "observation-contract.md"
+    },
+    {
+      "id": "RC-061-per-trip-mileage-excludes-between-trip-gap",
+      "scope": "travel_expense",
+      "audit_item": "fuel_subsidy",
+      "status": "confirmed",
+      "input_facts": [
+        "合成案例：按次带车，两组原图读数为 83859 至 85100、85105 至 85716，日期和归属分别支持两个行程",
+        "申报1857公里，油票类型拆分录入1740和117公里；原图重复上传不增加新行程"
+      ],
+      "incorrect_output": "用85716减83859得1857并认定申报一致，或把1740和117当作两个行程",
+      "expected_output": "逐组计算1241和611，合计1852，指出申报多计两组之间5公里；不能唯一配对则保留待核",
+      "failure_mode": "跨行程极值相减和申报拆分替代原图分组",
+      "rule_ref": "flows/travel-expense.md"
+    },
+    {
+      "id": "RC-062-tpm-company-advice-is-not-consistency",
+      "scope": "tpm_small_marketing_fee",
+      "audit_item": "entity_consistency",
+      "status": "confirmed",
+      "input_facts": [
+        "合成案例：实际报销、支付公司为示例销售公司，辅助支付公司2和开票公司为示例食品公司，权威发票购买方为示例食品公司"
+      ],
+      "incorrect_output": "只写建议使用示例食品公司账户支付，并把支付公司一致标为通过",
+      "expected_output": "模型明确比较实际报销/支付与购买方，保留不同主体和辅助字段角色，指出差异；支付建议不能替代比较结论",
+      "failure_mode": "省略原单主体冲突或静默用辅助字段替代实际支付公司",
+      "rule_ref": "flows/tpm-small-marketing-fee.md"
     }
   ]
 }
