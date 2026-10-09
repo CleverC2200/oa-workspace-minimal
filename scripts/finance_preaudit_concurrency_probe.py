@@ -5486,7 +5486,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload["primary_error_code"] = error.primary_error_code
         if controller_started:
             failure_code = str(error).partition(":")[0].strip()
-            alert_code = session_code or (
+            primary_code = payload.get("primary_error_code")
+            alert_code = primary_code if primary_code in session_alert.ALERT_ERROR_CODES else session_code or (
                 failure_code if failure_code in session_alert.PRODUCTION_ERROR_CODES
                 else "controller_failed"
             )
