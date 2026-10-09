@@ -38,6 +38,10 @@ def accepted_packets(expected: dict, state: dict, *, material: dict, action: dic
         return [expected]
     legacy = dict(expected)
     legacy.pop(MARKER, None)
+    # Recovery/confirmation validates canonical frozen routing. Only the open
+    # legacy-action reader retains the older packet-without-routing contract.
+    if action is None:
+        return [legacy]
     without_routing = dict(legacy)
     without_routing.pop("page_routing", None)
     return [legacy, without_routing]
@@ -90,7 +94,7 @@ def validate(value: object, *, contract: dict, item: dict, pages: tuple,
     if not isinstance(value, dict) or set(value) != {"outcome", "groups", "total_km"}:
         raise InvalidDecision(error)
     outcome, groups = value["outcome"], value["groups"]
-    if outcome not in {"grouped", "uncertain", "not_applicable"} or not isinstance(groups, list) or len(groups) > 100:
+    if not isinstance(outcome, str) or outcome not in {"grouped", "uncertain", "not_applicable"} or not isinstance(groups, list) or len(groups) > 100:
         raise InvalidDecision(error)
     refs = set(item["evidence_refs"])
     if not set(contract["mode_field_refs"]).issubset(refs):

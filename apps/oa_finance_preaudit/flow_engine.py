@@ -2441,6 +2441,8 @@ class FlowEngine:
                 "envelope_fingerprint": receipt["envelope_fingerprint"],
                 "receipt_fingerprint": _file_fingerprint(receipt_file),
                 "submission_token_sha256": receipt["submission_token_sha256"],
+                **({"company_comparison_contract_version": state["company_comparison_contract_version"]}
+                   if "company_comparison_contract_version" in state else {}),
             },
             indent=2,
         )
@@ -4618,6 +4620,8 @@ class FlowEngine:
                 "receipt_fingerprint": _file_fingerprint(receipt_file),
                 "no_write_evidence": receipt["no_write_evidence"],
                 "submission_token_sha256": receipt["submission_token_sha256"],
+                **({"company_comparison_contract_version": state["company_comparison_contract_version"]}
+                   if "company_comparison_contract_version" in state else {}),
             },
             indent=2,
         )

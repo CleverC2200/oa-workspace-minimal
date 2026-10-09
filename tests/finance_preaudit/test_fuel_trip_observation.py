@@ -112,6 +112,19 @@ def test_worker_normalization_preserves_model_owned_observation(tmp_path: Path) 
     engine.validate_review_decision(Path(action["action_file"]), result)
 
 
+@pytest.mark.parametrize("outcome", [[], {}])
+def test_malformed_outcome_is_rejected_by_public_decision_contract(tmp_path: Path, outcome) -> None:
+    from apps.oa_finance_preaudit.decision_validation import InvalidDecision
+
+    engine, action, _packet, decision = _review(tmp_path)
+    observation = _groups()
+    observation["outcome"] = outcome
+    decision["fuel_trip_observation"] = observation
+    with pytest.raises(InvalidDecision, match="review_decision_invalid") as rejection:
+        engine.validate_review_decision(Path(action["action_file"]), decision)
+    assert rejection.value.validation_code == "fuel_trip_observation"
+
+
 @pytest.mark.parametrize("invalid", ["whole_period_total", "invoice_row_split", "unowned_image", "missing_locator", "duplicate_trip"])
 def test_per_trip_contract_rejects_invalid_model_observations(tmp_path: Path, invalid: str) -> None:
     engine, action, _packet, decision = _review(tmp_path, duplicate=True)

@@ -10,7 +10,7 @@ import pytest
 from apps.oa_finance_preaudit import FlowEngine, codex_review_worker
 
 
-def engine_for(tmp_path: Path, *, primary="甲公司", auxiliary="乙公司", buyer="乙公司", missing=(), primary_source="display", primary_status="present") -> FlowEngine:
+def engine_for(tmp_path: Path, *, primary="甲公司", auxiliary="乙公司", buyer="乙公司", missing=(), primary_source="display", primary_status="present", submission_calls=None) -> FlowEngine:
     fields = [
         {"code": code, "name": name, "path": f"main[0].field[{index}]",
          "value": value, "value_source": "display", "read_status": "present"}
@@ -23,6 +23,17 @@ def engine_for(tmp_path: Path, *, primary="甲公司", auxiliary="乙公司", bu
     for row in fields:
         if row["code"] == "zfgs":
             row.update(value_source=primary_source, read_status=primary_status)
+
+    def grant(context):
+        return {"schema_version": 1, "kind": "preaudit_write_grant", "grant_id": "synthetic-company-grant",
+                **context, "mode": "controlled_write", "expires_at": "2099-01-01T00:00:00+08:00", "proof": "synthetic-verified"}
+
+    def submit(job):
+        submission_calls.append(dict(job))
+        return {"schema_version": 1, "kind": "preaudit_submission_result",
+                "submission_token": job["submission_token"], "write": True, "submit_ok": True,
+                "done_hit": True, "postcheck_done_hit": True}
+
     return FlowEngine(
         root=tmp_path / "runtime" / "finance_preaudit_flows",
         discover_candidates=lambda key: [{"request_id": "sanitized-tpm", "workflow_key": key,
@@ -35,6 +46,9 @@ def engine_for(tmp_path: Path, *, primary="甲公司", auxiliary="乙公司", bu
             "authority_facts": [] if buyer is None else [{"source": "invoice_cloud",
                 "name": "发票购买方", "value": buyer, "subject_ref": "sanitized-invoice"}],
         },
+        authorization_source=grant if submission_calls is not None else None,
+        authorization_verifier=(lambda supplied, context: supplied == grant(context)) if submission_calls is not None else None,
+        submit_frozen=submit if submission_calls is not None else None,
     )
 
 
@@ -180,6 +194,10 @@ def test_actual_legacy_marker_free_frozen_packet_keeps_original_decision_contrac
     state["material_fingerprint"] = fingerprint
     state_file.write_text(json.dumps(state))
     engine.validate_review_decision(Path(action["action_file"]), decision_for(action))
+    decision_file = tmp_path / "legacy-decision.json"
+    decision_file.write_text(json.dumps(decision_for(action)))
+    engine.complete_review(Path(action["action_file"]), decision_file)
+    assert "company_comparison_contract_version" not in json.loads(state_file.read_text())
 
 
 def test_marker_role_or_original_value_tampering_rejected(tmp_path):
@@ -261,3 +279,57 @@ def test_observation_result_and_item_cannot_disagree(tmp_path):
     decision["items"][-1]["status"] = "pass"
     with pytest.raises(ValueError, match="review_decision_invalid"):
         engine.validate_review_decision(Path(action["action_file"]), decision)
+
+
+def test_mock_submission_retains_company_binding_and_confirmation_is_read_only(tmp_path):
+    calls = []
+    engine = engine_for(tmp_path, submission_calls=calls)
+    action = engine.next_action("tpm_small_marketing_fee")
+    decision_file = tmp_path / "controlled-decision.json"
+    decision_file.write_text(json.dumps(compared_decision(action)))
+    closed = engine.complete_review(Path(action["action_file"]), decision_file)
+    assert closed["write_state"] == "submitted"
+    state = json.loads(Path(action["state_file"]).read_text())
+    before = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+              for path in Path(action["action_file"]).parent.iterdir() if path.is_file()}
+    assert FlowEngine.confirmed_submission(tmp_path / "runtime" / "finance_preaudit_flows", state)
+    after = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+             for path in Path(action["action_file"]).parent.iterdir() if path.is_file()}
+    assert before == after
+    assert state["company_comparison_contract_version"] == 1
+    assert len(calls) == 1
+    state.pop("company_comparison_contract_version")
+    state_file = Path(action["state_file"])
+    state_file.write_text(json.dumps(state))
+    original_bytes = state_file.read_bytes()
+    assert not FlowEngine.confirmed_submission(tmp_path / "runtime" / "finance_preaudit_flows", state)
+    assert state_file.read_bytes() == original_bytes
+
+
+def test_receipt_recovery_retains_company_binding_without_repeating_mock_writer(tmp_path, monkeypatch):
+    from apps import json_artifact
+
+    calls = []
+    engine = engine_for(tmp_path, submission_calls=calls)
+    action = engine.next_action("tpm_small_marketing_fee")
+    decision_file = tmp_path / "controlled-decision.json"
+    decision_file.write_text(json.dumps(compared_decision(action)))
+    original_write = json_artifact.write_json_atomic
+    tripped = False
+
+    def crash_after_receipt(path, payload, *args, **kwargs):
+        nonlocal tripped
+        original_write(path, payload, *args, **kwargs)
+        if Path(path).name == "execution-receipt.json" and not tripped:
+            tripped = True
+            raise SystemExit("receipt-persisted")
+
+    monkeypatch.setattr(json_artifact, "write_json_atomic", crash_after_receipt)
+    with pytest.raises(SystemExit, match="receipt-persisted"):
+        engine.complete_review(Path(action["action_file"]), decision_file)
+    recovered = engine.next_action("tpm_small_marketing_fee")
+    assert recovered["write_state"] == "submitted"
+    state = json.loads(Path(action["state_file"]).read_text())
+    assert FlowEngine.confirmed_submission(tmp_path / "runtime" / "finance_preaudit_flows", state)
+    assert state["company_comparison_contract_version"] == 1
+    assert len(calls) == 1
