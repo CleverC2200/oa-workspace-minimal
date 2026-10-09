@@ -122,6 +122,13 @@ _OPINION_BREVITY_REQUIREMENT = (
     "输出前自检：任一通过项仍带日期、金额、地点或号码等细节，或明显超过一句话，"
     "必须先改写成一句结论再输出。"
 )
+_INVOICE_LINKAGE_REQUIREMENT = (
+    "上传的发票附件及其内容不证明 OA 已关联；发票号码、附件名和金额相同也不能替代关联记录。"
+    "OA 关联字段未解析、为空且没有其它可信 OA 关联记录时，发票关联项不得判通过；"
+    "仅字段未解析时写明关联待核，不能声称申请人未关联。"
+    "按整单的可信关联关系审核，不要求拆分明细逐行重复挂票；"
+    "仍核对错关联、跨单据、多支付对象和重复票据等实际关系问题。"
+)
 _GENERAL_EXPENSE_REQUIREMENT = (
     "确认名称不一致后按规则核验人员关系和补充材料；"
     "五项必须逐项按通用费用规则包形成结论；预算通过结论必须逐字使用"
@@ -437,6 +444,8 @@ def _prompt(action_file: Path) -> str:
         workflow_requirement = _TPM_SMALL_MARKETING_REQUIREMENT
     else:
         workflow_requirement = "只按该流程固定审核项判断，不得读取其他流程规则或证据；"
+    if workflow_key in {"business_entertainment", "general_expense", "tpm_small_marketing_fee"}:
+        workflow_requirement += _INVOICE_LINKAGE_REQUIREMENT
     material_reading = (
         "材料先运行 `python3 -m apps.oa_finance_preaudit.read_material "
         + shlex.quote(str(action_file))

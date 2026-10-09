@@ -49,7 +49,10 @@ def _engine(
             "workflow_key": WORKFLOW_KEY,
             "workflow_name": "TPM小额市场费用报销申请流程",
             "declared_fields": (
-                {} if declared_fields is None else declared_fields
+                [{
+                    "path": "detail[0].row[0].field[17]", "name": "关联发票", "code": "glfp",
+                    "read_status": "present", "value": "12345678901234567890",
+                }] if declared_fields is None else declared_fields
             ),
             "resources": [],
             "prepared": {

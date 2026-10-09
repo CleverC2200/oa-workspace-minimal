@@ -170,6 +170,10 @@ _TPM_IMAGE_EVIDENCE_PREFIX = "material:prepared.images."
 _TPM_SUBJECT_FIELD_CODE = "yskm"
 _TPM_LINKED_INVOICE_FIELD_CODE = "glfp"
 _TPM_LINKED_INVOICE_ITEM = "linked_invoice_receipt"
+_INVOICE_LINKAGE_WORKFLOWS = frozenset(
+    {"business_entertainment", "general_expense", "tpm_small_marketing_fee"}
+)
+_INVOICE_LINKAGE_CONTRACT = "oa_record:1"
 _TPM_SUBJECT_EVIDENCE_GAP = "未核对预算科目对应的附件要求，请财务核对原单。"
 _TPM_LINKED_INVOICE_GAP = "关联发票未读取到关联记录，请财务核对原单。"
 _TPM_IMAGE_EVIDENCE_GAP = (
@@ -408,23 +412,37 @@ def enforce_tpm_subject_evidence(items: list[dict], material: dict) -> bool:
     return False
 
 
-def enforce_tpm_linked_invoice_evidence(items: list[dict], material: dict) -> bool:
-    """OA「关联发票」全部未解析时，第 2 项不得判通过（财务口径）。"""
-    rows = [row for row in (material.get("declared_fields") or ())
-            if isinstance(row, dict) and str(row.get("code") or "") == _TPM_LINKED_INVOICE_FIELD_CODE]
-    if not rows:
+def enforce_linked_invoice_evidence(
+    items: list[dict], material: dict, *, item_key: str, require_record: bool = False
+) -> bool:
+    """Missing OA relationship evidence cannot be replaced by invoice contents."""
+    rows = [
+        row for row in (material.get("declared_fields") or ())
+        if isinstance(row, dict) and str(row.get("code") or "") == _TPM_LINKED_INVOICE_FIELD_CODE
+    ]
+    if not rows and not require_record:
         return False
-    if any(str(row.get("read_status") or "") == "present" and str(row.get("value") or "").strip()
-           for row in rows):
+    if any(
+        str(row.get("read_status") or "") == "present" and str(row.get("value") or "").strip()
+        for row in rows
+    ):
         return False
     for item in items:
-        if item.get("item_key") != _TPM_LINKED_INVOICE_ITEM:
+        if item.get("item_key") != item_key:
             continue
         if item.get("status") != "pass":
             return False
         _downgrade_tpm_item(item, _TPM_LINKED_INVOICE_GAP)
         return True
     return False
+
+
+def enforce_tpm_linked_invoice_evidence(items: list[dict], material: dict) -> bool:
+    return enforce_linked_invoice_evidence(
+        items, material,
+        item_key=_TPM_LINKED_INVOICE_ITEM,
+        require_record=material.get("invoice_linkage_contract") == _INVOICE_LINKAGE_CONTRACT,
+    )
 
 
 def _validate_small_marketing_conclusions(
@@ -689,6 +707,8 @@ def _review_packet_constraints(workflow_key: str, material: dict) -> dict:
             "material_state": "complete",
             "required_uncertain_items": [],
         }
+        if material.get("invoice_linkage_contract") == _INVOICE_LINKAGE_CONTRACT:
+            constraints["invoice_linkage_contract"] = _INVOICE_LINKAGE_CONTRACT
         if workflow_key == "packaging_layout_approval":
             constraints["packaging_visual_contract"] = (
                 _packaging_visual_contract(material)
@@ -1683,6 +1703,12 @@ def _validate_review_decision(action: dict, packet: dict, quality_material: dict
             raise decision_validation.InvalidDecision("item_values")
         normalized_items.append(dict(item))
 
+    if action["workflow_key"] in _INVOICE_LINKAGE_WORKFLOWS:
+        model_overall = (
+            "needs_human" if any(item["status"] != "pass" for item in normalized_items) else "pass"
+        )
+        if decision["overall"] != model_overall:
+            raise decision_validation.InvalidDecision("overall_mismatch")
     required_uncertain_items = set(packet["required_uncertain_items"])
     if any(
         item["item_key"] in required_uncertain_items
@@ -1723,6 +1749,13 @@ def _validate_review_decision(action: dict, packet: dict, quality_material: dict
         if enforce_tpm_linked_invoice_evidence(
             normalized_items,
             quality_material,
+        ):
+            decision["overall"] = "needs_human"
+    if action["workflow_key"] in {"business_entertainment", "general_expense"}:
+        if enforce_linked_invoice_evidence(
+            normalized_items, quality_material,
+            item_key="invoice_linkage",
+            require_record=packet.get("invoice_linkage_contract") == _INVOICE_LINKAGE_CONTRACT,
         ):
             decision["overall"] = "needs_human"
     covered_page_refs = {
@@ -3018,6 +3051,8 @@ class FlowEngine:
                 material["tpm_price_reference"] = tpm_price_reference.snapshot(
                     self._root.parent / tpm_price_reference.REFERENCE_PATH
                 )
+            if workflow_key in _INVOICE_LINKAGE_WORKFLOWS:
+                material["invoice_linkage_contract"] = _INVOICE_LINKAGE_CONTRACT
             try:
                 material_file = attempt_root / "material.json"
                 json_artifact.write_json_atomic(material_file, material, indent=2)
