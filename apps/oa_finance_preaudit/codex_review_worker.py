@@ -516,6 +516,14 @@ def _prompt(action_file: Path) -> str:
         "不使用视图行号、简写路径或范围表达式；权威事实使用 material.authority_facts[实际数组索引]。"
         if workflow_key == "tpm_small_marketing_fee" else ""
     )
+    material_reading += (
+        "材料含 material.invoice_evidence 时，逐票按 source_field_paths 与 data_id 核对 OA 关联，"
+        "优先使用已读取的票种、金额、日期和买卖方权威资料；字段 not_provided 保持未知。"
+        "files 仅是该票的文件记录，body_read_status=not_read 表示正文未读取，"
+        "不能把文件记录写成已看正文；不能因没有重复上传发票附件认定未提供发票。"
+        "资料未覆盖当前审核事项时说明具体读取缺口，其他附件义务仍按流程规则核对。"
+        "旧材料没有 invoice_evidence 时按原材料读取，不推断完整覆盖。"
+    )
     output_requirement = (
         "最终只输出符合本次宿主 JSON schema 的单个 JSON 对象；`items` "
         "必须是以上六个规范键组成的对象，各键的值不包含 `item_key`；"
