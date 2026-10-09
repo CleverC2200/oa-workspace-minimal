@@ -10,7 +10,7 @@
 
 自动化运行记忆只使用 /Users/synear/.codex/automations/oa-skill/memory.md，确认在工作树之外且可写。不要把界面显示的 $CODEX_HOME 路径按字面当作相对路径。不可写使用 automation_memory_path_invalid 停止；不回退到工作树。
 
-每次启动前、结束后或复查的实时对账，均按 docs/runbooks/blocking-recovery.md 的文件输出方式执行一次。先新建私有临时目录，再在同一 exec_command 运行：
+每次启动前及原控制器真实退出后的实时对账，均按 docs/runbooks/blocking-recovery.md 的文件输出方式执行一次。运行中采用下述原回执监视，不把启动门禁用于尚在提交的控制器。先新建私有临时目录，再在同一 exec_command 运行：
 status_dir=$(mktemp -d /tmp/oa-status.XXXXXX) &&
 .venv/bin/python -m apps.oa_finance_preaudit.cli status --check-live --reconcile --summary --output-file "$status_dir/status.json"
 完整保留原 session_id、exit_code 和输出；运行中使用原 ID 的 write_stdin 等待，不把工具等待窗口当业务超时。仅在 exit_code=0 后解析终态：stdout 保留原安全门和计数，完整 JSON 已保存到 status_file.path，并返回字节数和 SHA-256。明细的 display_truncated=true 只表示未在界面展开，不代表待办或人工核对项为零；按需校验同一文件的字节数/哈希，再分字段、小批量读取全部必要明细，不将整份文件重新打印。stdout 若仍被宿主截断，从本次已知且确认成功的文件提取门禁，不为补读重复查询 OA。原会话、文件或校验结果不可信仍停止，不用部分数据放行。所有身份、授权、continuation、锁、Writer 和交接安全判断保持原要求。
@@ -25,11 +25,19 @@ status_dir=$(mktemp -d /tmp/oa-status.XXXXXX) &&
 .venv/bin/python -m scripts.finance_preaudit_run --owner-task-id <当前任务真实UUID> -- --rolling --adaptive --capacity 3 --max-capacity 6 --confirm-write YES --recover-confirmed-no-write-once YES --workflow travel_expense --workflow business_entertainment --workflow business_support_fee --workflow small_marketing_fee --workflow tpm_small_marketing_fee --workflow general_expense
 ```
 
+### 原运行监视
+
+保留原工具会话并等待真实终态。需要进度时，按[原执行回执](../agents/controller-execution.md#只读进度等待与终态取回)使用同一 owner_task_id、invocation_id、receipt_file 的 `finance_preaudit_run --progress`；已绑定工具 ID 时同时精确核对。它不查询 OA、不启动或停止控制器，也不授权包装、恢复、清窗或留存清理。回执等待、清单未收尾与 children_reaped=false 是运行期状态，不按固定静默时长判断故障。归属、锁、代码、进程或回执证据失信仍转人工核对，不认领或启动另一控制器。
+
+`status --check-live --reconcile` 依次读取待办、已办和本地状态，不能表示运行中的原子快照；输出的 `reconciliation.usage` 明确标记 startup_or_terminal、non_atomic 和 original_execution_progress。raw continuation 仍保持严格阻断，不能用活动控制器豁免 unknown、身份冲突、submitting 或 submitted。运行中不执行这次完整对账，也不根据旧待办与新本地提交状态的组合停止原运行。原控制器继续执行材料、身份、授权、冻结、Writer 未知结果及轮次后严格对账的安全检查；等待其真实退出后，才取得一次新鲜完整结束对账。持续冲突仍阻断，不重复查询直到放行，原回执和所有已取观测文件保留。
+
 ## 停止隔离与有限恢复
 
 停止标记只按项目现行受控恢复入口处理。普通 controller_cycle_stop 在确认可靠回收后由控制器收尾；残余、人工、环境或带具体失败原因的停止门不得手工删除、改文件或用清告警代替恢复。身份、待办已办冲突、损坏冻结/边界、当前未知写入、活动 Writer或未回收进程继续硬停止。
 
 控制器 failed、当前未知写入、身份/授权/冻结/隔离不可信、有同轮证据确认的进程故障、本机critical或停止门触发时，立即停止新增领取和写入，等待原调用收尾，保存首个错误和已提交证据。已有 notification 不重复发送。业务 fail/uncertain 为正常意见；completed_with_quarantine 可继续其他可信单据，但须重新完整对账。
+
+确已确认的外部对账门禁故障需要受控停止时，使用现有 `runtime_control.request_stop("production_reconciliation_blocked")`，并留存触发它的原对账回执。停止文件首次写入后不覆盖；原真正首错优先，具体原因贯通控制器 primary_error_code 和单次终态通知。普通人工、环境、损坏或未知停止保留原阻断和通用告警语义，只有可信 controller_cycle_stop 能按原回收门清理。不得因混合运行快照写停止标记。
 
 有限恢复保持原控制器在租约内按授权与可信未写入选择首个 attempt 一次；已存在后续 attempt 不自动再恢复，不使用 unknown 确认参数，未知写入不重试。指定恢复与普通新增分别核算。具体选择及失败类别见[阻断处置](blocking-recovery.md#一次跨轮恢复)，不自行挑旧路径、删隔离或重写冻结状态。
 

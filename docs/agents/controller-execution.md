@@ -12,6 +12,8 @@
 
 ## 只读进度、等待与终态取回
 
+小时调度的运行中监视使用本节原回执入口，并继续等待原工具会话；完整 `status --check-live --reconcile` 用于启动前和原控制器真实退出后。待办、已办及本地状态分次读取，不是活动 Writer 的原子快照。不得把运行中混合快照的 pending_write_state_unresolved 当作已确认故障去停止原控制器，也不能放宽 raw continuation 或给 submitting/submitted 自动豁免。原控制器内部身份、冻结、授权、Writer 未知结果及轮次后对账保护保持有效。
+
 从启动回执复制 `receipt_file`、`owner_task_id` 和父目录的 `invocation_id`。在同一源码工作树执行以下命令。
 读取入口不加载 `.env`、认证或刷新会话。控制目录有自定义配置时，须沿用原运行的
 `OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE` 环境变量；不能靠读取业务认证配置猜测目录。
@@ -39,5 +41,7 @@ python3 -B -m scripts.finance_preaudit_run --owner-task-id <原任务 UUID> --re
 日志按64 KiB块计算哈希，每份最多64 MiB；超过该上限或读取中漂移时拒绝取回。控制 JSON 各限1 MiB。
 这些限制约束本地读取工作量，不是业务运行超时。文件指针需保留为本地证据，后续读取仍应核对给出的 SHA-256，
 原始结果可能含业务内容，不上传、提交 Git 或贴进 Issue。取回结果不加载审核规则，也不修改历史业务判断。
+
+确已确认的外部对账失信采用有限停止理由 production_reconciliation_blocked；已写停止原因不覆盖，原真正首错优先。终态原输出的 primary_error_code 与通知保留具体原因，取回入口只验证并返回原结果，不改写它。普通停止或无法验证的原因保留通用失败语义，不能自动清除；普通周期停止仍按原回收门处理。
 
 回执不授予恢复、清警报或新的 OA 写入权限。原始输出仅本地留存，不提交 Git 或上传 Issue。父 Bug #325 的历史退出触发者仍待证实；本地回归不代替发布及正常生产轮次验收。

@@ -4946,7 +4946,11 @@ def _run_rolling_drain_locked(
         wave["capacity"] = current_capacity
         waves.append(wave)
         late_visible_pending = int(wave.get("late_visible_pending") or 0)
+        specific_stop_requested = runtime_control.stop_reason() not in {
+            None, "controller_cycle_stop",
+        }
         if (int(wave.get("retry_pending") or 0) > 0
+                and not specific_stop_requested
                 and not (wave["failed"] or wave["timed_out"] or wave["stopped"]
                          or wave["completed"] != wave["requested"])):
             # A transient first/second-round review failure is persisted on the
@@ -4960,6 +4964,7 @@ def _run_rolling_drain_locked(
             or wave["timed_out"]
             or wave["stopped"]
             or wave["completed"] != wave["requested"]
+            or specific_stop_requested
         ):
             runtime_control.request_cycle_stop()
             status = "failed"
@@ -5098,6 +5103,10 @@ def _run_rolling_drain_locked(
             "total_tokens",
         ):
             token_totals[field] += int(usage.get(field) or 0)
+    if status == "failed" and primary_error_code is None:
+        external_stop_reason = runtime_control.stop_reason()
+        if external_stop_reason != "controller_cycle_stop":
+            primary_error_code = external_stop_reason
     completed = sum(wave["completed"] for wave in waves)
     codex_events = _merge_codex_event_summaries(
         [wave["codex_events"] for wave in waves]
@@ -5407,7 +5416,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             controller_started = True
             payload = run_rolling_drain(**rolling_args)
             counts = payload.get("error_counts")
-            session_code = next(
+            primary_code = payload.get("primary_error_code")
+            session_code = primary_code if primary_code in session_alert.ALERT_ERROR_CODES else next(
                 (
                     code
                     for code in (*sorted(session_alert.PRODUCTION_ERROR_CODES), *_SESSION_ALERT_PRIORITY)
@@ -5481,7 +5491,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload["primary_error_code"] = error.primary_error_code
         if controller_started:
             failure_code = str(error).partition(":")[0].strip()
-            alert_code = session_code or (
+            primary_code = payload.get("primary_error_code")
+            alert_code = primary_code if primary_code in session_alert.ALERT_ERROR_CODES else session_code or (
                 failure_code if failure_code in session_alert.PRODUCTION_ERROR_CODES
                 else "controller_failed"
             )
