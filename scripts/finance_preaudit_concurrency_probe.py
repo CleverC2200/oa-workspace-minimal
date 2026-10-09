@@ -4946,7 +4946,11 @@ def _run_rolling_drain_locked(
         wave["capacity"] = current_capacity
         waves.append(wave)
         late_visible_pending = int(wave.get("late_visible_pending") or 0)
+        specific_stop_requested = runtime_control.stop_reason() not in {
+            None, "controller_cycle_stop",
+        }
         if (int(wave.get("retry_pending") or 0) > 0
+                and not specific_stop_requested
                 and not (wave["failed"] or wave["timed_out"] or wave["stopped"]
                          or wave["completed"] != wave["requested"])):
             # A transient first/second-round review failure is persisted on the
@@ -4960,7 +4964,7 @@ def _run_rolling_drain_locked(
             or wave["timed_out"]
             or wave["stopped"]
             or wave["completed"] != wave["requested"]
-            or runtime_control.stop_reason() not in {None, "controller_cycle_stop"}
+            or specific_stop_requested
         ):
             runtime_control.request_cycle_stop()
             status = "failed"

@@ -386,3 +386,41 @@ def test_specific_stop_is_retained_when_the_last_writer_finishes(
     assert result["status"] == expected_status
     assert result["primary_error_code"] == expected_primary
     assert runtime_control.stop_requested() is stop_preserved
+
+
+@pytest.mark.parametrize("stop_reason,expected_exit,expected_alert", [
+    ("production_reconciliation_blocked", 1, "production_reconciliation_blocked"),
+    (None, 0, None),
+    ("controller_cycle_stop", 0, None),
+])
+def test_retry_pending_does_not_hide_a_specific_stop(stop_reason, expected_exit, expected_alert, monkeypatch, capsys):
+    def pipeline(count, capacity):
+        runtime_control.request_stop(stop_reason)
+        return process_pool.PoolResult(
+            requested=count, started=1, completed=1, failed=0, timed_out=0,
+            stopped=0, peak_active=capacity, elapsed_seconds=0.01,
+            outcomes=(process_pool.TaskOutcome(
+                index=0, status="completed", value={
+                    "status": "retry_pending", "error_code": "codex_review_retry_pending",
+                    "write_state": "not_requested", "process_attempts": 1,
+                },
+            ),),
+        )
+
+    rolling = probe.run_rolling_drain
+    monkeypatch.setattr(probe, "run_rolling_drain", lambda **kwargs: rolling(
+        **kwargs, live_status=live_status, reconcile_status=reconciled, pipeline_runner=pipeline,
+    ))
+    alerts, clears = [], []
+    monkeypatch.setattr(probe.session_alert, "alert_from_environment", lambda code: (
+        alerts.append(code) or {"error_code": code, "delivery_state": "sent"}
+    ))
+    monkeypatch.setattr(probe.session_alert, "clear_active_alert", lambda **kwargs: clears.append(kwargs))
+    assert probe.main(["--rolling", "--capacity", "3", "--confirm-write", "YES"]) == expected_exit
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["completed"] == 1
+    assert payload["failed"] == payload["stopped"] == 0
+    assert payload["error_counts"] == {"codex_review_retry_pending": 1}
+    assert payload["primary_error_code"] == expected_alert
+    assert alerts == ([expected_alert] if expected_alert else [])
+    assert clears == ([] if expected_alert else [{"session_only": True}])
