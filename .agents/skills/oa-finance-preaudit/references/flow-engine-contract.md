@@ -111,12 +111,12 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
       {
         "trip_basis": "该次实际带车行程及配对依据",
         "basis_refs": ["能够回查配对依据的字段或原图引用"],
-        "start": {"reading_km": 83859, "locator": "起始日期或可定位行程", "image_ref": "原始页引用"},
-        "end": {"reading_km": 85100, "locator": "结束日期或可定位行程", "image_ref": "原始页引用"},
-        "distance_km": 1241
+        "start": {"reading_km": 10000, "locator": "起始日期或可定位行程", "image_ref": "原始页引用"},
+        "end": {"reading_km": 10120, "locator": "结束日期或可定位行程", "image_ref": "原始页引用"},
+        "distance_km": 120
       }
     ],
-    "total_km": 1241
+    "total_km": 120
   }
 }
 ```

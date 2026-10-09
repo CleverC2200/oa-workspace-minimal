@@ -91,6 +91,18 @@ def test_actual_worker_schema_and_prompt_require_frozen_group_observation(tmp_pa
     assert "fuel_trip_observation" in codex_review_worker._prompt(Path(action["action_file"]))
 
 
+def test_actual_worker_prompts_do_not_disclose_recorded_trip_answers(tmp_path: Path) -> None:
+    _engine, action, _packet, _decision = _review(tmp_path)
+    action_file = Path(action["action_file"])
+    for prompt in (codex_review_worker._prompt(action_file), codex_review_worker._read_only_prompt(action_file)):
+        assert "逐组" in prompt
+        assert "不得以全体最大值减最小值" in prompt
+        for recorded_value in ("83859", "85100", "85105", "85716", "1852", "1857"):
+            assert recorded_value not in prompt
+        assert "不得读取" in prompt and "regression-cases.json" in prompt
+        assert "测试" in prompt and "私有验收预期" in prompt
+
+
 def test_worker_normalization_preserves_model_owned_observation(tmp_path: Path) -> None:
     engine, action, _packet, decision = _review(tmp_path)
     decision["fuel_trip_observation"] = _groups()
