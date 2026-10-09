@@ -4,6 +4,8 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
 
@@ -55,6 +57,66 @@ def prepare(tmp_path, *, page_count=5, width=16, height=16, degraded=False, tail
     action = engine.next_action("business_entertainment")
     assert action["action"] == "review_required", json.dumps(action)
     return engine, {"project_root": str(root), "action_file": action["action_file"], "timeout_seconds": 60}
+
+
+def test_text_fallback_recovers_display_truncation_without_rereading_material(tmp_path):
+    """Execute the delivered tool examples; only the model's tool adapter is replaced."""
+    from apps.oa_finance_preaudit import review_input
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("offline JavaScript tool-example check requires an existing Node runtime")
+    fields = [{"path": f"detail[0].row[{index}].field[6]", "value": f"synthetic-{index}-" + "x" * 250,
+               "read_status": "resolved", "value_source": "oa"} for index in range(500)]
+    _, task = prepare(tmp_path / "frozen source ' $(literal)", page_count=0, declared_fields=fields)
+    action_file = Path(task["action_file"])
+    material_file = action_file.with_name("material.json")
+    original = material_file.read_bytes()
+    delivered = review_input.prepare(action_file)
+    assert delivered.fallback_reason == "text_limit"
+    examples = re.findall(r"```javascript\n(.*?)\n```", delivered.instruction, re.DOTALL)
+    assert len(examples) == 2, "fallback must deliver executable read-once and saved-output recovery examples"
+    adapter = r'''
+const {spawnSync} = require("node:child_process");
+const examples = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
+const saved = new Map(), visible = [], budgets = [];
+let calls = 0, originalOutput = "", firstDisplay = true;
+const tools = {exec_command: async args => {
+  calls++;
+  budgets.push(args.max_output_tokens);
+  const result = spawnSync(args.cmd, {shell: true, encoding: "utf8"});
+  if (result.status !== 0 || result.stderr) throw Error("reader failed: " + result.stderr);
+  originalOutput = result.stdout;
+  return {output: result.stdout, exit_code: result.status};
+}};
+const text = value => {
+  if (typeof value !== "string") return;
+  visible.push(firstDisplay ? value.split("\n").slice(0, 200).join("\n") : value);
+  firstDisplay = false;
+};
+const run = async code => {
+  budgets.push(JSON.parse(code.split("\n")[0].replace("// @exec: ", "")).max_output_tokens);
+  await new AsyncFunction("tools", "store", "load", "text", code)(
+    tools, (key, value) => saved.set(key, value), key => saved.get(key), text);
+};
+(async () => {
+  await run(examples[0]);
+  for (let start = 200; start < originalOutput.split("\n").length; start += 200) {
+    await run(examples[1].replace("slice(200, 400)", `slice(${start}, ${start + 200})`));
+  }
+  process.stdout.write(JSON.stringify({calls, budgets, originalOutput, recovered: visible.join("\n")}));
+})().catch(error => {console.error(error); process.exitCode = 1;});
+'''
+    checked = subprocess.run([node, "-e", adapter], input=json.dumps(examples), text=True,
+                             capture_output=True, cwd=Path(worker.__file__).resolve().parents[2], timeout=30, check=True)
+    observed = json.loads(checked.stdout)
+    assert observed["calls"] == 1
+    assert set(observed["budgets"]) == {60_000}
+    assert observed["recovered"] == observed["originalOutput"]
+    assert "synthetic-499-" + "x" * 250 in observed["recovered"]
+    assert "detail[0].row[499].field[6]" in observed["recovered"]
+    assert material_file.read_bytes() == original
 
 
 def reviewer(monkeypatch, tmp_path, task, *, direct=True, image_count=5, unknown_usage=False, wrong_token=False, resource_evidence=False, probe_large=False, probe_invalid=False, host_scope=False, fallback_context=False):
