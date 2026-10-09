@@ -109,9 +109,9 @@ def _aware_time(value: object) -> datetime:
 def _verify_original_exit(terminal: dict, manifest: dict, binding: dict, observed: datetime) -> None:
     """Verify the actual process result in the original tool event, not its wrapper."""
     raw = _bound_bytes(terminal["source_file"], private=False)
-    if type(terminal.get("source_line")) is not int or terminal["source_line"] < 1:
-        raise ValueError(BLOCKED)
     records = raw.splitlines()
+    if type(terminal.get("source_line")) is not int or not 1 <= terminal["source_line"] <= len(records):
+        raise ValueError(BLOCKED)
     decoded = [_object(line) for line in records]
     metadata = [_payload(entry) for entry in decoded if entry.get("type") == "session_meta"]
     if len(metadata) != 1 or metadata[0].get("cwd") != binding["target_root"]:
@@ -130,6 +130,11 @@ def _verify_original_exit(terminal: dict, manifest: dict, binding: dict, observe
     mixed = stop_source['call_id'] == terminal.get('source_call_id')
     source = stop_call.get('input', '')
     if mixed:
+        output_events = [entry for entry in decoded
+                         if _payload(entry).get('type') == 'custom_tool_call_output'
+                         and _payload(entry).get('call_id') == terminal['source_call_id']]
+        if len(output_events) != 1 or output_events[0] != decoded[terminal['source_line'] - 1]:
+            raise ValueError(BLOCKED)
         command_pattern = r'^\s*text\(await tools\.exec_command\(\{cmd:("(?:\\.|[^"\\])*"),max_output_tokens:[1-9][0-9]*\}\)\);'
         command_match = re.match(command_pattern, source)
         if command_match is None:
@@ -201,6 +206,13 @@ def _verify_original_exit(terminal: dict, manifest: dict, binding: dict, observe
     if len(calls) != 1 or calls[0].get("name") != "exec":
         raise ValueError(BLOCKED)
     source = source if mixed else calls[0].get("input", "")
+    if mixed:
+        literal_wait = re.fullmatch(
+            r'\s*text\(await tools\.write_stdin\(\{session_id:([1-9][0-9]*),chars:"",'
+            r'yield_time_ms:[1-9][0-9]*,max_output_tokens:[1-9][0-9]*\}\)\);\s*', source,
+        )
+        if literal_wait is None or literal_wait[1] != str(terminal['process_session_id']):
+            raise ValueError(BLOCKED)
     pattern = r'text\(await tools\.write_stdin\(\{([^{}]+)\}\)\);'
     operations = list(re.finditer(pattern, source))
     if not operations or re.sub(pattern, "", source).strip() or (mixed and len(operations) != 1):
@@ -230,6 +242,13 @@ def _verify_original_exit(terminal: dict, manifest: dict, binding: dict, observe
         raise ValueError(BLOCKED)
     if mixed and (type(envelopes[0].get('exit_code')) is not int or envelopes[0]['exit_code'] != 0):
         raise ValueError(BLOCKED)
+    if mixed:
+        try:
+            stop_fact = ast.literal_eval(envelopes[0].get('output', ''))
+        except (ValueError, SyntaxError):
+            raise ValueError(BLOCKED) from None
+        if not isinstance(stop_fact, dict) or stop_fact != stop_results[0] or stop_fact.get('stop_requested') is not True:
+            raise ValueError(BLOCKED)
     envelope = envelopes[sessions.index(session) + int(mixed)]
     if type(envelope.get("exit_code")) is not int or envelope["exit_code"] != terminal["exit_code"]:
         raise ValueError(BLOCKED)

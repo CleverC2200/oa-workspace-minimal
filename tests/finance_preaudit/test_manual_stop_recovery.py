@@ -335,6 +335,52 @@ def test_mixed_original_event_rejects_non_template_or_wrong_tool_result(tmp_path
     assert (target / 'runtime/stop-preaudit.flag').exists()
 
 
+@pytest.mark.parametrize('original,replacement', [
+    ('session_id:11476', 'session_id:11476+1'),
+    ('chars:""', 'chars:"x"'),
+    ('yield_time_ms:1000', 'yield_time_ms:1000+1'),
+    ('max_output_tokens:4500', 'max_output_tokens:Reflect.get(globalThis,"budget")'),
+    ('chars:""', 'chars:"",session_id:11477'),
+])
+def test_mixed_wait_requires_exact_empty_literal_parameters(tmp_path, original, replacement):
+    from apps.oa_finance_preaudit.manual_stop_recovery import recover_manual_stop
+    target, evidence, current = _submission_conflict(tmp_path); _mixed_stop_event(evidence)
+    binding = json.loads(evidence.read_text()); exit_path = Path(binding['original_exit']['path'])
+    terminal = json.loads(exit_path.read_text()); source = Path(terminal['source_file']['path'])
+    rows = [json.loads(line) for line in source.read_text().splitlines()]
+    rows[1]['payload']['input'] = rows[1]['payload']['input'].replace(original, replacement)
+    source.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
+    terminal['source_file']['sha256'] = hashlib.sha256(source.read_bytes()).hexdigest()
+    binding['original_exit'] = _write(exit_path, terminal); _write(evidence, binding)
+    with pytest.raises(ValueError, match='manual_stop_recovery_blocked'):
+        recover_manual_stop(target_root=target, evidence_file=evidence, confirmed=True, check_live=lambda: current)
+    assert (target / 'runtime/stop-preaudit.flag').exists()
+
+
+@pytest.mark.parametrize('prior_valid_fact', [True, False])
+def test_mixed_stop_fact_must_belong_to_the_single_terminal_output(tmp_path, prior_valid_fact):
+    from apps.oa_finance_preaudit.manual_stop_recovery import recover_manual_stop
+    target, evidence, current = _submission_conflict(tmp_path); _mixed_stop_event(evidence)
+    binding = json.loads(evidence.read_text()); exit_path = Path(binding['original_exit']['path'])
+    terminal = json.loads(exit_path.read_text()); source = Path(terminal['source_file']['path'])
+    rows = [json.loads(line) for line in source.read_text().splitlines()]
+    prior = copy.deepcopy(rows[-1])
+    prior['payload']['output'] = [copy.deepcopy(rows[-1]['payload']['output'][1])]
+    wrong = json.dumps({'exit_code': 0, 'output': "{'stop_requested':False,'source':'other'}"})
+    if prior_valid_fact:
+        rows[-1]['payload']['output'][1]['text'] = wrong
+    else:
+        prior['payload']['output'][0]['text'] = wrong
+    rows.insert(2, prior)
+    source.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
+    terminal.update(source_line=4)
+    terminal['source_file']['sha256'] = hashlib.sha256(source.read_bytes()).hexdigest()
+    binding['original_exit'] = _write(exit_path, terminal); _write(evidence, binding)
+    with pytest.raises(ValueError, match='manual_stop_recovery_blocked'):
+        recover_manual_stop(target_root=target, evidence_file=evidence, confirmed=True, check_live=lambda: current)
+    assert (target / 'runtime/stop-preaudit.flag').exists()
+
+
 @pytest.mark.parametrize('defect', ['later_edit', 'replacement', 'birth_mismatch', 'call_after_birth', 'result_before_modify',
     'ctime', 'missing_birth', 'saved_payload', 'observed_before_result'])
 def test_observed_identity_does_not_accept_replaced_or_later_modified_marker(tmp_path, defect):
