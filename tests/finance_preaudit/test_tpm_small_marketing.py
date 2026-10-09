@@ -43,6 +43,10 @@ def _engine(
     *,
     declared_fields: object | None = None,
 ) -> flow_engine.FlowEngine:
+    current_fields = list(declared_fields) if isinstance(declared_fields, list) else []
+    if not any(row.get("code") == "glfp" for row in current_fields):
+        current_fields.append({"path": "detail[0].row[0].field[17]", "name": "关联发票", "code": "glfp",
+                               "read_status": "present", "value": "12345678901234567890"})
     return flow_engine.FlowEngine(
         root=tmp_path / "runtime" / "finance_preaudit_flows",
         discover_candidates=lambda workflow_key: [
@@ -58,7 +62,7 @@ def _engine(
             "request_id": request_id,
             "workflow_key": WORKFLOW_KEY,
             "workflow_name": "TPM小额市场费用报销申请流程",
-            "declared_fields": (declared_fields if isinstance(declared_fields, list) else []) + _company_fields(),
+            "declared_fields": current_fields + _company_fields(),
             "resources": [],
             "prepared": {
                 "images": [],

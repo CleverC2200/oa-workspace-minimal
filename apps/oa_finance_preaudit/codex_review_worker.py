@@ -21,7 +21,7 @@ from typing import Callable, TextIO
 from apps import json_artifact
 from apps.oa_approval import runtime_control, writer_outcomes
 
-from . import concurrency_control, decision_validation, manual_handoff, process_diagnostics, review_failure_evidence, review_output, review_context
+from . import concurrency_control, decision_validation, fuel_trip_observation, manual_handoff, process_diagnostics, review_failure_evidence, review_output, review_context
 from .review_output import parse_json as _parse_decision_json
 
 
@@ -121,6 +121,13 @@ _OPINION_BREVITY_REQUIREMENT = (
     "不写已经核对过的明细。流程规则要求逐字使用的固定句式必须原样保留，不受本条限制。"
     "输出前自检：任一通过项仍带日期、金额、地点或号码等细节，或明显超过一句话，"
     "必须先改写成一句结论再输出。"
+)
+_INVOICE_LINKAGE_REQUIREMENT = (
+    "上传的发票附件及其内容不证明 OA 已关联；发票号码、附件名和金额相同也不能替代关联记录。"
+    "OA 关联字段未解析、为空且没有其它可信 OA 关联记录时，发票关联项不得判通过；"
+    "仅字段未解析时写明关联待核，不能声称申请人未关联。"
+    "按整单的可信关联关系审核，不要求拆分明细逐行重复挂票；"
+    "仍核对错关联、跨单据、多支付对象和重复票据等实际关系问题。"
 )
 _GENERAL_EXPENSE_REQUIREMENT = (
     "确认名称不一致后按规则核验人员关系和补充材料；"
@@ -404,6 +411,57 @@ def _small_marketing_attachment_terms_required(action_file: Path) -> bool:
     return flow_engine.small_marketing_requires_payment_attachments(material)
 
 
+def _fuel_trip_contract(action_file: Path) -> dict | None:
+    try:
+        action = json.loads(action_file.read_text(encoding="utf-8"))
+        state = json.loads(action_file.with_name("state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, AttributeError):
+        raise ValueError("frozen_packet_changed") from None
+    try:
+        packet = json.loads(action_file.with_name("review-packet.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # Legacy prompt routing already handles missing packets; execution still
+        # requires the frozen rule version and FlowEngine input validation.
+        packet = {}
+    if not all(isinstance(value, dict) for value in (packet, action, state)):
+        raise ValueError("frozen_packet_changed")
+    markers = [value.get(fuel_trip_observation.MARKER) for value in (packet, action, state)]
+    material_file = action_file.with_name("material.json")
+    if material_file.is_file():
+        try:
+            material = json.loads(material_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise ValueError("frozen_packet_changed") from None
+        if not isinstance(material, dict):
+            raise ValueError("frozen_packet_changed")
+        material_marker = material.get(fuel_trip_observation.MARKER)
+        if material_marker is not None:
+            if fuel_trip_observation.binding(material) != fuel_trip_observation.freeze_contract("travel_expense", material):
+                raise ValueError("frozen_packet_changed")
+        markers.append(material_marker)
+    elif markers[0] is not None:
+        raise ValueError("frozen_packet_changed")
+    if any(marker != markers[0] for marker in markers):
+        raise ValueError("frozen_packet_changed")
+    return markers[0]
+
+
+def _fuel_trip_instruction(action_file: Path) -> str:
+    if _fuel_trip_contract(action_file) is None:
+        return ""
+    return (
+        "冻结包的 fuel_trip_contract 要求 fuel_trip_observation：直接观察原图，"
+        "按实际带车行程逐组填写 start/end 的 reading_km、日期或行程 locator、image_ref，"
+        "以及 trip_basis、basis_refs、distance_km，最后给 total_km。配对依据必须来自当前材料，"
+        "发票类型拆分不是行程拆分，重复上传同一照片不是新行程；不得以全体最大值减最小值替代按次求和。"
+        "两组83859→85100和85105→85716的合计是1852，不包含行程之间的5公里。"
+        "outcome=grouped表示已确认分组；配对未知使用uncertain、total_km=null，油补项也为uncertain并列具体缺口；"
+        "未申报油补时使用not_applicable、groups=[]、total_km=null。mode_field_refs须进入油补evidence_refs。"
+        "起止图片和配对basis_refs必须逐字引用当前材料，并进入油补evidence_refs；业务判断仍由你形成，"
+        "油补conclusion保留逐组算式、合计和与申报的比较，不能只在观察字段中记录。"
+    )
+
+
 def _prompt(action_file: Path) -> str:
     workflow_key = _action_workflow(action_file) or "travel_expense"
     _rule_version, workflow_name, rule_reference = _FINANCE_RULES[workflow_key]
@@ -429,7 +487,7 @@ def _prompt(action_file: Path) -> str:
         else ""
     )
     if workflow_key == "travel_expense":
-        workflow_requirement = _TRAVEL_PAGE_ROUTING_REQUIREMENT
+        workflow_requirement = _TRAVEL_PAGE_ROUTING_REQUIREMENT + _fuel_trip_instruction(action_file)
     elif workflow_key == "general_expense":
         workflow_requirement = _GENERAL_EXPENSE_REQUIREMENT
     elif workflow_key == "small_marketing_fee":
@@ -442,6 +500,8 @@ def _prompt(action_file: Path) -> str:
         workflow_requirement = _TPM_SMALL_MARKETING_REQUIREMENT
     else:
         workflow_requirement = "只按该流程固定审核项判断，不得读取其他流程规则或证据；"
+    if workflow_key in {"business_entertainment", "general_expense", "tpm_small_marketing_fee"}:
+        workflow_requirement += _INVOICE_LINKAGE_REQUIREMENT
     material_reading = (
         "材料先运行 `python3 -m apps.oa_finance_preaudit.read_material "
         + shlex.quote(str(action_file))
@@ -485,6 +545,7 @@ def _read_only_prompt(action_file: Path) -> str:
 
 只处理这个动作引用的审核包：{action_file}
 {fallback_routing}
+{_fuel_trip_instruction(action_file)}
 
 要求：
 1. 完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由只读取差旅费规则、该动作引用的审核包、材料和准备页；{_TRAVEL_PAGE_ROUTING_REQUIREMENT}不得读取现有 decision、remark、receipt、events、其他 attempt 或其他单据。
@@ -681,6 +742,9 @@ def _decision_schema(action_file: Path | None = None, *, read_only: bool = False
         from . import company_comparison
         result["required"].append("company_comparison")
         result["properties"]["company_comparison"] = company_comparison.schema(contract)
+    if workflow_key == "travel_expense" and action_file is not None and _fuel_trip_contract(action_file) is not None:
+        result["required"].append(fuel_trip_observation.FIELD)
+        result["properties"][fuel_trip_observation.FIELD] = fuel_trip_observation.schema()
     return result
 
 
