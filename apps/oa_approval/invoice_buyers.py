@@ -56,11 +56,11 @@ def _invoice_refs(
     fields: List[Dict[str, Any]],
     *,
     linked_detail_only: bool = False,
-) -> tuple[List[Dict[str, str]], List[str], bool]:
-    refs: List[Dict[str, str]] = []
+) -> tuple[List[Dict[str, Any]], List[str], bool]:
+    refs: List[Dict[str, Any]] = []
     invalid_invoice_numbers: List[str] = []
     has_misaligned_refs = False
-    seen: dict[str, str] = {}
+    seen: dict[str, dict] = {}
     for field in fields:
         name = str(field.get("name") or "").strip()
         if linked_detail_only and (
@@ -90,12 +90,17 @@ def _invoice_refs(
             continue
         for data_id, invoice_no in zip(data_ids, invoice_numbers):
             if data_id in seen:
-                if seen[data_id] != invoice_no:
+                if seen[data_id]["invoice_no"] != invoice_no:
                     has_misaligned_refs = True
-                    invalid_invoice_numbers.extend((seen[data_id], invoice_no))
+                    invalid_invoice_numbers.extend((seen[data_id]["invoice_no"], invoice_no))
+                path = str(field.get("path") or "")
+                if path and path not in seen[data_id]["source_field_paths"]:
+                    seen[data_id]["source_field_paths"].append(path)
                 continue
-            seen[data_id] = invoice_no
-            refs.append({"data_id": data_id, "invoice_no": invoice_no})
+            ref = {"data_id": data_id, "invoice_no": invoice_no,
+                   "source_field_paths": [str(field.get("path") or "")]}
+            seen[data_id] = ref
+            refs.append(ref)
     return refs, invalid_invoice_numbers, has_misaligned_refs
 
 
@@ -116,7 +121,7 @@ def _map_invoice_id(oa_api: OaApi, data_id: str) -> str:
     return str(response["targetIds"])
 
 
-def _failed_result(refs: List[Dict[str, str]]) -> Dict[str, Any]:
+def _failed_result(refs: List[Dict[str, Any]]) -> Dict[str, Any]:
     invoice_numbers = [item["invoice_no"] for item in refs]
     return {
         "read_status": "failed",
@@ -127,12 +132,56 @@ def _failed_result(refs: List[Dict[str, str]]) -> Dict[str, Any]:
     }
 
 
+def _invoice_evidence(ref: dict, detail: dict) -> dict:
+    data = detail.get("data") or {}
+    comm = data.get("comm_info") or {}
+    pro = comm.get("pro") or {}
+    price = comm.get("price") or {}
+    values = {
+        "invoice_number": data.get("number"),
+        "invoice_type": pro.get("cname"),
+        "invoice_type_code": pro.get("type"),
+        "issue_date": pro.get("date"),
+        "total": price.get("total"),
+        "buyer": (comm.get("buyer") or {}).get("company"),
+        "seller": (comm.get("seller") or comm.get("payer") or {}).get("company"),
+    }
+    fields = {}
+    for name, value in values.items():
+        text = html.unescape(str(value)).strip() if isinstance(value, (str, int, float)) else ""
+        fields[name] = {"value": text, "read_status": "present" if text else "not_provided"}
+    files = []
+    for item in data.get("flist") or []:
+        if not isinstance(item, dict) or item.get("del", 0) not in (0, "0"):
+            continue
+        raw_id = item.get("id")
+        file_id = _display_text(raw_id) if type(raw_id) in (str, int) else ""
+        if not file_id:
+            continue
+        media_type = str(item.get("type") or "").strip().lower()
+        record = {
+            "file_id": file_id,
+            "media_type": media_type if media_type in {"pdf", "png", "jpg", "jpeg", "ofd"} else "unknown",
+            "read_status": "record_present", "body_read_status": "not_read",
+        }
+        size = item.get("size")
+        if isinstance(size, int) and not isinstance(size, bool) and size >= 0:
+            record["size_bytes"] = size
+        files.append(record)
+    return {
+        **ref, "read_status": "content_read", "fields": fields, "files": files,
+        "file_records_status": "present" if files else "not_provided",
+        "body_read_status": "not_read",
+    }
+
+
 def read_invoice_buyers(
     oa_api: OaApi,
     data: Dict[str, Any],
     *,
     invoice_client: Any | None = None,
     linked_detail_only: bool = False,
+    include_evidence: bool = False,
 ) -> Dict[str, Any]:
     fields = evidence_packet.extract_fields(data)
     refs, invalid_invoice_numbers, has_misaligned_refs = _invoice_refs(
@@ -182,6 +231,9 @@ def read_invoice_buyers(
 
     invoices: List[Dict[str, str]] = []
     for ref, detail in zip(refs, details):
+        returned_number = _display_text((detail.get("data") or {}).get("number"))
+        if returned_number and returned_number != ref["invoice_no"]:
+            return _failed_result(refs)
         comm_info = (detail.get("data") or {}).get("comm_info") or {}
         buyer = _display_text(
             (comm_info.get("buyer") or {}).get("company")
@@ -198,8 +250,12 @@ def read_invoice_buyers(
             invoice["seller"] = seller
         invoices.append(invoice)
 
-    return {
-        "read_status": "content_read",
-        "invoices": invoices,
-        "fail_code": "",
+    result = {
+        "read_status": "content_read", "invoices": invoices, "fail_code": "",
     }
+    if include_evidence:
+        result["invoice_evidence"] = {
+            "schema_version": 1, "source": "invoice_cloud", "read_status": "content_read",
+            "invoices": [_invoice_evidence(ref, detail) for ref, detail in zip(refs, details)],
+        }
+    return result

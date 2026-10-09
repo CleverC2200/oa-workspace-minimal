@@ -77,6 +77,7 @@ def _authority_facts(
     oa_api: object,
     config: dict[str, Any],
     workflow: dict[str, Any],
+    invoice_evidence: dict | None = None,
 ) -> list[dict[str, str]]:
     facts = []
     for item in (
@@ -106,11 +107,18 @@ def _authority_facts(
         oa_api,
         workflow,
         linked_detail_only=(workflow_key == "tpm_small_marketing_fee"),
+        include_evidence=invoice_evidence is not None,
     )
     if str(invoice_result.get("read_status") or "") == "failed":
         raise RuntimeError(
             str(invoice_result.get("fail_code") or "invoice_buyer_read_failed")
         )
+    if invoice_evidence is not None:
+        invoice_evidence.update(invoice_result.get("invoice_evidence") or {
+            "schema_version": 1, "source": "invoice_cloud",
+            "read_status": "not_applicable" if invoice_result.get("read_status") == "not_applicable" else "not_recorded",
+            "invoices": [],
+        })
     facts.extend(
         {
             "source": "invoice_cloud",
@@ -139,6 +147,18 @@ def _authority_facts(
             and str(item.get("invoice_no") or "").strip()
             and str(item.get("seller") or "").strip()
         )
+    for entry in invoice_result.get("invoice_evidence", {}).get("invoices", []):
+        for field_name, fact_name in (
+            ("invoice_type", "发票类型"),
+            ("issue_date", "发票开票日期"),
+            ("total", "发票价税合计"),
+        ):
+            field = entry["fields"][field_name]
+            if field["read_status"] == "present":
+                facts.append({
+                    "source": "invoice_cloud", "name": fact_name,
+                    "value": field["value"], "subject_ref": entry["invoice_no"],
+                })
     return facts
 
 
@@ -449,10 +469,12 @@ def collect_case(
     except (RuntimeError, SystemExit) as error:
         raise RuntimeError("workflow_ambiguous") from error
     identity = flow.workflow_identity(workflow)
+    invoice_evidence: dict = {}
     authority_facts = _authority_facts(
         oa_api=oa_api,
         config=config,
         workflow=workflow,
+        invoice_evidence=invoice_evidence,
     )
 
     form_resources = evidence_packet.logical_attachment_resources(
@@ -590,5 +612,6 @@ def collect_case(
         "attachment_deduplication": attachment_deduplication,
         "prepared": prepared,
         "authority_facts": authority_facts,
+        **({"invoice_evidence": invoice_evidence} if invoice_evidence else {}),
         "warnings": warnings,
     }
