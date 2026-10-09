@@ -123,7 +123,10 @@ def _authority_facts(
         and str(item.get("invoice_no") or "").strip()
         and str(item.get("buyer") or "").strip()
     )
-    if workflow_key == "tpm_small_marketing_fee":
+    if workflow_key in {
+        "travel_expense", "business_entertainment", "business_support_fee",
+        "small_marketing_fee", "tpm_small_marketing_fee", "general_expense",
+    }:
         facts.extend(
             {
                 "source": "invoice_cloud",
@@ -556,6 +559,21 @@ def collect_case(
             "manifest": manifest,
         }
 
+    warnings = [
+        {
+            "code": "invoice_document_reference_unresolved",
+            "source_field_path": field["path"],
+            "message": "发票文档已关联，尚未解析可信文件对应关系、未读取正文；关联发票权威资料见已采集事实，正文未覆盖事项才保留读取缺口。",
+        }
+        for field in evidence_packet.extract_fields(workflow)
+        if str(config.get("flow_key") or "") != _PACKAGING_FLOW
+        and field["field_name"] == "fpfj"
+        and re.search(r"\btoDocument\s*\(", field["attachment_html"])
+        and not any(
+            item["source_field_path"] == field["path"] for item in descriptors
+        )
+    ]
+
     public_resources = [
         {key: value for key, value in descriptor.items() if key != "raw_resource_id"}
         for descriptor in descriptors
@@ -572,5 +590,5 @@ def collect_case(
         "attachment_deduplication": attachment_deduplication,
         "prepared": prepared,
         "authority_facts": authority_facts,
-        "warnings": [],
+        "warnings": warnings,
     }

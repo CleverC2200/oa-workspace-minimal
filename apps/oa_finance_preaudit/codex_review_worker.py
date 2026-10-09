@@ -123,12 +123,7 @@ _OPINION_BREVITY_REQUIREMENT = (
     "必须先改写成一句结论再输出。"
 )
 _GENERAL_EXPENSE_REQUIREMENT = (
-    "仅对科目要求支付截图的明细，缺支付截图时先核对收款人名称与关联发票销售方，"
-    "逐字完全一致则免支付截图；多笔收款或发票须按可信对应关系分别核验；"
-    "名称或关联关系无法核实时，对该缺口使用 uncertain，说明无法确认对公付款豁免，"
-    "不得仅因缺截图判 fail；不得用购买方、合同乙方或发票文件名代替销售方；"
     "确认名称不一致后按规则核验人员关系和补充材料；"
-    "豁免仅免支付截图，其他必需附件仍须核验；"
     "五项必须逐项按通用费用规则包形成结论；预算通过结论必须逐字使用"
     "“当前阶段按既定策略暂不校验部门年度预算。”；支付公司一致通过时"
     "必须逐字使用“报销公司、支付公司、购买方三者一致，应选择当前"
@@ -145,7 +140,7 @@ _SMALL_MARKETING_V2_REQUIREMENT = (
     "六项必须逐项按小额市场费规则包形成结论；预算科目不是"
     "“配送费-自提/租车费”时，无论附件完整性结论为通过、不通过还是"
     "不确定，结论都必须逐字同时包含“支付截图”和“发票”（例如“已核对"
-    "支付截图和发票”），不得使用“支付凭证”等近义词替代；支付公司一致"
+    "支付截图和发票”或“发票已核验，对公付款免支付截图。”），不得使用“支付凭证”等近义词替代；支付公司一致"
     "通过时必须逐字使用“报销公司、支付公司、购买方三者一致，应选择"
     "当前实际公司全称支付。”的句式并替换公司全称；"
 )
@@ -470,7 +465,7 @@ def _prompt(action_file: Path) -> str:
 {material_reading}
 
 要求：
-1. 完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由读取 `references/result-contract.md`、`references/observation-contract.md`、`{rule_reference}`、动作引用的审核包、材料和准备页；{workflow_requirement}{frozen_item_requirement}不得读取其他 attempt。
+1. 完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由读取 `references/result-contract.md`、`references/observation-contract.md`、`{rule_reference}`，完整读取 `references/payment-screenshot-exemption.md`，再读取动作引用的审核包、材料和准备页；{workflow_requirement}{frozen_item_requirement}不得读取其他 attempt。
 2. 不修改任何文件、项目代码、Skill、配置、授权清单或冻结材料；不得调用 `next-action`、`complete-review` 或任何 OA 写入，不得领取其他单据；不得读取现有审核决定、意见或 `review-output-*.txt` 失败原输出。
 3. 根据审核包中的固定审核项动态形成结构化决定。证据不足使用 `uncertain` 交财务判断，不得因为材料缺口卡住业务流程；身份、归属、冻结或授权不可信时停止。审核包为 `material_state=degraded` 时，`collection_gaps` 只说明自动读取没有完成，不得声称申请人未填写字段、未上传附件或单据没有发票；结论直接说明自动读取失败、对应项目未完成核对，请财务查看原单。
 4. {_OPINION_BREVITY_REQUIREMENT}结论内保留规则要求的具体金额、实际公司全称等必要业务原值；不得输出密钥、凭据或无关附件原文。宿主会校验并负责受控提交。
