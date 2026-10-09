@@ -19,7 +19,7 @@ import fitz
 from apps import json_artifact
 from apps.oa_approval import writer_outcomes
 
-from . import decision_validation, item_failure, manual_handoff, observability, packaging_contract, review_failure_evidence, submission, tpm_price_reference
+from . import fuel_trip_observation, decision_validation, item_failure, manual_handoff, observability, packaging_contract, review_failure_evidence, submission, tpm_price_reference
 
 
 SCHEMA_VERSION = 1
@@ -702,10 +702,16 @@ def _review_packet_constraints(workflow_key: str, material: dict) -> dict:
             )
         ):
             raise ValueError("material_bundle_schema_invalid")
+    if fuel_trip_observation.MARKER in material and (
+        fuel_trip_observation.binding(material)
+        != fuel_trip_observation.freeze_contract(workflow_key, material)
+    ):
+        raise ValueError("material_bundle_schema_invalid")
     if not raw_gaps:
         constraints = {
             "material_state": "complete",
             "required_uncertain_items": [],
+            **fuel_trip_observation.freeze_contract(workflow_key, material),
         }
         if material.get("invoice_linkage_contract") == _INVOICE_LINKAGE_CONTRACT:
             constraints["invoice_linkage_contract"] = _INVOICE_LINKAGE_CONTRACT
@@ -1201,7 +1207,9 @@ def _validate_frozen_review_inputs(
         ),
     }
     accepted_packets = [expected_packet]
-    if workflow_key == "packaging_layout_approval":
+    if workflow_key == "travel_expense":
+        accepted_packets = fuel_trip_observation.accepted_packets(expected_packet, state, material=material)
+    elif workflow_key == "packaging_layout_approval":
         accepted_packets = _accepted_packaging_packets(expected_packet, state)
     elif workflow_key == "small_marketing_fee":
         accepted_packets = _accepted_small_marketing_packets(expected_packet, state)
@@ -1633,6 +1641,8 @@ def _validate_review_decision(action: dict, packet: dict, quality_material: dict
         "overall",
         "items",
     }
+    if packet.get(fuel_trip_observation.MARKER) is not None:
+        expected_fields.add(fuel_trip_observation.FIELD)
     if action["workflow_key"] == "packaging_layout_approval":
         expected_fields.add("excel_comparison")
         if packaging_v2:
@@ -1758,6 +1768,15 @@ def _validate_review_decision(action: dict, packet: dict, quality_material: dict
             require_record=packet.get("invoice_linkage_contract") == _INVOICE_LINKAGE_CONTRACT,
         ):
             decision["overall"] = "needs_human"
+    if packet.get(fuel_trip_observation.MARKER) is not None:
+        fuel_trip_observation.validate(
+            decision.get(fuel_trip_observation.FIELD),
+            contract=packet[fuel_trip_observation.MARKER],
+            item=next(item for item in normalized_items if item["item_key"] == "fuel_subsidy"),
+            pages=tuple((ref, {"content_sha256": _verified_page_sha256(image)})
+                        for ref, image in _travel_pages(quality_material)),
+            declared_fields=quality_material.get("declared_fields"),
+        )
     covered_page_refs = {
         value
         for item in normalized_items
@@ -2384,6 +2403,7 @@ class FlowEngine:
             events_file=str(attempt_root / "observability.json"),
             case_key=attempt_root.parent.name,
             attempt=_attempt_number(attempt_root),
+            **fuel_trip_observation.binding(state),
         )
         json_artifact.write_json_atomic(action_path, closed, indent=2)
         json_artifact.write_json_atomic(
@@ -2941,12 +2961,8 @@ class FlowEngine:
         }
         accepted_packets = [expected_packet]
         if workflow_key == "travel_expense":
-            accepted_packets.append(
-                {
-                    **expected_packet,
-                    "page_routing": _review_packet_routing(workflow_key, material),
-                }
-            )
+            expected_packet["page_routing"] = _review_packet_routing(workflow_key, material)
+            accepted_packets = fuel_trip_observation.accepted_packets(expected_packet, state, material=material, action=action)
         elif workflow_key == "packaging_layout_approval":
             accepted_packets = _accepted_packaging_packets(
                 expected_packet,
@@ -3053,6 +3069,7 @@ class FlowEngine:
                 )
             if workflow_key in _INVOICE_LINKAGE_WORKFLOWS:
                 material["invoice_linkage_contract"] = _INVOICE_LINKAGE_CONTRACT
+            material.update(fuel_trip_observation.freeze_contract(workflow_key, material))
             try:
                 material_file = attempt_root / "material.json"
                 json_artifact.write_json_atomic(material_file, material, indent=2)
@@ -3095,6 +3112,7 @@ class FlowEngine:
                     "review_packet_file": str(packet_file),
                     "material_fingerprint": verified["material_fingerprint"],
                     "evidence_fingerprint": evidence_fingerprint,
+                    **fuel_trip_observation.binding(packet),
                 }
                 json_artifact.write_json_atomic(state_path, claim, indent=2)
             except Exception as error:
@@ -3169,6 +3187,7 @@ class FlowEngine:
                     else {}
                 ),
                 **recovery_metadata,
+                **fuel_trip_observation.binding(packet),
             )
             state = {
                 **action,
@@ -4552,6 +4571,7 @@ class FlowEngine:
             events_file=action["events_file"],
             case_key=action["case_key"],
             attempt=action["attempt"],
+            **fuel_trip_observation.binding(state),
         )
         json_artifact.write_json_atomic(action_path, closed, indent=2)
         json_artifact.write_json_atomic(

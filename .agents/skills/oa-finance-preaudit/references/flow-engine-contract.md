@@ -97,6 +97,35 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
 - 任一固定项目或包装补充项为 `fail` 或 `uncertain` 时，`overall` 必须为 `needs_human`；固定项目全部为 `pass` 且无包装补充异常时必须为 `pass`。
 - 不增加 requestId、人员、公司、写入模式、意见文本或其他字段。
 
+### 按次油补观察
+
+新冻结差旅材料中，主表 `sfdc`（是否带车）已读取为“按次”时，材料、action、state 和审核包绑定 `fuel_trip_contract={"version":1,"mode_field_refs":["原字段path"]}`。材料指纹保护该升级标记；删除协议文件中的标记不能把新包变成旧包。旧冻结材料没有标记时按旧决定合同兼容，不修改历史材料、决定或意见。单一区间没有该标记，保留原决定结构。
+
+带标记的决定增加顶层 `fuel_trip_observation`，实际 Worker 使用同一 schema。下例只说明结构，读数、配对与业务状态由审核者依据原材料形成：
+
+```json
+{
+  "fuel_trip_observation": {
+    "outcome": "grouped",
+    "groups": [
+      {
+        "trip_basis": "该次实际带车行程及配对依据",
+        "basis_refs": ["能够回查配对依据的字段或原图引用"],
+        "start": {"reading_km": 83859, "locator": "起始日期或可定位行程", "image_ref": "原始页引用"},
+        "end": {"reading_km": 85100, "locator": "结束日期或可定位行程", "image_ref": "原始页引用"},
+        "distance_km": 1241
+      }
+    ],
+    "total_km": 1241
+  }
+}
+```
+
+- `grouped` 至少一组，`total_km` 等于每组 `distance_km` 的合计；每组差值等于模型所读结束里程减起始里程。仪表原单位不是公里时，由审核者记录原单位及换算依据后填写公里值。宿主不读图取数、不按文件名生成读数、不生成行程配对或费用 verdict。
+- `mode_field_refs`、所有 `basis_refs`、起止原图引用均须进入油补项 `evidence_refs`，引用必须属于当前冻结材料。每端的 `locator` 保留日期或可回查行程；相同起止照片对、完全相同照片的重复上传不产生新的组。申报里程按发票类型分行不构成行程配对依据。
+- 配对未确认时用 `outcome=uncertain`、`total_km=null`，可保留已确认的组，也可使用空组；油补项必须为 `uncertain`，并给出具体缺口。无油补申报用 `outcome=not_applicable`、`groups=[]`、`total_km=null`，由审核者在油补意见中明确不适用原因。
+- 分组与算式还要简记在油补 `conclusion`，不能只保存在观察对象或工作笔记中。金额是否合规、与申报是否一致仍由模型判断；宿主只核验结构、归属引用、组内减法及合计算术，不根据字符串或读数自行生成财务意见。
+
 包装流程的决定还必须增加一个 `excel_comparison`。未提供 Excel 时固定为 `{"status":"not_provided","resource_id":null,"mappings":[]}`。存在 Excel 时，`mappings` 必须按四项顺序逐项给出 `item_key`、可解析到同一结构化 Excel `key_text` 索引的 `cell_refs`，以及 `match`、`different` 或 `uncertain` 比较结果；相同 cell ref 还要进入对应项目的 `evidence_refs`。脚本逐条验证资源、索引、项目状态和四项映射后才渲染 Excel 对照尾行，不根据附件存在自行推断完成。
 
 `packaging_layout_approval:2` 的包装决定还必须增加 `visual_review`：

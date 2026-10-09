@@ -15,7 +15,7 @@ CODES = frozenset({
     "decision_overall", "decision_items_type", "decision_json", "decision_object",
     "required_uncertain", "payment_company_conclusion", "payment_attachment_terms",
     "budget_conclusion", "deferred_payment_conclusion",
-    "overall_mismatch",
+    "overall_mismatch", "fuel_trip_observation",
     "packaging_visual_contract",
     "packaging_supplementary_checks",
     "packaging_page_coverage", "packaging_page_reference", "packaging_version_coverage", "packaging_overall_mismatch",
