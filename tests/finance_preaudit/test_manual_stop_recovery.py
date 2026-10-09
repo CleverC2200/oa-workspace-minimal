@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import copy
+import os
 from datetime import datetime, timedelta, timezone
 import subprocess
 from pathlib import Path
@@ -125,6 +126,242 @@ def test_manual_stop_requires_original_evidence_and_records_recovery(tmp_path):
     assert receipt["original_exit_code"] == 1
     assert receipt["original_run_id"] == "a" * 32
     assert receipt["phase"] == "cleared"
+
+
+def _submission_conflict(tmp_path):
+    target, evidence, current = _environment(tmp_path)
+    binding = json.loads(evidence.read_text())
+    binding.update(schema_version=2, original_submissions=[], stop_identity_observation=None, original_stop_payload=None)
+    conflict = json.loads(Path(binding['original_conflict_status']['path']).read_text())
+    original = json.loads(Path(binding['original_status']['path']).read_text())
+    findings, closed = [], []
+    for index, write_state in enumerate(('submitting', 'submitted'), 1):
+        request_id, received_at = f'synthetic-{index}', '2026-10-09T08:00:00+00:00'
+        key = hashlib.sha256(f'{request_id}\x1f{received_at}'.encode()).hexdigest()
+        identity = {'workflow_key': 'travel_expense', 'item_key': key, 'attempt': 1}
+        findings.append({**identity, 'category': 'pending_not_handled', 'local_write_state': write_state,
+                         'local_execution_state': 'review_required' if index == 1 else 'closed'})
+        closed.append({**identity, 'category': 'handled_not_pending', 'local_write_state': 'submitted',
+                       'local_execution_state': 'closed'})
+        directory = target / 'runtime/finance_preaudit_flows/travel_expense/cases' / key / 'attempt-1'
+        receipt = {'schema_version': 1, 'kind': 'preaudit_execution_receipt', 'workflow_key': 'travel_expense',
+                   'case_key': key, 'attempt': 1, 'mode': 'controlled_write', 'business_state': 'needs_human',
+                   'write_state': 'submitted', 'no_write_evidence': None, 'write': True, 'submit_ok': True,
+                   'done_hit': True, 'postcheck_done_hit': True}
+        receipt_ref = _write(directory / 'execution-receipt.json', receipt)
+        state = {'schema_version': 1, 'kind': 'preaudit_action', 'workflow_key': 'travel_expense',
+                 'case_key': key, 'attempt': 1, 'mode': 'controlled_write', 'write_authorized': True,
+                 'execution_state': 'closed', 'write_state': 'submitted', 'business_state': 'needs_human',
+                 'request_id': request_id, 'received_at': received_at,
+                 'receipt_fingerprint': 'sha256:' + receipt_ref['sha256']}
+        binding['original_submissions'].append({'state': _write(directory / 'state.json', state), 'receipt': receipt_ref})
+    conflict['reconciliation']['findings'] = findings
+    conflict['reconciliation']['continuation'] = {'status': 'blocked', 'scope': 'controller', 'isolated_pending': 0,
+                                                 'blocking_reasons': {'pending_write_state_unresolved': 2}}
+    original['reconciliation']['findings'] = closed
+    current['reconciliation']['findings'] = copy.deepcopy(closed)
+    binding['original_conflict_status'] = _write(Path(binding['original_conflict_status']['path']), conflict)
+    binding['original_status'] = _write(Path(binding['original_status']['path']), original)
+    _write(evidence, binding)
+    return target, evidence, current
+
+
+def test_resolved_submitting_and_submitted_stop_requires_same_item_closure(tmp_path):
+    from apps.oa_finance_preaudit.manual_stop_recovery import recover_manual_stop
+    target, evidence, current = _submission_conflict(tmp_path)
+    result = recover_manual_stop(target_root=target, evidence_file=evidence, confirmed=True,
+                                 check_live=lambda: current)
+    assert result['status'] == 'recovered'
+    assert result['write_state'] == 'not_requested'
+    assert not (target / 'runtime/stop-preaudit.flag').exists()
+
+
+def _mixed_stop_event(evidence):
+    binding = json.loads(evidence.read_text())
+    exit_path = Path(binding['original_exit']['path'])
+    terminal = json.loads(exit_path.read_text())
+    source = Path(terminal['source_file']['path'])
+    rows = [json.loads(line) for line in source.read_text().splitlines()]
+    command = (".venv/bin/python -c 'from apps.oa_approval import runtime_control; runtime_control.request_stop(); "
+               'print({"stop_requested":runtime_control.stop_requested(),"source":"production_reconciliation_blocked",'
+               '"status_file":' + json.dumps(binding['original_conflict_status']['path']) + "})'")
+    call = rows[1]
+    call['payload']['input'] = ('text(await tools.exec_command({cmd:' + json.dumps(command) + ',max_output_tokens:1300}));\n'
+                              'text(await tools.write_stdin({session_id:11476,chars:"",yield_time_ms:1000,max_output_tokens:4500}));')
+    output = rows[-1]
+    output['payload']['call_id'] = 'call_stop'
+    fact = {'stop_requested': True, 'source': 'production_reconciliation_blocked',
+            'status_file': binding['original_conflict_status']['path']}
+    output['payload']['output'].insert(1, {'text': json.dumps({'exit_code': 0, 'output': repr(fact)})})
+    source.write_text('\n'.join(json.dumps(row) for row in (rows[0], call, output)) + '\n')
+    terminal.update(source_line=3, source_call_id='call_stop')
+    terminal['source_file']['sha256'] = hashlib.sha256(source.read_bytes()).hexdigest()
+    binding['original_exit'] = _write(exit_path, terminal)
+    _write(evidence, binding)
+
+
+def test_original_mixed_stop_and_wait_event_is_verified(tmp_path):
+    from apps.oa_finance_preaudit.manual_stop_recovery import recover_manual_stop
+    target, evidence, current = _submission_conflict(tmp_path)
+    _mixed_stop_event(evidence)
+    result = recover_manual_stop(target_root=target, evidence_file=evidence, confirmed=True,
+                                 check_live=lambda: current)
+    assert result['status'] == 'recovered'
+
+
+def _observed_birth(evidence):
+    binding = json.loads(evidence.read_text())
+    stop = Path(binding['target_root']) / 'runtime/stop-preaudit.flag'
+    stop.unlink()
+    descriptor = os.open(stop, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.write(descriptor, b'stop_requested\n')
+    os.close(descriptor)
+    info = stop.stat()
+    if not hasattr(info, 'st_birthtime'):
+        pytest.skip('birth identity requires filesystem birthtime')
+    at = datetime.fromtimestamp(info.st_mtime_ns / 1e9, tz=timezone.utc)
+    binding['stop'].update(device=info.st_dev, inode=info.st_ino, mtime_ns=info.st_mtime_ns)
+    observation = {'kind': 'preaudit_stop_identity_observation', 'path': str(stop),
+                   'observed_at': (at + timedelta(seconds=4)).isoformat(), 'device': info.st_dev, 'inode': info.st_ino,
+                   'mtime_ns': info.st_mtime_ns, 'ctime_ns': info.st_ctime_ns, 'birthtime': info.st_birthtime,
+                   'sha256': binding['stop']['sha256'], 'boundary': 'First maintenance observation; no historical inode claimed.'}
+    binding['stop_identity_observation'] = _write(stop.parent.parent.parent / 'observation.json', observation)
+    saved = stop.parent.parent.parent / 'saved-stop.flag'
+    saved.write_bytes(b'stop_requested\n'); saved.chmod(0o600)
+    binding['original_stop_payload'] = {'path': str(saved), 'sha256': binding['stop']['sha256']}
+    for field in ('manifest', 'original_manifest'):
+        path = Path(binding[field]['path']); value = json.loads(path.read_text())
+        value['completed_at'] = (at + timedelta(seconds=1)).isoformat()
+        binding[field] = _write(path, value)
+    original_path = Path(binding['original_status']['path'])
+    original = json.loads(original_path.read_text())
+    original['generated_at'] = (at + timedelta(seconds=4)).isoformat()
+    binding['original_status'] = _write(original_path, original)
+    exit_path = Path(binding['original_exit']['path'])
+    terminal = json.loads(exit_path.read_text()); source = Path(terminal['source_file']['path'])
+    rows = [json.loads(line) for line in source.read_text().splitlines()]
+    rows[1]['timestamp'] = (at - timedelta(seconds=.1)).isoformat()
+    rows[-1]['timestamp'] = (at + timedelta(seconds=3)).isoformat()
+    envelope = json.loads(rows[-1]['payload']['output'][-1]['text'])
+    receipt = json.loads(envelope['output'])
+    receipt['completed_at'] = (at + timedelta(seconds=2)).isoformat()
+    envelope['output'] = json.dumps(receipt)
+    rows[-1]['payload']['output'][-1]['text'] = json.dumps(envelope)
+    source.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
+    terminal['source_file']['sha256'] = hashlib.sha256(source.read_bytes()).hexdigest()
+    binding['original_exit'] = _write(exit_path, terminal)
+    _write(evidence, binding)
+
+
+def test_first_maintenance_identity_is_bound_to_original_file_birth(tmp_path):
+    from apps.oa_finance_preaudit.manual_stop_recovery import recover_manual_stop
+    target, evidence, current = _submission_conflict(tmp_path)
+    _mixed_stop_event(evidence)
+    _observed_birth(evidence)
+    result = recover_manual_stop(target_root=target, evidence_file=evidence, confirmed=True,
+                                 check_live=lambda: current)
+    receipt = json.loads(Path(result['receipt_file']).read_text())
+    assert result['status'] == 'recovered'
+    assert receipt['stop_identity_source'] == 'maintenance_observation_with_original_birth'
+
+
+@pytest.mark.parametrize('defect', ['unknown', 'authorized', 'count', 'extra_cause', 'missing_closure',
+    'wrong_attempt', 'still_pending', 'no_receipt', 'postcheck', 'receipt_identity', 'state_hash'])
+def test_submission_stop_rejects_missing_or_unresolved_same_item_evidence(tmp_path, defect):
+    from apps.oa_finance_preaudit.manual_stop_recovery import recover_manual_stop
+    target, evidence, current = _submission_conflict(tmp_path)
+    binding = json.loads(evidence.read_text())
+    conflict_path = Path(binding['original_conflict_status']['path'])
+    original_path = Path(binding['original_status']['path'])
+    conflict = json.loads(conflict_path.read_text()); original = json.loads(original_path.read_text())
+    if defect in {'unknown', 'authorized'}:
+        conflict['reconciliation']['findings'][0]['local_write_state'] = defect
+    elif defect == 'count':
+        conflict['reconciliation']['continuation']['blocking_reasons']['pending_write_state_unresolved'] = 1
+    elif defect == 'extra_cause':
+        conflict['reconciliation']['continuation']['blocking_reasons']['identity_conflict'] = 1
+    elif defect == 'missing_closure':
+        original['reconciliation']['findings'].pop()
+    elif defect == 'wrong_attempt':
+        original['reconciliation']['findings'][0]['attempt'] = 2
+    elif defect == 'still_pending':
+        current['reconciliation']['findings'][0]['category'] = 'pending_not_handled'
+    elif defect == 'no_receipt':
+        binding['original_submissions'].pop()
+    elif defect in {'postcheck', 'receipt_identity'}:
+        ref = binding['original_submissions'][0]['receipt']; path = Path(ref['path'])
+        receipt = json.loads(path.read_text())
+        receipt['postcheck_done_hit' if defect == 'postcheck' else 'case_key'] = False if defect == 'postcheck' else 'f' * 64
+        binding['original_submissions'][0]['receipt'] = _write(path, receipt)
+        state_ref = binding['original_submissions'][0]['state']; state_path = Path(state_ref['path'])
+        state = json.loads(state_path.read_text()); state['receipt_fingerprint'] = 'sha256:' + binding['original_submissions'][0]['receipt']['sha256']
+        binding['original_submissions'][0]['state'] = _write(state_path, state)
+    else:
+        Path(binding['original_submissions'][0]['state']['path']).write_text('{}')
+    binding['original_conflict_status'] = _write(conflict_path, conflict)
+    binding['original_status'] = _write(original_path, original)
+    _write(evidence, binding)
+    with pytest.raises((ValueError, RuntimeError)):
+        recover_manual_stop(target_root=target, evidence_file=evidence, confirmed=True, check_live=lambda: current)
+    assert (target / 'runtime/stop-preaudit.flag').read_bytes() == b'stop_requested\n'
+    assert not list((target / 'runtime/control').glob('manual-stop-recovery-*.json'))
+
+
+@pytest.mark.parametrize('defect', ['extra_command', 'extra_python', 'wrong_session', 'stop_not_zero', 'changed_fact', 'extra_wait'])
+def test_mixed_original_event_rejects_non_template_or_wrong_tool_result(tmp_path, defect):
+    from apps.oa_finance_preaudit.manual_stop_recovery import recover_manual_stop
+    target, evidence, current = _submission_conflict(tmp_path); _mixed_stop_event(evidence)
+    binding = json.loads(evidence.read_text()); exit_path = Path(binding['original_exit']['path'])
+    terminal = json.loads(exit_path.read_text()); source = Path(terminal['source_file']['path'])
+    rows = [json.loads(line) for line in source.read_text().splitlines()]
+    if defect == 'extra_command':
+        rows[1]['payload']['input'] += '\ntext(await tools.exec_command({cmd:"true"}));'
+    elif defect == 'extra_python':
+        rows[1]['payload']['input'] = rows[1]['payload']['input'].replace('runtime_control.request_stop();', 'runtime_control.request_stop(); pass;')
+    elif defect == 'wrong_session':
+        rows[1]['payload']['input'] = rows[1]['payload']['input'].replace('session_id:11476', 'session_id:11477')
+    elif defect == 'extra_wait':
+        rows[1]['payload']['input'] += '\ntext(await tools.write_stdin({session_id:11478,chars:""}));'
+    else:
+        envelope = json.loads(rows[-1]['payload']['output'][1]['text'])
+        if defect == 'stop_not_zero': envelope['exit_code'] = 1
+        else: envelope['output'] = "{'stop_requested':True,'source':'other'}"
+        rows[-1]['payload']['output'][1]['text'] = json.dumps(envelope)
+    source.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
+    terminal['source_file']['sha256'] = hashlib.sha256(source.read_bytes()).hexdigest()
+    binding['original_exit'] = _write(exit_path, terminal); _write(evidence, binding)
+    with pytest.raises(ValueError, match='manual_stop_recovery_blocked'):
+        recover_manual_stop(target_root=target, evidence_file=evidence, confirmed=True, check_live=lambda: current)
+    assert (target / 'runtime/stop-preaudit.flag').exists()
+
+
+@pytest.mark.parametrize('defect', ['later_edit', 'replacement', 'birth_mismatch', 'call_after_birth', 'result_before_modify',
+    'ctime', 'missing_birth', 'saved_payload', 'observed_before_result'])
+def test_observed_identity_does_not_accept_replaced_or_later_modified_marker(tmp_path, defect):
+    from apps.oa_finance_preaudit.manual_stop_recovery import recover_manual_stop
+    target, evidence, current = _submission_conflict(tmp_path); _mixed_stop_event(evidence); _observed_birth(evidence)
+    binding = json.loads(evidence.read_text()); stop = target / 'runtime/stop-preaudit.flag'
+    ref = binding['stop_identity_observation']; path = Path(ref['path']); observation = json.loads(path.read_text())
+    if defect == 'later_edit': stop.write_bytes(b'stop_requested\n')
+    elif defect == 'replacement': stop.unlink(); stop.write_bytes(b'stop_requested\n'); stop.chmod(0o600)
+    elif defect == 'birth_mismatch': observation['birthtime'] -= 1
+    elif defect == 'ctime': observation['ctime_ns'] += 1
+    elif defect == 'missing_birth': observation.pop('birthtime')
+    elif defect == 'saved_payload': Path(binding['original_stop_payload']['path']).write_bytes(b'changed')
+    elif defect == 'observed_before_result': observation['observed_at'] = '2000-01-01T00:00:00+00:00'
+    else:
+        exit_path = Path(binding['original_exit']['path']); terminal = json.loads(exit_path.read_text())
+        source = Path(terminal['source_file']['path']); rows = [json.loads(line) for line in source.read_text().splitlines()]
+        rows[1 if defect == 'call_after_birth' else -1]['timestamp'] = (
+            '2099-01-01T00:00:00+00:00' if defect == 'call_after_birth' else '2000-01-01T00:00:00+00:00')
+        source.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
+        terminal['source_file']['sha256'] = hashlib.sha256(source.read_bytes()).hexdigest()
+        binding['original_exit'] = _write(exit_path, terminal)
+    binding['stop_identity_observation'] = _write(path, observation); _write(evidence, binding)
+    with pytest.raises((ValueError, RuntimeError)):
+        recover_manual_stop(target_root=target, evidence_file=evidence, confirmed=True, check_live=lambda: current)
+    assert stop.exists()
+    assert not list((target / 'runtime/control').glob('manual-stop-recovery-*.json'))
 
 
 @pytest.mark.parametrize("phase", ["receipt_before_manifest", "tool_before_receipt", "tool_after_closure", "receipt_naive", "tool_missing"])

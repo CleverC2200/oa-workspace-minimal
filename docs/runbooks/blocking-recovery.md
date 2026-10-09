@@ -106,6 +106,18 @@ Writer 被停止门拦在提交之前时，仅精确签名边界为 `writer_pref
 - `original_exit` 使用 `path`、`sha256` 绑定 `preaudit_original_controller_exit` 记录。该记录必须包含实际 `exit_code`、`process_session_id`、`run_id`、`terminal=true`、`children_reaped=true`，以及原会话 `source_file` 的 `path/sha256`、`source_line`、`source_call_id`。
 - `stop_source` 包含原停止调用的 `line`、`call_id`，引用同一原会话文件。维护核对原 `request_stop()` 调用、实际退出 0 的停止结果、无原因码和对应冲突文件；再核对原会话 cwd、任务 id，以及实际 write_stdin 进程退出与嵌套执行回执的轮次、实例、PID、修订和终态。保留各阶段原时间，严格核对带时区的 manifest.completed_at ≤ supervisor.completed_at ≤ 原工具输出 timestamp ≤ 原收尾 status.generated_at；这些阶段无须同时结束。`Script completed` 不作为进程退出证据。原会话只读源允许当前用户所有且组和其他用户不可写，私有维护证据仍须 0600。
 
+### 已闭合提交未决与首次维护身份观测
+
+`schema_version=2` 仅扩展原阻断为 `pending_write_state_unresolved` 的受控恢复，不改变版本 1 的原身份合同。保留上述字段，并新增 `original_submissions`、`stop_identity_observation`、`original_stop_payload`：
+
+- 原完整对账须 read_only，continuation 为 blocked/controller，isolated_pending=0，唯一阻断码为 pending_write_state_unresolved。正整数计数必须精确对应 pending_not_handled 且本地 review_required/submitting 或 closed/submitted 的原项；原 unknown、额外阻断、重复项或数量不符均拒绝。
+- `original_submissions` 每项只能含 `state`、`receipt`，分别是原同 attempt 的 state.json、execution-receipt.json 的绝对 path/sha256。路径严格绑定生产流程目录和 workflow/item_key/attempt。原终态状态与维护时新鲜完整对账中，同项均须唯一 closed/submitted/handled_not_pending；不可见、下一 attempt 或当前仍待办不能代替闭环。状态中的 receipt_fingerprint 须命中原回执，controlled_write、提交及 done/postcheck 布尔均须为 true。保留原证据，不重放单据。
+- 有原身份记录时，`stop_identity_observation=null`、`original_stop_payload=null`，继续按原 stop 元数据绑定。缺少当时 inode 记录时，可采用有限出生证据模式：前者绑定私有 `preaudit_stop_identity_observation` 文件，后者绑定此前已保存的普通停止原字节文件，两者均使用 path/sha256。保存样本只证明原字节，不能把复制件 inode 当作原标记 inode。
+- 观测文件包含 `observed_at`、原停止路径、device/inode/mtime_ns/ctime_ns/birthtime/sha256，诚实记录首次维护观测，不声称是当时 inode 观测。实际文件出生及最后修改均须严格落在原停止工具调用与实际输出的时间区间内，ctime_ns==mtime_ns，出生不晚于修改，首次观测不早于原工具输出。文件须当前用户所有、私有、无符号链接；文件系统无 birthtime、后来改动、替换、区间不符或元数据漂移均拒绝。维护租约内反复核对本次观测的精确 identity 与出生/修改证据，审计回执标记 `stop_identity_source=maintenance_observation_with_original_birth`。
+- 出生模式仅接受已核实的混合原工具形式：同一 exec 先运行固定 `.venv/bin/python -c` 三语句（导入 runtime_control、无参数 request_stop、打印 stop_requested/source/status_file），随后一次精确原会话 write_stdin。停止结果必须真实 exit_code=0 且 source=production_reconciliation_blocked；后续真实终态与原退出回执须按顺序对应。额外 Python 动作、命令、等待、错会话或输出不符均拒绝，不进行通用 eval 或执行历史代码。旧独立停止与纯等待形式保持原合同。
+
+版本 2 同样只清除已授权且证据完整的绑定普通停止标记，写私有维护审计；不写 OA、不改原业务意见、不放宽未知写入、授权、冻结、回收或实时门禁。工程回归、证据格式预检与真实生产恢复分别记录，代码合并本身不是恢复证明。
+
 证据与原工具终态、文件 bytes/SHA 已核实后，按当前明确授权运行：
 
 ```bash

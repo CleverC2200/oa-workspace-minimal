@@ -6,10 +6,12 @@ import ast
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import secrets
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -125,8 +127,32 @@ def _verify_original_exit(terminal: dict, manifest: dict, binding: dict, observe
         or "runtime_control.request_stop()" not in stop_call.get("input", "")
         or binding["original_conflict_status"]["path"] not in stop_call.get("input", "")):
         raise ValueError(BLOCKED)
+    mixed = stop_source['call_id'] == terminal.get('source_call_id')
+    source = stop_call.get('input', '')
+    if mixed:
+        command_pattern = r'^\s*text\(await tools\.exec_command\(\{cmd:("(?:\\.|[^"\\])*"),max_output_tokens:[1-9][0-9]*\}\)\);'
+        command_match = re.match(command_pattern, source)
+        if command_match is None:
+            raise ValueError(BLOCKED)
+        try:
+            command = shlex.split(json.loads(command_match[1]))
+        except ValueError:
+            raise ValueError(BLOCKED) from None
+        expected_script = ("from apps.oa_approval import runtime_control; runtime_control.request_stop(); "
+                           "print({'stop_requested':runtime_control.stop_requested(),"
+                           "'source':'production_reconciliation_blocked','status_file':"
+                           + repr(binding['original_conflict_status']['path']) + "})")
+        if len(command) != 3 or command[:2] != ['.venv/bin/python', '-c']:
+            raise ValueError(BLOCKED)
+        try:
+            template_matches = ast.dump(ast.parse(command[2])) == ast.dump(ast.parse(expected_script))
+        except SyntaxError:
+            raise ValueError(BLOCKED) from None
+        if not template_matches:
+            raise ValueError(BLOCKED)
+        source = source[command_match.end():]
     stop_results = []
-    for entry in decoded[stop_source["line"]:terminal["source_line"] - 1]:
+    for entry in decoded[stop_source["line"]:terminal["source_line"] if mixed else terminal["source_line"] - 1]:
         output = _payload(entry)
         if output.get("call_id") != stop_source["call_id"] or output.get("type") != "custom_tool_call_output":
             continue
@@ -136,14 +162,30 @@ def _verify_original_exit(terminal: dict, manifest: dict, binding: dict, observe
                 fact = ast.literal_eval(envelope.get("output", ""))
             except (ValueError, SyntaxError, KeyError, TypeError):
                 continue
-            if (type(envelope.get("exit_code")) is int and envelope["exit_code"] == 0
-                and isinstance(fact, dict) and fact.get("stop_requested") is True
-                and fact.get("stop_reason", "absent") is None
-                and fact.get("cause") == "production_reconciliation_blocked"
-                and fact.get("status_file") == binding["original_conflict_status"]["path"]):
+            valid_fact = (fact == {'stop_requested': True, 'source': 'production_reconciliation_blocked',
+                                 'status_file': binding['original_conflict_status']['path']}
+                          and isinstance(fact, dict) and fact.get('stop_requested') is True) if mixed else (
+                isinstance(fact, dict) and fact.get('stop_requested') is True
+                and fact.get('stop_reason', 'absent') is None
+                and fact.get('cause') == 'production_reconciliation_blocked'
+                and fact.get('status_file') == binding['original_conflict_status']['path'])
+            if type(envelope.get("exit_code")) is int and envelope["exit_code"] == 0 and valid_fact:
                 stop_results.append(fact)
     if len(stop_results) != 1:
         raise ValueError(BLOCKED)
+    observation_ref = binding.get('stop_identity_observation')
+    if observation_ref is not None:
+        observation = _object(_bound_bytes(observation_ref))
+        born = observation.get('birthtime')
+        if (not mixed or type(born) not in {int, float} or not math.isfinite(born)
+            or born <= 0 or type(observation.get('mtime_ns')) is not int):
+            raise ValueError(BLOCKED)
+        call_at = _aware_time(decoded[stop_source['line'] - 1].get('timestamp'))
+        result_at = _aware_time(decoded[terminal['source_line'] - 1].get('timestamp'))
+        modified = datetime.fromtimestamp(observation['mtime_ns'] / 1e9, tz=timezone.utc)
+        birth = datetime.fromtimestamp(born, tz=timezone.utc)
+        if not call_at <= birth <= modified <= result_at <= _aware_time(observation.get('observed_at')):
+            raise ValueError(BLOCKED)
     if terminal["source_line"] > len(records):
         raise ValueError(BLOCKED)
     event = decoded[terminal["source_line"] - 1]
@@ -158,10 +200,10 @@ def _verify_original_exit(terminal: dict, manifest: dict, binding: dict, observe
             calls.append(call)
     if len(calls) != 1 or calls[0].get("name") != "exec":
         raise ValueError(BLOCKED)
-    source = calls[0].get("input", "")
+    source = source if mixed else calls[0].get("input", "")
     pattern = r'text\(await tools\.write_stdin\(\{([^{}]+)\}\)\);'
     operations = list(re.finditer(pattern, source))
-    if not operations or re.sub(pattern, "", source).strip():
+    if not operations or re.sub(pattern, "", source).strip() or (mixed and len(operations) != 1):
         raise ValueError(BLOCKED)
     sessions = []
     for operation in operations:
@@ -184,9 +226,11 @@ def _verify_original_exit(terminal: dict, manifest: dict, binding: dict, observe
             continue
         if isinstance(value, dict) and "exit_code" in value:
             envelopes.append(value)
-    if len(envelopes) != len(sessions):
+    if len(envelopes) != len(sessions) + int(mixed):
         raise ValueError(BLOCKED)
-    envelope = envelopes[sessions.index(session)]
+    if mixed and (type(envelopes[0].get('exit_code')) is not int or envelopes[0]['exit_code'] != 0):
+        raise ValueError(BLOCKED)
+    envelope = envelopes[sessions.index(session) + int(mixed)]
     if type(envelope.get("exit_code")) is not int or envelope["exit_code"] != terminal["exit_code"]:
         raise ValueError(BLOCKED)
     receipt = _object(envelope["output"])
@@ -212,11 +256,97 @@ def _verify_original_exit(terminal: dict, manifest: dict, binding: dict, observe
         raise ValueError(BLOCKED)
 
 
+def _finding_identity(row: dict) -> tuple[str, str, int]:
+    from .production_config import FINANCE_WORKFLOWS
+    if (row.get('workflow_key') not in FINANCE_WORKFLOWS
+        or re.fullmatch(r'[0-9a-f]{64}', str(row.get('item_key') or '')) is None
+        or type(row.get('attempt')) is not int or row['attempt'] < 1):
+        raise ValueError(BLOCKED)
+    return row['workflow_key'], row['item_key'], row['attempt']
+
+
+def _require_submission_closure(report: dict, identities: set[tuple[str, str, int]]) -> None:
+    findings = report.get('reconciliation', {}).get('findings')
+    if not isinstance(findings, list):
+        raise ValueError(BLOCKED)
+    for identity in identities:
+        matching = [row for row in findings if isinstance(row, dict)
+                    and (row.get('workflow_key'), row.get('item_key'), row.get('attempt')) == identity]
+        if (len(matching) != 1 or matching[0].get('category') != 'handled_not_pending'
+            or matching[0].get('local_execution_state') != 'closed'
+            or matching[0].get('local_write_state') != 'submitted'):
+            raise ValueError(BLOCKED)
+
+
+def _resolved_submission_evidence(target: Path, binding: dict, conflict: dict, original: dict) -> set:
+    report = conflict.get('reconciliation', {})
+    continuation = report.get('continuation', {})
+    count = continuation.get('blocking_reasons', {}).get('pending_write_state_unresolved')
+    if (conflict.get('kind') != 'preaudit_runtime_status' or conflict.get('schema_version') != 1
+        or report.get('kind') != 'preaudit_reconciliation' or report.get('read_only') is not True
+        or type(count) is not int or count <= 0
+        or continuation != {'status': 'blocked', 'scope': 'controller', 'isolated_pending': 0,
+                            'blocking_reasons': {'pending_write_state_unresolved': count}}
+        or not isinstance(report.get('findings'), list)
+        or any(not isinstance(row, dict) for row in report['findings'])):
+        raise ValueError(BLOCKED)
+    rows = [row for row in report['findings'] if isinstance(row, dict)
+            and row.get('category') == 'pending_not_handled'
+            and row.get('local_write_state') in {'submitting', 'submitted', 'unknown'}]
+    if (len(rows) != count or any(row.get('local_write_state') == 'unknown' for row in rows)
+        or any((row.get('local_execution_state'), row.get('local_write_state')) not in {
+            ('review_required', 'submitting'), ('closed', 'submitted'),
+        } for row in rows)):
+        raise ValueError(BLOCKED)
+    identities = {_finding_identity(row) for row in rows}
+    if len(identities) != count:
+        raise ValueError(BLOCKED)
+    _require_submission_closure(original, identities)
+    submissions = binding.get('original_submissions')
+    if not isinstance(submissions, list) or len(submissions) != count:
+        raise ValueError(BLOCKED)
+    verified = set()
+    for reference in submissions:
+        if not isinstance(reference, dict) or set(reference) != {'state', 'receipt'}:
+            raise ValueError(BLOCKED)
+        state = _object(_bound_bytes(reference['state']))
+        receipt = _object(_bound_bytes(reference['receipt']))
+        identity = _finding_identity({'workflow_key': state.get('workflow_key'),
+                                      'item_key': state.get('case_key'), 'attempt': state.get('attempt')})
+        workflow, key, attempt = identity
+        directory = target / 'runtime/finance_preaudit_flows' / workflow / 'cases' / key / f'attempt-{attempt}'
+        request, received = state.get('request_id'), state.get('received_at')
+        if (identity not in identities or identity in verified
+            or reference['state']['path'] != str(directory / 'state.json')
+            or reference['receipt']['path'] != str(directory / 'execution-receipt.json')
+            or state.get('schema_version') != 1 or state.get('kind') != 'preaudit_action'
+            or state.get('execution_state') != 'closed' or state.get('write_state') != 'submitted'
+            or state.get('mode') != 'controlled_write' or state.get('write_authorized') is not True
+            or not isinstance(request, str) or not request or not isinstance(received, str) or not received
+            or hashlib.sha256(f'{request}\x1f{received}'.encode()).hexdigest() != key
+            or state.get('receipt_fingerprint') != 'sha256:' + reference['receipt']['sha256']
+            or any(receipt.get(field) != value for field, value in {
+                'schema_version': 1, 'kind': 'preaudit_execution_receipt', 'workflow_key': workflow,
+                'case_key': key, 'attempt': attempt, 'mode': 'controlled_write', 'write_state': 'submitted',
+            }.items())
+            or receipt.get('business_state') not in {'pass', 'needs_human'}
+            or receipt.get('business_state') != state.get('business_state')
+            or receipt.get('no_write_evidence', 'missing') is not None
+            or any(receipt.get(field) is not True for field in ('write', 'submit_ok', 'done_hit', 'postcheck_done_hit'))):
+            raise ValueError(BLOCKED)
+        verified.add(identity)
+    return identities
+
+
 def _original_evidence(target: Path, binding: dict) -> tuple[dict, dict]:
+    fields = {"schema_version", "kind", "target_root", "target_revision", "stop", "stop_source",
+              "manifest", "original_manifest", "original_conflict_status", "original_status", "original_exit"}
+    version = binding.get('schema_version') if isinstance(binding, dict) else None
+    if version == 2:
+        fields |= {'original_submissions', 'stop_identity_observation', 'original_stop_payload'}
     if (not isinstance(binding, dict)
-        or set(binding) != {"schema_version", "kind", "target_root", "target_revision",
-                            "stop", "stop_source", "manifest", "original_manifest", "original_conflict_status", "original_status", "original_exit"}
-        or binding.get("schema_version") != 1
+        or set(binding) != fields
+        or type(version) is not int or version not in {1, 2}
         or binding.get("kind") != "preaudit_manual_stop_recovery_binding"
         or binding.get("target_root") != str(target)
         or binding.get("target_revision") != _source_revision(target)
@@ -260,7 +390,9 @@ def _original_evidence(target: Path, binding: dict) -> tuple[dict, dict]:
         raise ValueError(BLOCKED)
     from .maintenance_runtime import assert_live_safe
     assert_live_safe(original, maintenance_leases_held=False, original_closure=True)
-    if (conflict.get("kind") != "preaudit_runtime_status"
+    if version == 2:
+        _resolved_submission_evidence(target, binding, conflict, original)
+    elif (conflict.get("kind") != "preaudit_runtime_status"
         or conflict.get("reconciliation", {}).get("continuation", {}).get("status") != "blocked"
         or not any(row.get("category") == "pending_handled_conflict"
                    for row in conflict.get("reconciliation", {}).get("findings", []) if isinstance(row, dict))):
@@ -293,6 +425,23 @@ def _original_stop(target: Path, binding: dict) -> tuple[int, int, int]:
     if (identity != (expected["device"], expected["inode"], expected["mtime_ns"])
         or raw != _STOP_PAYLOAD or hashlib.sha256(raw).hexdigest() != expected["sha256"]):
         raise ValueError(BLOCKED)
+    reference = binding.get('stop_identity_observation')
+    if reference is not None:
+        if binding.get('schema_version') != 2:
+            raise ValueError(BLOCKED)
+        observation = _object(_bound_bytes(reference))
+        born = getattr(info, 'st_birthtime', None)
+        if (born is None or observation.get('kind') != 'preaudit_stop_identity_observation'
+            or observation.get('path') != str(stop)
+            or observation.get('sha256') != expected['sha256']
+            or any(type(observation.get(key)) is not int or observation[key] != value for key, value in (
+                ('device', info.st_dev), ('inode', info.st_ino), ('mtime_ns', info.st_mtime_ns), ('ctime_ns', info.st_ctime_ns),
+            ))
+            or observation.get('birthtime') != born or info.st_ctime_ns != info.st_mtime_ns
+            or _bound_bytes(binding.get('original_stop_payload')) != _STOP_PAYLOAD):
+            raise ValueError(BLOCKED)
+    elif binding.get('original_stop_payload') is not None:
+        raise ValueError(BLOCKED)
     return identity
 
 
@@ -316,6 +465,10 @@ def recover_manual_stop(
             manifest, terminal = _original_evidence(target, binding)
             current = check_live() if check_live is not None else read_live_status(target)
             assert_live_safe(current, maintenance_leases_held=True)
+            if binding['schema_version'] == 2:
+                conflict = _object(_bound_bytes(binding['original_conflict_status']))
+                original = _object(_bound_bytes(binding['original_status']))
+                _require_submission_closure(current, _resolved_submission_evidence(target, binding, conflict, original))
             if (_private_bytes(evidence_file) != raw_binding
                 or _original_stop(target, binding) != identity
                 or _original_evidence(target, binding) != (manifest, terminal)):
@@ -328,6 +481,9 @@ def recover_manual_stop(
                        "current_status_file": current.get("maintenance_status_file"),
                        "current_input_proof": current.get("maintenance_current_inputs"),
                        "live_continuation": current["reconciliation"]["continuation"],
+                       "stop_identity_source": ("maintenance_observation_with_original_birth"
+                                                if binding.get('stop_identity_observation') is not None
+                                                else "original_identity_binding"),
                        "write_state": "not_requested", "stop_cleared": False}
             def record() -> None:
                 runtime_control.write_control_bytes_atomic(receipt_file, (json.dumps(receipt, sort_keys=True) + "\n").encode())

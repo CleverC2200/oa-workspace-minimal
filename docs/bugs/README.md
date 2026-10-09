@@ -28,6 +28,8 @@
 
 ## 其他相关工作
 
+- [#413 已闭合提交未决的停止恢复](https://github.com/CleverC2200/oa-workspace-minimal/issues/413)：[版本 2 恢复证据合同](../runbooks/blocking-recovery.md#已闭合提交未决与首次维护身份观测)、[公开维护回归](../../tests/finance_preaudit/test_manual_stop_recovery.py)；严格区分原身份记录与首次维护观测的出生证据，不把恢复当作对账根因修复。
+
 - [#328 机械质量检查](https://github.com/CleverC2200/oa-workspace-minimal/issues/328)：[YAML、生成 Schema 和 lint](../agents/quality-checks.md)。
 - [#330 历史原会话定位](https://github.com/CleverC2200/oa-workspace-minimal/issues/330)：[UUID、压缩归档与有限工具投影](../agents/session-evidence.md)。
 - [#331 小时调度指令分层](https://github.com/CleverC2200/oa-workspace-minimal/issues/331)：[配置候选及启用条件](../runbooks/hourly-production.md)；按授权发布后才接入。
