@@ -36,6 +36,49 @@ def test_only_selected_pending_side_consumes_local_cli_and_preview(tmp_path, sou
     assert json.loads((after / 'result.json').read_text())['write_state'] == 'not_requested'
 
 
+def test_frozen_source_host_remains_separate_from_current_verification_host(tmp_path, sources, monkeypatch):
+    from apps.oa_finance_preaudit.review_comparison import _execute_pending_pair
+
+    monkeypatch.setenv('OA_REVIEW_API_KEY', 'offline-placeholder')
+    path, _auth, before, after = plan(tmp_path, sources, purpose='diagnostic')
+    frozen_host = e.HOST
+    monkeypatch.setattr(e, 'HOST', tmp_path / 'unrelated-verification-host.py')
+    selection = {'target_plan_ref': ref(path), 'reused_originals': {},
+                 'pending_arms': ['baseline', 'candidate']}
+    authority = {'not_before': (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+                 'expires_at': (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()}
+
+    result = _execute_pending_pair(path, selection, authority, revalidate=lambda: None,
+                                   host_file=frozen_host)
+
+    assert result['status'] == 'awaiting_independent_assessment', result
+    assert result['new_cli_starts'] == 2
+    assert result['dispatched_arms'] == ['baseline', 'candidate']
+    for root in (before, after):
+        raw = json.loads((root / 'result.json').read_text())
+        assert raw['cli_starts'] == 1 and raw['write_state'] == 'not_requested'
+
+
+def test_changed_explicit_source_host_is_rejected_before_local_cli(tmp_path, sources):
+    from apps.oa_finance_preaudit.review_comparison import _execute_pending_pair
+
+    path, _auth, before, after = plan(tmp_path, sources, purpose='diagnostic')
+    changed_host = tmp_path / 'changed-source-host.py'
+    changed_host.write_text(e.HOST.read_text() + '\n# changed\n')
+    selection = {'target_plan_ref': ref(path), 'reused_originals': {},
+                 'pending_arms': ['baseline', 'candidate']}
+    authority = {'not_before': (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+                 'expires_at': (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()}
+
+    result = _execute_pending_pair(path, selection, authority, revalidate=lambda: None,
+                                   host_file=changed_host)
+
+    assert result['status'] == 'rejected' and result['reason'] == 'host_drift'
+    assert result['new_cli_starts'] == 0
+    assert not (before / 'started.json').exists()
+    assert not (after / 'started.json').exists()
+
+
 def test_last_native_side_rechecks_bound_readiness_after_actual_output(tmp_path, sources, monkeypatch):
     from apps.oa_finance_preaudit.review_comparison import _execute_pending_pair
 

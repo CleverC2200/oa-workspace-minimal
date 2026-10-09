@@ -177,3 +177,26 @@ def test_authentication_rejects_changed_bound_plan_before_dispatch(tmp_path, mon
     Path(plan['file']).write_text('{}')
     with pytest.raises(ValueError):
         _require_reviewer_authentication(plan, ['candidate'])
+
+
+def test_caller_rechecks_frozen_source_host_without_changing_verifier(tmp_path):
+    from apps.oa_finance_preaudit.review_comparison import _ComparisonCaller
+    from tests.finance_preaudit.test_candidate_phase import ref
+
+    adapter = tmp_path / 'neutral-adapter.py'
+    adapter.write_text('"""No dispatch or financial judgment."""\n')
+    adapter.chmod(0o600)
+    host = tmp_path / 'source-host.py'
+    host.write_text('"""Bound transport only."""\n')
+    host.chmod(0o600)
+    host_reference = ref(host)
+    caller = _ComparisonCaller(caller_file=Path(__file__), identity_bank={},
+                               adapter_file=ref(adapter), source_host=host_reference)
+    caller._verify_runtime()
+
+    host.write_text('"""Changed after the original binding."""\n')
+    host_reference.update(ref(host))
+    with pytest.raises(ValueError):
+        caller._verify_runtime()
+
+    assert not (tmp_path / 'candidate-phase-claim.private.json').exists()

@@ -32,7 +32,8 @@ from apps.oa_finance_preaudit.review_comparison import _ComparisonCaller  # noqa
 caller = _ComparisonCaller(caller_file=Path(__file__),
                            identity_bank=configuration['identity_bank'],
                            adapter_file=configuration['adapter'],
-                           reference_module=configuration['reference_module'])
+                           reference_module=configuration['reference_module'],
+                           source_host=configuration.get('source_host'))
 request_path = Path(request_file).absolute()
 request = batch._object(request_path.parent, request_path)
 if mode in {'validate', 'run', 'quality'}:

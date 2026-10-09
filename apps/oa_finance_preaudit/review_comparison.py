@@ -76,6 +76,7 @@ def _require_reviewer_authentication(plan_reference, pending):
 
 def _execute_pending_pair(plan_file: Path, selection: dict, authority: dict, *,
                           revalidate: Callable[[], None],
+                          host_file: Path | None = None,
                           stop_requested: Callable[[], bool] = lambda: False) -> dict:
     """Caller-internal transport seam. Caller holds the parent lock throughout.
 
@@ -113,7 +114,7 @@ def _execute_pending_pair(plan_file: Path, selection: dict, authority: dict, *,
             _need(manifest['source_revision'] == plan['source_revisions'][arm]
                   and batch._sha(Path(plan['arms'][arm]) / 'manifest.json') == plan['manifests'][arm],
                   'source_drift')
-            current = e._host(plan_file, arm)
+            current = e._host(plan_file, arm, host_file=host_file)
             _need(all(current[key] == plan['preparations'][arm][key] for key in
                       ('conditions', 'delivery', 'input_sha256', 'source_snapshot_sha256')),
                   'prepared_input_drift')
@@ -125,7 +126,7 @@ def _execute_pending_pair(plan_file: Path, selection: dict, authority: dict, *,
                                     'purpose': 'explicit_actual_version_comparison',
                                     'pending_arms': pending, 'no_retry': True})
             dispatching = arm
-            output = e._host(plan_file, arm, execute=True)
+            output = e._host(plan_file, arm, execute=True, host_file=host_file)
             raw_results[arm] = output
             observed = e._observed_cli_start(plan, arm)
             _need(type(output.get('cli_starts')) is int and output['cli_starts'] == observed == 1,
@@ -289,16 +290,20 @@ class _ComparisonCaller:
     """Task-private paired caller; fixed immutable configuration, one run entry."""
 
     def __init__(self, *, caller_file: Path, identity_bank: dict, adapter_file: dict,
-                 reference_module: dict | None = None):
+                 reference_module: dict | None = None, source_host: dict | None = None):
         self.caller_file = Path(caller_file)
         self.identity_bank = identity_bank
         self._module_ref = _ref(Path(__file__))
         self._adapter_ref = copy.deepcopy(adapter_file)
         self._reference_ref = reference_module or _ref(Path(review_references.__file__))
+        self._source_host_ref = copy.deepcopy(source_host)
+        self._source_host_file = Path(source_host['file']) if source_host is not None else None
         _need(self._reference_ref['file'] == str(Path(review_references.__file__).resolve()),
               'reference_module_not_bound')
         from .flow_evals import _read_bound_artifact
         _read_bound_artifact(adapter_file, document=False)
+        if source_host is not None:
+            _read_bound_artifact(source_host, document=False)
         spec = importlib.util.spec_from_file_location("private_reference_adapter", adapter_file["file"])
         adapter = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(adapter)
@@ -308,6 +313,8 @@ class _ComparisonCaller:
         from .flow_evals import _read_bound_artifact
         for reference in (self._module_ref, self._adapter_ref, self._reference_ref):
             _read_bound_artifact(reference, document=False)
+        if self._source_host_ref is not None:
+            _read_bound_artifact(self._source_host_ref, document=False)
 
     def _side_expectations(self, row, plan, arm):
         """Every final side has its original independent, pre-run four facts."""
@@ -552,7 +559,7 @@ class _ComparisonCaller:
                 _need(archived.is_file(), 'source_native_contract_unavailable_' + arm)
             _read(record)
             result = e._host(Path(row['plan']['file']), arm,
-                             native_record=Path(record['file']))
+                             native_record=Path(record['file']), host_file=self._source_host_file)
             if arm == 'baseline':
                 _need(plan['source_roles']['baseline'] == 'production_code_replay'
                       and result.get('status') == 'verified_baseline_observation'
@@ -683,7 +690,7 @@ class _ComparisonCaller:
             self.native_ready(row, scope, selection)
             for arm in pending:
                 plan = _read(row['plan'])
-                current = e._host(Path(row['plan']['file']), arm)
+                current = e._host(Path(row['plan']['file']), arm, host_file=self._source_host_file)
                 _need(all(current[key] == plan['preparations'][arm][key] for key in
                           ('conditions', 'delivery', 'input_sha256', 'source_snapshot_sha256')),
                       'prepared_input_drift')
@@ -729,7 +736,8 @@ class _ComparisonCaller:
                 preflight_seconds += time.monotonic() - recheck_started
 
             result = _execute_pending_pair(plan_file, selection, authority,
-                                           revalidate=revalidate, stop_requested=stop_requested)
+                                           revalidate=revalidate, stop_requested=stop_requested,
+                                           host_file=self._source_host_file)
             if result['status'] == 'stopped':
                 try:
                     e._candidate_phase_stop(scope_file, row['alias'], result['reason'])

@@ -320,6 +320,72 @@ def _native_receipt_paths(root: Path) -> list[Path]:
     return paths
 
 
+def _exec_image_coverage(root: Path, expected: dict, calls: dict, outputs: dict) -> tuple[set, int]:
+    """Bind exec returns by original content, never by JS paths or output order."""
+    import fitz
+
+    returned = []
+    for call, records in calls.items():
+        replies = outputs.get(call, [])
+        if len(records) != 1 or len(replies) != 1:
+            continue
+        frame, value = records[0]
+        reply_frame, out = replies[0]
+        if (value.get("name") != "exec" or not isinstance(value.get("input"), str)
+                or not value["input"].strip() or reply_frame <= frame or not isinstance(out, list)):
+            continue
+        hashes = []
+        try:
+            for part in out:
+                if not isinstance(part, dict) or part.get("type") != "input_image":
+                    continue
+                url = part.get("image_url")
+                if not isinstance(url, str) or not url.startswith((
+                    "data:image/png;base64,", "data:image/jpeg;base64,", "data:image/webp;base64,"
+                )):
+                    raise ValueError("exec_image_invalid")
+                raw = base64.b64decode(url.split(",", 1)[1], validate=True)
+                if not raw:
+                    raise ValueError("exec_image_empty")
+                fitz.Pixmap(raw)
+                hashes.append(hashlib.sha256(raw).hexdigest())
+        except (ValueError, fitz.mupdf.FzErrorBase):
+            continue
+        if hashes and len(set(hashes)) == len(hashes):
+            returned.extend(hashes)
+    if not returned:
+        return set(), 0
+    content = {}
+    for name, fingerprint in expected.items():
+        content.setdefault(fingerprint, set()).add(name)
+    if any(fingerprint not in content for fingerprint in returned) and (root.parent / "plan.json").is_file():
+        from . import review_input
+
+        plan = _object(root.parent, "plan.json")
+        arms = [arm for arm, path in plan.get("arms", {}).items() if path == str(root)]
+        binary = review_input._native_codex_file()
+        manifest = _object(root, "manifest.json")
+        if (len(arms) == 1 and binary is not None
+                and plan.get("source_revisions", {}).get(arms[0]) == manifest["source_revision"]
+                and plan.get("reviewer") == str(binary)
+                and plan.get("reviewer_sha256") == review_input._binary_sha256(binary)):
+            try:
+                measured = review_input._native_image_sizes(tuple(Path(name) for name in expected))
+            except (OSError, ValueError):
+                measured = None
+            if measured is not None and measured[0] == (binary, plan["reviewer_sha256"]):
+                for name, (_size, fingerprint) in zip(expected, measured[1], strict=True):
+                    content.setdefault(fingerprint, set()).add(name)
+    covered = set()
+    observed = 0
+    for fingerprint in returned:
+        matches = content.get(fingerprint, set())
+        if len(matches) == 1:
+            covered.update(matches)
+            observed += 1
+    return covered, observed
+
+
 def _native(root: Path, material: dict, usage: dict) -> tuple[dict, int | str, dict]:
     images = material.get("prepared", {}).get("images", [])
     expected = {
@@ -334,6 +400,8 @@ def _native(root: Path, material: dict, usage: dict) -> tuple[dict, int | str, d
     }
     calls = {}
     returned = set()
+    exec_calls = {}
+    exec_outputs = {}
     peak = None
     reasoning = "unknown"
     tool_calls = set()
@@ -404,6 +472,12 @@ def _native(root: Path, material: dict, usage: dict) -> tuple[dict, int | str, d
                 ):
                     tool_calls.add(value["call_id"])
                 if event.get("type") == "response_item":
+                    call = value.get("call_id")
+                    if isinstance(call, str) and call:
+                        if value.get("type") == "custom_tool_call":
+                            exec_calls.setdefault(call, []).append((frames, value))
+                        elif value.get("type") == "custom_tool_call_output":
+                            exec_outputs.setdefault(call, []).append((frames, value.get("output")))
                     if (
                         value.get("type") == "function_call"
                         and value.get("name") == "view_image"
@@ -470,11 +544,20 @@ def _native(root: Path, material: dict, usage: dict) -> tuple[dict, int | str, d
     manifest = _object(root, "manifest.json")
     _sufficient, reused, _bound = _reading_coverage(root, manifest, material)
     pages = dict(flow_engine._travel_pages(material))
+    initial_delivered = len(initial_expected) if initial_expected and initial_frames == initial_expected and len(initial_expected) == len(expected) else 0
+    legacy_coverage = covered | {pages[reference]["path"] for reference, representative in reused.items()
+                                 if pages[representative]["path"] in covered}
+    # Complete existing proofs keep their exact saved projection, including counts.
+    if len(legacy_coverage) < len(expected) and initial_delivered != len(expected):
+        duplicate_paths = {pages[reference]["path"] for reference in reused}
+        originals = {name: fingerprint for name, fingerprint in expected.items() if name not in duplicate_paths}
+        observed, count = _exec_image_coverage(root, originals, exec_calls, exec_outputs)
+        covered.update(observed)
+        view_returned += count
     directly_covered = set(covered)
     for reference, representative in reused.items():
         if pages[representative]["path"] in directly_covered:
             covered.add(pages[reference]["path"])
-    initial_delivered = len(initial_expected) if initial_expected and initial_frames == initial_expected and len(initial_expected) == len(expected) else 0
     return (
         {
             "status": "not_applicable"

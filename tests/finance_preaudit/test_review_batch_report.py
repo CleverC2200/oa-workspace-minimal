@@ -25,7 +25,8 @@ def digest(path):
 
 def archive(
     tmp_path, usage=None, *, with_attachment=False, closed=True, business_value=None,
-    structured_pdf=False, duplicate_images=False, workflow="travel_expense", request_id="synthetic",
+    structured_pdf=False, duplicate_images=False, image_colors=None,
+    workflow="travel_expense", request_id="synthetic",
 ):
     root = tmp_path / "batch"
     root.mkdir(mode=0o700)
@@ -68,10 +69,10 @@ def archive(
                 page.write_bytes(rendered.get_pixmap().tobytes("png"))
             material["resources"] = [{"request_id": request, "resource_id": "pdf", "source_resource_id": "pdf", "local_readonly_path": str(source)}]
             material["prepared"] = {"images": [{"resource_id": "pdf", "path": str(page), "kind": "pdf_page", "content_sha256": digest(page)}], "structured_contents": [{"resource_id": "pdf", "document_type": "pdf_text", "key_text": ["P1: Controlled invoice total 10.00"]}], "manifest": [{"resource_id": "pdf", "image_count": 1}]}
-        if duplicate_images:
+        if duplicate_images or image_colors is not None:
             import fitz
             resources, images, entries = [], [], []
-            for index, color in enumerate((255, 255, 0)):
+            for index, color in enumerate(image_colors or (255, 255, 0)):
                 resource = "image-" + str(index)
                 source = attempt / "attachments" / (resource + ".png")
                 page = attempt / "prepared" / (resource + ".png")
