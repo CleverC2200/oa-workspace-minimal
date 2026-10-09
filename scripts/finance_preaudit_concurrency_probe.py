@@ -5098,6 +5098,10 @@ def _run_rolling_drain_locked(
             "total_tokens",
         ):
             token_totals[field] += int(usage.get(field) or 0)
+    if status == "failed" and primary_error_code is None:
+        external_stop_reason = runtime_control.stop_reason()
+        if external_stop_reason != "controller_cycle_stop":
+            primary_error_code = external_stop_reason
     completed = sum(wave["completed"] for wave in waves)
     codex_events = _merge_codex_event_summaries(
         [wave["codex_events"] for wave in waves]
@@ -5407,7 +5411,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             controller_started = True
             payload = run_rolling_drain(**rolling_args)
             counts = payload.get("error_counts")
-            session_code = next(
+            primary_code = payload.get("primary_error_code")
+            session_code = primary_code if primary_code in session_alert.ALERT_ERROR_CODES else next(
                 (
                     code
                     for code in (*sorted(session_alert.PRODUCTION_ERROR_CODES), *_SESSION_ALERT_PRIORITY)

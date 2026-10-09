@@ -86,6 +86,8 @@ def build_message(error_code: str, *, occurred_at: datetime | None = None) -> st
             if code in SESSION_ERROR_CODES else (
                 "原因：预审待办或人工处置超过目标时限，请查看本地处理人、期限和下一步。"
                 if code == "preaudit_pending_overdue" else
+                "原因：生产对账门禁未通过，请查看本地对账与控制器回执。"
+                if code == "production_reconciliation_blocked" else
                 "原因：生产启动门禁未通过，请查看本地任务回执。"
                 if code in STARTUP_ERROR_CODES else "原因：本轮出现失败或隔离项，请查看本地控制器回执和人工核对清单。"
             ),

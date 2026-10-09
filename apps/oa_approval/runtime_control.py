@@ -22,6 +22,7 @@ _ALLOWED_STOP_REASONS = frozenset(
         "controller_cycle_stop",
         "production_probe_prepare_failed",
         "production_probe_renew_failed",
+        "production_reconciliation_blocked",
         "write_authorization_invalid",
         "writer_result_unknown",
     }

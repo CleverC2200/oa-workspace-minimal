@@ -564,7 +564,14 @@ def main(
                 payload["live_check"] = live_status_operation()
             if args.reconcile:
                 reconcile_operation = reconcile_status or _live_reconciliation
-                payload["reconciliation"] = reconcile_operation(root)
+                payload["reconciliation"] = {
+                    **reconcile_operation(root),
+                    "usage": {
+                        "gate_scope": "startup_or_terminal",
+                        "snapshot_consistency": "non_atomic",
+                        "running_monitor": "original_execution_progress",
+                    },
+                }
             _attach_live_queue_projection(payload)
             payload["controller_handoff"] = controller_handoff.status()
             from . import session_alert
