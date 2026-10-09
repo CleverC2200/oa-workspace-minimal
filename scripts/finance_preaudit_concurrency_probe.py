@@ -4960,6 +4960,7 @@ def _run_rolling_drain_locked(
             or wave["timed_out"]
             or wave["stopped"]
             or wave["completed"] != wave["requested"]
+            or runtime_control.stop_reason() not in {None, "controller_cycle_stop"}
         ):
             runtime_control.request_cycle_stop()
             status = "failed"

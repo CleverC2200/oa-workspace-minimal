@@ -342,3 +342,47 @@ def test_unreaped_children_remain_blocked_and_keep_the_specific_alert(first_erro
     assert handoff["children_reaped"] is False
     assert handoff["ready_for_start"] is False
     assert runtime_control.stop_requested() is True
+
+
+@pytest.mark.parametrize("stop_reason,expected_status,expected_primary,stop_preserved", [
+    ("production_reconciliation_blocked", "failed", "production_reconciliation_blocked", True),
+    (None, "completed", None, True),
+    ("controller_cycle_stop", "completed", None, False),
+])
+def test_specific_stop_is_retained_when_the_last_writer_finishes(
+    stop_reason, expected_status, expected_primary, stop_preserved,
+):
+    pending = [1]
+
+    def pipeline(count, capacity):
+        runtime_control.request_stop(stop_reason)
+        pending[0] = 0
+        return process_pool.PoolResult(
+            requested=count, started=1, completed=1, failed=0, timed_out=0,
+            stopped=0, peak_active=capacity, elapsed_seconds=0.01,
+            outcomes=(process_pool.TaskOutcome(
+                index=0, status="completed", value={
+                    "status": "completed", "business_state": "needs_human", "write_state": "submitted",
+                },
+            ),),
+        )
+
+    def current_live():
+        payload = live_status()
+        payload["oa"]["by_workflow"]["travel_expense"] = pending[0]
+        return payload
+
+    def current_reconciliation():
+        payload = reconciled()
+        payload["quarantine"]["actionable_pending"] = pending[0]
+        return payload
+
+    result = probe.run_rolling_drain(
+        capacity=3, live_status=current_live, reconcile_status=current_reconciliation,
+        pipeline_runner=pipeline,
+    )
+    assert result["completed"] == 1
+    assert result["stopped"] == 0
+    assert result["status"] == expected_status
+    assert result["primary_error_code"] == expected_primary
+    assert runtime_control.stop_requested() is stop_preserved
