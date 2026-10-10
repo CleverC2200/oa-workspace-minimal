@@ -298,7 +298,7 @@ def verified_cycle_stop_no_write_failure(attempt_root: Path, state: dict) -> boo
             or "submit_started" in boundary["stages"]):
         return False
     try:
-        flow_engine._validate_frozen_review_inputs(
+        flow_engine.validate_frozen_review_inputs(
             attempt_root=attempt_root, state=state, workflow_key=state["workflow_key"],
         )
     except (OSError, KeyError, TypeError, ValueError):

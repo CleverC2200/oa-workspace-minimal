@@ -1173,7 +1173,7 @@ def validate_frozen_evidence(
     return material
 
 
-def _validate_frozen_review_inputs(
+def validate_frozen_review_inputs(
     *,
     attempt_root: Path,
     state: dict,
@@ -2853,7 +2853,7 @@ class FlowEngine:
                     "tpm_small_marketing_fee:3",
                 }:
                     validation_state = {**state, "rule_version": rule_version}
-                _validate_frozen_review_inputs(
+                validate_frozen_review_inputs(
                     attempt_root=attempt_root, state=validation_state,
                     workflow_key=state["workflow_key"],
                 )
@@ -3888,7 +3888,7 @@ class FlowEngine:
             if os.path.lexists(attempt_root / "writer-boundary.json"):
                 raise ValueError("recovery_not_safe")
             try:
-                _validate_frozen_review_inputs(
+                validate_frozen_review_inputs(
                     attempt_root=attempt_root,
                     state=state,
                     workflow_key=workflow_key,

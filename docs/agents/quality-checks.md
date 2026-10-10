@@ -24,3 +24,5 @@
 ## 实际模型只读回归
 
 需要验证 Worker 的业务判断时，按[通用费用实际模型回归](../runbooks/finance-native-replay.md)准备私有冻结材料，再显式调用原生 Worker 并闭合 preview。默认 CI 只运行该入口的离线行为测试，不调用模型，不把工程通过替代实际模型验收。
+
+同一 CLI 的 `--verify` 只读取既有原生回放和独立复核记录。逐项状态不符、独立业务复核拒绝或遗漏、绑定指纹不符及非原生记录均返回非零；原始模型结果保持业务未验收，不因生成校验报告改写。检查无法代替对原始证据和意见理由的独立判断。`test_native_replay.py` 在既有 pytest 与 CI 入口核验这些行为。[#425](https://github.com/CleverC2200/oa-workspace-minimal/issues/425) 留存真实历史错误及最终正确结果的只读拒绝/通过证明。
