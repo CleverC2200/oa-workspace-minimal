@@ -265,6 +265,60 @@ def test_travel_worker_preview_preserves_date_uncertainty_and_confirmed_anomalie
     assert "8月20日夏邑超出两份负责区域记录" in remark
 
 
+@pytest.mark.parametrize("hotel_address,actual_stay,status,conclusion,gaps", [
+    ("示例路29-6号", False, "uncertain", "9月22日考勤在示例市乙区，酒店地址仅有示例路29-6号，城市区县及实际入住待核。", ["9月22日酒店城市区县及实际入住"]),
+    ("示例市甲区示例路29-6号", False, "uncertain", "9月22日预订酒店在示例市甲区，考勤在示例市乙区，实际入住待核。", ["9月22日实际入住"]),
+    ("示例市甲区示例路29-6号", True, "fail", "9月22日实际住宿在示例市甲区，与示例市乙区考勤不一致。", []),
+])
+def test_travel_worker_delivers_address_boundary_and_preserves_verified_location_conflict(
+    tmp_path, monkeypatch, hotel_address, actual_stay, status, conclusion, gaps,
+):
+    from tests.finance_preaudit.test_flow_engine_submission import _material, _decision
+
+    project_root = tmp_path / "project"
+    relative_rule = Path(".agents/skills/oa-finance-preaudit/references/flows/travel-expense.md")
+    rule_file = project_root / relative_rule
+    rule_file.parent.mkdir(parents=True)
+    rule_file.write_text((Path(__file__).resolve().parents[2] / relative_rule).read_text())
+
+    def collect(request_id, _):
+        material = _material(request_id)
+        material["declared_fields"] = [{"path": "detail.hotel", "name": "酒店名称",
+                                       "value": "示例酒店（示例市甲区店）"}]
+        material["authority_facts"] = [
+            {"code": "recorded_hotel_address", "value": hotel_address},
+            {"code": "recorded_attendance_address", "value": "示例市乙区"},
+            {"code": "recorded_actual_stay", "value": "2026-09-22" if actual_stay else None},
+        ]
+        return material
+
+    engine = flow_engine.FlowEngine(
+        root=project_root / "runtime/finance_preaudit_flows",
+        discover_candidates=lambda key: [{"request_id": "synthetic-hotel-address", "workflow_key": key,
+                                          "received_at": "2026-10-10T09:00:00+08:00"}],
+        collect_material=collect,
+    )
+    action = engine.next_action("travel_expense", mode="preview")
+    action_file = Path(action["action_file"])
+    decision = _decision(action)
+    decision["overall"] = "needs_human"
+    decision["items"][3].update(status=status, conclusion=conclusion, missing_evidence=gaps)
+    prompts = _mock_final_output(monkeypatch, json.dumps(decision))
+    reviewed = codex_review_worker.review({"project_root": str(project_root),
+                                          "action_file": str(action_file), "timeout_seconds": 60})
+    # Offline policy delivery only. Model geography must be checked against source facts separately.
+    assert str(relative_rule).removeprefix(".agents/skills/oa-finance-preaudit/") in prompts[0]
+    assert "城市、区县中缺失的行政层级保持未知" in rule_file.read_text()
+    assert "地理常识" in rule_file.read_text()
+    assert reviewed["status"] == "reviewed"
+    decision_file = tmp_path / "hotel-decision.json"
+    json_artifact.write_json_atomic(decision_file, reviewed["decision"])
+    closed = engine.complete_review(action_file, decision_file)
+    assert closed["business_state"] == "needs_human"
+    assert closed["write_state"] == "not_requested"
+    assert conclusion in Path(closed["remark_file"]).read_text()
+
+
 @pytest.mark.parametrize("raw", [
     '说明\n```json\n{}\n```',
     '{}\n```json\n{}\n```',
