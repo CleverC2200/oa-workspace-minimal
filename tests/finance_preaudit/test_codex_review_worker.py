@@ -455,14 +455,21 @@ def test_mixed_general_review_loads_subject_requirements_and_keeps_real_gap(
 
 
 
-@pytest.mark.parametrize("gap,amount_status,amount_conclusion", [
-    ("附加服务费的金额与订单共享关系待核，已确认付款及退款事实保留。", "uncertain", "已确认付款及退款事实保留，费用对应关系未核实，整单核销上限待核。"),
-    ("实际第三方收款者与当前费用及发票销售方的对应关系待核，已确认支付成功事实保留。", "uncertain", "已确认付款事实保留，费用对应关系未核实，整单核销上限待核。"),
-    ("定位照片未读取，费用与付款及发票的金额对应关系已确认。", "pass", "整单核销金额为100.00元。"),
+@pytest.mark.parametrize("gap,attachment_missing,amount_status,amount_conclusion,amount_missing", [
+    ("附加服务费的金额与订单共享关系待核，已确认付款及退款事实保留。",
+     ["附加服务费的金额与订单共享关系"], "uncertain",
+     "已确认付款及退款事实保留，费用对应关系未核实，整单核销上限待核。",
+     ["附加服务费的同范围金额对应关系"]),
+    ("实际第三方收款者与当前费用及发票销售方的对应关系待核，已确认支付成功事实保留。",
+     ["实际第三方收款者与当前费用及发票销售方的对应关系"], "uncertain",
+     "已确认付款事实保留，费用对应关系未核实，整单核销上限待核。",
+     ["第三方付款的费用及发票对应关系"]),
+    ("定位照片未读取，费用与付款及发票的金额对应关系已确认。",
+     ["定位照片"], "pass", "整单核销金额为100.00元。", []),
 ])
 def test_general_review_preserves_payment_facts_without_closing_expense_relations(
-    tmp_path: Path, monkeypatch, gap: str, amount_status: str,
-    amount_conclusion: str,
+    tmp_path: Path, monkeypatch, gap: str, attachment_missing: list[str],
+    amount_status: str, amount_conclusion: str, amount_missing: list[str],
 ) -> None:
     from tests.finance_preaudit.test_flow_engine_general_expense import _material
 
@@ -490,11 +497,10 @@ def test_general_review_preserves_payment_facts_without_closing_expense_relation
             {"item_key": key, "status": status, "conclusion": conclusion,
              "evidence_refs": ["material:declared_fields"], "missing_evidence": missing}
             for key, status, conclusion, missing in (
-                ("attachment_payment_evidence", "uncertain", gap, ["当前费用与本笔付款的对应关系"]),
+                ("attachment_payment_evidence", "uncertain", gap, attachment_missing),
                 ("invoice_linkage", "pass", "发票已关联。", []),
                 ("budget", "pass", "当前阶段按既定策略暂不校验部门年度预算。", []),
-                ("reimbursable_minimum", amount_status, amount_conclusion,
-                 ["同范围金额对应关系"] if amount_status == "uncertain" else []),
+                ("reimbursable_minimum", amount_status, amount_conclusion, amount_missing),
                 ("payment_company_consistency", "pass", "报销公司、支付公司、购买方三者一致，应选择示例有限公司支付。", []),
             )
         ],
