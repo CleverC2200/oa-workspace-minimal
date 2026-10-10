@@ -347,6 +347,43 @@ def test_full_financial_cohort_keeps_original_twenty_and_extra_control_separate(
     assert result['new_model_starts'] == result['new_oa_writes'] == 0
 
 
+def test_scope_source_quality_and_budget_share_one_complete_validation_per_archive(completed_twenty, monkeypatch):
+    from collections import Counter
+    from apps.oa_finance_preaudit.review_comparison import _parent_budget
+
+    caller, request = completed_twenty
+    reads = Counter()
+    build = batch.build_report
+
+    def counted(root):
+        reads[Path(root)] += 1
+        return build(root)
+
+    monkeypatch.setattr(batch, "build_report", counted)
+    verified = batch._VerifiedReports()
+    scope = caller.verify_scope(request["scope"], verified=verified)
+    caller._candidate_sources(scope, verified=verified)
+    caller._previous_quality(scope, scope["cases"][-1], verified=verified)
+    budget = _parent_budget(caller.authority_for(request["scope"], request["authority"]),
+                            scope, request["scope"], verified=verified)
+
+    # Twenty pairs plus one retained source control, with three reused sides.
+    assert len(reads) == 41
+    assert set(reads.values()) == {1}
+    assert budget["phase_cli_starts"] == 37
+    assert budget["global_cli_starts"] == 41
+    assert budget["diagnostic_cli_starts"] == 4
+
+    # A separate final qualification operation must revalidate all archives,
+    # then share that new reader through both financial cohort projections.
+    reads.clear()
+    result = caller.final_financial_qualification(request)
+    assert result["financial_twenty_complete"] is True
+    assert result["financial_qualification"] is True
+    assert len(reads) == 41
+    assert set(reads.values()) == {1}
+
+
 def changed_final_request(tmp_path, original_request, scope):
     request = copy.deepcopy(original_request)
     path = tmp_path / 'scope.json'

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 from pathlib import Path
 import re
@@ -276,9 +277,48 @@ def _event_body(path: Path) -> object:
         return None
 
 
+def check_review_process(root: Path = PROJECT_ROOT) -> list[str]:
+    """Reject the two historical ways of bypassing review evidence ownership."""
+    findings = []
+    for name, kind, owner_name in (
+            ("apps/oa_finance_preaudit/review_comparison.py", ast.ClassDef, "_ComparisonCaller"),
+            ("apps/oa_finance_preaudit/review_references.py", ast.FunctionDef, "original_record")):
+        tree = ast.parse((root / name).read_text(encoding="utf-8"))
+        for owner in tree.body:
+            if not isinstance(owner, kind) or owner.name != owner_name:
+                continue
+            for node in ast.walk(owner):
+                if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "batch" and node.func.attr == "build_report"):
+                    findings.append(f"review_report_bypass:{name}:{node.lineno}: "
+                                    "use the operation's _VerifiedReports.read")
+                if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "flow_evals" and node.func.attr == "build_financial_quality_report"
+                        and not any(key.arg == "verified" for key in node.keywords)):
+                    findings.append(f"review_quality_reader_missing:{name}:{node.lineno}: "
+                                    "pass the operation's verified reader to build_financial_quality_report")
+    host = "scripts/review_experiment_host.py"
+    tree = ast.parse((root / host).read_text(encoding="utf-8"))
+    for mapping in ast.walk(tree):
+        if not isinstance(mapping, ast.Dict):
+            continue
+        for key, value in zip(mapping.keys, mapping.values):
+            if not isinstance(key, ast.Constant) or key.value != "output_files":
+                continue
+            if any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                   and isinstance(node.func.value, ast.Name)
+                   and node.func.value.id == "audit" and node.func.attr == "rglob"
+                   for node in ast.walk(value)):
+                findings.append(f"review_output_recursive:{host}:{value.lineno}: "
+                                "use review_archive_outputs.evidence_paths; do not bind runtime caches")
+    return findings
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="repository-quality")
-    parser.add_argument("check", choices=("skill", "hygiene", "format", "links", "pr", "yaml", "schema", "lint", "environment", "production-config", "native-contract"))
+    parser.add_argument("check", choices=("skill", "hygiene", "format", "links", "pr", "yaml", "schema", "lint", "environment", "production-config", "native-contract", "review-process"))
     parser.add_argument("--event", type=Path)
     parser.add_argument("--record", type=Path)
     parser.add_argument("--reuse", action='store_true')
@@ -312,6 +352,8 @@ def main(argv: list[str] | None = None) -> int:
     elif args.check == "production-config":
         from apps.oa_finance_preaudit.production_config import repository_findings
         findings = repository_findings(PROJECT_ROOT)
+    elif args.check == "review-process":
+        findings = check_review_process()
     elif args.check == "lint":
         return subprocess.call([sys.executable, '-m', 'ruff', 'check', 'apps', 'scripts', 'tests'], cwd=PROJECT_ROOT)
     else:

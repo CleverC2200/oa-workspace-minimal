@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from apps.oa_finance_preaudit import flow_evals
+from apps.oa_finance_preaudit import flow_evals, review_batch_report as batch
 from tests.finance_preaudit.test_financial_quality_assessment import _artifact, _original_history, _scene_reviews
 from tests.finance_preaudit.source_review_fixture import source_review
 from tests.finance_preaudit.test_candidate_phase import phase_source, phase, invoke, ref  # noqa: F401
@@ -235,7 +235,7 @@ def test_pending_final_side_rechecks_original_review_before_any_start(tmp_path, 
     caller = _ComparisonCaller.__new__(_ComparisonCaller)
 
     with pytest.raises(ValueError, match="financial_source_review_required"):
-        caller._side_expectations(row, plan, "candidate")
+        caller._side_expectations(row, plan, "candidate", verified=batch._VerifiedReports())
 
     assert not (Path(plan["arms"]["candidate"]) / "cli-start.json").exists()
     assert not (Path(plan["arms"]["candidate"]) / "started.json").exists()

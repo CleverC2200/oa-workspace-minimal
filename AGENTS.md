@@ -46,6 +46,7 @@
 | 约束 | 执行机制与回归入口 |
 | --- | --- |
 | 新档案只绑定本次调用证据，运行缓存不成为永久证据；旧档案保留原合同。 | `review_archive_outputs.evidence_paths` 统一选取；`review_batch_report` 核对集合与哈希；[归档范围回归](tests/finance_preaudit/test_review_archive_outputs.py)拒绝旧的递归绑定写法。 |
+| 同次操作的档案报告共用已核验结果；实际启动回执变化后先丢弃旧结果，再核验范围。 | `_ComparisonCaller` 共用 `_VerifiedReports`，执行后重建读取器；`python -m scripts.quality review-process` 在本地及 CI 拒绝直接重建、质量接线漏传读取器和宿主递归绑定；[检查反例](tests/finance_preaudit/test_quality_gates.py)、[完整质量路径复用](tests/finance_preaudit/test_readonly_comparison_start.py)、[执行后重验](tests/finance_preaudit/test_comparison_dispatch.py)。 |
 | 新启动前，四项事实的预期须独立核对原材料并提前冻结。 | `freeze_financial_expectations` 与 `_ComparisonCaller._side_expectations` 核对来源、覆盖和时序；[原材料核对回归](tests/finance_preaudit/test_original_fact_review.py)。脚本不替代业务判断。 |
 | 失败停止、已启动侧不重试、额度沿原回执累计；验收关闭不授予下一轮运行。 | 原停止记录、`_same_source_attempt`、`_counted_sides` 和 `_parent_budget`；[派发回归](tests/finance_preaudit/test_comparison_dispatch.py)、[停止资格回归](tests/finance_preaudit/test_readonly_comparison_start.py)。新修订或额度仍须明确授权。 |
 

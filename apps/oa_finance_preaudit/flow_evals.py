@@ -1243,7 +1243,7 @@ def _expectations_timing(freeze: dict | None, checklist_sha256: str, start: dict
             else {"status": "unverified", "reason": "frozen_after_replay_start"})
 
 
-def build_financial_quality_report(reviews: object) -> dict:
+def build_financial_quality_report(reviews: object, *, verified=None) -> dict:
     """Bind independent manual claim checks to original evidence and consumed output.
 
     This reads assessments; it does not infer financial truth from model text.
@@ -1300,7 +1300,7 @@ def build_financial_quality_report(reviews: object) -> dict:
             raise ValueError("financial_review_invalid")
         failed = [check["id"] for check in checked if check["outcome"] == "fail"]
         unknown = [check["id"] for check in checked if check["outcome"] == "unverified"]
-        binding = _financial_replay_binding(review, checklist, assessment)
+        binding = _financial_replay_binding(review, checklist, assessment, verified=verified)
         confirmed = False
         if review.get("confirmation") is not None:
             record = _read_bound_artifact(review["confirmation"])

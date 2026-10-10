@@ -347,7 +347,7 @@ def test_baseline_next_pair_requires_complete_independent_audit(tmp_path, phase_
         'checklist': baseline_checklist, 'expectations': baseline_expectations})
     row.update(baseline_checklist=baseline_checklist, baseline_expectations=baseline_expectations)
 
-    actual = _ComparisonCaller._baseline_quality(row, path, report)
+    actual = _ComparisonCaller._baseline_quality(row, path, report, verified=batch._VerifiedReports())
 
     assert actual['status'] == expected
     assert actual.get('audit_complete') is (role == 'historical_crosscheck')
@@ -572,3 +572,71 @@ def test_thin_caller_reports_all_missing_gates_without_native_or_financial_forge
     assert len(result['checks']) == 8
     assert result['checks']['dispatch_wiring']['status'] == 'verified'
     assert not (tmp_path / 'candidate-phase-claim.private.json').exists()
+
+
+def test_caller_discards_pre_execution_reports_before_scope_revalidation(tmp_path, monkeypatch):
+    """Only the execution transition is simulated; archived-byte validation is real."""
+    from contextlib import nullcontext
+    from apps.oa_finance_preaudit import review_batch_report as batch, review_comparison as comparison
+    from tests.finance_preaudit.test_review_batch_report import archive
+
+    root = archive(tmp_path)
+    path = tmp_path / "plan.json"
+    prepared = dict(conditions={}, delivery={}, input_sha256="neutral", source_snapshot_sha256="neutral")
+    fixtures.save(path, {"arms": {"baseline": str(tmp_path / "unstarted")},
+                         "preparations": {"baseline": prepared}})
+    scope_file = tmp_path / "scope.json"
+    scope = {"cases": [{"alias": "neutral", "plan": ref(path)}]}
+    fixtures.save(scope_file, scope)
+    authority_file = tmp_path / "authority.json"
+    fixtures.save(authority_file, {"purpose": "simulated transition only"})
+    request = {"alias": "neutral", "scope": ref(scope_file), "authority": ref(authority_file)}
+    selection = {"pending_arms": ["baseline"]}
+    starts, readers = set(), []
+    caller = comparison._ComparisonCaller.__new__(comparison._ComparisonCaller)
+    caller._source_host_file = None
+
+    def verify_scope(_reference, *, verified):
+        readers.append(verified)
+        assert verified.read(root)["usage"]["total_tokens"] == 15
+        return scope
+
+    # Other gates have their own binding regressions; this fixture cannot dispatch.
+    monkeypatch.setattr(caller, "authority_for", lambda *_args: {"parent_cumulative_authority": {}})
+    monkeypatch.setattr(caller, "verify_scope", verify_scope)
+    monkeypatch.setattr(caller, "selected_pair", lambda _row, **_kw: selection)
+    monkeypatch.setattr(caller, "readonly_start_ready", lambda *_args, **_kw: {})
+    monkeypatch.setattr(caller, "_budget", lambda *_args, **_kw: {})
+    for name in ("_candidate_sources", "_previous_quality", "_same_source_attempt", "native_ready"):
+        monkeypatch.setattr(caller, name, lambda *_args, **_kw: None)
+    monkeypatch.setattr(e, "_candidate_parent_lock", lambda _ref: nullcontext())
+    monkeypatch.setattr(e, "_claim_candidate_phase", lambda *_args: None)
+    monkeypatch.setattr(e, "_host", lambda *_args, **_kw: prepared)
+    monkeypatch.setattr(comparison, "_require_reviewer_authentication", lambda *_args: None)
+    monkeypatch.setattr(comparison, "_counted_sides", lambda _scope: starts.copy())
+
+    def execution(_plan, _selection, _authority, *, revalidate, **_kw):
+        revalidate()
+        starts.add((str(path), ref(path)["sha256"], "baseline"))
+        (root / "calling-source/apps/example.py").write_text("changed after simulated execution")
+        try:
+            revalidate()
+        except ValueError as error:
+            return {"status": "stopped", "reason": str(error), "new_cli_starts": 1}
+        return {"status": "awaiting_independent_assessment", "new_cli_starts": 1}
+
+    def final_budget(_authority, _scope, _ref, *, verified):
+        verified.read(root)
+        return {"global_cli_starts": 1}
+
+    monkeypatch.setattr(comparison, "_execute_pending_pair", execution)
+    monkeypatch.setattr(comparison, "_parent_budget", final_budget)
+
+    result = caller.validate_or_run(request, run=True)
+
+    assert result["status"] == "stopped" and result["reason"] == "review_archive_invalid"
+    assert result["new_cli_starts"] == 1
+    assert result["budget"] == {"status": "unverified", "global_cli_starts": "unknown"}
+    assert readers[:3] == [readers[0]] * 3
+    assert readers[-1] is not readers[0]
+    assert json.loads((tmp_path / "batch-stop.private.json").read_text())["reason"] == "review_archive_invalid"

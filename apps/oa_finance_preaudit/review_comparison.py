@@ -316,7 +316,7 @@ class _ComparisonCaller:
         if self._source_host_ref is not None:
             _read_bound_artifact(self._source_host_ref, document=False)
 
-    def _side_expectations(self, row, plan, arm):
+    def _side_expectations(self, row, plan, arm, *, verified):
         """Every final side has its original independent, pre-run four facts."""
         checklist_ref = row['checklist' if arm == 'candidate' else 'baseline_checklist']
         freeze_ref = row['expectations' if arm == 'candidate' else 'baseline_expectations']
@@ -356,9 +356,9 @@ class _ComparisonCaller:
         if reused is not None:
             _need(reused['checklist'] == checklist_ref and reused['freeze'] == freeze_ref,
                   'reused_expectations_not_original')
-            self.adapter.match_target(row['plan'], arm, reused, row.get('snapshot_audit'))
+            self.adapter.match_target(row['plan'], arm, reused, row.get('snapshot_audit'), verified=verified)
         elif (root / 'result.json').exists():
-            report = batch.build_report(root)
+            report = verified.read(root)
             _need(flow_evals._expectations_timing(freeze, checklist_ref['sha256'],
                                                 report['timing']['start_receipt'])['status'] == 'verified',
                   'final_expectations_not_frozen_before_dispatch')
@@ -372,7 +372,8 @@ class _ComparisonCaller:
             flow_evals._validate_source_review(freeze.get('source_review'), checklist_ref,
                                               checklist, freeze['frozen_at'])
 
-    def verify_scope(self, scope_ref):
+    def verify_scope(self, scope_ref, *, verified=None):
+        verified = verified if verified is not None else batch._VerifiedReports()
         scope = _read(scope_ref)
         _need(self.adapter.sha(Path(self.identity_bank['file'])) == self.identity_bank['sha256'], 'identity_bank_changed')
         _need(scope['identity_bank'] == {'file': str(Path(self.identity_bank['file'])), 'sha256': self.identity_bank['sha256']}, 'identity_bank_unbound')
@@ -415,7 +416,7 @@ class _ComparisonCaller:
                 _need(material['request_id'] == original['request_id']
                       and material['workflow_key'] == original['workflow_key'] == 'business_entertainment',
                       'case_identity_changed')
-                self._side_expectations(row, plan, arm)
+                self._side_expectations(row, plan, arm, verified=verified)
         return scope
 
     def source_quality(self, request, scope, *, verified=None):
@@ -495,9 +496,10 @@ class _ComparisonCaller:
 
     def qualified_source(self, request, scope, *, verified=None):
         """Legacy full-cohort qualification remains distinct from readonly admission."""
+        verified = verified if verified is not None else batch._VerifiedReports()
         self.readonly_start_ready(request, scope, verified=verified)
         self.full_source_qualification(request)
-        self._candidate_sources(scope)
+        self._candidate_sources(scope, verified=verified)
 
     def readonly_start_ready(self, request, scope, *, verified=None):
         """Validate the entire frozen control phase, without granting cohort eligibility."""
@@ -506,7 +508,7 @@ class _ComparisonCaller:
         return {'status': 'readonly_start_ready', 'source_reported_eligible': quality['eligible'],
                 'financial_qualification': False, 'new_model_starts': 0, 'new_oa_writes': 0}
 
-    def _candidate_sources(self, scope):
+    def _candidate_sources(self, scope, *, verified):
         # QA records bind original immutable source. New caller/report optimizations
         # cannot silently make old source-host bytes interchangeable with new bytes.
         for row, _path, plan in _pair_rows(scope):
@@ -517,13 +519,14 @@ class _ComparisonCaller:
             if (candidate / 'result.json').exists():
                 # Consumption legitimately changes state/observability inputs.
                 # Preserve the original manifest and verify actual correspondence.
-                _terminal(plan, 'candidate', batch.build_report(candidate))
+                _terminal(plan, 'candidate', verified.read(candidate))
             else:
                 _unowned(plan, 'candidate')
                 e._verify_sources(candidate, Path(plan['repository']))
 
-    def selected_pair(self, row):
-        return self.adapter.prepare_pair(row['plan'], row.get('reuse', {}), row.get('snapshot_audit'))
+    def selected_pair(self, row, *, verified=None):
+        return self.adapter.prepare_pair(row['plan'], row.get('reuse', {}), row.get('snapshot_audit'),
+                                         verified=verified)
 
     def authority_for(self, scope_ref, authority_ref):
         self._verify_runtime()
@@ -593,7 +596,8 @@ class _ComparisonCaller:
             reused = row.get('reuse', {})
             for arm in ARMS:
                 if arm in reused:
-                    self.adapter.match_target(row['plan'], arm, reused[arm], row.get('snapshot_audit'))
+                    self.adapter.match_target(row['plan'], arm, reused[arm], row.get('snapshot_audit'),
+                                              verified=verified)
                     continue
                 _need(_side_count(path, plan, arm) == 1, 'previous_case_not_observed')
                 report = verified.read(Path(plan['arms'][arm]))
@@ -601,7 +605,7 @@ class _ComparisonCaller:
                 if arm == 'candidate':
                     quality = e._candidate_phase_quality(row, path, report, verified=verified)
                 else:
-                    quality = self._baseline_quality(row, path, report)
+                    quality = self._baseline_quality(row, path, report, verified=verified)
                 if arm == 'candidate':
                     _need(quality['status'] == 'pass', 'previous_quality_' + quality['status'])
                 else:
@@ -617,7 +621,7 @@ class _ComparisonCaller:
         raise ValueError('scope_case_not_found')
 
     @staticmethod
-    def _baseline_quality(row, path, report):
+    def _baseline_quality(row, path, report, *, verified):
         """Baseline has its own original rule/checklist and consumed output binding."""
         from . import flow_evals
         binding_file = path.parent / 'baseline-audit-binding.private.json'
@@ -632,7 +636,7 @@ class _ComparisonCaller:
             'item_key': report['financial_binding']['item_key'],
             'archive': _ref(Path(_read(row['plan'])['arms']['baseline']) / 'manifest.json'),
             'checklist': refs['checklist'], 'assessment': refs['assessment'],
-            'expectations': refs['expectations']}])
+            'expectations': refs['expectations']}], verified=verified)
         _need(saved == rebuilt, 'baseline_quality_projection_changed')
         case = saved['cases'][0]
         complete = (case['binding_status'] == 'verified_consumed_correspondence'
@@ -666,17 +670,17 @@ class _ComparisonCaller:
         authority = self.authority_for(request['scope'], request['authority'])
         progress = {'phase_claim_written': False, 'new_cli_starts': 0}
         with e._candidate_parent_lock(authority['parent_cumulative_authority']):
-            scope = self.verify_scope(request['scope'])
+            verified = batch._VerifiedReports()
+            scope = self.verify_scope(request['scope'], verified=verified)
             row = next((row for row in scope['cases'] if row['alias'] == request['alias']), None)
             _need(row is not None, 'scope_case_not_found')
             stop_file = Path(request['scope']['file']).parent / 'batch-stop.private.json'
             _need(not stop_file.exists(), 'phase_already_stopped')
-            selection = self.selected_pair(row)
+            selection = self.selected_pair(row, verified=verified)
             pending = selection['pending_arms']
             _need(pending, 'pair_already_observed_no_retry')
-            verified = batch._VerifiedReports()
             source_ready = self.readonly_start_ready(request, scope, verified=verified)
-            self._candidate_sources(scope)
+            self._candidate_sources(scope, verified=verified)
             try:
                 self._previous_quality(scope, row, verified=verified)
             except ValueError as error:
@@ -705,7 +709,7 @@ class _ComparisonCaller:
             _require_reviewer_authentication(row['plan'], pending)
             scope_file, authority_file = Path(request['scope']['file']), Path(request['authority']['file'])
             self.authority_for(request['scope'], request['authority'])
-            self.verify_scope(request['scope'])
+            self.verify_scope(request['scope'], verified=verified)
             claim_file = scope_file.parent / 'candidate-phase-claim.private.json'
             existed = claim_file.exists()
             try:
@@ -723,11 +727,13 @@ class _ComparisonCaller:
                 nonlocal operation_starts, operation_reports, preflight_seconds
                 recheck_started = time.monotonic()
                 current_authority = self.authority_for(request['scope'], request['authority'])
-                current_scope = self.verify_scope(request['scope'])
-                observed = _counted_sides(current_scope)
+                # Count fresh receipts first so scope verification cannot reuse
+                # a pre-execution report after a new Native start.
+                observed = _counted_sides(_read(request['scope']))
                 if observed != operation_starts:
                     operation_reports = batch._VerifiedReports()
                     operation_starts = observed
+                current_scope = self.verify_scope(request['scope'], verified=operation_reports)
                 self.readonly_start_ready(request, current_scope, verified=operation_reports)
                 current_plan = _read(row['plan'])
                 remaining = sum(_side_count(plan_file, current_plan, arm) == 0 for arm in pending)
@@ -763,7 +769,7 @@ class _ComparisonCaller:
         selected = None
 
         def scope():
-            return self.verify_scope(request['scope'])
+            return self.verify_scope(request['scope'], verified=verified)
 
         def authority():
             return self.authority_for(request['scope'], request['authority'])
@@ -776,14 +782,14 @@ class _ComparisonCaller:
         def selection():
             nonlocal selected
             if selected is None:
-                selected = self.selected_pair(row())
+                selected = self.selected_pair(row(), verified=verified)
             _need(selected['pending_arms'], 'pair_already_observed_no_retry')
             return copy.deepcopy(selected)
 
         def source_quality():
             target = _read(request['scope']) if request.get('scope') else _read(request['prerequisites']['source_scope'])
             self.readonly_start_ready(request, target, verified=verified)
-            self._candidate_sources(target)
+            self._candidate_sources(target, verified=verified)
 
         checks = {
             'scope': scope, 'authority': authority, 'source_quality': source_quality,
@@ -812,10 +818,10 @@ class _ComparisonCaller:
         """
         authority = self.authority_for(request['scope'], request['authority'])
         with e._candidate_parent_lock(authority['parent_cumulative_authority']):
-            scope = self.verify_scope(request['scope'])
+            verified = batch._VerifiedReports()
+            scope = self.verify_scope(request['scope'], verified=verified)
             _need(not (Path(request['scope']['file']).parent / 'batch-stop.private.json').exists(),
                   'phase_already_stopped')
-            verified = batch._VerifiedReports()
             self.readonly_start_ready(request, scope, verified=verified)
             reviews, baseline_outcomes = {}, []
             for row, path, plan in _pair_rows(scope):
@@ -823,13 +829,14 @@ class _ComparisonCaller:
                     root = Path(plan['arms'][arm])
                     reused = row.get('reuse', {}).get(arm)
                     if reused is not None:
-                        self.adapter.match_target(row['plan'], arm, reused, row.get('snapshot_audit'))
+                        self.adapter.match_target(row['plan'], arm, reused, row.get('snapshot_audit'),
+                                                  verified=verified)
                     else:
                         _need(_side_count(path, plan, arm) == 1, 'final_twenty_incomplete')
                     report = verified.read(root)
                     _terminal(plan, arm, report)
                     if arm == 'baseline':
-                        quality = self._baseline_quality(row, path, report)
+                        quality = self._baseline_quality(row, path, report, verified=verified)
                         scoped_unknown = (quality['status'] == 'unverified'
                                           and quality.get('comparison_audit') == 'verified_business_scope_unknown')
                         _need(quality.get('audit_complete') is True
@@ -850,7 +857,7 @@ class _ComparisonCaller:
                           'final_candidate_identity_or_source_invalid')
                     reviews[case['item_key']] = {'item_key': case['item_key'], 'archive': _ref(root / 'manifest.json'),
                         'checklist': row['checklist'], 'assessment': audit['assessment'], 'expectations': row['expectations']}
-            twenty = flow_evals.build_financial_quality_report(list(reviews.values()))
+            twenty = flow_evals.build_financial_quality_report(list(reviews.values()), verified=verified)
             source_scope = _read(request['prerequisites']['source_scope'])
             additional = []
             for row, path, plan in _pair_rows(source_scope):
@@ -864,7 +871,7 @@ class _ComparisonCaller:
                 else:
                     reviews[case['item_key']] = review
                     additional.append(row['alias'])
-            cohort = flow_evals.build_financial_quality_report(list(reviews.values()))
+            cohort = flow_evals.build_financial_quality_report(list(reviews.values()), verified=verified)
             budget = self._budget(authority, scope, request, 0, verified=verified)
             qualified = cohort['eligible'] is True and not cohort['missing_entertainment_scenarios']
             return {'status': 'financial_control_cohort_qualified' if qualified else 'financial_cohort_ineligible',

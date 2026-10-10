@@ -26,6 +26,8 @@ jobs:
         run: python -m scripts.quality environment
       - name: Production review configuration contract
         run: python -m scripts.quality production-config
+      - name: Review evidence ownership and report reuse
+        run: python -m scripts.quality review-process
       - name: Skill validation
         run: python -m scripts.quality skill
       - name: Text format

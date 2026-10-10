@@ -95,8 +95,9 @@ def _reasoning_receipts(root, usage, raw_usage):
             'reference_reasoning_usage_invalid')
 
 
-def original_record(refs):
+def original_record(refs, *, verified=None):
     """Mechanically validate one fully audited consumed original, never rescore it."""
+    verified = verified if verified is not None else batch._VerifiedReports()
     plan = bound(refs["plan"])
     arm = refs["arm"]
     require(arm in ("baseline", "candidate"), "reference_arm_invalid")
@@ -120,7 +121,7 @@ def original_record(refs):
     saved = bound(refs["report"])
     if refs.get("report_field") is not None:
         saved = saved[refs["report_field"]]
-    rebuilt = batch.build_report(root)
+    rebuilt = verified.read(root)
     require(saved == rebuilt, "original_report_projection_changed")
     require(saved["source"]["revision"] == manifest["source_revision"]
             == plan["source_revisions"][arm], "reference_source_mismatch")
@@ -178,7 +179,7 @@ def original_record(refs):
             "item_key": case["item_key"], "archive": manifest_ref,
             "checklist": refs["checklist"], "assessment": refs["assessment"],
             "expectations": refs["freeze"],
-        }])
+        }], verified=verified)
         require(quality == rebuilt, "original_quality_projection_changed")
         require(case["historical_crosscheck"] == freeze["historical_crosscheck"] == "conflict"
                 and case["history_scope_resolution"]["status"] == "explained_scope_difference"
@@ -206,7 +207,7 @@ def original_record(refs):
     require(case["complete_review_scope"] is True and case["result_audit_complete"] is True
             and case["source_kind"] == "real_archive", "reference_scope_incomplete")
     replay = flow_evals._financial_replay_binding(
-        {"item_key": case["item_key"], "archive": manifest_ref}, checklist, assessment)
+        {"item_key": case["item_key"], "archive": manifest_ref}, checklist, assessment, verified=verified)
     require(replay["status"] == "verified_consumed_correspondence",
             "reference_assessment_consumption_mismatch")
     return {"refs": refs, "plan": plan, "arm": arm, "archive": str(root),
@@ -215,9 +216,9 @@ def original_record(refs):
             "quality_case": case, "reported_eligible": quality["eligible"]}
 
 
-def match_target(target_plan_ref, arm, refs, snapshot_audit_ref=None):
+def match_target(target_plan_ref, arm, refs, snapshot_audit_ref=None, *, verified=None):
     target = bound(target_plan_ref)
-    record = original_record(refs)
+    record = original_record(refs, verified=verified)
     original = record["plan"]
     target_root = Path(target["arms"][arm])
     target_manifest_ref = reference(target_root / "manifest.json")
@@ -305,13 +306,14 @@ def match_target(target_plan_ref, arm, refs, snapshot_audit_ref=None):
             "snapshot_difference": delta, "new_starts": 0, "new_consumption": False}
 
 
-def prepare_pair(target_plan_ref, reused_arms, snapshot_audit_ref=None):
+def prepare_pair(target_plan_ref, reused_arms, snapshot_audit_ref=None, *, verified=None):
     """Original archives are refs, never copied into the target arm."""
+    verified = verified if verified is not None else batch._VerifiedReports()
     plan = bound(target_plan_ref)
     require(set(plan["arms"]) == {"baseline", "candidate"}, "target_pair_invalid")
     require(plan["oa_write_authorized"] is False, "target_write_authorized")
     require(set(reused_arms) <= set(plan["arms"]), "reuse_arm_invalid")
-    reused = {arm: match_target(target_plan_ref, arm, refs, snapshot_audit_ref)
+    reused = {arm: match_target(target_plan_ref, arm, refs, snapshot_audit_ref, verified=verified)
               for arm, refs in reused_arms.items()}
     pending = [arm for arm in ("baseline", "candidate") if arm not in reused]
     for arm in pending:
