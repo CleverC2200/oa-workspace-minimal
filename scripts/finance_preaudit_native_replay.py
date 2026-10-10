@@ -117,7 +117,7 @@ def prepare(args):
         source_manifest.append({'path': name, 'sha256': digest(p)})
     root = project / 'runtime' / 'finance_preaudit_flows'
     engine = engine_for(root, material, original)
-    action = engine.next_action('general_expense', mode='preview')
+    action = engine.next_action(state['workflow_key'], mode='preview')
     if action.get('action') != 'review_required' or action.get('write_authorized') is not False or action.get('mode') != 'preview':
         dump(audit / 'prepare-failure.json', action)
         raise RuntimeError('preview_preparation_failed:' + str(action.get('reason')))

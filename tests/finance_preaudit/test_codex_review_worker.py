@@ -207,6 +207,64 @@ def test_finance_reviewer_consumes_single_json_fence(tmp_path, monkeypatch, wrap
     assert closed["write_state"] == "not_requested"
 
 
+@pytest.mark.parametrize("period_status,period_conclusion,period_gap", [
+    ("uncertain", "申报周期8月21日至9月30日，8月20日预订住宿早于周期，实际入住待核实。", ["8月20日实际入住证据"]),
+    ("fail", "申报周期8月21日至9月30日，已核实8月20日实际入住，超出周期。", []),
+])
+def test_travel_worker_preview_preserves_date_uncertainty_and_confirmed_anomalies(
+    tmp_path, monkeypatch, period_status, period_conclusion, period_gap,
+):
+    from tests.finance_preaudit.test_flow_engine_submission import _material, _decision
+
+    project_root = tmp_path / "project"
+    relative_rule = Path(".agents/skills/oa-finance-preaudit/references/flows/travel-expense.md")
+    rule_file = project_root / relative_rule
+    rule_file.parent.mkdir(parents=True)
+    rule_file.write_text((Path(__file__).resolve().parents[2] / relative_rule).read_text())
+
+    def collect(request_id, _):
+        material = _material(request_id)
+        material["declared_fields"] = [
+            {"path": "main.period", "name": "申报周期", "value": "2026-08-21至2026-09-30"},
+            {"path": "detail.hotel", "name": "预订住宿", "value": "2026-08-20至2026-08-21"},
+        ]
+        material["authority_facts"] = [{
+            "code": "recorded_hotel_checkin", "value": "2026-08-20" if period_status == "fail" else None,
+        }]
+        return material
+
+    engine = flow_engine.FlowEngine(
+        root=project_root / "runtime/finance_preaudit_flows",
+        discover_candidates=lambda key: [{"request_id": "synthetic-travel-period", "workflow_key": key,
+                                          "received_at": "2026-10-10T09:00:00+08:00"}],
+        collect_material=collect,
+    )
+    action = engine.next_action("travel_expense", mode="preview")
+    action_file = Path(action["action_file"])
+    decision = _decision(action)
+    decision["overall"] = "needs_human"
+    decision["items"][0].update(status=period_status, conclusion=period_conclusion, missing_evidence=period_gap)
+    decision["items"][4].update(status="fail", conclusion="8月20日夏邑超出两份负责区域记录。")
+
+    prompts = _mock_final_output(monkeypatch, json.dumps(decision))
+    reviewed = codex_review_worker.review({"project_root": str(project_root),
+                                          "action_file": str(action_file), "timeout_seconds": 60})
+    # Rule delivery and closure only; the real model must independently classify the dates.
+    assert "仅有申报或预订住宿日期" in rule_file.read_text()
+    assert "实际入住未确认" in rule_file.read_text()
+    assert "差旅异常或待核事项的日期、地点不受精简限制" in prompts[0]
+    assert reviewed["status"] == "reviewed"
+    assert reviewed["decision"] == decision
+    decision_file = tmp_path / "travel-decision.json"
+    json_artifact.write_json_atomic(decision_file, reviewed["decision"])
+    closed = engine.complete_review(action_file, decision_file)
+    assert closed["business_state"] == "needs_human"
+    assert closed["write_state"] == "not_requested"
+    remark = Path(closed["remark_file"]).read_text()
+    assert period_conclusion in remark
+    assert "8月20日夏邑超出两份负责区域记录" in remark
+
+
 @pytest.mark.parametrize("raw", [
     '说明\n```json\n{}\n```',
     '{}\n```json\n{}\n```',
