@@ -238,7 +238,14 @@ def main():
         except ValueError:
             completion_error = "preview_rejected"
     execution = executions[0]
-    result = {"source_revision": manifest["source_revision"], "loaded_source_revision": manifest["source_revision"], "runtime_source_sha256": digest((root / "runtime-source.json").read_bytes()), "execution": asdict(execution), "logical_review_calls": 1, "cli_starts": len(processes), "elapsed_seconds": time.monotonic() - started_at, "timing_boundary": plan["timing_boundary"], "preview": preview, "preview_consumed_at": datetime.now(timezone.utc).isoformat() if preview == "closed" else None, "completion_error": completion_error, "write_state": "not_requested", "stderr_summary": stderr, "started_receipt_sha256": digest((root / "started.json").read_bytes()), "cli_start_receipt_sha256": digest((root / "cli-start.json").read_bytes()) if (root / "cli-start.json").exists() else None, "output_files": {str(p): digest(p.read_bytes()) for p in audit.rglob("*") if p.is_file()}}
+    # Load the verifier host's pure output selector without importing its apps
+    # package over the separately frozen business source. runtime_files pins it.
+    selector = Path(__file__).resolve().parents[1] / "apps/oa_finance_preaudit/review_archive_outputs.py"
+    spec = importlib.util.spec_from_file_location("oa_review_archive_outputs", selector)
+    outputs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(outputs)
+    retained = outputs.evidence_paths(audit, stderr.get("tool_receipt_files", []))
+    result = {"source_revision": manifest["source_revision"], "loaded_source_revision": manifest["source_revision"], "runtime_source_sha256": digest((root / "runtime-source.json").read_bytes()), "execution": asdict(execution), "logical_review_calls": 1, "cli_starts": len(processes), "elapsed_seconds": time.monotonic() - started_at, "timing_boundary": plan["timing_boundary"], "preview": preview, "preview_consumed_at": datetime.now(timezone.utc).isoformat() if preview == "closed" else None, "completion_error": completion_error, "write_state": "not_requested", "stderr_summary": stderr, "started_receipt_sha256": digest((root / "started.json").read_bytes()), "cli_start_receipt_sha256": digest((root / "cli-start.json").read_bytes()) if (root / "cli-start.json").exists() else None, "output_files_scope": outputs.SCOPE, "output_files": {str(p): digest(p.read_bytes()) for p in retained}}
     save(root / "result.json", result)
     for path in root.rglob("*"):
         path.chmod(0o700 if path.is_dir() else 0o600)

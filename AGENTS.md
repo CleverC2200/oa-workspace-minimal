@@ -40,3 +40,13 @@
 - 局部代码改动采用聚焦测试、受影响静态检查和一次聚焦审查。写入、授权、幂等、进程回收、跨模块契约或发布改动保留 Standards/Spec 双路审查及必要完整验收；细则读 `CONTRIBUTING.md` 的“验证层级”。
 - 文档改动检查受影响链接和 `git diff --check`；修改 Skill 时校验对应 Skill，修改 AGENTS 或指令路由时执行指令审计。
 - 无法验证时明确说明未验证项，不把 mock、preview 或计划描述为生产事实。
+
+## 只读对照的约束与执行机制
+
+| 约束 | 执行机制与回归入口 |
+| --- | --- |
+| 新档案只绑定本次调用证据，运行缓存不成为永久证据；旧档案保留原合同。 | `review_archive_outputs.evidence_paths` 统一选取；`review_batch_report` 核对集合与哈希；[归档范围回归](tests/finance_preaudit/test_review_archive_outputs.py)拒绝旧的递归绑定写法。 |
+| 新启动前，四项事实的预期须独立核对原材料并提前冻结。 | `freeze_financial_expectations` 与 `_ComparisonCaller._side_expectations` 核对来源、覆盖和时序；[原材料核对回归](tests/finance_preaudit/test_original_fact_review.py)。脚本不替代业务判断。 |
+| 失败停止、已启动侧不重试、额度沿原回执累计；验收关闭不授予下一轮运行。 | 原停止记录、`_same_source_attempt`、`_counted_sides` 和 `_parent_budget`；[派发回归](tests/finance_preaudit/test_comparison_dispatch.py)、[停止资格回归](tests/finance_preaudit/test_readonly_comparison_start.py)。新修订或额度仍须明确授权。 |
+
+归档合同与运行边界见[受控只读对照](docs/agents/review-experiments.md)。以上机制不授予 OA 写入、生产修改或发布权限。

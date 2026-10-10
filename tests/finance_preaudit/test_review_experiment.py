@@ -171,6 +171,15 @@ def test_real_treatment_reaches_preview_and_exact_report(tmp_path, sources, monk
     assert result["status"] == "observed", result
     assert result["cli_starts"] == 2
     assert result["benefit"] == "not_established"
+    for root in (before, after):
+        retained = json.loads((root / "result.json").read_text())
+        assert retained["output_files_scope"] == "review_evidence_v1"
+        outputs = [Path(name).relative_to(root / "reviewer") for name in retained["output_files"]]
+        assert all(name.parts[0] not in {"native-state", "native-logs"} for name in outputs)
+        assert all(name.suffix == ".jsonl" and (name.parts[1] == "session.jsonl"
+                   or name.parts[1] == "sessions") for name in outputs if name.parts[0] == "codex-home")
+        assert any(name.suffix == ".jsonl" and name.parts[0] in {"codex-home", "tool-receipts"}
+                   for name in outputs)
     for report in result["trials"].values():
         assert report["usage"].get("total_tokens") == 110, {"report": report, "stderr": (before / "reviewer/stderr.log").read_text()}
         assert report["acceptance"]["preview"] == "verified_closed"
