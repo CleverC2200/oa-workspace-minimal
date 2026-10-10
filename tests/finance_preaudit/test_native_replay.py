@@ -41,6 +41,7 @@ def recorded_case(tmp_path: Path):
     material_file.write_text(json.dumps(material))
     state_file = archive / 'state.json'
     state_file.write_text(json.dumps({'request_id': 'recorded-case', 'received_at': '2026-10-10 09:00:00',
+        'workflow_key': 'general_expense',
         'material_file': str(tmp_path / 'old' / 'attempt-1' / 'material.json'),
         'material_fingerprint': 'sha256:' + hashlib.sha256(material_file.read_bytes()).hexdigest(),
         'evidence_fingerprint': 'sha256:' + hashlib.sha256(b'').hexdigest()}))
@@ -70,6 +71,31 @@ def test_prepare_freezes_complete_recorded_material_without_exposing_answers(rec
     assert not (project / 'inventory.json').exists()
     assert not list(project.rglob('review-decision.json'))
     assert material_file.read_text() == json.dumps(material)
+
+
+def test_prepare_routes_frozen_travel_material_to_its_eight_review_items(recorded_case, capsys) -> None:
+    arguments, material_file, material = recorded_case
+    material['workflow_key'] = 'travel_expense'
+    material['workflow_name'] = '差旅费报销'
+    material_file.write_text(json.dumps(material))
+    state_file = material_file.with_name('state.json')
+    state = json.loads(state_file.read_text())
+    state['workflow_key'] = 'travel_expense'
+    state['material_fingerprint'] = 'sha256:' + hashlib.sha256(material_file.read_bytes()).hexdigest()
+    state_file.write_text(json.dumps(state))
+
+    assert finance_preaudit_native_replay.main(arguments) == 0
+    summary = json.loads(capsys.readouterr().out)
+    action = json.loads(Path(summary['action_file']).read_text())
+    packet = json.loads(Path(action['review_packet_file']).read_text())
+    assert action['workflow_key'] == packet['workflow_key'] == 'travel_expense'
+    assert [item['item_key'] for item in packet['items']] == [
+        'reimbursement_period', 'travel_and_lodging_days', 'public_transport',
+        'lodging_and_attendance', 'cross_region_vehicle', 'fuel_subsidy',
+        'personal_advance_tickets', 'invoice_buyer',
+    ]
+    assert summary['mode'] == 'preview'
+    assert summary['write_authorized'] is False
 
 
 def test_run_uses_worker_then_closes_preview_with_real_anomalies_preserved(recorded_case, capsys) -> None:

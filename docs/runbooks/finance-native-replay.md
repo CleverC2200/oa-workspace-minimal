@@ -1,6 +1,8 @@
-# 通用费用实际模型只读回归
+# 财务预审实际模型只读回归
 
 需要验证真实 Worker 判断时，使用 `scripts.finance_preaudit_native_replay`。该入口从已保存材料生成新的 `preview`，调用现有 `codex_review_worker.review`，再通过 `FlowEngine.complete_review` 验证并闭合。它不配置 OA 连接、授权源或提交回调。
+
+准备时使用历史状态中的 `workflow_key`，保留对应流程的固定审核项；差旅材料不会转成通用费用审核。
 
 ## 准备私有输入
 
