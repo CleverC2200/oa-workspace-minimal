@@ -928,6 +928,20 @@
       "expected_output": "第1项按有效支付证据通过，不追加人员材料；第4项fail并保留10元差额，核销上限190元，整单needs_human",
       "failure_mode": "人员误报与真实金额异常混在一起，修复时丢失异常",
       "rule_ref": "payment-screenshot-exemption.md#入口先核对已有支付截图;flows/general-expense.md#第-4-项金额孰低核销"
+    },
+    {
+      "id": "RC-066-mixed-postage-keeps-subject-material-scope",
+      "scope": "general_expense",
+      "audit_item": "attachment_payment_evidence;reimbursable_minimum",
+      "status": "confirmed",
+      "input_facts": [
+        "合成混合单：邮寄费有已关联发票及票号明确对应的运单明细，运单起讫地可读，金额一致；另有额外个人转账截图",
+        "同单维修费用的真实交易收款对象与销售方关系未核实；另一笔邮寄费运单起讫地不可读；已有可信退款影响核销金额"
+      ],
+      "incorrect_output": "要求已满足发票加运单的邮寄费补付款人姓名或个人转账对象与销售方关系，或因邮寄费不要求支付截图而取消其他真实缺口和退款",
+      "expected_output": "第一笔邮寄费按发票加运单通过，不因额外截图新增人员材料要求；保留维修费交易关系和另一笔运单起讫地待核；可验证退款及金额冲突仍按原孰低规则，整单needs_human",
+      "failure_mode": "混合科目的支付截图要求扩散到本不要求截图的邮寄费",
+      "rule_ref": "flows/general-expense.md#第-1-项附件完整性支付证据;flows/general-expense.md#第-4-项金额孰低核销"
     }
   ]
 }

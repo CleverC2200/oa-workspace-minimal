@@ -395,6 +395,95 @@ def test_general_review_routes_payment_rules_and_preserves_preview_decision(
     assert receipt["no_write_evidence"] == "confirmed_no_write"
 
 
+
+def test_mixed_general_review_loads_subject_requirements_and_keeps_real_gap(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from tests.finance_preaudit.test_flow_engine_general_expense import _material
+
+    project_root = tmp_path / "project"
+    relative_rule = Path(".agents/skills/oa-finance-preaudit/references/flows/general-expense.md")
+    rule_file = project_root / relative_rule
+    rule_file.parent.mkdir(parents=True)
+    rule_file.write_text((Path(__file__).resolve().parents[2] / relative_rule).read_text())
+
+    def collect_material(request_id, _):
+        material = _material(request_id)
+        material["declared_fields"].extend([
+            {"path": "detail[0].row[0].field[0]", "name": "预算科目", "code": "yskm",
+             "read_status": "present", "value": "办公费-邮寄费"},
+            {"path": "detail[0].row[1].field[0]", "name": "预算科目", "code": "yskm",
+             "read_status": "present", "value": "维修费"},
+        ])
+        return material
+
+    engine = flow_engine.FlowEngine(
+        root=project_root / "runtime" / "finance_preaudit_flows",
+        discover_candidates=lambda key: [{
+            "request_id": "synthetic-mixed-subjects", "workflow_key": key,
+            "received_at": "2026-10-10T09:00:00+08:00",
+        }],
+        collect_material=collect_material,
+    )
+    action = engine.next_action("general_expense", mode="preview")
+    action_file = Path(action["action_file"])
+    recorded_decision = {
+        "schema_version": 1, "kind": "preaudit_review_decision",
+        "action_token": action["action_token"], "workflow_key": "general_expense",
+        "rule_version": "general_expense:1", "overall": "needs_human",
+        "items": [
+            {"item_key": "attachment_payment_evidence", "status": "uncertain",
+             "conclusion": "邮寄费发票与运单符合；维修费实际交易收款对象与发票销售方的关系待核。",
+             "evidence_refs": ["material:declared_fields"],
+             "missing_evidence": ["维修费实际交易收款对象与发票销售方的关系"]},
+            {"item_key": "invoice_linkage", "status": "pass", "conclusion": "发票已关联。",
+             "evidence_refs": ["material:declared_fields"], "missing_evidence": []},
+            {"item_key": "budget", "status": "pass", "conclusion": "当前阶段按既定策略暂不校验部门年度预算。",
+             "evidence_refs": ["material:declared_fields"], "missing_evidence": []},
+            {"item_key": "reimbursable_minimum", "status": "uncertain", "conclusion": "维修费交易关系待核，核销金额暂不能确定。",
+             "evidence_refs": ["material:declared_fields"], "missing_evidence": ["维修费支付归属"]},
+            {"item_key": "payment_company_consistency", "status": "pass",
+             "conclusion": "报销公司、支付公司、购买方三者一致，应选择示例有限公司支付。",
+             "evidence_refs": ["material:declared_fields"], "missing_evidence": []},
+        ],
+    }
+
+    class RecordedProcess:
+        pid = 12345
+        returncode = 0
+        stderr = io.StringIO()
+
+        def __init__(self, command):
+            self.output = Path(command[command.index("--output-last-message") + 1])
+
+        def communicate(self, *, input, timeout):
+            assert "references/flows/general-expense.md" in input
+            # Contract guard only. Actual financial behavior is checked with the model.
+            rule = rule_file.read_text()
+            assert "混合单逐明细按各自科目要求核验" in rule
+            assert "额外上传的支付截图不新增付款人姓名或交易收款对象与销售方关系的必需材料要求" in rule
+            self.output.write_text(json.dumps(recorded_decision), encoding="utf-8")
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
+    monkeypatch.setattr(codex_review_worker.subprocess, "Popen", lambda command, **kw: RecordedProcess(command))
+    reviewed = codex_review_worker.review({
+        "project_root": str(project_root), "action_file": str(action_file), "timeout_seconds": 60,
+    })
+    assert reviewed["status"] == "reviewed"
+    assert reviewed["decision"] == recorded_decision
+    decision_file = tmp_path / "mixed-decision.json"
+    json_artifact.write_json_atomic(decision_file, reviewed["decision"])
+    closed = engine.complete_review(action_file, decision_file)
+    assert closed["business_state"] == "needs_human"
+    assert closed["write_state"] == "not_requested"
+    remark = Path(closed["remark_file"]).read_text()
+    assert "邮寄费发票与运单符合" in remark
+    assert "维修费实际交易收款对象与发票销售方的关系待核" in remark
+
+
 def test_small_marketing_v2_worker_uses_six_item_requirements(
     tmp_path: Path,
 ) -> None:
