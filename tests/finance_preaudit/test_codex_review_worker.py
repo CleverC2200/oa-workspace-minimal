@@ -454,6 +454,82 @@ def test_mixed_general_review_loads_subject_requirements_and_keeps_real_gap(
     assert "维修费实际交易收款对象与发票销售方的关系待核" in remark
 
 
+
+@pytest.mark.parametrize("gap,amount_status,amount_conclusion", [
+    ("附加服务费的金额与订单共享关系待核，已确认付款及退款事实保留。", "uncertain", "已确认付款及退款事实保留，费用对应关系未核实，整单核销上限待核。"),
+    ("实际第三方收款者与当前费用及发票销售方的对应关系待核，已确认支付成功事实保留。", "uncertain", "已确认付款事实保留，费用对应关系未核实，整单核销上限待核。"),
+    ("定位照片未读取，费用与付款及发票的金额对应关系已确认。", "pass", "整单核销金额为100.00元。"),
+])
+def test_general_review_preserves_payment_facts_without_closing_expense_relations(
+    tmp_path: Path, monkeypatch, gap: str, amount_status: str,
+    amount_conclusion: str,
+) -> None:
+    from tests.finance_preaudit.test_flow_engine_general_expense import _material
+
+    project_root = tmp_path / "project"
+    references = Path(".agents/skills/oa-finance-preaudit/references")
+    for name in ("observation-contract.md", "payment-screenshot-exemption.md"):
+        target = project_root / references / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text((Path(__file__).resolve().parents[2] / references / name).read_text())
+    engine = flow_engine.FlowEngine(
+        root=project_root / "runtime" / "finance_preaudit_flows",
+        discover_candidates=lambda key: [{
+            "request_id": "synthetic-expense-relation", "workflow_key": key,
+            "received_at": "2026-10-10T09:00:00+08:00",
+        }],
+        collect_material=lambda request_id, _: _material(request_id),
+    )
+    action = engine.next_action("general_expense", mode="preview")
+    action_file = Path(action["action_file"])
+    recorded_decision = {
+        "schema_version": 1, "kind": "preaudit_review_decision",
+        "action_token": action["action_token"], "workflow_key": "general_expense",
+        "rule_version": "general_expense:1", "overall": "needs_human",
+        "items": [
+            {"item_key": key, "status": status, "conclusion": conclusion,
+             "evidence_refs": ["material:declared_fields"], "missing_evidence": missing}
+            for key, status, conclusion, missing in (
+                ("attachment_payment_evidence", "uncertain", gap, ["当前费用与本笔付款的对应关系"]),
+                ("invoice_linkage", "pass", "发票已关联。", []),
+                ("budget", "pass", "当前阶段按既定策略暂不校验部门年度预算。", []),
+                ("reimbursable_minimum", amount_status, amount_conclusion,
+                 ["同范围金额对应关系"] if amount_status == "uncertain" else []),
+                ("payment_company_consistency", "pass", "报销公司、支付公司、购买方三者一致，应选择示例有限公司支付。", []),
+            )
+        ],
+    }
+    prompts = _mock_final_output(monkeypatch, json.dumps(recorded_decision))
+    reviewed = codex_review_worker.review({
+        "project_root": str(project_root), "action_file": str(action_file), "timeout_seconds": 60,
+    })
+    assert reviewed["status"] == "reviewed"
+    assert len(prompts) == 1
+    assert "references/observation-contract.md" in prompts[0]
+    assert "references/payment-screenshot-exemption.md" in prompts[0]
+    # These are loaded-rule guards; actual model acceptance remains independent.
+    evidence_rule = (project_root / references / "observation-contract.md").read_text()
+    payment_rule = (project_root / references / "payment-screenshot-exemption.md").read_text()
+    assert "付款事实已核实不等于费用对应关系已闭合" in evidence_rule
+    assert "分别核对付款事实与费用对应关系" in payment_rule
+    assert "不进入下方 OA 收款人豁免及人员材料分支" in payment_rule
+    assert "OA 收款人与销售方同名也不能消除已存在的实际交易冲突" in payment_rule
+    assert reviewed["decision"] == recorded_decision
+    decision_file = tmp_path / "expense-relation-decision.json"
+    json_artifact.write_json_atomic(decision_file, reviewed["decision"])
+    closed = engine.complete_review(action_file, decision_file)
+    assert closed["business_state"] == "needs_human"
+    assert closed["write_state"] == "not_requested"
+    remark = Path(closed["remark_file"]).read_text()
+    assert gap in remark
+    assert "⚠️ 1、附件完整性/支付证据：" in remark
+    assert amount_conclusion in remark
+    if amount_status == "uncertain":
+        assert "⚠️ 4、金额孰低核销：" in remark
+    else:
+        assert "✅ 4、金额孰低核销：" in remark
+
+
 def test_small_marketing_v2_worker_uses_six_item_requirements(
     tmp_path: Path,
 ) -> None:

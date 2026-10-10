@@ -277,4 +277,6 @@ def test_six_finance_flows_share_payment_screenshot_rule():
         "RC-064-payment-proof-does-not-clear-real-gaps",
         "RC-065-valid-payment-with-amount-difference",
         "RC-066-mixed-postage-keeps-subject-material-scope",
+        "RC-067-payment-net-does-not-prove-shared-fee-scope",
+        "RC-068-actual-third-party-is-not-oa-reimbursement-payee",
     } <= cases

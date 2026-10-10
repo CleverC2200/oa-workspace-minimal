@@ -942,6 +942,34 @@
       "expected_output": "第一笔邮寄费按发票加运单通过，不因额外截图新增人员材料要求；保留维修费交易关系和另一笔运单起讫地待核；可验证退款及金额冲突仍按原孰低规则，整单needs_human",
       "failure_mode": "混合科目的支付截图要求扩散到本不要求截图的邮寄费",
       "rule_ref": "flows/general-expense.md#第-1-项附件完整性支付证据;flows/general-expense.md#第-4-项金额孰低核销"
+    },
+    {
+      "id": "RC-067-payment-net-does-not-prove-shared-fee-scope",
+      "scope": "general_expense",
+      "audit_item": "attachment_payment_evidence;reimbursable_minimum",
+      "status": "confirmed",
+      "input_facts": [
+        "合成混合单有商品费及附加服务费，付款页和退款页可确认本笔金额、状态及退款，净额与申报合计相等",
+        "附加服务费附件引用未解析，页面未显示该费用组成，其他可读来源也未证明与付款及关联发票的共享范围"
+      ],
+      "incorrect_output": "因净额与整单申报相等或文件名相似，推断附加费用已由同一付款覆盖，第1项和第4项通过",
+      "expected_output": "保留已确认付款及退款事实；附加服务费范围未闭合，第1项和第4项说明具体关系缺口，不给整单最终核销通过，也不把已支付事实改写为未支付",
+      "failure_mode": "金额算术正确被当作费用组成关系可信",
+      "rule_ref": "observation-contract.md#付款事实与费用对应关系;flows/general-expense.md#第-4-项金额孰低核销"
+    },
+    {
+      "id": "RC-068-actual-third-party-is-not-oa-reimbursement-payee",
+      "scope": "general_expense",
+      "audit_item": "attachment_payment_evidence;reimbursable_minimum",
+      "status": "confirmed",
+      "input_facts": [
+        "合成单中OA报销收款人为员工，维修费支付截图显示支付成功、金额可读，但实际交易收款对象是第三方昵称，现有交易与票据未证明其与销售方或费用的关系",
+        "同单邮寄费已有可信对应的发票及起讫地可读的运单；另一科目仅有不影响金额对应的定位照片缺口"
+      ],
+      "incorrect_output": "把员工垫付不要求委托材料扩为免核对截图第三方，或把邮寄费无需截图扩到维修费；金额因能相加而通过，或全部第1项未知均自动降级金额",
+      "expected_output": "员工与销售方不同名本身不追加人员材料；维修费保留真实第三方与费用关系缺口，第1项和第4项uncertain；邮寄费不新增截图要求，不影响金额的照片缺口不自动投射金额",
+      "failure_mode": "OA报销角色与实际交易对象混同，或不同科目与审核项之间盲目扩散状态",
+      "rule_ref": "observation-contract.md#付款事实与费用对应关系;payment-screenshot-exemption.md#入口先核对已有支付截图;flows/general-expense.md#第-4-项金额孰低核销"
     }
   ]
 }
