@@ -153,14 +153,17 @@ def test_non_travel_schema_and_timing_follow_bound_action(tmp_path: Path) -> Non
 
 def _mock_final_output(monkeypatch, raw):
     monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
+    prompts = []
 
     class Process:
         pid = 12345
         returncode = 0
-        stderr = io.StringIO()
+
+        def __init__(self):
+            self.stderr = io.StringIO()
 
         def communicate(self, **kwargs):
-            pass
+            prompts.append(kwargs["input"])
 
         def poll(self):
             return self.returncode
@@ -172,6 +175,7 @@ def _mock_final_output(monkeypatch, raw):
 
     monkeypatch.setattr(codex_review_worker.subprocess, "Popen", popen)
     monkeypatch.setattr(codex_review_worker.runtime_control, "stop_requested", lambda: False)
+    return prompts
 
 
 @pytest.mark.parametrize("wrapper", ["{}", "```json\n{}\n```", " \n```json\r\n{}\r\n```\n"])
@@ -306,7 +310,311 @@ def test_general_expense_worker_uses_bound_rule_pack(tmp_path: Path) -> None:
 def test_general_expense_prompt_uses_shared_payment_exemption(tmp_path: Path) -> None:
     _, action_file = _task(tmp_path, workflow_key="general_expense")
     assert "完整读取 `references/payment-screenshot-exemption.md`" in codex_review_worker._prompt(action_file)
-    assert "确认名称不一致后按规则核验人员关系和补充材料" in codex_review_worker._prompt(action_file)
+
+
+@pytest.mark.parametrize("amount_status,overall,amount_conclusion,attachment_gap", [
+    ("pass", "pass", "整单核销金额为100.00元。", None),
+    ("fail", "needs_human", "申报200元、实付190元，相差10元，整单核销上限190元。", None),
+    ("fail", "needs_human", "本轮财务审核100元、同范围实付90元，相差10元，核销上限90元。", "实际交易收款对象与销售方的主体关系待核，费用及支付金额对应已确认。"),
+])
+def test_general_review_routes_payment_rules_and_preserves_preview_decision(
+    tmp_path: Path, monkeypatch, amount_status: str, overall: str,
+    amount_conclusion: str, attachment_gap: str | None,
+) -> None:
+    from tests.finance_preaudit.test_flow_engine_general_expense import _material
+
+    project_root = tmp_path / "project"
+    engine = flow_engine.FlowEngine(
+        root=project_root / "runtime" / "finance_preaudit_flows",
+        discover_candidates=lambda key: [{
+            "request_id": "employee-reimbursement", "workflow_key": key,
+            "received_at": "2026-10-10T09:00:00+08:00",
+        }],
+        collect_material=lambda request_id, _: _material(request_id),
+    )
+    action = engine.next_action("general_expense", mode="preview")
+    action_file = Path(action["action_file"])
+    # This records the model process boundary, not a substitute financial judge.
+    # Actual model acceptance uses the same Worker and frozen preview input.
+    recorded_decision = {
+        "schema_version": 1, "kind": "preaudit_review_decision",
+        "action_token": action["action_token"], "workflow_key": "general_expense",
+        "rule_version": "general_expense:1", "overall": overall,
+        "items": [
+            {"item_key": key, "status": status, "conclusion": conclusion,
+             "evidence_refs": ["material:declared_fields"], "missing_evidence": gaps}
+            for key, status, conclusion, gaps in (
+                ("attachment_payment_evidence", "uncertain" if attachment_gap else "pass",
+                 attachment_gap or "附件及支付证据完整。", [attachment_gap] if attachment_gap else []),
+                ("invoice_linkage", "pass", "发票均已关联。", []),
+                ("budget", "pass", "当前阶段按既定策略暂不校验部门年度预算。", []),
+                ("reimbursable_minimum", amount_status, amount_conclusion, []),
+                ("payment_company_consistency", "pass", "报销公司、支付公司、购买方三者一致，应选择示例有限公司支付。", []),
+            )
+        ],
+    }
+    prompts = _mock_final_output(monkeypatch, json.dumps(recorded_decision))
+    reviewed = codex_review_worker.review({
+        "project_root": str(project_root), "action_file": str(action_file),
+        "timeout_seconds": 60,
+    })
+
+    assert reviewed["status"] == "reviewed"
+    assert len(prompts) == 1
+    assert "完整读取 `references/payment-screenshot-exemption.md`" in prompts[0]
+    assert "references/flows/general-expense.md" in prompts[0]
+    assert "确认名称不一致后按规则核验人员关系和补充材料" not in prompts[0]
+    assert reviewed["decision"] == recorded_decision
+    decision_file = tmp_path / "recorded-decision.json"
+    json_artifact.write_json_atomic(decision_file, reviewed["decision"])
+    closed = engine.complete_review(action_file, decision_file)
+    assert closed["action"] == "closed"
+    assert closed["business_state"] == overall
+    assert closed["write_state"] == "not_requested"
+    remark = Path(closed["remark_file"]).read_text(encoding="utf-8")
+    assert amount_conclusion in remark
+    if attachment_gap:
+        assert "⚠️ 1、附件完整性/支付证据：" in remark
+        assert attachment_gap in remark
+    else:
+        assert "✅ 1、附件完整性/支付证据：附件及支付证据完整。" in remark
+    if amount_status == "fail":
+        assert "❌ 4、金额孰低核销：" in remark
+    receipt = json.loads(action_file.with_name("execution-receipt.json").read_text())
+    assert receipt["mode"] == "preview"
+    assert receipt["write"] is False
+    assert receipt["no_write_evidence"] == "confirmed_no_write"
+
+
+def test_mixed_general_review_loads_subject_requirements_and_keeps_real_gap(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from tests.finance_preaudit.test_flow_engine_general_expense import _material
+
+    project_root = tmp_path / "project"
+    relative_rule = Path(".agents/skills/oa-finance-preaudit/references/flows/general-expense.md")
+    rule_file = project_root / relative_rule
+    rule_file.parent.mkdir(parents=True)
+    rule_file.write_text((Path(__file__).resolve().parents[2] / relative_rule).read_text())
+
+    def collect_material(request_id, _):
+        material = _material(request_id)
+        material["declared_fields"].extend([
+            {"path": "detail[0].row[0].field[0]", "name": "预算科目", "code": "yskm",
+             "read_status": "present", "value": "办公费-邮寄费"},
+            {"path": "detail[0].row[1].field[0]", "name": "预算科目", "code": "yskm",
+             "read_status": "present", "value": "维修费"},
+        ])
+        return material
+
+    engine = flow_engine.FlowEngine(
+        root=project_root / "runtime" / "finance_preaudit_flows",
+        discover_candidates=lambda key: [{
+            "request_id": "synthetic-mixed-subjects", "workflow_key": key,
+            "received_at": "2026-10-10T09:00:00+08:00",
+        }],
+        collect_material=collect_material,
+    )
+    action = engine.next_action("general_expense", mode="preview")
+    action_file = Path(action["action_file"])
+    recorded_decision = {
+        "schema_version": 1, "kind": "preaudit_review_decision",
+        "action_token": action["action_token"], "workflow_key": "general_expense",
+        "rule_version": "general_expense:1", "overall": "needs_human",
+        "items": [
+            {"item_key": "attachment_payment_evidence", "status": "uncertain",
+             "conclusion": "邮寄费发票与运单符合；维修费实际交易收款对象与发票销售方的关系待核。",
+             "evidence_refs": ["material:declared_fields"],
+             "missing_evidence": ["维修费实际交易收款对象与发票销售方的关系"]},
+            {"item_key": "invoice_linkage", "status": "pass", "conclusion": "发票已关联。",
+             "evidence_refs": ["material:declared_fields"], "missing_evidence": []},
+            {"item_key": "budget", "status": "pass", "conclusion": "当前阶段按既定策略暂不校验部门年度预算。",
+             "evidence_refs": ["material:declared_fields"], "missing_evidence": []},
+            {"item_key": "reimbursable_minimum", "status": "uncertain", "conclusion": "维修费交易关系待核，核销金额暂不能确定。",
+             "evidence_refs": ["material:declared_fields"], "missing_evidence": ["维修费支付归属"]},
+            {"item_key": "payment_company_consistency", "status": "pass",
+             "conclusion": "报销公司、支付公司、购买方三者一致，应选择示例有限公司支付。",
+             "evidence_refs": ["material:declared_fields"], "missing_evidence": []},
+        ],
+    }
+
+    prompts = _mock_final_output(monkeypatch, json.dumps(recorded_decision))
+    reviewed = codex_review_worker.review({
+        "project_root": str(project_root), "action_file": str(action_file), "timeout_seconds": 60,
+    })
+    assert reviewed["status"] == "reviewed"
+    assert len(prompts) == 1
+    assert "references/flows/general-expense.md" in prompts[0]
+    # Contract guard only. Actual financial behavior is checked with the model.
+    rule = rule_file.read_text()
+    assert "混合单逐明细按各自科目要求核验" in rule
+    assert "额外上传的支付截图不新增付款人姓名或交易收款对象与销售方关系的必需材料要求" in rule
+    assert reviewed["decision"] == recorded_decision
+    decision_file = tmp_path / "mixed-decision.json"
+    json_artifact.write_json_atomic(decision_file, reviewed["decision"])
+    closed = engine.complete_review(action_file, decision_file)
+    assert closed["business_state"] == "needs_human"
+    assert closed["write_state"] == "not_requested"
+    remark = Path(closed["remark_file"]).read_text()
+    assert "邮寄费发票与运单符合" in remark
+    assert "维修费实际交易收款对象与发票销售方的关系待核" in remark
+
+
+
+@pytest.mark.parametrize("gap,attachment_missing,amount_status,amount_conclusion,amount_missing", [
+    ("附加服务费的金额与订单共享关系待核，已确认付款及退款事实保留。",
+     ["附加服务费的金额与订单共享关系"], "uncertain",
+     "已确认付款及退款事实保留，费用对应关系未核实，整单核销上限待核。",
+     ["附加服务费的同范围金额对应关系"]),
+    ("实际第三方收款者与当前费用及发票销售方的对应关系待核，已确认支付成功事实保留。",
+     ["实际第三方收款者与当前费用及发票销售方的对应关系"], "uncertain",
+     "已确认付款事实保留，费用对应关系未核实，整单核销上限待核。",
+     ["第三方付款的费用及发票对应关系"]),
+    ("定位照片未读取，费用与付款及发票的金额对应关系已确认。",
+     ["定位照片"], "pass", "整单核销金额为100.00元。", []),
+])
+def test_general_review_preserves_payment_facts_without_closing_expense_relations(
+    tmp_path: Path, monkeypatch, gap: str, attachment_missing: list[str],
+    amount_status: str, amount_conclusion: str, amount_missing: list[str],
+) -> None:
+    from tests.finance_preaudit.test_flow_engine_general_expense import _material
+
+    project_root = tmp_path / "project"
+    references = Path(".agents/skills/oa-finance-preaudit/references")
+    for name in ("observation-contract.md", "payment-screenshot-exemption.md"):
+        target = project_root / references / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text((Path(__file__).resolve().parents[2] / references / name).read_text())
+    engine = flow_engine.FlowEngine(
+        root=project_root / "runtime" / "finance_preaudit_flows",
+        discover_candidates=lambda key: [{
+            "request_id": "synthetic-expense-relation", "workflow_key": key,
+            "received_at": "2026-10-10T09:00:00+08:00",
+        }],
+        collect_material=lambda request_id, _: _material(request_id),
+    )
+    action = engine.next_action("general_expense", mode="preview")
+    action_file = Path(action["action_file"])
+    recorded_decision = {
+        "schema_version": 1, "kind": "preaudit_review_decision",
+        "action_token": action["action_token"], "workflow_key": "general_expense",
+        "rule_version": "general_expense:1", "overall": "needs_human",
+        "items": [
+            {"item_key": key, "status": status, "conclusion": conclusion,
+             "evidence_refs": ["material:declared_fields"], "missing_evidence": missing}
+            for key, status, conclusion, missing in (
+                ("attachment_payment_evidence", "uncertain", gap, attachment_missing),
+                ("invoice_linkage", "pass", "发票已关联。", []),
+                ("budget", "pass", "当前阶段按既定策略暂不校验部门年度预算。", []),
+                ("reimbursable_minimum", amount_status, amount_conclusion, amount_missing),
+                ("payment_company_consistency", "pass", "报销公司、支付公司、购买方三者一致，应选择示例有限公司支付。", []),
+            )
+        ],
+    }
+    prompts = _mock_final_output(monkeypatch, json.dumps(recorded_decision))
+    reviewed = codex_review_worker.review({
+        "project_root": str(project_root), "action_file": str(action_file), "timeout_seconds": 60,
+    })
+    assert reviewed["status"] == "reviewed"
+    assert len(prompts) == 1
+    assert "references/observation-contract.md" in prompts[0]
+    assert "references/payment-screenshot-exemption.md" in prompts[0]
+    # These are loaded-rule guards; actual model acceptance remains independent.
+    evidence_rule = (project_root / references / "observation-contract.md").read_text()
+    payment_rule = (project_root / references / "payment-screenshot-exemption.md").read_text()
+    assert "付款事实已核实不等于费用对应关系已闭合" in evidence_rule
+    assert "分别核对付款事实与费用对应关系" in payment_rule
+    assert "不进入下方 OA 收款人豁免及人员材料分支" in payment_rule
+    assert "OA 收款人与销售方同名也不能消除已存在的实际交易冲突" in payment_rule
+    assert reviewed["decision"] == recorded_decision
+    decision_file = tmp_path / "expense-relation-decision.json"
+    json_artifact.write_json_atomic(decision_file, reviewed["decision"])
+    closed = engine.complete_review(action_file, decision_file)
+    assert closed["business_state"] == "needs_human"
+    assert closed["write_state"] == "not_requested"
+    remark = Path(closed["remark_file"]).read_text()
+    assert gap in remark
+    assert "⚠️ 1、附件完整性/支付证据：" in remark
+    assert amount_conclusion in remark
+    if amount_status == "uncertain":
+        assert "⚠️ 4、金额孰低核销：" in remark
+    else:
+        assert "✅ 4、金额孰低核销：" in remark
+
+
+@pytest.mark.parametrize("amount_status,overall,conclusion", [
+    ("pass", "pass", "按本轮财务审核金额与发票孰低，整单核销100元。"),
+    ("fail", "needs_human", "本轮财务审核100元，可验证实付90元，核销上限90元。"),
+])
+def test_general_review_keeps_financial_basis_and_optional_payment_scope(
+    tmp_path: Path, monkeypatch, amount_status: str, overall: str,
+    conclusion: str,
+) -> None:
+    from tests.finance_preaudit.test_flow_engine_general_expense import _material
+
+    project_root = tmp_path / "project"
+    rule_path = Path(".agents/skills/oa-finance-preaudit/references/flows/general-expense.md")
+    rule_file = project_root / rule_path
+    rule_file.parent.mkdir(parents=True)
+    rule_file.write_text((Path(__file__).resolve().parents[2] / rule_path).read_text())
+
+    def collect_material(request_id, _):
+        material = _material(request_id)
+        material["declared_fields"].extend([
+            {"path": "detail[0].row[0].field[0]", "name": "预算科目", "code": "yskm",
+             "read_status": "present", "value": "办公费-邮寄费"},
+            {"path": "detail[0].row[0].field[1]", "name": "财务审核金额", "code": "cwshje",
+             "read_status": "present", "value": "100"},
+            {"path": "main.field[0]", "name": "原始申请金额", "code": "old_request_amount",
+             "read_status": "present", "value": "120"},
+        ])
+        return material
+
+    engine = flow_engine.FlowEngine(
+        root=project_root / "runtime" / "finance_preaudit_flows",
+        discover_candidates=lambda key: [{
+            "request_id": "synthetic-financial-basis", "workflow_key": key,
+            "received_at": "2026-10-10T09:00:00+08:00",
+        }],
+        collect_material=collect_material,
+    )
+    action = engine.next_action("general_expense", mode="preview")
+    recorded_decision = {
+        "schema_version": 1, "kind": "preaudit_review_decision",
+        "action_token": action["action_token"], "workflow_key": "general_expense",
+        "rule_version": "general_expense:1", "overall": overall,
+        "items": [
+            {"item_key": key, "status": status, "conclusion": text,
+             "evidence_refs": ["material:declared_fields"], "missing_evidence": gaps}
+            for key, status, text, gaps in (
+                ("attachment_payment_evidence", "pass", "邮寄费发票与运单符合。", []),
+                ("invoice_linkage", "pass", "发票已关联。", []),
+                ("budget", "pass", "当前阶段按既定策略暂不校验部门年度预算。", []),
+                ("reimbursable_minimum", amount_status, conclusion, []),
+                ("payment_company_consistency", "pass", "报销公司、支付公司、购买方三者一致，应选择示例有限公司支付。", []),
+            )
+        ],
+    }
+    prompts = _mock_final_output(monkeypatch, json.dumps(recorded_decision))
+    action_file = Path(action["action_file"])
+    reviewed = codex_review_worker.review({
+        "project_root": str(project_root), "action_file": str(action_file), "timeout_seconds": 60,
+    })
+    assert reviewed["status"] == "reviewed"
+    assert len(prompts) == 1
+    assert "references/flows/general-expense.md" in prompts[0]
+    # Rule loading guard; the real model verifies the financial interpretation.
+    rule = rule_file.read_text()
+    assert "旧纸质申请或原始申请金额不替代本轮财务审核金额" in rule
+    assert "不因可选截图覆盖范围未知而新增付款证明义务" in rule
+    assert "不能把已确认的低付差额降为仅 `⚠️`" in rule
+    assert reviewed["decision"] == recorded_decision
+    decision_file = tmp_path / "financial-basis-decision.json"
+    json_artifact.write_json_atomic(decision_file, reviewed["decision"])
+    closed = engine.complete_review(action_file, decision_file)
+    assert closed["business_state"] == overall
+    assert closed["write_state"] == "not_requested"
+    assert conclusion in Path(closed["remark_file"]).read_text()
 
 
 def test_small_marketing_v2_worker_uses_six_item_requirements(
