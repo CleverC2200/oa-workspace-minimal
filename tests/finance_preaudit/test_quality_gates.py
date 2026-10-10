@@ -113,3 +113,57 @@ def test_issue_form_unhashable_type_is_a_finding():
     for kind in ([], {}):
         assert quality.check_issue_form({'name': 'Bug', 'description': 'Bug', 'body': [
             {'type': kind, 'attributes': {'label': 'Impact'}}]}, 'bug.yml') == ['issue_form_invalid:bug.yml']
+
+
+def test_review_process_rejects_the_real_past_bypasses(tmp_path):
+    # Offending expressions copied unchanged from 43a551e6c3dafc5d2161b400db0dab58d37425ba.
+    # Keep the regression runnable after a squash or a checkout without that old Git object.
+    past = {
+        "apps/oa_finance_preaudit/review_comparison.py": """
+class _ComparisonCaller:
+    def _side_expectations(self, root):
+        report = batch.build_report(root)
+    def _candidate_sources(self, plan, candidate):
+        _terminal(plan, 'candidate', batch.build_report(candidate))
+    def _baseline_quality(row, path, report):
+        rebuilt = flow_evals.build_financial_quality_report([{
+            'item_key': report['financial_binding']['item_key'],
+            'archive': _ref(Path(_read(row['plan'])['arms']['baseline']) / 'manifest.json'),
+            'checklist': refs['checklist'], 'assessment': refs['assessment'],
+            'expectations': refs['expectations']}])
+    def final_financial_qualification(self, reviews):
+        twenty = flow_evals.build_financial_quality_report(list(reviews.values()))
+        cohort = flow_evals.build_financial_quality_report(list(reviews.values()))
+""",
+        "apps/oa_finance_preaudit/review_references.py": """
+def original_record(refs):
+    rebuilt = batch.build_report(root)
+    rebuilt = flow_evals.build_financial_quality_report([{
+        "item_key": case["item_key"], "archive": manifest_ref,
+        "checklist": refs["checklist"], "assessment": refs["assessment"],
+        "expectations": refs["freeze"],
+    }])
+""",
+        "scripts/review_experiment_host.py": """
+result = {"output_files": {str(p): digest(p.read_bytes()) for p in audit.rglob("*") if p.is_file()}}
+""",
+    }
+    for name, original in past.items():
+        target = tmp_path / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(original)
+
+    findings = quality.check_review_process(tmp_path)
+
+    assert len(findings) == 8
+    assert sum(item.startswith("review_report_bypass:") for item in findings) == 3
+    assert sum(item.startswith("review_quality_reader_missing:") for item in findings) == 4
+    assert sum(item.startswith("review_output_recursive:") for item in findings) == 1
+    assert all("use " in item or "pass " in item for item in findings)
+
+
+def test_review_process_current_sources_and_ci_command_pass():
+    assert quality.check_review_process() == []
+    workflow = (quality.PROJECT_ROOT / ".github/workflows/quality.yml").read_text()
+    assert "run: python -m scripts.quality review-process" in workflow
+    assert quality.main(["review-process"]) == 0

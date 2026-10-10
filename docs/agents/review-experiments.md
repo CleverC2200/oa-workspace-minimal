@@ -2,6 +2,49 @@
 
 本入口只消费新建的私有冻结档案，不查询 OA、不恢复单据、不进入 Writer。实际单据和模型运行仍须覆盖本批的明确授权；生成计划、报告或本地提交不授予运行授权。
 
+## 新归档的证据范围
+
+新宿主将 `output_files_scope=review_evidence_v1` 写入结果，由
+`review_archive_outputs.evidence_paths` 统一选择实际存在的提示、生成 Schema、
+原决定、进程事件、stderr，以及本次声明并保留的原生 rollout。
+旧 Worker 在私有 `codex-home/session.jsonl` 或 `codex-home/sessions/` 中保留的
+原生 rollout 也进入证据集合；消费端只从绑定集合读取这些 JSONL。
+报告消费端要求路径集合恰好匹配，再核对原字节哈希。
+原生数据库、日志目录、插件和技能缓存属于运行环境，不递归绑定为新档案证据。
+调用源码、解释器、依赖、CLI 和规则指纹仍由原冻结合同核对。
+
+未声明该范围的旧档案继续核对原 `output_files` 全集；旧路径、原哈希、
+失败记录及资格保持，不删缓存、不回填范围、不追认通过。
+这个合同仅确定证据归属，不授权清理或新的模型调用。
+
+反例取自修订 `43a551e6` 的宿主：其 `output_files` 对 `reviewer` 做递归全集绑定。
+[归档范围回归](../../tests/finance_preaudit/test_review_archive_outputs.py)
+用中性文件重现同一写法，证明新消费端拒绝缓存混入，同时旧合同仍检查原字节。
+
+## 同次操作的报告核验
+
+`_ComparisonCaller` 的范围核验、旧侧参考接线、候选来源、质量与额度检查共用本次操作的
+`review_batch_report._VerifiedReports`。它只保存已完整核验的档案报告，并向调用者
+返回独立副本；操作结束即丢弃，不写持久缓存。原始授权、停止记录、启动回执和
+运行源码仍按原入口实时核对。实际启动回执集合变化后，先创建新读取器，再核验
+范围和来源；异常或中断的末尾额度也使用新读取器。
+
+报告生成在真实执行后仍是合法入口，不能从整个模块删除。Python 类型也不能
+阻止调用者直接引用该入口，因此已有质量命令增加
+`python -m scripts.quality review-process`，并接入同一 CI 工作流。
+它拒绝 `_ComparisonCaller` 和 `original_record` 内直接 `batch.build_report`，以及宿主把
+`audit.rglob` 放进 `output_files` 的旧写法；质量重建漏传 `verified` 也被拒绝。
+错误中给出替代接口或需传入的上下文。
+
+[检查反例](../../tests/finance_preaudit/test_quality_gates.py)保留修订 `43a551e6`
+的八处原错误表达式，避免回归依赖旧 Git 对象是否仍可获取。
+[复用回归](../../tests/finance_preaudit/test_readonly_comparison_start.py)用中性20对档案
+核对范围、来源、前单质量和额度的共享读取，以及独立最终资格操作的全新读取，
+每档在各自操作内只完成一次报告校验，原累计数量不变；
+[执行后重验](../../tests/finance_preaudit/test_comparison_dispatch.py)模拟执行边界并
+改动档案原字节，要求新读取器拒绝变化、保留已发生的数量和停止记录。
+这些检查不验证模型财务判断，不重新打开已结束的验收窗口。
+
 ## 启动前核验
 
 沿用单批档案合同：每侧包含 `calling-source`、当前只读 preview 动作及冻结原材料，以及声明实际修订和文件指纹的 `manifest.json`。来源必须能和开发克隆中的 Git 对象逐文件核对；全部调用源码和依赖声明均须冻结。已有 started/result/reviewer 的档案不能重用。

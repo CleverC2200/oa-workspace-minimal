@@ -18,6 +18,7 @@ from . import (
     flow_engine,
     flow_evals,
     observability,
+    review_archive_outputs,
     review_failure_evidence,
     runtime_maintenance,
 )
@@ -295,15 +296,19 @@ def _usage(events: list[dict]) -> dict:
 def _native_receipt_paths(root: Path) -> list[Path]:
     """Read old private homes and the current host's bound retained rollout."""
     paths = []
-    for name in ("codex-home", "tool-receipts"):
+    result = _object(root, "result.json")
+    scoped = result.get("output_files_scope") == review_archive_outputs.SCOPE
+    names = ("codex-home", "tool-receipts")
+    for name in names:
         directory = root / "reviewer" / name
         if not directory.exists():
             continue
         if directory != directory.resolve() or not directory.is_dir():
             raise ValueError(ERROR)
-        receipts = sorted(directory.rglob("*.jsonl"))
+        receipts = (sorted(Path(path) for path in result["output_files"]
+                           if Path(path).is_relative_to(directory) and Path(path).suffix == ".jsonl")
+                    if scoped else sorted(directory.rglob("*.jsonl")))
         if name == "tool-receipts":
-            result = _object(root, "result.json")
             files = result.get("output_files", {})
             for path in receipts:
                 if files.get(str(path)) != _sha(_path(root, path)):
@@ -753,6 +758,14 @@ def _build(root: Path) -> dict:
     if started.get("manifest_sha256") != _sha(root / "manifest.json"):
         raise ValueError(ERROR)
     result = _object(root, "result.json")
+    if "output_files_scope" in result:
+        if result["output_files_scope"] != review_archive_outputs.SCOPE:
+            raise ValueError(ERROR)
+        receipts = result.get("stderr_summary", {}).get("tool_receipt_files", [])
+        expected = {str(path) for path in review_archive_outputs.evidence_paths(root / "reviewer", receipts)}
+        files = result.get("output_files")
+        if not isinstance(files, dict) or set(files) != expected:
+            raise ValueError(ERROR)
     if result.get("output_files"):
         _hashes(root, result["output_files"])
     if result.get("source_revision") != manifest["source_revision"]:
