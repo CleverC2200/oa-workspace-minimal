@@ -153,14 +153,17 @@ def test_non_travel_schema_and_timing_follow_bound_action(tmp_path: Path) -> Non
 
 def _mock_final_output(monkeypatch, raw):
     monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
+    prompts = []
 
     class Process:
         pid = 12345
         returncode = 0
-        stderr = io.StringIO()
+
+        def __init__(self):
+            self.stderr = io.StringIO()
 
         def communicate(self, **kwargs):
-            pass
+            prompts.append(kwargs["input"])
 
         def poll(self):
             return self.returncode
@@ -172,6 +175,7 @@ def _mock_final_output(monkeypatch, raw):
 
     monkeypatch.setattr(codex_review_worker.subprocess, "Popen", popen)
     monkeypatch.setattr(codex_review_worker.runtime_control, "stop_requested", lambda: False)
+    return prompts
 
 
 @pytest.mark.parametrize("wrapper", ["{}", "```json\n{}\n```", " \n```json\r\n{}\r\n```\n"])
@@ -308,7 +312,6 @@ def test_general_expense_prompt_uses_shared_payment_exemption(tmp_path: Path) ->
     assert "完整读取 `references/payment-screenshot-exemption.md`" in codex_review_worker._prompt(action_file)
 
 
-
 @pytest.mark.parametrize("amount_status,overall,amount_conclusion", [
     ("pass", "pass", "整单核销金额为100.00元。"),
     ("fail", "needs_human", "申报200元、实付190元，相差10元，整单核销上限190元。"),
@@ -348,25 +351,7 @@ def test_general_review_routes_payment_rules_and_preserves_preview_decision(
             )
         ],
     }
-    prompts = []
-
-    class RecordedProcess:
-        pid = 12345
-        returncode = 0
-        stderr = io.StringIO()
-
-        def __init__(self, command):
-            self.output = Path(command[command.index("--output-last-message") + 1])
-
-        def communicate(self, *, input, timeout):
-            prompts.append(input)
-            self.output.write_text(json.dumps(recorded_decision), encoding="utf-8")
-
-        def poll(self):
-            return self.returncode
-
-    monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
-    monkeypatch.setattr(codex_review_worker.subprocess, "Popen", lambda command, **kw: RecordedProcess(command))
+    prompts = _mock_final_output(monkeypatch, json.dumps(recorded_decision))
     reviewed = codex_review_worker.review({
         "project_root": str(project_root), "action_file": str(action_file),
         "timeout_seconds": 60,
@@ -393,7 +378,6 @@ def test_general_review_routes_payment_rules_and_preserves_preview_decision(
     assert receipt["mode"] == "preview"
     assert receipt["write"] is False
     assert receipt["no_write_evidence"] == "confirmed_no_write"
-
 
 
 def test_mixed_general_review_loads_subject_requirements_and_keeps_real_gap(
@@ -448,31 +432,17 @@ def test_mixed_general_review_loads_subject_requirements_and_keeps_real_gap(
         ],
     }
 
-    class RecordedProcess:
-        pid = 12345
-        returncode = 0
-        stderr = io.StringIO()
-
-        def __init__(self, command):
-            self.output = Path(command[command.index("--output-last-message") + 1])
-
-        def communicate(self, *, input, timeout):
-            assert "references/flows/general-expense.md" in input
-            # Contract guard only. Actual financial behavior is checked with the model.
-            rule = rule_file.read_text()
-            assert "混合单逐明细按各自科目要求核验" in rule
-            assert "额外上传的支付截图不新增付款人姓名或交易收款对象与销售方关系的必需材料要求" in rule
-            self.output.write_text(json.dumps(recorded_decision), encoding="utf-8")
-
-        def poll(self):
-            return self.returncode
-
-    monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
-    monkeypatch.setattr(codex_review_worker.subprocess, "Popen", lambda command, **kw: RecordedProcess(command))
+    prompts = _mock_final_output(monkeypatch, json.dumps(recorded_decision))
     reviewed = codex_review_worker.review({
         "project_root": str(project_root), "action_file": str(action_file), "timeout_seconds": 60,
     })
     assert reviewed["status"] == "reviewed"
+    assert len(prompts) == 1
+    assert "references/flows/general-expense.md" in prompts[0]
+    # Contract guard only. Actual financial behavior is checked with the model.
+    rule = rule_file.read_text()
+    assert "混合单逐明细按各自科目要求核验" in rule
+    assert "额外上传的支付截图不新增付款人姓名或交易收款对象与销售方关系的必需材料要求" in rule
     assert reviewed["decision"] == recorded_decision
     decision_file = tmp_path / "mixed-decision.json"
     json_artifact.write_json_atomic(decision_file, reviewed["decision"])
