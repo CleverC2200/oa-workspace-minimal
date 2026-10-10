@@ -60,6 +60,24 @@ def test_material_cli_counts_linked_fields_without_claiming_pdf_read(tmp_path, c
     assert "43.00" not in json.dumps(result)
 
 
+def test_material_cli_accepts_space_separated_invoice_numbers_with_leading_zeros(tmp_path, capsys):
+    import copy
+    value = material()
+    value["declared_fields"][0].update(
+        name="发票号码", code="fphm", value="00000000000000000101 00000000000000000102",
+    )
+    second = copy.deepcopy(value["invoice_evidence"]["invoices"][0])
+    second["invoice_no"] = "00000000000000000102"
+    second["fields"]["invoice_number"]["value"] = "00000000000000000102"
+    value["invoice_evidence"]["invoices"].append(second)
+
+    code, result = run_cli(tmp_path, capsys, value)
+
+    assert code == 0
+    assert result["invoice_evidence"]["source_consistent_entries"] == 2
+    assert result["invoice_evidence"]["source_inconsistent_entries"] == 0
+
+
 def test_material_cli_excludes_mixed_untrusted_source_and_ignores_sensitive_values(tmp_path, capsys):
     import copy
     value = material()
@@ -219,3 +237,62 @@ def test_corrupt_status_shapes_return_safe_unknown_counts(tmp_path, capsys, loca
     assert code == 0
     assert "SECRET-" not in json.dumps(result)
     assert result["invoice_evidence"]["field_coverage"]["total"]["present"] == 0
+
+
+@pytest.mark.parametrize("separator", [",", "，", ";", "；", "  ", "\t", "\n", " \t;\n"])
+def test_material_cli_accepts_supported_invoice_number_separators(tmp_path, capsys, separator):
+    value = material()
+    value["declared_fields"][0].update(
+        name="发票号码", code="fphm",
+        value=f"00000000000000000101{separator}00000000000000000102",
+    )
+    _, result = run_cli(tmp_path, capsys, value)
+    assert result["invoice_evidence"]["source_consistent_entries"] == 1
+    assert result["invoice_evidence"]["source_inconsistent_entries"] == 0
+
+
+@pytest.mark.parametrize("damage", ["number_mismatch", "number_field_mismatch", "wrong_source", "wrong_field", "leading_zero_lost"])
+def test_material_cli_preserves_number_and_source_mismatches_in_multi_number_fields(tmp_path, capsys, damage):
+    import copy
+    value = material()
+    value["declared_fields"][0].update(
+        name="发票号码", code="fphm", value="00000000000000000101 00000000000000000102",
+    )
+    second = copy.deepcopy(value["invoice_evidence"]["invoices"][0])
+    second.update(invoice_no="00000000000000000102", data_id="102")
+    second["fields"]["invoice_number"]["value"] = "00000000000000000102"
+    if damage == "number_mismatch":
+        second["invoice_no"] = "00000000000000000103"
+        second["fields"]["invoice_number"]["value"] = "00000000000000000103"
+    elif damage == "number_field_mismatch":
+        second["fields"]["invoice_number"]["value"] = "00000000000000000103"
+    elif damage == "wrong_source":
+        second["source_field_paths"] = ["detail[0].row[1].field[0]"]
+        value["declared_fields"].append({
+            "path": "detail[0].row[1].field[0]", "name": "发票号码", "code": "fphm",
+            "value": "00000000000000000203", "read_status": "present",
+        })
+    elif damage == "wrong_field":
+        second["source_field_paths"] = ["detail[0].row[0].field[1]"]
+        value["declared_fields"].append({
+            "path": "detail[0].row[0].field[1]", "name": "报销事由", "code": "bz",
+            "value": "00000000000000000102", "read_status": "present",
+        })
+    else:
+        second["invoice_no"] = "102"
+        second["fields"]["invoice_number"]["value"] = "102"
+    value["invoice_evidence"]["invoices"].append(second)
+
+    _, result = run_cli(tmp_path, capsys, value)
+
+    assert result["invoice_evidence"]["source_consistent_entries"] == 1
+    assert result["invoice_evidence"]["source_inconsistent_entries"] == 1
+
+
+@pytest.mark.parametrize("declared_value", ["发票 00000000000000000101", "00000000000000000101 / 00000000000000000102", "00000000000000000101;"])
+def test_material_cli_does_not_infer_invoice_numbers_from_prose_or_unsupported_separators(tmp_path, capsys, declared_value):
+    value = material()
+    value["declared_fields"][0].update(name="发票号码", code="fphm", value=declared_value)
+    _, result = run_cli(tmp_path, capsys, value)
+    assert result["invoice_evidence"]["source_consistent_entries"] == 0
+    assert result["invoice_evidence"]["source_inconsistent_entries"] == 1

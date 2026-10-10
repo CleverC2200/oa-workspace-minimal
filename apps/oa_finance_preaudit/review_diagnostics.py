@@ -216,7 +216,7 @@ def inspect_material(material_file: Path) -> dict:
         if isinstance(field, dict) and isinstance(field.get("path"), str)
         and isinstance(field.get("value"), str) and field.get("read_status") == "present"
         and (field.get("name") == "发票号码" or (field.get("name") == "关联发票" and field.get("code") == "glfp"))
-        and re.fullmatch(r"[0-9]+(?:\s*[,，;；]\s*[0-9]+)*", field["value"].strip())
+        and re.fullmatch(r"[0-9]+(?:(?:\s*[,，;；]\s*|\s+)[0-9]+)*", field["value"].strip())
     }
     coverage["linked_field_count"] = len(linked_fields)
     evidence = material.get("invoice_evidence")
