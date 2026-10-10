@@ -306,7 +306,93 @@ def test_general_expense_worker_uses_bound_rule_pack(tmp_path: Path) -> None:
 def test_general_expense_prompt_uses_shared_payment_exemption(tmp_path: Path) -> None:
     _, action_file = _task(tmp_path, workflow_key="general_expense")
     assert "完整读取 `references/payment-screenshot-exemption.md`" in codex_review_worker._prompt(action_file)
-    assert "确认名称不一致后按规则核验人员关系和补充材料" in codex_review_worker._prompt(action_file)
+
+
+
+@pytest.mark.parametrize("amount_status,overall,amount_conclusion", [
+    ("pass", "pass", "整单核销金额为100.00元。"),
+    ("fail", "needs_human", "申报200元、实付190元，相差10元，整单核销上限190元。"),
+])
+def test_general_review_routes_payment_rules_and_preserves_preview_decision(
+    tmp_path: Path, monkeypatch, amount_status: str, overall: str,
+    amount_conclusion: str,
+) -> None:
+    from tests.finance_preaudit.test_flow_engine_general_expense import _material
+
+    project_root = tmp_path / "project"
+    engine = flow_engine.FlowEngine(
+        root=project_root / "runtime" / "finance_preaudit_flows",
+        discover_candidates=lambda key: [{
+            "request_id": "employee-reimbursement", "workflow_key": key,
+            "received_at": "2026-10-10T09:00:00+08:00",
+        }],
+        collect_material=lambda request_id, _: _material(request_id),
+    )
+    action = engine.next_action("general_expense", mode="preview")
+    action_file = Path(action["action_file"])
+    # This records the model process boundary, not a substitute financial judge.
+    # Actual model acceptance uses the same Worker and frozen preview input.
+    recorded_decision = {
+        "schema_version": 1, "kind": "preaudit_review_decision",
+        "action_token": action["action_token"], "workflow_key": "general_expense",
+        "rule_version": "general_expense:1", "overall": overall,
+        "items": [
+            {"item_key": key, "status": amount_status if key == "reimbursable_minimum" else "pass", "conclusion": conclusion,
+             "evidence_refs": ["material:declared_fields"], "missing_evidence": []}
+            for key, conclusion in (
+                ("attachment_payment_evidence", "附件及支付证据完整。"),
+                ("invoice_linkage", "发票均已关联。"),
+                ("budget", "当前阶段按既定策略暂不校验部门年度预算。"),
+                ("reimbursable_minimum", amount_conclusion),
+                ("payment_company_consistency", "报销公司、支付公司、购买方三者一致，应选择示例有限公司支付。"),
+            )
+        ],
+    }
+    prompts = []
+
+    class RecordedProcess:
+        pid = 12345
+        returncode = 0
+        stderr = io.StringIO()
+
+        def __init__(self, command):
+            self.output = Path(command[command.index("--output-last-message") + 1])
+
+        def communicate(self, *, input, timeout):
+            prompts.append(input)
+            self.output.write_text(json.dumps(recorded_decision), encoding="utf-8")
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
+    monkeypatch.setattr(codex_review_worker.subprocess, "Popen", lambda command, **kw: RecordedProcess(command))
+    reviewed = codex_review_worker.review({
+        "project_root": str(project_root), "action_file": str(action_file),
+        "timeout_seconds": 60,
+    })
+
+    assert reviewed["status"] == "reviewed"
+    assert len(prompts) == 1
+    assert "完整读取 `references/payment-screenshot-exemption.md`" in prompts[0]
+    assert "references/flows/general-expense.md" in prompts[0]
+    assert "确认名称不一致后按规则核验人员关系和补充材料" not in prompts[0]
+    assert reviewed["decision"] == recorded_decision
+    decision_file = tmp_path / "recorded-decision.json"
+    json_artifact.write_json_atomic(decision_file, reviewed["decision"])
+    closed = engine.complete_review(action_file, decision_file)
+    assert closed["action"] == "closed"
+    assert closed["business_state"] == overall
+    assert closed["write_state"] == "not_requested"
+    remark = Path(closed["remark_file"]).read_text(encoding="utf-8")
+    assert amount_conclusion in remark
+    assert "✅ 1、附件完整性/支付证据：附件及支付证据完整。" in remark
+    if amount_status == "fail":
+        assert "❌ 4、金额孰低核销：" in remark
+    receipt = json.loads(action_file.with_name("execution-receipt.json").read_text())
+    assert receipt["mode"] == "preview"
+    assert receipt["write"] is False
+    assert receipt["no_write_evidence"] == "confirmed_no_write"
 
 
 def test_small_marketing_v2_worker_uses_six_item_requirements(

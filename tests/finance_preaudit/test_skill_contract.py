@@ -273,4 +273,7 @@ def test_six_finance_flows_share_payment_screenshot_rule():
         "RC-057-finance-multiple-payees-untrusted-mapping",
         "RC-058-finance-seller-missing-or-different",
         "RC-059-finance-other-materials-and-document-read-gap",
+        "RC-063-employee-payment-proof-precedes-exemption",
+        "RC-064-payment-proof-does-not-clear-real-gaps",
+        "RC-065-valid-payment-with-amount-difference",
     } <= cases

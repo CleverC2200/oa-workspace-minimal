@@ -886,6 +886,48 @@
       "expected_output": "模型明确比较实际报销/支付与购买方，保留不同主体和辅助字段角色，指出差异；支付建议不能替代比较结论",
       "failure_mode": "省略原单主体冲突或静默用辅助字段替代实际支付公司",
       "rule_ref": "flows/tpm-small-marketing-fee.md"
+    },
+    {
+      "id": "RC-063-employee-payment-proof-precedes-exemption",
+      "scope": "general_expense",
+      "audit_item": "attachment_payment_evidence",
+      "status": "confirmed",
+      "input_facts": [
+        "合成员工垫付报销：OA收款人为员工甲，关联发票销售方为商户乙，其他必需附件及关联均完整",
+        "当前费用的支付截图可可信对应，显示支付成功和实付100元，未显示付款人姓名；申报与有效发票同为100元"
+      ],
+      "incorrect_output": "仅因员工甲与销售方乙不同名或截图不显示付款人姓名，要求员工主数据、委托代付款截图或委托收款函",
+      "expected_output": "按已有有效支付截图核验，第1项通过；不进入缺截图豁免及人员补充材料分支；固定五项保留",
+      "failure_mode": "把缺截图后的豁免条件当成员工垫付的普遍门槛",
+      "rule_ref": "payment-screenshot-exemption.md#入口先核对已有支付截图"
+    },
+    {
+      "id": "RC-064-payment-proof-does-not-clear-real-gaps",
+      "scope": "general_expense",
+      "audit_item": "attachment_payment_evidence;reimbursable_minimum",
+      "status": "confirmed",
+      "input_facts": [
+        "合成单据包含支付截图，但第1笔明确显示待付款，第2笔显示支付成功但实际交易收款对象与发票销售方关系无法可信核实",
+        "第3笔截图属于其他流程；缺少当前费用有效支付截图，OA收款人与关联销售方名称不同且所需委托材料确认未提供"
+      ],
+      "incorrect_output": "因截图文件存在就把全部支付项改为通过，或把对象关系未知直接写成未支付",
+      "expected_output": "保留待付款事实；第2笔说明实际交易收款对象与发票关系待核，不声称未支付；第3笔按缺有效截图分支核验并保留确认缺失的材料",
+      "failure_mode": "修复人员误报时取消真实支付与归属异常",
+      "rule_ref": "payment-screenshot-exemption.md#入口先核对已有支付截图;flows/general-expense.md#缺少有效支付截图时核对豁免及补充材料"
+    },
+    {
+      "id": "RC-065-valid-payment-with-amount-difference",
+      "scope": "general_expense",
+      "audit_item": "attachment_payment_evidence;reimbursable_minimum",
+      "status": "confirmed",
+      "input_facts": [
+        "合成员工垫付：OA收款人员与发票销售方不同名，但截图付款对象与当前费用对应可信且状态为支付成功",
+        "申报200元，发票200元，实际支付190元；其他必需附件和公司要求均满足"
+      ],
+      "incorrect_output": "要求不适用的委托代付材料，或去掉代付提示后直接把整单判通过",
+      "expected_output": "第1项按有效支付证据通过，不追加人员材料；第4项fail并保留10元差额，核销上限190元，整单needs_human",
+      "failure_mode": "人员误报与真实金额异常混在一起，修复时丢失异常",
+      "rule_ref": "payment-screenshot-exemption.md#入口先核对已有支付截图;flows/general-expense.md#第-4-项金额孰低核销"
     }
   ]
 }

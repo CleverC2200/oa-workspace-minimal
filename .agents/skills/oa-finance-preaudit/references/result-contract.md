@@ -12,7 +12,7 @@
 | `general_expense` | [通用费用报销](flows/general-expense.md) |
 | `packaging_layout_approval` | [包装版面](flows/packaging-layout-approval.md) |
 
-六类财务同时完整读取[对公付款免支付截图](payment-screenshot-exemption.md)，先核实豁免再判断支付材料缺口。包装只读取自己的规则包。
+六类财务同时完整读取[对公付款免支付截图](payment-screenshot-exemption.md)，先核对已有支付截图，仅在缺少有效截图时按共用规则核验豁免及相关补充材料。包装只读取自己的规则包。
 
 不在表中的 `workflow_key` 属于技术失败，停止当前单据，不猜测相近流程。
 
