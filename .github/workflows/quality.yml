@@ -28,6 +28,8 @@ jobs:
         run: python -m scripts.quality production-config
       - name: Skill validation
         run: python -m scripts.quality skill
+      - name: Payment relationship rule ownership
+        run: python -m scripts.quality payment-rules
       - name: Text format
         run: python -m scripts.quality format
       - name: Sensitive files and secrets

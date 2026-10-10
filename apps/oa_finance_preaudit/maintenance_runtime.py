@@ -188,7 +188,7 @@ def validate_collecting(flows, attempt, state):
         # review_required state. Validate that current contract without writing it.
         validation_state = {**state, 'rule_version':version}
     if has_frozen:
-        flow_engine._validate_frozen_review_inputs(attempt_root=attempt, state=validation_state, workflow_key=state['workflow_key'])
+        flow_engine.validate_frozen_review_inputs(attempt_root=attempt, state=validation_state, workflow_key=state['workflow_key'])
     else:
         # Bundle and packet can be complete before their paths/hashes reach state.
         # Verify these files using installed validators without persisting a projection.
@@ -207,7 +207,7 @@ def validate_collecting(flows, attempt, state):
                 projection = {**validation_state, 'material_file':str(material), 'review_packet_file':str(packet),
                     'material_fingerprint':verified['material_fingerprint'],
                     'evidence_fingerprint':flow_engine._evidence_fingerprint(contents)}
-                flow_engine._validate_frozen_review_inputs(attempt_root=attempt, state=projection, workflow_key=state['workflow_key'])
+                flow_engine.validate_frozen_review_inputs(attempt_root=attempt, state=projection, workflow_key=state['workflow_key'])
         elif os.path.lexists(packet):
             raise ValueError()
 
@@ -253,7 +253,7 @@ try:
             # a material failure cannot also promise a valid frozen material bundle.
             material_failure = isolated and state.get('reason') == 'material_collection_failed'
             if not material_failure and (state.get('material_file') is not None or state.get('review_packet_file') is not None):
-                flow_engine._validate_frozen_review_inputs(attempt_root=attempt, state=state, workflow_key=state['workflow_key'])
+                flow_engine.validate_frozen_review_inputs(attempt_root=attempt, state=state, workflow_key=state['workflow_key'])
         else:
             raise ValueError()
         validated += 1

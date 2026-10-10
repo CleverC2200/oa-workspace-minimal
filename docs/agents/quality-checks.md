@@ -2,6 +2,8 @@
 
 沿用 `scripts.quality` 和现有 GitHub quality workflow，不增加另一套检查平台。
 
+- `payment-rules`：用 AST 读取 Worker，不导入业务代码。阻止 Worker 字符串再次写入人员关系、委托代付款或委托收款指令，报错指向共享付款规则。此检查只约束已发生的重复提示词，不判断实际材料，也不保证模型语义正确。历史 `ec9c4a1` 的原指令会触发检查；当前 Worker 通过，脱敏原句回归由 `test_quality_gates.py` 在本地及 CI 同一 pytest 入口运行。
+
 - `yaml`：安全解析受版本控制的 YAML，拒绝重复键，采用 YAML 1.2 布尔值约定。Issue form 检查基本结构、非空标题、字段类型、唯一 ID、下拉选项及 required 布尔值；这是本项目固定合同检查，不代表 GitHub 平台的全部限制。
 - `schema`：通过离线 FlowEngine 冻结六类财务包，检查真实生成器的 JSON Schema；同时检查包装 V2 生成器。拒绝供应商已实际拒绝过的空属性对象。包装页、非包装页、不确定页和 Excel 映射进入原消费者的回归保留在 pytest 中。静态有效不证明供应商已经实际接受全部分支。
 - `lint`：固定 Ruff 版本，检查全部 apps/scripts/tests 的严重语法、不可成立的判断和未定义名称。规则以 `.ruff.toml` 为准；原 `format` 继续只处理换行/空白，不能宣称已经执行 Python 格式化或全面类型检查。
@@ -22,3 +24,5 @@
 ## 实际模型只读回归
 
 需要验证 Worker 的业务判断时，按[通用费用实际模型回归](../runbooks/finance-native-replay.md)准备私有冻结材料，再显式调用原生 Worker 并闭合 preview。默认 CI 只运行该入口的离线行为测试，不调用模型，不把工程通过替代实际模型验收。
+
+同一 CLI 的 `--verify` 只读取既有原生回放和独立复核记录。逐项状态不符、独立业务复核拒绝或遗漏、绑定指纹不符及非原生记录均返回非零；原始模型结果保持业务未验收，不因生成校验报告改写。检查无法代替对原始证据和意见理由的独立判断。`test_native_replay.py` 在既有 pytest 与 CI 入口核验这些行为。[#425](https://github.com/CleverC2200/oa-workspace-minimal/issues/425) 留存真实历史错误及最终正确结果的只读拒绝/通过证明。

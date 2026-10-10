@@ -184,6 +184,7 @@ def run(args, *, executor=None):
         'model': reviewed.get('model'), 'reasoning_effort': reviewed.get('reasoning_effort'),
         'requested_service_tier': reviewed.get('requested_service_tier'),
         'execution_transport': 'recorded' if executor is not None else 'native', 'oa_writes': 0,
+        'business_acceptance': 'not_verified',
         'original_material_unchanged': digest(manifest['original_material']) == manifest['original_material_sha256']}
     if reviewed['status'] == 'reviewed':
         decision_file = action_file.with_name('native-preview-decision.json')
@@ -205,24 +206,131 @@ def run(args, *, executor=None):
         return 1
     return 0
 
+
+def verify(args):
+    """Validate separately reviewed evidence, without generating a business opinion."""
+    from apps.oa_finance_preaudit.flow_engine import validate_frozen_review_inputs
+
+    audit = args.audit / 'runs' / args.label / args.case
+    findings = []
+    source_head = None
+    try:
+        manifest = read(audit / 'prepare.json')
+        source_head = manifest['source_head']
+        result = read(audit / 'result.json')
+        closure = read(audit / 'closure.json')
+        project = Path(manifest['project_root']).resolve()
+        if any(p.resolve().is_relative_to(project) for p in (args.expectations, args.independent_review)):
+            findings.append('business_review_inside_model_input:keep expectations and review outside the native project')
+        if digest(args.expectations) != args.expectations_sha256:
+            findings.append('expectations_fingerprint_mismatch:use the independently frozen digest')
+        if digest(args.independent_review) != args.review_sha256:
+            findings.append('review_fingerprint_mismatch:use the independently reviewed digest')
+        expectations = read(args.expectations)
+        independent = read(args.independent_review)
+        if (manifest['case'] != args.case or manifest['label'] != args.label
+                or result['case'] != args.case or manifest['mode'] != 'preview'
+                or manifest['write_authorized'] is not False
+                or result.get('review_status') != 'reviewed'
+                or result.get('preview_closed_no_write') is not True
+                or result.get('write_state') != 'not_requested' or result.get('oa_writes') != 0
+                or closure.get('action') != 'closed' or closure.get('execution_state') != 'closed'
+                or closure.get('write_state') != 'not_requested' or closure.get('write_authorized') is not False):
+            findings.append('native_preview_not_closed:finish the original native preview before business verification')
+        if (result.get('execution_transport') != 'native'
+                or result.get('model') != 'gpt-6.1-sol' or result.get('reasoning_effort') != 'medium'
+                or result.get('requested_service_tier') != 'default'):
+            findings.append('native_model_evidence_unverified:require explicit native transport and model identity')
+        if not all(digest(project / x['path']) == x['sha256'] for x in manifest['source_manifest']):
+            findings.append('frozen_source_changed:use a new label without rewriting the old snapshot')
+        if digest(manifest['original_material']) != manifest['original_material_sha256']:
+            findings.append('original_material_changed:preserve the original evidence')
+        if digest(Path(manifest['archived_path_prefix']) / 'state.json') != manifest['original_state_sha256']:
+            findings.append('original_state_changed:preserve the original state')
+        if not all(digest(x[p]) == x['sha256'] for x in manifest['file_mapping'] for p in ('source', 'target')):
+            findings.append('evidence_fingerprint_mismatch:preserve original and frozen attachments')
+        if digest(closure['state_file']) != result['state_sha256']:
+            findings.append('closure_state_changed:verify the original terminal receipt')
+        state = read(closure['state_file'])
+        attempt_root = Path(manifest['action_file']).parent
+        try:
+            validate_frozen_review_inputs(attempt_root=attempt_root, state=state, workflow_key=state['workflow_key'])
+            if digest(state['material_file']) != manifest['fresh_material_sha256']:
+                raise ValueError('frozen_material_changed')
+        except (OSError, ValueError):
+            findings.append('frozen_review_inputs_changed:preserve the actual frozen material and review packet')
+        decision_file = Path(manifest['action_file']).with_name('native-preview-decision.json')
+        decision_hash = digest(decision_file)
+        if (decision_hash != result['decision_sha256']
+                or read(closure['decision_file']) != read(decision_file)
+                or state['decision_fingerprint'] != 'sha256:' + digest(closure['decision_file'])):
+            findings.append('decision_fingerprint_mismatch:review the actual closed decision')
+        if (independent.get('schema_version') != 1 or independent.get('case') != args.case
+                or independent.get('label') != args.label
+                or independent.get('source_head') != manifest['source_head']
+                or independent.get('expectations_sha256') != args.expectations_sha256
+                or independent.get('decision_sha256') != decision_hash):
+            findings.append('independent_review_binding_mismatch:bind review to this source, expectation and decision')
+        if independent.get('verdict') != 'accepted' or independent.get('findings') != []:
+            findings.append('independent_review_not_accepted:resolve business findings in a new candidate')
+        cases = [c for c in expectations['cases'] if c['case'] == args.case]
+        if expectations.get('schema_version') != 1 or len(cases) != 1:
+            raise ValueError('expectations_schema_invalid')
+        allowed = cases[0]['allowed_statuses']
+        action = read(manifest['action_file'])
+        packet = read(action['review_packet_file'])
+        keys = {i['item_key'] for i in packet['items']}
+        if not isinstance(allowed, dict) or set(allowed) != keys or not all(
+            isinstance(v, list) and v and all(s in {'pass', 'fail', 'uncertain'} for s in v)
+            for v in allowed.values()
+        ):
+            raise ValueError('expectations_schema_invalid')
+        items = read(decision_file)['items']
+        if len(items) != len(keys) or {i['item_key'] for i in items} != keys:
+            findings.append('decision_items_incomplete:compare every frozen review item')
+        else:
+            findings.extend(f'item_status_mismatch:{i["item_key"]}:use the frozen independent expectation'
+                            for i in items if i['status'] not in allowed[i['item_key']])
+    except (OSError, KeyError, TypeError, ValueError, AttributeError):
+        findings.append('acceptance_evidence_unreadable:provide complete frozen records and independent review')
+    report = {'case': args.case, 'label': args.label,
+              'source_head': source_head, 'qualification_scope': 'single_frozen_native_case',
+              'business_acceptance': 'not_accepted' if findings else 'accepted',
+              'findings': sorted(set(findings)), 'oa_writes': 0, 'model_calls': 0}
+    print(json.dumps(report, ensure_ascii=False))
+    return 1 if findings else 0
+
+
 def main(argv=None, *, executor=None):
     parser = argparse.ArgumentParser(description=__doc__)
     phase = parser.add_mutually_exclusive_group(required=True)
     phase.add_argument('--prepare', action='store_true', help='copy immutable historical evidence and freeze a fresh preview; no native call')
     phase.add_argument('--run', action='store_true', help='explicit native Worker.review call then close only preview; one run per label/case')
+    phase.add_argument('--verify', action='store_true', help='read-only check of actual native result, frozen expectations and independent business review')
     parser.add_argument('--case', required=True)
     parser.add_argument('--label', required=True)
     parser.add_argument('--project', type=Path, required=True)
     parser.add_argument('--inventory', type=Path, required=True)
     parser.add_argument('--audit', type=Path, required=True)
     parser.add_argument('--timeout', type=int, default=1800)
+    parser.add_argument('--expectations', type=Path)
+    parser.add_argument('--expectations-sha256')
+    parser.add_argument('--independent-review', type=Path)
+    parser.add_argument('--review-sha256')
     args = parser.parse_args(argv)
+    if args.verify and (args.expectations is None or args.independent_review is None
+                       or not all(isinstance(x, str) and len(x) == 64
+                                  and all(c in '0123456789abcdef' for c in x)
+                                  for x in (args.expectations_sha256, args.review_sha256))):
+        parser.error('--verify requires expectations, independent review and their frozen SHA-256 digests')
     if not all(x and all(c.isalnum() or c in '-_' for c in x) for x in (args.case, args.label)):
         raise ValueError('invalid_case_or_label')
     if not 60 <= args.timeout <= 3600:
         raise ValueError('invalid_timeout')
     args.project = args.project.resolve()
     os.umask(0o077)
+    if args.verify:
+        return verify(args)
     if args.prepare:
         prepare(args)
         return 0

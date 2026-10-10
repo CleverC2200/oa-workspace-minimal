@@ -120,3 +120,133 @@ def test_prepare_rejects_changed_original_evidence_before_freezing(recorded_case
     original_path.write_bytes(b'changed payment evidence')
     with pytest.raises(ValueError, match='original_evidence_fingerprint_mismatch'):
         finance_preaudit_native_replay.main(arguments)
+
+
+@pytest.fixture
+def acceptance_records(recorded_case, capsys):
+    """Offline artifact fixture; its native tag does not represent a model call."""
+    arguments, _, _ = recorded_case
+    finance_preaudit_native_replay.main(arguments)
+    prepared = json.loads(capsys.readouterr().out)
+    action_file = Path(prepared['action_file'])
+    action = json.loads(action_file.read_text())
+    packet = json.loads(Path(action['review_packet_file']).read_text())
+    def recorded_native(*_args):
+        return CodexExecution(None, {'status': 'unknown'}, {
+            'schema_version': 1, 'kind': 'preaudit_review_decision',
+            'action_token': action['action_token'], 'workflow_key': 'general_expense',
+            'rule_version': packet['rule_version'], 'overall': 'needs_human',
+            'items': [{'item_key': item['item_key'], 'status': 'uncertain',
+                       'conclusion': '具体费用对应关系待核。', 'evidence_refs': [],
+                       'missing_evidence': ['具体费用对应关系']} for item in packet['items']],
+        }, process_state='exited', decision_state='valid_object', exit_code=0)
+    assert finance_preaudit_native_replay.main(
+        ['--run' if x == '--prepare' else x for x in arguments], executor=recorded_native) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result['business_acceptance'] == 'not_verified'
+    audit = Path(prepared['audit'])
+    result['execution_transport'] = 'native'
+    finance_preaudit_native_replay.dump(audit / 'result.json', result)
+    manifest = finance_preaudit_native_replay.read(audit / 'prepare.json')
+    expectations = audit.parent.parent.parent / 'expectations.json'
+    finance_preaudit_native_replay.dump(expectations, {
+        'schema_version': 1, 'cases': [{'case': 'sample-a',
+            'allowed_statuses': {i['item_key']: ['uncertain'] for i in packet['items']}}],
+    })
+    review = expectations.with_name('independent-review.json')
+    finance_preaudit_native_replay.dump(review, {
+        'schema_version': 1, 'case': 'sample-a', 'label': 'baseline',
+        'source_head': manifest['source_head'],
+        'expectations_sha256': finance_preaudit_native_replay.digest(expectations),
+        'decision_sha256': result['decision_sha256'], 'verdict': 'accepted', 'findings': [],
+    })
+    initial_review_hash = finance_preaudit_native_replay.digest(review)
+    def check(*, expected_hash=None, review_hash=None):
+        check_args = ['--verify' if x == '--prepare' else x for x in arguments]
+        return finance_preaudit_native_replay.main(check_args + [
+            '--expectations', str(expectations), '--expectations-sha256', expected_hash or finance_preaudit_native_replay.digest(expectations),
+            '--independent-review', str(review), '--review-sha256', review_hash or (finance_preaudit_native_replay.digest(review) if review.exists() else initial_review_hash),
+        ])
+    return check, audit, expectations, review
+
+
+def test_verify_requires_bound_independent_business_review(acceptance_records, capsys):
+    check, audit, _, _ = acceptance_records
+    before = {p: p.read_bytes() for p in audit.rglob('*') if p.is_file()}
+    assert check() == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report['business_acceptance'] == 'accepted'
+    assert report['source_head'] == finance_preaudit_native_replay.read(audit / 'prepare.json')['source_head']
+    assert report['qualification_scope'] == 'single_frozen_native_case'
+    assert report['findings'] == []
+    assert before == {p: p.read_bytes() for p in audit.rglob('*') if p.is_file()}
+
+
+@pytest.mark.parametrize('mistake,code', [
+    ('wrong_status', 'item_status_mismatch'), ('semantic_rejected', 'independent_review_not_accepted'),
+    ('review_for_other_decision', 'independent_review_binding_mismatch'),
+    ('recorded_transport', 'native_model_evidence_unverified'), ('missing_review', 'acceptance_evidence_unreadable'),
+    ('changed_rule', 'frozen_source_changed'), ('changed_material', 'original_material_changed'),
+    ('changed_decision', 'decision_fingerprint_mismatch'),
+    ('changed_fresh_material', 'frozen_review_inputs_changed'),
+    ('deleted_fresh_material', 'frozen_review_inputs_changed'),
+    ('changed_packet', 'frozen_review_inputs_changed'),
+    ('deleted_packet', 'frozen_review_inputs_changed'),
+])
+def test_verify_rejects_unqualified_results(acceptance_records, capsys, mistake, code):
+    check, audit, expectations, review = acceptance_records
+    manifest = finance_preaudit_native_replay.read(audit / 'prepare.json')
+    if mistake == 'wrong_status':
+        data = finance_preaudit_native_replay.read(expectations)
+        for key in data['cases'][0]['allowed_statuses']:
+            data['cases'][0]['allowed_statuses'][key] = ['pass']
+        finance_preaudit_native_replay.dump(expectations, data)
+        data = finance_preaudit_native_replay.read(review)
+        data['expectations_sha256'] = finance_preaudit_native_replay.digest(expectations)
+        finance_preaudit_native_replay.dump(review, data)
+    elif mistake.startswith('semantic') or mistake == 'review_for_other_decision':
+        data = finance_preaudit_native_replay.read(review)
+        data['verdict' if mistake.startswith('semantic') else 'decision_sha256'] = 'rejected' if mistake.startswith('semantic') else '0' * 64
+        finance_preaudit_native_replay.dump(review, data)
+    elif mistake == 'recorded_transport':
+        data = finance_preaudit_native_replay.read(audit / 'result.json')
+        data['execution_transport'] = 'recorded'
+        finance_preaudit_native_replay.dump(audit / 'result.json', data)
+    elif mistake == 'missing_review':
+        # Keep the caller's frozen digest while the corresponding file disappears.
+        review.unlink()
+    elif mistake == 'changed_rule':
+        p = Path(manifest['project_root']) / manifest['source_manifest'][0]['path']
+        p.write_text(p.read_text() + '\nchanged rule\n')
+    elif mistake == 'changed_material':
+        Path(manifest['original_material']).write_text('{}')
+    elif mistake in {'changed_fresh_material', 'deleted_fresh_material', 'changed_packet', 'deleted_packet'}:
+        action = finance_preaudit_native_replay.read(manifest['action_file'])
+        state = finance_preaudit_native_replay.read(action['state_file'])
+        p = Path(state['material_file'] if mistake.endswith('material') else action['review_packet_file'])
+        if mistake.startswith('deleted'):
+            p.unlink()
+        else:
+            data = finance_preaudit_native_replay.read(p)
+            if mistake.endswith('material'):
+                data['declared_fields'][0]['value'] = '999999'
+            else:
+                data['rule_version'] = 'unreviewed-tampered-rule'
+            finance_preaudit_native_replay.dump(p, data)
+    elif mistake == 'changed_decision':
+        Path(manifest['action_file']).with_name('native-preview-decision.json').write_text('{}')
+    assert check() == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report['business_acceptance'] == 'not_accepted'
+    assert any(code in finding for finding in report['findings'])
+
+
+@pytest.mark.parametrize('hash_argument,code', [
+    ('expected_hash', 'expectations_fingerprint_mismatch'), ('review_hash', 'review_fingerprint_mismatch'),
+])
+def test_verify_rejects_mismatching_independently_frozen_hash(acceptance_records, capsys, hash_argument, code):
+    check, _, _, _ = acceptance_records
+    assert check(**{hash_argument: '0' * 64}) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report['business_acceptance'] == 'not_accepted'
+    assert any(code in finding for finding in report['findings'])
