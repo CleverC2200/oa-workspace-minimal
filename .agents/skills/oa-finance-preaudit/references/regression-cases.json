@@ -970,6 +970,48 @@
       "expected_output": "员工与销售方不同名本身不追加人员材料；维修费保留真实第三方与费用关系缺口，第1项和第4项uncertain；邮寄费不新增截图要求，不影响金额的照片缺口不自动投射金额",
       "failure_mode": "OA报销角色与实际交易对象混同，或不同科目与审核项之间盲目扩散状态",
       "rule_ref": "observation-contract.md#付款事实与费用对应关系;payment-screenshot-exemption.md#入口先核对已有支付截图;flows/general-expense.md#第-4-项金额孰低核销"
+    },
+    {
+      "id": "RC-069-financial-review-basis-and-optional-postage-proof",
+      "scope": "general_expense",
+      "audit_item": "reimbursable_minimum",
+      "status": "confirmed",
+      "input_facts": [
+        "合成邮寄费：本轮财务审核金额100元、旧纸申请金额120元，关联发票100元，运单起讫地可读且票号可信对应",
+        "额外付款截图覆盖范围未知，没有可验证的同范围实付、退款或金额冲突"
+      ],
+      "incorrect_output": "要求解释旧纸申请差额或补额外付款截图的每笔运单覆盖关系，将本已闭合科目的金额判待核",
+      "expected_output": "按本轮财务审核100元与发票100元孰低，金额项通过100元；不把旧申请差额或可选截图覆盖未知当成新证明义务",
+      "failure_mode": "原申请金额替代财务审核口径，或非必需截图产生额外核销门槛",
+      "rule_ref": "flows/general-expense.md#第-4-项金额孰低核销"
+    },
+    {
+      "id": "RC-070-optional-payment-does-not-hide-verified-net-lower-amount",
+      "scope": "general_expense",
+      "audit_item": "reimbursable_minimum",
+      "status": "confirmed",
+      "input_facts": [
+        "合成邮寄费财务审核与关联发票均100元，运单可信闭合；虽不要求支付截图，已提供当前费用可验证实付100元及同笔退款10元",
+        "混合单另笔要求付款截图的维修费实际收款对象与发票的对应关系未核实"
+      ],
+      "incorrect_output": "因邮寄费无需截图而忽略可验证退款，或把邮寄费不新增证明义务扩大为其他明细金额通过",
+      "expected_output": "邮寄费已验证净实付90元仍参与孰低，100元高于90元的真实差额保留；另笔维修费真实付款关系缺口继续影响金额，不给整单最终核销通过",
+      "failure_mode": "消除可选截图误报时丢弃已验证低付退款或其他科目的真异常",
+      "rule_ref": "flows/general-expense.md#第-4-项金额孰低核销"
+    },
+    {
+      "id": "RC-071-confirmed-discount-failure-keeps-separate-receiver-gap",
+      "scope": "general_expense",
+      "audit_item": "attachment_payment_evidence;reimbursable_minimum",
+      "status": "confirmed",
+      "input_facts": [
+        "合成服务费财务审核及当前关联发票100元；付款页显示本项服务的交易成功、订单100元、优惠10元及实付90元，费用与付款范围可信对应",
+        "实际交易收款法人和开票法人之间的主体关系仍无法可信核实"
+      ],
+      "incorrect_output": "因主体关系待核而把已经确认的10元少付差额仅写为金额待核，或为消除关系缺口把少付事实丢弃",
+      "expected_output": "第1项保留实际收款法人和开票法人的主体关系待核；第4项fail并保留核销上限90元及10元差额，整单needs_human。费用与支付范围确实未知的其他案例仍按uncertain，不猜测为金额不符",
+      "failure_mode": "其他关系未知覆盖了已确认的同范围金额不符",
+      "rule_ref": "flows/general-expense.md#第-4-项金额孰低核销"
     }
   ]
 }

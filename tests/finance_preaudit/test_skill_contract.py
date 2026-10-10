@@ -279,4 +279,7 @@ def test_six_finance_flows_share_payment_screenshot_rule():
         "RC-066-mixed-postage-keeps-subject-material-scope",
         "RC-067-payment-net-does-not-prove-shared-fee-scope",
         "RC-068-actual-third-party-is-not-oa-reimbursement-payee",
+        "RC-069-financial-review-basis-and-optional-postage-proof",
+        "RC-070-optional-payment-does-not-hide-verified-net-lower-amount",
+        "RC-071-confirmed-discount-failure-keeps-separate-receiver-gap",
     } <= cases
