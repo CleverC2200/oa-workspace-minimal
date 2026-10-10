@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 from pathlib import Path
 import re
@@ -72,6 +73,26 @@ def check_skill(path: Path = SKILL_PATH) -> list[str]:
     if re.search(r"(?m)^[ ]{0,3}\[TODO:[^\n]*\][ \t]*$", content[match.end():]):
         return ["skill_todo_placeholder"]
     return []
+
+
+def check_payment_rule_ownership(
+    path: Path = PROJECT_ROOT / 'apps/oa_finance_preaudit/codex_review_worker.py',
+) -> list[str]:
+    """Keep the previously duplicated relationship branch in its Skill owner."""
+    owner = '.agents/skills/oa-finance-preaudit/references/payment-screenshot-exemption.md'
+    try:
+        tree = ast.parse(path.read_text(encoding='utf-8'))
+    except (OSError, SyntaxError):
+        return [f'{path.name}:payment_rule_source_invalid:fix Worker source before checking {owner}']
+    findings = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if any(term in node.value for term in ('人员关系', '委托代付款', '委托收款')):
+                findings.append(
+                    f'{path.name}:{node.lineno}:payment_relationship_rule_in_worker:'
+                    f'load {owner}; remove the duplicate relationship instruction'
+                )
+    return sorted(findings)
 
 
 def check_hygiene(paths: Iterable[Path]) -> list[str]:
@@ -278,12 +299,14 @@ def _event_body(path: Path) -> object:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="repository-quality")
-    parser.add_argument("check", choices=("skill", "hygiene", "format", "links", "pr", "yaml", "schema", "lint", "environment", "production-config"))
+    parser.add_argument("check", choices=("skill", "hygiene", "format", "links", "pr", "yaml", "schema", "lint", "environment", "production-config", "payment-rules"))
     parser.add_argument("--event", type=Path)
     args = parser.parse_args(argv)
     files = tracked_files()
     if args.check == "skill":
         findings = check_skill()
+    elif args.check == 'payment-rules':
+        findings = check_payment_rule_ownership()
     elif args.check == "hygiene":
         findings = check_hygiene(files)
     elif args.check == "format":

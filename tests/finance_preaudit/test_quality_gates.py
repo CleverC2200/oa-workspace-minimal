@@ -7,6 +7,29 @@ from pathlib import Path
 from scripts import quality
 
 
+def test_payment_rule_ownership_rejects_real_pr405_worker_instruction(tmp_path):
+    # Verbatim instruction retained from ec9c4a1, before the #424 repair.
+    worker = tmp_path / 'codex_review_worker.py'
+    worker.write_text('_GENERAL_EXPENSE_REQUIREMENT = (\n'
+                      '    "确认名称不一致后按规则核验人员关系和补充材料；"\n)\n')
+    findings = quality.check_payment_rule_ownership(worker)
+    assert len(findings) == 1
+    assert 'payment_relationship_rule_in_worker' in findings[0]
+    assert 'payment-screenshot-exemption.md' in findings[0]
+
+
+def test_payment_rule_ownership_reads_current_worker_without_importing_it():
+    assert quality.check_payment_rule_ownership() == []
+
+
+def test_payment_rule_ownership_detects_delegation_strings_and_reports_syntax(tmp_path):
+    worker = tmp_path / 'codex_review_worker.py'
+    worker.write_text('prompt = "需要" + "委托收款材料"\n')
+    assert 'payment_relationship_rule_in_worker' in quality.check_payment_rule_ownership(worker)[0]
+    worker.write_text('prompt = (\n')
+    assert 'payment_rule_source_invalid' in quality.check_payment_rule_ownership(worker)[0]
+
+
 class TestQualityGate:
     def test_tracked_files_include_new_files_and_skip_deleted_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

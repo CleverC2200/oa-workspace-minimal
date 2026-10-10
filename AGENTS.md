@@ -39,6 +39,7 @@
 
 | 规则 | 落实机制 |
 | --- | --- |
+| 付款人员关系及委托材料分支由[共享付款规则](.agents/skills/oa-finance-preaudit/references/payment-screenshot-exemption.md)维护 | `python -m scripts.quality payment-rules` 与 quality CI 检查 Worker 字符串中重现的人员关系、委托代付款及委托收款指令；错误直接指向规则文件。 |
 | pytest 离线验证使用显式录制或 fake 传输 | `tests/conftest.py` 默认拒绝测试进程及线程的 DNS、TCP/UDP 外联，意外调用报 `offline_network_forbidden`；子进程和独立脚本边界见[质量检查](docs/agents/quality-checks.md)。 |
 | OA 关联、票面字段、文件记录与正文覆盖分别核验 | FlowEngine 冻结关联合同，以及 `test_invoice_linkage_preview.py`、`test_invoice_evidence_coverage.py` 和 `test_invoice_material_diagnostics.py` 的真实公开入口回归。 |
 
