@@ -2682,6 +2682,14 @@ class FlowEngine:
             verifier=self._authorization_verifier,
             submitter_available=self._submit_frozen is not None,
         )
+        if not preserve_action_token and os.path.lexists(action_path.with_name("review-failure.json")):
+            # Keep the old failure bound to its original token before rotating it.
+            previous_failure = review_failure_evidence.read_receipt(action_path.with_name("review-failure.json"))
+            if not review_failure_evidence.receipt_matches(
+                previous_failure, action_token=action["action_token"], workflow_key=action["workflow_key"],
+            ):
+                raise ValueError("review_quarantine_invalid")
+            _supersede_stale_review_failure(action_path)
         refreshed_action = {
             **action,
             "authorization_fingerprint": authorization[

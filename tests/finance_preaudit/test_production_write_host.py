@@ -8,6 +8,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -386,6 +387,126 @@ def test_expiring_open_action_renews_same_bound_authorization_before_review(
     closed = engine.complete_review(Path(renewed["action_file"]), decision_file)
 
     assert closed["write_state"] == "submitted"
+    assert len(api.calls) == 1
+
+
+def _failed_open_action(tmp_path):
+    from apps.oa_finance_preaudit import review_failure_evidence
+
+    root = tmp_path / "runtime" / "finance_preaudit_flows"
+    policy = tmp_path / "write-policy.json"
+    json_artifact.write_json_atomic(policy, {
+        "schema_version": 1, "kind": "preaudit_write_policy",
+        "authorized_workflows": ["travel_expense"],
+    })
+    clock = [NOW]
+    api = FakeWriterApi()
+    engine = flow_engine.FlowEngine(
+        root=root,
+        discover_candidates=lambda workflow: [{
+            "request_id": "live-request", "received_at": "2026-08-23T08:30:00+08:00",
+            "workflow_key": workflow,
+        }],
+        collect_material=lambda request, _root: _material(request),
+        **production_write.build_ports(
+            root=root, policy_file=policy, signing_secret="local-test-secret",
+            api_factory=lambda: api, now=lambda: clock[0],
+        ),
+    )
+    action = engine.next_action("travel_expense", mode="controlled_write")
+    receipt = Path(action["action_file"]).with_name("review-failure.json")
+    json_artifact.write_json_atomic(receipt, review_failure_evidence.receipt_payload(
+        action_token=action["action_token"], workflow_key="travel_expense",
+        failure_code="codex_process_timeout", attempt_error_codes=["codex_process_timeout"],
+    ))
+    return engine, clock, api, action, receipt
+
+
+@pytest.mark.parametrize("advance_minutes", [39, 40, 41, 61])
+def test_renewed_authorization_retains_old_failure_and_accepts_new_cli_failure(
+    tmp_path, monkeypatch, advance_minutes,
+):
+    from apps.oa_finance_preaudit import codex_review_worker as worker, review_failure_evidence
+
+    engine, clock, api, original, receipt = _failed_open_action(tmp_path)
+    old_bytes = receipt.read_bytes()
+    clock[0] = NOW + timedelta(minutes=advance_minutes)
+    renewed = engine.next_action("travel_expense", mode="controlled_write")
+    assert renewed["action"] == "review_required"
+    assert (renewed["action_token"] != original["action_token"]) is (advance_minutes >= 40)
+    if advance_minutes >= 40:
+        assert not receipt.exists()
+        assert [path.read_bytes() for path in receipt.parent.glob("superseded-review-failure-*.json")] == [old_bytes]
+    else:
+        assert receipt.read_bytes() == old_bytes
+
+    # Exercise worker.review and its real process/diagnostic path, not a fake executor.
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "fake-native-home"))
+    monkeypatch.setattr(worker, "_codex_command", lambda *args, **kwargs: [
+        sys.executable, "-c",
+        'import sys,json; sys.stdin.read(); print(json.dumps({"type":"turn.failed",'
+        '"error":{"message":"offline transport failed","codexErrorInfo":'
+        '{"httpConnectionFailed":{"httpStatusCode":502}}}}),flush=True); sys.exit(1)',
+    ])
+    result = worker.review({
+        "project_root": str(tmp_path), "action_file": renewed["action_file"], "timeout_seconds": 60,
+    })
+    assert result["error_code"] == "codex_process_failed"
+    assert result["process_attempts"] == 1
+    assert result["process_retries"] == 0
+    assert result["write_state"] == "not_requested"
+    assert review_failure_evidence.receipt_matches(
+        review_failure_evidence.read_receipt(receipt), action_token=renewed["action_token"],
+        workflow_key="travel_expense", failure_code="codex_process_failed",
+    )
+    assert [path.read_bytes() for path in receipt.parent.glob("superseded-review-failure-*.json")] == [old_bytes]
+    assert list(receipt.parent.glob("review-process-*.json"))
+    assert not receipt.with_name("execution-receipt.json").exists()
+    assert api.calls == []
+
+
+@pytest.mark.parametrize("damage", ["token", "workflow", "malformed", "symlink", "archive_collision"])
+def test_authorization_renewal_refuses_untrusted_failure_evidence(tmp_path, damage):
+    engine, clock, api, original, receipt = _failed_open_action(tmp_path)
+    if damage == "symlink":
+        outside = tmp_path / "outside.json"
+        receipt.rename(outside)
+        receipt.symlink_to(outside)
+    elif damage == "archive_collision":
+        digest = hashlib.sha256(receipt.read_bytes()).hexdigest()[:16]
+        receipt.with_name(f"superseded-review-failure-{digest}.json").write_text("untouched")
+    else:
+        payload = json.loads(receipt.read_text())
+        if damage == "token":
+            payload["action_token"] = "different-action"
+        elif damage == "workflow":
+            payload["workflow_key"] = "general_expense"
+        else:
+            payload = {}
+        json_artifact.write_json_atomic(receipt, payload)
+    before = receipt.read_bytes()
+    clock[0] = NOW + timedelta(minutes=41)
+    result = engine.next_action("travel_expense", mode="controlled_write")
+    assert result["action"] == "needs_admin"
+    assert result["reason"] == "review_quarantine_invalid"
+    assert receipt.read_bytes() == before
+    state = json.loads(Path(original["state_file"]).read_text())
+    assert state["action_token"] == original["action_token"]
+    assert state["write_authorized"] is False
+    assert not receipt.with_name("execution-receipt.json").exists()
+    assert api.calls == []
+
+
+def test_completion_refresh_keeps_failure_evidence_when_action_token_is_preserved(tmp_path):
+    engine, clock, api, original, receipt = _failed_open_action(tmp_path)
+    old_bytes = receipt.read_bytes()
+    clock[0] = NOW + timedelta(minutes=41)
+    decision = tmp_path / "decision.json"
+    json_artifact.write_json_atomic(decision, _decision(original))
+    completed = engine.complete_review(Path(original["action_file"]), decision)
+    assert completed["write_state"] == "submitted"
+    assert receipt.read_bytes() == old_bytes
+    assert not list(receipt.parent.glob("superseded-review-failure-*.json"))
     assert len(api.calls) == 1
 
 
