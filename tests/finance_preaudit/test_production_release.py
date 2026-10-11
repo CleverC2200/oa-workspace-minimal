@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
+import os
 import subprocess
 
 import pytest
 
 from apps.oa_approval import runtime_control
-from apps.oa_finance_preaudit import production_release
+from apps.oa_finance_preaudit import maintenance_runtime, production_release
 from tests.finance_preaudit.test_maintenance_runtime import live_snapshot
 
 
@@ -37,6 +39,270 @@ def production(tmp_path, monkeypatch):
     manifest.parent.mkdir(parents=True)
     manifest.write_text('{"state":"failed"}')
     return root, remote, git(root, 'rev-parse', 'HEAD')
+
+
+@pytest.fixture
+def stopped_production(production):
+    root, remote, revision = production
+    stop = root / 'runtime/stop-preaudit.flag'
+    runtime_control.write_control_bytes_atomic(stop, b'stop_requested:codex_review_technical_failure\n')
+    automation_file = root.parent / 'automation.toml'
+    prompt = (Path(production_release.__file__).resolve().parents[2] / 'config/automations/oa-skill-prompt.txt').read_text()
+    automation_file.write_text('status = "PAUSED"\nkind = "cron"\nexecution_environment = "local"\n'
+        'model = "gpt-6.1-sol"\nreasoning_effort = "medium"\nrrule = "preserved"\n'
+        + 'cwds = ' + json.dumps([str(root)]) + '\nprompt = ' + json.dumps(prompt, ensure_ascii=False)
+        + '\n[target]\ntype = "project"\nproject_id = "production"\n')
+    automation_file.chmod(0o600)
+    automation = production_release.ProductionAutomation(automation_file, 'production', 'preserved')
+    manifest = {'kind': 'preaudit_controller_run_manifest', 'state': 'failed', 'children_reaped': True,
+        'run_id': 'a' * 32, 'controller_instance_id': 'b' * 32, 'controller_pid': 99999999,
+        'code_revision': revision}
+    runtime_control.write_control_bytes_atomic(root / 'runtime/control/rolling-controller-manifest.json',
+        json.dumps(manifest).encode())
+    original = maintenance_runtime.OriginalExecution(root / ('runtime/control/executions/' + 'c' * 32 + '/execution.json'),
+        '00000000-0000-0000-0000-000000000001', 'original-session')
+    report = {'kind': 'preaudit_controller_execution_readback', 'read_only': True, 'state': 'exited',
+        'terminal': True, 'children_reaped': True, 'controller_state': 'failed', 'exit_code': 1,
+        'run_id': manifest['run_id'], 'controller_instance_id': manifest['controller_instance_id'],
+        'code_revision': revision, 'receipt_file': str(original.file), 'owner_task_id': original.owner_task_id,
+        'invocation_id': original.file.parent.name, 'tool_session_id': original.tool_session_id}
+    return root, remote, revision, stop, automation, original, report
+
+
+def test_stopped_source_sync_preserves_stop_and_paused_cron_without_business_readiness(stopped_production):
+    root, remote, before, stop, automation, original, report = stopped_production
+    source = remote.parent / 'source'
+    git(remote.parent, 'clone', '-q', str(remote), str(source))
+    (source / 'source.txt').write_text('second')
+    git(source, 'add', '.')
+    git(source, 'commit', '-qm', 'second')
+    git(source, 'push', '-q')
+    git(root, 'fetch', '-q', 'origin')
+    expected = git(source, 'rev-parse', 'HEAD')
+    stop_before = stop.stat(), stop.read_bytes()
+    cron_before = automation.file.read_bytes()
+    def read_original(target, binding):
+        assert runtime_control.controller_active(target / 'runtime/control/rolling-controller.lock')
+        assert runtime_control.active_request_writers(target / 'runtime/control/frozen-writer.lock') == 1
+        assert binding == original
+        return report
+    result = production_release.release_source(root, expected_revision=expected, expected_origin=str(remote),
+        confirmed_sync=True, stopped_maintenance=True, automation=automation, original_execution=original,
+        check_original=read_original, check_live=lambda _: live_snapshot(), check_configuration=lambda *_: [])
+    assert result['status'] == 'synced'
+    assert result['before_revision'] == before
+    assert result['after_revision'] == expected
+    assert result['next_process_ready'] is False
+    assert result['write_state'] == 'not_requested'
+    assert result['production_acceptance'] == 'not_verified'
+    assert result['stop_preserved'] is True
+    assert result['automation_state'] == 'PAUSED'
+    assert (stop.stat(), stop.read_bytes()) == stop_before
+    assert automation.file.read_bytes() == cron_before
+
+
+def test_stopped_postcheck_preserves_actual_update_and_changed_control_proof(stopped_production):
+    root, remote, before, stop, automation, original, report = stopped_production
+    calls = 0
+    def live(_):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            runtime_control.write_control_bytes_atomic(stop, stop.read_bytes())
+        return live_snapshot()
+    result = production_release.release_source(root, expected_revision=before, expected_origin=str(remote),
+        confirmed_sync=True, stopped_maintenance=True, automation=automation, original_execution=original,
+        check_original=lambda *_: report, check_live=live, check_configuration=lambda *_: [])
+    assert result['status'] == 'blocked'
+    assert result['code'] == 'production_release_stopped_controls_changed'
+    assert result['stop_preserved'] is False
+    assert result['stopped_controls_before']['stop'] != result['stopped_controls_after']['stop']
+    assert result['stopped_controls_after']['automation_state'] == 'PAUSED'
+    assert result['source_sync_state'] == 'not_updated'
+    assert result['next_process_ready'] is False
+    assert result['write_state'] == 'not_requested'
+
+
+@pytest.mark.parametrize('scenario,code', [
+    ('ordinary', 'production_release_stop_requested'),
+    ('manual_stop', 'production_release_stop_not_repairable'),
+    ('unknown_stop', 'production_release_stop_not_repairable'),
+    ('writer_stop', 'production_release_stop_not_repairable'),
+    ('cooldown_stop', 'production_release_stop_not_repairable'),
+    ('unsafe_stop', 'production_release_control_untrusted'),
+    ('linked_stop', 'production_release_control_untrusted'),
+    ('active_cron', 'production_release_automation_not_paused'),
+    ('wrong_cron', 'production_release_configuration_invalid'),
+    ('original_waiting', 'maintenance_original_execution_untrusted'),
+    ('original_unreaped', 'maintenance_original_execution_untrusted'),
+    ('original_session', 'maintenance_original_execution_untrusted'),
+    ('original_run', 'maintenance_original_execution_untrusted'),
+    ('original_exit', 'maintenance_original_execution_untrusted'),
+    ('original_alive', 'maintenance_original_process_active'),
+    ('identity', 'maintenance_live_identity_untrusted'),
+    ('authorization', 'maintenance_current_inputs_untrusted'),
+    ('freeze', 'maintenance_current_inputs_untrusted'),
+    ('unknown_write', 'maintenance_current_write_unresolved'),
+    ('continuation', 'maintenance_reconciliation_untrusted'),
+    ('unreaped_controller', 'maintenance_handoff_untrusted'),
+])
+def test_stopped_mode_keeps_existing_and_original_evidence_gates(stopped_production, scenario, code):
+    root, remote, expected, stop, automation, original, report = stopped_production
+    snapshot = live_snapshot()
+    if scenario.endswith('_stop') and scenario not in {'unsafe_stop', 'linked_stop'}:
+        reason = {'manual_stop': b'stop_requested\n', 'unknown_stop': b'stop_requested:unknown\n',
+                  'writer_stop': b'stop_requested:writer_result_unknown\n',
+                  'cooldown_stop': b'stop_requested:codex_official_error_cooldown\n'}[scenario]
+        runtime_control.write_control_bytes_atomic(stop, reason)
+    elif scenario == 'unsafe_stop':
+        stop.chmod(0o666)
+    elif scenario == 'linked_stop':
+        external = root.parent / 'stop'
+        stop.rename(external)
+        stop.symlink_to(external)
+    elif scenario == 'active_cron':
+        automation.file.write_text(automation.file.read_text().replace('"PAUSED"', '"ACTIVE"'))
+    elif scenario == 'wrong_cron':
+        automation.file.write_text(automation.file.read_text().replace('project_id = "production"', 'project_id = "other"'))
+    elif scenario.startswith('original_'):
+        if scenario == 'original_alive':
+            manifest_file = root / 'runtime/control/rolling-controller-manifest.json'
+            manifest = json.loads(manifest_file.read_bytes())
+            manifest['controller_pid'] = os.getpgrp()
+            runtime_control.write_control_bytes_atomic(manifest_file, json.dumps(manifest).encode())
+        else:
+            key, value = {'original_waiting': ('state', 'waiting'), 'original_unreaped': ('children_reaped', False),
+                'original_session': ('tool_session_id', 'new-session'), 'original_run': ('run_id', 'd' * 32),
+                'original_exit': ('exit_code', 0)}[scenario]
+            report[key] = value
+    elif scenario == 'identity':
+        snapshot['live_check']['oa']['execution_identity'] = 'mismatch'
+    elif scenario == 'authorization':
+        snapshot['maintenance_current_inputs']['authorized_workflows'] = []
+    elif scenario == 'freeze':
+        snapshot['maintenance_current_inputs']['validated_frozen_count'] = 1
+    elif scenario == 'unknown_write':
+        snapshot['reconciliation']['findings'] = [{'category': 'pending_not_handled', 'local_write_state': 'unknown'}]
+    elif scenario == 'continuation':
+        snapshot['reconciliation']['continuation']['status'] = 'blocked'
+    elif scenario == 'unreaped_controller':
+        snapshot['controller_handoff']['children_reaped'] = False
+    before = stop.lstat(), stop.read_bytes(), automation.file.read_bytes()
+    with pytest.raises(RuntimeError, match=code):
+        production_release.release_source(root, expected_revision=expected, expected_origin=str(remote),
+            confirmed_sync=True, stopped_maintenance=scenario != 'ordinary', automation=automation,
+            original_execution=original, check_original=lambda *_: report,
+            check_live=lambda _: snapshot, check_configuration=lambda *_: [])
+    assert git(root, 'rev-parse', 'HEAD') == expected
+    assert (stop.lstat(), stop.read_bytes(), automation.file.read_bytes()) == before
+
+
+@pytest.mark.parametrize('when', ['original', 'live', 'configuration'])
+@pytest.mark.parametrize('control', ['stop', 'cron'])
+def test_stopped_sync_rejects_control_races_before_merge(stopped_production, when, control):
+    root, remote, expected, stop, automation, original, report = stopped_production
+    def mutate():
+        path = stop if control == 'stop' else automation.file
+        runtime_control.write_control_bytes_atomic(path, path.read_bytes())
+    def read_original(*_):
+        if when == 'original':
+            mutate()
+        return report
+    def live(_):
+        if when == 'live':
+            mutate()
+        return live_snapshot()
+    config_calls = 0
+    def config(*_):
+        nonlocal config_calls
+        config_calls += 1
+        if when == 'configuration' and config_calls == 2:
+            mutate()
+        return []
+    with pytest.raises(RuntimeError, match='production_release_stopped_controls_changed'):
+        production_release.release_source(root, expected_revision=expected, expected_origin=str(remote),
+            confirmed_sync=True, stopped_maintenance=True, automation=automation, original_execution=original,
+            check_original=read_original, check_live=live, check_configuration=config)
+    assert git(root, 'rev-parse', 'HEAD') == expected
+
+
+def test_stopped_post_sync_failure_reports_source_updated_and_preserved_controls(stopped_production):
+    root, remote, before, stop, automation, original, report = stopped_production
+    source = remote.parent / 'source'
+    git(remote.parent, 'clone', '-q', str(remote), str(source))
+    (source / 'source.txt').write_text('second')
+    git(source, 'add', '.')
+    git(source, 'commit', '-qm', 'second')
+    git(source, 'push', '-q')
+    git(root, 'fetch', '-q', 'origin')
+    expected = git(source, 'rev-parse', 'HEAD')
+    calls = 0
+    def live(_):
+        nonlocal calls
+        calls += 1
+        snapshot = live_snapshot()
+        if calls == 2:
+            snapshot['live_check']['oa']['execution_identity'] = 'mismatch'
+        return snapshot
+    result = production_release.release_source(root, expected_revision=expected, expected_origin=str(remote),
+        confirmed_sync=True, stopped_maintenance=True, automation=automation, original_execution=original,
+        check_original=lambda *_: report, check_live=live, check_configuration=lambda *_: [])
+    assert result['status'] == 'blocked'
+    assert result['code'] == 'maintenance_live_identity_untrusted'
+    assert result['source_sync_state'] == 'updated'
+    assert result['before_revision'] == before
+    assert result['after_revision'] == expected
+    assert result['stop_preserved'] is result['automation_preserved'] is True
+    assert result['stopped_controls_before'] == result['stopped_controls_after']
+    assert result['next_process_ready'] is False
+    assert git(root, 'rev-parse', 'HEAD') == expected
+
+
+def test_stopped_preflight_is_readonly_and_requires_original_binding(stopped_production, capsys):
+    root, remote, expected, stop, automation, original, report = stopped_production
+    result = production_release.release_source(root, expected_revision=expected, expected_origin=str(remote),
+        stopped_maintenance=True, automation=automation, original_execution=original,
+        check_original=lambda *_: report, check_live=lambda _: live_snapshot(), check_configuration=lambda *_: [])
+    assert result['status'] == 'ready'
+    assert result['next_process_ready'] is False
+    assert result['source_sync_requested'] is False
+    assert result['stop_preserved'] is True
+    assert production_release.main(['--target-root', str(root), '--expected-revision', expected,
+        '--automation-file', str(automation.file), '--production-project-id', 'production',
+        '--expected-schedule', 'preserved', '--stopped-maintenance', 'YES']) == 1
+    blocked = json.loads(capsys.readouterr().out)
+    assert blocked['code'] == 'production_release_original_execution_required'
+    assert blocked['stopped_controls_before'] == blocked['stopped_controls_after']
+    assert blocked['stop_preserved'] is True
+    assert blocked['automation_state'] == 'PAUSED'
+
+
+def test_stopped_mode_accepts_native_readable_cron_without_changing_permissions(stopped_production):
+    root, remote, expected, stop, automation, original, report = stopped_production
+    automation.file.chmod(0o644)
+    before = automation.file.stat().st_mode
+    result = production_release.release_source(root, expected_revision=expected, expected_origin=str(remote),
+        stopped_maintenance=True, automation=automation, original_execution=original,
+        check_original=lambda *_: report, check_live=lambda _: live_snapshot(), check_configuration=lambda *_: [])
+    assert result['status'] == 'ready'
+    assert result['automation_preserved'] is True
+    assert automation.file.stat().st_mode == before
+    assert stop.stat().st_mode & 0o777 == 0o600
+
+
+def test_stopped_cli_never_claims_unsafe_marker_preserved(stopped_production, capsys):
+    root, remote, expected, stop, automation, original, report = stopped_production
+    stop.chmod(0o666)
+    assert production_release.main(['--target-root', str(root), '--expected-revision', expected,
+        '--automation-file', str(automation.file), '--production-project-id', 'production',
+        '--expected-schedule', 'preserved', '--stopped-maintenance', 'YES',
+        '--original-receipt-file', str(original.file), '--original-owner-task-id', original.owner_task_id,
+        '--original-tool-session-id', original.tool_session_id]) == 1
+    blocked = json.loads(capsys.readouterr().out)
+    assert blocked['stopped_controls_before']['stop'] == {'status': 'untrusted'}
+    assert blocked['stopped_controls_after']['stop'] == {'status': 'untrusted'}
+    assert blocked['stop_preserved'] is False
+    assert blocked['next_process_ready'] is False
 
 
 def test_release_preflight_retains_leases_across_real_ff_and_readbacks(production):
