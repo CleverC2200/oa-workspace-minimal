@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import tempfile
 import tomllib
@@ -83,6 +85,68 @@ def _assert_no_stop(root: Path) -> None:
         raise RuntimeError('production_release_stop_requested')
 
 
+def _pinned_control(path: Path, *, private: bool = True) -> tuple[tuple[int, ...], bytes]:
+    pinned = path.lstat()
+    if (not stat.S_ISREG(pinned.st_mode) or pinned.st_uid != os.getuid()
+            or pinned.st_mode & (0o077 if private else 0o022)):
+        raise RuntimeError('production_release_control_untrusted')
+    raw = runtime_control.read_control_bytes(path)
+    current = path.lstat()
+    fields = ('st_dev', 'st_ino', 'st_mtime_ns', 'st_ctime_ns', 'st_mode', 'st_uid', 'st_size')
+    identity = tuple(getattr(pinned, name) for name in fields)
+    if raw is None or identity != tuple(getattr(current, name) for name in fields):
+        raise RuntimeError('production_release_control_untrusted')
+    return identity, raw
+
+
+def _stopped_controls(root: Path, automation: ProductionAutomation) -> tuple:
+    if os.environ.get('OA_FINANCE_PREAUDIT_STOP_REQUESTED', '').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}:
+        raise RuntimeError('production_release_stop_requested')
+    stop = _pinned_control(root / 'runtime/stop-preaudit.flag')
+    if stop[1] != b'stop_requested:codex_review_technical_failure\n':
+        raise RuntimeError('production_release_stop_not_repairable')
+    cron = _pinned_control(automation.file, private=False)
+    if tomllib.loads(cron[1].decode('utf-8')).get('status') != 'PAUSED':
+        raise RuntimeError('production_release_automation_not_paused')
+    findings = automation.findings(root)
+    if findings:
+        raise RuntimeError('production_release_configuration_invalid:' + ','.join(findings))
+    return stop, cron
+
+
+def _control_proof(pinned: tuple) -> dict:
+    identity, raw = pinned
+    return dict(zip(('device', 'inode', 'mtime_ns', 'ctime_ns', 'mode', 'uid', 'bytes'), identity),
+                sha256=hashlib.sha256(raw).hexdigest())
+
+
+def _stopped_observation(root: Path, automation: ProductionAutomation | None) -> dict:
+    observed = {}
+    for key, path in (('stop', root / 'runtime/stop-preaudit.flag'),
+                      ('automation', automation.file if automation else None)):
+        try:
+            if path is None:
+                raise RuntimeError('production_release_automation_required')
+            pinned = _pinned_control(path, private=key == 'stop')
+            observed[key] = _control_proof(pinned)
+            if key == 'automation':
+                state = tomllib.loads(pinned[1].decode('utf-8')).get('status')
+                observed['automation_state'] = state if state in {'PAUSED', 'ACTIVE'} else 'unknown'
+        except (OSError, ValueError, RuntimeError):
+            observed[key] = {'status': 'untrusted'}
+            if key == 'automation':
+                observed['automation_state'] = 'unknown'
+    return observed
+
+
+def _stopped_receipt(root: Path, automation: ProductionAutomation | None, before: dict | None) -> dict:
+    after = _stopped_observation(root, automation)
+    return {'stopped_maintenance': True, 'stopped_controls_before': before, 'stopped_controls_after': after,
+            'stop_preserved': bool(before and 'sha256' in before['stop'] and before['stop'] == after['stop']),
+            'automation_preserved': bool(before and 'sha256' in before['automation'] and before['automation'] == after['automation']),
+            'automation_state': after['automation_state']}
+
+
 def candidate_configuration_findings(root: Path, revision: str) -> list[str]:
     """Inspect candidate tracked text without importing or executing candidate code."""
     from . import production_config
@@ -103,7 +167,9 @@ def _observed_revision(root: Path) -> str | None:
     return revision if _REVISION.fullmatch(revision) else None
 
 
-def _failed_release(root: Path, before: str | None, expected: str, requested: bool, error: Exception) -> dict:
+def _failed_release(root: Path, before: str | None, expected: str, requested: bool, error: Exception,
+                    *, stopped_maintenance: bool = False, automation: ProductionAutomation | None = None,
+                    controls_before: dict | None = None) -> dict:
     after = _observed_revision(root)
     state = 'unknown' if before is None or after is None else ('not_updated' if after == before else 'updated')
     return {'schema_version': 1, 'kind': 'production_source_release', 'status': 'blocked',
@@ -111,7 +177,8 @@ def _failed_release(root: Path, before: str | None, expected: str, requested: bo
             'after_revision': after, 'revision': after, 'expected_revision': expected,
             'requested_revision': expected, 'source_sync_requested': requested,
             'source_sync_state': state, 'next_process_ready': False,
-            'production_acceptance': 'not_verified'}
+            'production_acceptance': 'not_verified',
+            **(_stopped_receipt(root, automation, controls_before) if stopped_maintenance else {})}
 
 
 def release_source(
@@ -119,6 +186,9 @@ def release_source(
     expected_origin: str = ORIGIN, automation: ProductionAutomation | None = None,
     check_live: Callable[[Path], dict] | None = None,
     check_configuration: Callable[[Path, str], list[str]] | None = None,
+    stopped_maintenance: bool = False,
+    original_execution: maintenance_runtime.OriginalExecution | None = None,
+    check_original: Callable[[Path, maintenance_runtime.OriginalExecution], dict] | None = None,
 ) -> dict:
     """Preflight, optionally ff-only sync, and verify while retaining both leases.
 
@@ -126,12 +196,31 @@ def release_source(
     adapters are for offline callers/tests; the CLI never accepts cached JSON.
     No OA write, stop mutation, automation change, fetch, dependency installation,
     or forced reset is performed. Fetch origin explicitly before calling.
+    stopped_maintenance retains one trusted technical stop and the original PAUSED
+    cron; it requires original execution readback and never makes approval ready.
     """
     root = Path(target_root).expanduser().absolute()
     if not _REVISION.fullmatch(expected_revision):
         raise RuntimeError('production_release_revision_invalid')
     maintenance_runtime.assert_target_environment(root)
-    _assert_no_stop(root)
+    controls = None
+    controls_before = None
+    if stopped_maintenance:
+        if automation is None:
+            raise RuntimeError('production_release_automation_required')
+        if original_execution is None:
+            raise RuntimeError('production_release_original_execution_required')
+        controls = _stopped_controls(root, automation)
+        controls_before = {'stop': _control_proof(controls[0]), 'automation': _control_proof(controls[1]),
+                           'automation_state': 'PAUSED'}
+    else:
+        _assert_no_stop(root)
+    def assert_controls() -> None:
+        if stopped_maintenance:
+            if _stopped_controls(root, automation) != controls:
+                raise RuntimeError('production_release_stopped_controls_changed')
+        else:
+            _assert_no_stop(root)
     before = _source(root, expected_revision, expected_origin)
     if check_configuration is None:
         if automation is None:
@@ -143,7 +232,7 @@ def release_source(
     findings = configuration(root, expected_revision)
     if findings:
         raise RuntimeError('production_release_configuration_invalid:' + ','.join(findings))
-    live = check_live or maintenance_runtime.read_live_status
+    live = check_live or (lambda target: maintenance_runtime.read_live_status(target, require_reaped=stopped_maintenance))
     manifest_file = root / 'runtime/control/rolling-controller-manifest.json'
     manifest = runtime_control.read_control_bytes(manifest_file)
     if manifest is None:
@@ -151,18 +240,22 @@ def release_source(
     sync_started = False
     try:
         with maintenance_runtime.target_runtime_leases(root):
-            _assert_no_stop(root)
+            assert_controls()
+            if stopped_maintenance:
+                report = (check_original or maintenance_runtime.read_original_execution)(root, original_execution)
+                maintenance_runtime.assert_original_execution_safe(root, original_execution, report, manifest)
             snapshot = live(root)
             maintenance_runtime.assert_live_safe(snapshot)
             if runtime_control.read_control_bytes(manifest_file) != manifest:
                 raise RuntimeError('production_release_manifest_changed')
             if _source(root, expected_revision, expected_origin) != before:
                 raise RuntimeError('production_release_source_changed')
-            _assert_no_stop(root)
+            assert_controls()
             findings = configuration(root, expected_revision)
             if findings:
                 raise RuntimeError('production_release_configuration_invalid:' + ','.join(findings))
             if confirmed_sync:
+                assert_controls()
                 sync_started = True
                 _git(root, 'merge', '--ff-only', expected_revision)
                 snapshot = live(root)
@@ -172,13 +265,21 @@ def release_source(
                     findings = production_config.repository_findings(root)
                     if findings:
                         raise RuntimeError('production_release_configuration_invalid:' + ','.join(findings))
-            _assert_no_stop(root)
+            assert_controls()
             after = _source(root, expected_revision, expected_origin, synchronized=confirmed_sync)
             findings = configuration(root, expected_revision)
             if findings:
                 raise RuntimeError('production_release_configuration_invalid:' + ','.join(findings))
             if runtime_control.read_control_bytes(manifest_file) != manifest:
                 raise RuntimeError('production_release_manifest_changed')
+            if stopped_maintenance:
+                report = (check_original or maintenance_runtime.read_original_execution)(root, original_execution)
+                maintenance_runtime.assert_original_execution_safe(root, original_execution, report, manifest)
+                assert_controls()
+                stopped_result = _stopped_receipt(root, automation, controls_before)
+                if (stopped_result['stopped_controls_after'] != controls_before
+                        or not stopped_result['stop_preserved'] or not stopped_result['automation_preserved']):
+                    raise RuntimeError('production_release_stopped_controls_changed')
             return {
                 'schema_version': 1, 'kind': 'production_source_release',
                 'status': 'synced' if confirmed_sync else 'ready',
@@ -187,16 +288,19 @@ def release_source(
                 'source_sync_state': 'updated' if after != before else 'not_updated',
                 'expected_revision': expected_revision, 'write_state': 'not_requested',
                 'source_sync_requested': confirmed_sync,
-                'next_process_ready': confirmed_sync,
+                'next_process_ready': confirmed_sync and not stopped_maintenance,
                 'production_acceptance': 'not_verified',
                 'status_file': snapshot.get('maintenance_status_file'),
                 'current_input_proof': snapshot.get('maintenance_current_inputs'),
                 'continuation': snapshot['reconciliation']['continuation'],
+                **({**stopped_result,
+                    'original_execution': report} if stopped_maintenance else {}),
             }
     except (OSError, ValueError, RuntimeError) as error:
         if not sync_started:
             raise
-        return _failed_release(root, before, expected_revision, confirmed_sync, error)
+        return _failed_release(root, before, expected_revision, confirmed_sync, error,
+            stopped_maintenance=stopped_maintenance, automation=automation, controls_before=controls_before)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -207,15 +311,30 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--automation-file', required=True, type=Path)
     parser.add_argument('--production-project-id', required=True)
     parser.add_argument('--expected-schedule', required=True)
+    parser.add_argument('--stopped-maintenance', choices=('YES',))
+    parser.add_argument('--original-receipt-file', type=Path)
+    parser.add_argument('--original-owner-task-id')
+    parser.add_argument('--original-tool-session-id')
     args = parser.parse_args(argv)
     before = _observed_revision(args.target_root)
+    controls_before = None
     try:
         automation = ProductionAutomation(args.automation_file,
                                           args.production_project_id, args.expected_schedule)
+        if args.stopped_maintenance == 'YES':
+            controls_before = _stopped_observation(args.target_root, automation)
+        original = None
+        if args.stopped_maintenance == 'YES':
+            if not all((args.original_receipt_file, args.original_owner_task_id, args.original_tool_session_id)):
+                raise RuntimeError('production_release_original_execution_required')
+            original = maintenance_runtime.OriginalExecution(args.original_receipt_file,
+                args.original_owner_task_id, args.original_tool_session_id)
         payload = release_source(args.target_root, expected_revision=args.expected_revision,
-                                 confirmed_sync=args.confirm_sync == 'YES', automation=automation)
+                                 confirmed_sync=args.confirm_sync == 'YES', automation=automation,
+                                 stopped_maintenance=args.stopped_maintenance == 'YES', original_execution=original)
     except (OSError, ValueError, RuntimeError) as error:
-        print(json.dumps(_failed_release(args.target_root, before, args.expected_revision, args.confirm_sync == 'YES', error)))
+        print(json.dumps(_failed_release(args.target_root, before, args.expected_revision, args.confirm_sync == 'YES', error,
+            stopped_maintenance=args.stopped_maintenance == 'YES', automation=automation, controls_before=controls_before)))
         return 1
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return 1 if payload['status'] == 'blocked' else 0
