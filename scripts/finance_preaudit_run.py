@@ -23,6 +23,19 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_ENV = "OA_CONTROLLER_EXECUTION_MANIFEST_FILE"
 EVIDENCE_LIMIT = 1_048_576
 LOG_LIMIT = 64 * EVIDENCE_LIMIT
+STOP_GRACE_SECONDS = 30
+
+
+def _process_alive(pid: object) -> bool:
+    if type(pid) is not int or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _now() -> str:
@@ -158,6 +171,10 @@ def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str
                   "controller_state": "unknown", "children_reaped": "unknown",
                   "exit_code": receipt.get("exit_code"), "exit_signal": receipt.get("exit_signal"),
                   "receipt_file": str(path)}
+        if state in {"starting", "waiting"} and not _process_alive(receipt.get("supervisor_pid")):
+            report.update(status="blocked", error_code="controller_supervisor_lost")
+        elif state in {"starting", "waiting"} and receipt.get("stop_wait_error"):
+            report.update(status="blocked", error_code=receipt["stop_wait_error"])
         manifest_raw = _read_evidence(path.with_name("controller-manifest.json"))
         manifest = None
         if manifest_raw is not None:
@@ -204,10 +221,12 @@ def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str
                     raise ValueError("controller_execution_manifest_mismatch")
                 report["terminal"] = manifest["state"] in {"completed", "failed"} and manifest["children_reaped"] is True
             if (report["terminal"] and receipt["exit_code"] == 0 and report["controller_state"] == "completed"
-                    and receipt["result"] == "completed" and "stop_request_error" not in receipt):
+                    and receipt["result"] == "completed" and "stop_request_error" not in receipt
+                    and "stop_wait_error" not in receipt):
                 report["status"] = "completed"
             elif (manifest is None and receipt["exit_code"] == 0 and receipt["result"] == "skipped"
-                    and "stop_request_error" not in receipt and logs["stdout.log"] is not None
+                    and "stop_request_error" not in receipt and "stop_wait_error" not in receipt
+                    and logs["stdout.log"] is not None
                     and _verified_skip(_object(logs["stdout.log"]))):
                 report.update(status="skipped", terminal=True)
             if retrieve and report["terminal"]:
@@ -290,6 +309,8 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str) ->
     process = None
     handlers = {}
     stop_attempted = False
+    owner_parent_pid = os.getppid()
+    receipt["owner_parent_pid"] = owner_parent_pid
 
     def persist() -> None:
         runtime_control.write_control_bytes_atomic(
@@ -303,8 +324,15 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str) ->
 
     def wait_owned(*, cancel: bool = False) -> int:
         nonlocal stop_attempted
+        stop_deadline = None
         while True:
-            if ((cancel or receipt["received_signals"])
+            if os.getppid() != owner_parent_pid and not receipt.get("owner_process_lost"):
+                receipt["owner_process_lost"] = True
+                persist()
+            cancelling = cancel or receipt["received_signals"] or receipt.get("owner_process_lost")
+            if cancelling and stop_deadline is None:
+                stop_deadline = time.monotonic() + STOP_GRACE_SECONDS
+            if (cancelling
                     and not stop_attempted
                     and runtime_control.controller_owner_pid() == process.pid):
                 stop_attempted = True
@@ -314,6 +342,12 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str) ->
                     receipt["stop_request_error"] = "controller_stop_request_failed"
                 else:
                     receipt["stop_requested_by_supervisor"] = True
+                persist()
+            if (stop_deadline is not None and time.monotonic() >= stop_deadline
+                    and "stop_wait_error" not in receipt):
+                # Do not kill a possibly in-flight Writer or invent its exit code.
+                receipt["stop_wait_error"] = "controller_stop_timeout"
+                persist()
             try:
                 return process.wait(timeout=0.5)
             except subprocess.TimeoutExpired:
@@ -385,6 +419,7 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str) ->
             "completed" if receipt["state"] == "exited" and receipt["exit_code"] == 0
             and receipt["controller_state"] == "completed" and receipt["children_reaped"] is True
             and "stop_request_error" not in receipt
+            and "stop_wait_error" not in receipt
             else "blocked"
         )
         if receipt["state"] == "exited" and receipt["exit_code"] == 0 and mirror_missing:
@@ -393,7 +428,7 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str) ->
                 verified_skip = isinstance(payload, dict) and _verified_skip(payload)
             except (OSError, RuntimeError, ValueError, AttributeError):
                 verified_skip = False
-            if verified_skip and "stop_request_error" not in receipt:
+            if verified_skip and "stop_request_error" not in receipt and "stop_wait_error" not in receipt:
                 receipt["result"] = "skipped"
         persist()
         return {**receipt, "receipt_file": str(receipt_file)}

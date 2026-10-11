@@ -107,7 +107,7 @@ def test_handoff_rejects_any_existing_writer_artifact(tmp_path: Path, artifact: 
 
 
 @pytest.mark.parametrize("workflow", sorted(manual_handoff.WORKFLOWS))
-def test_timeout_handoff_is_prepared_once_after_confirmed_exit(tmp_path: Path, monkeypatch, workflow: str) -> None:
+def test_timeout_stops_without_automatic_handoff_after_confirmed_exit(tmp_path: Path, monkeypatch, workflow: str) -> None:
     from apps.oa_finance_preaudit import codex_review_worker as worker
     from tests.finance_preaudit.test_codex_review_worker import _task
     task, action_path = _task(tmp_path, workflow_key=workflow)
@@ -118,8 +118,10 @@ def test_timeout_handoff_is_prepared_once_after_confirmed_exit(tmp_path: Path, m
         return worker.CodexExecution("codex_process_timeout", worker._unknown_usage(),
                                      process_state="timed_out", exit_code=-9)
     result = worker.review(task, executor=execute)
-    assert result["status"] == "reviewed"
-    assert result["decision"]["kind"] == manual_handoff.KIND
+    assert result["status"] == "failed"
+    assert result["error_code"] == "codex_process_timeout"
+    assert "decision" not in result
+    assert worker.runtime_control.stop_reason() == "codex_review_technical_failure"
     assert result["token_usage"]["status"] == "unknown"
     assert len(calls) == 1
     assert not action_path.with_name("writer-boundary.json").exists()

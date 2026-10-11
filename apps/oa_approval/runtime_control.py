@@ -25,6 +25,7 @@ _ALLOWED_STOP_REASONS = frozenset(
         "production_reconciliation_blocked",
         "write_authorization_invalid",
         "writer_result_unknown",
+        "codex_review_technical_failure",
     }
 )
 _CYCLE_STOP_PAYLOAD = b"stop_requested:controller_cycle_stop\n"
@@ -46,7 +47,21 @@ def stop_requested() -> bool:
     return raw in {"1", "true", "yes", "y", "on"} or stop_file().exists()
 
 
+@contextmanager
+def stop_control_lease(target: Path | None = None) -> Iterator[None]:
+    target = Path(target or stop_file()).expanduser()
+    if not target.is_absolute():
+        target = PROJECT_ROOT / target
+    with request_writer_lease("finance-preaudit-stop-control", target.with_name("stop-control.lock")):
+        yield
+
+
 def _write_stop(reason: str | None) -> None:
+    with stop_control_lease():
+        _write_stop_locked(reason)
+
+
+def _write_stop_locked(reason: str | None) -> None:
     target = stop_file().expanduser()
     if not target.is_absolute():
         target = PROJECT_ROOT / target
@@ -57,6 +72,8 @@ def _write_stop(reason: str | None) -> None:
     try:
         descriptor = os.open(target, flags, 0o600)
     except FileExistsError:
+        if reason == "codex_review_technical_failure" and read_control_bytes(target) == _CYCLE_STOP_PAYLOAD:
+            write_control_bytes_atomic(target, f"stop_requested:{reason}\n".encode("ascii"))
         return
     try:
         payload = (
@@ -351,6 +368,24 @@ def clear_manual_stop(
 
 
 def _clear_stop(
+    expected_payload: bytes,
+    *,
+    expected_identity: tuple[int, int, int] | None = None,
+    target: Path | None = None,
+) -> bool:
+    actual = Path(target or stop_file()).expanduser()
+    if not actual.is_absolute():
+        actual = PROJECT_ROOT / actual
+    if not actual.parent.exists():
+        return False
+    try:
+        with stop_control_lease(actual):
+            return _clear_stop_locked(expected_payload, expected_identity=expected_identity, target=target)
+    except RuntimeError as error:
+        raise RuntimeError("control_file_unsafe") from error
+
+
+def _clear_stop_locked(
     expected_payload: bytes,
     *,
     expected_identity: tuple[int, int, int] | None = None,

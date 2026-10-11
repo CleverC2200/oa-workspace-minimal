@@ -47,7 +47,7 @@ def valid_attempt_codes(codes: object) -> bool:
         return False
     if codes[-1] == "codex_process_timeout":
         return len(codes) in {1, 2} and "codex_process_timeout" not in codes[:-1]
-    return len(codes) == 2 and "codex_process_timeout" not in codes
+    return len(codes) in {1, 2} and "codex_process_timeout" not in codes
 
 
 def receipt_payload(

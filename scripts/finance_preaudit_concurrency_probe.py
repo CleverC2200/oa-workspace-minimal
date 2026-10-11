@@ -2432,7 +2432,7 @@ def _run_dispatched_tasks(
                     error_code="worker_process_failed",
                 )
                 continue
-            if value.get("status") == "reviewed":
+            if value.get("status") == "reviewed" or value.get("error_code") == "stop_requested":
                 stopped_review(index, prepare_elapsed, value)
             else:
                 outcomes[index] = process_pool.TaskOutcome(
@@ -2448,6 +2448,10 @@ def _run_dispatched_tasks(
         nonlocal force_terminated
         if force_terminated:
             return
+        if futures and runtime_control.stop_reason() == "codex_review_technical_failure":
+            # Workers already observe the gate; retain their failure receipts
+            # before forcibly reaping only the read-only review pool.
+            wait(tuple(futures), timeout=2)
         harvest_stopped_reviews(
             {future for future in futures if future.done()}
         )
