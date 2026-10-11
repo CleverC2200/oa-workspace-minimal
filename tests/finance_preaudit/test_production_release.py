@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import os
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,6 +16,21 @@ from tests.finance_preaudit.test_maintenance_runtime import live_snapshot
 def git(root, *args):
     return subprocess.run(['git', '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', *args],
                           cwd=root, check=True, capture_output=True, text=True).stdout.strip()
+
+
+def _control_metadata(info):
+    # Reading can update atime; inode, content timestamps and permissions must not change.
+    return tuple(getattr(info, key) for key in (
+        'st_dev', 'st_ino', 'st_mtime_ns', 'st_ctime_ns', 'st_mode', 'st_uid', 'st_gid', 'st_nlink', 'st_size'))
+
+
+def test_control_metadata_allows_access_time_but_detects_content_timestamp_change(tmp_path):
+    before = tmp_path.stat()
+    fields = {key: getattr(before, key) for key in dir(before) if key.startswith('st_')}
+    fields.update(st_atime=before.st_atime + 1, st_atime_ns=before.st_atime_ns + 1_000_000_000)
+    assert _control_metadata(SimpleNamespace(**fields)) == _control_metadata(before)
+    fields['st_mtime_ns'] += 1
+    assert _control_metadata(SimpleNamespace(**fields)) != _control_metadata(before)
 
 
 @pytest.fixture
@@ -82,7 +98,7 @@ def test_stopped_source_sync_preserves_stop_and_paused_cron_without_business_rea
     git(source, 'push', '-q')
     git(root, 'fetch', '-q', 'origin')
     expected = git(source, 'rev-parse', 'HEAD')
-    stop_before = stop.stat(), stop.read_bytes()
+    stop_before = _control_metadata(stop.lstat()), stop.read_bytes()
     cron_before = automation.file.read_bytes()
     def read_original(target, binding):
         assert runtime_control.controller_active(target / 'runtime/control/rolling-controller.lock')
@@ -100,7 +116,7 @@ def test_stopped_source_sync_preserves_stop_and_paused_cron_without_business_rea
     assert result['production_acceptance'] == 'not_verified'
     assert result['stop_preserved'] is True
     assert result['automation_state'] == 'PAUSED'
-    assert (stop.stat(), stop.read_bytes()) == stop_before
+    assert (_control_metadata(stop.lstat()), stop.read_bytes()) == stop_before
     assert automation.file.read_bytes() == cron_before
 
 
@@ -190,14 +206,14 @@ def test_stopped_mode_keeps_existing_and_original_evidence_gates(stopped_product
         snapshot['reconciliation']['continuation']['status'] = 'blocked'
     elif scenario == 'unreaped_controller':
         snapshot['controller_handoff']['children_reaped'] = False
-    before = stop.lstat(), stop.read_bytes(), automation.file.read_bytes()
+    before = _control_metadata(stop.lstat()), stop.read_bytes(), automation.file.read_bytes()
     with pytest.raises(RuntimeError, match=code):
         production_release.release_source(root, expected_revision=expected, expected_origin=str(remote),
             confirmed_sync=True, stopped_maintenance=scenario != 'ordinary', automation=automation,
             original_execution=original, check_original=lambda *_: report,
             check_live=lambda _: snapshot, check_configuration=lambda *_: [])
     assert git(root, 'rev-parse', 'HEAD') == expected
-    assert (stop.lstat(), stop.read_bytes(), automation.file.read_bytes()) == before
+    assert (_control_metadata(stop.lstat()), stop.read_bytes(), automation.file.read_bytes()) == before
 
 
 @pytest.mark.parametrize('when', ['original', 'live', 'configuration'])
