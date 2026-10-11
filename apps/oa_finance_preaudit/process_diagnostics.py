@@ -4,8 +4,10 @@ import hashlib
 import io
 import json
 import math
+import os
 from pathlib import Path
 import re
+import stat
 import time
 from typing import Callable, TextIO
 
@@ -31,6 +33,101 @@ _NATIVE_ERROR_CODES = frozenset({"usageLimitExceeded", "serverOverloaded", "mode
 _NOTICE_EVENTS = frozenset({"error", "turn.failed", "thread.failed", "item.started", "item.completed"})
 _NOTICE_FIELDS = frozenset({"schema_version", "kind", "role", "run_id_sha256", "controller_instance_id_sha256", "launch_id_sha256",
                             "action_sha256", "classification", "blocking", "source", "native_event_type", "native_error_code", "http_status", "observed_at"})
+_DETAIL_FIELDS = frozenset({"native_error_code_status", "http_status_source", "error_message", "error_message_sha256",
+                            "error_message_bytes", "error_message_redacted", "error_message_truncated"})
+_MESSAGE_LIMIT = 2048
+_MESSAGE_SCAN_LIMIT = 8192
+# Positive vocabulary prevents error envelopes from retaining arbitrary business text.
+_TECHNICAL_WORDS = frozenset("""
+a an and any api at attempts authentication authorization available backend bad before been billing body by
+capacity certificate chatgpt client closed closing code completed completion connect connection connecting content context
+could deactivated denied disconnected dns does during endpoint entity error exceeded exceeds exhausted failed
+failure fetch forbidden for found from gateway handshake has have hit http https idle in insufficient internal
+invalid is json length limit limited lost malformed max maximum message model models network no not of on only
+openai overloaded overload parse parsing payload peer permission pipe proxy protocol quota read received reconnect reconnecting
+redacted refused request requests reset resolve response responses retry retrying retries returned sending server service session socket ssl
+status stream suspended tcp temporarily terminal the then timeout timed tls to token tokens too transport
+unavailable unauthorized unexpected unknown upstream url usage user valid verify verification websocket will window with wrong your
+""".split())
+
+
+def _native_code(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,95}", value) is not None
+
+
+def _without_literals(message: str) -> str:
+    text = re.sub(r"(?i)\b(?:https?|wss?)://[^\s\"'<>]+", "[redacted]", message)
+    return re.sub(r"([\"'`])(?:(?!\1).)*?\1", "[redacted]", text, flags=re.DOTALL)
+
+
+def _redact_message(message: str) -> tuple[str, bool]:
+    if len(message) > _MESSAGE_SCAN_LIMIT:
+        return "[redacted]", True
+    text = _without_literals(message)
+    text = re.sub(r"(?i)\b(?:authorization|cookie|set-cookie|(?:api|access|refresh|id)[_-]?token|"
+                  r"api[_-]?key|password|secret|account|email|request[_-]?id|session[_-]?id|action[_-]?token)"
+                  r"\s*[:=]\s*[^;\n,]*", "[redacted]", text)
+    text = re.sub(r"(?i)\bbearer\s+\S+", "[redacted]", text)
+    text = re.sub(r"[\w.+-]+@[\w.-]+", "[redacted]", text)
+    text = re.sub(r"\b[A-Za-z]:\\[^\s\"'<>;,)]+", "[redacted]", text)
+    text = re.sub(r"[^\x20-\x7e]+", "[redacted]", text)
+    text = re.sub(r"[A-Za-z_][A-Za-z0-9_-]*|[0-9]+",
+                  lambda match: match[0] if match[0].lower() in _TECHNICAL_WORDS else "[redacted]", text)
+    text = re.sub(r"(?<![\w])/[^\s\"'<>;,)]+", "[redacted]", text)
+    text = " ".join(text.split())
+    truncated = len(text) > _MESSAGE_LIMIT
+    if truncated:
+        # Keep whole sanitized words/placeholders so readback remains valid.
+        prefix = text[:_MESSAGE_LIMIT]
+        text = prefix.rsplit(" ", 1)[0] if " " in prefix else "[redacted]"
+    return text, truncated
+
+
+def _error_details(error: dict) -> dict:
+    info = error.get("codexErrorInfo")
+    code = info if isinstance(info, str) else next(iter(info), None) if isinstance(info, dict) and len(info) == 1 else None
+    if info is None:
+        code = error.get("code")
+    code_status = "retained" if _native_code(code) else "missing" if info is None and code is None else "omitted_untrusted"
+    details = info.get(code) if isinstance(info, dict) and isinstance(code, str) else None
+    status = details.get("httpStatusCode") if isinstance(details, dict) else None
+    status_source = "codexErrorInfo"
+    if status is None:
+        status = error.get("httpStatusCode")
+        status_source = "httpStatusCode"
+    valid_status = type(status) is int and 100 <= status <= 599
+    status_source = status_source if valid_status else "missing" if status is None else "omitted_untrusted"
+    message = error.get("message")
+    if not valid_status and isinstance(message, str):
+        match = re.search(r"(?i)\b(?:HTTP(?:/[12](?:\.\d)?)?\s+(?:status(?:\s+code)?\s*[:=]?\s*)?"
+                          r"|status(?:\s+code)?(?:\s*[:=]\s*|\s+))([1-5][0-9]{2})\b",
+                          _without_literals(message[:_MESSAGE_SCAN_LIMIT]))
+        if match:
+            status, status_source, valid_status = int(match[1]), "message", True
+    text, truncated = _redact_message(message) if isinstance(message, str) else (None, False)
+    raw = message.encode("utf-8", errors="replace") if isinstance(message, str) else None
+    return {"native_error_code": code if code_status == "retained" else None,
+            "native_error_code_status": code_status, "http_status": status if valid_status else None,
+            "http_status_source": status_source, "error_message": text,
+            "error_message_sha256": hashlib.sha256(raw).hexdigest() if raw is not None else None,
+            "error_message_bytes": len(raw) if raw is not None else None,
+            "error_message_redacted": text is not None and text != message,
+            "error_message_truncated": truncated}
+
+
+def _valid_details(payload: dict) -> bool:
+    code, code_status = payload.get("native_error_code"), payload.get("native_error_code_status")
+    status, source = payload.get("http_status"), payload.get("http_status_source")
+    text, digest, size = (payload.get(key) for key in ("error_message", "error_message_sha256", "error_message_bytes"))
+    return (isinstance(code_status, str) and code_status in {"retained", "missing", "omitted_untrusted"}
+            and (_native_code(code) if code_status == "retained" else code is None)
+            and isinstance(source, str)
+            and (type(status) is int and 100 <= status <= 599 and source in {"codexErrorInfo", "httpStatusCode", "message"}
+                 or status is None and source in {"missing", "omitted_untrusted"})
+            and type(payload.get("error_message_redacted")) is bool and type(payload.get("error_message_truncated")) is bool
+            and (text is None and digest is None and size is None and not payload["error_message_redacted"] and not payload["error_message_truncated"]
+                 or isinstance(text, str) and len(text) <= _MESSAGE_LIMIT and _redact_message(text)[0] == text
+                 and isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) is not None and type(size) is int and size >= 0))
 
 
 def _timestamp(value: object) -> bool:
@@ -38,8 +135,12 @@ def _timestamp(value: object) -> bool:
 
 
 def _valid_notice(payload: object, action_hash: str) -> bool:
-    return (isinstance(payload, dict) and set(payload) == _NOTICE_FIELDS
-            and payload.get("schema_version") == 1 and payload.get("kind") == "preaudit_native_notice"
+    if not isinstance(payload, dict):
+        return False
+    version = payload.get("schema_version")
+    if type(version) is not int or version not in {1, 2} or set(payload) != (_NOTICE_FIELDS if version == 1 else _NOTICE_FIELDS | _DETAIL_FIELDS):
+        return False
+    return (payload.get("kind") == "preaudit_native_notice"
             and isinstance(payload.get("role"), str) and payload["role"] in _NOTICE_ROLES and payload.get("action_sha256") == action_hash
             and isinstance(payload.get("classification"), str) and payload["classification"] in _NOTICE_CLASSES and type(payload.get("blocking")) is bool
             and payload["blocking"] == (payload["classification"] != "network_reconnect")
@@ -47,8 +148,9 @@ def _valid_notice(payload: object, action_hash: str) -> bool:
             and (payload["role"] != "first_official_notice" or payload["classification"] in approval_guard.NOTICE_CODES)
             and isinstance(payload.get("source"), str) and payload["source"] in {"stdout", "stderr"}
             and (payload.get("native_event_type") is None or isinstance(payload["native_event_type"], str) and payload["native_event_type"] in _NOTICE_EVENTS)
-            and (payload.get("native_error_code") is None or isinstance(payload["native_error_code"], str) and payload["native_error_code"] in _NATIVE_ERROR_CODES)
-            and (payload.get("http_status") is None or type(payload["http_status"]) is int and payload["http_status"] in {401, 403, 413, 429, 503})
+            and (_valid_details(payload) if version == 2 else
+                 (payload.get("native_error_code") is None or isinstance(payload["native_error_code"], str) and payload["native_error_code"] in _NATIVE_ERROR_CODES)
+                 and (payload.get("http_status") is None or type(payload["http_status"]) is int and payload["http_status"] in {401, 403, 413, 429, 503}))
             and _timestamp(payload.get("observed_at"))
             and all(value is None or isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
                     for value in (payload.get(key) for key in ("run_id_sha256", "controller_instance_id_sha256", "launch_id_sha256")))
@@ -134,14 +236,9 @@ def notice_payload(event: dict, *, source: str, observed_at: float, plain_stderr
     if notice is None:
         return None
     error = error_envelope(event) or {}
-    info = error.get("codexErrorInfo")
-    code = info if isinstance(info, str) else next(iter(info), None) if isinstance(info, dict) and len(info) == 1 else None
-    details = info.get(code) if isinstance(info, dict) and isinstance(code, str) else None
-    status = details.get("httpStatusCode") if isinstance(details, dict) else None
     return {**notice, "source": source,
             "native_event_type": event["type"] if not plain_stderr and isinstance(event.get("type"), str) and event["type"] in _NOTICE_EVENTS else None,
-            "native_error_code": code if code in _NATIVE_ERROR_CODES else None,
-            "http_status": status if type(status) is int and status in {401, 403, 413, 429, 503} else None,
+            **_error_details(error),
             "observed_at": observed_at}
 
 
@@ -151,7 +248,7 @@ def record_notice(action_file: Path, *, slot: dict, role: str, notice: dict) -> 
         raise ValueError("process_diagnostic_invalid")
     identities = {key + "_sha256": hashlib.sha256(slot[key].encode()).hexdigest() if slot.get(key) is not None else None
                   for key in ("run_id", "controller_instance_id", "launch_id")}
-    payload = {"schema_version": 1, "kind": "preaudit_native_notice", "role": role,
+    payload = {"schema_version": 2, "kind": "preaudit_native_notice", "role": role,
                **identities, "action_sha256": slot["action_sha256"], **notice}
     if not _valid_notice(payload, slot["action_sha256"]):
         raise ValueError("process_diagnostic_invalid")
@@ -164,7 +261,7 @@ def record_notice(action_file: Path, *, slot: dict, role: str, notice: dict) -> 
             if existing != [target] or approval_guard.read(target) != payload:
                 raise ValueError("process_diagnostic_invalid")
             return digest
-        json_artifact.write_json_atomic(target, payload, indent=2)
+        runtime_control.write_control_bytes_atomic(target, (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode())
     return digest
 
 
@@ -182,6 +279,9 @@ def read_notices(action_file: Path, *, launch_id_sha256: str | None = None) -> d
         payload = approval_guard.read(path)
         if (not _valid_notice(payload, action_hash) or payload["role"] in result
                 or (launch is not None and launch != payload["launch_id_sha256"])):
+            raise ValueError("process_diagnostic_invalid")
+        metadata = path.stat(follow_symlinks=False)
+        if payload["schema_version"] == 2 and (metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600):
             raise ValueError("process_diagnostic_invalid")
         digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
         if path.name != f"review-notice-{payload['launch_id_sha256']}-{payload['role']}-{digest}.json":
