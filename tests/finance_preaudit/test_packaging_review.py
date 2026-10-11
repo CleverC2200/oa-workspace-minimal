@@ -55,7 +55,7 @@ def fake_process(monkeypatch, body, *, native_home, after=None, inspect_start=No
     class Process:
         pid = 12345
         returncode = 0
-        stderr = io.StringIO('original stderr\n')
+        stderr = io.TextIOWrapper(io.BytesIO(b'original stderr\n'), encoding="utf-8")
         def __init__(self, command, **kwargs):
             nonlocal kwargs_cwd
             kwargs_cwd = kwargs['cwd']

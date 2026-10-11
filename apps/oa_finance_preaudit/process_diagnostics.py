@@ -4,7 +4,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
-from typing import TextIO
+from typing import Callable, TextIO
 
 from apps import json_artifact
 
@@ -16,6 +16,8 @@ _SIGNAL_TERMS = {
     "authentication_signal": ("unauthorized", "401", "authentication"),
     "retry_signal": ("retry", "reconnect"),
     "payload_too_large_signal": ("status 413", "413 request", "payload too large", "request entity too large"),
+    "usage_limit_signal": ("you've hit your usage limit", "usage limit exceeded", "usage_limit_exceeded", "usagelimitexceeded", "insufficient_quota"),
+    "model_access_signal": ("model is not available", "model unavailable", "model_not_found"),
 }
 
 
@@ -33,19 +35,34 @@ def last_stage(stream: TextIO) -> str:
     return stage
 
 
-def stderr_summary(stream: TextIO) -> dict:
+def stderr_summary(stream: TextIO, *, on_signals: Callable[[set[str]], None] | None = None) -> dict:
     # Keep only fixed flags; never persist an error line or its contents.
     flags: set[str] = set()
     size = 0
     suffix = ""
     while chunk := stream.read(4096):
         size += len(chunk.encode("utf-8"))
-        lower = suffix + chunk.lower()
+        lower = suffix + chunk.lower().replace("\u2019", "'").replace("\u2018", "'")
         for code, terms in _SIGNAL_TERMS.items():
             if any(term in lower for term in terms):
                 flags.add(code)
+        if on_signals is not None:
+            on_signals(flags)
         suffix = lower[-64:]
     return {"stderr_bytes": size, "stderr_signals": sorted(flags)}
+
+
+def error_envelope(event: dict) -> dict | None:
+    """Exclude normal messages and command output from error classification."""
+    if event.get("type") == "error":
+        return event
+    if event.get("type") in {"turn.failed", "thread.failed"}:
+        error = event.get("error")
+        return error if isinstance(error, dict) else {}
+    item = event.get("item")
+    if isinstance(item, dict) and item.get("type") == "error":
+        return item
+    return None
 
 
 def event_error_signals(stream: TextIO) -> list[str]:
@@ -59,12 +76,7 @@ def event_error_signals(stream: TextIO) -> list[str]:
             continue
         if not isinstance(event, dict):
             continue
-        item = event.get("item")
-        error = event if event.get("type") == "error" else (
-            item if isinstance(item, dict) and item.get("type") == "error" else None
-        )
-        if event.get("type") == "turn.failed":
-            error = event.get("error")
+        error = error_envelope(event)
         if isinstance(error, dict) and isinstance(error.get("message"), str):
             flags.update(stderr_summary(io.StringIO(error["message"]))["stderr_signals"])
     return sorted(flags)

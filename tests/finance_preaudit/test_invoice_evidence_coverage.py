@@ -169,7 +169,7 @@ def test_worker_reads_frozen_invoice_coverage_and_preview_closes_without_write(
         returncode = 0
 
         def __init__(self, command):
-            self.stderr = io.StringIO()
+            self.stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
             self.decision_file = Path(command[command.index('--output-last-message') + 1])
 
         def communicate(self, *, input, timeout):

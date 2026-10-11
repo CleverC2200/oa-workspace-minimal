@@ -225,7 +225,7 @@ def test_actual_worker_uses_bound_company_schema_and_preserves_model_comparison(
         returncode = 0
 
         def __init__(self, command, **kwargs):
-            self.stderr = io.StringIO()
+            self.stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
             self.destination = Path(command[command.index("--output-last-message") + 1])
             captured["schema"] = json.loads(Path(command[command.index("--output-schema") + 1]).read_text())
 

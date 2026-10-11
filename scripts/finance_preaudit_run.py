@@ -17,12 +17,25 @@ from typing import Sequence
 from uuid import UUID, uuid4
 
 from apps.oa_approval import auth, runtime_control
-from apps.oa_finance_preaudit import controller_handoff
+from apps.oa_finance_preaudit import controller_handoff, approval_guard, approval_lifecycle
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_ENV = "OA_CONTROLLER_EXECUTION_MANIFEST_FILE"
 EVIDENCE_LIMIT = 1_048_576
 LOG_LIMIT = 64 * EVIDENCE_LIMIT
+STOP_GRACE_SECONDS = 30
+
+
+def _process_alive(pid: object) -> bool:
+    if type(pid) is not int or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _now() -> str:
@@ -107,12 +120,31 @@ def _log_evidence(path: Path) -> tuple[dict, bytes | None]:
 
 
 def _verified_skip(payload: dict) -> bool:
+    if payload.get("kind") == "approval_startup_gate" and payload.get("status") == "skipped":
+        if payload.get("reason") == "approval_model_cooldown":
+            cooldown = approval_guard.cooldown()
+            return bool(cooldown and cooldown["blocked_until"] == payload.get("blocked_until"))
+        if payload.get("reason") == "previous_run_busy":
+            manifest = controller_handoff._read_manifest()
+            if manifest is None or manifest["run_id"] != payload.get("run_id") or not runtime_control.controller_active():
+                return False
+            progress = approval_lifecycle._progress(manifest)
+            return bool(progress and runtime_control.controller_owner_pid() == manifest["controller_pid"]
+                        and approval_guard.process_identity(manifest["controller_pid"]) == progress["controller"])
+        return False
     handoff = payload.get("controller_handoff", {})
     return (payload.get("kind") == "preaudit_production_rolling_drain"
             and payload.get("status") == "skipped" and payload.get("reason") == "production_rolling_controller_active"
             and isinstance(handoff, dict) and handoff.get("status") == "active" and handoff.get("manifest_state") == "running"
             and all(handoff.get(key) is True for key in (
                 "controller_active", "lock_owner_consistent", "restart_verified", "code_matches_current")))
+
+
+def _skip_verification(payload: dict, receipt: dict) -> dict:
+    return {"kind": "preaudit_verified_startup_skip", "owner_task_id": receipt["owner_task_id"],
+            "invocation_id": receipt["invocation_id"], "verified_at": receipt["completed_at"],
+            "stdout_sha256": receipt["output_sha256"]["stdout.log"], "reason": payload.get("reason"),
+            "run_id": payload.get("run_id"), "blocked_until": payload.get("blocked_until")}
 
 
 def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str,
@@ -158,6 +190,10 @@ def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str
                   "controller_state": "unknown", "children_reaped": "unknown",
                   "exit_code": receipt.get("exit_code"), "exit_signal": receipt.get("exit_signal"),
                   "receipt_file": str(path)}
+        if state in {"starting", "waiting"} and not _process_alive(receipt.get("supervisor_pid")):
+            report.update(status="blocked", error_code="controller_supervisor_lost")
+        elif state in {"starting", "waiting"} and receipt.get("stop_wait_error"):
+            report.update(status="blocked", error_code=receipt["stop_wait_error"])
         manifest_raw = _read_evidence(path.with_name("controller-manifest.json"))
         manifest = None
         if manifest_raw is not None:
@@ -204,12 +240,22 @@ def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str
                     raise ValueError("controller_execution_manifest_mismatch")
                 report["terminal"] = manifest["state"] in {"completed", "failed"} and manifest["children_reaped"] is True
             if (report["terminal"] and receipt["exit_code"] == 0 and report["controller_state"] == "completed"
-                    and receipt["result"] == "completed" and "stop_request_error" not in receipt):
+                    and receipt["result"] == "completed" and "stop_request_error" not in receipt
+                    and "stop_wait_error" not in receipt):
                 report["status"] = "completed"
             elif (manifest is None and receipt["exit_code"] == 0 and receipt["result"] == "skipped"
-                    and "stop_request_error" not in receipt and logs["stdout.log"] is not None
-                    and _verified_skip(_object(logs["stdout.log"]))):
-                report.update(status="skipped", terminal=True)
+                    and "stop_request_error" not in receipt and "stop_wait_error" not in receipt
+                    and logs["stdout.log"] is not None):
+                payload = _object(logs["stdout.log"])
+                if payload.get("kind") == "approval_startup_gate":
+                    # The supervisor verified this past skip; current gates may have changed.
+                    verified = (payload.get("status") == "skipped"
+                                and payload.get("reason") in {"approval_model_cooldown", "previous_run_busy"}
+                                and receipt.get("skip_verification") == _skip_verification(payload, receipt))
+                else:
+                    verified = _verified_skip(payload)
+                if verified:
+                    report.update(status="skipped", terminal=True)
             if retrieve and report["terminal"]:
                 if logs["stdout.log"] is None:
                     report.update(output_omitted="size_limit", controller_stdout_file=str(path.with_name("stdout.log")))
@@ -290,6 +336,8 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str) ->
     process = None
     handlers = {}
     stop_attempted = False
+    owner_parent_pid = os.getppid()
+    receipt["owner_parent_pid"] = owner_parent_pid
 
     def persist() -> None:
         runtime_control.write_control_bytes_atomic(
@@ -303,8 +351,25 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str) ->
 
     def wait_owned(*, cancel: bool = False) -> int:
         nonlocal stop_attempted
+        stop_deadline = None
+        next_observation = 0.0
         while True:
-            if ((cancel or receipt["received_signals"])
+            if list(command[1:3]) == ["-m", "scripts.finance_preaudit_concurrency_probe"] and time.monotonic() >= next_observation:
+                try:
+                    approval_guard.observe_project_errors(PROJECT_ROOT)
+                except (OSError, RuntimeError, ValueError):
+                    runtime_control.request_stop("codex_review_technical_failure")
+                    receipt["stop_request_error"] = "approval_official_history_unavailable"
+                    persist()
+                next_observation = time.monotonic() + approval_guard.OBSERVATION_SECONDS
+            if os.getppid() != owner_parent_pid and not receipt.get("owner_process_lost"):
+                receipt["owner_process_lost"] = True
+                persist()
+            approval_stopped = list(command[1:3]) == ["-m", "scripts.finance_preaudit_concurrency_probe"] and runtime_control.stop_requested()
+            cancelling = cancel or receipt["received_signals"] or receipt.get("owner_process_lost") or approval_stopped
+            if cancelling and stop_deadline is None:
+                stop_deadline = time.monotonic() + STOP_GRACE_SECONDS
+            if (cancelling
                     and not stop_attempted
                     and runtime_control.controller_owner_pid() == process.pid):
                 stop_attempted = True
@@ -314,6 +379,12 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str) ->
                     receipt["stop_request_error"] = "controller_stop_request_failed"
                 else:
                     receipt["stop_requested_by_supervisor"] = True
+                persist()
+            if (stop_deadline is not None and time.monotonic() >= stop_deadline
+                    and "stop_wait_error" not in receipt):
+                # Do not kill a possibly in-flight Writer or invent its exit code.
+                receipt["stop_wait_error"] = "controller_stop_timeout"
+                persist()
             try:
                 return process.wait(timeout=0.5)
             except subprocess.TimeoutExpired:
@@ -328,7 +399,7 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str) ->
         persist()
         for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             handlers[signum] = signal.signal(signum, forward)
-        environment = {**os.environ, MANIFEST_ENV: str(manifest_file)}
+        environment = {**os.environ, MANIFEST_ENV: str(manifest_file), approval_guard.OWNER_ENV: owner_task_id}
         with open_log("stdout.log") as stdout, open_log("stderr.log") as stderr:
             try:
                 if receipt["received_signals"]:
@@ -385,6 +456,7 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str) ->
             "completed" if receipt["state"] == "exited" and receipt["exit_code"] == 0
             and receipt["controller_state"] == "completed" and receipt["children_reaped"] is True
             and "stop_request_error" not in receipt
+            and "stop_wait_error" not in receipt
             else "blocked"
         )
         if receipt["state"] == "exited" and receipt["exit_code"] == 0 and mirror_missing:
@@ -393,8 +465,10 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str) ->
                 verified_skip = isinstance(payload, dict) and _verified_skip(payload)
             except (OSError, RuntimeError, ValueError, AttributeError):
                 verified_skip = False
-            if verified_skip and "stop_request_error" not in receipt:
+            if verified_skip and "stop_request_error" not in receipt and "stop_wait_error" not in receipt:
                 receipt["result"] = "skipped"
+                if payload.get("kind") == "approval_startup_gate":
+                    receipt["skip_verification"] = _skip_verification(payload, receipt)
         persist()
         return {**receipt, "receipt_file": str(receipt_file)}
     finally:
@@ -448,6 +522,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.receipt_file is not None:
             raise ValueError("controller_tool_session_binding_invalid")
+        gate = approval_lifecycle.startup(PROJECT_ROOT)
+        if gate["status"] != "ready":
+            print(json.dumps({"schema_version": 1, "kind": "approval_startup_gate", **gate}, sort_keys=True))
+            return 0 if gate["status"] == "skipped" else 1
         directory = controller_handoff.manifest_file().parent / "executions" / uuid4().hex
         receipt = supervise(
             [sys.executable, "-m", "scripts.finance_preaudit_concurrency_probe", *arguments],

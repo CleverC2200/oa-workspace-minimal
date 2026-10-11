@@ -19,13 +19,19 @@ status_dir=$(mktemp -d /tmp/oa-status.XXXXXX) &&
 
 继续须凭据、OA 接口与专用浏览器会话正常、执行身份 verified、授权与冻结可信、所有控制器和 Writer 空闲、上一轮终态及子进程回收可信。continuation 须 status=ready、blocking_reasons={}、isolated_pending为非负整数且等于pending_quarantined、scope与计数一致。code_matches_current=false 若只表示已终态旧版本清单，且当前 Git干净同步、ready_for_start=true、children_reaped=true、restart_verified=true，其余门禁可信，可由 fresh process加载新版；不复用旧进程。不因笼统 degraded 或可信隔离数量停止其他待办。
 
-生产审核初始 3 槽、最高 6 槽，六类财务共享该池，材料准备和全局 Writer 均为 1。门禁通过后只调用一次：
+生产审核固定 3 槽，所有审批原生模型 CLI 共享持久的三个槽位，不能弹性扩容；材料准备和全局 Writer 均为 1。门禁通过后只调用一次：
 
 ```bash
-.venv/bin/python -m scripts.finance_preaudit_run --owner-task-id <当前任务真实UUID> -- --rolling --adaptive --capacity 3 --max-capacity 6 --confirm-write YES --recover-confirmed-no-write-once YES --workflow travel_expense --workflow business_entertainment --workflow business_support_fee --workflow small_marketing_fee --workflow tpm_small_marketing_fee --workflow general_expense
+.venv/bin/python -m scripts.finance_preaudit_run --owner-task-id <当前任务真实UUID> -- --rolling --fixed-capacity --capacity 3 --max-capacity 3 --confirm-write YES --recover-confirmed-no-write-once YES --workflow travel_expense --workflow business_entertainment --workflow business_support_fee --workflow small_marketing_fee --workflow tpm_small_marketing_fee --workflow general_expense
 ```
 
 ### 原运行监视
+
+入口在启动任何模型 CLI 前读取本地官方终态错误以及审批 run/instance、PID 启动时间、进程组和心跳。可信正常活动的上一轮返回 `approval_startup_gate/skipped`，本轮不叠加控制器。45 秒以上没有可信心跳只返回 blocked，不以静默判断卡死；明确阶段超时或已失去原控制器且进程归属仍可信时，只收尾登记的审批只读进程。登记不完整、PID 被复用、进程组回收未知或 Writer 活动均阻断，不猜 PID、不批量杀 Codex。旧版本缺少归属登记时，即使传入人工确认回收参数，也不能绕过此启动门。发起前未登记成功的 CLI 槽位保持占用，须人工核验。
+
+worker 与外层监督进程每 5 秒观察本地原生错误，不产生模型 token。首次官方用量上限、模型不可用、限流、服务过载或账号认证拒绝立即封住新 CLI，结束当前审批，不做审批层重试；首次事件起冷却 3 小时，重复观测不会重新计时。外层使用官方数据库的同项目终态错误保守触发冷却，该范围不证明进程属于审批；数据库不可读也阻断。官方主对话尚未落盘的错误和 CLI 输出首次警告前的内部行为不保证可观测。定时任务的首次模型唤醒发生在本地入口之前，不能由此阻止；本地门控制的是审批链，不承诺防封控。
+
+只有所有登记的只读进程已回收、Writer 空闲、控制器维护租约可信，才撤销本轮未写入动作的旧授权并保存中断证据，OA 待办不变。冷却结束后的下一轮通过原身份、授权、待办/已办和冻结门后，用新 attempt 重新读取当前材料；不续跑旧审核，不复用旧决定。Writer 边界、决定/提交文件或未知写入存在时不自动恢复。此技术中断恢复独立于原“首 attempt 一次”隔离恢复，后者限制不变。到期只清除精确的官方冷却停止标记，不清人工、损坏或未知写入停止门。skipped/blocked/官方冷却停止不进入包装、清窗或程序修复派单。
 
 保留原工具会话并等待真实终态。需要进度时，按[原执行回执](../agents/controller-execution.md#只读进度等待与终态取回)使用同一 owner_task_id、invocation_id、receipt_file 的 `finance_preaudit_run --progress`；已绑定工具 ID 时同时精确核对。它不查询 OA、不启动或停止控制器，也不授权包装、恢复、清窗或留存清理。回执等待、清单未收尾与 children_reaped=false 是运行期状态，不按固定静默时长判断故障。归属、锁、代码、进程或回执证据失信仍转人工核对，不认领或启动另一控制器。
 

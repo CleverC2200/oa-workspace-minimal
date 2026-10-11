@@ -160,7 +160,7 @@ def _mock_final_output(monkeypatch, raw):
         returncode = 0
 
         def __init__(self):
-            self.stderr = io.StringIO()
+            self.stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
 
         def communicate(self, **kwargs):
             prompts.append(kwargs["input"])
@@ -438,8 +438,11 @@ def test_failed_output_retention_failure_remains_unwritten(tmp_path, monkeypatch
     task, action_file = _task(tmp_path)
     _mock_final_output(monkeypatch, "not-json")
 
-    def unsafe(*args):
-        raise RuntimeError("control_file_unsafe")
+    original_write = runtime_control.write_control_bytes_atomic
+    def unsafe(path, payload):
+        if path.parent == action_file.parent:
+            raise RuntimeError("control_file_unsafe")
+        return original_write(path, payload)
 
     monkeypatch.setattr(codex_review_worker.runtime_control, "write_control_bytes_atomic", unsafe)
     result = codex_review_worker.review(task)
@@ -1270,7 +1273,7 @@ def test_execute_codex_normalizes_small_marketing_transport_schema(
     class Process:
         pid = 12345
         returncode = 0
-        stderr = io.StringIO()
+        stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
 
         def __init__(self, command: list[str]) -> None:
             self.decision_file = Path(
@@ -1413,7 +1416,7 @@ def test_codex_start_blocks_sigterm_until_process_group_is_registered(
     class Process:
         pid = 12345
         returncode = 1
-        stderr = io.StringIO()
+        stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
 
         def communicate(self, *, input: str, timeout: int) -> None:
             del input, timeout
@@ -1471,7 +1474,7 @@ def test_codex_process_receives_only_reviewer_runtime_environment(
     class Process:
         pid = 12345
         returncode = 1
-        stderr = io.StringIO()
+        stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
 
         def communicate(self, *, input: str, timeout: int) -> None:
             del input, timeout
@@ -1600,7 +1603,7 @@ def test_production_review_phase_returns_decision_without_completing_action(
     assert not action_file.with_name("execution-receipt.json").exists()
 
 
-def test_production_review_accumulates_retry_events_and_tokens(
+def test_production_review_retains_first_failure_events_and_tokens(
     tmp_path: Path,
 ) -> None:
     task, _action_file = _task(tmp_path)
@@ -1639,28 +1642,25 @@ def test_production_review_accumulates_retry_events_and_tokens(
         executor=lambda *_args: next(executions),
     )
 
-    assert result["status"] == "reviewed"
-    assert result["process_attempts"] == 2
+    assert result["status"] == "failed"
+    assert result["process_attempts"] == 1
     assert result["token_usage"] == {
         "status": "recorded",
-        "input_tokens": 30,
-        "cached_input_tokens": 7,
-        "output_tokens": 4,
-        "total_tokens": 34,
+        "input_tokens": 10,
+        "cached_input_tokens": 2,
+        "output_tokens": 1,
+        "total_tokens": 11,
     }
     assert result["codex_events"] == {
         "status": "recorded",
-        "attempts": 2,
-        "recorded_attempts": 2,
+        "attempts": 1,
+        "recorded_attempts": 1,
         "unknown_attempts": 0,
-        "counts": {"error": 1, "turn.completed": 2},
+        "counts": {"error": 1, "turn.completed": 1},
     }
 
 
-def test_turn_failed_review_is_bounded_so_the_controller_retries(tmp_path: Path) -> None:
-    """上游容量失败(turn.failed)两次后仍属于有界写前失败:
-    控制器据此记录跨轮重试,而不是立刻把单据隔离。
-    """
+def test_turn_failed_review_stops_after_one_attempt(tmp_path: Path) -> None:
     task, action_file = _task(tmp_path)
 
     result = codex_review_worker.review(
@@ -1680,13 +1680,14 @@ def test_turn_failed_review_is_bounded_so_the_controller_retries(tmp_path: Path)
         ),
     )
 
-    assert result["process_attempts"] == 2
-    assert result["codex_events"]["counts"].get("turn.failed") == 2
+    assert result["process_attempts"] == 1
+    assert result["codex_events"]["counts"].get("turn.failed") == 1
+    assert runtime_control.stop_requested()
     assert codex_review_worker.is_bounded_prewrite_failure(result)
     assert action_file.with_name("review-failure.json").is_file()
 
 
-@pytest.mark.parametrize("code,count", [("codex_process_failed", 2), ("codex_process_timeout", 1)])
+@pytest.mark.parametrize("code,count", [("codex_process_failed", 1), ("codex_process_timeout", 1)])
 def test_bounded_prewrite_failure_persists_bound_receipt(tmp_path: Path, code: str, count: int) -> None:
     task, action_file = _task(tmp_path)
 
@@ -1724,9 +1725,9 @@ def test_payload_too_large_keeps_diagnostic_and_existing_failure_boundary(tmp_pa
         error_code="codex_process_failed", token_usage={"status": "unknown"},
         event_signals=("payload_too_large_signal",), process_state="exited", exit_code=1,
     ))
-    assert result["process_attempts"] == 2
+    assert result["process_attempts"] == 1
     assert result["write_state"] == "not_requested"
-    assert result["codex_events"]["counts"]["payload_too_large_signal"] == 2
+    assert result["codex_events"]["counts"]["payload_too_large_signal"] == 1
     assert codex_review_worker.is_bounded_prewrite_failure(result)
     assert action_file.with_name("review-failure.json").is_file()
 
@@ -1748,7 +1749,8 @@ def test_bounded_prewrite_failure_reuses_matching_receipt_after_stop(
     second = codex_review_worker.review(task, executor=fail)
 
     assert codex_review_worker.is_bounded_prewrite_failure(first)
-    assert codex_review_worker.is_bounded_prewrite_failure(second)
+    assert second["error_code"] == "stop_requested"
+    assert second["process_attempts"] == 0
     assert receipt_file.read_bytes() == first_receipt
 
 
@@ -2493,7 +2495,7 @@ def test_process_receives_bound_token_schema(tmp_path: Path, monkeypatch, read_o
     class Process:
         pid = 12345
         returncode = 1
-        stderr = io.StringIO()
+        stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
 
         def communicate(self, *, input: str, timeout: int) -> None:
             expected = "capacity-probe" if read_only else "test-action-token"

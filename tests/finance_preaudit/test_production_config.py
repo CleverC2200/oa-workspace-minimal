@@ -58,7 +58,7 @@ def test_original_native_prompt_wording_is_supported():
 
 @pytest.mark.parametrize("relative,before,after,code", [
     ("config/automations/oa-skill-prompt.txt", "--capacity 3", "--capacity 4", "production_config_capacity_drift:template"),
-    ("config/automations/oa-skill-prompt.txt", "--max-capacity 6", "--max-capacity 12", "production_config_capacity_drift:template"),
+    ("config/automations/oa-skill-prompt.txt", "--max-capacity 3", "--max-capacity 12", "production_config_capacity_drift:template"),
     ("docs/runbooks/hourly-production.md", "service_tier=default", "service_tier=priority", "production_config_service_tier_drift:runbook"),
     ("config/automations/oa-skill-prompt.txt", "--workflow general_expense", "--workflow packaging_layout_approval", "production_config_workflows_drift:template"),
     ("config/automations/oa-skill-prompt.txt", "--confirm-write YES", "--read-only", "production_config_command_invalid:template"),
@@ -83,7 +83,7 @@ def test_obsolete_active_provider_instruction_is_rejected(repository):
 def test_public_snapshot_matches_authorized_production_settings():
     assert production_config.snapshot() == {
         "model": "gpt-6.1-sol", "reasoning_effort": "medium", "model_provider": "openai",
-        "requested_service_tier": "default", "initial_capacity": 3, "max_capacity": 6,
+        "requested_service_tier": "default", "initial_capacity": 3, "max_capacity": 3,
         "workflows": ["travel_expense", "business_entertainment", "business_support_fee",
                       "small_marketing_fee", "tpm_small_marketing_fee", "general_expense"],
     }

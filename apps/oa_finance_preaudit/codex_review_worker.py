@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import codecs
 from contextlib import ExitStack, contextmanager, nullcontext
 import json
 import math
@@ -21,12 +22,13 @@ from typing import Callable, TextIO
 from apps import json_artifact
 from apps.oa_approval import runtime_control, writer_outcomes
 
-from . import concurrency_control, decision_validation, fuel_trip_observation, manual_handoff, process_diagnostics, review_failure_evidence, review_output, review_context
+from . import approval_guard, concurrency_control, decision_validation, fuel_trip_observation, manual_handoff, process_diagnostics, review_failure_evidence, review_output, review_context
 from .review_output import parse_json as _parse_decision_json
 
 
 MODEL = review_failure_evidence.MODEL
 REASONING_EFFORT = review_failure_evidence.REASONING_EFFORT
+OBSERVATION_INTERVAL_SECONDS = 5
 _NATIVE_RECEIPT_MAX_BYTES = 32 * 1024 * 1024
 _NATIVE_RECEIPT_HEADER_MAX_BYTES = 1024 * 1024
 _FINANCE_RULES = {
@@ -80,6 +82,8 @@ _SANITIZED_EVENT_TYPES = _EVENT_TYPES | {
     "retry_signal",
     "transport_signal",
     "payload_too_large_signal",
+    "usage_limit_signal",
+    "model_access_signal",
 }
 _COMPLETION_FAILURE_CODES = writer_outcomes.FAILURE_CODES | {
     "writer_result_unknown",
@@ -196,6 +200,7 @@ class CodexExecution:
     event_status: str = "unknown"
     exit_code: int | None = None
     event_signals: tuple[str, ...] = ()
+    stop_request_error: str | None = None
 
 
 Executor = Callable[[Path, Path, int], CodexExecution]
@@ -600,6 +605,8 @@ def _codex_command(
         f'model_reasoning_effort="{REASONING_EFFORT}"',
         "--config",
         'model_provider="openai"',
+        "--config",
+        "features.unbounded_connection_retries=false",
         "--config",
         'service_tier="default"',
         "--config",
@@ -1020,8 +1027,31 @@ def _execute_codex(
             "codex_process_diagnostic_failed", execution.token_usage,
             process_state=execution.process_state, event_counts=execution.event_counts,
             event_status=execution.event_status, exit_code=execution.exit_code,
+            stop_request_error=execution.stop_request_error,
         )
     return execution
+
+
+def _request_review_stop(action_file: Path, error_code: str) -> tuple[int, int, int] | None:
+    trigger = action_file.with_name("review-stop-trigger.json")
+    owned = None
+    try:
+        if not trigger.exists():
+            action_bytes = action_file.read_bytes()
+            runtime_control.write_control_bytes_atomic(trigger, (json.dumps({
+                "schema_version": 1, "kind": "preaudit_review_stop_trigger",
+                "error_code": error_code, "model": MODEL,
+                "process_result": "unknown",
+                "action_sha256": hashlib.sha256(action_bytes).hexdigest(),
+            }, sort_keys=True) + "\n").encode())
+    finally:
+        with runtime_control.stop_control_lease():
+            previous = runtime_control.read_control_bytes(runtime_control.stop_file())
+            runtime_control._write_stop_locked("codex_review_technical_failure")
+            if previous in {None, b"stop_requested:controller_cycle_stop\n"}:
+                metadata = runtime_control.stop_file().stat(follow_symlinks=False)
+                owned = (metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns)
+    return owned
 
 
 @contextmanager
@@ -1059,6 +1089,9 @@ def _execute_codex_raw(
     audit_directory: Path | None = None,
     allow_visual_aux: bool = False,
 ) -> CodexExecution:
+    if not read_only and runtime_control.stop_requested():
+        return CodexExecution("stop_requested", _unknown_usage(),
+                              process_state="not_started", decision_state="not_attempted")
     try:
         if type(allow_visual_aux) is not bool or (allow_visual_aux and (
                 not read_only or audit_directory is None
@@ -1106,6 +1139,7 @@ def _execute_codex_raw(
                                "--config", "log_dir=" + json.dumps(str(temporary_root / "native-logs"))]
             (temporary_root / "prompt.txt").write_text(prompt, encoding="utf-8")
         process: subprocess.Popen | None = None
+        review_parent_pid = os.getppid()
         previous_sigterm: object | None = None
         previous_sigterm_mask: set[signal.Signals] | None = None
 
@@ -1127,6 +1161,11 @@ def _execute_codex_raw(
             if previous_sigterm_mask is not None:
                 signal.pthread_sigmask(signal.SIG_SETMASK, previous_sigterm_mask)
 
+        if not read_only and runtime_control.stop_requested():
+            output.close()
+            return CodexExecution("stop_requested", _unknown_usage(),
+                                  process_state="not_started", decision_state="not_attempted")
+
         if threading.current_thread() is threading.main_thread():
             previous_sigterm_mask = signal.pthread_sigmask(
                 signal.SIG_BLOCK,
@@ -1141,60 +1180,183 @@ def _execute_codex_raw(
                 restore_sigterm_mask()
                 previous_sigterm_mask = None
 
+        slot = None
         try:
-            process = subprocess.Popen(
-                command,
-                cwd=project_root,
-                env=reviewer_environment,
-                stdin=subprocess.PIPE,
-                stdout=output,
-                stderr=subprocess.PIPE,
-                text=True,
-                errors="replace",
-                start_new_session=True,
-            )
+            slot = visual_leases.enter_context(approval_guard.model_slot(action_file, project_root, timeout_seconds))
+            with runtime_control.stop_control_lease():
+                if runtime_control.stop_requested():
+                    approval_guard.cancel_unlaunched_locked(slot)
+                    restore_sigterm()
+                    output.close()
+                    return CodexExecution("stop_requested", _unknown_usage(),
+                                          process_state="not_started", decision_state="not_attempted")
+                process = subprocess.Popen(
+                    command,
+                    cwd=project_root,
+                    env=reviewer_environment,
+                    stdin=subprocess.PIPE,
+                    stdout=output,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    errors="replace",
+                    start_new_session=True,
+                )
+                approval_guard.register_model(slot, process.pid, command)
         except OSError:
+            if slot is not None and process is None:
+                approval_guard.cancel_unlaunched(slot)
+            if process is not None:
+                _terminate_process_group(process, grace_seconds=0.2)
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
             restore_sigterm()
             output.close()
             return CodexExecution(
                 "codex_process_start_failed",
                 _unknown_usage(),
-                process_state="start_failed",
+                process_state="start_failed" if process is None else "cleanup_failed",
                 decision_state="not_attempted",
                 event_status="unknown",
             )
+        except (ValueError, RuntimeError) as error:
+            restore_sigterm()
+            if process is not None:
+                _terminate_process_group(process, grace_seconds=0.2)
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+            output.close()
+            return CodexExecution(str(error), _unknown_usage(), process_state="not_started" if process is None else "cleanup_failed",
+                                  decision_state="not_attempted")
         finally:
             restore_sigterm_mask()
         errors = process.stderr
         process.stderr = None  # The bounded reader owns this pipe, not communicate().
         stderr_failed: list[bool] = []
+        fatal_stderr = threading.Event()
+        official_notices: list[tuple[str, float]] = []
+
+        def observe_stderr(signals: set[str]) -> None:
+            if signals & {"usage_limit_signal", "model_access_signal"}:
+                if not official_notices:
+                    official_notices.append(("usage_limit" if "usage_limit_signal" in signals else "model_unavailable", time.time()))
+                fatal_stderr.set()
 
         def collect_stderr() -> None:
             try:
                 with errors:
-                    if audit_directory:
-                        with (temporary_root / "stderr.log").open("x", encoding="utf-8") as raw:
-                            class RetainedStderr:
-                                def read(self, size):
-                                    chunk = errors.read(size)
-                                    raw.write(chunk)
-                                    return chunk
-                            stderr_summary.update(process_diagnostics.stderr_summary(RetainedStderr()))
+                    with ((temporary_root / "stderr.log").open("x", encoding="utf-8")
+                          if audit_directory else nullcontext()) as raw:
+                        class AvailableStderr:
+                            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+                            def read(self, size):
+                                # read1 returns a short warning while the CLI is still alive.
+                                while True:
+                                    data = errors.buffer.read1(size)
+                                    chunk = self.decoder.decode(data, final=not data)
+                                    if chunk or not data:
+                                        if raw is not None:
+                                            raw.write(chunk)
+                                        return chunk
+
+                        stderr_summary.update(process_diagnostics.stderr_summary(
+                            AvailableStderr(), on_signals=observe_stderr))
+                        if raw is not None:
                             raw.flush()
                             os.fsync(raw.fileno())
-                    else:
-                        stderr_summary.update(process_diagnostics.stderr_summary(errors))
             except (OSError, ValueError):
                 stderr_failed.append(True)
 
         stderr_reader = threading.Thread(target=collect_stderr, daemon=True)
         stderr_reader.start()
+        finished = threading.Event()
+        communication_errors: list[BaseException] = []
+        interrupted = False
+        live_failure = False
+        technical_stop_identity = None
+        stop_error = None
+        offset = 0
+        pending = b""
+
+        def communicate() -> None:
+            try:
+                process.communicate(input=prompt, timeout=timeout_seconds)
+            except BaseException as error:
+                communication_errors.append(error)
+            finally:
+                finished.set()
+
+        communicator = threading.Thread(target=communicate, daemon=True)
+        communicator.start()
+
+        def observe_failure() -> bool:
+            nonlocal offset, pending
+            # pread does not move the offset shared with the child's stdout.
+            output.flush()
+            snapshot_size = os.fstat(output.fileno()).st_size
+            while offset < snapshot_size or (finished.is_set() and pending):
+                chunk = os.pread(output.fileno(), min(512 * 1024, snapshot_size - offset), offset)
+                if not chunk and offset < snapshot_size:
+                    return True
+                offset += len(chunk)
+                pending += chunk
+                lines = pending.split(b"\n")
+                pending = lines.pop()
+                if finished.is_set() and offset == snapshot_size and pending:
+                    lines.append(pending)
+                    pending = b""
+                for line in lines:
+                    if not line.strip():
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except (ValueError, UnicodeError):
+                        return True
+                    if not isinstance(event, dict):
+                        return True
+                    error = process_diagnostics.error_envelope(event)
+                    if error is not None:
+                        code = approval_guard.notice_code(error)
+                        if code and not official_notices:
+                            official_notices.append((code, time.time()))
+                        return True
+                if len(pending) > _NATIVE_RECEIPT_MAX_BYTES:
+                    return True
+            return fatal_stderr.is_set()
+
         try:
-            process.communicate(
-                input=prompt,
-                timeout=timeout_seconds,
-            )
+            while True:
+                live_failure = observe_failure()
+                parent_lost = os.getppid() != review_parent_pid
+                interrupted = runtime_control.stop_requested() or parent_lost
+                if live_failure or interrupted:
+                    if live_failure or parent_lost:
+                        try:
+                            if official_notices:
+                                code, stamp = official_notices[0]
+                                approval_guard.record_notice(code, f"cli:{slot['launch_id']}", occurred_at=stamp)
+                            if not read_only:
+                                technical_stop_identity = _request_review_stop(action_file, "codex_process_failed" if live_failure else "codex_review_parent_lost")
+                        except (OSError, RuntimeError, ValueError):
+                            stop_error = "codex_review_stop_failed"
+                    _terminate_process_group(process, grace_seconds=0.2)
+                    break
+                if finished.is_set() and offset >= os.fstat(output.fileno()).st_size:
+                    break
+                finished.wait(OBSERVATION_INTERVAL_SECONDS)
+            communicator.join(timeout=1)
+            if communication_errors:
+                raise communication_errors[0]
         except subprocess.TimeoutExpired:
+            if not read_only:
+                try:
+                    _request_review_stop(action_file, "codex_process_timeout")
+                except (OSError, RuntimeError, ValueError):
+                    stop_error = "codex_review_stop_failed"
             _terminate_process_group(process, grace_seconds=5)
             process.poll()
             try:
@@ -1220,11 +1382,13 @@ def _execute_codex_raw(
                 event_status=event_status,
                 exit_code=process.returncode,
                 event_signals=tuple(stderr_summary.get("event_signals", ())),
+                stop_request_error=stop_error,
             )
         finally:
             restore_sigterm()
             if process.poll() is None:
                 _terminate_process_group(process, grace_seconds=0.2)
+            communicator.join(timeout=1)
             stderr_reader.join(timeout=5)
             if stderr_reader.is_alive():
                 _terminate_process_group(process, grace_seconds=0.2)
@@ -1243,6 +1407,23 @@ def _execute_codex_raw(
                     stderr_summary["tool_receipt_files"] = []
                     stderr_summary["tool_receipt_unavailable"] = True
 
+        if fatal_stderr.is_set():
+            # A fast CLI exit can precede the stderr reader's final classification.
+            live_failure = True
+            try:
+                if official_notices:
+                    code, stamp = official_notices[0]
+                    approval_guard.record_notice(code, f"cli:{slot['launch_id']}", occurred_at=stamp,
+                                                 technical_stop_identity=technical_stop_identity)
+                if not read_only:
+                    _request_review_stop(action_file, "codex_process_failed")
+            except (OSError, RuntimeError, ValueError):
+                stop_error = "codex_review_stop_failed"
+
+        if approval_guard.group_alive(process.pid):
+            output.close()
+            return CodexExecution("codex_model_cleanup_unknown", _unknown_usage(),
+                                  process_state="cleanup_failed", decision_state="not_attempted")
         usage = _parse_token_usage(output)
         event_counts = _parse_event_counts(output)
         event_status = _event_status(output, event_counts)
@@ -1251,7 +1432,7 @@ def _execute_codex_raw(
         decision: dict | None = None
         decision_state = "not_written"
         output_error = None
-        if process.returncode == 0:
+        if process.returncode == 0 and not live_failure and not interrupted:
             try:
                 raw_bytes = decision_file.read_bytes()
                 parsed = review_output.consume(raw_bytes, parser=decision_parser)
@@ -1296,7 +1477,9 @@ def _execute_codex_raw(
                     output_error = "codex_decision_diagnostic_failed"
     output.close()
     return CodexExecution(
-        output_error if process.returncode == 0 else "codex_process_failed",
+        "stop_requested" if interrupted and not live_failure else (
+            "codex_process_failed" if live_failure or process.returncode != 0 else output_error
+        ),
         usage,
         decision,
         process_state="exited",
@@ -1305,6 +1488,7 @@ def _execute_codex_raw(
         event_status=event_status,
         exit_code=process.returncode,
         event_signals=tuple(stderr_summary.get("event_signals", ())),
+        stop_request_error=stop_error,
     )
 
 
@@ -1492,10 +1676,9 @@ def _is_bounded_failure(
 
 
 def is_bounded_prewrite_failure(value: object) -> bool:
-    error_code = value.get("error_code") if isinstance(value, dict) else None
     return _is_bounded_failure(
         value,
-        allowed_attempts={1, 2} if error_code == "codex_process_timeout" else {2},
+        allowed_attempts={1, 2},
         error_codes=_BOUNDED_PREWRITE_FAILURE_CODES,
     )
 
@@ -1813,72 +1996,39 @@ def review(
             "write_state": "not_requested",
             "error_code": "codex_review_task_invalid",
         }
-    usages: list[dict] = []
-    executions: list[CodexExecution] = []
-    for attempt in (1, 2):
-        execution = executor(project_root, action_file, timeout_seconds)
-        executions.append(execution)
-        usages.append(execution.token_usage)
-        if execution.error_code is None and isinstance(execution.decision, dict):
-            return {
-                **_base_result(attempts=attempt, usages=usages),
-                "codex_events": _merge_events(executions),
-                "status": "reviewed",
-                "business_state": "not_available",
-                "write_state": "not_requested",
-                "error_code": None,
-                "agent_wall_seconds": max(
-                    0,
-                    int(time.monotonic() - run_started),
-                ),
-                "decision": execution.decision,
-            }
-        error_code = execution.error_code or "codex_process_incomplete"
-        if (
-            attempt == 1
-            and error_code in {"codex_process_failed", "codex_process_incomplete"}
-            and _safe_to_retry(action_file)
-        ):
-            continue
-        result = {
-            **_base_result(attempts=attempt, usages=usages),
-            "codex_events": _merge_events(executions),
-            "status": "failed",
-            "business_state": "not_available",
-            "write_state": "not_requested",
-            "error_code": error_code,
+    if runtime_control.stop_requested():
+        return {
+            **_base_result(attempts=0, usages=[]),
+            "codex_events": _merge_events([]), "status": "failed",
+            "business_state": "not_available", "write_state": "not_requested",
+            "error_code": "stop_requested",
         }
-        attempt_error_codes = [
-            execution.error_code or "codex_process_incomplete"
-            for execution in executions
-        ]
-        if is_bounded_prewrite_failure(result) and not _write_review_failure_receipt(
-            action_file,
-            result,
-            attempt_error_codes=attempt_error_codes,
-        ):
-            return {
-                **result,
-                "error_code": "codex_review_failure_evidence_invalid",
-            }
-        if (
-            error_code == "codex_process_timeout"
-            and execution.process_state == "timed_out"
-            and execution.exit_code is not None
-            and _safe_to_retry(action_file)
-            and not runtime_control.stop_requested()
-        ):
-            try:
-                handoff = manual_handoff.build(action_file, error_code)
-            except (OSError, ValueError, TypeError):
-                return {**result, "error_code": "codex_review_failure_evidence_invalid"}
-            return {
-                **result, "status": "reviewed", "error_code": None,
-                "decision": handoff,
-                "agent_wall_seconds": max(0, int(time.monotonic() - run_started)),
-            }
-        return result
-    raise AssertionError("unreachable")
+    execution = executor(project_root, action_file, timeout_seconds)
+    base = {
+        **_base_result(attempts=1, usages=[execution.token_usage]),
+        "codex_events": _merge_events([execution]),
+        "business_state": "not_available", "write_state": "not_requested",
+    }
+    if execution.error_code is None and isinstance(execution.decision, dict):
+        return {
+            **base, "status": "reviewed", "error_code": None,
+            "agent_wall_seconds": max(0, int(time.monotonic() - run_started)),
+            "decision": execution.decision,
+        }
+    error_code = execution.error_code or "codex_process_incomplete"
+    stop_error = execution.stop_request_error
+    try:
+        _request_review_stop(action_file, error_code)
+    except (OSError, RuntimeError, ValueError):
+        stop_error = "codex_review_stop_failed"
+    result = {**base, "status": "failed", "error_code": error_code,
+              **({"stop_request_error": stop_error} if stop_error else {})}
+    if is_bounded_prewrite_failure(result) and not _write_review_failure_receipt(
+        action_file, result,
+        attempt_error_codes=[execution.error_code or "codex_process_incomplete"],
+    ):
+        return {**result, "error_code": "codex_review_failure_evidence_invalid"}
+    return result
 
 
 def complete_review_result(

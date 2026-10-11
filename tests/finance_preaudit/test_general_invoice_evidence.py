@@ -185,7 +185,7 @@ def test_review_launch_requires_shared_payment_rule(tmp_path, monkeypatch, flow_
     class Process:
         pid = 12345
         returncode = 0
-        stderr = io.StringIO()
+        stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
 
         def __init__(self, command):
             self.decision_file = Path(command[command.index("--output-last-message") + 1])

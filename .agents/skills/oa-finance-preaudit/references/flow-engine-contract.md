@@ -31,7 +31,9 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
 
 控制器领取已打开动作时，若 capability 已过期或剩余有效期不超过 20 分钟，必须先在原身份、材料和 evidence 指纹绑定下刷新 capability 与提交 token，再开始最长 15 分钟的审核；剩余有效期超过该窗口时保持原 token，不因重复读取破坏幂等。完成宿主在提交前再次执行同一刷新判断；此时保留审核决定绑定的 action token，只轮换 capability 和 submission token。
 
-滚动控制器不得把单个 AI 进程的普通写前失败扩大为长期全局阻断。`codex_process_failed` 或 `codex_process_incomplete` 只有在同一单据已完成两次安全尝试、结果明确为 `write_state=not_requested`，且存在绑定当前 action token、模型、推理档位和两次逐次错误码的原子 `review-failure.json` 时，才进入隔离检查。FlowEngine 在完成锁内复核该凭据、动作仍为 `review_required / authorized`，且不存在 Writer 边界、执行回执、审核决定、签字意见和提交信封后，持久化凭据指纹与 `codex_review_failed / needs_admin / not_requested` 并继续全局 FIFO。收据已写但父控制器在隔离前停止时，后续运行可以复用完全相同且仍绑定当前 action 的收据；内容冲突必须停止。任一条件不满足、隔离落盘失败、未满足下述人工交接条件的进程超时/卡死、宿主 critical 或出现未列入白名单的新错误码时，仍立即停止整轮。历史 `codex_review_failed` 只有在 action/state、收据指纹和零 Writer 痕迹全部复核通过后才计入隔离并参与人工对账；损坏现场按 `review_quarantine_invalid` 技术失败处理，不自动重试。
+滚动审核在首次模型进程失败、结果未完成或超时时设置持久停止门 `codex_review_technical_failure`，停止新领取、模型派发和业务层自动重试。模型启动与停止门的写入、清除共用本地停止控制租约；启动前在租约内复查停止门。模型 CLI 关闭无限连接重试；内置 OpenAI provider 的底层有界重试尚不能据此认定为零。审核期间每 5 秒检查结构化错误事件、停止门及原父进程存活，每次排空该检查开始时可见的事件。stderr 使用短读取，不等满 4 KiB 或进程结束；明确的额度上限和模型不可用警告也触发停止。普通工具输出不用于错误判断。发现错误后回收只读模型进程组；系统失去调度能力或 CLI 尚未输出错误时，不承诺 5 秒内阻断。已进入 Writer 的操作等待原回执，不中断或重放。先保存绑定动作文件摘要的 `review-stop-trigger.json`，其 `process_result=unknown` 不证明退出或未写入。控制器给予审核 worker 6 秒协作收尾窗口，超时再收只读池；完整 `review-failure.json` 依赖 worker 正常收尾，缺失时不得据触发凭据隔离或认定已回收。完整失败凭据绑定 action token、模型、推理档位和逐次错误码；历史两次尝试凭据继续可读，不改写历史。停止门不会因本轮收尾自动清除，须人工核对后显式恢复。触发凭据或停止门写入失败时保留原始错误与次级停止错误，不宣称成功阻断。
+
+FlowEngine 的隔离和恢复仍须在完成锁内复核失败凭据、动作、冻结输入及零 Writer 痕迹。历史 `codex_review_failed` 只有在 action/state、收据指纹和零 Writer 痕迹全部复核通过后才计入隔离并参与人工对账；损坏现场按 `review_quarantine_invalid` 技术失败处理，不自动重试。异常阻断不证明历史单据已隔离、未写入或已完成。
 
 人工明确授权后，滚动入口可通过精确的 `--recover-action-file` 恢复 `codex_decision_invalid` 或 `codex_review_failed`。恢复前必须核对 action/state 均为 `needs_admin / not_requested`、冻结身份与材料完整、最新 attempt、实时待办身份一致且无已办命中，并确认不存在 Writer 边界、执行回执、审核决定、意见或提交信封；进程失败还必须通过原始失败凭据与指纹校验。只创建新的冻结 attempt，保留原隔离证据，不直接写 OA；不带显式恢复参数时仍跳过历史隔离，不自动重试，未知写入规则不变。
 
@@ -47,15 +49,15 @@ stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSO
 
 资源等待与 AI 审核失败分开处理。CPU 高负载本身属于 `pressure`，不单独触发 `critical`。当前生产调度显式配置起始 3、最高 6，恢复健康后需连续两个完整窗口才按 `3 → 4 → 6` 升一级。代码保留未指定参数时起始 2、最高 12 的历史默认和 `2 → 4 → 6 → 8 → 10 → 12` 升档。持续压力按每次心跳逐级降档，3、4 槽均降到 2，限流直接降到 2；保留在途审核，不为降档杀进程。材料准备及 Writer 均保持 1 槽，原全局 FIFO 不变。
 
-宿主健康采样未知时，控制器标记 `resource_paused=true`，暂停新领取、准备完成后的审核派发及排队 Writer；已在途操作仍受原超时和安全校验约束。周期性复测恢复可信后继续原队列，排队等待不启动 AI 审核计时。等待期间仍响应显式停止，已进入 Writer 的操作不能被重放。可用内存低于 12% 仍为 `critical`，即使 CPU 采样缺失也立即停止。资源繁忙或等待绝不生成下述人工交接意见；只有实际 AI 超时继续按下述独立规则处理。
+宿主健康采样未知时，控制器标记 `resource_paused=true`，暂停新领取、准备完成后的审核派发及排队 Writer；已在途操作仍受原超时和安全校验约束。周期性复测恢复可信后继续原队列，排队等待不启动 AI 审核计时。等待期间仍响应显式停止，已进入 Writer 的操作不能被重放。可用内存低于 12% 仍为 `critical`，即使 CPU 采样缺失也立即停止。资源繁忙或等待不生成人工交接意见。
 
-六类财务当前受控 attempt 遇到 `codex_process_timeout` 时，宿主可生成 `preaudit_manual_handoff` 行政交接记录，说明 AI 未形成有效业务结论，请财务人工审核。它不是 `preaudit_review_decision`，不含 `items`，不计为完成业务审核覆盖；原固定项目规则只适用于有效业务决定。包装与手工 preview 不使用此分支。
+当前滚动审核遇到 `codex_process_timeout` 时停止整轮，不自动生成或提交行政交接意见。历史 `preaudit_manual_handoff` 是说明 AI 未形成有效业务结论、请财务人工审核的行政记录，不是 `preaudit_review_decision`，不含 `items`，不计为完成业务审核覆盖；原固定项目规则只适用于有效业务决定。包装与手工 preview 不使用此分支。
 
-超时须确认审核进程组退出并保存绑定当前 action token 的失败凭据。宿主在同一完成锁内复核动作仍为 `review_required / authorized`、冻结输入、当前授权及零 Writer 痕迹，再将特别说明交给唯一串行 Writer；身份、待办、begin-submit、终态回执与后置校验仍全部执行。此分支不再请求 AI 重试，成功闭合为 `needs_human / submitted` 后继续 FIFO。意见只说明审核超时，不包含原始错误内容，也不生成业务通过/不通过结论。
+历史人工交接的校验继续保留。超时须确认审核进程组退出并保存绑定当前 action token 的失败凭据；宿主在同一完成锁内复核动作、冻结输入、当前授权及零 Writer 痕迹，身份、待办、begin-submit、终态回执与后置校验仍全部执行。历史意见只说明审核超时，不包含原始错误内容，也不生成业务通过/不通过结论；保留这些读取与校验能力不授权当前自动提交。
 
 `codex_decision_invalid` 不得生成 `preaudit_manual_handoff`，也不得进入 Writer。有效 JSON 对象在父 Writer 的结构校验失败时，由调度器重新发起一次独立 AI 审核；第二次仍无效则把当前 attempt 隔离为 `codex_decision_invalid / needs_admin / not_requested`，继续全局 FIFO。原始输出不是单个有效决定对象时不重试，直接按同一 no-write 结果隔离当前 attempt 并继续 FIFO。两种路径都保存脱敏拒绝凭据，禁止把“审核结果格式异常”写入 OA；最终人工交接校验边界也必须拒绝该失败码。
 
-登录失效、身份/材料/授权不可信、未知写入、当前停止门、本机 critical 或健康状态未知仍停止；进程回收未确认时不得转交接。历史隔离项不自动重试，已办意见不追改。普通进程失败和无有效对象的进程未完成仍按原隔离合同处理。
+登录失效、身份/材料/授权不可信、未知写入、当前停止门、本机 critical 或健康状态未知仍停止；进程回收未确认时不得转交接。历史隔离项不自动重试，已办意见不追改。外层监督器收到停止信号或发现直接父进程退出后请求控制器停止；等待超过 30 秒保存 `controller_stop_timeout`，查询返回 blocked，仍等待实际退出和在途 Writer，不伪造退出码或成功。监督器死亡而回执仍为 starting/waiting 时，只读查询返回 `controller_supervisor_lost`，原回执不改写。主聊天结束但宿主进程仍活着时，尚无可靠事件接线，不将进程存活检测等同聊天生命周期检测。
 
 审核子进程另保存脱敏阶段诊断：动作令牌摘要、固定事件计数、最后观察阶段、耗时、退出码和标准错误固定信号。不保存标准错误原文、事件正文或审核决定。固定信号只表示观察到相关关键字，不单独证明网络或服务故障根因。无完成用量事件时，汇总状态为 `unknown`，数值累计字段不代表实际消耗为零。
 

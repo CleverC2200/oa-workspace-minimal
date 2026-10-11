@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from contextlib import ExitStack
 from concurrent.futures import (
     FIRST_COMPLETED,
     Future,
@@ -28,6 +29,8 @@ from zoneinfo import ZoneInfo
 from apps import json_artifact
 from apps.oa_approval import attachment_cache, runtime_control, writer_outcomes
 from apps.oa_finance_preaudit import (
+    approval_guard,
+    approval_lifecycle,
     cli,
     codex_review_worker,
     concurrency_control,
@@ -1958,21 +1961,27 @@ def _process_executor(capacity: int) -> ProcessPoolExecutor:
     return ProcessPoolExecutor(
         max_workers=capacity,
         mp_context=multiprocessing.get_context("spawn"),
+        initializer=_initialize_review_worker,
+        initargs=(approval_lifecycle.context(),),
     )
 
 
-def _initialize_preparation_worker() -> None:
+def _initialize_readonly_worker(role: str, binding: tuple[str, str, str] | None) -> None:
     os.setsid()
     parent = multiprocessing.parent_process()
     if parent is None:
         raise RuntimeError("preparation_parent_missing")
+    record = approval_lifecycle.register_readonly_worker(role, binding)
 
     def reap_after_parent_exit() -> None:
         # The sentinel identifies the original parent without PID reuse races.
         # Only this read-only preparation group is owned here, never the Writer.
         wait_for_process([parent.sentinel])
-        if os.getpgrp() == os.getpid():
-            os.killpg(os.getpgrp(), signal.SIGKILL)
+        try:
+            approval_lifecycle.reap_worker_models(record)
+        finally:
+            if os.getpgrp() == os.getpid():
+                os.killpg(os.getpgrp(), signal.SIGKILL)
 
     threading.Thread(
         target=reap_after_parent_exit,
@@ -1981,11 +1990,20 @@ def _initialize_preparation_worker() -> None:
     ).start()
 
 
+def _initialize_preparation_worker(binding: tuple[str, str, str] | None = None) -> None:
+    _initialize_readonly_worker("prepare", binding)
+
+
+def _initialize_review_worker(binding: tuple[str, str, str] | None = None) -> None:
+    _initialize_readonly_worker("review", binding)
+
+
 def _preparation_executor() -> ProcessPoolExecutor:
     return ProcessPoolExecutor(
         max_workers=1,
         mp_context=multiprocessing.get_context("spawn"),
         initializer=_initialize_preparation_worker,
+        initargs=(approval_lifecycle.context(),),
     )
 
 
@@ -2222,7 +2240,7 @@ def _run_dispatched_tasks(
     executor_factory: ExecutorFactory = _process_executor,
     task_timeout_sec: float = 960,
     prepare_timeout_sec: float = 300,
-    heartbeat_interval_sec: float = 15,
+    heartbeat_interval_sec: float = 5,
     runtime_status: Callable[[], dict] = concurrency_control.sample_local_health,
     strict_global_fifo: bool = False,
     adaptive: bool = False,
@@ -2432,7 +2450,7 @@ def _run_dispatched_tasks(
                     error_code="worker_process_failed",
                 )
                 continue
-            if value.get("status") == "reviewed":
+            if value.get("status") == "reviewed" or value.get("error_code") == "stop_requested":
                 stopped_review(index, prepare_elapsed, value)
             else:
                 outcomes[index] = process_pool.TaskOutcome(
@@ -2448,6 +2466,10 @@ def _run_dispatched_tasks(
         nonlocal force_terminated
         if force_terminated:
             return
+        if futures and runtime_control.stop_reason() in {"codex_review_technical_failure", approval_guard.STOP_REASON}:
+            # Workers already observe the gate; retain their failure receipts
+            # before forcibly reaping only the read-only review pool.
+            wait(tuple(futures), timeout=codex_review_worker.OBSERVATION_INTERVAL_SECONDS + 1)
         harvest_stopped_reviews(
             {future for future in futures if future.done()}
         )
@@ -2614,13 +2636,16 @@ def _run_dispatched_tasks(
         first_attempt: bool,
     ) -> None:
         nonlocal started, peak_active
-        future = executor.submit(
+        publish_progress()
+        future = approval_lifecycle.submit_readonly(
+            executor,
             review_worker,
             {
                 "project_root": str(root),
                 "action_file": str(action_file),
                 "timeout_seconds": 900,
             },
+            role="review",
         )
         futures[future] = (
             index,
@@ -2631,6 +2656,15 @@ def _run_dispatched_tasks(
         if first_attempt:
             started += 1
         peak_active = max(peak_active, len(futures))
+
+    def publish_progress() -> None:
+        if approval_lifecycle.context() is None:
+            return
+        now, wall = time.monotonic(), time.time()
+        deadlines = [wall + task_timeout_sec - (now - task[2]) for task in futures.values()]
+        if preparation is not None:
+            deadlines.append(wall + prepare_timeout_sec - (now - preparation[2]))
+        approval_lifecycle.heartbeat(run_id, controller_instance_id, assigned, deadlines, writer_active=writer is not None)
 
     def validated_assigned_identity(action_file: Path) -> tuple[str, str]:
         action_path = action_file.resolve()
@@ -2909,6 +2943,7 @@ def _run_dispatched_tasks(
                 continue
 
             if now >= next_heartbeat:
+                publish_progress()
                 try:
                     host = runtime_status()
                 except Exception:
@@ -3212,6 +3247,7 @@ def _run_dispatched_tasks(
                                 )
                                 continue
                         assigned.add(action_file)
+                        publish_progress()
                         advance_write_head()
                         pending_reviews[index] = (prepare_elapsed, action_file, True)
 
@@ -3237,6 +3273,11 @@ def _run_dispatched_tasks(
                         first_review_error_code = "worker_process_failed"
                     continue
                 if value.get("status") != "reviewed":
+                    if runtime_control.stop_reason() == approval_guard.STOP_REASON:
+                        outcomes[index] = process_pool.TaskOutcome(index=index, status="stopped", value=value, error_code="stop_requested")
+                        failed_now = True
+                        first_review_error_code = first_review_error_code or "stop_requested"
+                        continue
                     error_code = str(
                         value.get("error_code") or "worker_process_failed"
                     )
@@ -3592,12 +3633,14 @@ def _run_dispatched_tasks(
                         "controller_instance_id": controller_instance_id,
                     }
                     preparation = (
-                        prepare_executor.submit(
+                        approval_lifecycle.submit_readonly(
+                            prepare_executor,
                             prepare_trace.run,
                             prepare_action,
                             selection,
                             trace_directory,
                             prepare_trace_context,
+                            role="prepare",
                         ),
                         next_index,
                         time.monotonic(),
@@ -3626,6 +3669,7 @@ def _run_dispatched_tasks(
                     break
                 action_file = available[0]
                 assigned.add(action_file)
+                publish_progress()
                 submit_review(
                     next_index,
                     prepare_elapsed,
@@ -3688,6 +3732,8 @@ def _run_dispatched_tasks(
         known_processes,
         timeout_seconds=5,
     )
+    if run_id is not None:
+        processes_reaped = processes_reaped and approval_guard.models_reaped(run_id)
 
     if timed_out_prepare_context is not None:
         prepare_trace.record_timeout(trace_directory, timed_out_prepare_context)
@@ -4497,7 +4543,7 @@ def run_rolling_drain(
     *,
     capacity: int,
     adaptive: bool = False,
-    max_capacity: int = 12,
+    max_capacity: int | None = None,
     live_status: LiveStatus = runtime_doctor.status,
     pipeline_runner: PipelineRunner = _run_global_dispatched_tasks,
     reconcile_status: Callable[[], dict] = _production_reconciliation,
@@ -4507,7 +4553,16 @@ def run_rolling_drain(
     confirm_stale_children_reaped: bool = False,
     authorized_recovery_once: bool = False,
 ) -> dict:
+    native_pipeline = pipeline_runner is _run_global_dispatched_tasks
+    # Recorded runners retain the diagnostic algorithm; native admission is fixed.
+    max_capacity = (3 if native_pipeline else 12) if max_capacity is None else max_capacity
     _validate_rolling_capacity(capacity, max_capacity)
+    if native_pipeline:
+        if adaptive or capacity > approval_guard.MAX_MODEL_WORKERS or max_capacity > approval_guard.MAX_MODEL_WORKERS:
+            raise ValueError("approval_global_capacity_invalid")
+        gate = approval_lifecycle.startup(PROJECT_ROOT, observe_errors=not bool(os.environ.get(approval_guard.OWNER_ENV)))
+        if gate["status"] != "ready":
+            return {"schema_version": 1, "kind": "approval_startup_gate", **gate}
     recovery_queue = tuple(
         Path(path).expanduser().resolve() for path in recovery_action_files
     )
@@ -4534,7 +4589,7 @@ def run_rolling_drain(
     )
     controller_handoff.assert_ready_for_start()
     try:
-        with runtime_control.global_controller_lease():
+        with runtime_control.global_controller_lease(), ExitStack() as run_context:
             if authorized_recovery_once:
                 from apps.oa_finance_preaudit.case_recovery import select_once
                 from apps.oa_finance_preaudit import production_write
@@ -4545,6 +4600,13 @@ def run_rolling_drain(
                     PROJECT_ROOT / "runtime" / "finance_preaudit_flows",
                     scoped_reconcile_status(), allowed_workflows & authorized_workflows,
                 )
+            if native_pipeline:
+                from apps.oa_finance_preaudit import production_write, review_interruption
+                flow_root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
+                if flow_root.exists() and any(state.get("reason") == review_interruption.REASON for state in reconciliation.latest_states(flow_root)):
+                    authorized_workflows = frozenset(production_write._authorized_workflows(production_write._policy_path()))
+                    fresh_queue = review_interruption.select(flow_root, scoped_reconcile_status(), allowed_workflows & authorized_workflows)
+                    recovery_queue = tuple(dict.fromkeys((*recovery_queue, *fresh_queue)))
             cache_maintenance = attachment_cache.prune_expired()
             admission_cutoff = (
                 datetime.now(timezone.utc) + timedelta(minutes=60)
@@ -4571,6 +4633,8 @@ def run_rolling_drain(
                 }
             )
             children_reaped = True
+            if native_pipeline:
+                run_context.enter_context(approval_lifecycle.run_scope(manifest, PROJECT_ROOT))
             pending_recoveries = recovery_queue
             committed_received_at: str | None = None
             committed_request_id: str | None = None
@@ -4614,6 +4678,8 @@ def run_rolling_drain(
                 else:
                     wave_result = pipeline_runner(count, review_capacity)
                 children_reaped = wave_result.processes_reaped is True
+                if native_pipeline:
+                    children_reaped = children_reaped and approval_lifecycle.readonly_reaped(manifest)
                 return wave_result
 
             try:
@@ -4638,6 +4704,8 @@ def run_rolling_drain(
             except BaseException:
                 if not children_reaped:
                     runtime_control.request_cycle_stop()
+                if children_reaped and native_pipeline and runtime_control.stop_reason() == approval_guard.STOP_REASON:
+                    approval_lifecycle.interrupt_unwritten(manifest, cause=approval_guard.STOP_REASON)
                 controller_handoff.finish(
                     manifest,
                     status="failed",
@@ -4646,6 +4714,8 @@ def run_rolling_drain(
                 )
                 _clear_finished_cycle_stop(children_reaped=children_reaped)
                 raise
+            if native_pipeline and runtime_control.stop_reason() == approval_guard.STOP_REASON:
+                approval_lifecycle.interrupt_unwritten(manifest, cause=approval_guard.STOP_REASON)
             handoff = controller_handoff.finish(
                 manifest,
                 status=(
@@ -5324,15 +5394,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--capacity", type=int, default=2)
     parser.add_argument(
         "--max-capacity", type=int,
-        help="生产审核并发上限，未指定时沿用 12 槽上限",
+        help="生产审核并发上限，未指定时为 3",
     )
     parser.add_argument("--confirm-write", choices=("YES",))
     parser.add_argument("--read-only", action="store_true")
     parser.add_argument(
         "--adaptive",
         action="store_true",
-        default=True,
-        help="按健康窗口逐级扩容（生产默认开启）",
+        default=False,
+        help="只读诊断的弹性扩容，生产审批不允许开启",
     )
     parser.add_argument(
         "--fixed-capacity",
@@ -5394,6 +5464,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             if args.max_capacity is not None:
                 _validate_rolling_capacity(args.capacity, args.max_capacity)
+            if args.adaptive or args.capacity > approval_guard.MAX_MODEL_WORKERS or (args.max_capacity is not None and args.max_capacity > approval_guard.MAX_MODEL_WORKERS):
+                raise ValueError("approval_global_capacity_invalid")
             rolling_args = {
                 "capacity": args.capacity,
                 "adaptive": args.adaptive,
@@ -5415,6 +5487,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 rolling_args["confirm_stale_children_reaped"] = True
             controller_started = True
             payload = run_rolling_drain(**rolling_args)
+            if payload.get("kind") == "approval_startup_gate":
+                print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+                return 0 if payload.get("status") == "skipped" else 1
             counts = payload.get("error_counts")
             primary_code = payload.get("primary_error_code")
             session_code = primary_code if primary_code in session_alert.ALERT_ERROR_CODES else next(
