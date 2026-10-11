@@ -55,21 +55,30 @@ def _native_code(value: object) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,95}", value) is not None
 
 
-def _without_literals(message: str) -> str:
+def _http_status(value: object) -> bool:
+    return type(value) is int and 100 <= value <= 599
+
+
+def _without_private_literals(message: str) -> str:
     text = re.sub(r"(?i)\b(?:https?|wss?)://[^\s\"'<>]+", "[redacted]", message)
-    return re.sub(r"([\"'`])(?:(?!\1).)*?\1", "[redacted]", text, flags=re.DOTALL)
-
-
-def _redact_message(message: str) -> tuple[str, bool]:
-    if len(message) > _MESSAGE_SCAN_LIMIT:
-        return "[redacted]", True
-    text = _without_literals(message)
+    text = re.sub(r"([\"'`])(?:(?!\1).)*?\1", "[redacted]", text, flags=re.DOTALL)
     text = re.sub(r"(?i)\b(?:authorization|cookie|set-cookie|(?:api|access|refresh|id)[_-]?token|"
                   r"api[_-]?key|password|secret|account|email|request[_-]?id|session[_-]?id|action[_-]?token)"
                   r"\s*[:=]\s*[^;\n,]*", "[redacted]", text)
     text = re.sub(r"(?i)\bbearer\s+\S+", "[redacted]", text)
     text = re.sub(r"[\w.+-]+@[\w.-]+", "[redacted]", text)
     text = re.sub(r"\b[A-Za-z]:\\[^\s\"'<>;,)]+", "[redacted]", text)
+    text = re.sub(r"\b(?:[A-Za-z0-9_-]+\.)+[A-Za-z][A-Za-z0-9_-]*\b", "[redacted]", text)
+    text = re.sub(r"(?i)(?<![\w])[0-9a-f]*(?::[0-9a-f]*){2,}(?![\w])", "[redacted]", text)
+    text = re.sub(r"(?<![\w])/[^\s\"'<>;,)]+", "[redacted]", text)
+    return re.sub(r"\b[A-Za-z0-9._-]+(?:[/\\][A-Za-z0-9._-]+)+",
+                  lambda match: match[0] if re.fullmatch(r"(?i)HTTP/[12](?:\.\d)?", match[0]) else "[redacted]", text)
+
+
+def _redact_message(message: str) -> tuple[str, bool]:
+    if len(message) > _MESSAGE_SCAN_LIMIT:
+        return "[redacted]", True
+    text = _without_private_literals(message)
     text = re.sub(r"[^\x20-\x7e]+", "[redacted]", text)
     text = re.sub(r"[A-Za-z_][A-Za-z0-9_-]*|[0-9]+",
                   lambda match: match[0] if match[0].lower() in _TECHNICAL_WORDS else "[redacted]", text)
@@ -92,16 +101,17 @@ def _error_details(error: dict) -> dict:
     details = info.get(code) if isinstance(info, dict) and isinstance(code, str) else None
     status = details.get("httpStatusCode") if isinstance(details, dict) else None
     status_source = "codexErrorInfo"
-    if status is None:
-        status = error.get("httpStatusCode")
+    top_status = error.get("httpStatusCode")
+    if not _http_status(status) and (_http_status(top_status) or status is None):
+        status = top_status
         status_source = "httpStatusCode"
-    valid_status = type(status) is int and 100 <= status <= 599
+    valid_status = _http_status(status)
     status_source = status_source if valid_status else "missing" if status is None else "omitted_untrusted"
     message = error.get("message")
     if not valid_status and isinstance(message, str):
         match = re.search(r"(?i)\b(?:HTTP(?:/[12](?:\.\d)?)?\s+(?:status(?:\s+code)?\s*[:=]?\s*)?"
                           r"|status(?:\s+code)?(?:\s*[:=]\s*|\s+))([1-5][0-9]{2})\b",
-                          _without_literals(message[:_MESSAGE_SCAN_LIMIT]))
+                          _without_private_literals(message[:_MESSAGE_SCAN_LIMIT]))
         if match:
             status, status_source, valid_status = int(match[1]), "message", True
     text, truncated = _redact_message(message) if isinstance(message, str) else (None, False)
@@ -122,7 +132,7 @@ def _valid_details(payload: dict) -> bool:
     return (isinstance(code_status, str) and code_status in {"retained", "missing", "omitted_untrusted"}
             and (_native_code(code) if code_status == "retained" else code is None)
             and isinstance(source, str)
-            and (type(status) is int and 100 <= status <= 599 and source in {"codexErrorInfo", "httpStatusCode", "message"}
+            and (_http_status(status) and source in {"codexErrorInfo", "httpStatusCode", "message"}
                  or status is None and source in {"missing", "omitted_untrusted"})
             and type(payload.get("error_message_redacted")) is bool and type(payload.get("error_message_truncated")) is bool
             and (text is None and digest is None and size is None and not payload["error_message_redacted"] and not payload["error_message_truncated"]

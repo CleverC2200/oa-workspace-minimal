@@ -478,6 +478,11 @@ def test_unknown_native_error_retains_redacted_details_through_review(tmp_path, 
     ({'message': 'private invoice amount 502'}, None, 'missing', None, 'missing'),
     ({'message': 'connection failed url=https://private/status502'}, None, 'missing', None, 'missing'),
     ({'message': 'client error: request_id="status 502"'}, None, 'missing', None, 'missing'),
+    ({'message': 'connection failed; account=status 502'}, None, 'missing', None, 'missing'),
+    ({'message': 'connection failed; Authorization: status 504'}, None, 'missing', None, 'missing'),
+    ({'message': 'connection failed endpoint /status 502'}, None, 'missing', None, 'missing'),
+    ({'codexErrorInfo': {'httpConnectionFailed': {'httpStatusCode': 'bad'}}, 'httpStatusCode': 504},
+     'httpConnectionFailed', 'retained', 504, 'httpStatusCode'),
     ({'codexErrorInfo': ['private-secret'], 'httpStatusCode': True},
      None, 'omitted_untrusted', None, 'omitted_untrusted'),
     ({'codexErrorInfo': 'sk-private-secret', 'message': 42}, None, 'omitted_untrusted', None, 'missing'),
@@ -500,6 +505,25 @@ def test_review_preserves_error_metadata_sources_without_inventing_http_status(
         assert notice['error_message'] is None
         assert notice['error_message_sha256'] is None
         assert notice['error_message_bytes'] is None
+
+
+@pytest.mark.parametrize('message,private_literal', [
+    ('connection failed endpoint api.internal', 'api.internal'),
+    ('permission denied: user/session', 'user/session'),
+    ('permission denied: user\\session', 'user\\session'),
+    ('connection failed endpoint a::a', 'a::a'),
+])
+def test_review_redacts_unqualified_addresses_and_relative_paths(tmp_path, monkeypatch, message, private_literal):
+    task, action = _task(tmp_path)
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+    event = {'type': 'error', 'message': message}
+    script = 'import sys; sys.stdin.read(); ' + f'print({json.dumps(event)!r}, flush=True)'
+    monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
+    assert worker.review(task)['error_code'] == 'codex_process_failed'
+    notice = worker.process_diagnostics.read_notices(action)['first_blocking_notice']
+    assert private_literal not in notice['error_message']
+    assert '[redacted]' in notice['error_message']
+    assert notice['error_message_redacted'] is True
 
 
 @pytest.mark.parametrize('message', ['connection failed ' * 200, 'connection failed ' * 1000],
