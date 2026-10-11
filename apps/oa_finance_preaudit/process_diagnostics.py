@@ -39,15 +39,15 @@ _MESSAGE_LIMIT = 2048
 _MESSAGE_SCAN_LIMIT = 8192
 # Positive vocabulary prevents error envelopes from retaining arbitrary business text.
 _TECHNICAL_WORDS = frozenset("""
-a an and any api at attempts authentication authorization available backend bad before been billing body by
+a an and any api at attempts authentication authorization available back backend bad before been billing body broken by
 capacity certificate chatgpt client closed closing code completed completion connect connection connecting content context
-could deactivated denied disconnected dns does during endpoint entity error exceeded exceeds exhausted failed
+could deactivated denied disconnected dns does during endpoint entity error exceeded exceeds exhausted failed falling
 failure fetch forbidden for found from gateway handshake has have hit http https idle in insufficient internal
-invalid is json length limit limited lost malformed max maximum message model models network no not of on only
-openai overloaded overload parse parsing payload peer permission pipe proxy protocol quota read received reconnect reconnecting
+invalid io is json length limit limited lost malformed max maximum message model models network no not of on only
+openai os overloaded overload parse parsing payload peer permission pipe proxy protocol quota read received reconnect reconnecting
 redacted refused request requests reset resolve response responses retry retrying retries returned sending server service session socket ssl
 status stream suspended tcp temporarily terminal the then timeout timed tls to token tokens too transport
-unavailable unauthorized unexpected unknown upstream url usage user valid verify verification websocket will window with wrong your
+unavailable unauthorized unexpected unknown upstream url usage user valid verify verification websocket websockets will window with wrong your
 """.split())
 
 
@@ -235,7 +235,9 @@ def classify_error(event: dict) -> dict | None:
     if isinstance(message, str) and ("codexErrorInfo" not in error or transport_code):
         signals = stderr_summary(io.StringIO(message))["stderr_signals"]
         lower = message.lower()
-        if ("transport_signal" in signals and any(term in lower for term in ("reconnecting", "retrying", "will retry"))
+        if ("transport_signal" in signals
+                and (any(term in lower for term in ("reconnecting", "retrying", "will retry"))
+                     or lower.startswith("falling back from websockets to https transport. "))
                 and not any(term in lower for term in ("not reconnecting", "not retrying", "will not retry"))):
             return {"classification": "network_reconnect", "blocking": False}
     return {"classification": "unknown_error", "blocking": True}

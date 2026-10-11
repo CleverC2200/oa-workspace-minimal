@@ -19,6 +19,12 @@ from tests.finance_preaudit.test_concurrency_probe import _open_action
 from tests.finance_preaudit.test_execution_readback import recorded_execution
 
 
+_TRANSPORT_FALLBACK_WARNING = (
+    'Falling back from WebSockets to HTTPS transport. '
+    'stream disconnected before completion: IO error: Broken pipe (os error 32)'
+)
+
+
 def test_approval_cli_disables_unbounded_connection_retries(tmp_path):
     command = worker._codex_command(tmp_path, tmp_path / 'schema', tmp_path / 'decision')
     assert 'features.unbounded_connection_retries=false' in command
@@ -396,6 +402,149 @@ def test_explicit_reconnect_warning_can_finish_same_review(tmp_path, monkeypatch
     notice = worker.process_diagnostics.read_notices(action)['first_notice']
     assert notice['classification'] == 'network_reconnect'
     assert notice['source'] == ('stdout' if channel == 'stdout' else 'stderr')
+
+
+@pytest.mark.parametrize('info', [None, {'httpConnectionFailed': {'httpStatusCode': 502}}])
+@pytest.mark.parametrize('channel', ['stdout', 'stderr', 'split_stderr', 'plain_stderr'])
+def test_native_transport_fallback_can_finish_same_review(tmp_path, monkeypatch, info, channel):
+    task, action = _small_marketing_v2_task(tmp_path, budget_account='宣传制作费')
+    message = _TRANSPORT_FALLBACK_WARNING
+    launches = []
+
+    def command(root, schema, decision, **kwargs):
+        launches.append(decision)
+        item = {'type': 'error', 'message': message}
+        if info is not None:
+            item['codexErrorInfo'] = info
+        warning = message if channel == 'plain_stderr' else json.dumps({'type': 'item.completed', 'item': item})
+        if channel == 'split_stderr':
+            emit = (f'sys.stderr.write({warning[:40]!r}); sys.stderr.flush(); time.sleep(.05); '
+                    f'sys.stderr.write({warning[40:]!r}); sys.stderr.flush(); ')
+        else:
+            stream = 'stdout' if channel == 'stdout' else 'stderr'
+            emit = f'print({warning!r}, file=sys.{stream}, flush=True); '
+        return [sys.executable, '-c',
+                'import sys,json,time; from pathlib import Path; sys.stdin.read(); ' + emit +
+                f'Path({str(decision)!r}).write_text(json.dumps({{"overall":"pass"}})); '
+                'print(json.dumps({"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}), flush=True)']
+
+    monkeypatch.setattr(worker, '_codex_command', command)
+    result = worker.review(task)
+    assert result['status'] == 'reviewed'
+    assert result['process_attempts'] == 1
+    assert result['process_retries'] == 0
+    assert len(launches) == 1
+    assert not runtime_control.stop_requested()
+    assert guard.cooldown() is None
+    notices = worker.process_diagnostics.read_notices(action)
+    assert set(notices) == {'first_notice'}
+    notice = notices['first_notice']
+    assert notice['classification'] == 'network_reconnect'
+    assert notice['blocking'] is False
+    assert notice['source'] == ('stdout' if channel == 'stdout' else 'stderr')
+    assert notice['native_event_type'] == (None if channel == 'plain_stderr' else 'item.completed')
+    assert notice['error_message'].startswith('Falling back from WebSockets to HTTPS transport.')
+    assert 'Broken pipe' in notice['error_message']
+    assert notice['error_message_sha256'] == hashlib.sha256(message.encode()).hexdigest()
+
+
+@pytest.mark.parametrize('restriction,classification', [
+    ('usage limit exceeded', 'usage_limit'),
+    ('model is not available', 'model_unavailable'),
+    ('authentication failed', 'authentication'),
+    ('too many requests', 'rate_limit'),
+    ('server overloaded', 'server_overloaded'),
+])
+def test_official_error_after_transport_fallback_stops_before_retry(tmp_path, monkeypatch, restriction, classification):
+    task, action = _task(tmp_path)
+    retry = tmp_path / 'retry-started'
+    child_pid = tmp_path / 'model-pid'
+    launches = []
+    messages = [_TRANSPORT_FALLBACK_WARNING, _TRANSPORT_FALLBACK_WARNING + ' ' + restriction]
+
+    def command(*args, **kwargs):
+        launches.append(True)
+        emit = ''.join(f'print({json.dumps({"type": "item.completed", "item": {"type": "error", "message": message}})!r}, flush=True); '
+                       for message in messages)
+        script = ('import os,sys,time; from pathlib import Path; sys.stdin.read(); '
+                  f'Path({str(child_pid)!r}).write_text(str(os.getpid())); ' + emit +
+                  f'time.sleep(10); Path({str(retry)!r}).write_text("retry"); time.sleep(10)')
+        return [sys.executable, '-c', script]
+
+    monkeypatch.setattr(worker, '_codex_command', command)
+    started = time.monotonic()
+    result = worker.review(task)
+    assert time.monotonic() - started < 8
+    assert worker.OBSERVATION_INTERVAL_SECONDS == 5
+    assert result['error_code'] == 'codex_process_failed'
+    assert result['process_attempts'] == 1
+    assert result['process_retries'] == 0
+    assert len(launches) == 1
+    assert not retry.exists()
+    assert not action.with_name('execution-receipt.json').exists()
+    assert runtime_control.stop_reason() == guard.STOP_REASON
+    cooldown = guard.cooldown()
+    assert cooldown['notice_code'] == classification
+    assert cooldown['blocked_until'] - cooldown['triggered_at'] == 10800
+    notices = worker.process_diagnostics.read_notices(action)
+    assert notices['first_notice']['classification'] == 'network_reconnect'
+    assert notices['first_notice']['blocking'] is False
+    assert notices['first_blocking_notice']['classification'] == classification
+    assert notices['first_official_notice']['classification'] == classification
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(child_pid.read_text()), 0)
+
+
+@pytest.mark.parametrize('event,classification', [
+    ({'type': 'turn.failed', 'error': {'message': _TRANSPORT_FALLBACK_WARNING}}, 'terminal_failure'),
+    ({'type': 'thread.failed', 'error': {'message': _TRANSPORT_FALLBACK_WARNING}}, 'terminal_failure'),
+    ({'type': 'item.completed', 'item': {'type': 'error', 'message': _TRANSPORT_FALLBACK_WARNING,
+                                      'codexErrorInfo': 'unrecognizedCode'}}, 'unknown_error'),
+    ({'type': 'error', 'message': 'Not falling back from WebSockets to HTTPS transport. stream disconnected'}, 'unknown_error'),
+    ({'type': 'error', 'message': 'Falling back from WebSockets to HTTP transport. stream disconnected'}, 'unknown_error'),
+    ({'type': 'error', 'message': 'Falling back from WebSockets to HTTPS transport. connection failed; will not retry'}, 'unknown_error'),
+    ({'type': 'error', 'message': 'Falling back from WebSockets to HTTPS transport. '}, 'unknown_error'),
+])
+def test_transport_fallback_does_not_exempt_other_failures(tmp_path, monkeypatch, event, classification):
+    task, action = _task(tmp_path)
+    script = f'import sys; sys.stdin.read(); print({json.dumps(event)!r}, flush=True)'
+    monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
+    result = worker.review(task)
+    assert result['error_code'] == 'codex_process_failed'
+    assert result['process_attempts'] == 1
+    assert result['process_retries'] == 0
+    assert runtime_control.stop_reason() == 'codex_review_technical_failure'
+    assert guard.cooldown() is None
+    notice = worker.process_diagnostics.read_notices(action)['first_blocking_notice']
+    assert notice['classification'] == classification
+    assert notice['blocking'] is True
+
+
+@pytest.mark.parametrize('complete,decision_present,exit_code,expected', [
+    (False, True, 0, 'codex_process_incomplete'),
+    (True, True, 1, 'codex_process_failed'),
+    (True, False, 0, 'codex_process_incomplete'),
+])
+def test_transport_fallback_still_requires_successful_terminal_event(tmp_path, monkeypatch, complete, decision_present, exit_code, expected):
+    task, action = _task(tmp_path)
+
+    def command(root, schema, decision, **kwargs):
+        warning = json.dumps({'type': 'item.completed', 'item': {'type': 'error', 'message': _TRANSPORT_FALLBACK_WARNING}})
+        terminal = 'print(json.dumps({"type":"turn.completed"}),flush=True); ' if complete else ''
+        write_decision = f'Path({str(decision)!r}).write_text(json.dumps({{"overall":"pass"}})); ' if decision_present else ''
+        return [sys.executable, '-c',
+                'import sys,json; from pathlib import Path; sys.stdin.read(); '
+                f'print({warning!r},flush=True); ' + write_decision + terminal +
+                f'sys.exit({exit_code})']
+
+    monkeypatch.setattr(worker, '_codex_command', command)
+    result = worker.review(task)
+    assert result['error_code'] == expected
+    assert result['process_attempts'] == 1
+    assert result['process_retries'] == 0
+    assert runtime_control.stop_reason() == 'codex_review_technical_failure'
+    assert guard.cooldown() is None
+    assert set(worker.process_diagnostics.read_notices(action)) == {'first_notice'}
 
 
 def test_reconnect_does_not_hide_first_official_blocking_notice(tmp_path, monkeypatch):
