@@ -240,12 +240,12 @@ def test_first_usage_warning_stops_before_ten_second_retry(tmp_path, monkeypatch
 
 
 def test_quota_warning_classified_after_fast_exit_still_blocks_decision(tmp_path, monkeypatch):
-    task, _ = _task(tmp_path)
+    task, action = _task(tmp_path)
     monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
     original_summary = worker.process_diagnostics.stderr_summary
 
     def delayed_summary(stream, **kwargs):
-        if 'on_signals' in kwargs:
+        if 'on_chunk' in kwargs:
             time.sleep(.3)
         return original_summary(stream, **kwargs)
 
@@ -264,14 +264,15 @@ def test_quota_warning_classified_after_fast_exit_still_blocks_decision(tmp_path
     assert result['error_code'] == 'codex_process_failed'
     assert result['process_retries'] == 0
     assert runtime_control.stop_requested()
+    assert worker.process_diagnostics.read_notices(action)['first_official_notice']['classification'] == 'usage_limit'
 
 
 def test_late_quota_classification_after_generic_stdout_failure_publishes_cooldown(tmp_path, monkeypatch):
-    task, _ = _task(tmp_path)
+    task, action = _task(tmp_path)
     monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
     original_summary = worker.process_diagnostics.stderr_summary
     def delayed(stream, **kwargs):
-        if 'on_signals' in kwargs:
+        if 'on_chunk' in kwargs:
             time.sleep(.3)
         return original_summary(stream, **kwargs)
     monkeypatch.setattr(worker.process_diagnostics, 'stderr_summary', delayed)
@@ -282,6 +283,24 @@ def test_late_quota_classification_after_generic_stdout_failure_publishes_cooldo
     assert result['status'] == 'failed' and result['process_retries'] == 0
     assert guard.cooldown()['notice_code'] == 'usage_limit'
     assert runtime_control.stop_reason() == guard.STOP_REASON
+    notices = worker.process_diagnostics.read_notices(action)
+    assert notices['first_blocking_notice']['classification'] == 'unknown_error'
+    assert notices['first_official_notice']['classification'] == 'usage_limit'
+
+
+def test_blocking_stdout_notice_keeps_later_official_error_from_same_read(tmp_path, monkeypatch):
+    task, action = _task(tmp_path)
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+    monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c',
+        'import sys,json; sys.stdin.read(); '
+        'print(json.dumps({"type":"error","message":"generic failure"}),flush=True); '
+        'print(json.dumps({"type":"error","codexErrorInfo":"usageLimitExceeded"}),flush=True)'])
+    result = worker.review(task)
+    assert result['error_code'] == 'codex_process_failed'
+    assert guard.cooldown()['notice_code'] == 'usage_limit'
+    notices = worker.process_diagnostics.read_notices(action)
+    assert notices['first_blocking_notice']['classification'] == 'unknown_error'
+    assert notices['first_official_notice']['classification'] == 'usage_limit'
 
 
 def test_registration_write_failure_reaps_already_started_cli(tmp_path, monkeypatch):
@@ -344,6 +363,261 @@ def test_normal_progress_is_not_mistaken_for_model_failure(tmp_path, monkeypatch
     result = worker.review(task)
     assert result['status'] == 'reviewed'
     assert not runtime_control.stop_requested()
+
+
+@pytest.mark.parametrize('info', [None, {'httpConnectionFailed': {'httpStatusCode': 502}}])
+@pytest.mark.parametrize('channel', ['stdout', 'stderr', 'split_stderr'])
+def test_explicit_reconnect_warning_can_finish_same_review(tmp_path, monkeypatch, info, channel):
+    task, action = _small_marketing_v2_task(tmp_path, budget_account='宣传制作费')
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+
+    def command(root, schema, decision, **kwargs):
+        warning = {'type': 'error', 'message': 'Reconnecting... 1/5 (stream disconnected before completion)'}
+        if info is not None:
+            warning['codexErrorInfo'] = info
+        text = json.dumps(warning)
+        emit = f'print({text!r}, file=sys.{channel}, flush=True); ' if channel != 'split_stderr' else (
+            f'sys.stderr.write({text[:40]!r}); sys.stderr.flush(); time.sleep(.05); '
+            f'sys.stderr.write({text[40:]!r}); sys.stderr.flush(); ')
+        return [sys.executable, '-c',
+                'import sys,json,time; from pathlib import Path; sys.stdin.read(); ' + emit +
+                f'Path({str(decision)!r}).write_text(json.dumps({{"overall":"pass"}})); '
+                'print(json.dumps({"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}), flush=True)']
+
+    monkeypatch.setattr(worker, '_codex_command', command)
+    result = worker.review(task)
+    assert result['status'] == 'reviewed'
+    assert result['process_attempts'] == 1
+    assert result['process_retries'] == 0
+    assert not runtime_control.stop_requested()
+    assert guard.cooldown() is None
+    notice = worker.process_diagnostics.read_notices(action)['first_notice']
+    assert notice['classification'] == 'network_reconnect'
+    assert notice['source'] == ('stdout' if channel == 'stdout' else 'stderr')
+
+
+def test_reconnect_does_not_hide_first_official_blocking_notice(tmp_path, monkeypatch):
+    task, action = _task(tmp_path)
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+    monkeypatch.setenv(guard.RUN_ENV, 'a' * 32)
+    monkeypatch.setenv(guard.INSTANCE_ENV, 'b' * 32)
+    events = [
+        {'type': 'error', 'message': 'Reconnecting... 1/5 (stream disconnected private-secret)'},
+        {'type': 'error', 'message': 'Reconnecting... 2/5 (status 429 private-secret)',
+         'codexErrorInfo': {'httpConnectionFailed': {'httpStatusCode': 429, 'url': 'https://private-secret'}},
+         'token': 'private-secret'},
+        {'type': 'error', 'codexErrorInfo': 'usageLimitExceeded'},
+    ]
+    script = 'import sys; sys.stdin.read(); ' + '; '.join(f'print({json.dumps(e)!r}, flush=True)' for e in events)
+    monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
+    result = worker.review(task)
+    assert result['error_code'] == 'codex_process_failed'
+    notices = worker.process_diagnostics.read_notices(action)
+    first = notices['first_notice']
+    blocking = notices['first_blocking_notice']
+    assert first['classification'] == 'network_reconnect'
+    assert first['blocking'] is False
+    assert blocking['classification'] == 'rate_limit'
+    assert blocking['native_error_code'] == 'httpConnectionFailed'
+    assert blocking['http_status'] == 429
+    assert blocking['blocking'] is True
+    assert first['action_sha256'] == blocking['action_sha256']
+    assert first['launch_id_sha256'] == blocking['launch_id_sha256']
+    assert first['run_id_sha256'] is not None and first['controller_instance_id_sha256'] is not None
+    assert blocking['observed_at'] >= first['observed_at']
+    assert guard.cooldown()['notice_code'] == 'rate_limit'
+    diagnostic = json.loads(next(action.parent.glob('review-process-*.json')).read_text())
+    assert diagnostic['notice_timing']['stop_requested_at'] >= blocking['observed_at']
+    assert diagnostic['notice_timing']['process_exit_observed_at'] >= diagnostic['notice_timing']['stop_requested_at']
+    assert all('private-secret' not in path.read_text() for path in action.parent.glob('review-notice-*.json'))
+
+
+@pytest.mark.parametrize('message,classification', [
+    ('Reconnecting... connection failed: too many requests. Will retry in 10s', 'rate_limit'),
+    ('Reconnecting... connection failed: server overloaded. Will retry in 10s', 'server_overloaded'),
+    ('Reconnecting... connection failed: account suspended. Will retry in 10s', 'authentication'),
+    ('Reconnecting... connection failed: authentication failed. Will retry in 10s', 'authentication'),
+])
+def test_first_stderr_restriction_blocks_before_cli_retry(tmp_path, monkeypatch, message, classification):
+    task, action = _task(tmp_path)
+    retry = tmp_path / 'retry'
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+    script = ('import sys,time; from pathlib import Path; sys.stdin.read(); '
+              f'sys.stderr.write({message[:20]!r}); sys.stderr.flush(); time.sleep(.05); '
+              f'sys.stderr.write({message[20:]!r}); sys.stderr.flush(); '
+              f'time.sleep(10); Path({str(retry)!r}).write_text("retry"); time.sleep(10)')
+    monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
+    started = time.monotonic()
+    result = worker.review(task)
+    assert time.monotonic() - started < 8
+    assert result['error_code'] == 'codex_process_failed'
+    assert not retry.exists()
+    assert guard.cooldown()['notice_code'] == classification
+    notices = worker.process_diagnostics.read_notices(action)
+    assert notices['first_blocking_notice']['classification'] == classification
+    assert notices['first_blocking_notice']['source'] == 'stderr'
+    assert notices['first_blocking_notice']['native_event_type'] is None
+
+
+def test_decision_after_reconnect_without_terminal_event_is_not_success(tmp_path, monkeypatch):
+    task, action = _task(tmp_path)
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+
+    def command(root, schema, decision, **kwargs):
+        return [sys.executable, '-c',
+                'import sys,json; from pathlib import Path; sys.stdin.read(); '
+                'print(json.dumps({"type":"error","message":"Reconnecting... 1/5 (stream disconnected)"}), flush=True); '
+                f'Path({str(decision)!r}).write_text(json.dumps({{"overall":"pass"}}))']
+
+    monkeypatch.setattr(worker, '_codex_command', command)
+    result = worker.review(task)
+    assert result['status'] == 'failed'
+    assert result['error_code'] == 'codex_process_incomplete'
+    assert result['process_retries'] == 0
+    assert runtime_control.stop_requested()
+    diagnostic = json.loads(next(action.parent.glob('review-process-*.json')).read_text())
+    timing = diagnostic['notice_timing']
+    assert timing['stop_requested_at'] >= timing['process_exit_observed_at']
+
+
+@pytest.mark.parametrize('failure,classification', [
+    (json.dumps({'type': 'error', 'message': 'stream disconnected'}), 'unknown_error'),
+    (json.dumps({'type': 'error', 'message': 'connection failed; not retrying'}), 'unknown_error'),
+    (json.dumps({'type': 'error', 'message': 'Reconnecting stream disconnected', 'codexErrorInfo': 'private-code'}), 'unknown_error'),
+    (json.dumps({'type': 'turn.failed', 'error': {'message': 'Reconnecting stream disconnected'}}), 'terminal_failure'),
+    (json.dumps({'type': 'thread.failed', 'error': {'message': 'Reconnecting stream disconnected'}}), 'terminal_failure'),
+    ('{broken private-secret', 'invalid_event'),
+    (json.dumps({'type': 'private-secret'}), 'invalid_event'),
+    (json.dumps({'type': []}), 'invalid_event'),
+])
+def test_reconnect_never_exempts_terminal_unknown_or_corrupt_events(tmp_path, monkeypatch, failure, classification):
+    task, action = _task(tmp_path)
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+    warning = json.dumps({'type': 'error', 'message': 'Reconnecting stream disconnected'})
+    script = ('import sys; sys.stdin.read(); '
+              f'print({warning!r}, flush=True); print({failure!r}, flush=True); '
+              'print(\'{"type":"turn.completed"}\', flush=True)')
+    monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
+    result = worker.review(task)
+    assert result['status'] == 'failed'
+    assert result['error_code'] == 'codex_process_failed'
+    notices = worker.process_diagnostics.read_notices(action)
+    assert notices['first_notice']['classification'] == 'network_reconnect'
+    assert notices['first_blocking_notice']['classification'] == classification
+    if classification == 'invalid_event':
+        assert notices['first_blocking_notice']['native_event_type'] is None
+    assert guard.cooldown() is None
+    assert result['process_attempts'] == 1 and result['process_retries'] == 0
+
+
+def test_original_notice_readback_preserves_earlier_launches(tmp_path, monkeypatch):
+    task, action = _small_marketing_v2_task(tmp_path, budget_account='宣传制作费')
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+
+    def command(root, schema, decision, **kwargs):
+        return [sys.executable, '-c',
+                'import sys,json; from pathlib import Path; sys.stdin.read(); '
+                'print(json.dumps({"type":"error","message":"Reconnecting stream disconnected"}), flush=True); '
+                f'Path({str(decision)!r}).write_text(json.dumps({{"overall":"pass"}})); '
+                'print(\'{"type":"turn.completed"}\', flush=True)']
+
+    monkeypatch.setattr(worker, '_codex_command', command)
+    assert worker.review(task)['status'] == 'reviewed'
+    original = worker.process_diagnostics.read_notices(action)
+    launch = original['first_notice']['launch_id_sha256']
+    original_files = {path: path.read_bytes() for path in action.parent.glob('review-notice-*.json')}
+    assert worker.review(task)['status'] == 'reviewed'
+    assert worker.process_diagnostics.read_notices(action, launch_id_sha256=launch) == original
+    assert all(path.read_bytes() == raw for path, raw in original_files.items())
+    archived_action = action.with_name('interrupted-action.json')
+    archived_action.write_bytes(action.read_bytes())
+    changed = json.loads(action.read_text())
+    changed['write_authorized'] = False
+    changed['action'] = 'needs_admin'
+    action.write_text(json.dumps(changed))
+    assert worker.process_diagnostics.read_notices(archived_action, launch_id_sha256=launch) == original
+
+
+@pytest.mark.parametrize('damage', ['content', 'symlink', 'rehashed'])
+def test_tampered_first_notice_blocks_without_overwriting_evidence(tmp_path, monkeypatch, damage):
+    task, action = _task(tmp_path)
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+    script = '''import hashlib,json,sys,time
+from pathlib import Path
+sys.stdin.read()
+root = Path(ROOT)
+print(json.dumps({"type":"error","message":"Reconnecting stream disconnected"}), flush=True)
+deadline = time.monotonic() + 7
+while not list(root.glob("review-notice-*.json")) and time.monotonic() < deadline:
+    time.sleep(.01)
+notice = next(root.glob("review-notice-*.json"))
+original = notice.read_bytes()
+if DAMAGE == "content":
+    notice.write_text("{}")
+elif DAMAGE == "symlink":
+    saved = root / "original-notice.json"
+    saved.write_bytes(original)
+    notice.unlink()
+    notice.symlink_to(saved)
+else:
+    payload = json.loads(original)
+    payload["run_id_sha256"] = "c" * 64
+    payload["controller_instance_id_sha256"] = "d" * 64
+    digest = hashlib.sha256(json.dumps(payload,sort_keys=True).encode()).hexdigest()
+    replacement = notice.with_name(notice.name.rsplit("-",1)[0] + "-" + digest + ".json")
+    notice.unlink()
+    replacement.write_text(json.dumps(payload))
+if DAMAGE != "rehashed":
+    print(json.dumps({"type":"error","message":"Reconnecting stream disconnected"}), flush=True)
+print(json.dumps({"type":"turn.completed"}), flush=True)
+'''.replace('ROOT', repr(str(action.parent))).replace('DAMAGE', repr(damage))
+    monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
+    result = worker.review(task)
+    assert result['error_code'] == 'codex_process_diagnostic_failed'
+    assert runtime_control.stop_requested()
+    notice = next(action.parent.glob('review-notice-*.json'))
+    if damage == 'symlink':
+        assert notice.is_symlink()
+    elif damage == 'content':
+        assert notice.read_text() == '{}'
+    else:
+        assert json.loads(notice.read_text())['run_id_sha256'] == 'c' * 64
+
+
+def test_first_stderr_official_observation_blocks_another_review_immediately(tmp_path, monkeypatch):
+    first_task, action = _task(tmp_path / 'first')
+    next_task, _ = _task(tmp_path / 'next')
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+    monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c',
+        'import sys,time; sys.stdin.read(); print("usage limit exceeded",file=sys.stderr,flush=True); time.sleep(10)'])
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(worker.review, first_task)
+        deadline = time.monotonic() + 3
+        while not list(action.parent.glob('review-notice-*.json')) and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert list(action.parent.glob('review-notice-*.json'))
+        result = worker.review(next_task)
+        assert result['error_code'] == 'stop_requested'
+        assert result['process_attempts'] == 0
+        assert first.result(timeout=8)['error_code'] == 'codex_process_failed'
+
+
+@pytest.mark.parametrize('exit_code,expected', [(0, 'codex_process_incomplete'), (1, 'codex_process_failed')])
+def test_reconnect_with_missing_decision_or_nonzero_exit_remains_blocked(tmp_path, monkeypatch, exit_code, expected):
+    task, action = _task(tmp_path)
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+    script = ('import sys,json; sys.stdin.read(); '
+              'print(json.dumps({"type":"error","message":"Reconnecting stream disconnected"}),flush=True); '
+              'print(json.dumps({"type":"turn.completed"}),flush=True); '
+              f'sys.exit({exit_code})')
+    monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
+    result = worker.review(task)
+    assert result['status'] == 'failed'
+    assert result['error_code'] == expected
+    assert guard.cooldown() is None
+    diagnostic = json.loads(next(action.parent.glob('review-process-*.json')).read_text())
+    timing = diagnostic['notice_timing']
+    assert timing['stop_requested_at'] >= timing['process_exit_observed_at']
 
 
 def test_controller_retains_failure_result_before_reaping_pool(tmp_path):
