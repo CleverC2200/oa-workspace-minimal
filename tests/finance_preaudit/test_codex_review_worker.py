@@ -171,6 +171,8 @@ def _mock_final_output(monkeypatch, raw):
     def popen(command, **kwargs):
         payload = raw if isinstance(raw, bytes) else raw.encode()
         Path(command[command.index("--output-last-message") + 1]).write_bytes(payload)
+        kwargs["stdout"].write('{"type":"turn.completed"}\n')
+        kwargs["stdout"].flush()
         return Process()
 
     monkeypatch.setattr(codex_review_worker.subprocess, "Popen", popen)
@@ -1306,11 +1308,12 @@ def test_execute_codex_normalizes_small_marketing_transport_schema(
         def poll(self) -> int:
             return self.returncode
 
-    monkeypatch.setattr(
-        codex_review_worker.subprocess,
-        "Popen",
-        lambda command, **_kwargs: Process(command),
-    )
+    def popen(command, **kwargs):
+        kwargs["stdout"].write('{"type":"turn.completed"}\n')
+        kwargs["stdout"].flush()
+        return Process(command)
+
+    monkeypatch.setattr(codex_review_worker.subprocess, "Popen", popen)
 
     result = codex_review_worker._execute_codex(
         Path(task["project_root"]),

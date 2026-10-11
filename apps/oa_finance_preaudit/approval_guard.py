@@ -90,7 +90,8 @@ def notice_code(error: object) -> str | None:
         "model_unavailable": ("model unavailable", "model is not available", "model_not_found", "does not exist or you do not have access"),
         "rate_limit": ("rate limit", "too many requests", "status 429"),
         "server_overloaded": ("server overloaded", "server is overloaded", "selected model is at capacity"),
-        "authentication": ("account has been deactivated", "account is deactivated", "account suspended", "status 401", "status 403"),
+        "authentication": ("account has been deactivated", "account is deactivated", "account suspended", "status 401", "status 403",
+                           "unauthorized", "authentication failed", "invalid authentication credentials", "invalid api key", "incorrect api key"),
     }
     return next((name for name, phrases in terms.items() if any(term in lower for term in phrases)), None)
 

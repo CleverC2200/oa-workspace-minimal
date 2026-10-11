@@ -1238,12 +1238,67 @@ def _execute_codex_raw(
         stderr_failed: list[bool] = []
         fatal_stderr = threading.Event()
         official_notices: list[tuple[str, float]] = []
+        first_notices: dict[str, dict] = {}
+        notice_lock = threading.Lock()
+        technical_stop_identity = None
+        stderr_summary["notice_timing"] = {"stop_requested_at": None, "process_exit_observed_at": None}
+        stderr_summary["notice_launch_id_sha256"] = hashlib.sha256(slot['launch_id'].encode()).hexdigest()
+        stderr_summary["notice_artifacts"] = {}
 
-        def observe_stderr(signals: set[str]) -> None:
-            if signals & {"usage_limit_signal", "model_access_signal"}:
-                if not official_notices:
-                    official_notices.append(("usage_limit" if "usage_limit_signal" in signals else "model_unavailable", time.time()))
-                fatal_stderr.set()
+        def observe_notice(event: dict, *, source: str, plain_stderr: bool = False) -> bool:
+            with notice_lock:
+                notice = process_diagnostics.notice_payload(event, source=source, observed_at=time.time(), plain_stderr=plain_stderr)
+                if notice is None:
+                    return False
+                roles = ["first_notice"]
+                if notice["blocking"]:
+                    roles.append("first_blocking_notice")
+                if notice["classification"] in approval_guard.NOTICE_CODES:
+                    roles.append("first_official_notice")
+                try:
+                    if notice["classification"] in approval_guard.NOTICE_CODES and not official_notices:
+                        official_notices.append((notice["classification"], notice["observed_at"]))
+                        approval_guard.record_notice(notice["classification"], f"cli:{slot['launch_id']}",
+                                                     occurred_at=notice["observed_at"], technical_stop_identity=technical_stop_identity)
+                        if stderr_summary["notice_timing"]["stop_requested_at"] is None:
+                            stderr_summary["notice_timing"]["stop_requested_at"] = time.time()
+                    for role in roles:
+                        first = first_notices.setdefault(role, notice)
+                        digest = process_diagnostics.record_notice(action_file, slot=slot, role=role, notice=first)
+                        stderr_summary["notice_artifacts"][role] = digest
+                except (OSError, RuntimeError, ValueError, TypeError):
+                    stderr_summary["collection_failed"] = True
+                    return True
+            return notice["blocking"]
+
+        stderr_pending = ""
+
+        def observe_stderr_chunk(chunk: str) -> None:
+            nonlocal stderr_pending
+            stderr_pending += chunk
+            lines = stderr_pending.split("\n")
+            stderr_pending = lines.pop()
+            for text in [*lines, stderr_pending]:
+                if text.lstrip().startswith("{"):
+                    try:
+                        event = json.loads(text)
+                    except ValueError:
+                        if text in lines or len(text) > _NATIVE_RECEIPT_MAX_BYTES:
+                            observe_notice({"type": "invalid_event"}, source="stderr")
+                            fatal_stderr.set()
+                        continue
+                    if not isinstance(event, dict) or (process_diagnostics.error_envelope(event) is None
+                                                      and (not isinstance(event.get("type"), str) or event["type"] not in _EVENT_TYPES)):
+                        event = {"type": "invalid_event"}
+                    if observe_notice(event, source="stderr"):
+                        fatal_stderr.set()
+                else:
+                    event = {"type": "error", "message": text}
+                    notice = process_diagnostics.classify_error(event)
+                    if notice["classification"] != "unknown_error" and observe_notice(event, source="stderr", plain_stderr=True):
+                        fatal_stderr.set()
+            if not stderr_pending.lstrip().startswith("{"):
+                stderr_pending = stderr_pending[-512:]
 
         def collect_stderr() -> None:
             try:
@@ -1264,7 +1319,13 @@ def _execute_codex_raw(
                                         return chunk
 
                         stderr_summary.update(process_diagnostics.stderr_summary(
-                            AvailableStderr(), on_signals=observe_stderr))
+                            AvailableStderr(), on_chunk=observe_stderr_chunk))
+                        if stderr_pending.lstrip().startswith("{"):
+                            try:
+                                json.loads(stderr_pending)
+                            except ValueError:
+                                observe_notice({"type": "invalid_event"}, source="stderr")
+                                fatal_stderr.set()
                         if raw is not None:
                             raw.flush()
                             os.fsync(raw.fileno())
@@ -1277,7 +1338,6 @@ def _execute_codex_raw(
         communication_errors: list[BaseException] = []
         interrupted = False
         live_failure = False
-        technical_stop_identity = None
         stop_error = None
         offset = 0
         pending = b""
@@ -1295,6 +1355,7 @@ def _execute_codex_raw(
 
         def observe_failure() -> bool:
             nonlocal offset, pending
+            failure = False
             # pread does not move the offset shared with the child's stdout.
             output.flush()
             snapshot_size = os.fstat(output.fileno()).st_size
@@ -1315,18 +1376,24 @@ def _execute_codex_raw(
                     try:
                         event = json.loads(line)
                     except (ValueError, UnicodeError):
-                        return True
+                        observe_notice({"type": "invalid_event"}, source="stdout")
+                        failure = True
+                        continue
                     if not isinstance(event, dict):
-                        return True
+                        observe_notice({"type": "invalid_event"}, source="stdout")
+                        failure = True
+                        continue
                     error = process_diagnostics.error_envelope(event)
                     if error is not None:
-                        code = approval_guard.notice_code(error)
-                        if code and not official_notices:
-                            official_notices.append((code, time.time()))
-                        return True
+                        if observe_notice(event, source="stdout"):
+                            failure = True
+                    elif not isinstance(event.get("type"), str) or event["type"] not in _EVENT_TYPES:
+                        observe_notice({"type": "invalid_event"}, source="stdout")
+                        failure = True
                 if len(pending) > _NATIVE_RECEIPT_MAX_BYTES:
+                    observe_notice({"type": "invalid_event"}, source="stdout")
                     return True
-            return fatal_stderr.is_set()
+            return failure or fatal_stderr.is_set()
 
         try:
             while True:
@@ -1339,8 +1406,12 @@ def _execute_codex_raw(
                             if official_notices:
                                 code, stamp = official_notices[0]
                                 approval_guard.record_notice(code, f"cli:{slot['launch_id']}", occurred_at=stamp)
+                                if stderr_summary["notice_timing"]["stop_requested_at"] is None:
+                                    stderr_summary["notice_timing"]["stop_requested_at"] = time.time()
                             if not read_only:
                                 technical_stop_identity = _request_review_stop(action_file, "codex_process_failed" if live_failure else "codex_review_parent_lost")
+                                if stderr_summary["notice_timing"]["stop_requested_at"] is None:
+                                    stderr_summary["notice_timing"]["stop_requested_at"] = time.time()
                         except (OSError, RuntimeError, ValueError):
                             stop_error = "codex_review_stop_failed"
                     _terminate_process_group(process, grace_seconds=0.2)
@@ -1355,6 +1426,7 @@ def _execute_codex_raw(
             if not read_only:
                 try:
                     _request_review_stop(action_file, "codex_process_timeout")
+                    stderr_summary["notice_timing"]["stop_requested_at"] = time.time()
                 except (OSError, RuntimeError, ValueError):
                     stop_error = "codex_review_stop_failed"
             _terminate_process_group(process, grace_seconds=5)
@@ -1388,6 +1460,8 @@ def _execute_codex_raw(
             restore_sigterm()
             if process.poll() is None:
                 _terminate_process_group(process, grace_seconds=0.2)
+            if process.poll() is not None:
+                stderr_summary["notice_timing"]["process_exit_observed_at"] = time.time()
             communicator.join(timeout=1)
             stderr_reader.join(timeout=5)
             if stderr_reader.is_alive():
@@ -1415,8 +1489,12 @@ def _execute_codex_raw(
                     code, stamp = official_notices[0]
                     approval_guard.record_notice(code, f"cli:{slot['launch_id']}", occurred_at=stamp,
                                                  technical_stop_identity=technical_stop_identity)
+                    if stderr_summary["notice_timing"]["stop_requested_at"] is None:
+                        stderr_summary["notice_timing"]["stop_requested_at"] = time.time()
                 if not read_only:
                     _request_review_stop(action_file, "codex_process_failed")
+                    if stderr_summary["notice_timing"]["stop_requested_at"] is None:
+                        stderr_summary["notice_timing"]["stop_requested_at"] = time.time()
             except (OSError, RuntimeError, ValueError):
                 stop_error = "codex_review_stop_failed"
 
@@ -1431,8 +1509,9 @@ def _execute_codex_raw(
         stderr_summary["last_observed_stage"] = process_diagnostics.last_stage(output)
         decision: dict | None = None
         decision_state = "not_written"
-        output_error = None
-        if process.returncode == 0 and not live_failure and not interrupted:
+        output_error = (None if event_status == "recorded" and event_counts.get("turn.completed") == 1
+                        and _event_terminal_count(event_counts) == 1 else "codex_process_incomplete")
+        if process.returncode == 0 and not live_failure and not interrupted and output_error is None:
             try:
                 raw_bytes = decision_file.read_bytes()
                 parsed = review_output.consume(raw_bytes, parser=decision_parser)
@@ -1475,6 +1554,14 @@ def _execute_codex_raw(
                     output_error = "codex_decision_invalid"
                 except (OSError, RuntimeError, ValueError, TypeError):
                     output_error = "codex_decision_diagnostic_failed"
+        if decision is None and output_error is None:
+            output_error = "codex_process_incomplete"
+        if not read_only and not live_failure and not interrupted and (process.returncode != 0 or output_error is not None):
+            try:
+                _request_review_stop(action_file, "codex_process_failed" if process.returncode != 0 else output_error)
+                stderr_summary["notice_timing"]["stop_requested_at"] = time.time()
+            except (OSError, RuntimeError, ValueError):
+                stop_error = "codex_review_stop_failed"
     output.close()
     return CodexExecution(
         "stop_requested" if interrupted and not live_failure else (

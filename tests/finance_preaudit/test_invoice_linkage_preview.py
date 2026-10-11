@@ -164,6 +164,8 @@ def test_actual_worker_prompt_distinguishes_oa_link_from_upload(
         Path(command[command.index("--output-last-message") + 1]).write_text(
             json.dumps(decision)
         )
+        kwargs['stdout'].write('{"type":"turn.completed"}\n')
+        kwargs['stdout'].flush()
         return Process()
 
     monkeypatch.setattr(codex_review_worker.subprocess, "Popen", popen)

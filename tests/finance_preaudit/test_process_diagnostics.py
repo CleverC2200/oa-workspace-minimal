@@ -124,3 +124,16 @@ def test_payload_too_large_signal_is_recorded_without_raw_error(tmp_path, event)
     text = next(tmp_path.glob("review-process-*.json")).read_text()
     assert "private-secret" not in text
     assert json.loads(text)["event_signals"] == signals
+
+
+@pytest.mark.parametrize("timing", [
+    {"stop_requested_at": 1.0, "process_exit_observed_at": 2.0, "message": "private-secret"},
+    {"stop_requested_at": "private-secret", "process_exit_observed_at": None},
+    {"stop_requested_at": float("inf"), "process_exit_observed_at": None},
+])
+def test_notice_timing_rejects_non_allowlisted_evidence(tmp_path, timing):
+    path = _action(tmp_path)
+    with pytest.raises(ValueError, match="process_diagnostic_invalid"):
+        process_diagnostics.record(path, execution=worker.CodexExecution(None, {}),
+                                   elapsed_seconds=1, stderr={"notice_timing": timing})
+    assert not list(tmp_path.glob("review-process-*.json"))

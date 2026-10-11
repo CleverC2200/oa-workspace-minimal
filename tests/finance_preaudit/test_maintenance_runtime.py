@@ -321,6 +321,114 @@ def test_read_live_status_requires_terminal_success_and_exact_receipt(tmp_path, 
             maintenance_runtime.read_live_status(tmp_path)
 
 
+def test_stopped_readonly_status_refuses_unreaped_child_even_after_parent_exit(tmp_path):
+    import sys
+    interpreter = tmp_path / '.venv/bin/python'
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text('#!' + sys.executable + '\n'
+        'import os,sys,time,json,hashlib\nfrom pathlib import Path\n'
+        'if os.fork() == 0:\n'
+        ' os.close(1); os.close(2); time.sleep(60); os._exit(0)\n'
+        'target=Path(sys.argv[sys.argv.index("--output-file")+1])\n'
+        'raw=b"{}\\n"; target.write_bytes(raw); target.chmod(0o600)\n'
+        'print(json.dumps({"status_file":{"path":str(target),"bytes":len(raw),'
+        '"sha256":hashlib.sha256(raw).hexdigest()}}))\n')
+    interpreter.chmod(0o700)
+    with pytest.raises(RuntimeError, match='maintenance_readonly_children_unreaped'):
+        maintenance_runtime.read_live_status(tmp_path, require_reaped=True)
+
+
+@pytest.mark.parametrize('fault_kind', ['interrupt', 'oserror', 'timeout'])
+def test_stopped_readonly_exception_reaps_own_group_before_lease_release(tmp_path, monkeypatch, fault_kind):
+    import os
+    import signal
+    import subprocess
+    import sys
+    import time
+    interpreter = tmp_path / '.venv/bin/python'
+    interpreter.parent.mkdir(parents=True)
+    ready = tmp_path / 'readonly-ready'
+    interpreter.write_text('#!' + sys.executable + '\n'
+        'import time\nfrom pathlib import Path\n'
+        + 'Path(' + repr(str(ready)) + ').write_text("ready")\n'
+        + 'time.sleep(1)\n')
+    interpreter.chmod(0o700)
+    fault = {'interrupt': KeyboardInterrupt('cancel-readonly'), 'oserror': OSError('read-channel-failed'),
+             'timeout': subprocess.TimeoutExpired('readonly', 1)}[fault_kind]
+    original_communicate = subprocess.Popen.communicate
+    processes = []
+    def interrupted_communicate(process, *args, **kwargs):
+        if not processes:
+            processes.append(process)
+            deadline = time.monotonic() + 2
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+            assert ready.exists()
+            raise fault
+        return original_communicate(process, *args, **kwargs)
+    monkeypatch.setattr(subprocess.Popen, 'communicate', interrupted_communicate)
+    try:
+        with maintenance_runtime.target_runtime_leases(tmp_path):
+            expected = KeyboardInterrupt if fault_kind == 'interrupt' else RuntimeError
+            with pytest.raises(expected) as raised:
+                maintenance_runtime.read_live_status(tmp_path, require_reaped=True)
+            if fault_kind == 'interrupt':
+                assert raised.value is fault
+            else:
+                assert raised.value.__cause__ is fault
+            assert processes[0].poll() is not None
+            assert processes[0].returncode == -signal.SIGKILL
+            with pytest.raises(ProcessLookupError):
+                os.killpg(processes[0].pid, 0)
+            assert runtime_control.controller_active(tmp_path / 'runtime/control/rolling-controller.lock')
+        assert not runtime_control.controller_active(tmp_path / 'runtime/control/rolling-controller.lock')
+    finally:
+        if processes:
+            try:
+                os.killpg(processes[0].pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            processes[0].wait(timeout=2)
+
+
+def test_original_maintenance_readback_uses_owned_terminal_receipt_and_rejects_tampering(tmp_path, monkeypatch):
+    import sys
+    from uuid import uuid4
+    from scripts.finance_preaudit_run import supervise, bind_tool_session
+    source = Path(maintenance_runtime.__file__).resolve().parents[2]
+    for name in ('apps', 'scripts'):
+        shutil.copytree(source / name, tmp_path / name, ignore=shutil.ignore_patterns('__pycache__'))
+    interpreter = tmp_path / '.venv/bin/python'
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text('#!/bin/sh\nexec "' + sys.executable + '" "$@"\n')
+    interpreter.chmod(0o700)
+    directory = tmp_path / 'runtime/control/executions' / uuid4().hex
+    owner = str(uuid4())
+    child = '''import os,json,datetime
+from pathlib import Path
+Path(os.environ['OA_CONTROLLER_EXECUTION_MANIFEST_FILE']).write_text(json.dumps({
+ 'kind':'preaudit_controller_run_manifest','controller_pid':os.getpid(),
+ 'run_id':'a'*32,'controller_instance_id':'b'*32,'state':'failed',
+ 'children_reaped':True,'code_revision':'c'*40,
+ 'started_at':datetime.datetime.now(datetime.timezone.utc).isoformat()}))
+print('offline fake only')
+raise SystemExit(1)'''
+    receipt = supervise([sys.executable, '-c', child], directory=directory, owner_task_id=owner)
+    original = maintenance_runtime.OriginalExecution(Path(receipt['receipt_file']), owner, 'original-session')
+    with monkeypatch.context() as binding_environment:
+        binding_environment.setenv('OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE', str(tmp_path / 'runtime/control/rolling-controller.lock'))
+        bind_tool_session(original.file, owner_task_id=owner, session_id=original.tool_session_id)
+    mirror = original.file.with_name('controller-manifest.json').read_bytes()
+    report = maintenance_runtime.read_original_execution(tmp_path, original)
+    maintenance_runtime.assert_original_execution_safe(tmp_path, original, report, mirror)
+    assert report['terminal'] is True
+    assert report['exit_code'] == 1
+    assert 'controller_stdout' not in report
+    original.file.with_name('stdout.log').write_text('tampered')
+    with pytest.raises(RuntimeError, match='maintenance_original_execution_untrusted'):
+        maintenance_runtime.read_original_execution(tmp_path, original)
+
+
 @pytest.mark.parametrize('section', ['live_check', 'controller_handoff', 'reconciliation'])
 def test_live_safety_rejects_incomplete_sections_with_stable_code(section):
     snapshot = live_snapshot()

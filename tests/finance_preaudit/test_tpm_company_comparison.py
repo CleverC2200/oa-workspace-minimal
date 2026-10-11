@@ -227,11 +227,14 @@ def test_actual_worker_uses_bound_company_schema_and_preserves_model_comparison(
         def __init__(self, command, **kwargs):
             self.stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
             self.destination = Path(command[command.index("--output-last-message") + 1])
+            self.output = kwargs['stdout']
             captured["schema"] = json.loads(Path(command[command.index("--output-schema") + 1]).read_text())
 
         def communicate(self, *, input, timeout):
             captured["prompt"] = input
             self.destination.write_text(json.dumps(decision))
+            self.output.write('{"type":"turn.completed"}\n')
+            self.output.flush()
 
         def poll(self):
             return self.returncode

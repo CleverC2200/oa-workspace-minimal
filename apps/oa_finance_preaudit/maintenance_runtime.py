@@ -2,16 +2,141 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import tempfile
+import time
 from typing import Iterator
 
 from apps.oa_approval import runtime_control
 from . import controller_handoff
+
+
+@dataclass(frozen=True)
+class OriginalExecution:
+    file: Path
+    owner_task_id: str
+    tool_session_id: str
+
+
+def _reap_readonly_group(process: subprocess.Popen) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait(timeout=5)
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError('maintenance_readonly_children_unreaped')
+        time.sleep(.01)
+
+
+def _run_readonly(arguments: list[str], *, target_root: Path, environment: dict,
+                  timeout: int, require_reaped: bool = False) -> subprocess.CompletedProcess:
+    if not require_reaped:
+        return subprocess.run(arguments, cwd=target_root, env=environment, capture_output=True,
+                              text=True, check=False, timeout=timeout)
+    with subprocess.Popen(arguments, cwd=target_root, env=environment, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True, start_new_session=True) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
+            raise RuntimeError('maintenance_readonly_children_unreaped')
+        except BaseException as error:
+            try:
+                _reap_readonly_group(process)
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
+            raise
+
+
+_ORIGINAL_EXECUTION_READER = '''
+import json, sys
+from pathlib import Path
+from scripts import finance_preaudit_run
+root = Path.cwd().resolve()
+if not Path(finance_preaudit_run.__file__).resolve().is_relative_to(root):
+    raise ValueError('maintenance_original_execution_untrusted')
+path, owner, session = sys.argv[1:]
+print(json.dumps(finance_preaudit_run.read_execution(Path(path), owner_task_id=owner,
+    invocation_id=Path(path).parent.name, tool_session_id=session)))
+'''
+
+
+def read_original_execution(target_root: Path, original: OriginalExecution) -> dict:
+    """Read the original supervised invocation using target-owned validators."""
+    target_root = Path(target_root).absolute()
+    assert_target_environment(target_root)
+    interpreter = target_root / '.venv/bin/python'
+    if (target_root / '.venv').is_symlink() or not interpreter.is_file():
+        raise RuntimeError('maintenance_interpreter_untrusted')
+    environment = dict(os.environ)
+    environment.pop('PYTHONPATH', None)
+    environment.pop('PYTHONHOME', None)
+    try:
+        result = _run_readonly([str(interpreter), '-B', '-E', '-c', _ORIGINAL_EXECUTION_READER,
+            str(original.file), original.owner_task_id, original.tool_session_id], target_root=target_root,
+            environment=environment, timeout=60, require_reaped=True)
+        if result.returncode or len(result.stdout.encode()) > 1_000_000:
+            raise RuntimeError('maintenance_original_execution_untrusted')
+        report = json.loads(result.stdout)
+        if not isinstance(report, dict):
+            raise RuntimeError('maintenance_original_execution_untrusted')
+        return report
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        raise RuntimeError('maintenance_original_execution_untrusted') from error
+
+
+def assert_original_execution_safe(target_root: Path, original: OriginalExecution,
+                                   report: dict, manifest: bytes) -> None:
+    """Bind terminal readback to the unchanged controller and require its group idle."""
+    try:
+        saved = json.loads(manifest)
+        if (not isinstance(saved, dict) or not isinstance(report, dict)
+                or original.file.name != 'execution.json'
+                or original.file.parent.parent != target_root / 'runtime/control/executions'
+                or controller_handoff._RUN_ID.fullmatch(original.file.parent.name) is None
+                or not original.owner_task_id or not original.tool_session_id
+                or report.get('kind') != 'preaudit_controller_execution_readback'
+                or report.get('read_only') is not True or report.get('state') != 'exited'
+                or report.get('terminal') is not True or report.get('children_reaped') is not True
+                or type(report.get('exit_code')) is not int
+                or report.get('receipt_file') != str(original.file)
+                or report.get('owner_task_id') != original.owner_task_id
+                or report.get('invocation_id') != original.file.parent.name
+                or report.get('tool_session_id') != original.tool_session_id
+                or saved.get('kind') != 'preaudit_controller_run_manifest'
+                or saved.get('state') not in {'completed', 'failed'}
+                or saved.get('children_reaped') is not True
+                or (saved['state'] == 'completed') != (report['exit_code'] == 0)
+                or any(report.get(key) != saved.get(source) for key, source in (
+                    ('run_id', 'run_id'), ('controller_instance_id', 'controller_instance_id'),
+                    ('controller_state', 'state'), ('code_revision', 'code_revision')))):
+            raise RuntimeError('maintenance_original_execution_untrusted')
+        pid = saved.get('controller_pid')
+        if type(pid) is not int or pid < 1:
+            raise RuntimeError('maintenance_original_execution_untrusted')
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise RuntimeError('maintenance_original_process_active')
+    except (OSError, ValueError) as error:
+        raise RuntimeError('maintenance_original_execution_untrusted') from error
 
 
 def assert_target_environment(target_root: Path) -> None:
@@ -272,7 +397,7 @@ except (OSError, ValueError, RuntimeError, KeyError, TypeError):
 '''
 
 
-def read_current_inputs(target_root: Path, receipt: dict) -> dict:
+def read_current_inputs(target_root: Path, receipt: dict, *, require_reaped: bool = False) -> dict:
     """Obtain current policy/frozen proof from the target's existing validators."""
     from .production_config import FINANCE_WORKFLOWS
     target_root = Path(target_root).expanduser().absolute()
@@ -283,9 +408,9 @@ def read_current_inputs(target_root: Path, receipt: dict) -> dict:
     environment.pop('PYTHONPATH', None)
     environment.pop('PYTHONHOME', None)
     try:
-        result = subprocess.run([str(target_root / '.venv/bin/python'), '-B', '-E', '-c', _CURRENT_INPUTS_READER,
+        result = _run_readonly([str(target_root / '.venv/bin/python'), '-B', '-E', '-c', _CURRENT_INPUTS_READER,
             receipt['path'], receipt['sha256'], json.dumps([*FINANCE_WORKFLOWS, 'packaging_layout_approval'])],
-            cwd=target_root, env=environment, capture_output=True, text=True, check=False, timeout=300)
+            target_root=target_root, environment=environment, timeout=300, require_reaped=require_reaped)
         if len(result.stdout.encode()) > 1_000_000:
             raise RuntimeError('maintenance_current_inputs_untrusted')
         proof = json.loads(result.stdout)
@@ -300,7 +425,7 @@ def read_current_inputs(target_root: Path, receipt: dict) -> dict:
         raise RuntimeError('maintenance_current_inputs_untrusted') from error
 
 
-def read_live_status(target_root: Path) -> dict:
+def read_live_status(target_root: Path, *, require_reaped: bool = False) -> dict:
     """Await target Python's own readonly status and verify its file-backed receipt."""
     target_root = Path(target_root).absolute()
     assert_target_environment(target_root)
@@ -315,12 +440,11 @@ def read_live_status(target_root: Path) -> dict:
     evidence_dir = Path(tempfile.mkdtemp(prefix='oa-maintenance-status-')).resolve()
     evidence_file = evidence_dir / 'status.json'
     try:
-        result = subprocess.run(
+        result = _run_readonly(
             [str(interpreter), '-B', '-E', '-m', 'apps.oa_finance_preaudit.cli',
              'status', '--check-live', '--reconcile', '--summary',
              '--output-file', str(evidence_file)],
-            cwd=target_root, env=environment, capture_output=True, text=True,
-            check=False, timeout=300,
+            target_root=target_root, environment=environment, timeout=300, require_reaped=require_reaped,
         )
         if result.returncode != 0:
             raise RuntimeError('maintenance_live_status_failed')
@@ -339,7 +463,7 @@ def read_live_status(target_root: Path) -> dict:
         if not isinstance(payload, dict):
             raise RuntimeError('maintenance_live_receipt_invalid')
         payload['maintenance_status_file'] = receipt
-        payload['maintenance_current_inputs'] = read_current_inputs(target_root, receipt)
+        payload['maintenance_current_inputs'] = read_current_inputs(target_root, receipt, require_reaped=require_reaped)
         return payload
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         raise RuntimeError('maintenance_live_status_failed') from error
