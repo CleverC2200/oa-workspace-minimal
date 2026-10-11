@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import sys
@@ -347,7 +348,7 @@ def test_native_failure_preserves_error_when_stop_publication_fails(tmp_path, mo
 
 
 def test_normal_progress_is_not_mistaken_for_model_failure(tmp_path, monkeypatch):
-    task, _ = _small_marketing_v2_task(tmp_path, budget_account='宣传制作费')
+    task, action = _small_marketing_v2_task(tmp_path, budget_account='宣传制作费')
     monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
 
     def command(root, schema, decision, **kwargs):
@@ -363,6 +364,7 @@ def test_normal_progress_is_not_mistaken_for_model_failure(tmp_path, monkeypatch
     result = worker.review(task)
     assert result['status'] == 'reviewed'
     assert not runtime_control.stop_requested()
+    assert worker.process_diagnostics.read_notices(action) == {}
 
 
 @pytest.mark.parametrize('info', [None, {'httpConnectionFailed': {'httpStatusCode': 502}}])
@@ -430,6 +432,179 @@ def test_reconnect_does_not_hide_first_official_blocking_notice(tmp_path, monkey
     assert diagnostic['notice_timing']['stop_requested_at'] >= blocking['observed_at']
     assert diagnostic['notice_timing']['process_exit_observed_at'] >= diagnostic['notice_timing']['stop_requested_at']
     assert all('private-secret' not in path.read_text() for path in action.parent.glob('review-notice-*.json'))
+
+
+@pytest.mark.parametrize('channel', ['stdout', 'stderr', 'split_stderr'])
+def test_unknown_native_error_retains_redacted_details_through_review(tmp_path, monkeypatch, channel):
+    task, action = _task(tmp_path)
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+    message = ('stream disconnected before completion: unexpected HTTP status 502 Bad Gateway; '
+               'Authorization: Bearer private-secret; url=https://private.internal/path?token=private-query; '
+               'account=private-account; invoice="private-business"')
+    event = {'type': 'item.completed', 'item': {'type': 'error', 'message': message,
+             'codexErrorInfo': {'responseStreamDisconnected': {'httpStatusCode': 502}}}}
+    text = json.dumps(event)
+    emit = f'print({text!r}, file=sys.{channel}, flush=True)' if channel != 'split_stderr' else (
+        f'sys.stderr.write({text[:40]!r}); sys.stderr.flush(); time.sleep(.05); '
+        f'sys.stderr.write({text[40:]!r}); sys.stderr.flush()')
+    script = 'import sys,time; sys.stdin.read(); ' + emit
+    monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
+    result = worker.review(task)
+    assert result['status'] == 'failed' and result['process_retries'] == 0
+    assert guard.cooldown() is None
+    notice = worker.process_diagnostics.read_notices(action)['first_blocking_notice']
+    assert notice['schema_version'] == 2
+    assert notice['source'] == ('stdout' if channel == 'stdout' else 'stderr')
+    assert notice['classification'] == 'unknown_error'
+    assert notice['native_error_code'] == 'responseStreamDisconnected'
+    assert notice['native_error_code_status'] == 'retained'
+    assert notice['http_status'] == 502
+    assert notice['http_status_source'] == 'codexErrorInfo'
+    assert 'stream disconnected before completion' in notice['error_message']
+    assert 'Bad Gateway' in notice['error_message']
+    assert 'private' not in json.dumps(notice)
+    assert notice['error_message_sha256'] == hashlib.sha256(message.encode()).hexdigest()
+    assert notice['error_message_bytes'] == len(message.encode())
+    assert notice['error_message_redacted'] is True
+    assert notice['error_message_truncated'] is False
+    assert all(path.stat().st_mode & 0o777 == 0o600 for path in action.parent.glob('review-notice-*.json'))
+
+
+@pytest.mark.parametrize('error,code,code_status,status,status_source', [
+    ({'message': 'unexpected HTTP/1.1 502 Bad Gateway'}, None, 'missing', 502, 'message'),
+    ({'message': 'unexpected status code: 504 upstream timeout'}, None, 'missing', 504, 'message'),
+    ({'message': 'request failed', 'code': 'futureNativeError', 'httpStatusCode': 500},
+     'futureNativeError', 'retained', 500, 'httpStatusCode'),
+    ({'message': 'private invoice amount 502'}, None, 'missing', None, 'missing'),
+    ({'message': 'connection failed url=https://private/status502'}, None, 'missing', None, 'missing'),
+    ({'message': 'client error: request_id="status 502"'}, None, 'missing', None, 'missing'),
+    ({'message': 'connection failed; account=status 502'}, None, 'missing', None, 'missing'),
+    ({'message': 'connection failed; Authorization: status 504'}, None, 'missing', None, 'missing'),
+    ({'message': 'connection failed endpoint /status 502'}, None, 'missing', None, 'missing'),
+    ({'codexErrorInfo': {'httpConnectionFailed': {'httpStatusCode': 'bad'}}, 'httpStatusCode': 504},
+     'httpConnectionFailed', 'retained', 504, 'httpStatusCode'),
+    ({'codexErrorInfo': ['private-secret'], 'httpStatusCode': True},
+     None, 'omitted_untrusted', None, 'omitted_untrusted'),
+    ({'codexErrorInfo': 'sk-private-secret', 'message': 42}, None, 'omitted_untrusted', None, 'missing'),
+])
+def test_review_preserves_error_metadata_sources_without_inventing_http_status(
+        tmp_path, monkeypatch, error, code, code_status, status, status_source):
+    task, action = _task(tmp_path)
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+    event = {'type': 'turn.failed', 'error': error}
+    script = 'import sys; sys.stdin.read(); ' + f'print({json.dumps(event)!r}, flush=True)'
+    monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
+    assert worker.review(task)['error_code'] == 'codex_process_failed'
+    notice = worker.process_diagnostics.read_notices(action)['first_blocking_notice']
+    assert notice['native_error_code'] == code
+    assert notice['native_error_code_status'] == code_status
+    assert notice['http_status'] == status
+    assert notice['http_status_source'] == status_source
+    assert 'private' not in json.dumps(notice)
+    if not isinstance(error.get('message'), str):
+        assert notice['error_message'] is None
+        assert notice['error_message_sha256'] is None
+        assert notice['error_message_bytes'] is None
+
+
+@pytest.mark.parametrize('message,private_literal', [
+    ('connection failed endpoint api.internal', 'api.internal'),
+    ('permission denied: user/session', 'user/session'),
+    ('permission denied: user\\session', 'user\\session'),
+    ('connection failed endpoint a::a', 'a::a'),
+])
+def test_review_redacts_unqualified_addresses_and_relative_paths(tmp_path, monkeypatch, message, private_literal):
+    task, action = _task(tmp_path)
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+    event = {'type': 'error', 'message': message}
+    script = 'import sys; sys.stdin.read(); ' + f'print({json.dumps(event)!r}, flush=True)'
+    monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
+    assert worker.review(task)['error_code'] == 'codex_process_failed'
+    notice = worker.process_diagnostics.read_notices(action)['first_blocking_notice']
+    assert private_literal not in notice['error_message']
+    assert '[redacted]' in notice['error_message']
+    assert notice['error_message_redacted'] is True
+
+
+@pytest.mark.parametrize('message', ['connection failed ' * 200, 'connection failed ' * 1000],
+                         ids=['truncated', 'oversized'])
+def test_review_bounds_long_error_messages_without_losing_notice(tmp_path, monkeypatch, message):
+    task, action = _task(tmp_path)
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+    event = {'type': 'error', 'message': message}
+    script = 'import sys; sys.stdin.read(); ' + f'print({json.dumps(event)!r}, flush=True)'
+    monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
+    assert worker.review(task)['error_code'] == 'codex_process_failed'
+    notice = worker.process_diagnostics.read_notices(action)['first_blocking_notice']
+    assert len(notice['error_message']) <= 2048
+    assert notice['error_message_truncated'] is True
+    assert notice['error_message_bytes'] == len(message.encode())
+    assert notice['error_message_sha256'] == hashlib.sha256(message.encode()).hexdigest()
+
+
+def test_schema_one_notice_remains_readable_without_rewriting_history(tmp_path, monkeypatch):
+    task, action = _task(tmp_path)
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+    event = {'type': 'error', 'codexErrorInfo': 'usageLimitExceeded'}
+    script = 'import sys; sys.stdin.read(); ' + f'print({json.dumps(event)!r}, flush=True)'
+    monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
+    assert worker.review(task)['error_code'] == 'codex_process_failed'
+    legacy_fields = {'schema_version', 'kind', 'role', 'run_id_sha256', 'controller_instance_id_sha256',
+                     'launch_id_sha256', 'action_sha256', 'classification', 'blocking', 'source',
+                     'native_event_type', 'native_error_code', 'http_status', 'observed_at'}
+    saved = {}
+    for path in action.parent.glob('review-notice-*.json'):
+        payload = {key: value for key, value in json.loads(path.read_text()).items() if key in legacy_fields}
+        payload['schema_version'] = 1
+        raw = json.dumps(payload, sort_keys=True).encode()
+        target = path.with_name(f"review-notice-{payload['launch_id_sha256']}-{payload['role']}-{hashlib.sha256(raw).hexdigest()}.json")
+        path.unlink()
+        target.write_bytes(raw)
+        saved[target] = raw
+    notices = worker.process_diagnostics.read_notices(action)
+    assert notices['first_official_notice']['schema_version'] == 1
+    assert notices['first_official_notice']['native_error_code'] == 'usageLimitExceeded'
+    assert all(path.read_bytes() == raw for path, raw in saved.items())
+
+
+@pytest.mark.parametrize('field,value', [
+    ('native_error_code_status', []), ('http_status_source', {}), ('http_status', True),
+    ('error_message', 'https://private-secret/path'), ('error_message_sha256', []),
+    ('error_message_redacted', 1), ('error_message_truncated', 'private-secret'),
+])
+def test_invalid_v2_error_evidence_is_rejected_even_when_rehashed(tmp_path, monkeypatch, field, value):
+    task, action = _task(tmp_path)
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+    event = {'type': 'error', 'message': 'stream disconnected before completion'}
+    script = 'import sys; sys.stdin.read(); ' + f'print({json.dumps(event)!r}, flush=True)'
+    monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
+    assert worker.review(task)['error_code'] == 'codex_process_failed'
+    path = next(action.parent.glob('review-notice-*-first_blocking_notice-*.json'))
+    payload = json.loads(path.read_text())
+    payload[field] = value
+    raw = json.dumps(payload, sort_keys=True).encode()
+    target = path.with_name(f"review-notice-{payload['launch_id_sha256']}-{payload['role']}-{hashlib.sha256(raw).hexdigest()}.json")
+    path.unlink()
+    target.write_bytes(raw)
+    target.chmod(0o600)
+    with pytest.raises(ValueError, match='process_diagnostic_invalid'):
+        worker.process_diagnostics.read_notices(action)
+    assert target.read_bytes() == raw
+
+
+def test_v2_error_evidence_rejects_public_permissions_without_rewriting(tmp_path, monkeypatch):
+    task, action = _task(tmp_path)
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+    event = {'type': 'error', 'message': 'connection failed'}
+    script = 'import sys; sys.stdin.read(); ' + f'print({json.dumps(event)!r}, flush=True)'
+    monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
+    assert worker.review(task)['error_code'] == 'codex_process_failed'
+    path = next(action.parent.glob('review-notice-*-first_blocking_notice-*.json'))
+    original = path.read_bytes()
+    path.chmod(0o644)
+    with pytest.raises(ValueError, match='process_diagnostic_invalid'):
+        worker.process_diagnostics.read_notices(action)
+    assert path.read_bytes() == original
 
 
 @pytest.mark.parametrize('message,classification', [
