@@ -105,8 +105,15 @@ def _stopped_controls(root: Path, automation: ProductionAutomation) -> tuple:
     stop = _pinned_control(root / 'runtime/stop-preaudit.flag')
     if stop[1] != b'stop_requested:codex_review_technical_failure\n':
         raise RuntimeError('production_release_stop_not_repairable')
+    native_home = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex').expanduser().absolute()
+    registered = native_home / 'automations/oa-skill/automation.toml'
+    if automation.file.expanduser().absolute() != registered:
+        raise RuntimeError('production_release_automation_identity_mismatch')
     cron = _pinned_control(automation.file, private=False)
-    if tomllib.loads(cron[1].decode('utf-8')).get('status') != 'PAUSED':
+    configuration = tomllib.loads(cron[1].decode('utf-8'))
+    if configuration.get('id') != 'oa-skill':
+        raise RuntimeError('production_release_automation_identity_mismatch')
+    if configuration.get('status') != 'PAUSED':
         raise RuntimeError('production_release_automation_not_paused')
     findings = automation.findings(root)
     if findings:

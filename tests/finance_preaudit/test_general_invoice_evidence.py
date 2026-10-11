@@ -187,17 +187,20 @@ def test_review_launch_requires_shared_payment_rule(tmp_path, monkeypatch, flow_
         returncode = 0
         stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
 
-        def __init__(self, command):
+        def __init__(self, command, output):
             self.decision_file = Path(command[command.index("--output-last-message") + 1])
+            self.output = output
 
         def communicate(self, *, input, timeout):
             prompts.append(input)
             self.decision_file.write_text('{}')
+            self.output.write('{"type":"turn.completed"}\n')
+            self.output.flush()
 
         def poll(self):
             return self.returncode
 
-    monkeypatch.setattr(codex_review_worker.subprocess, "Popen", lambda command, **kw: Process(command))
+    monkeypatch.setattr(codex_review_worker.subprocess, "Popen", lambda command, **kw: Process(command, kw['stdout']))
     result = codex_review_worker.review(task)
     assert result["status"] == "reviewed"
     assert "完整读取 `references/payment-screenshot-exemption.md`" in prompts[0]

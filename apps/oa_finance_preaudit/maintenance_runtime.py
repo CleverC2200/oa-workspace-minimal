@@ -10,6 +10,7 @@ from pathlib import Path
 import signal
 import subprocess
 import tempfile
+import time
 from typing import Iterator
 
 from apps.oa_approval import runtime_control
@@ -23,6 +24,23 @@ class OriginalExecution:
     tool_session_id: str
 
 
+def _reap_readonly_group(process: subprocess.Popen) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait(timeout=5)
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError('maintenance_readonly_children_unreaped')
+        time.sleep(.01)
+
+
 def _run_readonly(arguments: list[str], *, target_root: Path, environment: dict,
                   timeout: int, require_reaped: bool = False) -> subprocess.CompletedProcess:
     if not require_reaped:
@@ -32,16 +50,17 @@ def _run_readonly(arguments: list[str], *, target_root: Path, environment: dict,
                           stderr=subprocess.PIPE, text=True, start_new_session=True) as process:
         try:
             stdout, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.communicate()
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
+            raise RuntimeError('maintenance_readonly_children_unreaped')
+        except BaseException as error:
+            try:
+                _reap_readonly_group(process)
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
             raise
-        try:
-            os.killpg(process.pid, 0)
-        except ProcessLookupError:
-            return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
-        os.killpg(process.pid, signal.SIGKILL)
-        raise RuntimeError('maintenance_readonly_children_unreaped')
 
 
 _ORIGINAL_EXECUTION_READER = '''

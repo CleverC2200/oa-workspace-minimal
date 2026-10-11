@@ -32,9 +32,9 @@ python -m apps.oa_finance_preaudit.production_release \
   --original-tool-session-id "$original_tool_session_id"
 ```
 
-原执行参数来自原轮监督执行的私有回执和原工具 session；不创建替代 attempt，不使用汇总 JSON 或人工写入的终态。程序使用目标解释器及既有 `read_execution` 只读接口重新核验原 invocation、owner、tool session、manifest 和完整日志哈希。原轮必须确实 exited、终态及 children_reaped 可信，与仍保留的 rolling manifest 相符，原 controller 进程组也必须已退出。目标状态、当前授权及冻结校验的每个只读子进程必须终态并无遗留进程组；异常时阻断，并只清理本次入口启动的只读进程组。
+原执行参数来自原轮监督执行的私有回执和原工具 session；不创建替代 attempt，不使用汇总 JSON 或人工写入的终态。程序使用目标解释器及既有 `read_execution` 只读接口重新核验原 invocation、owner、tool session、manifest 和完整日志哈希。原轮必须确实 exited、终态及 children_reaped 可信，与仍保留的 rolling manifest 相符，原 controller 进程组也必须已退出。目标状态、当前授权及冻结校验的每个只读子进程必须终态并无遗留进程组；异常或取消时阻断，只清理本次入口启动的只读进程组，等待退出并核验组内无遗留进程后才返回原异常。回收无法确认时保留原异常及回收失败，不报告同步就绪。
 
-该模式只接受本用户持有、私有普通文件中的精确 `stop_requested:codex_review_technical_failure` 标记。手动停止、未知原因、Writer 未知写入停止、官方错误冷却停止及环境停止请求仍拒绝。实际原 cron TOML 必须为 PAUSED，项目、调度、模型、提示词及并发合同仍须通过原配置门。源码、身份、授权、冻结、continuation 和 controller/global/request Writer 门禁均保持。
+该模式只接受本用户持有、私有普通文件中的精确 `stop_requested:codex_review_technical_failure` 标记。手动停止、未知原因、Writer 未知写入停止、官方错误冷却停止及环境停止请求仍拒绝。实际原 cron 必须是 `$CODEX_HOME/automations/oa-skill/automation.toml`，未配置 CODEX_HOME 时使用 `~/.codex`；文件内 ID 必须为 `oa-skill` 且状态为 PAUSED，拒绝副本和链接替换。项目、调度、模型、提示词及并发合同仍须通过原配置门。源码、身份、授权、冻结、continuation 和 controller/global/request Writer 门禁均保持。
 
 同一维护租约内，在原执行回读、实时状态、配置检查和源码快进前后重复核验停止门与原 cron 的身份、权限、内容哈希；同内容替换文件也拒绝。程序不写这两个文件、不恢复调度、不清停止门、不调用审批模型、不提交 OA。成功回执记录 `stopped_controls_before/after`、`stop_preserved=true`、`automation_preserved=true`、`automation_state=PAUSED`，并明确 `next_process_ready=false`、`write_state=not_requested`、`production_acceptance=not_verified`。停止门继续阻断审批，即使源码已更新也不表示恢复资格。
 

@@ -338,6 +338,59 @@ def test_stopped_readonly_status_refuses_unreaped_child_even_after_parent_exit(t
         maintenance_runtime.read_live_status(tmp_path, require_reaped=True)
 
 
+@pytest.mark.parametrize('fault_kind', ['interrupt', 'oserror', 'timeout'])
+def test_stopped_readonly_exception_reaps_own_group_before_lease_release(tmp_path, monkeypatch, fault_kind):
+    import os
+    import signal
+    import subprocess
+    import sys
+    import time
+    interpreter = tmp_path / '.venv/bin/python'
+    interpreter.parent.mkdir(parents=True)
+    ready = tmp_path / 'readonly-ready'
+    interpreter.write_text('#!' + sys.executable + '\n'
+        'import time\nfrom pathlib import Path\n'
+        + 'Path(' + repr(str(ready)) + ').write_text("ready")\n'
+        + 'time.sleep(1)\n')
+    interpreter.chmod(0o700)
+    fault = {'interrupt': KeyboardInterrupt('cancel-readonly'), 'oserror': OSError('read-channel-failed'),
+             'timeout': subprocess.TimeoutExpired('readonly', 1)}[fault_kind]
+    original_communicate = subprocess.Popen.communicate
+    processes = []
+    def interrupted_communicate(process, *args, **kwargs):
+        if not processes:
+            processes.append(process)
+            deadline = time.monotonic() + 2
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+            assert ready.exists()
+            raise fault
+        return original_communicate(process, *args, **kwargs)
+    monkeypatch.setattr(subprocess.Popen, 'communicate', interrupted_communicate)
+    try:
+        with maintenance_runtime.target_runtime_leases(tmp_path):
+            expected = KeyboardInterrupt if fault_kind == 'interrupt' else RuntimeError
+            with pytest.raises(expected) as raised:
+                maintenance_runtime.read_live_status(tmp_path, require_reaped=True)
+            if fault_kind == 'interrupt':
+                assert raised.value is fault
+            else:
+                assert raised.value.__cause__ is fault
+            assert processes[0].poll() is not None
+            assert processes[0].returncode == -signal.SIGKILL
+            with pytest.raises(ProcessLookupError):
+                os.killpg(processes[0].pid, 0)
+            assert runtime_control.controller_active(tmp_path / 'runtime/control/rolling-controller.lock')
+        assert not runtime_control.controller_active(tmp_path / 'runtime/control/rolling-controller.lock')
+    finally:
+        if processes:
+            try:
+                os.killpg(processes[0].pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            processes[0].wait(timeout=2)
+
+
 def test_original_maintenance_readback_uses_owned_terminal_receipt_and_rejects_tampering(tmp_path, monkeypatch):
     import sys
     from uuid import uuid4

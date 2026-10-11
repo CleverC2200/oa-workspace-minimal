@@ -303,6 +303,8 @@ def test_raw_malformed_output_fails_without_handoff(
     def popen(command, **kwargs):
         calls.append(command)
         Path(command[command.index("--output-last-message") + 1]).write_text(raw)
+        kwargs['stdout'].write('{"type":"turn.completed"}\n')
+        kwargs['stdout'].flush()
         return Process()
     monkeypatch.setattr(worker.subprocess, "Popen", popen)
     monkeypatch.setattr(worker.runtime_control, "stop_requested", lambda: False)

@@ -168,9 +168,10 @@ def test_worker_reads_frozen_invoice_coverage_and_preview_closes_without_write(
         pid = 12345
         returncode = 0
 
-        def __init__(self, command):
+        def __init__(self, command, output):
             self.stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
             self.decision_file = Path(command[command.index('--output-last-message') + 1])
+            self.output = output
 
         def communicate(self, *, input, timeout):
             assert 'material.invoice_evidence' in input
@@ -197,12 +198,14 @@ def test_worker_reads_frozen_invoice_coverage_and_preview_closes_without_write(
                     'missing_evidence': ['该项目业务材料尚未核验'],
                 } for item in packet['items']],
             })
+            self.output.write('{"type":"turn.completed"}\n')
+            self.output.flush()
 
         def poll(self):
             return self.returncode
 
     monkeypatch.setattr(codex_review_worker.subprocess, 'Popen',
-                        lambda command, **_kwargs: ReviewerProcess(command))
+                        lambda command, **kwargs: ReviewerProcess(command, kwargs['stdout']))
     result = codex_review_worker.review({
         'project_root': str(project), 'action_file': str(action_file), 'timeout_seconds': 60,
     })

@@ -42,13 +42,16 @@ def production(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def stopped_production(production):
+def stopped_production(production, monkeypatch):
     root, remote, revision = production
     stop = root / 'runtime/stop-preaudit.flag'
     runtime_control.write_control_bytes_atomic(stop, b'stop_requested:codex_review_technical_failure\n')
-    automation_file = root.parent / 'automation.toml'
+    native_home = root.parent / 'native-codex'
+    monkeypatch.setenv('CODEX_HOME', str(native_home))
+    automation_file = native_home / 'automations/oa-skill/automation.toml'
+    automation_file.parent.mkdir(parents=True)
     prompt = (Path(production_release.__file__).resolve().parents[2] / 'config/automations/oa-skill-prompt.txt').read_text()
-    automation_file.write_text('status = "PAUSED"\nkind = "cron"\nexecution_environment = "local"\n'
+    automation_file.write_text('id = "oa-skill"\nstatus = "PAUSED"\nkind = "cron"\nexecution_environment = "local"\n'
         'model = "gpt-6.1-sol"\nreasoning_effort = "medium"\nrrule = "preserved"\n'
         + 'cwds = ' + json.dumps([str(root)]) + '\nprompt = ' + json.dumps(prompt, ensure_ascii=False)
         + '\n[target]\ntype = "project"\nproject_id = "production"\n')
@@ -303,6 +306,40 @@ def test_stopped_cli_never_claims_unsafe_marker_preserved(stopped_production, ca
     assert blocked['stopped_controls_after']['stop'] == {'status': 'untrusted'}
     assert blocked['stop_preserved'] is False
     assert blocked['next_process_ready'] is False
+
+
+@pytest.mark.parametrize('substitution', ['copy', 'wrong_id', 'symlink', 'linked_registry'])
+def test_stopped_mode_requires_registered_native_approval_cron(stopped_production, substitution):
+    root, remote, expected, stop, automation, original, report = stopped_production
+    registered = automation.file
+    if substitution == 'copy':
+        copied = root.parent / 'paused-copy.toml'
+        copied.write_bytes(registered.read_bytes())
+        copied.chmod(0o644)
+        registered.write_text(registered.read_text().replace('"PAUSED"', '"ACTIVE"'))
+        automation = production_release.ProductionAutomation(copied, automation.project_id, automation.schedule)
+        code = 'production_release_automation_identity_mismatch'
+    elif substitution == 'wrong_id':
+        registered.write_text(registered.read_text().replace('id = "oa-skill"', 'id = "another-cron"'))
+        code = 'production_release_automation_identity_mismatch'
+    elif substitution == 'symlink':
+        copied = root.parent / 'paused-copy.toml'
+        registered.rename(copied)
+        registered.symlink_to(copied)
+        code = 'production_release_control_untrusted'
+    else:
+        moved = root.parent / 'moved-registry'
+        registered.parent.rename(moved)
+        registered.parent.symlink_to(moved, target_is_directory=True)
+        code = 'control_file_unsafe'
+    stop_before, cron_before = stop.read_bytes(), registered.read_bytes()
+    with pytest.raises(RuntimeError, match=code):
+        production_release.release_source(root, expected_revision=expected, expected_origin=str(remote),
+            stopped_maintenance=True, automation=automation, original_execution=original,
+            check_original=lambda *_: report, check_live=lambda _: live_snapshot(), check_configuration=lambda *_: [])
+    assert git(root, 'rev-parse', 'HEAD') == expected
+    assert stop.read_bytes() == stop_before
+    assert registered.read_bytes() == cron_before
 
 
 def test_release_preflight_retains_leases_across_real_ff_and_readbacks(production):
