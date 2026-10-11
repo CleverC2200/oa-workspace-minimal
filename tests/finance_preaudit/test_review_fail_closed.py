@@ -404,18 +404,21 @@ def test_explicit_reconnect_warning_can_finish_same_review(tmp_path, monkeypatch
     assert notice['source'] == ('stdout' if channel == 'stdout' else 'stderr')
 
 
-@pytest.mark.parametrize('info', [None, {'httpConnectionFailed': {'httpStatusCode': 502}}])
+@pytest.mark.parametrize('fields', [
+    {},
+    {'codexErrorInfo': {'httpConnectionFailed': {'httpStatusCode': 502}}},
+    {'code': 'httpConnectionFailed', 'httpStatusCode': 502},
+    {'codexErrorInfo': {'httpConnectionFailed': {'httpStatusCode': 502}}, 'code': 'httpConnectionFailed', 'httpStatusCode': 500},
+])
 @pytest.mark.parametrize('channel', ['stdout', 'stderr', 'split_stderr', 'plain_stderr'])
-def test_native_transport_fallback_can_finish_same_review(tmp_path, monkeypatch, info, channel):
+def test_native_transport_fallback_can_finish_same_review(tmp_path, monkeypatch, fields, channel):
     task, action = _small_marketing_v2_task(tmp_path, budget_account='宣传制作费')
     message = _TRANSPORT_FALLBACK_WARNING
     launches = []
 
     def command(root, schema, decision, **kwargs):
         launches.append(decision)
-        item = {'type': 'error', 'message': message}
-        if info is not None:
-            item['codexErrorInfo'] = info
+        item = {'type': 'error', 'message': message, **fields}
         warning = message if channel == 'plain_stderr' else json.dumps({'type': 'item.completed', 'item': item})
         if channel == 'split_stderr':
             emit = (f'sys.stderr.write({warning[:40]!r}); sys.stderr.flush(); time.sleep(.05); '
@@ -449,23 +452,35 @@ def test_native_transport_fallback_can_finish_same_review(tmp_path, monkeypatch,
 
 
 @pytest.mark.parametrize('restriction,classification', [
-    ('usage limit exceeded', 'usage_limit'),
-    ('model is not available', 'model_unavailable'),
-    ('authentication failed', 'authentication'),
-    ('too many requests', 'rate_limit'),
-    ('server overloaded', 'server_overloaded'),
+    ({'message': 'usage limit exceeded'}, 'usage_limit'),
+    ({'message': 'model is not available'}, 'model_unavailable'),
+    ({'message': 'authentication failed'}, 'authentication'),
+    ({'message': 'too many requests'}, 'rate_limit'),
+    ({'message': 'server overloaded'}, 'server_overloaded'),
+    ({'code': 'usageLimitExceeded', 'codexErrorInfo': 'httpConnectionFailed'}, 'usage_limit'),
+    ({'code': 'modelUnavailable'}, 'model_unavailable'),
+    ({'code': 'unauthorized'}, 'authentication'),
+    ({'code': 'rateLimitExceeded'}, 'rate_limit'),
+    ({'code': 'serverOverloaded'}, 'server_overloaded'),
+    ({'httpStatusCode': 401}, 'authentication'),
+    ({'httpStatusCode': 403}, 'authentication'),
+    ({'httpStatusCode': 429, 'codexErrorInfo': {'httpConnectionFailed': {'httpStatusCode': 502}}}, 'rate_limit'),
+    ({'httpStatusCode': 429, 'codexErrorInfo': {'responseStreamDisconnected': {'httpStatusCode': 401}}}, 'rate_limit'),
+    ({'httpStatusCode': 503}, 'server_overloaded'),
 ])
 def test_official_error_after_transport_fallback_stops_before_retry(tmp_path, monkeypatch, restriction, classification):
     task, action = _task(tmp_path)
     retry = tmp_path / 'retry-started'
     child_pid = tmp_path / 'model-pid'
     launches = []
-    messages = [_TRANSPORT_FALLBACK_WARNING, _TRANSPORT_FALLBACK_WARNING + ' ' + restriction]
+    errors = [{'type': 'error', 'message': _TRANSPORT_FALLBACK_WARNING},
+              {'type': 'error', **restriction,
+               'message': _TRANSPORT_FALLBACK_WARNING + ' ' + restriction.get('message', '')}]
 
     def command(*args, **kwargs):
         launches.append(True)
-        emit = ''.join(f'print({json.dumps({"type": "item.completed", "item": {"type": "error", "message": message}})!r}, flush=True); '
-                       for message in messages)
+        emit = ''.join(f'print({json.dumps({"type": "item.completed", "item": error})!r}, flush=True); '
+                       for error in errors)
         script = ('import os,sys,time; from pathlib import Path; sys.stdin.read(); '
                   f'Path({str(child_pid)!r}).write_text(str(os.getpid())); ' + emit +
                   f'time.sleep(10); Path({str(retry)!r}).write_text("retry"); time.sleep(10)')
@@ -491,6 +506,13 @@ def test_official_error_after_transport_fallback_stops_before_retry(tmp_path, mo
     assert notices['first_notice']['blocking'] is False
     assert notices['first_blocking_notice']['classification'] == classification
     assert notices['first_official_notice']['classification'] == classification
+    official = notices['first_official_notice']
+    if 'code' in restriction:
+        assert official['native_error_code'] == restriction['code']
+        assert official['native_error_code_status'] == 'retained'
+    if 'httpStatusCode' in restriction:
+        assert official['http_status'] == restriction['httpStatusCode']
+        assert official['http_status_source'] == 'httpStatusCode'
     with pytest.raises(ProcessLookupError):
         os.kill(int(child_pid.read_text()), 0)
 
@@ -515,6 +537,45 @@ def test_transport_fallback_does_not_exempt_other_failures(tmp_path, monkeypatch
     assert result['process_retries'] == 0
     assert runtime_control.stop_reason() == 'codex_review_technical_failure'
     assert guard.cooldown() is None
+    notice = worker.process_diagnostics.read_notices(action)['first_blocking_notice']
+    assert notice['classification'] == classification
+    assert notice['blocking'] is True
+
+
+@pytest.mark.parametrize('event,classification', [
+    ({'type': 'error', 'message': _TRANSPORT_FALLBACK_WARNING, 'code': 'futureNativeError'}, 'unknown_error'),
+    ({'type': 'error', 'message': _TRANSPORT_FALLBACK_WARNING, 'code': 'futureNativeError',
+      'codexErrorInfo': 'httpConnectionFailed'}, 'unknown_error'),
+    ({'type': 'error', 'message': _TRANSPORT_FALLBACK_WARNING, 'code': None}, 'unknown_error'),
+    ({'type': 'error', 'message': _TRANSPORT_FALLBACK_WARNING, 'code': [], 'httpStatusCode': 502}, 'unknown_error'),
+    ({'type': 'error', 'message': _TRANSPORT_FALLBACK_WARNING, 'httpStatusCode': 418,
+      'codexErrorInfo': {'httpConnectionFailed': {'httpStatusCode': 502}}}, 'unknown_error'),
+    ({'type': 'future.event', 'item': {'type': 'error', 'message': _TRANSPORT_FALLBACK_WARNING}}, 'invalid_event'),
+    ({'item': {'type': 'error', 'message': _TRANSPORT_FALLBACK_WARNING}}, 'invalid_event'),
+    ({'type': [], 'item': {'type': 'error', 'message': _TRANSPORT_FALLBACK_WARNING}}, 'invalid_event'),
+])
+@pytest.mark.parametrize('channel', ['stdout', 'stderr'])
+def test_transport_fallback_cannot_hide_unknown_fields_before_valid_completion(tmp_path, monkeypatch, event, classification, channel):
+    task, action = _small_marketing_v2_task(tmp_path, budget_account='宣传制作费')
+    launches = []
+
+    def command(root, schema, decision, **kwargs):
+        launches.append(decision)
+        return [sys.executable, '-c',
+                'import sys,json; from pathlib import Path; sys.stdin.read(); '
+                f'print({json.dumps(event)!r},file=sys.{channel},flush=True); '
+                f'Path({str(decision)!r}).write_text(json.dumps({{"overall":"pass"}})); '
+                'print(json.dumps({"type":"turn.completed"}),flush=True)']
+
+    monkeypatch.setattr(worker, '_codex_command', command)
+    result = worker.review(task)
+    assert result['status'] == 'failed'
+    assert result['process_attempts'] == 1
+    assert result['process_retries'] == 0
+    assert len(launches) == 1
+    assert runtime_control.stop_reason() == 'codex_review_technical_failure'
+    assert guard.cooldown() is None
+    assert not action.with_name('execution-receipt.json').exists()
     notice = worker.process_diagnostics.read_notices(action)['first_blocking_notice']
     assert notice['classification'] == classification
     assert notice['blocking'] is True

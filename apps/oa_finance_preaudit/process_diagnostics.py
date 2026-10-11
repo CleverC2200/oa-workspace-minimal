@@ -95,14 +95,20 @@ def _redact_message(message: str) -> tuple[str, bool]:
 def _error_details(error: dict) -> dict:
     info = error.get("codexErrorInfo")
     code = info if isinstance(info, str) else next(iter(info), None) if isinstance(info, dict) and len(info) == 1 else None
-    if info is None:
-        code = error.get("code")
-    code_status = "retained" if _native_code(code) else "missing" if info is None and code is None else "omitted_untrusted"
     details = info.get(code) if isinstance(info, dict) and isinstance(code, str) else None
+    top_code = error.get("code")
+    # Preserve the official source that took precedence over transport details.
+    if info is None or (approval_guard.notice_code({"code": code}) is None
+                        and approval_guard.notice_code({"code": top_code}) is not None):
+        code = top_code
+    code_status = "retained" if _native_code(code) else "missing" if info is None and code is None else "omitted_untrusted"
     status = details.get("httpStatusCode") if isinstance(details, dict) else None
     status_source = "codexErrorInfo"
     top_status = error.get("httpStatusCode")
-    if not _http_status(status) and (_http_status(top_status) or status is None):
+    nested_http_official = (isinstance(info, dict) and set(info) == {"httpConnectionFailed"}
+                            and approval_guard.notice_code({"codexErrorInfo": info}) is not None)
+    if ((not _http_status(status) and (_http_status(top_status) or status is None))
+            or (not nested_http_official and approval_guard.notice_code({"httpStatusCode": top_status}) is not None)):
         status = top_status
         status_source = "httpStatusCode"
     valid_status = _http_status(status)
@@ -226,13 +232,19 @@ def classify_error(event: dict) -> dict | None:
         return {"classification": official, "blocking": True}
     if isinstance(event.get("type"), str) and event["type"] in {"turn.failed", "thread.failed"}:
         return {"classification": "terminal_failure", "blocking": True}
+    if not isinstance(event.get("type"), str) or event["type"] not in _NOTICE_EVENTS:
+        return {"classification": "invalid_event", "blocking": True}
     message = error.get("message")
     info = error.get("codexErrorInfo")
     details = info.get("httpConnectionFailed") if isinstance(info, dict) and set(info) == {"httpConnectionFailed"} else None
-    transport_code = (info == "httpConnectionFailed" or isinstance(details, dict)
+    transient_http_statuses = {408, 500, 502, 504}
+    transport_info = (info == "httpConnectionFailed" or isinstance(details, dict)
                       and (details.get("httpStatusCode") is None or type(details["httpStatusCode"]) is int
-                           and details["httpStatusCode"] in {408, 500, 502, 504}))
-    if isinstance(message, str) and ("codexErrorInfo" not in error or transport_code):
+                           and details["httpStatusCode"] in transient_http_statuses))
+    transport_code = "code" not in error or error["code"] == "httpConnectionFailed"
+    transport_status = ("httpStatusCode" not in error or type(error["httpStatusCode"]) is int
+                        and error["httpStatusCode"] in transient_http_statuses)
+    if isinstance(message, str) and ("codexErrorInfo" not in error or transport_info) and transport_code and transport_status:
         signals = stderr_summary(io.StringIO(message))["stderr_signals"]
         lower = message.lower()
         if ("transport_signal" in signals
