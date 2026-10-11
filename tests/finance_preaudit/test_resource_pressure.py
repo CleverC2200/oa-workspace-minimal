@@ -113,48 +113,47 @@ def test_invalid_cpu_measurements_are_not_treated_as_healthy(value):
         load_reader=lambda: (value, 0, 0), cpu_reader=lambda: 10)["status"] == "unknown"
 
 
-def test_retry_waits_for_resource_recovery(tmp_path: Path, monkeypatch):
-    from tests.finance_preaudit.test_concurrency_probe import _open_action
+def test_writer_rejection_does_not_retry_after_resource_recovery(tmp_path: Path, monkeypatch):
+    from tests.finance_preaudit.test_concurrency_probe import _open_action, _rejected_decision_result
     _open_action(tmp_path / "runtime" / "finance_preaudit_flows", case_key="retry-wait",
         created_at="2026-08-25T02:01:00+00:00")
     phase = "initial"
-    wait_samples = 0
     review_count = 0
-    write_count = 0
+    completion_count = 0
     unknown_seen = threading.Event()
     monkeypatch.setattr(probe.runtime_control, "stop_requested", lambda: False)
     def health():
-        nonlocal phase, wait_samples
-        if phase in {"writer", "waiting"}:
+        if phase == "writer":
             unknown_seen.set()
-            if phase == "waiting":
-                wait_samples += 1
-                if wait_samples >= 3:
-                    phase = "recovered"
-            return {"status": "healthy" if phase == "recovered" else "unknown"}
+            return {"status": "unknown"}
         return {"status": "healthy"}
     def review(task):
         nonlocal review_count
         review_count += 1
-        if review_count == 2:
-            assert phase == "recovered"
-        return {"status": "reviewed", "decision": {}, "process_attempts": 1,
+        assert review_count == 1
+        return {**probe.codex_review_worker._base_result(attempts=1, usages=[{"status": "unknown"}]),
+                "codex_events": probe.codex_review_worker._unknown_events(1),
+                "status": "reviewed", "decision": {},
                 "agent_wall_seconds": 0, "token_usage": {"status": "unknown"}}
     def complete(action, value):
-        nonlocal phase, write_count
-        write_count += 1
-        if write_count == 1:
-            phase = "writer"
-            assert unknown_seen.wait(1)
-            phase = "waiting"
-            return {**value, "status": "retry_required", "error_code": "codex_decision_invalid"}
-        return {**value, "status": "completed", "business_state": "pass", "write_state": "submitted"}
+        nonlocal phase, completion_count
+        completion_count += 1
+        assert completion_count == 1
+        phase = "writer"
+        assert unknown_seen.wait(1)
+        phase = "recovered"
+        return _rejected_decision_result(value)
     result = probe._run_dispatched_tasks(1, 6, project_root=tmp_path, adaptive=True,
         heartbeat_interval_sec=0.01, runtime_status=health, renew_actions=lambda p: p,
         review_worker=review, complete_review=complete,
+        record_failure_round=lambda *_args: {"production_failure_round": 1},
         executor_factory=lambda n: ThreadPoolExecutor(max_workers=n))
     assert result.completed == 1
-    assert review_count == write_count == 2
+    assert review_count == completion_count == 1
+    assert result.outcomes[0].value["status"] == "retry_pending"
+    assert phase == "recovered"
+    assert any(sample["resource_paused"] for sample in result.runtime_samples)
+    assert probe.runtime_control.stop_reason() is None
 
 
 def test_prepared_work_waits_until_existing_reviews_drain_after_decrease(tmp_path: Path, monkeypatch):

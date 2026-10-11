@@ -107,7 +107,7 @@ def test_handoff_rejects_any_existing_writer_artifact(tmp_path: Path, artifact: 
 
 
 @pytest.mark.parametrize("workflow", sorted(manual_handoff.WORKFLOWS))
-def test_timeout_stops_without_automatic_handoff_after_confirmed_exit(tmp_path: Path, monkeypatch, workflow: str) -> None:
+def test_timeout_ends_item_without_automatic_handoff_after_confirmed_exit(tmp_path: Path, monkeypatch, workflow: str) -> None:
     from apps.oa_finance_preaudit import codex_review_worker as worker
     from tests.finance_preaudit.test_codex_review_worker import _task
     task, action_path = _task(tmp_path, workflow_key=workflow)
@@ -121,22 +121,26 @@ def test_timeout_stops_without_automatic_handoff_after_confirmed_exit(tmp_path: 
     assert result["status"] == "failed"
     assert result["error_code"] == "codex_process_timeout"
     assert "decision" not in result
-    assert worker.runtime_control.stop_reason() == "codex_review_technical_failure"
+    assert worker.runtime_control.stop_reason() is None
     assert result["token_usage"]["status"] == "unknown"
     assert len(calls) == 1
     assert not action_path.with_name("writer-boundary.json").exists()
+    assert action_path.with_name("review-failure.json").exists()
 
 
 @pytest.mark.parametrize("state,exit_code", [("cleanup_failed", -9), ("timed_out", None)])
-def test_timeout_without_reap_proof_stays_failed(tmp_path: Path, monkeypatch, state, exit_code) -> None:
+def test_timeout_without_reap_proof_stops_round(tmp_path: Path, monkeypatch, state, exit_code) -> None:
     from apps.oa_finance_preaudit import codex_review_worker as worker
     from tests.finance_preaudit.test_codex_review_worker import _task
-    task, _ = _task(tmp_path)
+    task, action = _task(tmp_path)
     monkeypatch.setattr(worker.runtime_control, "stop_requested", lambda: False)
     result = worker.review(task, executor=lambda *args: worker.CodexExecution(
         "codex_process_timeout", worker._unknown_usage(), process_state=state, exit_code=exit_code))
     assert result["status"] == "failed"
+    assert result["error_code"] == "codex_model_cleanup_unknown"
+    assert worker.runtime_control.stop_reason() == "codex_review_technical_failure"
     assert "decision" not in result
+    assert not action.with_name("review-failure.json").exists()
 
 
 @pytest.mark.parametrize("health", ["healthy", "critical", "unknown"])

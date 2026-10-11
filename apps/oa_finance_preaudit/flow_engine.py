@@ -4176,7 +4176,7 @@ class FlowEngine:
         """Persist a production retry streak without isolating the attempt.
 
         The attempt remains reviewable so the next production cycle can retry it.
-        Isolation is deliberately a separate operation after the third cycle.
+        Isolation remains a separate, explicitly selected operation.
         """
         if failure_code not in _REVIEW_QUARANTINE_REASONS:
             raise ValueError("review_failure_round_invalid")

@@ -1685,7 +1685,7 @@ def test_turn_failed_review_stops_after_one_attempt(tmp_path: Path) -> None:
 
     assert result["process_attempts"] == 1
     assert result["codex_events"]["counts"].get("turn.failed") == 1
-    assert runtime_control.stop_requested()
+    assert not runtime_control.stop_requested()
     assert codex_review_worker.is_bounded_prewrite_failure(result)
     assert action_file.with_name("review-failure.json").is_file()
 
@@ -1749,6 +1749,7 @@ def test_bounded_prewrite_failure_reuses_matching_receipt_after_stop(
     first = codex_review_worker.review(task, executor=fail)
     receipt_file = action_file.with_name("review-failure.json")
     first_receipt = receipt_file.read_bytes()
+    runtime_control.request_stop()
     second = codex_review_worker.review(task, executor=fail)
 
     assert codex_review_worker.is_bounded_prewrite_failure(first)
