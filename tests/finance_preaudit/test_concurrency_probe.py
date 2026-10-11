@@ -34,6 +34,10 @@ def isolate_alert_delivery(tmp_path, monkeypatch):
         return original(code, **kwargs)
     monkeypatch.setattr(alert, "alert_once", local_alert)
     monkeypatch.setattr(alert, "send_message", lambda *args, **kwargs: None)
+    from tests.finance_preaudit.test_approval_guard import official_history
+    home = tmp_path / "official"
+    official_history(home, finance_preaudit_concurrency_probe.PROJECT_ROOT, [])
+    monkeypatch.setenv("CODEX_HOME", str(home))
 
 
 def _slow_failed_prepare(_workflow: str) -> dict:
@@ -1939,6 +1943,7 @@ def test_prepare_one_rejects_duplicate_recovery_identity(
 
 def test_unknown_snapshot_failure_happens_before_handoff_begin(monkeypatch) -> None:
     begins: list[dict] = []
+    monkeypatch.setattr(finance_preaudit_concurrency_probe.approval_lifecycle, "startup", lambda *a, **kw: {"status": "ready"})
 
     def fail_snapshot() -> frozenset[tuple[str, str]]:
         raise ValueError("production_probe_state_invalid")
@@ -1970,7 +1975,7 @@ def test_unknown_snapshot_failure_happens_before_handoff_begin(monkeypatch) -> N
     )
 
     with pytest.raises(ValueError, match="production_probe_state_invalid"):
-        finance_preaudit_concurrency_probe.run_rolling_drain(capacity=6)
+        finance_preaudit_concurrency_probe.run_rolling_drain(capacity=3)
 
     assert begins == []
 
@@ -3047,14 +3052,14 @@ def test_rolling_drain_routes_recoveries_through_the_isolated_prepare_stage(
     )
 
     result = finance_preaudit_concurrency_probe.run_rolling_drain(
-        capacity=6,
+        capacity=3,
         recovery_action_files=(recovery,),
         live_status=live_status,
         pipeline_runner=pipeline,
         reconcile_status=lambda: _reconciliation_snapshot(*current[0]),
     )
 
-    assert calls == [(1, 6, (recovery,))]
+    assert calls == [(1, 3, (recovery,))]
     assert result["completed"] == 1
     assert result["quarantined_pending"] == 2
 
@@ -3196,11 +3201,8 @@ def test_rolling_controller_holds_unique_runtime_lease(tmp_path, monkeypatch) ->
     assert not finance_preaudit_concurrency_probe.runtime_control.controller_active()
 
     with finance_preaudit_concurrency_probe.runtime_control.global_controller_lease():
-        with pytest.raises(
-            ValueError,
-            match="production_rolling_controller_active",
-        ):
-            finance_preaudit_concurrency_probe.run_rolling_drain(capacity=6)
+        result = finance_preaudit_concurrency_probe.run_rolling_drain(capacity=3)
+        assert result["status"] == "blocked" and result["reason"] == "previous_run_ownership_unknown"
 
 
 @pytest.mark.parametrize(
@@ -3393,11 +3395,8 @@ def test_rolling_controller_holds_unique_runtime_lease(tmp_path, monkeypatch) ->
     assert not finance_preaudit_concurrency_probe.runtime_control.controller_active()
 
     with finance_preaudit_concurrency_probe.runtime_control.global_controller_lease():
-        with pytest.raises(
-            ValueError,
-            match="production_rolling_controller_active",
-        ):
-            finance_preaudit_concurrency_probe.run_rolling_drain(capacity=6)
+        result = finance_preaudit_concurrency_probe.run_rolling_drain(capacity=3)
+        assert result["status"] == "blocked" and result["reason"] == "previous_run_ownership_unknown"
 
 
 def test_rolling_failure_retains_internal_host_critical_decision() -> None:
@@ -3959,12 +3958,12 @@ def test_production_cli_defaults_to_rolling_and_rejects_legacy_drain(
     )
 
     assert finance_preaudit_concurrency_probe.main(
-        ["--capacity", "6", "--confirm-write", "YES"]
+        ["--capacity", "3", "--confirm-write", "YES"]
     ) == 0
     assert calls == [
         (
-            6,
-            True,
+            3,
+            False,
             (),
             finance_preaudit_concurrency_probe.ROLLING_WORKFLOW_KEYS,
         )
@@ -3975,7 +3974,7 @@ def test_production_cli_defaults_to_rolling_and_rejects_legacy_drain(
     assert finance_preaudit_concurrency_probe.main(
         [
             "--capacity",
-            "6",
+            "3",
             "--confirm-write",
             "YES",
             "--recover-action-file",
@@ -3983,8 +3982,8 @@ def test_production_cli_defaults_to_rolling_and_rejects_legacy_drain(
         ]
     ) == 0
     assert calls[-1] == (
-        6,
-        True,
+        3,
+        False,
         (recovery,),
         finance_preaudit_concurrency_probe.ROLLING_WORKFLOW_KEYS,
     )
@@ -3993,25 +3992,25 @@ def test_production_cli_defaults_to_rolling_and_rejects_legacy_drain(
     assert finance_preaudit_concurrency_probe.main(
         [
             "--capacity",
-            "6",
+            "3",
             "--confirm-write",
             "YES",
             "--workflow",
             "general_expense",
         ]
     ) == 0
-    assert calls[-1] == (6, True, (), frozenset({"general_expense"}))
+    assert calls[-1] == (3, False, (), frozenset({"general_expense"}))
     capsys.readouterr()
 
     assert finance_preaudit_concurrency_probe.main(
-        ["--capacity", "6", "--confirm-write", "YES", "--drain"]
+        ["--capacity", "3", "--confirm-write", "YES", "--drain"]
     ) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["error_code"] == "production_legacy_scheduler_removed"
     assert len(calls) == 3
 
 
-def test_production_cli_defaults_to_two_adaptive_slots(monkeypatch, capsys) -> None:
+def test_production_cli_defaults_to_two_fixed_slots(monkeypatch, capsys) -> None:
     calls = []
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe,
@@ -4023,22 +4022,22 @@ def test_production_cli_defaults_to_two_adaptive_slots(monkeypatch, capsys) -> N
         ["--confirm-write", "YES"]
     ) == 0
     assert calls[0]["capacity"] == 2
-    assert calls[0]["adaptive"] is True
+    assert calls[0]["adaptive"] is False
     capsys.readouterr()
 
 
-def test_production_cli_passes_three_slot_start_and_six_slot_ceiling(monkeypatch, capsys) -> None:
+def test_production_cli_passes_three_fixed_slots(monkeypatch, capsys) -> None:
     calls = []
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe, "run_rolling_drain",
         lambda **kwargs: calls.append(kwargs) or {"status": "completed"},
     )
     assert finance_preaudit_concurrency_probe.main([
-        "--rolling", "--capacity", "3", "--max-capacity", "6", "--confirm-write", "YES",
+        "--rolling", "--capacity", "3", "--max-capacity", "3", "--confirm-write", "YES",
     ]) == 0
     assert calls[0]["capacity"] == 3
-    assert calls[0]["max_capacity"] == 6
-    assert calls[0]["adaptive"] is True
+    assert calls[0]["max_capacity"] == 3
+    assert calls[0]["adaptive"] is False
     capsys.readouterr()
 
 
@@ -4110,7 +4109,7 @@ def test_production_cli_alerts_on_session_failure_without_masking_it(
     )
 
     assert finance_preaudit_concurrency_probe.main(
-        ["--capacity", "6", "--confirm-write", "YES"]
+        ["--capacity", "3", "--confirm-write", "YES"]
     ) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["error_code"] == "oa_session_expired"
@@ -4150,7 +4149,7 @@ def test_production_cli_alerts_on_pipeline_session_failure_without_clearing(
     )
 
     assert finance_preaudit_concurrency_probe.main(
-        ["--capacity", "6", "--confirm-write", "YES"]
+        ["--capacity", "3", "--confirm-write", "YES"]
     ) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["error_counts"] == {"oa_session_expired": 1}
@@ -4182,7 +4181,7 @@ def test_production_cli_alerts_only_on_current_failures(
     ))
     monkeypatch.setattr(probe.session_alert, "clear_active_alert", lambda **kw: clears.append(kw))
 
-    exit_code = probe.main(["--rolling", "--capacity", "6", "--confirm-write", "YES"])
+    exit_code = probe.main(["--rolling", "--capacity", "3", "--confirm-write", "YES"])
     payload = json.loads(capsys.readouterr().out)
     assert exit_code == (1 if status == "failed" else 0)
     assert payload["status"] == status
@@ -4226,7 +4225,7 @@ def test_production_cli_finds_session_failure_in_exception_chain(
     )
 
     assert finance_preaudit_concurrency_probe.main(
-        ["--capacity", "6", "--confirm-write", "YES"]
+        ["--capacity", "3", "--confirm-write", "YES"]
     ) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["error_code"] == "rpa_cdp_timeout"
@@ -4248,7 +4247,7 @@ def test_production_cli_preserves_primary_error_when_reaping_fails(
     )
 
     assert finance_preaudit_concurrency_probe.main(
-        ["--capacity", "6", "--confirm-write", "YES"]
+        ["--capacity", "3", "--confirm-write", "YES"]
     ) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["error_code"] == "production_controller_children_active"
@@ -4274,7 +4273,7 @@ def test_production_cli_preserves_known_error_prefix_with_detail(
     )
 
     assert finance_preaudit_concurrency_probe.main(
-        ["--capacity", "6", "--confirm-write", "YES"]
+        ["--capacity", "3", "--confirm-write", "YES"]
     ) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["error_code"] == "production_reconciliation_blocked"
@@ -4302,7 +4301,7 @@ def test_production_cli_does_not_mask_success_when_alert_reset_is_unknown(
     )
 
     assert finance_preaudit_concurrency_probe.main(
-        ["--capacity", "6", "--confirm-write", "YES"]
+        ["--capacity", "3", "--confirm-write", "YES"]
     ) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "completed"
@@ -7995,7 +7994,7 @@ def test_controller_current_failures_notify_without_session_failure(tmp_path, mo
     monkeypatch.setenv("OA_FEISHU_ALERT_CHAT_ID", "oc_recorded")
     monkeypatch.setattr(session_alert, "_live_status", lambda: {"status": "ok"})
     monkeypatch.setattr(session_alert, "send_message", lambda *args, **kwargs: sent.append(args))
-    finance_preaudit_concurrency_probe.main(["--capacity", "6", "--confirm-write", "YES"])
+    finance_preaudit_concurrency_probe.main(["--capacity", "3", "--confirm-write", "YES"])
     payload = json.loads(capsys.readouterr().out)
     assert payload["notification"]["delivery_state"] == "sent"
     assert len(sent) == 1
@@ -8128,7 +8127,7 @@ def test_finance_success_does_not_clear_whole_task_production_fault(tmp_path, mo
     original_clear = alert.clear_active_alert
     monkeypatch.setattr(alert, "clear_active_alert", lambda **kw: original_clear(control_root=tmp_path / "alerts", **kw))
     monkeypatch.setattr(probe, "run_rolling_drain", lambda **kw: {"status": "completed"})
-    assert probe.main(["--rolling", "--capacity", "6", "--confirm-write", "YES"]) == 0
+    assert probe.main(["--rolling", "--capacity", "3", "--confirm-write", "YES"]) == 0
     capsys.readouterr()
     state = alert.status(control_root=tmp_path / "alerts")
     assert state["status"] == "active"

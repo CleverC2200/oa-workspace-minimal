@@ -438,8 +438,11 @@ def test_failed_output_retention_failure_remains_unwritten(tmp_path, monkeypatch
     task, action_file = _task(tmp_path)
     _mock_final_output(monkeypatch, "not-json")
 
-    def unsafe(*args):
-        raise RuntimeError("control_file_unsafe")
+    original_write = runtime_control.write_control_bytes_atomic
+    def unsafe(path, payload):
+        if path.parent == action_file.parent:
+            raise RuntimeError("control_file_unsafe")
+        return original_write(path, payload)
 
     monkeypatch.setattr(codex_review_worker.runtime_control, "write_control_bytes_atomic", unsafe)
     result = codex_review_worker.review(task)

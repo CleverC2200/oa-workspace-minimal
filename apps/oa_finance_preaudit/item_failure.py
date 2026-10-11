@@ -28,7 +28,7 @@ _ARTIFACTS = (
     "submission-envelope.json",
 )
 _FAILURE_CODES = frozenset({
-    "codex_decision_invalid", "codex_review_failed", "material_collection_failed",
+    "codex_decision_invalid", "codex_review_failed", "codex_review_interrupted", "material_collection_failed",
     "write_authorization_invalid", "writer_result_unknown", *writer_outcomes.FAILURE_CODES,
 })
 
@@ -74,6 +74,9 @@ def _scope(root: Path, state: dict, *, confirmed_rejection: bool) -> str:
         return "controller"
     if reason == "codex_review_failed":
         return "item" if evidence.trusted_quarantine(root, state) else "controller"
+    if reason == "codex_review_interrupted":
+        from . import review_interruption
+        return "item" if review_interruption.trusted(root, state) else "controller"
     if reason == "codex_decision_invalid":
         return "item"
     if reason == "material_collection_failed" and state.get("failure_detail_code") in ITEM_LOCAL_MATERIAL_FAILURE_DETAILS:

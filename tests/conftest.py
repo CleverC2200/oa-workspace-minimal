@@ -51,3 +51,12 @@ def isolate_production_runtime_controls(
         "OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE",
         str(tmp_path / "control" / "rolling-controller.lock"),
     )
+
+
+@pytest.fixture(autouse=True)
+def isolate_native_process_doubles(monkeypatch):
+    from apps.oa_finance_preaudit import approval_guard
+    identity, alive = approval_guard.process_identity, approval_guard.group_alive
+    # Explicit Popen-double IDs must never become real ps or killpg targets.
+    monkeypatch.setattr(approval_guard, "process_identity", lambda pid: None if pid in {12345, 123456} else identity(pid))
+    monkeypatch.setattr(approval_guard, "group_alive", lambda pid: False if pid in {12345, 123456} else alive(pid))

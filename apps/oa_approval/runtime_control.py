@@ -26,6 +26,7 @@ _ALLOWED_STOP_REASONS = frozenset(
         "write_authorization_invalid",
         "writer_result_unknown",
         "codex_review_technical_failure",
+        "codex_official_error_cooldown",
     }
 )
 _CYCLE_STOP_PAYLOAD = b"stop_requested:controller_cycle_stop\n"
@@ -72,8 +73,13 @@ def _write_stop_locked(reason: str | None) -> None:
     try:
         descriptor = os.open(target, flags, 0o600)
     except FileExistsError:
-        if reason == "codex_review_technical_failure" and read_control_bytes(target) == _CYCLE_STOP_PAYLOAD:
-            write_control_bytes_atomic(target, f"stop_requested:{reason}\n".encode("ascii"))
+        previous = read_control_bytes(target)
+        if (reason is None and previous in {b"stop_requested:codex_review_technical_failure\n", b"stop_requested:codex_official_error_cooldown\n"}) or (reason in {"codex_review_technical_failure", "codex_official_error_cooldown"}
+                and previous == _CYCLE_STOP_PAYLOAD) or (
+                previous == b"stop_requested:codex_official_error_cooldown\n"
+                and reason in {None, "production_probe_prepare_failed", "production_probe_renew_failed",
+                               "production_reconciliation_blocked", "write_authorization_invalid", "writer_result_unknown"}):
+            write_control_bytes_atomic(target, b"stop_requested\n" if reason is None else f"stop_requested:{reason}\n".encode("ascii"))
         return
     try:
         payload = (

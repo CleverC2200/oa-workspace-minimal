@@ -11,6 +11,7 @@ import pytest
 
 from apps.oa_approval import runtime_control
 from apps.oa_finance_preaudit import codex_review_worker as worker
+from apps.oa_finance_preaudit import approval_guard as guard
 from scripts import finance_preaudit_run, finance_preaudit_concurrency_probe as probe
 from tests.finance_preaudit.test_codex_review_worker import _task, _small_marketing_v2_task
 from tests.finance_preaudit.test_concurrency_probe import _open_action
@@ -85,6 +86,20 @@ def test_existing_manual_stop_is_never_replaced():
     original = runtime_control.stop_file().read_bytes()
     runtime_control.request_stop('codex_review_technical_failure')
     assert runtime_control.stop_file().read_bytes() == original
+
+
+def test_other_worker_cannot_upgrade_unowned_technical_stop(tmp_path):
+    _task_a, first = _task(tmp_path / 'a')
+    _task_b, second = _task(tmp_path / 'b')
+    identity = worker._request_review_stop(first, 'codex_process_failed')
+    assert identity is not None
+    assert worker._request_review_stop(second, 'codex_process_failed') is None
+    guard.record_notice('usage_limit', 'second-worker', technical_stop_identity=None)
+    assert runtime_control.stop_reason() == 'codex_review_technical_failure'
+    # A later replacement is not the marker that the first worker published.
+    runtime_control.write_control_bytes_atomic(runtime_control.stop_file(), b'stop_requested:codex_review_technical_failure\n')
+    guard.record_notice('usage_limit', 'first-worker', technical_stop_identity=identity)
+    assert runtime_control.stop_reason() == 'codex_review_technical_failure'
 
 
 def test_stop_publication_waits_for_launch_lease():
@@ -215,6 +230,8 @@ def test_first_usage_warning_stops_before_ten_second_retry(tmp_path, monkeypatch
     assert result['process_retries'] == 0
     assert runtime_control.stop_requested()
     assert not retry.exists()
+    assert runtime_control.stop_reason() == guard.STOP_REASON
+    assert guard.cooldown()['blocked_until'] - guard.cooldown()['triggered_at'] == 10800
     with pytest.raises(ProcessLookupError):
         os.kill(int(child_pid.read_text()), 0)
     diagnostic = next(Path(task['action_file']).parent.glob('review-process-*.json')).read_text()
@@ -247,6 +264,41 @@ def test_quota_warning_classified_after_fast_exit_still_blocks_decision(tmp_path
     assert result['error_code'] == 'codex_process_failed'
     assert result['process_retries'] == 0
     assert runtime_control.stop_requested()
+
+
+def test_late_quota_classification_after_generic_stdout_failure_publishes_cooldown(tmp_path, monkeypatch):
+    task, _ = _task(tmp_path)
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+    original_summary = worker.process_diagnostics.stderr_summary
+    def delayed(stream, **kwargs):
+        if 'on_signals' in kwargs:
+            time.sleep(.3)
+        return original_summary(stream, **kwargs)
+    monkeypatch.setattr(worker.process_diagnostics, 'stderr_summary', delayed)
+    monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c',
+        'import sys,json;sys.stdin.read();print(json.dumps({"type":"error","message":"generic failure"}),flush=True);'
+        'print("usage limit exceeded",file=sys.stderr,flush=True)'])
+    result = worker.review(task)
+    assert result['status'] == 'failed' and result['process_retries'] == 0
+    assert guard.cooldown()['notice_code'] == 'usage_limit'
+    assert runtime_control.stop_reason() == guard.STOP_REASON
+
+
+def test_registration_write_failure_reaps_already_started_cli(tmp_path, monkeypatch):
+    task, action = _task(tmp_path)
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+    monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', 'import time;time.sleep(60)'])
+    identity = guard.process_identity
+    started = []
+    def failed_registration(slot, pid, command):
+        started.append(pid)
+        raise OSError('offline registration disk failure')
+    monkeypatch.setattr(guard, 'register_model', failed_registration)
+    result = worker._execute_codex_raw(Path(task['project_root']), action, 60,
+        prompt_builder=lambda _: 'offline', stderr_summary={})
+    assert result.process_state == 'cleanup_failed'
+    assert len(started) == 1 and identity(started[0]) is None
+    assert not guard.models_reaped()  # Persistent unknown intent is not falsely freed.
 
 
 @pytest.mark.parametrize('live_error', [True, False])

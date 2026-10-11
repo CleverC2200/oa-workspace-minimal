@@ -553,7 +553,7 @@ def _evidence_fingerprint(material: dict) -> str:
 
 
 @contextmanager
-def _exclusive_lock(path: Path):
+def _exclusive_lock(path: Path, *, blocking: bool = True):
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(
         path,
@@ -561,7 +561,7 @@ def _exclusive_lock(path: Path):
         0o600,
     )
     with os.fdopen(descriptor, "a+", encoding="utf-8") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
         try:
             yield
         finally:
@@ -3837,13 +3837,18 @@ class FlowEngine:
                 "write_authorization_invalid",
                 "codex_decision_invalid",
                 "codex_review_failed",
+                "codex_review_interrupted",
                 *writer_outcomes.CONFIRMED_NO_WRITE_CODES,
             }
             and action.get("write_state") == "not_requested"
             and state.get("write_state") == "not_requested"
         )
         authorization_failure = reason == "write_authorization_invalid"
-        review_failure = reason in {"codex_decision_invalid", "codex_review_failed"}
+        review_failure = reason in {"codex_decision_invalid", "codex_review_failed", "codex_review_interrupted"}
+        if reason == "codex_review_interrupted":
+            from . import review_interruption
+            if not review_interruption.trusted(attempt_root, state):
+                raise ValueError("recovery_not_safe")
         if review_failure:
             shared = (
                 "workflow_key",
@@ -4049,6 +4054,36 @@ class FlowEngine:
             raise
         recovery_receipt.finish(prepare_root, result_action=str(result.get("action") or ""))
         return result
+
+    def interrupt_unwritten_review(self, action_file: Path, *, run_id: str) -> bool:
+        """Revoke one closed run's prewrite review without changing OA pending."""
+        from . import review_interruption, approval_guard
+        from apps.oa_approval import runtime_control
+        action_path = Path(action_file)
+        if not approval_guard.maintenance_writer_idle():
+            raise ValueError("review_interruption_untrusted")
+        review_interruption.closed_run(run_id, action_path)
+        if not action_path.is_relative_to(self._root) or not _is_attempt_action_path(action_path, self._root):
+            raise ValueError("review_interruption_untrusted")
+        with _exclusive_lock(action_path.parent / "complete.lock", blocking=False):
+            state = _read_object(action_path.with_name("state.json"), code="review_interruption_untrusted")
+            if state.get("reason") == review_interruption.REASON:
+                if not review_interruption.trusted(action_path.parent, state):
+                    raise ValueError("review_interruption_untrusted")
+                return True
+            if state.get("action") != "review_required":
+                # Submitted, unknown, collecting and unrelated failures stay intact.
+                return False
+            if any(os.path.lexists(action_path.with_name(name)) for name in review_interruption.FORBIDDEN_WRITES):
+                raise ValueError("review_interruption_written_or_unknown")
+            action, state, _packet = self._open_attempt(action_path)
+            if (runtime_control.writer_active() or not self._attempt_identity_matches(action_path.parent, state, require_material=True)
+                    or state.get("write_state") not in {"authorized", "not_requested"}):
+                raise ValueError("review_interruption_untrusted")
+            fingerprint = review_interruption.record(action_path, state, run_id=run_id)
+            self._persist_attempt_needs_admin(action_path, review_interruption.REASON,
+                                             failure_details={"review_interruption_fingerprint": fingerprint})
+            return True
 
     def quarantine_review_failure(
         self,

@@ -245,6 +245,8 @@ def test_rolling_controller_prunes_only_expired_cache_entries_at_startup(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    from apps.oa_finance_preaudit import approval_guard
+    monkeypatch.setattr(approval_guard, "observe_project_errors", lambda _: None)
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe,
         "PROJECT_ROOT",
@@ -271,7 +273,7 @@ def test_rolling_controller_prunes_only_expired_cache_entries_at_startup(
         connection.commit()
 
     result = finance_preaudit_concurrency_probe.run_rolling_drain(
-        capacity=6,
+        capacity=3,
         live_status=lambda: {
             "credentials": {"status": "ok"},
             "oa": {

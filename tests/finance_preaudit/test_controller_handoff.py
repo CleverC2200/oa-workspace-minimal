@@ -11,8 +11,14 @@ import pytest
 
 from apps import json_artifact
 from apps.oa_approval import runtime_control
-from apps.oa_finance_preaudit import cli, controller_handoff, process_pool
+from apps.oa_finance_preaudit import approval_guard, cli, controller_handoff, process_pool
 from scripts import finance_preaudit_concurrency_probe
+
+
+@pytest.fixture(autouse=True)
+def local_official_history(tmp_path, monkeypatch):
+    monkeypatch.setattr(approval_guard, "observe_project_errors", lambda _: None)
+    monkeypatch.setattr(finance_preaudit_concurrency_probe, "PROJECT_ROOT", tmp_path)
 
 
 def _live_status(pending: int = 0) -> dict:
@@ -75,7 +81,7 @@ def test_completed_controller_run_publishes_sanitized_handoff_status(
     monkeypatch.setenv("OA_FINANCE_PREAUDIT_CACHE_DB", "0")
 
     result = finance_preaudit_concurrency_probe.run_rolling_drain(
-        capacity=6,
+        capacity=3,
         live_status=_live_status,
         reconcile_status=_reconciliation,
     )
@@ -164,12 +170,13 @@ def test_stale_running_manifest_blocks_a_new_controller(
         },
     )
 
-    with pytest.raises(ValueError, match="controller_handoff_untrusted"):
-        finance_preaudit_concurrency_probe.run_rolling_drain(
-            capacity=6,
-            live_status=_live_status,
-            reconcile_status=_reconciliation,
-        )
+    result = finance_preaudit_concurrency_probe.run_rolling_drain(
+        capacity=3,
+        live_status=_live_status,
+        reconcile_status=_reconciliation,
+    )
+    assert result["status"] == "blocked"
+    assert result["reason"] == "previous_run_ownership_unknown"
 
     assert runtime_control.controller_active() is False
     assert runtime_control.writer_active() is False
@@ -258,7 +265,7 @@ def _write_failed_unreaped_manifest(
     )
 
 
-def test_confirmed_stale_handoff_recovery_runs_only_after_live_gates(
+def test_confirmed_legacy_handoff_without_ownership_remains_blocked(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -280,17 +287,20 @@ def test_confirmed_stale_handoff_recovery_runs_only_after_live_gates(
     )
     runtime_control.request_cycle_stop()
 
+    def forbidden_live():
+        pytest.fail("missing ownership must block before live OA calls")
+
     result = finance_preaudit_concurrency_probe.run_rolling_drain(
-        capacity=6,
+        capacity=3,
         confirm_stale_children_reaped=True,
-        live_status=_live_status,
-        reconcile_status=_clear_reconciliation,
+        live_status=forbidden_live,
+        reconcile_status=forbidden_live,
     )
 
-    assert result["status"] == "completed"
-    assert result["recovered_cycle_stop"] is True
-    assert runtime_control.stop_requested() is False
-    assert controller_handoff.status()["children_reaped"] is True
+    assert result["status"] == "blocked"
+    assert result["reason"] == "previous_run_ownership_unknown"
+    assert runtime_control.stop_requested() is True
+    assert controller_handoff.status()["children_reaped"] is False
 
 
 def test_unconfirmed_stale_handoff_recovery_remains_blocked(
@@ -314,15 +324,13 @@ def test_unconfirmed_stale_handoff_recovery_remains_blocked(
     )
     runtime_control.request_cycle_stop()
 
-    with pytest.raises(
-        ValueError,
-        match="production_cycle_stop_recovery_blocked",
-    ):
-        finance_preaudit_concurrency_probe.run_rolling_drain(
-            capacity=6,
-            live_status=_live_status,
-            reconcile_status=_reconciliation,
-        )
+    result = finance_preaudit_concurrency_probe.run_rolling_drain(
+        capacity=3,
+        live_status=_live_status,
+        reconcile_status=_reconciliation,
+    )
+    assert result["status"] == "blocked"
+    assert result["reason"] == "previous_run_ownership_unknown"
 
     assert runtime_control.stop_requested() is True
     assert controller_handoff.status()["children_reaped"] is False
@@ -346,7 +354,7 @@ def test_confirmed_stale_handoff_recovery_rejects_when_not_required(
         match="production_cycle_stop_recovery_not_required",
     ):
         finance_preaudit_concurrency_probe.run_rolling_drain(
-            capacity=6,
+            capacity=3,
             confirm_stale_children_reaped=True,
             live_status=_live_status,
             reconcile_status=_clear_reconciliation,
@@ -433,21 +441,21 @@ def test_terminal_handoff_requires_a_fresh_controller_process(
     )
     monkeypatch.setenv("OA_FINANCE_PREAUDIT_CACHE_DB", "0")
     finance_preaudit_concurrency_probe.run_rolling_drain(
-        capacity=6,
+        capacity=3,
         live_status=_live_status,
         reconcile_status=_reconciliation,
     )
 
     with pytest.raises(ValueError, match="controller_handoff_untrusted"):
         finance_preaudit_concurrency_probe.run_rolling_drain(
-            capacity=6,
+            capacity=3,
             live_status=_live_status,
             reconcile_status=_reconciliation,
         )
 
     monkeypatch.setattr(controller_handoff, "CONTROLLER_INSTANCE_ID", "f" * 32)
     resumed = finance_preaudit_concurrency_probe.run_rolling_drain(
-        capacity=6,
+        capacity=3,
         live_status=_live_status,
         reconcile_status=_reconciliation,
     )

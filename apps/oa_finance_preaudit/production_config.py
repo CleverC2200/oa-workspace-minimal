@@ -12,7 +12,7 @@ REASONING_EFFORT = "medium"
 MODEL_PROVIDER = "openai"
 SERVICE_TIER = "default"
 INITIAL_CAPACITY = 3
-MAX_CAPACITY = 6
+MAX_CAPACITY = 3
 FINANCE_WORKFLOWS = (
     "travel_expense", "business_entertainment", "business_support_fee",
     "small_marketing_fee", "tpm_small_marketing_fee", "general_expense",
@@ -67,9 +67,9 @@ def _text_findings(text: str, source: str) -> list[str]:
     workflows = [arguments[index + 1] for index, value in enumerate(arguments[:-1]) if value == "--workflow"]
     if sorted(workflows) != sorted(FINANCE_WORKFLOWS) or arguments[-1:] == ["--workflow"]:
         findings.append(f"production_config_workflows_drift:{source}")
-    if arguments.count("--rolling") != 1 or arguments.count("--adaptive") != 1 or "--fixed-capacity" in arguments:
+    if arguments.count("--rolling") != 1 or arguments.count("--fixed-capacity") != 1 or "--adaptive" in arguments:
         findings.append(f"production_config_command_invalid:{source}")
-    expected_arguments = ["--rolling", "--adaptive", "--capacity", str(INITIAL_CAPACITY),
+    expected_arguments = ["--rolling", "--fixed-capacity", "--capacity", str(INITIAL_CAPACITY),
                           "--max-capacity", str(MAX_CAPACITY), "--confirm-write", "YES",
                           "--recover-confirmed-no-write-once", "YES"]
     for workflow in FINANCE_WORKFLOWS:

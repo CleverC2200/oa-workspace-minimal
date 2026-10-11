@@ -6,6 +6,7 @@ import sys
 from uuid import uuid4
 
 import pytest
+from apps.oa_approval import runtime_control
 
 from scripts.finance_preaudit_run import supervise
 
@@ -149,6 +150,8 @@ def test_supervisor_cancel_uses_controller_stop_and_waits(tmp_path, monkeypatch)
 
 def test_main_calls_original_entry_with_original_write_gate(tmp_path, monkeypatch):
     from scripts import finance_preaudit_run
+    monkeypatch.setattr(finance_preaudit_run.approval_lifecycle, 'startup', lambda _: {'status': 'ready'})
+    monkeypatch.setattr(finance_preaudit_run.approval_guard, 'observe_project_errors', lambda _: None)
     monkeypatch.setenv('OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE', str(tmp_path / 'rolling.lock'))
     # No write confirmation: the real original entry rejects before any OA work.
     assert finance_preaudit_run.main(['--owner-task-id', str(uuid4()), '--']) == 1
@@ -179,8 +182,29 @@ def test_stop_failure_does_not_abandon_child(tmp_path, monkeypatch):
     assert receipt['result'] == 'blocked'
 
 
+def test_official_stop_sets_bounded_readback_without_killing_pending_controller(tmp_path, monkeypatch):
+    from scripts import finance_preaudit_run
+    from apps.oa_finance_preaudit import approval_guard
+    real = finance_preaudit_run.subprocess.Popen
+    pids = []
+    def synthetic(_command, **kwargs):
+        child = real([sys.executable, '-c', 'import time;time.sleep(.8)'], **kwargs)
+        pids.append(child.pid)
+        return child
+    monkeypatch.setattr(finance_preaudit_run.subprocess, 'Popen', synthetic)
+    monkeypatch.setattr(finance_preaudit_run, 'STOP_GRACE_SECONDS', .05)
+    monkeypatch.setattr(runtime_control, 'controller_owner_pid', lambda: pids[0] if pids else None)
+    monkeypatch.setattr(approval_guard, 'observe_project_errors', lambda _: approval_guard.record_notice('usage_limit', 'official-main'))
+    receipt = finance_preaudit_run.supervise([sys.executable, '-m', 'scripts.finance_preaudit_concurrency_probe'],
+        directory=tmp_path / uuid4().hex, owner_task_id=str(uuid4()))
+    assert receipt['stop_wait_error'] == 'controller_stop_timeout'
+    assert receipt['exit_code'] == 0 and receipt['result'] == 'blocked'
+    assert runtime_control.stop_reason() == approval_guard.STOP_REASON
+
+
 def test_main_loads_control_paths_before_selecting_evidence_directory(tmp_path, monkeypatch):
     from scripts import finance_preaudit_run
+    monkeypatch.setattr(finance_preaudit_run.approval_lifecycle, 'startup', lambda _: {'status': 'ready'})
     monkeypatch.setattr(finance_preaudit_run.auth, 'load_local_env', lambda: monkeypatch.setenv(
         'OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE', str(tmp_path / 'configured.lock')))
     captured = []
@@ -203,6 +227,35 @@ def test_concurrent_start_race_preserves_original_verified_skip(tmp_path, truste
     assert receipt['result'] == ('skipped' if trusted else 'blocked')
     assert receipt['children_reaped'] == 'unknown'  # Other controller remains owned by its original caller.
     assert receipt['run_id'] is None
+
+
+@pytest.mark.parametrize('reason', ['previous_run_busy', 'approval_model_cooldown'])
+def test_verified_startup_skip_stays_terminal_when_live_gate_changes(tmp_path, monkeypatch, reason):
+    from scripts import finance_preaudit_run as runner
+    monkeypatch.setenv('OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE', str(tmp_path / 'rolling.lock'))
+    payload = {'kind': 'approval_startup_gate', 'status': 'skipped', 'reason': reason}
+    if reason == 'approval_model_cooldown':
+        payload['blocked_until'] = 10000
+        monkeypatch.setattr(runner.approval_guard, 'cooldown', lambda: {'blocked_until': 10000})
+    else:
+        payload['run_id'] = 'a' * 32
+        monkeypatch.setattr(runner.controller_handoff, '_read_manifest', lambda: {'run_id': 'a' * 32, 'controller_pid': 123})
+        monkeypatch.setattr(runner.approval_lifecycle, '_progress', lambda _: {'controller': {'pid': 123}})
+        monkeypatch.setattr(runtime_control, 'controller_active', lambda: True)
+        monkeypatch.setattr(runtime_control, 'controller_owner_pid', lambda: 123)
+        monkeypatch.setattr(runner.approval_guard, 'process_identity', lambda _: {'pid': 123})
+    owner = str(uuid4()); directory = tmp_path / 'executions' / uuid4().hex
+    receipt = runner.supervise([sys.executable, '-c', 'print(' + repr(json.dumps(payload)) + ')'],
+                               directory=directory, owner_task_id=owner)
+    assert receipt['result'] == 'skipped'
+    monkeypatch.setattr(runner, '_verified_skip', lambda _: pytest.fail('historical skip must not read live gates'))
+    options = {'owner_task_id': owner, 'invocation_id': directory.name}
+    report = runner.read_execution(directory / 'execution.json', **options)
+    assert report['status'] == 'skipped' and report['terminal'] is True
+    saved = json.loads((directory / 'execution.json').read_text())
+    saved['skip_verification']['stdout_sha256'] = '0' * 64
+    runtime_control.write_control_bytes_atomic(directory / 'execution.json', json.dumps(saved).encode())
+    assert runner.read_execution(directory / 'execution.json', **options)['terminal'] is False
 
 
 def test_skipped_stdout_cannot_override_corrupt_existing_mirror(tmp_path):
