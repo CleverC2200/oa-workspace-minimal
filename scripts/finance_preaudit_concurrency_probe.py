@@ -2451,7 +2451,7 @@ def _run_dispatched_tasks(
         if futures and runtime_control.stop_reason() == "codex_review_technical_failure":
             # Workers already observe the gate; retain their failure receipts
             # before forcibly reaping only the read-only review pool.
-            wait(tuple(futures), timeout=2)
+            wait(tuple(futures), timeout=codex_review_worker.OBSERVATION_INTERVAL_SECONDS + 1)
         harvest_stopped_reviews(
             {future for future in futures if future.done()}
         )

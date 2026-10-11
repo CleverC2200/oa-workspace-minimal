@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import codecs
 from contextlib import ExitStack, contextmanager, nullcontext
 import json
 import math
@@ -27,6 +28,7 @@ from .review_output import parse_json as _parse_decision_json
 
 MODEL = review_failure_evidence.MODEL
 REASONING_EFFORT = review_failure_evidence.REASONING_EFFORT
+OBSERVATION_INTERVAL_SECONDS = 5
 _NATIVE_RECEIPT_MAX_BYTES = 32 * 1024 * 1024
 _NATIVE_RECEIPT_HEADER_MAX_BYTES = 1024 * 1024
 _FINANCE_RULES = {
@@ -80,6 +82,8 @@ _SANITIZED_EVENT_TYPES = _EVENT_TYPES | {
     "retry_signal",
     "transport_signal",
     "payload_too_large_signal",
+    "usage_limit_signal",
+    "model_access_signal",
 }
 _COMPLETION_FAILURE_CODES = writer_outcomes.FAILURE_CODES | {
     "writer_result_unknown",
@@ -1202,22 +1206,35 @@ def _execute_codex_raw(
         errors = process.stderr
         process.stderr = None  # The bounded reader owns this pipe, not communicate().
         stderr_failed: list[bool] = []
+        fatal_stderr = threading.Event()
+
+        def observe_stderr(signals: set[str]) -> None:
+            if signals & {"usage_limit_signal", "model_access_signal"}:
+                fatal_stderr.set()
 
         def collect_stderr() -> None:
             try:
                 with errors:
-                    if audit_directory:
-                        with (temporary_root / "stderr.log").open("x", encoding="utf-8") as raw:
-                            class RetainedStderr:
-                                def read(self, size):
-                                    chunk = errors.read(size)
-                                    raw.write(chunk)
-                                    return chunk
-                            stderr_summary.update(process_diagnostics.stderr_summary(RetainedStderr()))
+                    with ((temporary_root / "stderr.log").open("x", encoding="utf-8")
+                          if audit_directory else nullcontext()) as raw:
+                        class AvailableStderr:
+                            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+                            def read(self, size):
+                                # read1 returns a short warning while the CLI is still alive.
+                                while True:
+                                    data = errors.buffer.read1(size)
+                                    chunk = self.decoder.decode(data, final=not data)
+                                    if chunk or not data:
+                                        if raw is not None:
+                                            raw.write(chunk)
+                                        return chunk
+
+                        stderr_summary.update(process_diagnostics.stderr_summary(
+                            AvailableStderr(), on_signals=observe_stderr))
+                        if raw is not None:
                             raw.flush()
                             os.fsync(raw.fileno())
-                    else:
-                        stderr_summary.update(process_diagnostics.stderr_summary(errors))
             except (OSError, ValueError):
                 stderr_failed.append(True)
 
@@ -1246,26 +1263,30 @@ def _execute_codex_raw(
             nonlocal offset, pending
             # pread does not move the offset shared with the child's stdout.
             output.flush()
-            chunk = os.pread(output.fileno(), 512 * 1024, offset)
-            offset += len(chunk)
-            pending += chunk
-            lines = pending.split(b"\n")
-            pending = lines.pop()
-            if finished.is_set() and not chunk and pending:
-                lines.append(pending)
-                pending = b""
-            for line in lines:
-                if not line.strip():
-                    continue
-                try:
-                    event = json.loads(line)
-                except (ValueError, UnicodeError):
+            snapshot_size = os.fstat(output.fileno()).st_size
+            while offset < snapshot_size or (finished.is_set() and pending):
+                chunk = os.pread(output.fileno(), min(512 * 1024, snapshot_size - offset), offset)
+                if not chunk and offset < snapshot_size:
                     return True
-                if not isinstance(event, dict):
+                offset += len(chunk)
+                pending += chunk
+                lines = pending.split(b"\n")
+                pending = lines.pop()
+                if finished.is_set() and offset == snapshot_size and pending:
+                    lines.append(pending)
+                    pending = b""
+                for line in lines:
+                    if not line.strip():
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except (ValueError, UnicodeError):
+                        return True
+                    if not isinstance(event, dict) or process_diagnostics.error_envelope(event) is not None:
+                        return True
+                if len(pending) > _NATIVE_RECEIPT_MAX_BYTES:
                     return True
-                if event.get("type") in {"error", "turn.failed", "thread.failed"}:
-                    return True
-            return len(pending) > _NATIVE_RECEIPT_MAX_BYTES
+            return fatal_stderr.is_set()
 
         try:
             if read_only:
@@ -1285,7 +1306,7 @@ def _execute_codex_raw(
                         break
                     if finished.is_set() and offset >= os.fstat(output.fileno()).st_size:
                         break
-                    finished.wait(0.1)
+                    finished.wait(OBSERVATION_INTERVAL_SECONDS)
             communicator.join(timeout=1)
             if communication_errors:
                 raise communication_errors[0]
@@ -1344,6 +1365,14 @@ def _execute_codex_raw(
                 except (OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error):
                     stderr_summary["tool_receipt_files"] = []
                     stderr_summary["tool_receipt_unavailable"] = True
+
+        if not read_only and fatal_stderr.is_set() and not live_failure:
+            # A fast CLI exit can precede the stderr reader's final classification.
+            live_failure = True
+            try:
+                _request_review_stop(action_file, "codex_process_failed")
+            except (OSError, RuntimeError, ValueError):
+                stop_error = "codex_review_stop_failed"
 
         usage = _parse_token_usage(output)
         event_counts = _parse_event_counts(output)

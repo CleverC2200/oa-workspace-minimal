@@ -295,7 +295,7 @@ def test_raw_malformed_output_fails_without_handoff(
     class Process:
         pid = 123456
         returncode = 0
-        stderr = io.StringIO()
+        stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
         def communicate(self, **kwargs):
             pass
         def poll(self):

@@ -160,7 +160,7 @@ def _mock_final_output(monkeypatch, raw):
         returncode = 0
 
         def __init__(self):
-            self.stderr = io.StringIO()
+            self.stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
 
         def communicate(self, **kwargs):
             prompts.append(kwargs["input"])
@@ -1270,7 +1270,7 @@ def test_execute_codex_normalizes_small_marketing_transport_schema(
     class Process:
         pid = 12345
         returncode = 0
-        stderr = io.StringIO()
+        stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
 
         def __init__(self, command: list[str]) -> None:
             self.decision_file = Path(
@@ -1413,7 +1413,7 @@ def test_codex_start_blocks_sigterm_until_process_group_is_registered(
     class Process:
         pid = 12345
         returncode = 1
-        stderr = io.StringIO()
+        stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
 
         def communicate(self, *, input: str, timeout: int) -> None:
             del input, timeout
@@ -1471,7 +1471,7 @@ def test_codex_process_receives_only_reviewer_runtime_environment(
     class Process:
         pid = 12345
         returncode = 1
-        stderr = io.StringIO()
+        stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
 
         def communicate(self, *, input: str, timeout: int) -> None:
             del input, timeout
@@ -2492,7 +2492,7 @@ def test_process_receives_bound_token_schema(tmp_path: Path, monkeypatch, read_o
     class Process:
         pid = 12345
         returncode = 1
-        stderr = io.StringIO()
+        stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
 
         def communicate(self, *, input: str, timeout: int) -> None:
             expected = "capacity-probe" if read_only else "test-action-token"

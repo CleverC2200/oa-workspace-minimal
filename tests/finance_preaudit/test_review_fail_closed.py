@@ -139,6 +139,7 @@ def test_stop_wait_timeout_preserves_actual_exit_and_reports_blocked(tmp_path, m
 @pytest.mark.parametrize('event', [
     {'type': 'error', 'message': 'model unavailable'},
     {'type': 'turn.failed', 'error': {'message': 'server overloaded'}},
+    {'type': 'item.completed', 'item': {'type': 'error', 'message': 'usage limit exceeded'}},
 ])
 def test_live_error_stops_hanging_cli_before_total_timeout(tmp_path, monkeypatch, event):
     task, action = _task(tmp_path)
@@ -151,7 +152,7 @@ def test_live_error_stops_hanging_cli_before_total_timeout(tmp_path, monkeypatch
     ])
     started = time.monotonic()
     result = worker.review(task)
-    assert time.monotonic() - started < 4
+    assert time.monotonic() - started < 8
     assert result['error_code'] == 'codex_process_failed'
     assert runtime_control.stop_requested()
     assert result['process_attempts'] == 1
@@ -173,11 +174,79 @@ def test_other_worker_stop_interrupts_live_cli(tmp_path, monkeypatch):
     try:
         started = time.monotonic()
         result = worker.review(task)
-        assert time.monotonic() - started < 4
+        assert time.monotonic() - started < 8
         assert result['error_code'] == 'stop_requested'
         assert result['process_attempts'] == 1
     finally:
         stopper.join()
+
+
+@pytest.mark.parametrize('channel', ['stdout', 'stderr', 'curly_stderr', 'split_stderr', 'backlogged_stdout'])
+def test_first_usage_warning_stops_before_ten_second_retry(tmp_path, monkeypatch, channel):
+    task, _ = _task(tmp_path)
+    retry = tmp_path / 'retry-started'
+    child_pid = tmp_path / 'model-pid'
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+    warning = "You've hit your usage limit. Try again later."
+    event = json.dumps({'type': 'error', 'message': warning})
+    if channel == 'stdout':
+        emit = f'print({event!r}, flush=True); '
+    elif channel in {'stderr', 'curly_stderr'}:
+        text = warning.replace("'", '\u2019') if channel == 'curly_stderr' else warning
+        emit = f'print({text!r}, file=sys.stderr, end="", flush=True); '
+    elif channel == 'split_stderr':
+        emit = ('sys.stderr.write("You\\\'ve hit your usage "); sys.stderr.flush(); '
+                'time.sleep(.1); sys.stderr.write("limit. Try again later."); sys.stderr.flush(); ')
+    else:
+        # Error lies beyond the old 512 KiB one-poll read limit.
+        progress = json.dumps({'type': 'item.completed', 'item': {'type': 'command_execution',
+                                                                    'aggregated_output': 'x' * 1024}})
+        emit = f'sys.stdout.write(({progress!r} + "\\n") * 1600); print({event!r}, flush=True); '
+    script = ('import os,sys,time; from pathlib import Path; sys.stdin.read(); '
+              f'Path({str(child_pid)!r}).write_text(str(os.getpid())); ' + emit +
+              f'time.sleep(10); Path({str(retry)!r}).write_text("retry"); time.sleep(10)')
+    monkeypatch.setattr(worker, '_codex_command', lambda *args, **kwargs: [sys.executable, '-c', script])
+    started = time.monotonic()
+    result = worker.review(task)
+    assert worker.OBSERVATION_INTERVAL_SECONDS == 5
+    assert time.monotonic() - started < 8
+    assert result['error_code'] == 'codex_process_failed'
+    assert result['process_attempts'] == 1
+    assert result['process_retries'] == 0
+    assert runtime_control.stop_requested()
+    assert not retry.exists()
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(child_pid.read_text()), 0)
+    diagnostic = next(Path(task['action_file']).parent.glob('review-process-*.json')).read_text()
+    assert warning not in diagnostic
+    assert 'usage_limit_signal' in diagnostic
+
+
+def test_quota_warning_classified_after_fast_exit_still_blocks_decision(tmp_path, monkeypatch):
+    task, _ = _task(tmp_path)
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+    original_summary = worker.process_diagnostics.stderr_summary
+
+    def delayed_summary(stream, **kwargs):
+        if 'on_signals' in kwargs:
+            time.sleep(.3)
+        return original_summary(stream, **kwargs)
+
+    monkeypatch.setattr(worker.process_diagnostics, 'stderr_summary', delayed_summary)
+
+    def command(root, schema, decision, **kwargs):
+        return [sys.executable, '-c',
+                'import sys,json; from pathlib import Path; sys.stdin.read(); '
+                f'Path({str(decision)!r}).write_text(json.dumps({{"overall":"pass"}})); '
+                'print(json.dumps({"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}), flush=True); '
+                'print("usage limit exceeded", file=sys.stderr, flush=True)']
+
+    monkeypatch.setattr(worker, '_codex_command', command)
+    result = worker.review(task)
+    assert result['status'] == 'failed'
+    assert result['error_code'] == 'codex_process_failed'
+    assert result['process_retries'] == 0
+    assert runtime_control.stop_requested()
 
 
 @pytest.mark.parametrize('live_error', [True, False])
@@ -213,7 +282,9 @@ def test_normal_progress_is_not_mistaken_for_model_failure(tmp_path, monkeypatch
     def command(root, schema, decision, **kwargs):
         return [sys.executable, '-c',
                 'import sys,json,time; from pathlib import Path; sys.stdin.read(); '
-                'print(json.dumps({"type":"turn.started"}), flush=True); time.sleep(.2); '
+                'print(json.dumps({"type":"turn.started"}), flush=True); '
+                'print(json.dumps({"type":"item.completed","item":{"type":"command_execution",'
+                '"aggregated_output":"usage limit exceeded model unavailable"}}), flush=True); time.sleep(.2); '
                 f'Path({str(decision)!r}).write_text(json.dumps({{"overall":"pass"}})); '
                 'print(json.dumps({"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}), flush=True)']
 

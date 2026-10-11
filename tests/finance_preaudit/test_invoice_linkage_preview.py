@@ -152,7 +152,7 @@ def test_actual_worker_prompt_distinguishes_oa_link_from_upload(
     class Process:
         pid = 12345
         returncode = 0
-        stderr = io.StringIO()
+        stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
 
         def communicate(self, *, input, timeout):
             prompts.append(input)
