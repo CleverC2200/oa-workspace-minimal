@@ -57,3 +57,19 @@ python -m apps.oa_finance_preaudit.production_release \
 当前身份、OA/web 认证、授权、其他冻结材料、Controller/Writer 空闲和配置门禁保持。仅源码维护允许保留已验证的历史采集取消：`material_collection_failed`、`failure_detail_code=oa_run_stopped`，完整且验证通过的 controller-scope manual receipt，write_state=not_requested，无 Writer、执行、意见、提交产物及冻结材料。不要求原 progress 登记，也不据时间相近推断属于原轮；回执将 `historical_stopped_actions` 与原 `actions` 分列，并标明 `historical_stop_attribution=not_verified`。只有这些取消造成的 `pending_failure_not_isolated` 可以留作源码维护例外；数量须与当前待办隔离及 continuation 相符。其他 controller 失败、未知写入或对账阻断仍拒绝。程序不改变原 continuation、失败 state、隔离回执或 attempt，也不把取消列入单据隔离白名单。
 
 成功回执增加 `supervisor_loss_source_only=true`、`original_wait_verified=false`、`approval_recovery_allowed=false`、`original_evidence_preserved=true`。原 exit_code 仍为 null，原 execution 仍非 terminal，业务 continuation 仍可 blocked。源码同步不闭合原执行，也不解除历史业务阻断。末尾留证无法验证时 `original_evidence_preserved=unknown`，同时保留源码是否已经更新的真实状态。恢复审批需要独立授权和独立恢复合同，不能使用本源码维护回执代替。
+
+## 官方冷却停止后仅同步源码
+
+已明确授权保留官方停止门安装修复源码时，在停机维护参数之外追加：
+
+```bash
+  --official-stop-source-only YES
+```
+
+该参数必须与 `--stopped-maintenance YES` 同时使用，不能与失去监督模式并用。普通发布和原技术停机模式仍拒绝官方停止门。本模式只接受精确 `stop_requested:codex_official_error_cooldown`，原 `oa-skill` 必须 PAUSED。冷却无需提前到期，因为维护不调用模型、不提交 OA；本模式不清门、不更新冷却、不恢复审批资格。
+
+目标自己的原回执读取器必须核验真实 exited 终态、原工具 session、非零退出码、同轮 failed manifest 和 children_reaped。原监督者、controller、登记只读 worker/pool 及全局模型槽位须已退出；closed 槽位仍核验实际 PID 和进程组，启动意图或归属未知拒绝。现有关闭只读证明须绑定同轮 progress、控制器身份、项目根和精确官方冷却记录；当前中断单据必须经目标现有 `item_failure.isolated` 校验，同轮且可信未写入。停止门、原 cron 与冷却文件固定 inode、权限和字节哈希；原 execution、tool-session、manifest、日志、progress、worker/pool、模型槽位、关闭证明、首错文件及同轮 action/state/中断回执的身份和哈希在同步前后必须一致，同内容替换也阻断。
+
+旧版对账可能计入 `isolated_pending`，但未将可信中断计入 `pending_quarantined`。仅源码维护允许逐项解释这一缺口：当前完整只读对账必须 ready/item、blocking_reasons 为空，隔离计数差值必须精确等于本次新鲜输入证明中、同轮待办且经目标现有校验器确认未计入隔离的中断数。原 status 文件及 continuation 不改写。其他计数差异、缺失中断证明、身份冲突、Writer 产物、未知写入和业务阻断仍拒绝；当前身份、认证、授权、冻结、Controller/Writer 租约及发布配置门保持。
+
+成功回执增加 `official_stop_source_only=true`、`original_wait_verified=true`、`cooldown_preserved=true`、`original_evidence_preserved=true`、`approval_recovery_allowed=false` 和同步前完整 `pre_sync_status_file` 引用。源码安装后重新从目标生成完整只读状态和输入证明，不复用升级前的计数解释。`next_process_ready=false`、`write_state=not_requested`、`production_acceptance=not_verified` 保持；只有冷却到期后的独立恢复门禁和新进程验收才可证明审批恢复。同步后校验失败仍报告真实源码更新状态，停止门或冷却留证失信时明确未保留或 unknown，不自动重试、回滚或启动审批。
