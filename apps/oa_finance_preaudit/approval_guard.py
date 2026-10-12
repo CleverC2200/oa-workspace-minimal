@@ -148,8 +148,8 @@ def record_notice(code: str, source: str, *, occurred_at: float | None = None,
                 runtime_control._write_stop_locked(STOP_REASON)
 
 
-def observe_project_errors(project_root: Path) -> None:
-    """Read official terminal errors conservatively across this OA project.
+def project_official_errors(project_root: Path) -> Iterator[tuple[str, str, float]]:
+    """Read recognized official terminal notices without recording or stopping.
 
     Cwd is an error-scope filter, not proof that a process belongs to approvals.
     No prompts, titles, credentials or generic log bodies are read.
@@ -171,8 +171,16 @@ def observe_project_errors(project_root: Path) -> None:
             error = json.loads(raw)
             code = notice_code(error)
             if code:
-                record_notice(code, f"main:{thread}:{turn}", occurred_at=stamp)
+                yield code, f"main:{thread}:{turn}", stamp
     except (sqlite3.Error, OSError, ValueError, TypeError) as error:
+        raise ValueError("approval_official_history_unavailable") from error
+
+
+def observe_project_errors(project_root: Path) -> None:
+    try:
+        for code, source, stamp in project_official_errors(project_root):
+            record_notice(code, source, occurred_at=stamp)
+    except (OSError, ValueError, TypeError) as error:
         raise ValueError("approval_official_history_unavailable") from error
 
 

@@ -90,6 +90,20 @@ def test_unreadable_official_history_blocks_before_any_launch(tmp_path, monkeypa
         lifecycle.startup(tmp_path)
 
 
+def test_first_official_notice_stops_before_later_damaged_history(tmp_path, monkeypatch):
+    now = time.time()
+    home, root = tmp_path / "codex", tmp_path / "project"
+    official_history(home, root, [
+        ("oa", "first", json.dumps({"codexErrorInfo": "usageLimitExceeded"}), now - 120, "failed"),
+        ("oa", "damaged", "invalid json", now, "failed"),
+    ])
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    with pytest.raises(ValueError, match="approval_official_history_unavailable"):
+        guard.observe_project_errors(root)
+    assert guard.cooldown()["triggered_at"] == now - 120
+    assert runtime_control.stop_reason() == guard.STOP_REASON
+
+
 def test_three_durable_global_slots_and_unknown_launch_not_reused(tmp_path):
     action = tmp_path / "action.json"
     action.write_text("{}")
