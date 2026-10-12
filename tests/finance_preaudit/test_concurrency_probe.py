@@ -158,6 +158,15 @@ def _open_action(
     return action_file
 
 
+def _rejected_decision_result(reviewed: dict) -> dict:
+    return {
+        **codex_review_worker._base_result(attempts=reviewed["process_attempts"], usages=[reviewed["token_usage"]]),
+        "codex_events": reviewed["codex_events"], "status": "retry_required",
+        "execution_state": "review_required", "business_state": "not_available",
+        "write_state": "not_requested", "error_code": "codex_decision_invalid",
+    }
+
+
 def _quarantined_action(
     root: Path,
     *,
@@ -3064,6 +3073,44 @@ def test_rolling_drain_routes_recoveries_through_the_isolated_prepare_stage(
     assert result["quarantined_pending"] == 2
 
 
+def test_hourly_recovery_option_keeps_new_failures_deferred(tmp_path, monkeypatch):
+    from apps.oa_finance_preaudit import case_recovery, production_write
+
+    probe = finance_preaudit_concurrency_probe
+    monkeypatch.setattr(probe, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(case_recovery, "select_once", lambda *args: ())
+    monkeypatch.setattr(production_write, "_authorized_workflows", lambda *args: probe.ROLLING_WORKFLOW_KEYS)
+    pending = [2]
+    calls = []
+
+    def pipeline(count, capacity, *, defer_review_failures=True, **kwargs):
+        calls.append((count, capacity, defer_review_failures))
+        pending[0] = 1
+        return process_pool.PoolResult(
+            requested=2, started=2, completed=2, failed=0, timed_out=0, stopped=0,
+            peak_active=1, elapsed_seconds=1,
+            outcomes=(
+                process_pool.TaskOutcome(index=0, status="completed", value={
+                    "status": "retry_pending", "error_code": "codex_review_retry_pending",
+                    "write_state": "authorized", "token_usage": {"status": "unknown"}}),
+                process_pool.TaskOutcome(index=1, status="completed", value={
+                    "status": "completed", "write_state": "submitted", "token_usage": {"status": "unknown"}}),
+            ),
+        )
+
+    monkeypatch.setattr(probe, "_run_global_dispatched_tasks", pipeline)
+    result = probe.run_rolling_drain(
+        capacity=3, max_capacity=3, authorized_recovery_once=True, pipeline_runner=pipeline,
+        live_status=lambda: {"credentials": {"status": "ok"}, "oa": {
+            "execution_identity": "verified", "by_workflow": {"travel_expense": pending[0]}}},
+        reconcile_status=lambda: _reconciliation_snapshot(pending[0]),
+    )
+    assert calls == [(2, 3, True)]
+    assert result["completed"] == 2
+    assert result["error_counts"] == {"codex_review_retry_pending": 1}
+    assert result["stop_reason"] == "review_retry_pending"
+
+
 def test_elastic_health_window_does_not_cap_claims() -> None:
     pending = iter([36, 0, 0])
     current_pending = [0]
@@ -3469,21 +3516,6 @@ def test_rolling_failure_retains_internal_host_critical_decision() -> None:
             "maximum_oldest_task_seconds": 8.0,
         }
     ]
-
-
-def test_review_failure_circuit_breaker_threshold_is_bounded() -> None:
-    """连续单据级审核失败达到阈值即停止本轮领取,阈值以内继续处理。"""
-    probe = finance_preaudit_concurrency_probe
-    threshold = probe.REVIEW_FAILURE_CIRCUIT_BREAKER
-
-    assert threshold >= 2
-    assert probe._review_failure_streak_reached(0) is False
-    assert probe._review_failure_streak_reached(threshold - 1) is False
-    assert probe._review_failure_streak_reached(threshold) is True
-    assert probe._review_failure_streak_reached(threshold + 1) is True
-    assert probe.REVIEW_FAILURE_CIRCUIT_BREAKER_ERROR == (
-        "review_failure_circuit_breaker"
-    )
 
 
 def test_rolling_wave_preserves_transient_codex_error_counts() -> None:
@@ -5536,7 +5568,7 @@ def test_dispatcher_prepare_timeout_reclaims_owned_child_process_group(
     assert diagnostic["sample"]["stack"]
 
 
-def test_dispatcher_retries_one_prewrite_invalid_decision_with_merged_usage(
+def test_dispatcher_defers_prewrite_invalid_decision_without_extra_usage(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -5591,11 +5623,7 @@ def test_dispatcher_retries_one_prewrite_invalid_decision_with_merged_usage(
         attempts = reviewed["process_attempts"]
         completion_attempts.append(attempts)
         if attempts == 1:
-            return {
-                **reviewed,
-                "status": "retry_required",
-                "error_code": "codex_decision_invalid",
-            }
+            return _rejected_decision_result(reviewed)
         return {
             **reviewed,
             "status": "completed",
@@ -5611,41 +5639,45 @@ def test_dispatcher_retries_one_prewrite_invalid_decision_with_merged_usage(
         renew_actions=lambda paths: paths,
         review_worker=review,
         complete_review=complete,
+        record_failure_round=lambda *_args: {"production_failure_round": 1},
         executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
         runtime_status=lambda: {"status": "healthy"},
     )
 
     value = result.outcomes[0].value
     assert result.completed == 1
-    assert review_calls == [1, 2]
-    assert completion_attempts == [1, 2]
-    assert value["process_attempts"] == 2
-    assert value["process_retries"] == 1
+    assert review_calls == [1]
+    assert completion_attempts == [1]
+    assert value["status"] == "retry_pending"
+    assert value["process_attempts"] == 1
+    assert value["process_retries"] == 0
     assert value["token_usage"] == {
         "status": "recorded",
-        "input_tokens": 30,
-        "cached_input_tokens": 3,
-        "output_tokens": 6,
-        "total_tokens": 36,
+        "input_tokens": 10,
+        "cached_input_tokens": 1,
+        "output_tokens": 2,
+        "total_tokens": 12,
     }
     assert value["codex_events"] == {
         "status": "recorded",
-        "attempts": 2,
-        "recorded_attempts": 2,
+        "attempts": 1,
+        "recorded_attempts": 1,
         "unknown_attempts": 0,
-        "counts": {"turn.completed": 2},
+        "counts": {"turn.completed": 1},
     }
     assert stop_requests == []
 
 
-def test_timeout_is_quarantined_but_still_stops_pipeline(tmp_path: Path, monkeypatch) -> None:
+def test_isolated_timeout_does_not_stop_next_item(tmp_path: Path, monkeypatch) -> None:
     from apps.oa_finance_preaudit import codex_review_worker as worker
 
     stopped, quarantined, submitted = [], [], []
     monkeypatch.setattr(finance_preaudit_concurrency_probe.runtime_control, "stop_requested", lambda: False)
     monkeypatch.setattr(finance_preaudit_concurrency_probe.runtime_control, "request_stop", lambda: stopped.append(True))
-    _open_action(tmp_path / "runtime" / "finance_preaudit_flows",
-                 case_key="8" * 64, created_at="2026-08-24T12:00:00+00:00")
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    first = _open_action(flow_root, case_key="8" * 64, created_at="2026-08-24T12:00:00+00:00")
+    second = _open_action(flow_root, case_key="9" * 64, created_at="2026-08-24T12:00:01+00:00")
+    reviews = []
     value = {
         **worker._base_result(attempts=1, usages=[{"status": "unknown"}]),
         "codex_events": worker._unknown_events(1), "status": "failed",
@@ -5659,18 +5691,29 @@ def test_timeout_is_quarantined_but_still_stops_pipeline(tmp_path: Path, monkeyp
                 "business_state": "not_available", "write_state": "not_requested",
                 "reason": "codex_review_failed"}
 
+    def review(task):
+        action = Path(task["action_file"])
+        reviews.append(action)
+        return value if action == first else {"status": "reviewed", "decision": {"overall": "pass"}}
+
+    def complete(action, reviewed):
+        submitted.append(action)
+        return {**reviewed, "status": "completed", "write_state": "submitted", "error_code": None}
+
     result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
-        1, 1, project_root=tmp_path, renew_actions=lambda paths: paths,
-        review_worker=lambda task: value,
-        complete_review=lambda *args: submitted.append(True),
+        2, 1, project_root=tmp_path, renew_actions=lambda paths: paths,
+        review_worker=review, complete_review=complete,
         quarantine_review=quarantine,
         executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
         runtime_status=lambda: {"status": "healthy"},
     )
     assert quarantined == ["codex_process_timeout"]
-    assert stopped and submitted == []
+    assert stopped == [] and submitted == [second]
+    assert reviews == [first, second]
     assert result.outcomes[0].value["execution_state"] == "needs_admin"
-    assert result.outcomes[0].value["status"] == "failed"
+    assert result.outcomes[0].value["status"] == "quarantined"
+    assert result.outcomes[0].value["write_state"] == "not_requested"
+    assert result.outcomes[1].value["status"] == "completed"
 
 
 def test_rolling_timeout_keeps_token_usage_unknown() -> None:
@@ -5695,7 +5738,7 @@ def test_rolling_timeout_keeps_token_usage_unknown() -> None:
     assert result["token_usage"]["status"] == "unknown"
 
 
-def test_dispatcher_quarantines_second_prewrite_invalid_decision(
+def test_dispatcher_isolates_invalid_decision_without_failure_recorder(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -5740,13 +5783,7 @@ def test_dispatcher_quarantines_second_prewrite_invalid_decision(
 
     def complete(_action: Path, reviewed: dict) -> dict:
         completion_calls.append(True)
-        return {
-            **reviewed,
-            "status": "retry_required",
-            "business_state": "not_available",
-            "write_state": "not_requested",
-            "error_code": "codex_decision_invalid",
-        }
+        return _rejected_decision_result(reviewed)
 
     def quarantine(action_file: Path, reason: str) -> dict:
         assert reason == "codex_decision_invalid"
@@ -5772,14 +5809,14 @@ def test_dispatcher_quarantines_second_prewrite_invalid_decision(
     )
 
     value = result.outcomes[0].value
-    assert review_calls == [True, True]
-    assert completion_calls == [True, True]
+    assert review_calls == [True]
+    assert completion_calls == [True]
     assert len(quarantine_calls) == 1
     assert value["status"] == "quarantined"
     assert value["write_state"] == "not_requested"
     assert value["error_code"] == "codex_decision_invalid"
-    assert value["process_attempts"] == 2
-    assert value["process_retries"] == 1
+    assert value["process_attempts"] == 1
+    assert value["process_retries"] == 0
     assert stop_requests == []
 
 
@@ -5849,7 +5886,7 @@ def test_dispatcher_quarantines_malformed_review_without_writing(
     assert stop_requests == []
 
 
-def test_dispatcher_preserves_retry_history_when_retry_is_malformed(
+def test_dispatcher_never_calls_second_review_after_writer_rejection(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -5900,11 +5937,7 @@ def test_dispatcher_preserves_retry_history_when_retry_is_malformed(
 
     def complete(_action_file: Path, value: dict) -> dict:
         completion_calls.append(True)
-        return {
-            **value,
-            "status": "retry_required",
-            "error_code": "codex_decision_invalid",
-        }
+        return _rejected_decision_result(value)
 
     def quarantine(_action_file: Path, reason: str) -> dict:
         quarantine_calls.append(reason)
@@ -5929,7 +5962,7 @@ def test_dispatcher_preserves_retry_history_when_retry_is_malformed(
     )
 
     value = result.outcomes[0].value
-    assert review_calls == [True, True]
+    assert review_calls == [True]
     assert completion_calls == [True]
     assert quarantine_calls == ["codex_decision_invalid"], (
         value,
@@ -5937,8 +5970,8 @@ def test_dispatcher_preserves_retry_history_when_retry_is_malformed(
         stop_requests,
     )
     assert value["status"] == "quarantined"
-    assert value["process_attempts"] == 2
-    assert value["process_retries"] == 1
+    assert value["process_attempts"] == 1
+    assert value["process_retries"] == 0
     assert value["write_state"] == "not_requested"
     assert stop_requests == []
 
@@ -6010,13 +6043,7 @@ def test_dispatcher_continues_fifo_after_invalid_decision_quarantine(
         if not blocked_key:
             blocked_key.append(case_key)
         if case_key == blocked_key[0]:
-            return {
-                **reviewed,
-                "status": "retry_required",
-                "business_state": "not_available",
-                "write_state": "not_requested",
-                "error_code": "codex_decision_invalid",
-            }
+            return _rejected_decision_result(reviewed)
         submitted.append(case_key)
         return {
             **reviewed,
@@ -6217,19 +6244,13 @@ def test_dispatcher_stops_when_invalid_decision_quarantine_is_untrusted(
             "process_attempts": 1,
             "process_retries": 0,
             "token_usage": {"status": "unknown"},
-            "codex_events": {"status": "unknown"},
+            "codex_events": codex_review_worker._unknown_events(1),
             "agent_wall_seconds": 1,
             "decision": {"overall": "needs_human"},
         }
 
     def complete(_action: Path, reviewed: dict) -> dict:
-        return {
-            **reviewed,
-            "status": "retry_required",
-            "business_state": "not_available",
-            "write_state": "not_requested",
-            "error_code": "codex_decision_invalid",
-        }
+        return _rejected_decision_result(reviewed)
 
     result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
         1,
@@ -6251,7 +6272,7 @@ def test_dispatcher_stops_when_invalid_decision_quarantine_is_untrusted(
 
     value = result.outcomes[0].value
     assert value["status"] == "failed"
-    assert value["error_code"] == "codex_decision_quarantine_failed"
+    assert value["error_code"] == "codex_review_quarantine_failed"
     assert stop_requests == [True]
 
 

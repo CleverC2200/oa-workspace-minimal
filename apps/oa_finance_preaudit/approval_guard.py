@@ -74,11 +74,11 @@ def notice_code(error: object) -> str | None:
     codes = {"usageLimitExceeded": "usage_limit", "serverOverloaded": "server_overloaded",
              "modelNotFound": "model_unavailable", "modelUnavailable": "model_unavailable",
              "rateLimitExceeded": "rate_limit", "unauthorized": "authentication"}
-    if code in codes:
-        return codes[code]
-    if code == "httpConnectionFailed" and isinstance(info, dict):
-        details = info[code]
-        status = details.get("httpStatusCode") if isinstance(details, dict) else None
+    for native_code in (code, error.get("code")):
+        if isinstance(native_code, str) and native_code in codes:
+            return codes[native_code]
+    details = info.get("httpConnectionFailed") if code == "httpConnectionFailed" and isinstance(info, dict) else None
+    for status in (details.get("httpStatusCode") if isinstance(details, dict) else None, error.get("httpStatusCode")):
         if type(status) is int and status in {401, 403, 429, 503}:
             return {401: "authentication", 403: "authentication", 429: "rate_limit", 503: "server_overloaded"}[status]
     message = error.get("message")

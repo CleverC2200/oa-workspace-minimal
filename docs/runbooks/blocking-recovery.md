@@ -32,7 +32,7 @@ OA GET 及已有白名单只读 POST 的网络连接异常最多重试一次，�
 
 ```bash
 .venv/bin/python -m scripts.finance_preaudit_concurrency_probe \
-  --rolling --adaptive --capacity 3 --max-capacity 6 --confirm-write YES \
+  --rolling --capacity 3 --max-capacity 3 --confirm-write YES \
   --recover-confirmed-no-write-once YES
 ```
 
@@ -42,7 +42,7 @@ Writer 被停止门拦在提交之前时，仅精确签名边界为 `writer_pref
 
 每个单据轮次只对首个 attempt 恢复一次，新 attempt 重新采集、审核、授权、提交和后查，原证据保留。已有后续 attempt 的失败转人工。即使恢复字段被移除，attempt 大于 1 也不再次选择。不能与精确 `--recover-action-file` 参数混用，不能在只读探针使用。普通未授权调用仍跳过历史隔离。
 
-显式启用此策略时，同一审核的安全进程尝试耗尽后立即按可信凭据隔离，不再沿用旧的额外三轮 retry_pending；无效决定的原有一次定向重审核规则保持。真实准备/审核超时或停止结果始终优先报告为本轮失败，不能被等待重试项覆盖为完成。材料准备超时仍保留现场与回收证据，按当前门禁调查或继续可信动作，不生成未经审核的意见。
+该参数只选择历史已隔离且可信确认未写入的首个 attempt，不改变当前单据的失败策略。当前普通审核失败、无效决定和 CLI 超时在可信写前留证后保留待办，不当轮重试，继续其他单据；不因失败轮次累积自动永久隔离。明确官方限制首错停止整轮并冷却 3 小时，分类与安全例外见[小时生产合同](hourly-production.md)。整个 worker 或材料准备超时、回收不明和安全停止仍优先报告为本轮失败，不能被等待重试项覆盖为完成。材料准备超时保留现场与回收证据，不生成未经审核的意见。
 
 同一单据的收集或审核在新 attempt 打开后中断，下轮依据现行冻结和安全门继续该动作，不创建第三个恢复 attempt。登录、冻结、隔离或 Writer 证据不可信时停止。
 

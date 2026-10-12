@@ -1045,12 +1045,13 @@ def _request_review_stop(action_file: Path, error_code: str) -> tuple[int, int, 
                 "action_sha256": hashlib.sha256(action_bytes).hexdigest(),
             }, sort_keys=True) + "\n").encode())
     finally:
-        with runtime_control.stop_control_lease():
-            previous = runtime_control.read_control_bytes(runtime_control.stop_file())
-            runtime_control._write_stop_locked("codex_review_technical_failure")
-            if previous in {None, b"stop_requested:controller_cycle_stop\n"}:
-                metadata = runtime_control.stop_file().stat(follow_symlinks=False)
-                owned = (metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns)
+        if error_code not in _BOUNDED_PREWRITE_FAILURE_CODES | {"codex_decision_invalid"}:
+            with runtime_control.stop_control_lease():
+                previous = runtime_control.read_control_bytes(runtime_control.stop_file())
+                runtime_control._write_stop_locked("codex_review_technical_failure")
+                if previous in {None, b"stop_requested:controller_cycle_stop\n"}:
+                    metadata = runtime_control.stop_file().stat(follow_symlinks=False)
+                    owned = (metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns)
     return owned
 
 
@@ -1337,6 +1338,7 @@ def _execute_codex_raw(
         finished = threading.Event()
         communication_errors: list[BaseException] = []
         interrupted = False
+        parent_lost = False
         live_failure = False
         stop_error = None
         offset = 0
@@ -1409,7 +1411,7 @@ def _execute_codex_raw(
                                 if stderr_summary["notice_timing"]["stop_requested_at"] is None:
                                     stderr_summary["notice_timing"]["stop_requested_at"] = time.time()
                             if not read_only:
-                                technical_stop_identity = _request_review_stop(action_file, "codex_process_failed" if live_failure else "codex_review_parent_lost")
+                                technical_stop_identity = _request_review_stop(action_file, "codex_review_parent_lost" if parent_lost else "codex_process_failed")
                                 if stderr_summary["notice_timing"]["stop_requested_at"] is None:
                                     stderr_summary["notice_timing"]["stop_requested_at"] = time.time()
                         except (OSError, RuntimeError, ValueError):
@@ -1564,7 +1566,7 @@ def _execute_codex_raw(
                 stop_error = "codex_review_stop_failed"
     output.close()
     return CodexExecution(
-        "stop_requested" if interrupted and not live_failure else (
+        "stop_requested" if parent_lost or (interrupted and not live_failure) else (
             "codex_process_failed" if live_failure or process.returncode != 0 else output_error
         ),
         usage,
@@ -1627,8 +1629,8 @@ def _complete_decision(action_file: Path, decision: dict) -> str | None:
                     decision_validation.record_rejection(action_file, decision, error)
                 except (OSError, ValueError, TypeError):
                     return "codex_decision_diagnostic_failed"
-                # The dispatcher owns the one bounded retry and item-local
-                # quarantine. Never turn an invalid AI decision into an OA
+                # The dispatcher retains this item for a later cycle without
+                # retrying it now. Never turn an invalid AI decision into an OA
                 # write: doing so advances the workflow with no business
                 # review and makes the original pending item unrecoverable.
                 return "codex_decision_invalid"
@@ -2096,13 +2098,19 @@ def review(
         "codex_events": _merge_events([execution]),
         "business_state": "not_available", "write_state": "not_requested",
     }
-    if execution.error_code is None and isinstance(execution.decision, dict):
+    error_code = (
+        "codex_model_cleanup_unknown"
+        if (execution.process_state == "cleanup_failed"
+            or (execution.process_state == "timed_out" and execution.exit_code is None))
+        else execution.error_code
+    )
+    if error_code is None and isinstance(execution.decision, dict):
         return {
             **base, "status": "reviewed", "error_code": None,
             "agent_wall_seconds": max(0, int(time.monotonic() - run_started)),
             "decision": execution.decision,
         }
-    error_code = execution.error_code or "codex_process_incomplete"
+    error_code = error_code or "codex_process_incomplete"
     stop_error = execution.stop_request_error
     try:
         _request_review_stop(action_file, error_code)
@@ -2114,6 +2122,10 @@ def review(
         action_file, result,
         attempt_error_codes=[execution.error_code or "codex_process_incomplete"],
     ):
+        try:
+            _request_review_stop(action_file, "codex_review_failure_evidence_invalid")
+        except (OSError, RuntimeError, ValueError):
+            result["stop_request_error"] = "codex_review_stop_failed"
         return {**result, "error_code": "codex_review_failure_evidence_invalid"}
     return result
 

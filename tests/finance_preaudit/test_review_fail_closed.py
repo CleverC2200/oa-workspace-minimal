@@ -19,6 +19,12 @@ from tests.finance_preaudit.test_concurrency_probe import _open_action
 from tests.finance_preaudit.test_execution_readback import recorded_execution
 
 
+_TRANSPORT_FALLBACK_WARNING = (
+    'Falling back from WebSockets to HTTPS transport. '
+    'stream disconnected before completion: IO error: Broken pipe (os error 32)'
+)
+
+
 def test_approval_cli_disables_unbounded_connection_retries(tmp_path):
     command = worker._codex_command(tmp_path, tmp_path / 'schema', tmp_path / 'decision')
     assert 'features.unbounded_connection_retries=false' in command
@@ -26,7 +32,7 @@ def test_approval_cli_disables_unbounded_connection_retries(tmp_path):
 
 
 @pytest.mark.parametrize('code', ['codex_process_failed', 'codex_process_incomplete', 'codex_process_timeout'])
-def test_first_technical_failure_stops_without_retry(tmp_path, code):
+def test_first_item_technical_failure_does_not_retry_or_stop_round(tmp_path, code):
     task, action = _task(tmp_path)
     calls = []
 
@@ -38,10 +44,163 @@ def test_first_technical_failure_stops_without_retry(tmp_path, code):
     assert len(calls) == 1
     assert result['error_code'] == code
     assert result['process_retries'] == 0
-    assert runtime_control.stop_requested()
-    assert runtime_control.stop_reason() == 'codex_review_technical_failure'
+    assert not runtime_control.stop_requested()
+    assert guard.cooldown() is None
     assert action.with_name('review-failure.json').exists()
     assert not action.with_name('execution-receipt.json').exists()
+
+
+@pytest.mark.parametrize('mode', ['unknown_error', 'nonzero_exit', 'incomplete', 'timeout'])
+def test_item_technical_failure_allows_next_native_review(tmp_path, monkeypatch, mode):
+    first_task, first_action = _task(tmp_path / 'first')
+    next_task, _ = _small_marketing_v2_task(tmp_path / 'next', budget_account='宣传制作费')
+    if mode == 'timeout':
+        first_task['timeout_seconds'] = 60
+    launches = []
+
+    def command(root, schema, decision, **kwargs):
+        launches.append(root)
+        if str(root) == first_task['project_root']:
+            script = {
+                'unknown_error': 'print(json.dumps({"type":"error","message":"unexpected client failure"}),flush=True); time.sleep(10)',
+                'nonzero_exit': 'sys.exit(1)',
+                'incomplete': 'print(json.dumps({"type":"turn.started"}),flush=True)',
+                'timeout': 'time.sleep(90)',
+            }[mode]
+            return [sys.executable, '-c', 'import sys,json,time; sys.stdin.read(); ' + script]
+        return [sys.executable, '-c', 'import sys,json; from pathlib import Path; sys.stdin.read(); '
+                f'Path({str(decision)!r}).write_text(json.dumps({{"overall":"pass"}})); '
+                'print(json.dumps({"type":"turn.completed"}),flush=True)']
+
+    monkeypatch.setattr(worker, '_codex_command', command)
+    failed = worker.review(first_task)
+    assert failed['status'] == 'failed'
+    assert failed['process_attempts'] == 1 and failed['process_retries'] == 0
+    assert first_action.with_name('review-failure.json').exists()
+    assert not first_action.with_name('execution-receipt.json').exists()
+    assert json.loads(first_action.read_text())['action'] == 'review_required'
+    assert not runtime_control.stop_requested()
+    assert guard.cooldown() is None
+    completed = worker.review(next_task)
+    assert completed['status'] == 'reviewed'
+    assert len(launches) == 2
+
+
+@pytest.mark.parametrize('failure_round', [1, 3, 4])
+def test_consecutive_item_failures_leave_pending_and_continue_dispatch(tmp_path, failure_round):
+    actions = [_open_action(tmp_path / 'runtime' / 'finance_preaudit_flows', case_key=str(i) * 64,
+                            created_at=f'2026-10-11T00:00:0{i}+00:00') for i in range(4)]
+    reviews, writes = [], []
+
+    def review(task):
+        action = Path(task['action_file'])
+        reviews.append(action)
+        if action != actions[-1]:
+            return {**worker._base_result(attempts=1, usages=[{'status': 'unknown'}]),
+                    'codex_events': worker._unknown_events(1), 'status': 'failed',
+                    'business_state': 'not_available', 'write_state': 'not_requested',
+                    'error_code': 'codex_process_failed'}
+        return {'status': 'reviewed', 'decision': {'overall': 'pass'}, 'process_attempts': 1,
+                'process_retries': 0, 'token_usage': {'status': 'unknown'}}
+
+    def complete(action, reviewed):
+        writes.append(action)
+        return {**reviewed, 'status': 'completed', 'write_state': 'submitted', 'error_code': None}
+
+    def quarantine(*args):
+        pytest.fail('an ordinary deferred failure was permanently isolated')
+
+    result = probe._run_dispatched_tasks(
+        4, 1, project_root=tmp_path, renew_actions=lambda paths: paths,
+        review_worker=review, complete_review=complete, quarantine_review=quarantine,
+        record_failure_round=lambda *args: {'production_failure_round': failure_round},
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        runtime_status=lambda: {'status': 'healthy'})
+    assert reviews == actions
+    assert writes == [actions[-1]]
+    assert [outcome.value['status'] for outcome in result.outcomes] == ['retry_pending'] * 3 + ['completed']
+    assert not runtime_control.stop_requested()
+    assert guard.cooldown() is None
+
+
+def test_parent_loss_takes_priority_over_simultaneous_native_failure(tmp_path, monkeypatch):
+    task, action = _task(tmp_path)
+    real_parent = os.getppid()
+    observed_failure = threading.Event()
+    classify = worker.process_diagnostics.notice_payload
+
+    def classify_and_lose_parent(event, **kwargs):
+        result = classify(event, **kwargs)
+        if result is not None and result['classification'] == 'unknown_error':
+            observed_failure.set()
+        return result
+
+    monkeypatch.setattr(worker.process_diagnostics, 'notice_payload', classify_and_lose_parent)
+    monkeypatch.setattr(worker.os, 'getppid', lambda: real_parent + int(observed_failure.is_set()))
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+    script = ('import sys,time; sys.stdin.read(); '
+              'print(\'{"type":"error","message":"unexpected client failure"}\',flush=True); time.sleep(15)')
+    monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
+    result = worker.review(task)
+    assert observed_failure.is_set()
+    assert result['error_code'] == 'stop_requested'
+    assert runtime_control.stop_reason() == 'codex_review_technical_failure'
+    assert json.loads(action.with_name('review-stop-trigger.json').read_text())['error_code'] == 'codex_review_parent_lost'
+    assert guard.cooldown() is None
+
+
+def test_writer_rejected_decision_is_pending_without_second_review(tmp_path, monkeypatch):
+    from apps.oa_finance_preaudit import decision_validation, flow_engine
+
+    actions = [_open_action(tmp_path / 'runtime' / 'finance_preaudit_flows', case_key=str(i) * 64,
+                            created_at=f'2026-10-11T00:00:0{i}+00:00') for i in range(2)]
+    for action in actions:
+        for path in (action, action.with_name('state.json')):
+            payload = json.loads(path.read_text())
+            payload['action_token'] = action.parent.parent.name
+            path.write_text(json.dumps(payload))
+    reviews, completions, writes = [], [], []
+
+    def review(task):
+        action = Path(task['action_file'])
+        reviews.append(action)
+        return {**worker._base_result(attempts=1, usages=[{'status': 'unknown'}]),
+                'codex_events': worker._unknown_events(1), 'status': 'reviewed',
+                'business_state': 'not_available', 'write_state': 'not_requested', 'error_code': None,
+                'agent_wall_seconds': 1, 'decision': {'overall': 'needs_human'}}
+
+    def complete(action, reviewed):
+        completions.append(action)
+        if action == actions[-1]:
+            writes.append(action)
+            return {**reviewed, 'status': 'completed', 'write_state': 'submitted', 'error_code': None}
+
+        def validate(path, decision):
+            with pytest.raises(decision_validation.InvalidDecision) as rejected:
+                flow_engine._validate_review_decision(json.loads(path.read_text()), {}, {}, decision)
+            decision_validation.record_rejection(path, decision, rejected.value)
+            return 'codex_decision_invalid'
+
+        return worker.complete_review_result(action, reviewed, completer=validate, defer_invalid_stop=True)
+
+    monkeypatch.setattr(probe, 'PROJECT_ROOT', tmp_path)
+    result = probe._run_dispatched_tasks(
+        2, 1, project_root=tmp_path, renew_actions=lambda paths: paths,
+        review_worker=review, complete_review=complete, record_failure_round=probe._record_failure_round,
+        quarantine_review=lambda *args: pytest.fail('rejected decision must stay pending'),
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        runtime_status=lambda: {'status': 'healthy'})
+    assert reviews == completions == actions
+    assert writes == [actions[-1]]
+    assert [outcome.value['status'] for outcome in result.outcomes] == ['retry_pending', 'completed']
+    assert result.outcomes[0].value['process_attempts'] == 1
+    assert result.outcomes[0].value['process_retries'] == 0
+    state = json.loads(actions[0].with_name('state.json').read_text())
+    assert state['execution_state'] == 'review_required' and state['production_failure_round'] == 1
+    assert list(actions[0].parent.glob('review-rejection-*.json'))
+    assert not actions[0].with_name('execution-receipt.json').exists()
+    assert not runtime_control.stop_requested()
+    assert guard.cooldown() is None
 
 
 def test_stop_blocks_next_review_before_model_execution(tmp_path):
@@ -92,9 +251,9 @@ def test_existing_manual_stop_is_never_replaced():
 def test_other_worker_cannot_upgrade_unowned_technical_stop(tmp_path):
     _task_a, first = _task(tmp_path / 'a')
     _task_b, second = _task(tmp_path / 'b')
-    identity = worker._request_review_stop(first, 'codex_process_failed')
+    identity = worker._request_review_stop(first, 'codex_review_parent_lost')
     assert identity is not None
-    assert worker._request_review_stop(second, 'codex_process_failed') is None
+    assert worker._request_review_stop(second, 'codex_review_parent_lost') is None
     guard.record_notice('usage_limit', 'second-worker', technical_stop_identity=None)
     assert runtime_control.stop_reason() == 'codex_review_technical_failure'
     # A later replacement is not the marker that the first worker published.
@@ -398,6 +557,210 @@ def test_explicit_reconnect_warning_can_finish_same_review(tmp_path, monkeypatch
     assert notice['source'] == ('stdout' if channel == 'stdout' else 'stderr')
 
 
+@pytest.mark.parametrize('fields', [
+    {},
+    {'codexErrorInfo': {'httpConnectionFailed': {'httpStatusCode': 502}}},
+    {'code': 'httpConnectionFailed', 'httpStatusCode': 502},
+    {'codexErrorInfo': {'httpConnectionFailed': {'httpStatusCode': 502}}, 'code': 'httpConnectionFailed', 'httpStatusCode': 500},
+])
+@pytest.mark.parametrize('channel', ['stdout', 'stderr', 'split_stderr', 'plain_stderr'])
+def test_native_transport_fallback_can_finish_same_review(tmp_path, monkeypatch, fields, channel):
+    task, action = _small_marketing_v2_task(tmp_path, budget_account='宣传制作费')
+    message = _TRANSPORT_FALLBACK_WARNING
+    launches = []
+
+    def command(root, schema, decision, **kwargs):
+        launches.append(decision)
+        item = {'type': 'error', 'message': message, **fields}
+        warning = message if channel == 'plain_stderr' else json.dumps({'type': 'item.completed', 'item': item})
+        if channel == 'split_stderr':
+            emit = (f'sys.stderr.write({warning[:40]!r}); sys.stderr.flush(); time.sleep(.05); '
+                    f'sys.stderr.write({warning[40:]!r}); sys.stderr.flush(); ')
+        else:
+            stream = 'stdout' if channel == 'stdout' else 'stderr'
+            emit = f'print({warning!r}, file=sys.{stream}, flush=True); '
+        return [sys.executable, '-c',
+                'import sys,json,time; from pathlib import Path; sys.stdin.read(); ' + emit +
+                f'Path({str(decision)!r}).write_text(json.dumps({{"overall":"pass"}})); '
+                'print(json.dumps({"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}), flush=True)']
+
+    monkeypatch.setattr(worker, '_codex_command', command)
+    result = worker.review(task)
+    assert result['status'] == 'reviewed'
+    assert result['process_attempts'] == 1
+    assert result['process_retries'] == 0
+    assert len(launches) == 1
+    assert not runtime_control.stop_requested()
+    assert guard.cooldown() is None
+    notices = worker.process_diagnostics.read_notices(action)
+    assert set(notices) == {'first_notice'}
+    notice = notices['first_notice']
+    assert notice['classification'] == 'network_reconnect'
+    assert notice['blocking'] is False
+    assert notice['source'] == ('stdout' if channel == 'stdout' else 'stderr')
+    assert notice['native_event_type'] == (None if channel == 'plain_stderr' else 'item.completed')
+    assert notice['error_message'].startswith('Falling back from WebSockets to HTTPS transport.')
+    assert 'Broken pipe' in notice['error_message']
+    assert notice['error_message_sha256'] == hashlib.sha256(message.encode()).hexdigest()
+
+
+@pytest.mark.parametrize('restriction,classification', [
+    ({'message': 'usage limit exceeded'}, 'usage_limit'),
+    ({'message': 'model is not available'}, 'model_unavailable'),
+    ({'message': 'authentication failed'}, 'authentication'),
+    ({'message': 'too many requests'}, 'rate_limit'),
+    ({'message': 'server overloaded'}, 'server_overloaded'),
+    ({'code': 'usageLimitExceeded', 'codexErrorInfo': 'httpConnectionFailed'}, 'usage_limit'),
+    ({'code': 'modelUnavailable'}, 'model_unavailable'),
+    ({'code': 'unauthorized'}, 'authentication'),
+    ({'code': 'rateLimitExceeded'}, 'rate_limit'),
+    ({'code': 'serverOverloaded'}, 'server_overloaded'),
+    ({'httpStatusCode': 401}, 'authentication'),
+    ({'httpStatusCode': 403}, 'authentication'),
+    ({'httpStatusCode': 429, 'codexErrorInfo': {'httpConnectionFailed': {'httpStatusCode': 502}}}, 'rate_limit'),
+    ({'httpStatusCode': 429, 'codexErrorInfo': {'responseStreamDisconnected': {'httpStatusCode': 401}}}, 'rate_limit'),
+    ({'httpStatusCode': 503}, 'server_overloaded'),
+])
+def test_official_error_after_transport_fallback_stops_before_retry(tmp_path, monkeypatch, restriction, classification):
+    task, action = _task(tmp_path)
+    retry = tmp_path / 'retry-started'
+    child_pid = tmp_path / 'model-pid'
+    launches = []
+    errors = [{'type': 'error', 'message': _TRANSPORT_FALLBACK_WARNING},
+              {'type': 'error', **restriction,
+               'message': _TRANSPORT_FALLBACK_WARNING + ' ' + restriction.get('message', '')}]
+
+    def command(*args, **kwargs):
+        launches.append(True)
+        emit = ''.join(f'print({json.dumps({"type": "item.completed", "item": error})!r}, flush=True); '
+                       for error in errors)
+        script = ('import os,sys,time; from pathlib import Path; sys.stdin.read(); '
+                  f'Path({str(child_pid)!r}).write_text(str(os.getpid())); ' + emit +
+                  f'time.sleep(10); Path({str(retry)!r}).write_text("retry"); time.sleep(10)')
+        return [sys.executable, '-c', script]
+
+    monkeypatch.setattr(worker, '_codex_command', command)
+    started = time.monotonic()
+    result = worker.review(task)
+    assert time.monotonic() - started < 8
+    assert worker.OBSERVATION_INTERVAL_SECONDS == 5
+    assert result['error_code'] == 'codex_process_failed'
+    assert result['process_attempts'] == 1
+    assert result['process_retries'] == 0
+    assert len(launches) == 1
+    assert not retry.exists()
+    assert not action.with_name('execution-receipt.json').exists()
+    assert runtime_control.stop_reason() == guard.STOP_REASON
+    cooldown = guard.cooldown()
+    assert cooldown['notice_code'] == classification
+    assert cooldown['blocked_until'] - cooldown['triggered_at'] == 10800
+    notices = worker.process_diagnostics.read_notices(action)
+    assert notices['first_notice']['classification'] == 'network_reconnect'
+    assert notices['first_notice']['blocking'] is False
+    assert notices['first_blocking_notice']['classification'] == classification
+    assert notices['first_official_notice']['classification'] == classification
+    official = notices['first_official_notice']
+    if 'code' in restriction:
+        assert official['native_error_code'] == restriction['code']
+        assert official['native_error_code_status'] == 'retained'
+    if 'httpStatusCode' in restriction:
+        assert official['http_status'] == restriction['httpStatusCode']
+        assert official['http_status_source'] == 'httpStatusCode'
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(child_pid.read_text()), 0)
+
+
+@pytest.mark.parametrize('event,classification', [
+    ({'type': 'turn.failed', 'error': {'message': _TRANSPORT_FALLBACK_WARNING}}, 'terminal_failure'),
+    ({'type': 'thread.failed', 'error': {'message': _TRANSPORT_FALLBACK_WARNING}}, 'terminal_failure'),
+    ({'type': 'item.completed', 'item': {'type': 'error', 'message': _TRANSPORT_FALLBACK_WARNING,
+                                      'codexErrorInfo': 'unrecognizedCode'}}, 'unknown_error'),
+    ({'type': 'error', 'message': 'Not falling back from WebSockets to HTTPS transport. stream disconnected'}, 'unknown_error'),
+    ({'type': 'error', 'message': 'Falling back from WebSockets to HTTP transport. stream disconnected'}, 'unknown_error'),
+    ({'type': 'error', 'message': 'Falling back from WebSockets to HTTPS transport. connection failed; will not retry'}, 'unknown_error'),
+    ({'type': 'error', 'message': 'Falling back from WebSockets to HTTPS transport. '}, 'unknown_error'),
+])
+def test_transport_fallback_does_not_exempt_other_failures(tmp_path, monkeypatch, event, classification):
+    task, action = _task(tmp_path)
+    script = f'import sys; sys.stdin.read(); print({json.dumps(event)!r}, flush=True)'
+    monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
+    result = worker.review(task)
+    assert result['error_code'] == 'codex_process_failed'
+    assert result['process_attempts'] == 1
+    assert result['process_retries'] == 0
+    assert not runtime_control.stop_requested()
+    assert guard.cooldown() is None
+    notice = worker.process_diagnostics.read_notices(action)['first_blocking_notice']
+    assert notice['classification'] == classification
+    assert notice['blocking'] is True
+
+
+@pytest.mark.parametrize('event,classification', [
+    ({'type': 'error', 'message': _TRANSPORT_FALLBACK_WARNING, 'code': 'futureNativeError'}, 'unknown_error'),
+    ({'type': 'error', 'message': _TRANSPORT_FALLBACK_WARNING, 'code': 'futureNativeError',
+      'codexErrorInfo': 'httpConnectionFailed'}, 'unknown_error'),
+    ({'type': 'error', 'message': _TRANSPORT_FALLBACK_WARNING, 'code': None}, 'unknown_error'),
+    ({'type': 'error', 'message': _TRANSPORT_FALLBACK_WARNING, 'code': [], 'httpStatusCode': 502}, 'unknown_error'),
+    ({'type': 'error', 'message': _TRANSPORT_FALLBACK_WARNING, 'httpStatusCode': 418,
+      'codexErrorInfo': {'httpConnectionFailed': {'httpStatusCode': 502}}}, 'unknown_error'),
+    ({'type': 'future.event', 'item': {'type': 'error', 'message': _TRANSPORT_FALLBACK_WARNING}}, 'invalid_event'),
+    ({'item': {'type': 'error', 'message': _TRANSPORT_FALLBACK_WARNING}}, 'invalid_event'),
+    ({'type': [], 'item': {'type': 'error', 'message': _TRANSPORT_FALLBACK_WARNING}}, 'invalid_event'),
+])
+@pytest.mark.parametrize('channel', ['stdout', 'stderr'])
+def test_transport_fallback_cannot_hide_unknown_fields_before_valid_completion(tmp_path, monkeypatch, event, classification, channel):
+    task, action = _task(tmp_path)
+    launches = []
+
+    def command(root, schema, decision, **kwargs):
+        launches.append(decision)
+        return [sys.executable, '-c',
+                'import sys,json; from pathlib import Path; sys.stdin.read(); '
+                f'print({json.dumps(event)!r},file=sys.{channel},flush=True); '
+                f'Path({str(decision)!r}).write_text(json.dumps({{"overall":"pass"}})); '
+                'print(json.dumps({"type":"turn.completed"}),flush=True)']
+
+    monkeypatch.setattr(worker, '_codex_command', command)
+    result = worker.review(task)
+    assert result['status'] == 'failed'
+    assert result['process_attempts'] == 1
+    assert result['process_retries'] == 0
+    assert len(launches) == 1
+    assert not runtime_control.stop_requested()
+    assert guard.cooldown() is None
+    assert not action.with_name('execution-receipt.json').exists()
+    notice = worker.process_diagnostics.read_notices(action)['first_blocking_notice']
+    assert notice['classification'] == classification
+    assert notice['blocking'] is True
+
+
+@pytest.mark.parametrize('complete,decision_present,exit_code,expected', [
+    (False, True, 0, 'codex_process_incomplete'),
+    (True, True, 1, 'codex_process_failed'),
+    (True, False, 0, 'codex_process_incomplete'),
+])
+def test_transport_fallback_still_requires_successful_terminal_event(tmp_path, monkeypatch, complete, decision_present, exit_code, expected):
+    task, action = _task(tmp_path)
+
+    def command(root, schema, decision, **kwargs):
+        warning = json.dumps({'type': 'item.completed', 'item': {'type': 'error', 'message': _TRANSPORT_FALLBACK_WARNING}})
+        terminal = 'print(json.dumps({"type":"turn.completed"}),flush=True); ' if complete else ''
+        write_decision = f'Path({str(decision)!r}).write_text(json.dumps({{"overall":"pass"}})); ' if decision_present else ''
+        return [sys.executable, '-c',
+                'import sys,json; from pathlib import Path; sys.stdin.read(); '
+                f'print({warning!r},flush=True); ' + write_decision + terminal +
+                f'sys.exit({exit_code})']
+
+    monkeypatch.setattr(worker, '_codex_command', command)
+    result = worker.review(task)
+    assert result['error_code'] == expected
+    assert result['process_attempts'] == 1
+    assert result['process_retries'] == 0
+    assert not runtime_control.stop_requested()
+    assert guard.cooldown() is None
+    assert set(worker.process_diagnostics.read_notices(action)) == {'first_notice'}
+
+
 def test_reconnect_does_not_hide_first_official_blocking_notice(tmp_path, monkeypatch):
     task, action = _task(tmp_path)
     monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
@@ -649,7 +1012,7 @@ def test_decision_after_reconnect_without_terminal_event_is_not_success(tmp_path
     assert result['status'] == 'failed'
     assert result['error_code'] == 'codex_process_incomplete'
     assert result['process_retries'] == 0
-    assert runtime_control.stop_requested()
+    assert not runtime_control.stop_requested()
     diagnostic = json.loads(next(action.parent.glob('review-process-*.json')).read_text())
     timing = diagnostic['notice_timing']
     assert timing['stop_requested_at'] >= timing['process_exit_observed_at']

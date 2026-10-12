@@ -94,10 +94,6 @@ ITEM_LOCAL_QUARANTINE_REASONS = {
 ITEM_LOCAL_REVIEW_FAILURE_REASONS = frozenset(
     {"codex_process_failed", "codex_process_incomplete", "codex_decision_invalid"}
 )
-# 同一轮里连续这么多单单据级审核进程失败时，停止本轮领取，避免把整批待办
-# 全部推进隔离；阈值以内仍按既有规则继续处理。
-REVIEW_FAILURE_CIRCUIT_BREAKER = 3
-REVIEW_FAILURE_CIRCUIT_BREAKER_ERROR = "review_failure_circuit_breaker"
 # 失败轮次记录器抛错时只记固定分类,用于定位是状态前置条件不满足还是文件/类型问题。
 _RECORDER_ERROR_CODES = {
     "ValueError": "recorder_error_value",
@@ -107,11 +103,6 @@ _RECORDER_ERROR_CODES = {
     "FileNotFoundError": "recorder_error_missing",
     "RuntimeError": "recorder_error_runtime",
 }
-
-
-def _review_failure_streak_reached(streak: int) -> bool:
-    """同一轮内连续的单据级审核失败是否达到熔断阈值。"""
-    return streak >= REVIEW_FAILURE_CIRCUIT_BREAKER
 
 
 def _record_failure_round(action_file: Path, failure_code: str) -> dict:
@@ -2007,78 +1998,6 @@ def _preparation_executor() -> ProcessPoolExecutor:
     )
 
 
-def _merge_review_attempts(attempts: list[dict]) -> dict:
-    current = dict(attempts[-1])
-    process_attempts = sum(int(item.get("process_attempts") or 0) for item in attempts)
-    usages = [
-        item.get("token_usage")
-        for item in attempts
-        if isinstance(item.get("token_usage"), dict)
-    ]
-    recorded_usages = [
-        usage for usage in usages if usage.get("status") in {"recorded", "partial"}
-    ]
-    token_usage = {
-        "status": (
-            "recorded"
-            if len(usages) == len(attempts)
-            and usages
-            and all(usage.get("status") == "recorded" for usage in usages)
-            else "partial"
-            if recorded_usages
-            else "unknown"
-        ),
-        **{
-            field: sum(int(usage.get(field) or 0) for usage in recorded_usages)
-            for field in (
-                "input_tokens",
-                "cached_input_tokens",
-                "output_tokens",
-                "total_tokens",
-            )
-        },
-    }
-    event_values = [
-        item.get("codex_events")
-        for item in attempts
-        if isinstance(item.get("codex_events"), dict)
-    ]
-    event_counts: Counter[str] = Counter()
-    recorded_events = 0
-    for events in event_values:
-        recorded_events += int(events.get("recorded_attempts") or 0)
-        counts = events.get("counts")
-        if isinstance(counts, dict):
-            event_counts.update(
-                {
-                    str(key): int(value)
-                    for key, value in counts.items()
-                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0
-                }
-            )
-    codex_events = {
-        "status": (
-            "recorded"
-            if process_attempts > 0 and recorded_events == process_attempts
-            else "unknown"
-        ),
-        "attempts": process_attempts,
-        "recorded_attempts": recorded_events,
-        "unknown_attempts": max(0, process_attempts - recorded_events),
-        "counts": dict(sorted(event_counts.items())),
-    }
-    return {
-        **current,
-        "process_attempts": process_attempts,
-        "process_retries": max(0, process_attempts - 1),
-        "token_usage": token_usage,
-        "codex_events": codex_events,
-        "agent_wall_seconds": sum(
-            int(item.get("agent_wall_seconds") or 0) for item in attempts
-        ),
-    }
-
-
 def _terminate_executor(
     executor: object,
     *,
@@ -2308,7 +2227,7 @@ def _run_dispatched_tasks(
     assigned_order_keys: dict[int, tuple[datetime, str]] = {}
     pending_write_indices: set[int] = set()
     futures: dict[object, tuple[int, float, float, Path]] = {}
-    pending_reviews: dict[int, tuple[float, Path, bool]] = {}
+    pending_reviews: dict[int, tuple[float, Path]] = {}
     write_ready: dict[
         int,
         tuple[float, Path, dict, float, int, float | None],
@@ -2319,7 +2238,6 @@ def _run_dispatched_tasks(
             int,
             float,
             Path,
-            dict,
             float,
             float,
             int,
@@ -2328,8 +2246,6 @@ def _run_dispatched_tasks(
         | None
     ) = None
     writer_busy_intervals: list[tuple[float, float]] = []
-    review_histories: dict[int, list[dict]] = {}
-    decision_retries: set[int] = set()
     skipped_write_indices: set[int] = set()
     initial_late_visible_keys = set(known_late_visible_keys)
     late_visible_keys = set(initial_late_visible_keys)
@@ -2348,7 +2264,6 @@ def _run_dispatched_tasks(
     started = 0
     peak_active = 0
     halted = False
-    consecutive_review_failures = 0
     review_retry_diagnostics = {
         "item_local_failure": 0,
         "bounded": 0,
@@ -2363,7 +2278,6 @@ def _run_dispatched_tasks(
         "recorder_error_runtime": 0,
         "recorder_error_other": 0,
         "recorder_invalid": 0,
-        "streak_exhausted": 0,
         "retry_pending": 0,
         "isolated": 0,
     }
@@ -2632,8 +2546,6 @@ def _run_dispatched_tasks(
         index: int,
         prepare_elapsed: float,
         action_file: Path,
-        *,
-        first_attempt: bool,
     ) -> None:
         nonlocal started, peak_active
         publish_progress()
@@ -2653,8 +2565,7 @@ def _run_dispatched_tasks(
             time.monotonic(),
             action_file,
         )
-        if first_attempt:
-            started += 1
+        started += 1
         peak_active = max(peak_active, len(futures))
 
     def publish_progress() -> None:
@@ -2730,6 +2641,50 @@ def _run_dispatched_tasks(
             selection["admission_cutoff"] = admission_deadline.isoformat()
         return selection
 
+    def finish_bounded_review_failure(action_file: Path, value: dict, error_code: str) -> dict:
+        nonlocal retry_pending_now
+        failure_round = None
+        recorder = record_failure_round or (
+            codex_review_worker.record_production_failure_round
+            if strict_global_fifo and continuous_discovery
+            else None
+        )
+        if recorder is None:
+            review_retry_diagnostics["recorder_missing"] += 1
+        else:
+            try:
+                failure_round = recorder(action_file, error_code).get("production_failure_round")
+            except Exception as error:
+                review_retry_diagnostics["recorder_error"] += 1
+                review_retry_diagnostics[_RECORDER_ERROR_CODES.get(type(error).__name__, "recorder_error_other")] += 1
+            if type(failure_round) is not int or failure_round < 1:
+                if failure_round is not None:
+                    review_retry_diagnostics["recorder_invalid"] += 1
+                failure_round = None
+        if defer_review_failures and failure_round is not None:
+            review_retry_diagnostics["retry_pending"] += 1
+            retry_pending_now = True
+            return {
+                **value, "status": "retry_pending", "execution_state": "review_required",
+                "business_state": "not_available", "write_state": "authorized",
+                "error_code": "codex_review_retry_pending", "production_failure_round": failure_round,
+            }
+        try:
+            quarantine = quarantine_review(action_file, error_code)
+        except Exception:
+            quarantine = {}
+        review_retry_diagnostics["isolated"] += 1
+        expected_reason = "codex_decision_invalid" if error_code == "codex_decision_invalid" else "codex_review_failed"
+        if all(quarantine.get(field) == expected for field, expected in {
+            "action": "needs_admin", "execution_state": "needs_admin", "business_state": "not_available",
+            "write_state": "not_requested", "reason": expected_reason,
+        }.items()):
+            return {
+                **value, "status": "quarantined", "execution_state": "needs_admin",
+                "business_state": "not_available", "write_state": "not_requested", "error_code": error_code,
+            }
+        return {**value, "status": "failed", "error_code": "codex_review_quarantine_failed"}
+
     try:
         while (
             futures
@@ -2757,7 +2712,6 @@ def _run_dispatched_tasks(
                     index,
                     prepare_elapsed,
                     action_file,
-                    submitted_review,
                     review_ready_at,
                     writer_started_at,
                     enqueue_depth,
@@ -2792,75 +2746,25 @@ def _run_dispatched_tasks(
                     "write_queue_depth_at_enqueue": enqueue_depth,
                     "write_wait_attribution": write_wait,
                 }
-                if (
-                    value.get("status") == "retry_required"
-                    and value.get("error_code") == "codex_decision_invalid"
-                    and index not in decision_retries
-                    and not halted
-                ):
-                    decision_retries.add(index)
-                    review_histories[index] = [submitted_review]
-                    pending_reviews[index] = (prepare_elapsed, action_file, False)
+                rejected = {key: item for key, item in completed.items() if key != "execution_state"}
+                rejected["status"] = "failed"
+                if (value.get("status") == "retry_required" and not halted
+                        and codex_review_worker.is_bounded_invalid_decision(rejected)):
+                    review_retry_diagnostics["item_local_failure"] += 1
+                    review_retry_diagnostics["bounded"] += 1
+                    value = finish_bounded_review_failure(action_file, value, "codex_decision_invalid")
+                if value.get("status") == "retry_required":
+                    value = {**value, "status": "failed"}
+                outcomes[index] = process_pool.TaskOutcome(index=index, status="completed", value=value)
+                if value.get("status") not in {"completed", "quarantined", "retry_pending"}:
+                    request_pipeline_stop(value.get("error_code"))
                 else:
-                    if (
-                        value.get("status") == "retry_required"
-                        and value.get("error_code") == "codex_decision_invalid"
-                        and index in decision_retries
-                        and not halted
-                    ):
-                        try:
-                            quarantine = quarantine_review(
-                                action_file,
-                                "codex_decision_invalid",
-                            )
-                        except Exception:
-                            quarantine = {}
-                        if all(
-                            quarantine.get(field) == expected
-                            for field, expected in {
-                                "action": "needs_admin",
-                                "execution_state": "needs_admin",
-                                "business_state": "not_available",
-                                "write_state": "not_requested",
-                                "reason": "codex_decision_invalid",
-                            }.items()
-                        ):
-                            value = {
-                                **value,
-                                "status": "quarantined",
-                                "execution_state": "needs_admin",
-                                "business_state": "not_available",
-                                "write_state": "not_requested",
-                                "error_code": "codex_decision_invalid",
-                            }
-                        else:
-                            value = {
-                                **value,
-                                "status": "failed",
-                                "error_code": (
-                                    "codex_decision_quarantine_failed"
-                                ),
-                            }
-                    if value.get("status") == "retry_required":
-                        value = {**value, "status": "failed"}
-                    outcomes[index] = process_pool.TaskOutcome(
-                        index=index,
-                        status="completed",
-                        value=value,
-                    )
-                    review_histories.pop(index, None)
-                    if value.get("status") not in {
-                        "completed",
-                        "quarantined",
-                    }:
-                        request_pipeline_stop(value.get("error_code"))
+                    if strict_global_fifo:
+                        pending_write_indices.remove(index)
                     else:
-                        if strict_global_fifo:
-                            pending_write_indices.remove(index)
-                        else:
-                            next_write_index += 1
-                        advance_write_head()
-                        observe_adaptive_window(value)
+                        next_write_index += 1
+                    advance_write_head()
+                    observe_adaptive_window(value)
 
             review_ages = {
                 index: max(0.0, now - task_started)
@@ -3249,7 +3153,7 @@ def _run_dispatched_tasks(
                         assigned.add(action_file)
                         publish_progress()
                         advance_write_head()
-                        pending_reviews[index] = (prepare_elapsed, action_file, True)
+                        pending_reviews[index] = (prepare_elapsed, action_file)
 
             done = {future for future in futures if future.done()}
             reviewed_now: list[tuple[int, float, Path, dict]] = []
@@ -3281,26 +3185,6 @@ def _run_dispatched_tasks(
                     error_code = str(
                         value.get("error_code") or "worker_process_failed"
                     )
-                    if (
-                        error_code in ITEM_LOCAL_REVIEW_FAILURE_REASONS
-                        or error_code == "codex_process_timeout"
-                    ):
-                        consecutive_review_failures += 1
-                        if _review_failure_streak_reached(
-                            consecutive_review_failures
-                        ):
-                            request_pipeline_stop(
-                                REVIEW_FAILURE_CIRCUIT_BREAKER_ERROR
-                            )
-                    else:
-                        consecutive_review_failures = 0
-                    reported_value = (
-                        _merge_review_attempts(
-                            [*review_histories[index], value]
-                        )
-                        if index in review_histories
-                        else value
-                    )
                     bounded_review_failure = (
                         codex_review_worker.is_bounded_invalid_decision(value)
                         if error_code == "codex_decision_invalid"
@@ -3319,121 +3203,19 @@ def _run_dispatched_tasks(
                          or error_code == "codex_process_timeout")
                         and bounded_review_failure
                     ):
-                        failure_round = None
-                        production_failure_round_recorder = (
-                            record_failure_round
-                            or (
-                                codex_review_worker.record_production_failure_round
-                                if strict_global_fifo and continuous_discovery
-                                else None
-                            )
-                        )
-                        if production_failure_round_recorder is None:
-                            review_retry_diagnostics["recorder_missing"] += 1
-                        else:
-                            try:
-                                failure_round = production_failure_round_recorder(
-                                    action_file,
-                                    error_code,
-                                ).get("production_failure_round")
-                            except Exception as error:
-                                failure_round = None
-                                review_retry_diagnostics["recorder_error"] += 1
-                                review_retry_diagnostics[
-                                    _RECORDER_ERROR_CODES.get(
-                                        type(error).__name__,
-                                        "recorder_error_other",
-                                    )
-                                ] += 1
-                            if not isinstance(failure_round, int):
-                                if failure_round is not None:
-                                    review_retry_diagnostics[
-                                        "recorder_invalid"
-                                    ] += 1
-                        if defer_review_failures and isinstance(failure_round, int) and failure_round < 3:
-                            review_retry_diagnostics["retry_pending"] += 1
-                            retry_pending_now = True
-                            retry_value = {
-                                **reported_value,
-                                "status": "retry_pending",
-                                "execution_state": "review_required",
-                                "business_state": "not_available",
-                                "write_state": "authorized",
-                                "error_code": "codex_review_retry_pending",
-                                "production_failure_round": failure_round,
-                                "prepare_elapsed_seconds": prepare_elapsed,
-                            }
+                        value = finish_bounded_review_failure(action_file, value, error_code)
+                        if value.get("status") in {"retry_pending", "quarantined"}:
                             outcomes[index] = process_pool.TaskOutcome(
-                                index=index,
-                                status="completed",
-                                value=retry_value,
+                                index=index, status="completed",
+                                value={**value, "prepare_elapsed_seconds": prepare_elapsed},
                             )
                             if strict_global_fifo:
                                 pending_write_indices.remove(index)
                             else:
                                 skipped_write_indices.add(index)
-                            review_histories.pop(index, None)
                             advance_write_head()
+                            observe_adaptive_window(value)
                             continue
-                        if isinstance(failure_round, int):
-                            review_retry_diagnostics["streak_exhausted"] += 1
-                        try:
-                            quarantine = quarantine_review(
-                                action_file,
-                                error_code,
-                            )
-                        except Exception:
-                            quarantine = {}
-                        review_retry_diagnostics["isolated"] += 1
-                        expected_reason = (
-                            "codex_decision_invalid"
-                            if error_code == "codex_decision_invalid"
-                            else "codex_review_failed"
-                        )
-                        if all(
-                            quarantine.get(field) == expected
-                            for field, expected in {
-                                "action": "needs_admin",
-                                "execution_state": "needs_admin",
-                                "business_state": "not_available",
-                                "write_state": "not_requested",
-                                "reason": expected_reason,
-                            }.items()
-                        ):
-                            quarantined_value = {
-                                **reported_value,
-                                "status": "quarantined",
-                                "execution_state": "needs_admin",
-                                "business_state": "not_available",
-                                "write_state": "not_requested",
-                                "error_code": error_code,
-                                "prepare_elapsed_seconds": prepare_elapsed,
-                            }
-                            outcomes[index] = process_pool.TaskOutcome(
-                                index=index,
-                                status="completed",
-                                value={**quarantined_value, "status": "failed"}
-                                if error_code == "codex_process_timeout" else quarantined_value,
-                            )
-                            if error_code == "codex_process_timeout":
-                                failed_now = True
-                                first_review_error_code = first_review_error_code or error_code
-                                continue
-                            if strict_global_fifo:
-                                pending_write_indices.remove(index)
-                            else:
-                                skipped_write_indices.add(index)
-                            review_histories.pop(index, None)
-                            advance_write_head()
-                            observe_adaptive_window(quarantined_value)
-                            continue
-                        value = {
-                            **reported_value,
-                            "status": "failed",
-                            "error_code": "codex_review_quarantine_failed",
-                        }
-                    else:
-                        value = reported_value
                     outcomes[index] = process_pool.TaskOutcome(
                         index=index,
                         status="completed",
@@ -3442,7 +3224,6 @@ def _run_dispatched_tasks(
                             "prepare_elapsed_seconds": prepare_elapsed,
                         },
                     )
-                    review_histories.pop(index, None)
                     failed_now = True
                     if first_review_error_code is None:
                         first_review_error_code = str(
@@ -3452,7 +3233,6 @@ def _run_dispatched_tasks(
                 reviewed_now.append(
                     (index, prepare_elapsed, action_file, value)
                 )
-                consecutive_review_failures = 0
             if failed_now:
                 for index, prepare_elapsed, _action, reviewed in reviewed_now:
                     stopped_review(index, prepare_elapsed, reviewed)
@@ -3462,14 +3242,11 @@ def _run_dispatched_tasks(
                     stopped_review(index, prepare_elapsed, reviewed)
             else:
                 for index, prepare_elapsed, action_file, reviewed in reviewed_now:
-                    merged = _merge_review_attempts(
-                        [*review_histories.get(index, []), reviewed]
-                    )
                     head = current_write_head()
                     write_ready[index] = (
                         prepare_elapsed,
                         action_file,
-                        merged,
+                        reviewed,
                         (ready_at := time.monotonic()),
                         len(write_ready) + 1,
                         ready_at if index == head else None,
@@ -3482,8 +3259,8 @@ def _run_dispatched_tasks(
 
             while pending_reviews and not halted and not resource_paused and len(futures) < current_review_capacity:
                 index = min(pending_reviews)
-                prepare_elapsed, action_file, first_attempt = pending_reviews.pop(index)
-                submit_review(index, prepare_elapsed, action_file, first_attempt=first_attempt)
+                prepare_elapsed, action_file = pending_reviews.pop(index)
+                submit_review(index, prepare_elapsed, action_file)
 
             write_head = current_write_head()
             if (
@@ -3517,7 +3294,7 @@ def _run_dispatched_tasks(
                     write_started_at=writer_started_at,
                     queue_depth=enqueue_depth,
                     attribution=write_wait,
-                    event_suffix=(2 if index in decision_retries else 1),
+                    event_suffix=1,
                 ):
                     outcomes[index] = process_pool.TaskOutcome(
                         index=index,
@@ -3563,7 +3340,6 @@ def _run_dispatched_tasks(
                     index,
                     prepare_elapsed,
                     action_file,
-                    reviewed,
                     review_ready_at,
                     writer_started_at,
                     enqueue_depth,
@@ -3674,7 +3450,6 @@ def _run_dispatched_tasks(
                     next_index,
                     prepare_elapsed,
                     action_file,
-                    first_attempt=True,
                 )
                 next_index += 1
 
@@ -4667,7 +4442,6 @@ def run_rolling_drain(
                         controller_instance_id=(
                             manifest["controller_instance_id"]
                         ),
-                        **({"defer_review_failures": False} if authorized_recovery_once else {}),
                     )
                     pending_recoveries = ()
                     committed_received_at = wave_result.committed_received_at
@@ -5023,9 +4797,8 @@ def _run_rolling_drain_locked(
                 and not specific_stop_requested
                 and not (wave["failed"] or wave["timed_out"] or wave["stopped"]
                          or wave["completed"] != wave["requested"])):
-            # A transient first/second-round review failure is persisted on the
-            # open attempt. End this production cycle quietly; the next cycle
-            # will retry it and only round three can create an isolation.
+            # All other admitted items have drained. Leave failed reviews pending
+            # for a later cycle without retrying them in this cycle.
             status = "completed"
             stop_reason = "review_retry_pending"
             break
