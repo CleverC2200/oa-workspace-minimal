@@ -122,6 +122,80 @@ def test_public_confirmed_recovery_only_clears_audited_stop(recovery_target, cap
     assert observed['exit_code'] is None
 
 
+@pytest.mark.parametrize('padding_bytes,confirmed,accepted,tamper', [
+    (2 * 1024 * 1024, False, True, None),
+    (10 * 1024 * 1024, True, True, None),
+    (64 * 1024 * 1024, True, False, None),
+    (2 * 1024 * 1024, True, False, 'replacement'),
+    (2 * 1024 * 1024, True, False, 'content'),
+    (2 * 1024 * 1024, True, False, 'policy_size'),
+])
+def test_public_recovery_reads_bounded_large_status_without_changing_old_execution(
+    recovery_target, capsys, monkeypatch, padding_bytes, confirmed, accepted, tamper,
+):
+    root, original, action, stop, cron, args = recovery_target
+    policy = root / 'runtime/control/write-policy.json'
+    if tamper == 'policy_size':
+        runtime_control.write_control_bytes_atomic(policy, policy.read_bytes() + b' ' * padding_bytes)
+    protected = {path:path.read_bytes() for path in (*original.file.parent.iterdir(),
+        action, action.with_name('state.json'), action.with_name('manual-review-receipt.json'), cron, policy)}
+    stop_before = stop.read_bytes()
+
+    def live(target):
+        snapshot = current_snapshot(target, original, action)
+        snapshot['offline_status_padding'] = 'x' * padding_bytes
+        status_file = Path(snapshot['maintenance_status_file']['path'])
+        raw = json.dumps({key:value for key, value in snapshot.items()
+            if not key.startswith('maintenance_')}).encode()
+        runtime_control.write_control_bytes_atomic(status_file, raw)
+        snapshot['maintenance_status_file'] = {'path':str(status_file),
+            'bytes':len(raw), 'sha256':hashlib.sha256(raw).hexdigest()}
+        report = maintenance_runtime.read_original_execution(target, original, supervisor_loss_source_only=True)
+        snapshot['maintenance_current_inputs'] = maintenance_runtime.read_current_inputs(target,
+            snapshot['maintenance_status_file'], source_only_proof=report['source_only_proof'])
+        return snapshot
+
+    write = runtime_control.write_control_bytes_atomic
+    def drift_after_validation(path, payload, *args, **kwargs):
+        result = write(path, payload, *args, **kwargs)
+        if tamper in {'replacement', 'content'} and Path(path).name == 'receipt.json' and json.loads(payload)['status'] == 'validated':
+            status_file = root / 'status.json'
+            if tamper == 'replacement':
+                replacement = status_file.with_name('status.replacement.json')
+                replacement.write_bytes(status_file.read_bytes())
+                replacement.chmod(0o600)
+                replacement.replace(status_file)
+            else:
+                write(status_file, status_file.read_bytes() + b'\n')
+        return result
+    monkeypatch.setattr(runtime_control, 'write_control_bytes_atomic', drift_after_validation)
+
+    code = supervisor_loss_recovery.main([*args, *(['--confirm-recovery', 'YES'] if confirmed else [])],
+        check_live=live)
+    result = json.loads(capsys.readouterr().out)
+    assert code == (0 if accepted else 1), result
+    expected_status = ('cleared' if confirmed else 'ready') if accepted else 'blocked'
+    assert result['status'] == expected_status
+    assert result['stop_cleared'] is (accepted and confirmed)
+    assert stop.exists() is not (accepted and confirmed)
+    if stop.exists():
+        assert stop.read_bytes() == stop_before
+    assert result['original_wait_verified'] is False
+    assert result['original_exit_code'] is None
+    assert result['approval_started'] is False
+    assert {path:path.read_bytes() for path in protected} == protected
+    if accepted:
+        assert result['current_status_file']['bytes'] > 1024 * 1024
+        assert result['current_inputs']['status_sha256'] == result['current_status_file']['sha256']
+    with monkeypatch.context() as reader:
+        reader.setenv('OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE', str(root / 'runtime/control/rolling-controller.lock'))
+        observed = read_execution(original.file, owner_task_id=original.owner_task_id,
+            invocation_id=original.file.parent.name, tool_session_id=original.tool_session_id)
+    assert observed['state'] == 'supervisor_lost'
+    assert observed['terminal'] is False
+    assert observed['exit_code'] is None
+
+
 @pytest.mark.parametrize('scenario', [
     'active_supervisor', 'wrong_owner', 'wrong_session', 'unreaped', 'active_cron',
     'other_stop', 'wrong_selection', 'missing_manual', 'writer_artifact', 'frozen_artifact',

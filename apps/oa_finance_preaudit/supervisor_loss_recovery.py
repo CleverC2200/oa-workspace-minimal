@@ -27,7 +27,8 @@ if any(not Path(module.__file__).resolve().is_relative_to(root) for module in
     raise ValueError('supervisor_loss_recovery_selection_untrusted')
 path, digest, selected = sys.argv[1:]
 receipt = Path(path)
-pinned_status = production_release._pinned_control(receipt)
+status_limit = 64 * 1024 * 1024
+pinned_status = production_release._pinned_control(receipt, max_bytes=status_limit)
 if hashlib.sha256(pinned_status[1]).hexdigest() != digest:
     raise ValueError('supervisor_loss_recovery_status_changed')
 snapshot = json.loads(pinned_status[1])
@@ -54,11 +55,12 @@ for item in pending:
         'material.json','review-packet.json','writer-boundary.json','execution-receipt.json',
         'review-decision.json','remark.txt','submission-envelope.json','recovery-receipt.json'))
 def fingerprints():
-    return {str(file):production_release._control_proof(production_release._pinned_control(file, private=False))
+    return {str(file):production_release._control_proof(production_release._pinned_control(file, private=False,
+        max_bytes=status_limit if file == receipt else 1_048_576))
         if os.path.lexists(file) else None for file in sorted(files)}
 before = fingerprints()
 if (reconciliation.latest_states(flows) != states or fingerprints() != before
-        or production_release._pinned_control(receipt) != pinned_status):
+        or production_release._pinned_control(receipt, max_bytes=status_limit) != pinned_status):
     raise ValueError('supervisor_loss_recovery_inputs_changed')
 if list(approval_guard.project_official_errors(root)):
     raise ValueError('supervisor_loss_recovery_official_notice')
