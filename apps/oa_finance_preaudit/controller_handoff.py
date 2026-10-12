@@ -127,6 +127,13 @@ def _read_manifest() -> dict | None:
         "restart_verified",
         "health",
     }
+    if isinstance(value, dict) and "review_configuration" in value:
+        from . import production_config
+        configuration = value["review_configuration"]
+        if (not isinstance(configuration, dict) or configuration.get("provider") not in {"deepseek", "openai"}
+                or configuration != production_config.review_settings(configuration["provider"])):
+            raise ValueError("controller_handoff_untrusted")
+        expected_fields.add("review_configuration")
     if (
         not isinstance(value, dict)
         or set(value) != expected_fields
@@ -436,6 +443,7 @@ def begin(config: Mapping[str, object]) -> dict:
         "code_revision": revision,
         "code_dirty": dirty,
         "config_fingerprint": _config_fingerprint(config),
+        **({"review_configuration": config["review_configuration"]} if "review_configuration" in config else {}),
         "restart_mode": "fresh_process",
         "controller_lock_verified": True,
         "writer_inactive_at_start": True,

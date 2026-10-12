@@ -156,6 +156,7 @@ def test_document_attachment_reference_is_not_reported_as_absent(recorded_invoic
     "small_marketing_fee", "tpm_small_marketing_fee", "general_expense",
 ])
 def test_review_launch_requires_shared_payment_rule(tmp_path, monkeypatch, flow_key):
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "offline-fake-key")
     import io
     from pathlib import Path
 

@@ -22,12 +22,13 @@ from typing import Callable, TextIO
 from apps import json_artifact
 from apps.oa_approval import runtime_control, writer_outcomes
 
-from . import approval_guard, concurrency_control, decision_validation, fuel_trip_observation, manual_handoff, process_diagnostics, review_failure_evidence, review_output, review_context
+from . import approval_guard, concurrency_control, decision_validation, fuel_trip_observation, manual_handoff, process_diagnostics, production_config, review_failure_evidence, review_output, review_context
 from .review_output import parse_json as _parse_decision_json
 
 
-MODEL = review_failure_evidence.MODEL
-REASONING_EFFORT = review_failure_evidence.REASONING_EFFORT
+REVIEW_SETTINGS = production_config.review_settings()
+MODEL = REVIEW_SETTINGS["model"]
+REASONING_EFFORT = REVIEW_SETTINGS["reasoning_effort"]
 OBSERVATION_INTERVAL_SECONDS = 5
 _NATIVE_RECEIPT_MAX_BYTES = 32 * 1024 * 1024
 _NATIVE_RECEIPT_HEADER_MAX_BYTES = 1024 * 1024
@@ -215,9 +216,14 @@ def _reviewer_environment() -> dict[str, str]:
     }
     if not environment.get("HOME") or not environment.get("PATH"):
         raise ValueError("codex_reviewer_environment_invalid")
-    # Native authentication stays in its original credential store. No credential
-    # file or provider key is copied into an attempt or packaging evidence directory.
-    environment["CODEX_HOME"] = environment.get("CODEX_HOME") or str(Path(environment["HOME"]) / ".codex")
+    if REVIEW_SETTINGS["provider"] == "deepseek":
+        key = os.environ.get("OA_REVIEW_API_KEY", "").strip()
+        if not key:
+            raise ValueError("codex_reviewer_api_key_missing")
+        environment.pop("CODEX_HOME", None)
+        environment["OA_REVIEW_API_KEY"] = key
+    else:
+        environment["CODEX_HOME"] = environment.get("CODEX_HOME") or str(Path(environment["HOME"]) / ".codex")
     environment["OCX_SHIM_BYPASS"] = "1"
     return environment
 
@@ -604,7 +610,29 @@ def _codex_command(
         "--config",
         f'model_reasoning_effort="{REASONING_EFFORT}"',
         "--config",
-        'model_provider="openai"',
+        f'model_provider="{REVIEW_SETTINGS["model_provider"]}"',
+        *([
+            "--config",
+            'model_providers.oa_deepseek.name="OA DeepSeek"',
+            "--config",
+            'model_providers.oa_deepseek.base_url="https://api.deepseek.com"',
+            "--config",
+            'model_providers.oa_deepseek.wire_api="responses"',
+            "--config",
+            'model_providers.oa_deepseek.env_key="OA_REVIEW_API_KEY"',
+            "--config",
+            'model_providers.oa_deepseek.requires_openai_auth=false',
+            "--config",
+            'model_providers.oa_deepseek.supports_websockets=false',
+            "--config",
+            'model_providers.oa_deepseek.request_max_retries=0',
+            "--config",
+            'model_providers.oa_deepseek.stream_max_retries=0',
+            "--config",
+            'model_catalog_json=' + json.dumps(str(project_root / production_config.MODEL_CATALOG)),
+            "--config",
+            'web_search="disabled"',
+        ] if REVIEW_SETTINGS["provider"] == "deepseek" else []),
         "--config",
         "features.unbounded_connection_retries=false",
         "--config",
@@ -1120,6 +1148,10 @@ def _execute_codex_raw(
 """
         try:
             reviewer_environment = _reviewer_environment()
+            if REVIEW_SETTINGS["provider"] == "deepseek":
+                reviewer_home = temporary_root / "codex-home"
+                reviewer_home.mkdir(mode=0o700)
+                reviewer_environment["CODEX_HOME"] = str(reviewer_home)
         except (OSError, ValueError) as error:
             output.close()
             return CodexExecution(
@@ -1134,7 +1166,7 @@ def _execute_codex_raw(
         )
         command = _codex_command(project_root, schema_file, decision_file, visual_aux=visual_aux)
         if audit_directory:
-            # Authentication stays native; the isolated DB indexes this review only.
+            # The isolated home and DB contain only this API review's evidence.
             command.remove("--ephemeral")
             command[-1:-1] = ["--config", "sqlite_home=" + json.dumps(str(temporary_root / "native-state")),
                                "--config", "log_dir=" + json.dumps(str(temporary_root / "native-logs"))]
@@ -1687,8 +1719,8 @@ def _base_result(*, attempts: int, usages: list[dict]) -> dict:
         "kind": "preaudit_review_worker_result",
         "model": MODEL,
         "reasoning_effort": REASONING_EFFORT,
-        "model_provider": review_failure_evidence.MODEL_PROVIDER,
-        "requested_service_tier": review_failure_evidence.SERVICE_TIER,
+        "model_provider": REVIEW_SETTINGS["model_provider"],
+        "requested_service_tier": REVIEW_SETTINGS["requested_service_tier"],
         "process_attempts": attempts,
         "process_retries": max(0, attempts - 1),
         "token_usage": _merge_usage(usages),
@@ -1864,8 +1896,8 @@ def _write_agent_timing(
     identity: dict | None = None,
 ) -> bool:
     identity = identity or {"model": MODEL, "reasoning_effort": REASONING_EFFORT,
-                            "model_provider": review_failure_evidence.MODEL_PROVIDER,
-                            "requested_service_tier": review_failure_evidence.SERVICE_TIER}
+                            "model_provider": REVIEW_SETTINGS["model_provider"],
+                            "requested_service_tier": REVIEW_SETTINGS["requested_service_tier"]}
     timing_file = action_file.with_name("agent-timing.json")
     if timing_file.is_symlink():
         return False

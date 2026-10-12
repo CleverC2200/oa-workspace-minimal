@@ -213,6 +213,7 @@ def test_marker_role_or_original_value_tampering_rejected(tmp_path):
 
 
 def test_actual_worker_uses_bound_company_schema_and_preserves_model_comparison(tmp_path, monkeypatch):
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "offline-fake-key")
     from jsonschema import validate
 
     engine = engine_for(tmp_path)

@@ -1103,9 +1103,9 @@ def test_worker_returns_sanitized_success_only_after_bound_receipt(
         "business_state": "needs_human",
         "write_state": "submitted",
         "error_code": None,
-        "model": "gpt-6.1-sol",
-        "reasoning_effort": "medium",
-        "model_provider": "openai",
+        "model": codex_review_worker.MODEL,
+        "reasoning_effort": codex_review_worker.REASONING_EFFORT,
+        "model_provider": review_failure_evidence.MODEL_PROVIDER,
         "requested_service_tier": "default",
         "process_attempts": 1,
         "process_retries": 0,
@@ -1235,19 +1235,21 @@ def test_worker_does_not_retry_timeout_or_changed_action(tmp_path: Path) -> None
     assert action_file.exists()
 
 
-def test_codex_command_pins_openai_medium_standard_and_json_output(tmp_path: Path) -> None:
+def test_codex_command_pins_deepseek_high_and_json_output(tmp_path: Path) -> None:
     command = codex_review_worker._codex_command(
         tmp_path, tmp_path / "schema.json", tmp_path / "decision.json",
     )
-    assert command[command.index("--model") + 1] == "gpt-6.1-sol"
-    assert 'model_reasoning_effort="medium"' in command
-    assert 'model_provider="openai"' in command
+    assert command[command.index("--model") + 1] == "deepseek-flash"
+    assert 'model_reasoning_effort="high"' in command
+    assert 'model_provider="oa_deepseek"' in command
     assert 'service_tier="default"' in command
     assert "--json" in command and "--ephemeral" in command
     assert "--ignore-user-config" in command
     assert "memories.use_memories=false" in command
     assert "memories.generate_memories=false" in command
-    assert not any("deepseek" in argument or "OA_REVIEW_API_KEY" in argument for argument in command)
+    assert 'model_providers.oa_deepseek.env_key="OA_REVIEW_API_KEY"' in command
+    assert 'model_providers.oa_deepseek.requires_openai_auth=false' in command
+    assert 'model_catalog_json=' + json.dumps(str(tmp_path / "config/deepseek-models.json")) in command
     assert not any("model_context_window" in argument for argument in command)
     import tomllib
     profile = next(argument for argument in command if argument.startswith("permissions.oa-reviewer="))
@@ -1487,7 +1489,8 @@ def test_codex_process_receives_only_reviewer_runtime_environment(
 
     def popen(*_args, **kwargs) -> Process:
         captured_environment.update(kwargs["env"])
-        assert kwargs["env"]["CODEX_HOME"] == str(inherited_codex_home)
+        assert kwargs["env"]["CODEX_HOME"] != str(inherited_codex_home)
+        assert not (Path(kwargs["env"]["CODEX_HOME"]) / "auth.json").exists()
         return Process()
 
     monkeypatch.setattr(codex_review_worker.subprocess, "Popen", popen)
@@ -1501,8 +1504,8 @@ def test_codex_process_receives_only_reviewer_runtime_environment(
     assert result.error_code == "codex_process_failed"
     assert captured_environment["HOME"]
     assert captured_environment["PATH"]
-    assert "OA_REVIEW_API_KEY" not in captured_environment
-    assert captured_environment["CODEX_HOME"] == str(inherited_codex_home)
+    assert captured_environment["OA_REVIEW_API_KEY"] == "deepseek-reviewer-key"
+    assert captured_environment["CODEX_HOME"] != str(inherited_codex_home)
     assert "OPENAI_API_KEY" not in captured_environment
     assert "CODEX_API_KEY" not in captured_environment
     assert captured_environment["OCX_SHIM_BYPASS"] == "1"
@@ -1563,7 +1566,7 @@ def test_worker_submits_structured_agent_decision_through_host(
         action_file.with_name("agent-timing.json").read_text(encoding="utf-8")
     )
     assert timing["action_token"] == "test-action-token"
-    assert timing["model"] == "gpt-6.1-sol"
+    assert timing["model"] == "deepseek-flash"
     assert timing["process_attempts"] == 1
     assert "request_id" not in timing
 
@@ -1713,7 +1716,7 @@ def test_bounded_prewrite_failure_persists_bound_receipt(tmp_path: Path, code: s
         "workflow_key": "travel_expense",
         "model": codex_review_worker.MODEL,
         "reasoning_effort": codex_review_worker.REASONING_EFFORT,
-        "model_provider": "openai",
+        "model_provider": review_failure_evidence.MODEL_PROVIDER,
         "requested_service_tier": "default",
         "process_attempts": count,
         "process_retries": count - 1,
@@ -1825,7 +1828,7 @@ def test_parent_completion_persists_timing_and_bound_receipt(
         {
             "status": "reviewed",
             "model": codex_review_worker.MODEL, "reasoning_effort": codex_review_worker.REASONING_EFFORT,
-            "model_provider": "openai", "requested_service_tier": "default",
+            "model_provider": review_failure_evidence.MODEL_PROVIDER, "requested_service_tier": "default",
             "process_attempts": 1,
             "agent_wall_seconds": 12,
             "token_usage": {"status": "unknown"},
@@ -1862,7 +1865,7 @@ def test_parent_completion_can_defer_first_invalid_decision_stop(
         {
             "status": "reviewed",
             "model": codex_review_worker.MODEL, "reasoning_effort": codex_review_worker.REASONING_EFFORT,
-            "model_provider": "openai", "requested_service_tier": "default",
+            "model_provider": review_failure_evidence.MODEL_PROVIDER, "requested_service_tier": "default",
             "process_attempts": 1,
             "agent_wall_seconds": 12,
             "token_usage": {"status": "unknown"},
@@ -1979,7 +1982,7 @@ def test_parent_completion_reports_writer_failure_state(
         {
             "status": "reviewed",
             "model": codex_review_worker.MODEL, "reasoning_effort": codex_review_worker.REASONING_EFFORT,
-            "model_provider": "openai", "requested_service_tier": "default",
+            "model_provider": review_failure_evidence.MODEL_PROVIDER, "requested_service_tier": "default",
             "process_attempts": 1,
             "agent_wall_seconds": 12,
             "token_usage": {"status": "unknown"},
@@ -2191,7 +2194,7 @@ def test_parent_invalid_review_preserves_known_attempts_as_unknown_events(
         {
             "status": "reviewed",
             "model": codex_review_worker.MODEL, "reasoning_effort": codex_review_worker.REASONING_EFFORT,
-            "model_provider": "openai", "requested_service_tier": "default",
+            "model_provider": review_failure_evidence.MODEL_PROVIDER, "requested_service_tier": "default",
             "process_attempts": 2,
             "agent_wall_seconds": 12,
             "token_usage": {"status": "unknown"},
@@ -2416,9 +2419,9 @@ def test_read_only_worker_returns_structured_decision_without_completion(
         "business_state": "needs_human",
         "write_state": "not_requested",
         "error_code": None,
-        "model": "gpt-6.1-sol",
-        "reasoning_effort": "medium",
-        "model_provider": "openai",
+        "model": codex_review_worker.MODEL,
+        "reasoning_effort": codex_review_worker.REASONING_EFFORT,
+        "model_provider": review_failure_evidence.MODEL_PROVIDER,
         "requested_service_tier": "default",
         "process_attempts": 1,
         "process_retries": 0,
@@ -2578,23 +2581,24 @@ def test_tpm_prompt_keeps_passing_conclusions_short_and_direct(tmp_path):
     assert "输出前自检" in prompt
 
 
-def test_reviewer_environment_uses_native_auth_without_provider_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reviewer_environment_isolates_deepseek_key_from_native_auth(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OA_REVIEW_API_KEY", "must-not-leak")
     monkeypatch.setenv("UNRELATED_SECRET", "must-not-leak")
     monkeypatch.setenv("OPENAI_API_KEY", "must-not-leak")
     monkeypatch.setenv("CODEX_API_KEY", "must-not-leak")
     monkeypatch.setenv("CODEX_HOME", "/user/codex/auth")
     environment = codex_review_worker._reviewer_environment()
-    assert environment["CODEX_HOME"] == "/user/codex/auth"
-    assert not {"OA_REVIEW_API_KEY", "UNRELATED_SECRET", "OPENAI_API_KEY", "CODEX_API_KEY"} & environment.keys()
+    assert "CODEX_HOME" not in environment
+    assert environment["OA_REVIEW_API_KEY"] == "must-not-leak"
+    assert not {"UNRELATED_SECRET", "OPENAI_API_KEY", "CODEX_API_KEY"} & environment.keys()
     assert environment["HOME"] and environment["PATH"]
 
 
-def test_reviewer_environment_needs_no_deepseek_key(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reviewer_environment_rejects_missing_deepseek_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("OA_REVIEW_API_KEY", raising=False)
     monkeypatch.delenv("CODEX_HOME", raising=False)
-    environment = codex_review_worker._reviewer_environment()
-    assert environment["CODEX_HOME"] == str(Path(environment["HOME"]) / ".codex")
+    with pytest.raises(ValueError, match="codex_reviewer_api_key_missing"):
+        codex_review_worker._reviewer_environment()
 
 
 def test_legacy_openai_review_evidence_still_validates() -> None:
@@ -2644,6 +2648,7 @@ def test_production_failure_round_uses_existing_controlled_engine(tmp_path, monk
 
 
 @pytest.mark.parametrize("model,effort,accepted", [
+    ("deepseek-flash", "high", True), ("deepseek-flash", "medium", False),
     ("gpt-6.1-sol", "medium", True), ("gpt-6.1-sol", "high", False),
     ("gpt-5.6-terra", "high", True), ("gpt-5.6-terra", "medium", False),
     ("deepseek-v4-flash", "high", True), ("deepseek-v4-flash", "medium", False),
@@ -2655,9 +2660,9 @@ def test_failure_receipt_preserves_model_effort_contract(model, effort, accepted
         attempt_error_codes=["codex_process_failed", "codex_process_failed"],
     )
     receipt.update(model=model, reasoning_effort=effort)
-    if model != "gpt-6.1-sol":
-        receipt.pop("model_provider")
-        receipt.pop("requested_service_tier")
+    receipt.pop("model_provider")
+    receipt.pop("requested_service_tier")
+    receipt.update(review_failure_evidence.MODEL_SETTINGS.get(model, {}))
     original = json.dumps(receipt)
     assert review_failure_evidence.receipt_matches(receipt, action_token="token", workflow_key="travel_expense") is accepted
     assert json.dumps(receipt) == original
@@ -2668,9 +2673,9 @@ def test_current_failure_receipt_records_requested_provider_and_service_tier():
         action_token="token", workflow_key="travel_expense", failure_code="codex_process_failed",
         attempt_error_codes=["codex_process_failed", "codex_process_failed"],
     )
-    assert receipt["model_provider"] == "openai"
+    assert receipt["model_provider"] == "oa_deepseek"
     assert receipt["requested_service_tier"] == "default"
-    for field, value in (("model_provider", "oa_deepseek"), ("requested_service_tier", "priority")):
+    for field, value in (("model_provider", "openai"), ("requested_service_tier", "priority")):
         tampered = {**receipt, field: value}
         assert not review_failure_evidence.receipt_matches(tampered, action_token="token", workflow_key="travel_expense")
 
@@ -2707,7 +2712,7 @@ def test_parent_completion_preserves_legacy_model_identity_in_new_timing(tmp_pat
 
 
 @pytest.mark.parametrize("change", [
-    {"model_provider": "oa_deepseek"}, {"requested_service_tier": "priority"},
+    {"model_provider": "openai"}, {"requested_service_tier": "priority"},
     {"model_provider": None}, {"requested_service_tier": None},
     {"model": "deepseek-v4-flash", "reasoning_effort": "high"},
 ])
@@ -2725,3 +2730,19 @@ def test_parent_completion_rejects_provider_tier_or_mixed_historical_identity(tm
     assert result["error_code"] == "codex_review_result_invalid"
     assert result["write_state"] == "not_requested" and stopped == [True]
     assert not action_file.with_name("agent-timing.json").exists()
+
+
+@pytest.fixture(autouse=True)
+def fake_review_api_key(monkeypatch):
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "offline-fake-key")
+
+
+@pytest.mark.parametrize("key", ["", "   "])
+def test_missing_deepseek_key_never_starts_model_or_uses_native_auth(tmp_path, monkeypatch, key):
+    task, action_file = _task(tmp_path)
+    monkeypatch.setenv("OA_REVIEW_API_KEY", key)
+    monkeypatch.setenv("OPENAI_API_KEY", "unusable-native-key")
+    monkeypatch.setattr(codex_review_worker.subprocess, "Popen", lambda *a, **kw: pytest.fail("model started without DeepSeek key"))
+    result = codex_review_worker._execute_codex(Path(task["project_root"]), action_file, 60)
+    assert result.error_code == "codex_process_start_failed"
+    assert result.process_state == "start_failed"

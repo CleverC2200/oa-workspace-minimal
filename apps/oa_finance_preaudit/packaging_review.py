@@ -221,7 +221,8 @@ def review(action_file: Path, *, project_root: Path = PROJECT_ROOT, timeout_seco
             'evidence_directory': str(directory),
             'tool_receipt_files': stderr.get('tool_receipt_files', []),
             'model': worker.MODEL, 'reasoning_effort': worker.REASONING_EFFORT,
-            'model_provider': 'openai', 'requested_service_tier': 'default',
+            'model_provider': worker.REVIEW_SETTINGS['model_provider'],
+            'requested_service_tier': worker.REVIEW_SETTINGS['requested_service_tier'],
             'contract_validation': contract_validation,
             'decision_validation_code': validation_code,
 

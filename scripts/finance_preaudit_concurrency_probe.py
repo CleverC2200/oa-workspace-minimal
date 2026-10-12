@@ -4404,6 +4404,7 @@ def run_rolling_drain(
                     "max_capacity": max_capacity,
                     "model": codex_review_worker.MODEL,
                     "reasoning_effort": codex_review_worker.REASONING_EFFORT,
+                    "review_configuration": codex_review_worker.REVIEW_SETTINGS,
                     "prepare_capacity": 1,
                     "prepare_timeout_seconds": 300,
                     "review_timeout_seconds": 960,
