@@ -1,6 +1,6 @@
 # 生产源码发布门
 
-开发改动合并远端后，生产仍需要独立授权的源码同步。统一入口是 `apps.oa_finance_preaudit.production_release`；默认只读预检，`--confirm-sync YES` 才请求更新源码。两种模式都不提交审批、不改停止标记、不启停自动化、不安装依赖、不自动 fetch。
+开发改动合并远端后，生产仍需要独立授权的源码同步。统一入口是 `apps.oa_finance_preaudit.production_release`；默认只读预检，`--confirm-sync YES` 才请求更新源码。各模式都不提交审批、不改停止标记、不启停自动化、不安装依赖、不自动 fetch。
 
 先现场核实目标为生产克隆的唯一干净 `main`，明确预期远端提交、生产项目 ID，以及本轮应保留的实际调度频率。授权范围内 fetch 后，从已审查的开发候选执行下列入口。`--automation-file` 使用本机原自动化 TOML；不得把它、凭据或现场业务证据提交到仓库。
 
@@ -40,4 +40,20 @@ python -m apps.oa_finance_preaudit.production_release \
 
 任一末尾检查失败，回执保留实际更新状态及新鲜的停止门和 cron 观测。文件不可信时明确 untrusted，调度无法核实时明确 unknown；不自动回滚、重试、改标记或恢复调度。
 
-两种发布模式的成功回执均区分 `ready` 和 `synced`，记录更新前后 SHA、完整状态证据引用及 continuation，明确 `write_state=not_requested`、`production_acceptance=not_verified`。若快进尝试后的检查失败，API 和命令均返回 blocked、原细码、before_revision、after_revision、requested_revision，以及 source_sync_state=updated/not_updated/unknown；读取 HEAD 失败时明确 unknown。next_process_ready=false、production_acceptance=not_verified 保持，不能把失败当作未更新，也不能自动回滚、重试或提交。普通发布只有源码同步和末尾检查通过，下一轮新进程才具备加载条件；停机维护始终保持 next_process_ready=false。实际生产恢复仍须独立授权、该轮版本、运行及提交后查证据。
+各发布模式的成功回执均区分 `ready` 和 `synced`，记录更新前后 SHA、完整状态证据引用及 continuation，明确 `write_state=not_requested`、`production_acceptance=not_verified`。若快进尝试后的检查失败，API 和命令均返回 blocked、原细码、before_revision、after_revision、requested_revision，以及 source_sync_state=updated/not_updated/unknown；读取 HEAD 失败时明确 unknown。next_process_ready=false、production_acceptance=not_verified 保持，不能把失败当作未更新，也不能自动回滚、重试或提交。普通发布只有源码同步和末尾检查通过，下一轮新进程才具备加载条件；停机维护始终保持 next_process_ready=false。实际生产恢复仍须独立授权、该轮版本、运行及提交后查证据。
+
+## 失去监督后仅同步源码
+
+原监督者退出且真实 wait 无法恢复时，不得修改 waiting 回执或补造退出码。只有当前明确授权保留未知终态、暂停调度、停止门与历史对账阻断的源码维护，才在上述停机参数之外追加：
+
+```bash
+  --supervisor-loss-source-only YES
+```
+
+该参数必须与 `--stopped-maintenance YES` 同时使用；不提供时仍执行原有真实终态门禁。目标自己的原回执读取器必须核验 owner、invocation、真实 tool session，以及同轮 rolling/mirror manifest 的 failed、children_reaped 和代码修订。原监督者 PID、同轮 controller PID/进程组、登记 readonly worker/pool 和全局模型槽位都必须已退出，未登记完的启动意图也拒绝。标记 closed 的模型槽位还要核对实际 PID/进程组，不能仅凭槽位状态证明回收。官方冷却记录存在时拒绝，不清冷却、不做可用性探测。
+
+固定只读桥接仅使用已安装在目标中的校验器，绑定同轮 progress 的项目、控制器身份和 action 列表。原 execution、tool-session、rolling/mirror manifest、stdout/stderr、progress、worker/pool、模型槽位及同轮 action/state/manual receipt 的文件身份和哈希在快进前后必须相同。同内容替换也阻断。日志哈希标为 `observed_after_supervisor_loss`，表示丢失监督后的现场观测，不冒充原监督者封存的 wait 留证；不输出日志正文。
+
+当前身份、OA/web 认证、授权、其他冻结材料、Controller/Writer 空闲和配置门禁保持。历史对账只允许保留同轮 progress 登记的采集取消：`material_collection_failed`、`failure_detail_code=oa_run_stopped`，完整且验证通过的 controller-scope manual receipt，write_state=not_requested，无 Writer、执行、意见、提交产物及冻结材料。只有这些取消造成的 `pending_failure_not_isolated` 可以留作源码维护例外；数量须与当前待办隔离及 continuation 相符。其他 controller 失败、未知写入或对账阻断仍拒绝。程序不改变原 continuation、失败 state、隔离回执或 attempt，也不把取消列入单据隔离白名单。
+
+成功回执增加 `supervisor_loss_source_only=true`、`original_wait_verified=false`、`approval_recovery_allowed=false`、`original_evidence_preserved=true`。原 exit_code 仍为 null，原 execution 仍非 terminal，业务 continuation 仍可 blocked。源码同步不闭合原执行，也不解除历史业务阻断。末尾留证无法验证时 `original_evidence_preserved=unknown`，同时保留源码是否已经更新的真实状态。恢复审批需要独立授权和独立恢复合同，不能使用本源码维护回执代替。
