@@ -157,6 +157,11 @@ def heartbeat(run_id: str | None, instance: str | None, actions: set[Path], dead
     if (value is None or value.get("controller_instance_id") != instance
             or value.get("controller", {}).get("pid") != os.getpid()):
         raise ValueError("approval_run_untrusted")
+    now = time.time()
+    if now - value.get("execution_owner_checked_at", 0) >= guard.OBSERVATION_SECONDS:
+        if not guard.execution_owners_alive():
+            runtime_control.request_stop("codex_review_technical_failure")
+        value["execution_owner_checked_at"] = now
     guard.write(path, {**value, "heartbeat_at": time.time(), "actions": sorted({*value["actions"], *(str(path) for path in actions)}),
                        "phase_deadlines": deadlines, "writer_active": writer_active})
 

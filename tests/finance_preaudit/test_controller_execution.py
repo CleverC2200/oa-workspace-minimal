@@ -208,7 +208,8 @@ def test_main_loads_control_paths_before_selecting_evidence_directory(tmp_path, 
     monkeypatch.setattr(finance_preaudit_run.auth, 'load_local_env', lambda: monkeypatch.setenv(
         'OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE', str(tmp_path / 'configured.lock')))
     captured = []
-    def fake(command, *, directory, owner_task_id):
+    def fake(command, *, directory, owner_task_id, detached):
+        assert detached is True
         captured.append(directory)
         return {'result': 'completed'}
     monkeypatch.setattr(finance_preaudit_run, 'supervise', fake)
@@ -243,7 +244,8 @@ def test_verified_startup_skip_stays_terminal_when_live_gate_changes(tmp_path, m
         monkeypatch.setattr(runner.approval_lifecycle, '_progress', lambda _: {'controller': {'pid': 123}})
         monkeypatch.setattr(runtime_control, 'controller_active', lambda: True)
         monkeypatch.setattr(runtime_control, 'controller_owner_pid', lambda: 123)
-        monkeypatch.setattr(runner.approval_guard, 'process_identity', lambda _: {'pid': 123})
+        identity = runner.approval_guard.process_identity
+        monkeypatch.setattr(runner.approval_guard, 'process_identity', lambda pid: {'pid': 123} if pid == 123 else identity(pid))
     owner = str(uuid4()); directory = tmp_path / 'executions' / uuid4().hex
     receipt = runner.supervise([sys.executable, '-c', 'print(' + repr(json.dumps(payload)) + ')'],
                                directory=directory, owner_task_id=owner)

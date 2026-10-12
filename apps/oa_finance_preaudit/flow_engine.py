@@ -17,7 +17,7 @@ from typing import Callable, Iterable
 import fitz
 
 from apps import json_artifact
-from apps.oa_approval import writer_outcomes
+from apps.oa_approval import runtime_control, writer_outcomes
 
 from . import company_comparison, fuel_trip_observation, decision_validation, item_failure, manual_handoff, observability, packaging_contract, review_failure_evidence, submission, tpm_price_reference
 
@@ -3075,6 +3075,14 @@ class FlowEngine:
                     raise ValueError("material_workflow_mismatch")
                 _validate_flow_material(workflow_key, material)
             except Exception as error:
+                if (str(error) == runtime_control.STOP_CODE and runtime_control.stop_requested()
+                        and _read_object(state_path, code="persistent_state_invalid") == claim
+                        and not any(os.path.lexists(attempt_root / name) for name in (
+                            "writer-boundary.json", "execution-receipt.json", "review-decision.json",
+                            "remark.txt", "submission-envelope.json",
+                        ))):
+                    # Cancellation leaves the original claim for fresh collection, not material-failure isolation.
+                    raise
                 failure_code = _stable_error_code(
                     error,
                     _HARD_COLLECTION_FAILURE_CODES,

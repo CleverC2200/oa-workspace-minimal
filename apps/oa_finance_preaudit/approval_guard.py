@@ -26,6 +26,7 @@ STOP_REASON = "codex_official_error_cooldown"
 RUN_ENV = "OA_APPROVAL_RUN_ID"
 INSTANCE_ENV = "OA_APPROVAL_INSTANCE_ID"
 OWNER_ENV = "OA_APPROVAL_OWNER_TASK_ID"
+EXECUTION_OWNERS_ENV = "OA_APPROVAL_EXECUTION_OWNERS"
 NOTICE_CODES = frozenset({"usage_limit", "model_unavailable", "rate_limit", "server_overloaded", "authentication"})
 
 
@@ -180,7 +181,7 @@ def process_identity(pid: int) -> dict | None:
         raise ValueError("approval_process_untrusted")
     # Preserve a real local ps even when tests replace model Popen with a double.
     try:
-        with _identity_popen(["ps", "-p", str(pid), "-o", "lstart=", "-o", "pgid=", "-o", "uid="],
+        with _identity_popen(["ps", "-p", str(pid), "-o", "lstart=", "-o", "pgid=", "-o", "uid=", "-o", "stat="],
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
                              env={**os.environ, "LC_ALL": "C"}) as process:
             try:
@@ -192,8 +193,10 @@ def process_identity(pid: int) -> dict | None:
         fields = text.split()
         if process.returncode == 1 and not fields:
             return None
-        if process.returncode != 0 or len(fields) != 7:
+        if process.returncode != 0 or len(fields) != 8:
             raise ValueError("approval_process_untrusted")
+        if fields[7].startswith("Z"):
+            return None
         return {"pid": pid, "birth": " ".join(fields[:5]), "pgid": int(fields[5]), "uid": int(fields[6])}
     except (OSError, subprocess.SubprocessError) as error:
         raise ValueError("approval_process_untrusted") from error
@@ -272,11 +275,33 @@ def _close_slot(value: dict) -> None:
 
 
 def assert_admission() -> None:
+    with runtime_control.stop_control_lease():
+        _assert_admission_locked()
+
+
+def _assert_admission_locked() -> None:
     value = cooldown()
     if value and time.time() < value["blocked_until"]:
         raise ValueError("approval_model_cooldown")
     if runtime_control.stop_requested():
         raise ValueError("stop_requested")
+    if not execution_owners_alive():
+        runtime_control._write_stop_locked("codex_review_technical_failure")
+        raise ValueError("approval_execution_owner_lost")
+
+
+def execution_owners_alive() -> bool:
+    raw = os.environ.get(EXECUTION_OWNERS_ENV)
+    if raw is None:
+        return True
+    try:
+        if len(raw) > 4096:
+            return False
+        owners = json.loads(raw)
+        return (isinstance(owners, list) and 1 <= len(owners) <= 3
+                and all(_valid_identity(owner) and process_identity(owner["pid"]) == owner for owner in owners))
+    except (ValueError, TypeError, OSError):
+        return False
 
 
 @contextmanager
@@ -286,7 +311,7 @@ def model_slot(action_file: Path, project_root: Path, timeout_seconds: float) ->
         raise ValueError("approval_process_untrusted")
     value = None
     with runtime_control.stop_control_lease():
-        assert_admission()
+        _assert_admission_locked()
         for index in range(MAX_MODEL_WORKERS):
             previous = _slot(index)
             if previous is None or previous["state"] == "closed":
