@@ -43,6 +43,28 @@ def arguments():
     return result
 
 
+def foreign_startup(root):
+    code = '''from pathlib import Path
+from apps.oa_finance_preaudit import approval_guard as guard, approval_lifecycle
+guard.time.time=lambda: guard.cooldown()['blocked_until']+1
+try:
+ approval_lifecycle.startup(Path.cwd(),observe_errors=False)
+except ValueError as error:
+ print(str(error))
+else:
+ raise SystemExit('unexpected second startup')'''
+    result = subprocess.run([sys.executable, "-B", "-c", code], cwd=root,
+                            capture_output=True, text=True, check=True)
+    assert result.stdout.strip().startswith("approval_cooldown_override_")
+
+
+def test_raw_controller_cannot_copy_wrapper_bootstrap_even_after_expiry(stopped):
+    root, original, _calls = stopped
+    with cooldown_override.one_round(root, owner_task_id=str(uuid4()), invocation_id=uuid4().hex, original=original):
+        foreign_startup(root)
+        guard.assert_admission()
+
+
 def test_override_only_allows_owned_invocation_and_preserves_original_evidence(stopped):
     root, original, calls = stopped
     owner, invocation = str(uuid4()), uuid4().hex
@@ -149,16 +171,42 @@ def test_public_cli_binds_real_wait_receipt_to_waiver_and_rejects_audit_drift(st
     receipts = []
     def supervised(_command, **options):
         # A real local child checks admission with the inherited waiver, then publishes its own terminal mirror.
-        code = '''import os,json,datetime
+        code = r'''import os,json,datetime,subprocess,sys
 from pathlib import Path
-from apps.oa_finance_preaudit import approval_guard
+from apps.oa_approval import runtime_control
+from apps.oa_finance_preaudit import approval_guard, approval_lifecycle
 approval_guard.assert_admission()
-Path(os.environ['OA_CONTROLLER_EXECUTION_MANIFEST_FILE']).write_text(json.dumps({
+manifest={
  'kind':'preaudit_controller_run_manifest','controller_pid':os.getpid(),
- 'run_id':'d'*32,'controller_instance_id':'e'*32,'state':'completed','children_reaped':True,
- 'code_revision':'f'*40,'started_at':datetime.datetime.now(datetime.timezone.utc).isoformat()}))'''
+ 'run_id':'d'*32,'controller_instance_id':'e'*32,'state':'running','children_reaped':False,
+ 'code_revision':'f'*40,'started_at':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+mirror=Path(os.environ['OA_CONTROLLER_EXECUTION_MANIFEST_FILE'])
+mirror.write_text(json.dumps(manifest))
+with runtime_control.global_controller_lease(), approval_lifecycle.run_scope(manifest,Path.cwd()):
+ approval_guard.assert_admission()
+ worker_code="""from apps.oa_finance_preaudit import approval_guard as guard, approval_lifecycle as lifecycle
+lifecycle.register_readonly_worker('review',lifecycle.context())
+guard.assert_admission()
+"""
+ subprocess.run([sys.executable,'-B','-c',worker_code],check=True,start_new_session=True)
+ unregistered="""from apps.oa_finance_preaudit import approval_guard as guard
+try: guard.assert_admission()
+except ValueError: pass
+else: raise SystemExit('unregistered worker admitted')
+"""
+ subprocess.run([sys.executable,'-B','-c',unregistered],check=True,start_new_session=True)
+manifest.update(state='completed',children_reaped=True)
+mirror.write_text(json.dumps(manifest))
+try: approval_guard.assert_admission()
+except ValueError as error: assert str(error)=='approval_cooldown_override_consumed'
+else: raise SystemExit('same controller reused completed invocation')
+'''
         result = original_supervise([sys.executable, "-B", "-c", code], **options)
         receipts.append(result)
+        # The original wrapper is still alive; completed invocation cannot be consumed again.
+        foreign_startup(root)
+        with pytest.raises(ValueError, match="approval_cooldown_override_consumed"):
+            guard.assert_admission()
         return result
     monkeypatch.setattr(finance_preaudit_run, "supervise", supervised)
     monkeypatch.setattr(finance_preaudit_run.auth, "load_local_env", lambda: None)

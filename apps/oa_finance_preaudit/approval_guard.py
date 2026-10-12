@@ -298,7 +298,8 @@ def assert_admission() -> None:
 
 def _assert_admission_locked() -> None:
     value = cooldown()
-    if value and time.time() < value["blocked_until"] and not cooldown_ignored(value):
+    ignored = cooldown_ignored(value)
+    if value and time.time() < value["blocked_until"] and not ignored:
         raise ValueError("approval_model_cooldown")
     if runtime_control.stop_requested():
         raise ValueError("stop_requested")

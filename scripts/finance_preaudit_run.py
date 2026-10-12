@@ -208,6 +208,10 @@ def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str
         if supervisor is not None and (not approval_guard._valid_identity(supervisor)
                 or supervisor["pid"] != receipt.get("supervisor_pid")):
             raise ValueError("controller_execution_evidence_failed")
+        controller = receipt.get("controller_process")
+        if controller is not None and (not approval_guard._valid_identity(controller)
+                or controller["pid"] != receipt.get("controller_pid")):
+            raise ValueError("controller_execution_evidence_failed")
         supervisor_alive = (approval_guard.process_identity(supervisor["pid"]) == supervisor
                             if supervisor is not None else _process_alive(receipt.get("supervisor_pid")))
         if state in {"starting", "waiting"} and not supervisor_alive:
@@ -444,7 +448,7 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str,
     override = os.environ.get(approval_guard.COOLDOWN_OVERRIDE_ENV)
     if override is not None:
         override_path = approval_guard.directory() / "cooldown-overrides" / f"{directory.name}.json"
-        if override != str(override_path) or not approval_guard.cooldown_ignored(approval_guard.cooldown()):
+        if override != str(override_path):
             raise ValueError("controller_execution_override_mismatch")
         receipt["cooldown_override"] = {"path": override, "sha256": hashlib.sha256(_read_evidence(override_path)).hexdigest()}
 
@@ -510,6 +514,8 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str,
 
     try:
         persist()
+        if override is not None and not approval_guard.cooldown_ignored(approval_guard.cooldown()):
+            raise ValueError("controller_execution_override_mismatch")
         for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             handlers[signum] = signal.signal(signum, forward)
         environment = {**os.environ, MANIFEST_ENV: str(manifest_file), approval_guard.OWNER_ENV: owner_task_id}
@@ -529,7 +535,8 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str,
             except OSError as error:
                 receipt.update(state="start_failed", error_type=type(error).__name__, completed_at=_now())
             else:
-                receipt.update(state="waiting", controller_pid=process.pid, process_group_id=process.pid)
+                receipt.update(state="waiting", controller_pid=process.pid, process_group_id=process.pid,
+                               controller_process=approval_guard.process_identity(process.pid))
                 persist()
                 print(json.dumps({"state": "waiting", "receipt_file": str(receipt_file),
                                   "owner_task_id": owner_task_id, "controller_pid": process.pid}), flush=True)

@@ -230,6 +230,8 @@ def interrupt_unwritten(manifest: dict, *, cause: str) -> int:
 
 def startup(project_root: Path, *, observe_errors: bool = True) -> dict:
     """No model/OA requests. Unknown ownership blocks, never authorizes killing."""
+    if guard.COOLDOWN_OVERRIDE_ENV in os.environ:
+        guard.cooldown_ignored(guard.cooldown())
     if observe_errors:
         guard.observe_project_errors(project_root)
     manifest = controller_handoff._read_manifest()

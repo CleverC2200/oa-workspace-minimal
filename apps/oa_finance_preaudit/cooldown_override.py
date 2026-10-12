@@ -53,7 +53,55 @@ def matches(value: dict) -> bool:
             or any(not guard._valid_identity(owner) for owner in audit["owners"])):
         raise ValueError("approval_cooldown_override_untrusted")
     if any(guard.process_identity(owner["pid"]) != owner for owner in audit["owners"]):
-        return False
+        raise ValueError("approval_cooldown_override_owner_lost")
+    execution_directory = Path(audit["manifest_file"]).parent
+    caller = guard.process_identity(os.getpid())
+    if not execution_directory.exists():
+        # Bootstrap is only for the original wrapper; mkdir(O_EXCL) permanently consumes it.
+        if caller != audit["owners"][0]:
+            raise ValueError("approval_cooldown_override_process_untrusted")
+    else:
+        execution = guard.read(execution_directory / "execution.json")
+        audit_raw = runtime_control.read_control_bytes(path)
+        if (execution is None or execution.get("kind") != "preaudit_controller_execution"
+                or execution.get("invocation_id") != path.stem
+                or execution.get("owner_task_id") != audit["owner_task_id"]
+                or execution.get("state") not in {"starting", "waiting"}
+                or execution.get("owner_parent_pid") != audit["owners"][0]["pid"]
+                or execution.get("cooldown_override") != {"path": str(path), "sha256": hashlib.sha256(audit_raw).hexdigest()}
+                or not guard._valid_identity(execution.get("supervisor_process"))
+                or guard.process_identity(execution["supervisor_process"]["pid"]) != execution["supervisor_process"]):
+            raise ValueError("approval_cooldown_override_consumed")
+        supervisor = execution["supervisor_process"]
+        if caller != supervisor:
+            controller = execution.get("controller_process")
+            if controller is None and execution["state"] == "starting":
+                # Only the supervisor's direct child may cross the Popen/receipt publication window.
+                if os.getppid() != supervisor["pid"]:
+                    raise ValueError("approval_cooldown_override_process_untrusted")
+            else:
+                if (not guard._valid_identity(controller)
+                        or controller["pid"] != execution.get("controller_pid")
+                        or guard.process_identity(controller["pid"]) != controller):
+                    raise ValueError("approval_cooldown_override_process_untrusted")
+                manifest = guard.read(Path(audit["manifest_file"]))
+                if caller == controller and os.environ.get(guard.RUN_ENV) is None:
+                    if manifest is not None:
+                        raise ValueError("approval_cooldown_override_consumed")
+                else:
+                    if (manifest is None or manifest.get("state") != "running"
+                            or manifest.get("controller_pid") != controller["pid"]
+                            or manifest.get("run_id") != os.environ.get(guard.RUN_ENV)
+                            or manifest.get("controller_instance_id") != os.environ.get(guard.INSTANCE_ENV)):
+                        raise ValueError("approval_cooldown_override_run_untrusted")
+                    if caller != controller:
+                        worker = guard.read(guard.directory() / "runs" / manifest["run_id"] / f"worker-{os.getpid()}.json")
+                        if (worker is None or worker.get("kind") != "approval_readonly_worker"
+                                or worker.get("role") not in {"prepare", "review"}
+                                or worker.get("process") != caller or worker.get("controller") != controller
+                                or worker.get("run_id") != manifest["run_id"]
+                                or worker.get("controller_instance_id") != manifest["controller_instance_id"]):
+                            raise ValueError("approval_cooldown_override_worker_untrusted")
     pinned = production_release._pinned_control(guard.directory() / "cooldown.json")
     return (audit.get("cooldown") == value
             and audit.get("cooldown_identity") == list(pinned[0])
