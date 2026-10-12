@@ -76,10 +76,23 @@ report = finance_preaudit_run.read_execution(Path(path), owner_task_id=owner,
 '''
 
 
-_SUPERVISOR_LOSS_READER = r'''
+_HISTORICAL_STOP_VALIDATOR = r'''
+def historical_stopped_collection(attempt, state):
+    if state.get('execution_state') != 'needs_admin' or state.get('failure_detail_code') != 'oa_run_stopped':
+        return False
+    receipt = item_failure.verified_receipt(attempt, state)
+    return (receipt is not None and receipt['scope'] == 'controller'
+        and item_failure.material_failure_without_write(attempt, state)
+        and all(state.get(key) is None for key in ('material_file', 'review_packet_file',
+            'material_fingerprint', 'evidence_fingerprint'))
+        and not any(os.path.lexists(attempt / name) for name in ('material.json', 'review-packet.json')))
+'''
+
+
+_SUPERVISOR_LOSS_READER = _HISTORICAL_STOP_VALIDATOR + r'''
 import os, stat
-from apps.oa_finance_preaudit import approval_guard as guard, approval_lifecycle as lifecycle
-if any(not Path(module.__file__).resolve().is_relative_to(root) for module in (guard, lifecycle)):
+from apps.oa_finance_preaudit import approval_guard as guard, approval_lifecycle as lifecycle, item_failure, reconciliation
+if any(not Path(module.__file__).resolve().is_relative_to(root) for module in (guard, lifecycle, item_failure, reconciliation)):
     raise ValueError('maintenance_original_execution_untrusted')
 path = Path(path)
 saved = json.loads(finance_preaudit_run._read_evidence(path))
@@ -106,12 +119,23 @@ if any(slot and slot.get('pid') is not None and
     raise ValueError('maintenance_original_process_active')
 run = lifecycle.run_directory(mirror['run_id'])
 
+def historical_actions():
+    flows = root / 'runtime/finance_preaudit_flows'
+    actions = []
+    for state in reconciliation.latest_states(flows):
+        attempt = flows / state['workflow_key'] / 'cases' / state['case_key'] / ('attempt-' + str(state['attempt']))
+        if historical_stopped_collection(attempt, state):
+            actions.append(str(attempt / 'action.json'))
+    return sorted(actions)
+
+historical = historical_actions()
+
 def evidence_paths():
     return sorted({path, path.with_name('tool-session.json'), path.with_name('controller-manifest.json'),
         path.with_name('stdout.log'), path.with_name('stderr.log'), rolling, run/'progress.json',
         *run.glob('pool-*.json'), *run.glob('worker-*.json'),
         *(guard._slot_path(index) for index in range(guard.MAX_MODEL_WORKERS)),
-        *(Path(action).with_name(name) for action in progress['actions']
+        *(Path(action).with_name(name) for action in [*progress['actions'], *historical]
             for name in ('action.json', 'state.json', 'manual-review-receipt.json'))})
 
 def fingerprint(file):
@@ -139,6 +163,7 @@ if (any(fingerprints[str(file)] is None for file in required)
         or mirror != json.loads(finance_preaudit_run._read_evidence(path.with_name('controller-manifest.json')))
         or mirror != json.loads(finance_preaudit_run._read_evidence(rolling))
         or progress != lifecycle._progress(mirror)
+        or historical != historical_actions()
         or report != finance_preaudit_run.read_execution(path, owner_task_id=owner,
             invocation_id=path.parent.name, tool_session_id=session)):
     raise ValueError('maintenance_original_execution_untrusted')
@@ -147,7 +172,8 @@ report['source_only_proof'] = {'kind':'preaudit_supervisor_loss_source_only','re
     'target_root':str(root),'run_id':mirror['run_id'],
     'controller_instance_id':mirror['controller_instance_id'],
     'readonly_reaped':True,'models_reaped':True,'supervisor_absent':True,'cooldown_clear':True,
-    'actions':progress['actions'],'evidence_files':fingerprints}
+    'actions':progress['actions'],'historical_stopped_actions':historical,
+    'historical_stop_attribution':'not_verified','evidence_files':fingerprints}
 '''
 
 
@@ -214,6 +240,8 @@ def assert_original_execution_safe(target_root: Path, original: OriginalExecutio
                     or any(proof.get(key) is not True for key in
                         ('readonly_reaped', 'models_reaped', 'supervisor_absent', 'cooldown_clear'))
                     or not isinstance(proof.get('actions'), list)
+                    or not isinstance(proof.get('historical_stopped_actions'), list)
+                    or proof.get('historical_stop_attribution') != 'not_verified'
                     or not isinstance(proof.get('evidence_files'), dict) or not proof['evidence_files']):
                 raise RuntimeError('maintenance_original_execution_untrusted')
         elif (report.get('state') != 'exited' or report.get('terminal') is not True
@@ -312,7 +340,7 @@ def assert_live_safe(payload: dict, *, maintenance_leases_held: bool = True,
         if (not isinstance(continuation, dict) or not isinstance(quarantine, dict)
                 or not isinstance(preserved, list) or any(not isinstance(path, str) for path in preserved)
                 or len(set(preserved)) != len(preserved)
-                or not set(preserved).issubset(source_only_proof.get('actions', []))):
+                or not set(preserved).issubset(source_only_proof.get('historical_stopped_actions', []))):
             raise RuntimeError('maintenance_reconciliation_untrusted')
         quarantined = quarantine.get('pending_quarantined')
         if preserved:
@@ -364,7 +392,7 @@ def assert_live_safe(payload: dict, *, maintenance_leases_held: bool = True,
 
 # This fixed bridge imports only validators already installed in the target tree.
 # It never calls an OA port, renews a grant, persists state, or imports candidate code.
-_CURRENT_INPUTS_READER = r'''
+_CURRENT_INPUTS_READER = _HISTORICAL_STOP_VALIDATOR + r'''
 import hashlib, json, os, stat, sys
 from pathlib import Path
 from apps.oa_approval import auth
@@ -492,14 +520,8 @@ try:
         elif state['execution_state'] == 'needs_admin':
             isolated = item_failure.isolated(attempt, state)
             stopped_collection = False
-            if source_only is not None and str(attempt / 'action.json') in source_only['actions']:
-                receipt = item_failure.verified_receipt(attempt, state)
-                stopped_collection = (receipt is not None and receipt['scope'] == 'controller'
-                    and state.get('failure_detail_code') == 'oa_run_stopped'
-                    and item_failure.material_failure_without_write(attempt, state)
-                    and all(state.get(key) is None for key in ('material_file', 'review_packet_file',
-                        'material_fingerprint', 'evidence_fingerprint'))
-                    and not any(os.path.lexists(attempt / name) for name in ('material.json', 'review-packet.json')))
+            if source_only is not None and str(attempt / 'action.json') in source_only['historical_stopped_actions']:
+                stopped_collection = historical_stopped_collection(attempt, state)
             if not (isolated or reconciliation._trusted_quarantine(flows, state) or stopped_collection):
                 raise ValueError()
             if stopped_collection:

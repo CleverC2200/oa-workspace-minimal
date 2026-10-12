@@ -183,8 +183,14 @@ def current_snapshot(root, original, action):
     return snapshot
 
 
-def test_public_release_source_only_sync_preserves_unknown_wait_blocker_and_controls(source_only_production):
+@pytest.mark.parametrize('progress_bound', [True, False])
+def test_public_release_source_only_sync_preserves_unknown_wait_blocker_and_controls(source_only_production, progress_bound):
     root, original, action, before, expected, remote, cron = source_only_production
+    if not progress_bound:
+        progress_file = root / ('runtime/control/approval-guard/runs/' + 'a' * 32 + '/progress.json')
+        progress = json.loads(progress_file.read_bytes())
+        progress['actions'] = []
+        runtime_control.write_control_bytes_atomic(progress_file, json.dumps(progress).encode())
     stop = root / 'runtime/stop-preaudit.flag'
     before_files = {path: path.read_bytes() for path in (*original.file.parent.iterdir(),
         action, action.with_name('state.json'), action.with_name('manual-review-receipt.json'), stop, cron.file)}
@@ -202,6 +208,9 @@ def test_public_release_source_only_sync_preserves_unknown_wait_blocker_and_cont
     assert result['original_wait_verified'] is False
     assert result['approval_recovery_allowed'] is False
     assert result['original_evidence_preserved'] is True
+    assert result['original_execution']['source_only_proof']['historical_stop_attribution'] == 'not_verified'
+    assert result['original_execution']['source_only_proof']['historical_stopped_actions'] == [str(action)]
+    assert result['original_execution']['source_only_proof']['actions'] == ([str(action)] if progress_bound else [])
     assert result['continuation']['status'] == 'blocked'
     assert result['original_execution']['exit_code'] is None
     assert result['stop_preserved'] is True
@@ -210,11 +219,15 @@ def test_public_release_source_only_sync_preserves_unknown_wait_blocker_and_cont
 
 
 @pytest.mark.parametrize('scenario', ['active_supervisor', 'wrong_session', 'unreaped_controller',
-    'other_failure', 'missing_manual_receipt', 'writer_artifact', 'unbound_action',
+    'other_failure', 'missing_manual_receipt', 'writer_artifact', 'frozen_artifact', 'receipt_automatic_retry',
     'unknown_write', 'other_continuation_block', 'active_cron', 'manual_stop', 'default_mode'])
 def test_source_only_rejects_untrusted_loss_or_business_conditions_without_updating(source_only_production, scenario):
     from apps.oa_finance_preaudit import item_failure
     root, original, action, before, expected, remote, cron = source_only_production
+    progress_file = root / ('runtime/control/approval-guard/runs/' + 'a' * 32 + '/progress.json')
+    progress = json.loads(progress_file.read_bytes())
+    progress['actions'] = []
+    runtime_control.write_control_bytes_atomic(progress_file, json.dumps(progress).encode())
     if scenario == 'active_supervisor':
         saved = json.loads(original.file.read_bytes())
         saved['supervisor_pid'] = os.getpid()
@@ -239,11 +252,13 @@ def test_source_only_rejects_untrusted_loss_or_business_conditions_without_updat
         action.with_name('manual-review-receipt.json').unlink()
     elif scenario == 'writer_artifact':
         runtime_control.write_control_bytes_atomic(action.with_name('writer-boundary.json'), b'{}')
-    elif scenario == 'unbound_action':
-        progress_file = root / ('runtime/control/approval-guard/runs/' + 'a' * 32 + '/progress.json')
-        progress = json.loads(progress_file.read_bytes())
-        progress['actions'] = []
-        runtime_control.write_control_bytes_atomic(progress_file, json.dumps(progress).encode())
+    elif scenario == 'frozen_artifact':
+        runtime_control.write_control_bytes_atomic(action.with_name('material.json'), b'{}')
+    elif scenario == 'receipt_automatic_retry':
+        path = action.with_name('manual-review-receipt.json')
+        receipt = json.loads(path.read_bytes())
+        receipt['automatic_retry'] = True
+        runtime_control.write_control_bytes_atomic(path, json.dumps(receipt).encode())
     elif scenario == 'active_cron':
         cron.file.write_text(cron.file.read_text().replace('PAUSED', 'ACTIVE'))
     elif scenario == 'manual_stop':
@@ -263,14 +278,18 @@ def test_source_only_rejects_untrusted_loss_or_business_conditions_without_updat
 
 
 @pytest.mark.parametrize('file', ['execution.json', 'tool-session.json', 'stdout.log', 'stderr.log',
-    'controller-manifest.json', 'progress.json', 'manual-review-receipt.json'])
+    'controller-manifest.json', 'progress.json', 'manual-review-receipt.json', 'action.json', 'state.json'])
 def test_same_content_evidence_replacement_is_rejected_before_sync(source_only_production, file):
     root, original, action, before, expected, remote, cron = source_only_production
+    progress_file = root / ('runtime/control/approval-guard/runs/' + 'a' * 32 + '/progress.json')
+    progress = json.loads(progress_file.read_bytes())
+    progress['actions'] = []
+    runtime_control.write_control_bytes_atomic(progress_file, json.dumps(progress).encode())
     def live(target):
         snapshot = current_snapshot(target, original, action)
         if file == 'progress.json':
             path = root / ('runtime/control/approval-guard/runs/' + 'a' * 32 + '/progress.json')
-        elif file == 'manual-review-receipt.json':
+        elif file in {'manual-review-receipt.json', 'action.json', 'state.json'}:
             path = action.with_name(file)
         else:
             path = original.file.with_name(file)
@@ -283,15 +302,21 @@ def test_same_content_evidence_replacement_is_rejected_before_sync(source_only_p
     assert git(root, 'rev-parse', 'HEAD') == before
 
 
-def test_source_only_post_sync_error_reports_updated_source_and_unknown_preservation(source_only_production):
+@pytest.mark.parametrize('file', ['stdout.log', 'manual-review-receipt.json'])
+def test_source_only_post_sync_error_reports_updated_source_and_unknown_preservation(source_only_production, file):
     root, original, action, before, expected, remote, cron = source_only_production
+    progress_file = root / ('runtime/control/approval-guard/runs/' + 'a' * 32 + '/progress.json')
+    progress = json.loads(progress_file.read_bytes())
+    progress['actions'] = []
+    runtime_control.write_control_bytes_atomic(progress_file, json.dumps(progress).encode())
     calls = 0
     def live(target):
         nonlocal calls
         calls += 1
         snapshot = current_snapshot(target, original, action)
         if calls == 2:
-            runtime_control.write_control_bytes_atomic(original.file.with_name('stdout.log'), b'changed after source sync')
+            path = action.with_name(file) if file == 'manual-review-receipt.json' else original.file.with_name(file)
+            runtime_control.write_control_bytes_atomic(path, path.read_bytes())
         return snapshot
     result = production_release.release_source(root, expected_revision=expected, expected_origin=str(remote),
         confirmed_sync=True, stopped_maintenance=True, supervisor_loss_source_only=True,
