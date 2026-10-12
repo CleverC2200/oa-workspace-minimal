@@ -85,12 +85,13 @@ def _assert_no_stop(root: Path) -> None:
         raise RuntimeError('production_release_stop_requested')
 
 
-def _pinned_control(path: Path, *, private: bool = True) -> tuple[tuple[int, ...], bytes]:
+def _pinned_control(path: Path, *, private: bool = True,
+                    max_bytes: int = 1_048_576) -> tuple[tuple[int, ...], bytes]:
     pinned = path.lstat()
     if (not stat.S_ISREG(pinned.st_mode) or pinned.st_uid != os.getuid()
             or pinned.st_mode & (0o077 if private else 0o022)):
         raise RuntimeError('production_release_control_untrusted')
-    raw = runtime_control.read_control_bytes(path)
+    raw = runtime_control.read_control_bytes(path, max_bytes=max_bytes)
     current = path.lstat()
     fields = ('st_dev', 'st_ino', 'st_mtime_ns', 'st_ctime_ns', 'st_mode', 'st_uid', 'st_size')
     identity = tuple(getattr(pinned, name) for name in fields)
