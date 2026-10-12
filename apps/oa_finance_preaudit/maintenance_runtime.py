@@ -89,7 +89,25 @@ def historical_stopped_collection(attempt, state):
 '''
 
 
-_SUPERVISOR_LOSS_READER = _HISTORICAL_STOP_VALIDATOR + r'''
+_EVIDENCE_FINGERPRINT_READER = r'''
+import os, stat
+def fingerprint(file):
+    try:
+        before = file.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or before.st_mode & 0o022:
+        raise ValueError('maintenance_original_execution_untrusted')
+    identity = lambda info: [getattr(info, name) for name in
+        ('st_dev','st_ino','st_mtime_ns','st_ctime_ns','st_mode','st_uid','st_size')]
+    digest, _ = finance_preaudit_run._log_evidence(file)
+    if identity(before) != identity(file.lstat()):
+        raise ValueError('maintenance_original_execution_untrusted')
+    return {**digest, 'identity':identity(before)}
+'''
+
+
+_SUPERVISOR_LOSS_READER = _HISTORICAL_STOP_VALIDATOR + _EVIDENCE_FINGERPRINT_READER + r'''
 import os, stat
 from apps.oa_finance_preaudit import approval_guard as guard, approval_lifecycle as lifecycle, item_failure, reconciliation
 if any(not Path(module.__file__).resolve().is_relative_to(root) for module in (guard, lifecycle, item_failure, reconciliation)):
@@ -138,20 +156,6 @@ def evidence_paths():
         *(Path(action).with_name(name) for action in [*progress['actions'], *historical]
             for name in ('action.json', 'state.json', 'manual-review-receipt.json'))})
 
-def fingerprint(file):
-    try:
-        before = file.lstat()
-    except FileNotFoundError:
-        return None
-    if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or before.st_mode & 0o022:
-        raise ValueError('maintenance_original_execution_untrusted')
-    identity = lambda info: [getattr(info, name) for name in
-        ('st_dev','st_ino','st_mtime_ns','st_ctime_ns','st_mode','st_uid','st_size')]
-    digest, _ = finance_preaudit_run._log_evidence(file)
-    if identity(before) != identity(file.lstat()):
-        raise ValueError('maintenance_original_execution_untrusted')
-    return {**digest, 'identity':identity(before)}
-
 files = evidence_paths()
 fingerprints = {str(file):fingerprint(file) for file in files}
 required = (path, path.with_name('tool-session.json'), path.with_name('controller-manifest.json'),
@@ -177,8 +181,92 @@ report['source_only_proof'] = {'kind':'preaudit_supervisor_loss_source_only','re
 '''
 
 
+_OFFICIAL_STOP_READER = _EVIDENCE_FINGERPRINT_READER + r'''
+from apps.oa_finance_preaudit import approval_guard as guard, approval_lifecycle as lifecycle, item_failure, reconciliation, review_interruption
+if any(not Path(module.__file__).resolve().is_relative_to(root)
+        for module in (guard, lifecycle, item_failure, reconciliation, review_interruption)):
+    raise ValueError('maintenance_original_execution_untrusted')
+path = Path(path)
+saved = json.loads(finance_preaudit_run._read_evidence(path))
+rolling = root / 'runtime/control/rolling-controller-manifest.json'
+mirror = json.loads(finance_preaudit_run._read_evidence(path.with_name('controller-manifest.json')))
+if (report.get('state') != 'exited' or report.get('terminal') is not True
+        or type(report.get('exit_code')) is not int or report['exit_code'] == 0
+        or mirror != json.loads(finance_preaudit_run._read_evidence(rolling))
+        or mirror.get('state') != 'failed' or mirror.get('children_reaped') is not True
+        or type(saved.get('supervisor_pid')) is not int
+        or guard.process_identity(saved['supervisor_pid']) is not None):
+    raise ValueError('maintenance_original_execution_untrusted')
+progress = lifecycle._progress(mirror)
+cooldown = guard.cooldown()
+if (progress is None or not progress['actions'] or Path(progress['project_root']).resolve() != root
+        or progress['writer_active'] is not False
+        or guard.process_identity(mirror['controller_pid']) is not None or guard.group_alive(mirror['controller_pid'])
+        or not lifecycle.readonly_reaped(mirror) or not guard.models_reaped()
+        or cooldown is None or cooldown['run_id'] != mirror['run_id']):
+    raise ValueError('maintenance_original_process_active')
+slots = [guard._slot(index) for index in range(guard.MAX_MODEL_WORKERS)]
+if any(slot and slot.get('pid') is not None and
+        (guard.process_identity(slot['pid']) is not None or guard.group_alive(slot['pid'])) for slot in slots):
+    raise ValueError('maintenance_original_process_active')
+closed = review_interruption.closed_run(mirror['run_id'], Path(progress['actions'][0]))
+if (closed['cause'] != guard.STOP_REASON or closed['cooldown'] != cooldown
+        or closed['controller_instance_id'] != mirror['controller_instance_id']
+        or closed['controller'] != progress['controller'] or closed['project_root'] != str(root)
+        or closed['actions'] != progress['actions']
+        or not cooldown['triggered_at'] <= closed['closed_at'] <= finance_preaudit_run._timestamp(saved['completed_at']).timestamp()):
+    raise ValueError('maintenance_official_stop_untrusted')
+run = lifecycle.run_directory(mirror['run_id'])
+flows = root / 'runtime/finance_preaudit_flows'
+
+def interrupted_actions():
+    actions = []
+    for state in reconciliation.latest_states(flows):
+        if state.get('reason') != review_interruption.REASON:
+            continue
+        attempt = flows / state['workflow_key'] / 'cases' / state['case_key'] / ('attempt-' + str(state['attempt']))
+        receipt = guard.read(attempt / 'review-interruption.json')
+        action = str(attempt / 'action.json')
+        if (receipt is None or receipt.get('run_id') != mirror['run_id']
+                or receipt.get('controller_instance_id') != mirror['controller_instance_id']
+                or action not in progress['actions'] or not item_failure.isolated(attempt, state)):
+            raise ValueError('maintenance_official_stop_untrusted')
+        actions.append(action)
+    return sorted(actions)
+
+interrupted = interrupted_actions()
+def evidence_paths():
+    return sorted({path, path.with_name('tool-session.json'), path.with_name('controller-manifest.json'),
+        path.with_name('stdout.log'), path.with_name('stderr.log'), rolling, run/'progress.json', run/'closed-readonly.json',
+        guard.directory()/'cooldown.json', *run.glob('pool-*.json'), *run.glob('worker-*.json'),
+        *(guard._slot_path(index) for index in range(guard.MAX_MODEL_WORKERS)),
+        *(Path(action).with_name(name) for action in progress['actions'] for name in
+            (*item_failure._ARTIFACTS,'manual-review-receipt.json','review-interruption.json',
+             'interrupted-action.json','interrupted-state.json')),
+        *(file for action in progress['actions'] for pattern in ('review-notice-*.json','review-process-*.json')
+          for file in Path(action).parent.glob(pattern))})
+files = evidence_paths()
+fingerprints = {str(file):fingerprint(file) for file in files}
+required = (path, path.with_name('tool-session.json'), path.with_name('controller-manifest.json'),
+    path.with_name('stdout.log'), path.with_name('stderr.log'), rolling, run/'progress.json', run/'closed-readonly.json',
+    guard.directory()/'cooldown.json')
+if (any(fingerprints[str(file)] is None for file in required)
+        or files != evidence_paths() or fingerprints != {str(file):fingerprint(file) for file in files}
+        or cooldown != guard.cooldown() or progress != lifecycle._progress(mirror)
+        or closed != review_interruption.closed_run(mirror['run_id'], Path(progress['actions'][0]))
+        or interrupted != interrupted_actions()
+        or report != finance_preaudit_run.read_execution(path,owner_task_id=owner,invocation_id=path.parent.name,tool_session_id=session)):
+    raise ValueError('maintenance_original_execution_untrusted')
+report['official_stop_proof'] = {'kind':'preaudit_official_stop_source_only','read_only':True,
+    'original_wait_verified':True,'target_root':str(root),'run_id':mirror['run_id'],
+    'controller_instance_id':mirror['controller_instance_id'],'readonly_reaped':True,'models_reaped':True,
+    'supervisor_absent':True,'cooldown':cooldown,'actions':progress['actions'],
+    'interrupted_actions':interrupted,'evidence_files':fingerprints}
+'''
+
+
 def read_original_execution(target_root: Path, original: OriginalExecution, *,
-                            supervisor_loss_source_only: bool = False) -> dict:
+                            supervisor_loss_source_only: bool = False, official_stop_source_only: bool = False) -> dict:
     """Read the original supervised invocation using target-owned validators."""
     target_root = Path(target_root).absolute()
     assert_target_environment(target_root)
@@ -189,7 +277,11 @@ def read_original_execution(target_root: Path, original: OriginalExecution, *,
     environment.pop('PYTHONPATH', None)
     environment.pop('PYTHONHOME', None)
     try:
+        if supervisor_loss_source_only and official_stop_source_only:
+            raise RuntimeError('maintenance_source_only_modes_conflict')
         reader = _ORIGINAL_EXECUTION_READER + (_SUPERVISOR_LOSS_READER if supervisor_loss_source_only else '')
+        if official_stop_source_only:
+            reader += _OFFICIAL_STOP_READER
         reader += '\nprint(json.dumps(report))\n'
         result = _run_readonly([str(interpreter), '-B', '-E', '-c', reader,
             str(original.file), original.owner_task_id, original.tool_session_id], target_root=target_root,
@@ -205,7 +297,8 @@ def read_original_execution(target_root: Path, original: OriginalExecution, *,
 
 
 def assert_original_execution_safe(target_root: Path, original: OriginalExecution,
-                                   report: dict, manifest: bytes, *, supervisor_loss_source_only: bool = False) -> None:
+                                   report: dict, manifest: bytes, *, supervisor_loss_source_only: bool = False,
+                                   official_stop_source_only: bool = False) -> None:
     """Bind terminal readback to the unchanged controller and require its group idle."""
     try:
         saved = json.loads(manifest)
@@ -248,6 +341,19 @@ def assert_original_execution_safe(target_root: Path, original: OriginalExecutio
                 or type(report.get('exit_code')) is not int
                 or (saved['state'] == 'completed') != (report['exit_code'] == 0)):
             raise RuntimeError('maintenance_original_execution_untrusted')
+        if official_stop_source_only:
+            proof = report.get('official_stop_proof')
+            if (supervisor_loss_source_only or saved['state'] != 'failed' or not isinstance(proof, dict)
+                    or proof.get('kind') != 'preaudit_official_stop_source_only'
+                    or proof.get('read_only') is not True or proof.get('original_wait_verified') is not True
+                    or proof.get('target_root') != str(target_root.resolve())
+                    or proof.get('run_id') != saved['run_id']
+                    or proof.get('controller_instance_id') != saved['controller_instance_id']
+                    or any(proof.get(key) is not True for key in ('readonly_reaped', 'models_reaped', 'supervisor_absent'))
+                    or not isinstance(proof.get('cooldown'), dict) or proof['cooldown'].get('run_id') != saved['run_id']
+                    or not isinstance(proof.get('interrupted_actions'), list)
+                    or not isinstance(proof.get('evidence_files'), dict) or not proof['evidence_files']):
+                raise RuntimeError('maintenance_original_execution_untrusted')
         pid = saved.get('controller_pid')
         if type(pid) is not int or pid < 1:
             raise RuntimeError('maintenance_original_execution_untrusted')
@@ -295,7 +401,8 @@ def target_runtime_leases(target_root: Path) -> Iterator[None]:
 
 
 def assert_live_safe(payload: dict, *, maintenance_leases_held: bool = True,
-                     original_closure: bool = False, source_only_proof: dict | None = None) -> None:
+                     original_closure: bool = False, source_only_proof: dict | None = None,
+                     official_stop_proof: dict | None = None) -> None:
     """Require complete live identity/authentication and trusted continuation evidence."""
     if not isinstance(payload, dict) or any(
             not isinstance(payload.get(key), dict)
@@ -330,6 +437,39 @@ def assert_live_safe(payload: dict, *, maintenance_leases_held: bool = True,
         raise RuntimeError('maintenance_runtime_active')
     reconciled = payload.get('reconciliation', {})
     trusted_continuation = controller_handoff._recovery_reconciliation_is_trusted(reconciled)
+    if official_stop_proof is not None:
+        inputs = payload.get('maintenance_current_inputs', {})
+        if (not isinstance(official_stop_proof, dict) or not isinstance(inputs, dict)
+                or not isinstance(official_stop_proof.get('target_root'), str)
+                or not Path(official_stop_proof['target_root']).is_absolute()
+                or not isinstance(reconciled.get('quarantine'), dict)
+                or not isinstance(reconciled.get('continuation'), dict)):
+            raise RuntimeError('maintenance_reconciliation_untrusted')
+        verified = inputs.get('verified_interrupted_actions')
+        uncounted = inputs.get('uncounted_interrupted_actions')
+        actions = official_stop_proof.get('interrupted_actions')
+        if (official_stop_proof.get('kind') != 'preaudit_official_stop_source_only'
+                or not isinstance(actions, list) or any(not isinstance(p, str) for p in actions)
+                or not isinstance(verified, list) or any(not isinstance(p, str) for p in verified)
+                or not isinstance(uncounted, list) or any(not isinstance(p, str) for p in uncounted)
+                or len(set(verified)) != len(verified) or len(set(uncounted)) != len(uncounted)
+                or not set(uncounted).issubset(verified) or not set(verified).issubset(actions)
+                or not isinstance(reconciled.get('findings'), list)):
+            raise RuntimeError('maintenance_reconciliation_untrusted')
+        pending_paths = {str(Path(official_stop_proof['target_root']) / 'runtime/finance_preaudit_flows'
+            / str(row.get('workflow_key')) / 'cases' / str(row.get('item_key')) / ('attempt-' + str(row.get('attempt')))
+            / 'action.json') for row in reconciled['findings'] if isinstance(row, dict)
+            and row.get('category') == 'pending_not_handled'}
+        if set(verified) != set(actions).intersection(pending_paths):
+            raise RuntimeError('maintenance_reconciliation_untrusted')
+        if not trusted_continuation:
+            continuation = reconciled.get('continuation', {})
+            quarantined = reconciled.get('quarantine', {}).get('pending_quarantined')
+            isolated = continuation.get('isolated_pending')
+            trusted_continuation = (
+                continuation == {'status': 'ready', 'scope': 'item', 'isolated_pending': isolated, 'blocking_reasons': {}}
+                and type(isolated) is int and type(quarantined) is int and quarantined >= 0
+                and len(uncounted) > 0 and isolated == quarantined + len(uncounted))
     if source_only_proof is not None:
         current_inputs = payload.get('maintenance_current_inputs')
         if not isinstance(current_inputs, dict) or not isinstance(source_only_proof, dict):
@@ -509,6 +649,8 @@ try:
     pending = [item for item in snapshot['reconciliation']['findings'] if item['category'] == 'pending_not_handled']
     validated = 0
     preserved = []
+    interrupted = []
+    uncounted = []
     for item in pending:
         state = by_key[(item['workflow_key'], item['item_key'], item['attempt'])]
         attempt = flows / state['workflow_key'] / 'cases' / state['case_key'] / ('attempt-' + str(state['attempt']))
@@ -520,12 +662,20 @@ try:
         elif state['execution_state'] == 'needs_admin':
             isolated = item_failure.isolated(attempt, state)
             stopped_collection = False
-            if source_only is not None and str(attempt / 'action.json') in source_only['historical_stopped_actions']:
+            if source_only is not None and str(attempt / 'action.json') in source_only.get('historical_stopped_actions', []):
                 stopped_collection = historical_stopped_collection(attempt, state)
             if not (isolated or reconciliation._trusted_quarantine(flows, state) or stopped_collection):
                 raise ValueError()
             if stopped_collection:
                 preserved.append(str(attempt / 'action.json'))
+            if (source_only is not None and source_only.get('kind') == 'preaudit_official_stop_source_only'
+                    and state.get('reason') == 'codex_review_interrupted'):
+                action = str(attempt / 'action.json')
+                if not isolated or action not in source_only['interrupted_actions']:
+                    raise ValueError()
+                interrupted.append(action)
+                if not reconciliation._trusted_quarantine(flows, state):
+                    uncounted.append(action)
             # A verified item receipt binds the failure artifacts and proves no write;
             # a material failure cannot also promise a valid frozen material bundle.
             material_failure = isolated and state.get('reason') == 'material_collection_failed'
@@ -543,7 +693,9 @@ try:
         'write_state':'not_requested','target_root':str(root),'status_sha256':expected_hash,
         'policy_sha256':policy_hash,'authorized_workflows':sorted(required),
         'pending_frozen_count':len(pending),'validated_frozen_count':validated,
-        **({'preserved_stop_failures':sorted(preserved)} if source_only is not None else {})}))
+        **({'verified_interrupted_actions':sorted(interrupted),'uncounted_interrupted_actions':sorted(uncounted)}
+            if source_only is not None and source_only.get('kind') == 'preaudit_official_stop_source_only'
+            else {'preserved_stop_failures':sorted(preserved)} if source_only is not None else {})}))
 except (OSError, ValueError, RuntimeError, KeyError, TypeError):
     print(json.dumps({'status':'blocked','error_code':code}))
     raise SystemExit(1)
@@ -551,7 +703,7 @@ except (OSError, ValueError, RuntimeError, KeyError, TypeError):
 
 
 def read_current_inputs(target_root: Path, receipt: dict, *, require_reaped: bool = False,
-                        source_only_proof: dict | None = None) -> dict:
+                        source_only_proof: dict | None = None, official_stop_proof: dict | None = None) -> dict:
     """Obtain current policy/frozen proof from the target's existing validators."""
     from .production_config import FINANCE_WORKFLOWS
     target_root = Path(target_root).expanduser().absolute()
@@ -564,7 +716,7 @@ def read_current_inputs(target_root: Path, receipt: dict, *, require_reaped: boo
     try:
         result = _run_readonly([str(target_root / '.venv/bin/python'), '-B', '-E', '-c', _CURRENT_INPUTS_READER,
             receipt['path'], receipt['sha256'], json.dumps([*FINANCE_WORKFLOWS, 'packaging_layout_approval']),
-            json.dumps(source_only_proof)],
+            json.dumps(official_stop_proof if official_stop_proof is not None else source_only_proof)],
             target_root=target_root, environment=environment, timeout=300, require_reaped=require_reaped)
         if len(result.stdout.encode()) > 1_000_000:
             raise RuntimeError('maintenance_current_inputs_untrusted')
@@ -581,7 +733,7 @@ def read_current_inputs(target_root: Path, receipt: dict, *, require_reaped: boo
 
 
 def read_live_status(target_root: Path, *, require_reaped: bool = False,
-                     source_only_proof: dict | None = None) -> dict:
+                     source_only_proof: dict | None = None, official_stop_proof: dict | None = None) -> dict:
     """Await target Python's own readonly status and verify its file-backed receipt."""
     target_root = Path(target_root).absolute()
     assert_target_environment(target_root)
@@ -620,7 +772,7 @@ def read_live_status(target_root: Path, *, require_reaped: bool = False,
             raise RuntimeError('maintenance_live_receipt_invalid')
         payload['maintenance_status_file'] = receipt
         payload['maintenance_current_inputs'] = read_current_inputs(target_root, receipt,
-            require_reaped=require_reaped, source_only_proof=source_only_proof)
+            require_reaped=require_reaped, source_only_proof=source_only_proof, official_stop_proof=official_stop_proof)
         return payload
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         raise RuntimeError('maintenance_live_status_failed') from error
