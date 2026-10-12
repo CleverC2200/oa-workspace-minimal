@@ -81,6 +81,7 @@ QUARANTINED_REASONS = {
 }
 RECOVERABLE_NO_WRITE_REASONS = {
     "write_authorization_invalid",
+    "codex_review_interrupted",
     *QUARANTINED_REASONS,
 }
 ITEM_LOCAL_QUARANTINE_REASONS = {
@@ -795,7 +796,12 @@ def _local_quarantined_identities() -> frozenset[tuple[str, str]]:
         if (
             state.get("execution_state") == "needs_admin"
             and state.get("write_state") == "not_requested"
-            and reason in {"write_authorization_invalid", *QUARANTINED_REASONS}
+            and (
+                reason in {"write_authorization_invalid", *QUARANTINED_REASONS}
+                or (reason == "codex_review_interrupted" and reconciliation._trusted_quarantine(
+                    PROJECT_ROOT / "runtime" / "finance_preaudit_flows", state,
+                ))
+            )
         ):
             request_id = str(state.get("request_id") or "").strip()
             received_at = str(state.get("received_at") or "").strip()
@@ -4469,6 +4475,15 @@ def run_rolling_drain(
                     recovery_action_files=recovery_queue,
                     allowed_workflows=allowed_workflows,
                 )
+                if result.get("stop_reason") == approval_guard.STOP_REASON:
+                    notice = approval_guard.cooldown()
+                    result["official_notice"] = (
+                        {"status": "recorded", **{key: notice[key] for key in (
+                            "notice_code", "triggered_at", "blocked_until",
+                        )}}
+                        if notice is not None and notice["run_id"] == manifest["run_id"]
+                        else {"status": "unknown"}
+                    )
                 if result["processes_reaped"] is not True:
                     children_reaped = False
                     runtime_control.request_cycle_stop()
@@ -4811,6 +4826,13 @@ def _run_rolling_drain_locked(
         ):
             runtime_control.request_cycle_stop()
             status = "failed"
+            if runtime_control.stop_reason() == approval_guard.STOP_REASON:
+                stop_reason = approval_guard.STOP_REASON
+                last_decision = {
+                    "action": "stop", "next_capacity": current_capacity,
+                    "healthy_windows": 0, "reason": stop_reason,
+                }
+                break
             if adaptive and int(wave.get("rate_limit_events") or 0) > 0:
                 current_capacity = concurrency_control.CAPACITY_STEPS[0]
                 last_decision = {
@@ -4946,7 +4968,11 @@ def _run_rolling_drain_locked(
             "total_tokens",
         ):
             token_totals[field] += int(usage.get(field) or 0)
-    if status == "failed" and primary_error_code is None:
+    if stop_reason == approval_guard.STOP_REASON:
+        # Preparation can fail after the first official stop closes admission.
+        # Keep those task errors, but report the stop gate as the round's cause.
+        primary_error_code = approval_guard.STOP_REASON
+    elif status == "failed" and primary_error_code is None:
         external_stop_reason = runtime_control.stop_reason()
         if external_stop_reason != "controller_cycle_stop":
             primary_error_code = external_stop_reason

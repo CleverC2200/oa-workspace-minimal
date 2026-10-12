@@ -28,6 +28,7 @@ QUARANTINED_REASONS = frozenset(
     {
         "codex_decision_invalid",
         "codex_review_failed",
+        "codex_review_interrupted",
         "material_collection_failed",
         "write_authorization_invalid",
         "writer_result_unknown",
@@ -216,6 +217,12 @@ def _trusted_quarantine(root: Path, state: dict) -> bool:
         or state.get("reason") not in QUARANTINED_REASONS
     ):
         return False
+    if state.get("reason") == "codex_review_interrupted":
+        return item_failure.isolated(
+            Path(root) / str(state["workflow_key"]) / "cases"
+            / str(state["case_key"]) / f"attempt-{state['attempt']}",
+            state,
+        )
     if state.get("reason") != "codex_review_failed":
         return True
     return review_failure_evidence.trusted_quarantine(
