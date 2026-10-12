@@ -24,7 +24,7 @@ from tests.finance_preaudit.test_supervisor_loss_maintenance import (
 def recovery_target(lost_execution, monkeypatch):
     root, original, action = lost_execution
     source = Path(supervisor_loss_recovery.__file__).resolve().parents[2]
-    for relative in production_config.REPOSITORY_INPUTS[:2]:
+    for relative in (*production_config.REPOSITORY_INPUTS[:2], production_config.MODEL_CATALOG):
         target = root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes((source / relative).read_bytes())

@@ -179,6 +179,10 @@ def project_official_errors(project_root: Path) -> Iterator[tuple[str, str, floa
 
 
 def observe_project_errors(project_root: Path) -> None:
+    # OpenAI Desktop errors do not describe the isolated DeepSeek API reviewer.
+    # Its own CLI notices still pass through record_notice and the same cooldown.
+    if production_config.review_settings()["provider"] == "deepseek":
+        return
     try:
         for code, source, stamp in project_official_errors(project_root):
             record_notice(code, source, occurred_at=stamp)
@@ -245,7 +249,7 @@ def _slot(index: int) -> dict | None:
             or any(value.get(key) is not None and (not isinstance(value[key], str) or re.fullmatch(r"[0-9a-f]{32}", value[key]) is None)
                    for key in ("run_id", "controller_instance_id"))
             or (value.get("run_id") is None) != (value.get("controller_instance_id") is None)
-            or value.get("model") != production_config.MODEL
+            or value.get("model") not in {production_config.MODEL, "gpt-6.1-sol"}
             or not isinstance(value.get("project_root"), str) or not Path(value["project_root"]).is_absolute()
             or not isinstance(value.get("action_sha256"), str) or re.fullmatch(r"[0-9a-f]{64}", value["action_sha256"]) is None
             or not isinstance(value.get("action_file"), str) or not Path(value["action_file"]).is_absolute()
@@ -350,7 +354,7 @@ def model_slot(action_file: Path, project_root: Path, timeout_seconds: float) ->
                          "controller_instance_id": os.environ.get(INSTANCE_ENV),
                          "project_root": str(Path(project_root).resolve()), "action_file": str(action_file),
                          "action_sha256": hashlib.sha256(action_file.read_bytes()).hexdigest(),
-                         "model": production_config.MODEL, "created_at": time.time(),
+                         "model": production_config.review_settings()["model"], "created_at": time.time(),
                          "deadline": time.time() + timeout_seconds}
                 write(_slot_path(index), value)
                 break

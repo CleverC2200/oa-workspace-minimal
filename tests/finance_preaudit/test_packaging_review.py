@@ -60,7 +60,7 @@ def fake_process(monkeypatch, body, *, native_home, after=None, inspect_start=No
             nonlocal kwargs_cwd
             kwargs_cwd = kwargs['cwd']
             assert '--ephemeral' not in command
-            assert 'OA_REVIEW_API_KEY' not in kwargs['env']
+            assert kwargs['env']['OA_REVIEW_API_KEY'] == 'unit-test-key'
             assert 'OPENAI_API_KEY' not in kwargs['env'] and 'CODEX_API_KEY' not in kwargs['env']
             assert not list(Path(kwargs['env']['CODEX_HOME']).iterdir())
             self.target = Path(command[command.index('--output-last-message')+1])
@@ -82,7 +82,7 @@ def fake_process(monkeypatch, body, *, native_home, after=None, inspect_start=No
             with sqlite3.connect(self.store / 'state_5.sqlite') as database:
                 database.execute('CREATE TABLE threads (id TEXT, cwd TEXT, rollout_path TEXT)')
                 database.execute('INSERT INTO threads VALUES (?, ?, ?)', ('00000000-0000-0000-0000-000000000001', str(kwargs_cwd), str(native)))
-            if after: after()
+            if after: after(self.home)
         def poll(self): return self.returncode
     monkeypatch.setattr(reviewer.worker.subprocess, 'Popen', Process)
 
@@ -113,7 +113,7 @@ def test_failure_keeps_original_output_without_mutating_attempt(tmp_path, monkey
     path = action(tmp_path)
     packet = json.loads(path.with_name('review-packet.json').read_text())
     raw = 'not json' if failure == 'malformed' else json.dumps(draft(packet))
-    fake_process(monkeypatch, raw, native_home=tmp_path / 'native-auth', after=(lambda: path.with_name('material.json').write_text('{}'))
+    fake_process(monkeypatch, raw, native_home=tmp_path / 'native-auth', after=(lambda _home: path.with_name('material.json').write_text('{}'))
                  if failure == 'frozen_changed' else None)
     result = reviewer.review(path, project_root=tmp_path, timeout_seconds=60)
     assert result['status'] == 'failed' and result['decision_file'] is None
@@ -156,15 +156,14 @@ def test_draft_shapes_reach_existing_completion_consumer(tmp_path, classificatio
     assert result['business_state'] == ('needs_human' if classification == 'uncertain' else 'pass')
 
 
-def test_packaging_receipt_records_current_model_without_deepseek_key(tmp_path, monkeypatch):
+def test_packaging_receipt_records_current_deepseek_identity(tmp_path, monkeypatch):
     path = action(tmp_path)
     packet = json.loads(path.with_name('review-packet.json').read_text())
     fake_process(monkeypatch, json.dumps(draft(packet)), native_home=tmp_path / 'native-auth')
-    monkeypatch.delenv('OA_REVIEW_API_KEY', raising=False)
     result = reviewer.review(path, project_root=tmp_path, timeout_seconds=60)
     assert result['status'] == 'draft_ready'
-    assert result['model'] == 'gpt-6.1-sol' and result['reasoning_effort'] == 'medium'
-    assert result['model_provider'] == 'openai' and result['requested_service_tier'] == 'default'
+    assert result['model'] == 'deepseek-flash' and result['reasoning_effort'] == 'high'
+    assert result['model_provider'] == 'oa_deepseek' and result['requested_service_tier'] == 'default'
     assert not Path(result['evidence_directory']).joinpath('auth.json').exists()
 
 
@@ -201,7 +200,7 @@ def test_native_receipt_mismatch_fails_without_copying_other_chat(tmp_path, monk
     packet = json.loads(path.with_name('review-packet.json').read_text())
     native_home = tmp_path / 'native-auth'
     fake_process(monkeypatch, json.dumps(draft(packet)), native_home=native_home,
-                 after=lambda: native_home.joinpath('sessions/own.jsonl').write_text(native_content))
+                 after=lambda review_home: review_home.joinpath('sessions/own.jsonl').write_text(native_content))
     result = reviewer.review(path, project_root=tmp_path, timeout_seconds=60)
     assert result['status'] == 'failed' and result['error_code'] == 'codex_tool_receipt_unavailable'
     assert result['tool_receipt_files'] == [] and result['decision_file'] is None
@@ -318,7 +317,7 @@ root = Path(__import__('sys').argv[1])
 path = action(root)
 packet = json.loads(path.with_name('review-packet.json').read_text())
 home = root / 'native-auth'
-def replace_receipt():
+def replace_receipt(home):
     target = home / 'sessions' / 'own.jsonl'
     target.unlink()
     os.mkfifo(target)
@@ -345,7 +344,7 @@ def test_damaged_native_receipt_fails_before_draft_ready(tmp_path, monkeypatch, 
     packet = json.loads(path.with_name('review-packet.json').read_text())
     home = tmp_path / 'native-auth'
     raw = json.dumps(draft(packet))
-    def damage_receipt():
+    def damage_receipt(home):
         native = home / 'sessions' / 'own.jsonl'
         if damage == 'oversized':
             with native.open('ab') as stream:
@@ -380,7 +379,7 @@ def test_native_receipt_replaced_after_open_is_not_retained(tmp_path, monkeypatc
     def replace_after_open(file, flags, *args, **kwargs):
         descriptor = original_open(file, flags, *args, **kwargs)
         if file == 'own.jsonl':
-            native = home / 'sessions' / 'own.jsonl'
+            native = next((tmp_path / 'runtime/control/packaging-reviews').glob('*/codex-home/sessions/own.jsonl'))
             replacement = native.with_name('replacement.jsonl')
             replacement.write_bytes(native.read_bytes())
             os.replace(replacement, native)
@@ -412,8 +411,8 @@ def test_packaging_review_grants_only_its_private_visual_aux_directory(tmp_path,
                           directory/'events.jsonl', directory/'other-visual-aux', tmp_path/'other-audit/visual-aux'):
             assert not protected.is_relative_to(aux)
             assert str(protected) not in {k for k,v in profile['filesystem'].items() if v == 'write'}
-        assert command[command.index('--model')+1] == 'gpt-6.1-sol'
-        assert 'model_reasoning_effort="medium"' in command and 'service_tier="default"' in command
+        assert command[command.index('--model')+1] == 'deepseek-flash'
+        assert 'model_reasoning_effort="high"' in command and 'service_tier="default"' in command
         seen.append(aux)
     fake_process(monkeypatch, json.dumps(draft(packet)), native_home=tmp_path/'native-auth', inspect_start=observe)
     result = reviewer.review(path, project_root=tmp_path, timeout_seconds=60)
@@ -432,7 +431,7 @@ def test_packaging_review_rejects_changed_visual_aux_directory(tmp_path, monkeyp
     captured = []
     def observe(_command, directory):
         captured.append(directory/'visual-aux')
-    def change():
+    def change(_home):
         aux = captured[0]
         if damage == 'mode':
             aux.chmod(0o777)
@@ -484,7 +483,7 @@ def test_packaging_review_rejects_audit_parent_drift_at_completion(tmp_path, mon
     captured = []
     def observe(_command, directory):
         captured.append(directory)
-    def change():
+    def change(_home):
         directory = captured[0]
         if damage == 'mode':
             directory.chmod(0o777)
@@ -506,3 +505,8 @@ def test_packaging_review_rejects_audit_parent_drift_at_completion(tmp_path, mon
     assert result['status'] == 'failed' and result['decision_file'] is None
     assert result['business_fields_changed'] is False
     assert {p.name:p.read_bytes() for p in path.parent.glob('*.json')} == before
+
+
+@pytest.fixture(autouse=True)
+def fake_review_api_key(monkeypatch):
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "offline-fake-key")

@@ -7,6 +7,7 @@
 ```bash
 .venv/bin/python -m scripts.finance_preaudit_run \
   --owner-task-id <当前聊天真实UUID> \
+  --review-provider deepseek \
   --ignore-cooldown-once YES \
   --original-receipt-file <原execution.json绝对路径> \
   --original-owner-task-id <原聊天真实UUID> \

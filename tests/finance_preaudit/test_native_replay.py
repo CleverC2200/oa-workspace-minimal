@@ -276,3 +276,19 @@ def test_verify_rejects_mismatching_independently_frozen_hash(acceptance_records
     report = json.loads(capsys.readouterr().out)
     assert report['business_acceptance'] == 'not_accepted'
     assert any(code in finding for finding in report['findings'])
+
+
+def test_prepared_provider_is_frozen_and_cannot_change_at_run(recorded_case, capsys):
+    from apps.oa_finance_preaudit import production_config
+    arguments, _, _ = recorded_case
+    assert finance_preaudit_native_replay.main(arguments) == 0
+    summary = json.loads(capsys.readouterr().out)
+    manifest_file = Path(summary["audit"]) / "prepare.json"
+    manifest = json.loads(manifest_file.read_text())
+    assert manifest["review_configuration"] == production_config.review_settings("deepseek")
+    manifest["review_configuration"] = production_config.review_settings("openai")
+    manifest_file.write_text(json.dumps(manifest))
+    with pytest.raises(RuntimeError, match="review_model_identity_changed"):
+        finance_preaudit_native_replay.main(["--run" if arg == "--prepare" else arg for arg in arguments],
+                                           executor=lambda *args: pytest.fail("changed provider started a model"))
+    assert not manifest_file.with_name("worker-result.json").exists()

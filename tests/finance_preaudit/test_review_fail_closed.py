@@ -67,7 +67,7 @@ def test_owner_loss_during_review_stops_same_cli_without_official_cooldown(tmp_p
 def test_approval_cli_disables_unbounded_connection_retries(tmp_path):
     command = worker._codex_command(tmp_path, tmp_path / 'schema', tmp_path / 'decision')
     assert 'features.unbounded_connection_retries=false' in command
-    assert 'model_provider="openai"' in command
+    assert 'model_provider="oa_deepseek"' in command
 
 
 @pytest.mark.parametrize('code', ['codex_process_failed', 'codex_process_incomplete', 'codex_process_timeout'])
@@ -1224,3 +1224,8 @@ def test_controller_retains_failure_result_before_reaping_pool(tmp_path):
         runtime_status=lambda: {'status': 'healthy'})
     assert completed == [True]
     assert result.outcomes[0].value['error_code'] == 'codex_process_failed'
+
+
+@pytest.fixture(autouse=True)
+def fake_review_api_key(monkeypatch):
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "offline-fake-key")

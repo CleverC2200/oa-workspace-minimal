@@ -10,8 +10,13 @@ from .production_config import MODEL, REASONING_EFFORT, MODEL_PROVIDER, SERVICE_
 # Frozen historical evidence keeps the model and effort used by that invocation.
 LEGACY_MODELS = frozenset({"gpt-5.6-terra"})
 ALTERNATE_MODELS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
-ACCEPTED_MODELS = frozenset({MODEL}) | ALTERNATE_MODELS | LEGACY_MODELS
-MODEL_EFFORTS = {MODEL: REASONING_EFFORT, **{model: "high" for model in LEGACY_MODELS | ALTERNATE_MODELS}}
+ACCEPTED_MODELS = frozenset({MODEL, "gpt-6.1-sol"}) | ALTERNATE_MODELS | LEGACY_MODELS
+MODEL_EFFORTS = {MODEL: REASONING_EFFORT, "gpt-6.1-sol": "medium",
+                 **{model: "high" for model in LEGACY_MODELS | ALTERNATE_MODELS}}
+MODEL_SETTINGS = {
+    MODEL: {"model_provider": MODEL_PROVIDER, "requested_service_tier": SERVICE_TIER},
+    "gpt-6.1-sol": {"model_provider": "openai", "requested_service_tier": "default"},
+}
 PROCESS_FAILURE_CODES = frozenset(
     {"codex_process_failed", "codex_process_incomplete", "codex_process_timeout"}
 )
@@ -30,12 +35,12 @@ def read_model_identity(value: object) -> dict | None:
     if not isinstance(value, dict) or not model_effort_matches(value.get("model"), value.get("reasoning_effort")):
         return None
     identity = {"model": value["model"], "reasoning_effort": value["reasoning_effort"]}
-    settings = {"model_provider": MODEL_PROVIDER, "requested_service_tier": SERVICE_TIER}
-    if value["model"] == MODEL:
+    settings = MODEL_SETTINGS.get(value["model"])
+    if settings is not None:
         if any(value.get(key) != expected for key, expected in settings.items()):
             return None
         identity.update(settings)
-    elif any(key in value for key in settings):
+    elif any(key in value for key in ("model_provider", "requested_service_tier")):
         return None
     return identity
 
@@ -66,7 +71,7 @@ def receipt_payload(
         "workflow_key": workflow_key,
         "model": model,
         "reasoning_effort": reasoning_effort,
-        **({"model_provider": MODEL_PROVIDER, "requested_service_tier": SERVICE_TIER} if model == MODEL else {}),
+        **MODEL_SETTINGS.get(model, {}),
         "process_attempts": len(attempt_error_codes),
         "process_retries": len(attempt_error_codes) - 1,
         "failure_code": failure_code,

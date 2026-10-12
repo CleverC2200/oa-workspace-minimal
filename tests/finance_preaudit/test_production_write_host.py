@@ -426,6 +426,7 @@ def _failed_open_action(tmp_path):
 def test_renewed_authorization_retains_old_failure_and_accepts_new_cli_failure(
     tmp_path, monkeypatch, advance_minutes,
 ):
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "offline-fake-key")
     from apps.oa_finance_preaudit import codex_review_worker as worker, review_failure_evidence
 
     engine, clock, api, original, receipt = _failed_open_action(tmp_path)

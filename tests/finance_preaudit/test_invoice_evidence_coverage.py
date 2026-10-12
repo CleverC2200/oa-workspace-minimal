@@ -144,6 +144,7 @@ def test_each_invoice_preserves_exact_multiple_row_binding_and_partial_fields(cl
 def test_worker_reads_frozen_invoice_coverage_and_preview_closes_without_write(
     tmp_path, monkeypatch, cloud_http,
 ):
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "offline-fake-key")
     import io
     from pathlib import Path
 

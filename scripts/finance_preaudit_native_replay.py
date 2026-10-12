@@ -67,6 +67,7 @@ def engine_for(root, material=None, original=None):
             'received_at': original['received_at'], 'workflow_key': key}], collect_material=collect)
 
 def prepare(args):
+    from apps.oa_finance_preaudit import production_config
     case = next(c for c in read(args.inventory)['cases'] if c['case'] == args.case)
     source = Path(case['material_file']).resolve()
     state_file = Path(case['state_file']).resolve()
@@ -103,7 +104,7 @@ def prepare(args):
     source_manifest = []
     for name in tracked:
         if not name or not (name.startswith('apps/') or name.startswith('.agents/skills/')
-                or name.startswith('docs/agents/') or name in {'AGENTS.md', 'CONTRIBUTING.md', 'CONTEXT.md', 'GLOSSARY.md'}):
+                or name.startswith('docs/agents/') or name in {'AGENTS.md', 'CONTRIBUTING.md', 'CONTEXT.md', 'GLOSSARY.md', production_config.MODEL_CATALOG}):
             continue
         if Path(name).name in {'regression-cases.json', 'confirmed-feedback.md'}:
             continue
@@ -139,7 +140,8 @@ def prepare(args):
         'source_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=args.project).decode().strip(),
         'model_has_no_historical_decisions_or_expectations': True, 'oa_client_config_or_submit_callback': False,
         'excluded_reviewer_files': ['confirmed-feedback.md', 'regression-cases.json', 'tests/', 'inventory', 'historical decisions'],
-        'worker_source_sha256': digest(args.project / 'apps/oa_finance_preaudit/codex_review_worker.py')}
+        'worker_source_sha256': digest(args.project / 'apps/oa_finance_preaudit/codex_review_worker.py'),
+        'review_configuration': production_config.review_settings()}
     dump(audit / 'prepare.json', manifest)
     print(json.dumps({'status': 'prepared', 'case': args.case, 'audit': str(audit),
         'project_root': str(project), 'action_file': action['action_file'], 'image_count': len(prepared_material['prepared']['images']),
@@ -147,13 +149,14 @@ def prepare(args):
 
 def run(args, *, executor=None):
     from apps.oa_finance_preaudit import codex_review_worker as worker
-    from apps.oa_finance_preaudit import process_diagnostics
+    from apps.oa_finance_preaudit import process_diagnostics, production_config
     audit = args.audit / 'runs' / args.label / args.case
     manifest = read(audit / 'prepare.json')
     if (audit / 'worker-result.json').exists() or (audit / 'native-attempt-1').exists():
         raise RuntimeError('native_run_already_started_do_not_repeat')
     project, action_file = Path(manifest['project_root']), Path(manifest['action_file'])
-    if worker.MODEL != 'gpt-6.1-sol' or worker.REASONING_EFFORT != 'medium':
+    configuration = manifest.get('review_configuration', production_config.review_settings('openai'))
+    if worker.REVIEW_SETTINGS != configuration:
         raise RuntimeError('review_model_identity_changed')
     # Import source must match the snapshot given to the reviewer.
     if digest(Path(worker.__file__)) != manifest['worker_source_sha256']:
@@ -182,6 +185,7 @@ def run(args, *, executor=None):
     dump(audit / 'worker-result.json', reviewed)
     result = {'case': args.case, 'review_status': reviewed['status'], 'attempts': attempts,
         'model': reviewed.get('model'), 'reasoning_effort': reviewed.get('reasoning_effort'),
+        'model_provider': reviewed.get('model_provider'),
         'requested_service_tier': reviewed.get('requested_service_tier'),
         'execution_transport': 'recorded' if executor is not None else 'native', 'oa_writes': 0,
         'business_acceptance': 'not_verified',
@@ -210,6 +214,7 @@ def run(args, *, executor=None):
 def verify(args):
     """Validate separately reviewed evidence, without generating a business opinion."""
     from apps.oa_finance_preaudit.flow_engine import validate_frozen_review_inputs
+    from apps.oa_finance_preaudit import production_config
 
     audit = args.audit / 'runs' / args.label / args.case
     findings = []
@@ -237,9 +242,11 @@ def verify(args):
                 or closure.get('action') != 'closed' or closure.get('execution_state') != 'closed'
                 or closure.get('write_state') != 'not_requested' or closure.get('write_authorized') is not False):
             findings.append('native_preview_not_closed:finish the original native preview before business verification')
+        configuration = manifest.get('review_configuration', production_config.review_settings('openai'))
         if (result.get('execution_transport') != 'native'
-                or result.get('model') != 'gpt-6.1-sol' or result.get('reasoning_effort') != 'medium'
-                or result.get('requested_service_tier') != 'default'):
+                or configuration != production_config.review_settings(configuration['provider'])
+                or any(result.get(key) != configuration[key] for key in ('model', 'reasoning_effort', 'requested_service_tier'))
+                or ('review_configuration' in manifest and result.get('model_provider') != configuration['model_provider'])):
             findings.append('native_model_evidence_unverified:require explicit native transport and model identity')
         if not all(digest(project / x['path']) == x['sha256'] for x in manifest['source_manifest']):
             findings.append('frozen_source_changed:use a new label without rewriting the old snapshot')

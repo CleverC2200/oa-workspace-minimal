@@ -71,6 +71,7 @@ def official_history(home, root, rows):
 
 
 def test_main_official_error_uses_original_time_and_project_scope(tmp_path, monkeypatch):
+    monkeypatch.setenv(guard.production_config.REVIEW_PROVIDER_ENV, "openai")
     now = time.time()
     error = json.dumps({"codexErrorInfo": "usageLimitExceeded"})
     home, root = tmp_path / "codex", tmp_path / "project"
@@ -86,12 +87,14 @@ def test_main_official_error_uses_original_time_and_project_scope(tmp_path, monk
 
 
 def test_unreadable_official_history_blocks_before_any_launch(tmp_path, monkeypatch):
+    monkeypatch.setenv(guard.production_config.REVIEW_PROVIDER_ENV, "openai")
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "missing"))
     with pytest.raises(ValueError, match="approval_official_history_unavailable"):
         lifecycle.startup(tmp_path)
 
 
 def test_first_official_notice_stops_before_later_damaged_history(tmp_path, monkeypatch):
+    monkeypatch.setenv(guard.production_config.REVIEW_PROVIDER_ENV, "openai")
     now = time.time()
     home, root = tmp_path / "codex", tmp_path / "project"
     official_history(home, root, [
@@ -433,3 +436,12 @@ def test_interruption_count_and_start_gate_reject_damaged_or_unresolved_evidence
     with pytest.raises(ValueError, match="production_rolling_reconciliation_invalid"):
         review_interruption.select(root, report, frozenset({"travel_expense"}))
     assert all(path.read_bytes() == raw for path, raw in before.items())
+
+
+def test_deepseek_admission_ignores_unrelated_openai_history(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-openai-auth"))
+    guard.observe_project_errors(tmp_path)
+    assert guard.cooldown() is None
+    guard.record_notice("rate_limit", "deepseek-cli:current")
+    with pytest.raises(ValueError, match="approval_model_cooldown"):
+        guard.assert_admission()

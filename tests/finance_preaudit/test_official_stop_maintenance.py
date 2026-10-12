@@ -28,7 +28,7 @@ def official_production(tmp_path, monkeypatch):
     source = Path(maintenance_runtime.__file__).resolve().parents[2]
     for name in ('apps', 'scripts'):
         shutil.copytree(source / name, root / name, ignore=shutil.ignore_patterns('__pycache__'))
-    for name in production_config.REPOSITORY_INPUTS[:2]:
+    for name in (*production_config.REPOSITORY_INPUTS[:2], production_config.MODEL_CATALOG):
         target = root / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source / name, target)

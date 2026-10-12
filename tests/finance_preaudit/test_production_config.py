@@ -12,7 +12,7 @@ def repository(tmp_path):
         "apps/oa_finance_preaudit/production_config.py",
         "apps/oa_finance_preaudit/review_failure_evidence.py",
         "apps/oa_finance_preaudit/codex_review_worker.py",
-        "scripts/finance_preaudit_concurrency_probe.py",
+        "scripts/finance_preaudit_concurrency_probe.py", "config/deepseek-models.json",
     ):
         target = tmp_path / relative
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -28,7 +28,7 @@ def test_production_configuration_quality_cli_accepts_current_repository(capsys)
 def test_source_default_model_drift_is_rejected_without_execution(repository):
     path = repository / "apps/oa_finance_preaudit/codex_review_worker.py"
     path.write_text(path.read_text().replace(
-        "MODEL = review_failure_evidence.MODEL", 'MODEL = "deepseek-v4-flash"',
+        'MODEL = REVIEW_SETTINGS["model"]', 'MODEL = "deepseek-v4-flash"',
     ) + '\nraise RuntimeError("must never execute target source")\n')
     assert "production_config_reviewer_drift" in production_config.repository_findings(repository)
 
@@ -43,26 +43,13 @@ def test_native_automation_shape_preserves_project_and_schedule():
     ) == []
 
 
-def test_original_native_prompt_wording_is_supported():
-    prompt = (quality.PROJECT_ROOT / "config/automations/oa-skill-prompt.txt").read_text().replace(
-        "审核默认 model=gpt-6.1-sol reasoning_effort=medium model_provider=openai service_tier=default。",
-        "审核默认使用已发布代码中的原生 OpenAI gpt-6.1-sol，推理 medium，service_tier=default，不开 Fast/priority 加速。",
-    )
-    config = {"model": "gpt-6.1-sol", "reasoning_effort": "medium", "prompt": prompt,
-              "rrule": "original-schedule", "kind": "cron", "execution_environment": "local",
-              "target": {"type": "project", "project_id": "production-project"}}
-    assert production_config.automation_findings(
-        config, production_project_id="production-project", expected_schedule="original-schedule",
-    ) == []
-
-
 @pytest.mark.parametrize("relative,before,after,code", [
     ("config/automations/oa-skill-prompt.txt", "--capacity 3", "--capacity 4", "production_config_capacity_drift:template"),
     ("config/automations/oa-skill-prompt.txt", "--max-capacity 3", "--max-capacity 12", "production_config_capacity_drift:template"),
     ("docs/runbooks/hourly-production.md", "service_tier=default", "service_tier=priority", "production_config_service_tier_drift:runbook"),
     ("config/automations/oa-skill-prompt.txt", "--workflow general_expense", "--workflow packaging_layout_approval", "production_config_workflows_drift:template"),
     ("config/automations/oa-skill-prompt.txt", "--confirm-write YES", "--read-only", "production_config_command_invalid:template"),
-    ("apps/oa_finance_preaudit/codex_review_worker.py", 'f\'model_reasoning_effort="{REASONING_EFFORT}"\'', '\'model_reasoning_effort="high"\'', "production_config_native_settings_drift"),
+    ("apps/oa_finance_preaudit/codex_review_worker.py", 'f\'model_reasoning_effort="{REASONING_EFFORT}"\'', '\'model_reasoning_effort="medium"\'', "production_config_native_settings_drift"),
 ])
 def test_repository_drift_is_rejected_at_quality_seam(repository, monkeypatch, capsys, relative, before, after, code):
     path = repository / relative
@@ -76,13 +63,13 @@ def test_repository_drift_is_rejected_at_quality_seam(repository, monkeypatch, c
 
 def test_obsolete_active_provider_instruction_is_rejected(repository):
     path = repository / "docs/runbooks/hourly-production.md"
-    path.write_text(path.read_text() + "\n业务审核仍使用独立 DeepSeek。\n")
+    path.write_text(path.read_text() + "\n审核默认使用原生 OpenAI。\n")
     assert "production_config_provider_instruction_drift:runbook" in production_config.repository_findings(repository)
 
 
 def test_public_snapshot_matches_authorized_production_settings():
     assert production_config.snapshot() == {
-        "model": "gpt-6.1-sol", "reasoning_effort": "medium", "model_provider": "openai",
+        "model": "deepseek-flash", "reasoning_effort": "high", "model_provider": "oa_deepseek",
         "requested_service_tier": "default", "initial_capacity": 3, "max_capacity": 3,
         "workflows": ["travel_expense", "business_entertainment", "business_support_fee",
                       "small_marketing_fee", "tpm_small_marketing_fee", "general_expense"],
@@ -113,3 +100,16 @@ def test_unused_default_tier_string_cannot_hide_actual_priority_setting(reposito
     text = text.replace("    native_home = Path", "    unused = 'service_tier=\"default\"'\n    native_home = Path", 1)
     path.write_text(text)
     assert "production_config_native_settings_drift" in production_config.repository_findings(repository)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("input_modalities", ["text"]), ("slug", "gpt-6.1-sol"),
+    ("default_reasoning_level", "low"), ("prefer_websockets", True),
+])
+def test_catalog_drift_blocks_production_configuration(repository, field, value):
+    import json
+    path = repository / production_config.MODEL_CATALOG
+    data = json.loads(path.read_text())
+    data["models"][0][field] = value
+    path.write_text(json.dumps(data))
+    assert "production_config_catalog_drift" in production_config.repository_findings(repository)
