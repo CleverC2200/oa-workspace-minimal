@@ -13,7 +13,7 @@ from apps.oa_approval import runtime_control
 from apps.oa_finance_preaudit import approval_guard as guard, approval_lifecycle, cooldown_override
 from apps.oa_finance_preaudit import maintenance_runtime, production_config, production_release
 from scripts import finance_preaudit_run
-from tests.finance_preaudit.test_official_stop_maintenance import official_production, offline_live
+from tests.finance_preaudit.test_official_stop_maintenance import official_production, offline_live, project_notice_cooldown
 from tests.finance_preaudit.test_maintenance_runtime import clean_control_environment
 from tests.finance_preaudit.test_production_release import git
 
@@ -86,6 +86,21 @@ def test_override_only_allows_owned_invocation_and_preserves_original_evidence(s
         assert archive.read_bytes() == before[1] and archive.stat().st_mode & 0o777 == 0o600
     assert len(calls) == 1 and guard.COOLDOWN_OVERRIDE_ENV not in os.environ
     with pytest.raises(ValueError, match="approval_model_cooldown"):
+        guard.assert_admission()
+
+
+def test_project_notice_can_be_consumed_by_one_owned_round_without_rewriting_old_run(stopped, monkeypatch):
+    root, original, calls = stopped
+    cooldown, _home = project_notice_cooldown(root, monkeypatch)
+    before = cooldown.stat().st_ino, cooldown.read_bytes()
+    original_before = original.file.read_bytes()
+    with cooldown_override.one_round(root, owner_task_id=str(uuid4()), invocation_id=uuid4().hex, original=original):
+        guard.assert_admission()
+        assert not runtime_control.stop_requested()
+        assert (cooldown.stat().st_ino, cooldown.read_bytes()) == before
+        assert original.file.read_bytes() == original_before
+    assert len(calls) == 1
+    with pytest.raises(ValueError, match='approval_model_cooldown'):
         guard.assert_admission()
 
 

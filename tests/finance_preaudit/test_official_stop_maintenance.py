@@ -5,8 +5,10 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
+import time
 from uuid import uuid4
 
 import pytest
@@ -212,6 +214,67 @@ def test_official_source_only_default_preflight_keeps_old_counts_and_source(offi
 def change_json(path, **fields):
     value = json.loads(path.read_bytes())
     runtime_control.write_control_bytes_atomic(path, json.dumps({**value, **fields}).encode())
+
+
+def project_notice_cooldown(root, monkeypatch):
+    home = Path(os.environ['CODEX_HOME'])
+    stamp = time.time()
+    with sqlite3.connect(home / 'state_5.sqlite') as database:
+        database.execute('CREATE TABLE threads (id TEXT,cwd TEXT,model_provider TEXT)')
+        database.execute('INSERT INTO threads VALUES (?,?,?)', ('main-chat', str(root), 'openai'))
+    with sqlite3.connect(home / 'thread_history_1.sqlite') as database:
+        database.execute('CREATE TABLE thread_turns (thread_id TEXT,turn_id TEXT,error_json TEXT,completed_at REAL,status TEXT)')
+        database.execute('INSERT INTO thread_turns VALUES (?,?,?,?,?)',
+            ('main-chat', 'main-turn', json.dumps({'code':'serverOverloaded'}), stamp, 'failed'))
+    source = hashlib.sha256(b'main:main-chat:main-turn').hexdigest()
+    cooldown = root / 'runtime/control/approval-guard/cooldown.json'
+    change_json(cooldown, run_id=None, triggered_at=stamp, blocked_until=stamp + 3 * 60 * 60,
+        sources=[source], notice_code='server_overloaded')
+    return cooldown, home
+
+
+def test_project_notice_source_sync_keeps_approval_closure_and_unowned_notice_separate(official_production, monkeypatch, capsys):
+    root, original, action, _before, expected, _remote, _cron = official_production
+    cooldown, _home = project_notice_cooldown(root, monkeypatch)
+    unchanged = {p:(p.stat().st_ino,p.read_bytes()) for p in
+        [cooldown, original.file, action.with_name('review-interruption.json'),
+         root / ('runtime/control/approval-guard/runs/' + 'a' * 32 + '/closed-readonly.json')]}
+    code, result = run_release(official_production, monkeypatch, capsys)
+    assert code == 0 and result['status'] == 'synced' and result['after_revision'] == expected
+    proof = result['original_execution']['official_stop_proof']
+    assert proof['cooldown_attribution'] == 'project_notice'
+    assert proof['cooldown']['run_id'] is None and proof['run_id'] == 'a' * 32
+    assert len(proof['project_notices']) == 1
+    assert result['approval_recovery_allowed'] is False and result['cooldown_preserved'] is True
+    assert {p:(p.stat().st_ino,p.read_bytes()) for p in unchanged} == unchanged
+
+
+@pytest.mark.parametrize('damage', ['source','code','time','cwd','unreadable_history','overlaps_original','foreign_run'])
+def test_unowned_notice_requires_actual_project_terminal_error(official_production, monkeypatch, capsys, damage):
+    root, _original, _action, before, _expected, _remote, _cron = official_production
+    cooldown, home = project_notice_cooldown(root, monkeypatch)
+    if damage == 'source':
+        change_json(cooldown, sources=['0' * 64])
+    elif damage == 'foreign_run':
+        change_json(cooldown, run_id='d' * 32)
+    elif damage == 'cwd':
+        with sqlite3.connect(home / 'state_5.sqlite') as database:
+            database.execute('UPDATE threads SET cwd=?', ('other-project',))
+    elif damage == 'unreadable_history':
+        (home / 'thread_history_1.sqlite').unlink()
+    elif damage == 'overlaps_original':
+        value = json.loads(cooldown.read_bytes())
+        change_json(cooldown, triggered_at=value['triggered_at'] - 100, blocked_until=value['blocked_until'] - 100)
+    else:
+        with sqlite3.connect(home / 'thread_history_1.sqlite') as database:
+            if damage == 'code':
+                database.execute('UPDATE thread_turns SET error_json=?', (json.dumps({'code':'rateLimitExceeded'}),))
+            else:
+                database.execute('UPDATE thread_turns SET completed_at=completed_at-1')
+    actual = cooldown.read_bytes()
+    code, result = run_release(official_production, monkeypatch, capsys)
+    assert code == 1 and result['status'] == 'blocked'
+    assert git(root, 'rev-parse', 'HEAD') == before and cooldown.read_bytes() == actual
 
 
 @pytest.mark.parametrize('scenario', [

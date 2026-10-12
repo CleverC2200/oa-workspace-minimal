@@ -73,3 +73,5 @@ python -m apps.oa_finance_preaudit.production_release \
 旧版对账可能计入 `isolated_pending`，但未将可信中断计入 `pending_quarantined`。仅源码维护允许逐项解释这一缺口：当前完整只读对账必须 ready/item、blocking_reasons 为空，隔离计数差值必须精确等于本次新鲜输入证明中、同轮待办且经目标现有校验器确认未计入隔离的中断数。原 status 文件及 continuation 不改写。其他计数差异、缺失中断证明、身份冲突、Writer 产物、未知写入和业务阻断仍拒绝；当前身份、认证、授权、冻结、Controller/Writer 租约及发布配置门保持。
 
 成功回执增加 `official_stop_source_only=true`、`original_wait_verified=true`、`cooldown_preserved=true`、`original_evidence_preserved=true`、`approval_recovery_allowed=false` 和同步前完整 `pre_sync_status_file` 引用。源码安装后重新从目标生成完整只读状态和输入证明，不复用升级前的计数解释。`next_process_ready=false`、`write_state=not_requested`、`production_acceptance=not_verified` 保持；只有冷却到期后的独立恢复门禁和新进程验收才可证明审批恢复。同步后校验失败仍报告真实源码更新状态，停止门或冷却留证失信时明确未保留或 unknown，不自动重试、回滚或启动审批。
+
+上一审批真实退出后产生的主聊天 `run_id=null` 冷却也可保留用于源码维护。按[单轮豁免的来源合同](cooldown-override.md)分别核验目标本机官方历史和上一审批闭合，不把主聊天事件归为原审批错误。回执以 `cooldown_attribution=project_notice` 保存当前事件来源，上轮审批关闭证明及所有原证据不变。维护仍不清门、不恢复调度；提前运行必须有当前单轮豁免授权并经独立入口消费。
