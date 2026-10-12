@@ -24,6 +24,13 @@ def wait_until(predicate, seconds=6):
     pytest.fail('owned execution did not reach the expected state')
 
 
+def sealed_execution(path):
+    if not path.exists():
+        return None
+    value = json.loads(path.read_text())
+    return value if value['state'] == 'exited' and 'result' in value else None
+
+
 def fake_controller(counter):
     return f'''import json,time
 from pathlib import Path
@@ -75,7 +82,7 @@ supervise({command!r},directory=Path({str(directory)!r}),owner_task_id={owner!r}
         if target != 'supervisor':
             if target == 'caller':
                 caller.wait(timeout=2)
-            final = wait_until(lambda: (v if (v := json.loads(receipt_path.read_text()))['state'] == 'exited' else None))
+            final = wait_until(lambda: sealed_execution(receipt_path))
             assert final['exit_code'] == 7 and final['children_reaped'] is True
             report = runner.read_execution(receipt_path, owner_task_id=owner, invocation_id=directory.name)
             assert report['terminal'] is True and report['status'] == 'blocked'
@@ -173,7 +180,7 @@ while not Path({str(counter)!r}).exists():time.sleep(.05)
     try:
         assert tool.wait(timeout=6) == 0
         receipt_path = directory / 'execution.json'
-        final = wait_until(lambda: (v if (v := json.loads(receipt_path.read_text()))['state'] == 'exited' else None))
+        final = wait_until(lambda: sealed_execution(receipt_path))
         assert final['owner_process_lost'] is True and final['exit_code'] == 7
         report = runner.read_execution(receipt_path, owner_task_id=owner, invocation_id=directory.name)
         assert report['terminal'] is True and report['children_reaped'] is True
@@ -181,6 +188,38 @@ while not Path({str(counter)!r}).exists():time.sleep(.05)
     finally:
         runtime_control.request_cycle_stop()
         tool.wait(timeout=6)
+
+
+def test_exited_wait_ignores_unsealed_receipt(tmp_path, monkeypatch):
+    monkeypatch.setenv('OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE', str(tmp_path / 'rolling.lock'))
+    owner = str(uuid4())
+    directory = tmp_path / 'executions' / uuid4().hex
+    receipt_path = directory / 'execution.json'
+    manifest_path = directory / 'controller-manifest.json'
+    read = runtime_control.read_control_bytes
+    observed = []
+
+    def observe_before_manifest_attestation(path):
+        if Path(path) == manifest_path and not observed:
+            observed.append(sealed_execution(receipt_path))
+        return read(path)
+
+    monkeypatch.setattr(runtime_control, 'read_control_bytes', observe_before_manifest_attestation)
+    command = [sys.executable, '-c', '''import time
+from apps.oa_approval import runtime_control as control
+from apps.oa_finance_preaudit import controller_handoff as handoff
+with control.global_controller_lease():
+    manifest=handoff.begin({'capacity':3})
+    handoff.finish(manifest,status='failed',children_reaped=True,health='degraded')
+time.sleep(.15)
+raise SystemExit(7)
+''']
+    runner.supervise(command, directory=directory, owner_task_id=owner)
+    assert observed == [None]
+    final = sealed_execution(receipt_path)
+    assert final['exit_code'] == 7 and final['children_reaped'] is True
+    report = runner.read_execution(receipt_path, owner_task_id=owner, invocation_id=directory.name)
+    assert report['terminal'] is True and report['status'] == 'blocked'
 
 
 @pytest.mark.parametrize('error_code', ['controller_execution_snapshot_changed', 'controller_execution_evidence_failed'])
