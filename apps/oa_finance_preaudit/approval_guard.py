@@ -26,6 +26,7 @@ STOP_REASON = "codex_official_error_cooldown"
 RUN_ENV = "OA_APPROVAL_RUN_ID"
 INSTANCE_ENV = "OA_APPROVAL_INSTANCE_ID"
 OWNER_ENV = "OA_APPROVAL_OWNER_TASK_ID"
+COOLDOWN_OVERRIDE_ENV = "OA_APPROVAL_COOLDOWN_OVERRIDE"
 EXECUTION_OWNERS_ENV = "OA_APPROVAL_EXECUTION_OWNERS"
 NOTICE_CODES = frozenset({"usage_limit", "model_unavailable", "rate_limit", "server_overloaded", "authentication"})
 
@@ -124,10 +125,11 @@ def record_notice(code: str, source: str, *, occurred_at: float | None = None,
         publish = True
         try:
             previous = cooldown()
+            overridden = cooldown_ignored(previous) if previous else False
             if previous and key in previous["sources"]:
-                publish = now < previous["blocked_until"]
+                publish = now < previous["blocked_until"] and not overridden
                 return previous
-            if previous and now < previous["blocked_until"]:
+            if previous and now < previous["blocked_until"] and not overridden:
                 # Other workers reporting this incident do not restart its clock.
                 if len(previous["sources"]) >= 1000:
                     raise ValueError("approval_notice_capacity_exceeded")
@@ -282,6 +284,13 @@ def _close_slot(value: dict) -> None:
         value.update(closed)
 
 
+def cooldown_ignored(value: dict) -> bool:
+    if COOLDOWN_OVERRIDE_ENV not in os.environ:
+        return False
+    from .cooldown_override import matches
+    return matches(value)
+
+
 def assert_admission() -> None:
     with runtime_control.stop_control_lease():
         _assert_admission_locked()
@@ -289,7 +298,7 @@ def assert_admission() -> None:
 
 def _assert_admission_locked() -> None:
     value = cooldown()
-    if value and time.time() < value["blocked_until"]:
+    if value and time.time() < value["blocked_until"] and not cooldown_ignored(value):
         raise ValueError("approval_model_cooldown")
     if runtime_control.stop_requested():
         raise ValueError("stop_requested")

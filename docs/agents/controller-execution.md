@@ -1,5 +1,7 @@
 # 控制器执行回执
 
+显式授权的提前单轮执行使用[人工单轮冷却豁免](../runbooks/cooldown-override.md)，仍由本入口监督。原执行、冷却字节、完整启动对账和当前调用保存在私有豁免回执中；execution.json 绑定其路径和 SHA-256，进度回读核对该绑定。它不改变普通启动、工具会话绑定或真实 wait 合同。
+
 正常已授权调度使用 `python -m scripts.finance_preaudit_run --owner-task-id <当前聊天 UUID> -- <原滚动控制器参数>`。该入口仅监督现有 `scripts.finance_preaudit_concurrency_probe`，确认写入、范围、恢复参数和全部门禁仍由原入口校验；开发验证不传真实业务写入参数。
 
 工具调用者与每轮监督者分开：入口启动一个独立进程组中的本轮监督者，由它创建、真实 wait 原控制器并独占保存 execution.json。它不是常驻 daemon 或额外模型 worker，不重复启动控制器。调用者收到停止信号时转交监督者；调用者或其原工具父进程消失或 PID 身份变化时，监督者请求既有停止门并继续等待 Writer 和控制器收尾，保留真实退出码。启动前和每次 CLI 启动前核对已绑定的 PID、出生时间、进程组及用户，不能仅凭 PID 仍存在放行。

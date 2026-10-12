@@ -280,7 +280,7 @@ def startup(project_root: Path, *, observe_errors: bool = True) -> dict:
                 runtime_control.clear_cycle_stop()
         if not guard.reap_models():
             return {"status": "blocked", "reason": "approval_model_children_unknown"}
-        if value and time.time() < value["blocked_until"]:
+        if value and time.time() < value["blocked_until"] and not guard.cooldown_ignored(value):
             return {"status": "skipped", "reason": "approval_model_cooldown", "blocked_until": value["blocked_until"], "cleanup": cleanup}
         if runtime_control.stop_reason() == guard.STOP_REASON:
             if not guard.clear_expired_cooldown():
