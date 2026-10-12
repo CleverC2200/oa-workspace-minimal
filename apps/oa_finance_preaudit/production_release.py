@@ -176,7 +176,7 @@ def _observed_revision(root: Path) -> str | None:
 
 def _failed_release(root: Path, before: str | None, expected: str, requested: bool, error: Exception,
                     *, stopped_maintenance: bool = False, automation: ProductionAutomation | None = None,
-                    controls_before: dict | None = None) -> dict:
+                    controls_before: dict | None = None, supervisor_loss_source_only: bool = False) -> dict:
     after = _observed_revision(root)
     state = 'unknown' if before is None or after is None else ('not_updated' if after == before else 'updated')
     return {'schema_version': 1, 'kind': 'production_source_release', 'status': 'blocked',
@@ -185,6 +185,9 @@ def _failed_release(root: Path, before: str | None, expected: str, requested: bo
             'requested_revision': expected, 'source_sync_requested': requested,
             'source_sync_state': state, 'next_process_ready': False,
             'production_acceptance': 'not_verified',
+            **({'supervisor_loss_source_only': True, 'original_wait_verified': False,
+                'approval_recovery_allowed': False, 'original_evidence_preserved': 'unknown'}
+                if supervisor_loss_source_only else {}),
             **(_stopped_receipt(root, automation, controls_before) if stopped_maintenance else {})}
 
 
@@ -194,6 +197,7 @@ def release_source(
     check_live: Callable[[Path], dict] | None = None,
     check_configuration: Callable[[Path, str], list[str]] | None = None,
     stopped_maintenance: bool = False,
+    supervisor_loss_source_only: bool = False,
     original_execution: maintenance_runtime.OriginalExecution | None = None,
     check_original: Callable[[Path, maintenance_runtime.OriginalExecution], dict] | None = None,
 ) -> dict:
@@ -207,6 +211,8 @@ def release_source(
     cron; it requires original execution readback and never makes approval ready.
     """
     root = Path(target_root).expanduser().absolute()
+    if supervisor_loss_source_only and not stopped_maintenance:
+        raise RuntimeError('production_release_stopped_maintenance_required')
     if not _REVISION.fullmatch(expected_revision):
         raise RuntimeError('production_release_revision_invalid')
     maintenance_runtime.assert_target_environment(root)
@@ -239,20 +245,34 @@ def release_source(
     findings = configuration(root, expected_revision)
     if findings:
         raise RuntimeError('production_release_configuration_invalid:' + ','.join(findings))
-    live = check_live or (lambda target: maintenance_runtime.read_live_status(target, require_reaped=stopped_maintenance))
+    loss_proof = None
+    live = check_live or (lambda target: maintenance_runtime.read_live_status(target,
+        require_reaped=stopped_maintenance, source_only_proof=loss_proof))
     manifest_file = root / 'runtime/control/rolling-controller-manifest.json'
     manifest = runtime_control.read_control_bytes(manifest_file)
     if manifest is None:
         raise RuntimeError('production_release_manifest_missing')
     sync_started = False
+    def original_readback() -> dict:
+        if check_original is not None:
+            report = check_original(root, original_execution)
+        else:
+            report = maintenance_runtime.read_original_execution(root, original_execution,
+                supervisor_loss_source_only=supervisor_loss_source_only)
+        maintenance_runtime.assert_original_execution_safe(root, original_execution, report, manifest,
+            supervisor_loss_source_only=supervisor_loss_source_only)
+        if loss_proof is not None and report.get('source_only_proof') != loss_proof:
+            raise RuntimeError('production_release_original_evidence_changed')
+        return report
     try:
         with maintenance_runtime.target_runtime_leases(root):
             assert_controls()
             if stopped_maintenance:
-                report = (check_original or maintenance_runtime.read_original_execution)(root, original_execution)
-                maintenance_runtime.assert_original_execution_safe(root, original_execution, report, manifest)
+                report = original_readback()
+                if supervisor_loss_source_only:
+                    loss_proof = report['source_only_proof']
             snapshot = live(root)
-            maintenance_runtime.assert_live_safe(snapshot)
+            maintenance_runtime.assert_live_safe(snapshot, source_only_proof=loss_proof)
             if runtime_control.read_control_bytes(manifest_file) != manifest:
                 raise RuntimeError('production_release_manifest_changed')
             if _source(root, expected_revision, expected_origin) != before:
@@ -261,12 +281,14 @@ def release_source(
             findings = configuration(root, expected_revision)
             if findings:
                 raise RuntimeError('production_release_configuration_invalid:' + ','.join(findings))
+            if supervisor_loss_source_only:
+                original_readback()
             if confirmed_sync:
                 assert_controls()
                 sync_started = True
                 _git(root, 'merge', '--ff-only', expected_revision)
                 snapshot = live(root)
-                maintenance_runtime.assert_live_safe(snapshot)
+                maintenance_runtime.assert_live_safe(snapshot, source_only_proof=loss_proof)
                 if check_configuration is None:
                     from . import production_config
                     findings = production_config.repository_findings(root)
@@ -280,8 +302,7 @@ def release_source(
             if runtime_control.read_control_bytes(manifest_file) != manifest:
                 raise RuntimeError('production_release_manifest_changed')
             if stopped_maintenance:
-                report = (check_original or maintenance_runtime.read_original_execution)(root, original_execution)
-                maintenance_runtime.assert_original_execution_safe(root, original_execution, report, manifest)
+                report = original_readback()
                 assert_controls()
                 stopped_result = _stopped_receipt(root, automation, controls_before)
                 if (stopped_result['stopped_controls_after'] != controls_before
@@ -300,6 +321,9 @@ def release_source(
                 'status_file': snapshot.get('maintenance_status_file'),
                 'current_input_proof': snapshot.get('maintenance_current_inputs'),
                 'continuation': snapshot['reconciliation']['continuation'],
+                **({'supervisor_loss_source_only': True, 'original_wait_verified': False,
+                    'approval_recovery_allowed': False, 'original_evidence_preserved': True}
+                    if supervisor_loss_source_only else {}),
                 **({**stopped_result,
                     'original_execution': report} if stopped_maintenance else {}),
             }
@@ -307,7 +331,8 @@ def release_source(
         if not sync_started:
             raise
         return _failed_release(root, before, expected_revision, confirmed_sync, error,
-            stopped_maintenance=stopped_maintenance, automation=automation, controls_before=controls_before)
+            stopped_maintenance=stopped_maintenance, automation=automation, controls_before=controls_before,
+            supervisor_loss_source_only=supervisor_loss_source_only)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -319,6 +344,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--production-project-id', required=True)
     parser.add_argument('--expected-schedule', required=True)
     parser.add_argument('--stopped-maintenance', choices=('YES',))
+    parser.add_argument('--supervisor-loss-source-only', choices=('YES',))
     parser.add_argument('--original-receipt-file', type=Path)
     parser.add_argument('--original-owner-task-id')
     parser.add_argument('--original-tool-session-id')
@@ -338,10 +364,12 @@ def main(argv: list[str] | None = None) -> int:
                 args.original_owner_task_id, args.original_tool_session_id)
         payload = release_source(args.target_root, expected_revision=args.expected_revision,
                                  confirmed_sync=args.confirm_sync == 'YES', automation=automation,
-                                 stopped_maintenance=args.stopped_maintenance == 'YES', original_execution=original)
+                                 stopped_maintenance=args.stopped_maintenance == 'YES', original_execution=original,
+                                 supervisor_loss_source_only=args.supervisor_loss_source_only == 'YES')
     except (OSError, ValueError, RuntimeError) as error:
         print(json.dumps(_failed_release(args.target_root, before, args.expected_revision, args.confirm_sync == 'YES', error,
-            stopped_maintenance=args.stopped_maintenance == 'YES', automation=automation, controls_before=controls_before)))
+            stopped_maintenance=args.stopped_maintenance == 'YES', automation=automation, controls_before=controls_before,
+            supervisor_loss_source_only=args.supervisor_loss_source_only == 'YES')))
         return 1
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return 1 if payload['status'] == 'blocked' else 0
