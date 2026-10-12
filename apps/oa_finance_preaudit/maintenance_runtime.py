@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -203,19 +204,43 @@ if (progress is None or not progress['actions'] or Path(progress['project_root']
         or progress['writer_active'] is not False
         or guard.process_identity(mirror['controller_pid']) is not None or guard.group_alive(mirror['controller_pid'])
         or not lifecycle.readonly_reaped(mirror) or not guard.models_reaped()
-        or cooldown is None or cooldown['run_id'] != mirror['run_id']):
+        or cooldown is None or cooldown['run_id'] not in (None, mirror['run_id'])):
     raise ValueError('maintenance_original_process_active')
 slots = [guard._slot(index) for index in range(guard.MAX_MODEL_WORKERS)]
 if any(slot and slot.get('pid') is not None and
         (guard.process_identity(slot['pid']) is not None or guard.group_alive(slot['pid'])) for slot in slots):
     raise ValueError('maintenance_original_process_active')
 closed = review_interruption.closed_run(mirror['run_id'], Path(progress['actions'][0]))
-if (closed['cause'] != guard.STOP_REASON or closed['cooldown'] != cooldown
+original_cooldown = closed['cooldown']
+if (closed['cause'] != guard.STOP_REASON or not isinstance(original_cooldown, dict)
+        or original_cooldown.get('run_id') != mirror['run_id']
+        or (cooldown['run_id'] is not None and original_cooldown != cooldown)
         or closed['controller_instance_id'] != mirror['controller_instance_id']
         or closed['controller'] != progress['controller'] or closed['project_root'] != str(root)
         or closed['actions'] != progress['actions']
-        or not cooldown['triggered_at'] <= closed['closed_at'] <= finance_preaudit_run._timestamp(saved['completed_at']).timestamp()):
+        or not original_cooldown['triggered_at'] <= closed['closed_at'] <= finance_preaudit_run._timestamp(saved['completed_at']).timestamp()):
     raise ValueError('maintenance_official_stop_untrusted')
+
+def project_notices():
+    if cooldown['run_id'] is not None:
+        return []
+    import hashlib
+    completed = finance_preaudit_run._timestamp(saved['completed_at']).timestamp()
+    if cooldown['triggered_at'] < completed:
+        raise ValueError('maintenance_project_notice_untrusted')
+    notices = [{'source_sha256':hashlib.sha256(source.encode()).hexdigest(),
+                'notice_code':code,'occurred_at':stamp}
+               for code, source, stamp in guard.project_official_errors(root)
+               if hashlib.sha256(source.encode()).hexdigest() in cooldown['sources']]
+    if (len(notices) != len(cooldown['sources'])
+            or {notice['source_sha256'] for notice in notices} != set(cooldown['sources'])
+            or any(not cooldown['triggered_at'] <= notice['occurred_at'] < cooldown['blocked_until'] for notice in notices)
+            or not any(notice['occurred_at'] == cooldown['triggered_at']
+                       and notice['notice_code'] == cooldown['notice_code'] for notice in notices)):
+        raise ValueError('maintenance_project_notice_untrusted')
+    return notices
+
+notices = project_notices()
 run = lifecycle.run_directory(mirror['run_id'])
 flows = root / 'runtime/finance_preaudit_flows'
 
@@ -253,6 +278,7 @@ required = (path, path.with_name('tool-session.json'), path.with_name('controlle
 if (any(fingerprints[str(file)] is None for file in required)
         or files != evidence_paths() or fingerprints != {str(file):fingerprint(file) for file in files}
         or cooldown != guard.cooldown() or progress != lifecycle._progress(mirror)
+        or notices != project_notices()
         or closed != review_interruption.closed_run(mirror['run_id'], Path(progress['actions'][0]))
         or interrupted != interrupted_actions()
         or report != finance_preaudit_run.read_execution(path,owner_task_id=owner,invocation_id=path.parent.name,tool_session_id=session)):
@@ -261,6 +287,8 @@ report['official_stop_proof'] = {'kind':'preaudit_official_stop_source_only','re
     'original_wait_verified':True,'target_root':str(root),'run_id':mirror['run_id'],
     'controller_instance_id':mirror['controller_instance_id'],'readonly_reaped':True,'models_reaped':True,
     'supervisor_absent':True,'cooldown':cooldown,'actions':progress['actions'],
+    'cooldown_attribution':'project_notice' if cooldown['run_id'] is None else 'approval_run',
+    'project_notices':notices,
     'interrupted_actions':interrupted,'evidence_files':fingerprints}
 '''
 
@@ -350,9 +378,23 @@ def assert_original_execution_safe(target_root: Path, original: OriginalExecutio
                     or proof.get('run_id') != saved['run_id']
                     or proof.get('controller_instance_id') != saved['controller_instance_id']
                     or any(proof.get(key) is not True for key in ('readonly_reaped', 'models_reaped', 'supervisor_absent'))
-                    or not isinstance(proof.get('cooldown'), dict) or proof['cooldown'].get('run_id') != saved['run_id']
+                    or not isinstance(proof.get('cooldown'), dict)
                     or not isinstance(proof.get('interrupted_actions'), list)
                     or not isinstance(proof.get('evidence_files'), dict) or not proof['evidence_files']):
+                raise RuntimeError('maintenance_original_execution_untrusted')
+            cooldown = proof['cooldown']
+            attribution = proof.get('cooldown_attribution', 'approval_run')
+            if attribution == 'project_notice':
+                notices = proof.get('project_notices')
+                if (cooldown.get('run_id') is not None or not isinstance(notices, list) or not notices
+                        or any(not isinstance(notice, dict) for notice in notices)
+                        or {notice.get('source_sha256') for notice in notices} != set(cooldown.get('sources', []))
+                        or len(notices) != len(cooldown.get('sources', []))
+                        or cooldown['triggered_at'] < datetime.fromisoformat(saved['completed_at']).timestamp()
+                        or not any(notice.get('occurred_at') == cooldown['triggered_at']
+                                   and notice.get('notice_code') == cooldown['notice_code'] for notice in notices)):
+                    raise RuntimeError('maintenance_original_execution_untrusted')
+            elif attribution != 'approval_run' or cooldown.get('run_id') != saved['run_id']:
                 raise RuntimeError('maintenance_original_execution_untrusted')
         pid = saved.get('controller_pid')
         if type(pid) is not int or pid < 1:
