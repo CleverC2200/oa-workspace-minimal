@@ -7,7 +7,8 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from functools import partial
 import multiprocessing
 
 import pytest
@@ -277,6 +278,12 @@ def test_interruption_revokes_authorization_and_next_attempt_refetches(tmp_path)
             assert not state["write_authorized"] and state["write_state"] == "not_requested"
             assert review_interruption.trusted(action.parent, state)
             report = reconciliation.reconcile(root, pending_rows=rows, handled_rows=[])
+            from scripts import finance_preaudit_concurrency_probe as probe
+            assert report["quarantine"] == {
+                "local_quarantined": 1, "pending_quarantined": 1, "actionable_pending": 0,
+            }
+            assert probe._continuation_is_ready(report)
+            assert report["manual_review"]["items"][0]["failure_code"] == review_interruption.REASON
             assert review_interruption.select(root, report, frozenset({"travel_expense"})) == (action,)
             # Simulate the next eligible round after the official gate was safely cleared.
             runtime_control._clear_stop(f"stop_requested:{guard.STOP_REASON}\n".encode())
@@ -299,3 +306,130 @@ def test_writer_artifacts_never_reclassified_or_replayed(tmp_path, artifact):
                 lifecycle.interrupt_unwritten(manifest, cause="controller_orphaned")
     assert before == (action.read_bytes(), action.with_name("state.json").read_bytes())
     assert len(collections) == 1
+
+
+@pytest.mark.parametrize("entry", ["rolling", "dispatcher"])
+def test_mixed_interruption_and_permanent_quarantine_restarts_only_interrupted_item(tmp_path, monkeypatch, entry):
+    from apps.oa_finance_preaudit import process_pool
+    from apps.oa_finance_preaudit import codex_review_worker as worker, production_write
+    from scripts import finance_preaudit_concurrency_probe as probe
+    from tests.finance_preaudit.test_reconciliation import _state
+
+    root, rows, collections, engine, action = prepared_case(tmp_path)
+    _state(root, "permanent", rows[0]["received_at"], reason="codex_review_failed")
+    rows.append({"request_id": "permanent", "received_at": rows[0]["received_at"], "workflow_key": "travel_expense"})
+    with runtime_control.global_controller_lease():
+        manifest = controller_handoff.begin({"capacity": 3})
+        with lifecycle.run_scope(manifest, tmp_path):
+            lifecycle.heartbeat(manifest["run_id"], manifest["controller_instance_id"], {action}, [], writer_active=False)
+            guard.record_notice("server_overloaded", "cli:offline")
+            lifecycle.interrupt_unwritten(manifest, cause=guard.STOP_REASON)
+        controller_handoff.finish(manifest, status="failed", children_reaped=True, health="degraded")
+    report = reconciliation.reconcile(root, pending_rows=rows, handled_rows=[])
+    assert report["quarantine"] == {"local_quarantined": 2, "pending_quarantined": 2, "actionable_pending": 0}
+    assert report["continuation"]["isolated_pending"] == 2
+    assert probe._continuation_is_ready(report)
+    before = {path: path.read_bytes() for path in root.glob("*/cases/*/attempt-1/*.json")}
+    policy = tmp_path / "policy.json"
+    policy.write_text(json.dumps({"schema_version": 1, "kind": "preaudit_write_policy", "authorized_workflows": ["travel_expense"]}))
+    home = tmp_path / "codex"
+    official_history(home, tmp_path, [])
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setenv("OA_FINANCE_PREAUDIT_WRITE_POLICY", str(policy))
+    monkeypatch.setattr(probe, "PROJECT_ROOT", tmp_path)
+    ports = production_write.build_ports(root=root, policy_file=policy,
+        signing_secret="offline-test-secret", api_factory=lambda: pytest.fail("no writer allowed"))
+    engine = flow_engine.FlowEngine(root=root, discover_candidates=lambda _: rows,
+        discover_handled=lambda: [], collect_material=engine._collect_material, **ports)
+    monkeypatch.setattr(probe.cli, "_live_flow_engine", lambda **_: engine)
+    monkeypatch.setattr(probe.cli, "_live_pending_identities", lambda: [
+        {"requestId": row["request_id"], "received_at": row["received_at"],
+         "flow_key": row["workflow_key"], "support_status": "supported", "can_submit": True}
+        for row in rows])
+    # Retain the real identity validator with the offline project's root.
+    monkeypatch.setattr(probe, "_prepared_action_matches_selection",
+        partial(probe._prepared_action_matches_selection, project_root=tmp_path))
+    calls = []
+
+    def pipeline(count, capacity, **kwargs):
+        calls.append((count, capacity, kwargs["recovery_action_files"]))
+        prepared = probe._prepare_one({"workflow_key": "*", "assigned_identities": [],
+            "historical_unknown_identities": [], "recover_action_files": [str(path) for path in kwargs["recovery_action_files"]]})
+        assert prepared["action"] == "review_required"
+        assert json.loads(Path(prepared["action_file"]).read_text())["attempt"] == 2
+        return process_pool.PoolResult(requested=count, started=count, completed=count,
+            failed=0, timed_out=0, stopped=0, peak_active=1, elapsed_seconds=1,
+            outcomes=(process_pool.TaskOutcome(index=0, status="completed", value={
+                "status": "retry_pending", "error_code": "codex_review_retry_pending",
+                "token_usage": {"status": "unknown"}}),))
+
+    monkeypatch.setattr(probe, "_run_global_dispatched_tasks", pipeline)
+    kwargs = dict(capacity=3, max_capacity=3, pipeline_runner=pipeline,
+        live_status=lambda: {"credentials": {"status": "ok"}, "oa": {
+            "execution_identity": "verified", "by_workflow": {"travel_expense": 2}}},
+        reconcile_status=lambda: reconciliation.reconcile(root, pending_rows=rows, handled_rows=[]))
+    assert probe.run_rolling_drain(**kwargs)["status"] == "skipped"
+    assert calls == [] and len(collections) == 1
+    now = guard.cooldown()["blocked_until"] + 1
+    monkeypatch.setattr(guard.time, "time", lambda: now)
+    monkeypatch.setattr(controller_handoff, "CONTROLLER_INSTANCE_ID", "b" * 32)
+    if entry == "rolling":
+        result = probe.run_rolling_drain(**kwargs)
+        assert calls == [(1, 3, (action,))]
+        assert result["stop_reason"] == "review_retry_pending"
+    else:
+        assert lifecycle.startup(tmp_path, observe_errors=False)["status"] == "ready"
+        selected = review_interruption.select(root, report, frozenset({"travel_expense"}))
+        monkeypatch.setattr(probe, "_preparation_executor", lambda: ThreadPoolExecutor(max_workers=1))
+        reviewed = []
+        def offline_review(payload):
+            reviewed.append(Path(payload["action_file"]))
+            return {**worker._base_result(attempts=1, usages=[{"status": "unknown"}]),
+                "codex_events": worker._unknown_events(1), "status": "failed",
+                "business_state": "not_available", "write_state": "not_requested",
+                "error_code": "codex_process_failed"}
+        result = probe._run_dispatched_tasks(1, 3, project_root=tmp_path,
+            strict_global_fifo=True, recovery_action_files=selected,
+            prepare_action=probe._prepare_one, renew_actions=lambda paths: paths,
+            review_worker=offline_review, record_failure_round=probe._record_failure_round,
+            executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+            runtime_status=lambda: {"status": "healthy"})
+        assert result.completed == 1 and result.failed == 0
+        assert len(reviewed) == 1 and reviewed[0].parent.name == "attempt-2"
+        assert result.outcomes[0].value["status"] == "retry_pending"
+    assert len(collections) == 2
+    assert all(path.read_bytes() == raw for path, raw in before.items())
+
+
+@pytest.mark.parametrize("damage", ["interruption_receipt", "manual_receipt", "archived_action", "writer", "unknown_write", "identity"])
+def test_interruption_count_and_start_gate_reject_damaged_or_unresolved_evidence(tmp_path, damage):
+    from scripts import finance_preaudit_concurrency_probe as probe
+    root, rows, _collections, _engine, action = prepared_case(tmp_path)
+    with runtime_control.global_controller_lease():
+        manifest = controller_handoff.begin({"capacity": 3})
+        with lifecycle.run_scope(manifest, tmp_path):
+            lifecycle.heartbeat(manifest["run_id"], manifest["controller_instance_id"], {action}, [], writer_active=False)
+            guard.record_notice("usage_limit", "cli:offline")
+            lifecycle.interrupt_unwritten(manifest, cause=guard.STOP_REASON)
+    if damage == "interruption_receipt":
+        action.with_name("review-interruption.json").unlink()
+    elif damage == "manual_receipt":
+        action.with_name("manual-review-receipt.json").unlink()
+    elif damage == "archived_action":
+        action.with_name("interrupted-action.json").write_text("{}")
+    elif damage == "writer":
+        action.with_name("writer-boundary.json").write_text("{}")
+    elif damage == "unknown_write":
+        for path in (action, action.with_name("state.json")):
+            state = json.loads(path.read_text())
+            path.write_text(json.dumps({**state, "write_state": "unknown"}))
+    else:
+        rows[0]["received_at"] = "2026-10-10 10:00:00"
+    before = {path: path.read_bytes() for path in root.rglob("*.json")}
+    report = reconciliation.reconcile(root, pending_rows=rows, handled_rows=[])
+    assert report["quarantine"]["pending_quarantined"] == 0
+    assert report["continuation"]["status"] == "blocked"
+    assert not probe._continuation_is_ready(report)
+    with pytest.raises(ValueError, match="production_rolling_reconciliation_invalid"):
+        review_interruption.select(root, report, frozenset({"travel_expense"}))
+    assert all(path.read_bytes() == raw for path, raw in before.items())

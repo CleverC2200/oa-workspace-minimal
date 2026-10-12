@@ -8524,3 +8524,82 @@ def test_retry_pending_does_not_hide_prepare_timeout(monkeypatch):
     )
     assert payload["status"] == "failed"
     assert payload["primary_error_code"] == "production_probe_prepare_timeout"
+
+
+@pytest.mark.parametrize("notice_code", [None, *sorted(finance_preaudit_concurrency_probe.approval_guard.NOTICE_CODES)])
+def test_official_first_stop_survives_secondary_prepare_failure(tmp_path, monkeypatch, notice_code):
+    probe = finance_preaudit_concurrency_probe
+    guard = probe.approval_guard
+    monkeypatch.setattr(probe, "PROJECT_ROOT", tmp_path)
+
+    def pipeline(count, capacity, **kwargs):
+        if notice_code is not None:
+            guard.record_notice(notice_code, "cli:offline-first")
+        return process_pool.PoolResult(
+            requested=count, started=1, completed=0, failed=1, timed_out=0,
+            stopped=count - 1, peak_active=1, elapsed_seconds=1,
+            primary_error_code="production_probe_prepare_failed",
+            outcomes=(process_pool.TaskOutcome(index=0, status="failed", value={
+                "status": "failed", "error_code": "production_probe_prepare_failed",
+                "token_usage": {"status": "unknown"},
+            }),),
+        )
+
+    monkeypatch.setattr(probe, "_run_global_dispatched_tasks", pipeline)
+    result = probe.run_rolling_drain(
+        capacity=3, max_capacity=3, pipeline_runner=pipeline,
+        live_status=lambda: {"credentials": {"status": "ok"}, "oa": {
+            "execution_identity": "verified", "by_workflow": {"travel_expense": 2}}},
+        reconcile_status=lambda: _reconciliation_snapshot(2),
+    )
+    assert result["status"] == "failed"
+    if notice_code is None:
+        assert result["stop_reason"] == "technical_failure"
+        assert result["primary_error_code"] == "production_probe_prepare_failed"
+        assert "official_notice" not in result
+        return
+    assert result["stop_reason"] == guard.STOP_REASON
+    assert result["primary_error_code"] == guard.STOP_REASON
+    assert result["official_notice"] == {
+        "status": "recorded", "notice_code": notice_code,
+        "triggered_at": guard.cooldown()["triggered_at"],
+        "blocked_until": guard.cooldown()["blocked_until"],
+    }
+    assert result["last_capacity_decision"]["reason"] == guard.STOP_REASON
+    assert result["error_counts"] == {"production_probe_prepare_failed": 1}
+    assert result["processes_reaped"] is True
+    assert result["controller_handoff"]["children_reaped"] is True
+    assert probe.runtime_control.stop_reason() == guard.STOP_REASON
+
+
+@pytest.mark.parametrize("evidence", ["missing", "other_run", "invalid"])
+def test_official_stop_does_not_invent_classification_from_unbound_evidence(tmp_path, monkeypatch, evidence):
+    probe = finance_preaudit_concurrency_probe
+    guard = probe.approval_guard
+    monkeypatch.setattr(probe, "PROJECT_ROOT", tmp_path)
+
+    def pipeline(count, capacity, **kwargs):
+        if evidence == "other_run":
+            with monkeypatch.context() as context:
+                context.setenv(guard.RUN_ENV, "a" * 32)
+                guard.record_notice("usage_limit", "cli:old")
+        else:
+            probe.runtime_control.request_stop(guard.STOP_REASON)
+            if evidence == "invalid":
+                guard.write(guard.directory() / "cooldown.json", {"notice_code": "usage_limit"})
+        return process_pool.PoolResult(requested=count, started=0, completed=0, failed=0,
+            timed_out=0, stopped=count, peak_active=0, elapsed_seconds=1, outcomes=())
+
+    monkeypatch.setattr(probe, "_run_global_dispatched_tasks", pipeline)
+    kwargs = dict(capacity=3, max_capacity=3, pipeline_runner=pipeline,
+        live_status=lambda: {"credentials": {"status": "ok"}, "oa": {
+            "execution_identity": "verified", "by_workflow": {"travel_expense": 1}}},
+        reconcile_status=lambda: _reconciliation_snapshot(1))
+    if evidence == "invalid":
+        with pytest.raises(ValueError, match="approval_guard_untrusted"):
+            probe.run_rolling_drain(**kwargs)
+    else:
+        result = probe.run_rolling_drain(**kwargs)
+        assert result["status"] == "failed"
+        assert result["official_notice"] == {"status": "unknown"}
+    assert probe.runtime_control.stop_reason() == guard.STOP_REASON
