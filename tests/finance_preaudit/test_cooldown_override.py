@@ -103,6 +103,23 @@ def test_new_official_error_stops_overridden_round_and_starts_fresh_cooldown(sto
         assert guard.record_notice("usage_limit", "new-launch:second-error")["blocked_until"] == new["blocked_until"]
 
 
+def test_new_official_error_still_records_fresh_cooldown_after_owner_is_lost(stopped, monkeypatch):
+    root, original, _calls = stopped
+    with cooldown_override.one_round(root, owner_task_id=str(uuid4()), invocation_id=uuid4().hex, original=original):
+        old = guard.cooldown()
+        identity = guard.process_identity
+        monkeypatch.setattr(guard, "process_identity", lambda pid: None if pid == os.getppid() else identity(pid))
+        now = old["triggered_at"] + 100
+        monkeypatch.setattr(guard.time, "time", lambda: now)
+        assert guard.record_notice("server_overloaded", "offline-first-error") == old
+        new = guard.record_notice("authentication", "new-launch:owner-lost-error")
+        assert new["notice_code"] == "authentication"
+        assert new["triggered_at"] == now and new["blocked_until"] == now + guard.COOLDOWN_SECONDS
+        assert runtime_control.stop_reason() == guard.STOP_REASON
+        with pytest.raises(ValueError, match="approval_cooldown_override_owner_lost"):
+            guard.assert_admission()
+
+
 @pytest.mark.parametrize("damage", ["owner", "invocation", "replaced_cooldown", "owner_lost", "manual_stop"])
 def test_override_cannot_bypass_changed_binding_or_other_stop(stopped, monkeypatch, damage):
     root, original, _calls = stopped
@@ -164,7 +181,8 @@ def test_public_cli_rejects_incomplete_override_before_loading_auth(monkeypatch,
     assert finance_preaudit_run.main(["--owner-task-id", str(uuid4()), *options]) == 1
 
 
-def test_public_cli_binds_real_wait_receipt_to_waiver_and_rejects_audit_drift(stopped, monkeypatch):
+@pytest.mark.parametrize("publication_delay", [0, .8])
+def test_public_cli_binds_real_wait_receipt_to_waiver_and_rejects_audit_drift(stopped, monkeypatch, publication_delay):
     root, original, _calls = stopped
     owner = str(uuid4())
     original_supervise = finance_preaudit_run.supervise
@@ -201,7 +219,34 @@ try: approval_guard.assert_admission()
 except ValueError as error: assert str(error)=='approval_cooldown_override_consumed'
 else: raise SystemExit('same controller reused completed invocation')
 '''
-        result = original_supervise([sys.executable, "-B", "-c", code], **options)
+        command = [sys.executable, "-B", "-c", code]
+        if publication_delay:
+            delayed_supervisor = r'''import json,sys,subprocess,time
+from pathlib import Path
+from apps.oa_finance_preaudit import approval_guard
+from scripts.finance_preaudit_run import supervise
+actual_identity=approval_guard.process_identity
+actual_popen=subprocess.Popen
+launched=[]
+def delayed_identity(pid):
+ if launched and pid==launched[0]:
+  time.sleep(float(sys.argv[4]))
+ return actual_identity(pid)
+def launch(*args,**kwargs):
+ process=actual_popen(*args,**kwargs)
+ if not launched: launched.append(process.pid)
+ return process
+subprocess.Popen=launch
+approval_guard.process_identity=delayed_identity
+result=supervise(json.loads(sys.argv[1]),directory=Path(sys.argv[2]),owner_task_id=sys.argv[3])
+print(json.dumps(result))
+'''
+            finished = subprocess.run([sys.executable, "-B", "-c", delayed_supervisor, json.dumps(command),
+                str(options["directory"]), options["owner_task_id"], str(publication_delay)],
+                cwd=root, capture_output=True, text=True, check=True, start_new_session=True)
+            result = json.loads(finished.stdout.strip().splitlines()[-1])
+        else:
+            result = original_supervise(command, **options)
         receipts.append(result)
         # The original wrapper is still alive; completed invocation cannot be consumed again.
         foreign_startup(root)

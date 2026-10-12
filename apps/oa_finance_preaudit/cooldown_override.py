@@ -34,10 +34,10 @@ def _write_new(path: Path, raw: bytes) -> None:
         os.fsync(parent)
 
 
-def matches(value: dict) -> bool:
+def _audit() -> tuple[Path, dict] | None:
     raw_path = os.environ.get(guard.COOLDOWN_OVERRIDE_ENV)
     if raw_path is None:
-        return False
+        return None
     path = Path(raw_path)
     if (not path.is_absolute() or path.parent != guard.directory() / "cooldown-overrides"
             or len(path.stem) != 32 or path.suffix != ".json"):
@@ -52,6 +52,38 @@ def matches(value: dict) -> bool:
             or not isinstance(audit.get("owners"), list) or len(audit["owners"]) != 2
             or any(not guard._valid_identity(owner) for owner in audit["owners"])):
         raise ValueError("approval_cooldown_override_untrusted")
+    return path, audit
+
+
+def _baseline_matches(value: dict, audit: dict) -> bool:
+    pinned = production_release._pinned_control(guard.directory() / "cooldown.json")
+    return (audit.get("cooldown") == value
+            and audit.get("cooldown_identity") == list(pinned[0])
+            and audit.get("cooldown_sha256") == hashlib.sha256(pinned[1]).hexdigest())
+
+
+def recording_matches(value: dict) -> bool:
+    """Historical exemption proof for recording errors; never authorizes a process."""
+    binding = _audit()
+    if binding is None:
+        return False
+    path, audit = binding
+    directory = Path(audit["manifest_file"]).parent
+    if directory.exists():
+        execution = guard.read(directory / "execution.json")
+        if (execution is None or execution.get("owner_task_id") != audit["owner_task_id"]
+                or execution.get("invocation_id") != path.stem
+                or execution.get("cooldown_override") != {"path": str(path),
+                    "sha256": hashlib.sha256(runtime_control.read_control_bytes(path)).hexdigest()}):
+            return False
+    return _baseline_matches(value, audit)
+
+
+def matches(value: dict) -> bool:
+    binding = _audit()
+    if binding is None:
+        return False
+    path, audit = binding
     if any(guard.process_identity(owner["pid"]) != owner for owner in audit["owners"]):
         raise ValueError("approval_cooldown_override_owner_lost")
     execution_directory = Path(audit["manifest_file"]).parent
@@ -76,9 +108,18 @@ def matches(value: dict) -> bool:
         if caller != supervisor:
             controller = execution.get("controller_process")
             if controller is None and execution["state"] == "starting":
-                # Only the supervisor's direct child may cross the Popen/receipt publication window.
+                # The direct child must wait for its own binding before it can create any worker.
                 if os.getppid() != supervisor["pid"]:
                     raise ValueError("approval_cooldown_override_process_untrusted")
+                deadline = time.monotonic() + guard.OBSERVATION_SECONDS
+                while time.monotonic() < deadline:
+                    current = guard.read(execution_directory / "execution.json")
+                    if current is None or current.get("state") != "starting":
+                        return matches(value)
+                    if guard.process_identity(supervisor["pid"]) != supervisor:
+                        break
+                    time.sleep(.01)
+                raise ValueError("approval_cooldown_override_publication_pending")
             else:
                 if (not guard._valid_identity(controller)
                         or controller["pid"] != execution.get("controller_pid")
@@ -102,10 +143,7 @@ def matches(value: dict) -> bool:
                                 or worker.get("run_id") != manifest["run_id"]
                                 or worker.get("controller_instance_id") != manifest["controller_instance_id"]):
                             raise ValueError("approval_cooldown_override_worker_untrusted")
-    pinned = production_release._pinned_control(guard.directory() / "cooldown.json")
-    return (audit.get("cooldown") == value
-            and audit.get("cooldown_identity") == list(pinned[0])
-            and audit.get("cooldown_sha256") == hashlib.sha256(pinned[1]).hexdigest())
+    return _baseline_matches(value, audit)
 
 
 @contextmanager

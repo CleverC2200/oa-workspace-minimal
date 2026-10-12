@@ -125,7 +125,7 @@ def record_notice(code: str, source: str, *, occurred_at: float | None = None,
         publish = True
         try:
             previous = cooldown()
-            overridden = cooldown_ignored(previous) if previous else False
+            overridden = cooldown_was_overridden(previous) if previous else False
             if previous and key in previous["sources"]:
                 publish = now < previous["blocked_until"] and not overridden
                 return previous
@@ -289,6 +289,17 @@ def cooldown_ignored(value: dict) -> bool:
         return False
     from .cooldown_override import matches
     return matches(value)
+
+
+def cooldown_was_overridden(value: dict) -> bool:
+    if COOLDOWN_OVERRIDE_ENV not in os.environ:
+        return False
+    from .cooldown_override import recording_matches
+    try:
+        return recording_matches(value)
+    except (OSError, RuntimeError, ValueError, TypeError):
+        # Invalid waiver proof cannot relax admission or suppress an official stop.
+        return False
 
 
 def assert_admission() -> None:
