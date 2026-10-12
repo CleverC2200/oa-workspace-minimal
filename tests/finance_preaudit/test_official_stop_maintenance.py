@@ -59,6 +59,10 @@ root = Path.cwd()
 manifest = {'kind':'preaudit_controller_run_manifest','controller_pid':os.getpid(),
  'schema_version':1,'run_id':'a'*32,'controller_instance_id':'b'*32,'state':'failed',
  'children_reaped':True,'code_revision':'c'*40,
+ 'code_dirty':False,'config_fingerprint':'sha256:'+'f'*64,'previous_run_id':None,
+ 'previous_controller_instance_id':None,'restart_mode':'fresh_process',
+ 'controller_lock_verified':True,'writer_inactive_at_start':True,
+ 'restart_verified':True,'health':'degraded',
  'started_at':datetime.datetime.now(datetime.timezone.utc).isoformat()}
 with runtime_control.global_controller_lease(), lifecycle.run_scope(manifest, root):
  lifecycle.heartbeat(manifest['run_id'],manifest['controller_instance_id'],{Path(p) for p in json.loads(sys.argv[1])},[],writer_active=False)

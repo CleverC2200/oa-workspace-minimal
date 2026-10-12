@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -190,9 +191,26 @@ def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str
                   "controller_state": "unknown", "children_reaped": "unknown",
                   "exit_code": receipt.get("exit_code"), "exit_signal": receipt.get("exit_signal"),
                   "receipt_file": str(path)}
+        override = receipt.get("cooldown_override")
+        if override is not None:
+            expected = approval_guard.directory() / "cooldown-overrides" / f"{invocation_id}.json"
+            if not isinstance(override, dict) or override.get("path") != str(expected):
+                raise ValueError("controller_execution_override_mismatch")
+            override_raw = _read_evidence(expected)
+            audit = _object(override_raw)
+            if (hashlib.sha256(override_raw).hexdigest() != override.get("sha256")
+                    or audit.get("kind") != "approval_one_round_cooldown_override"
+                    or audit.get("owner_task_id") != owner_task_id or audit.get("invocation_id") != invocation_id
+                    or audit.get("manifest_file") != str(path.with_name("controller-manifest.json"))):
+                raise ValueError("controller_execution_override_mismatch")
+            report["cooldown_override"] = override
         supervisor = receipt.get("supervisor_process")
         if supervisor is not None and (not approval_guard._valid_identity(supervisor)
                 or supervisor["pid"] != receipt.get("supervisor_pid")):
+            raise ValueError("controller_execution_evidence_failed")
+        controller = receipt.get("controller_process")
+        if controller is not None and (not approval_guard._valid_identity(controller)
+                or controller["pid"] != receipt.get("controller_pid")):
             raise ValueError("controller_execution_evidence_failed")
         supervisor_alive = (approval_guard.process_identity(supervisor["pid"]) == supervisor
                             if supervisor is not None else _process_alive(receipt.get("supervisor_pid")))
@@ -427,6 +445,12 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str,
     receipt["supervisor_process"] = approval_guard.process_identity(os.getpid())
     if owners is not None:
         receipt["owner_processes"] = owners
+    override = os.environ.get(approval_guard.COOLDOWN_OVERRIDE_ENV)
+    if override is not None:
+        override_path = approval_guard.directory() / "cooldown-overrides" / f"{directory.name}.json"
+        if override != str(override_path):
+            raise ValueError("controller_execution_override_mismatch")
+        receipt["cooldown_override"] = {"path": override, "sha256": hashlib.sha256(_read_evidence(override_path)).hexdigest()}
 
     def persist() -> None:
         runtime_control.write_control_bytes_atomic(
@@ -490,6 +514,8 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str,
 
     try:
         persist()
+        if override is not None and not approval_guard.cooldown_ignored(approval_guard.cooldown()):
+            raise ValueError("controller_execution_override_mismatch")
         for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             handlers[signum] = signal.signal(signum, forward)
         environment = {**os.environ, MANIFEST_ENV: str(manifest_file), approval_guard.OWNER_ENV: owner_task_id}
@@ -509,7 +535,8 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str,
             except OSError as error:
                 receipt.update(state="start_failed", error_type=type(error).__name__, completed_at=_now())
             else:
-                receipt.update(state="waiting", controller_pid=process.pid, process_group_id=process.pid)
+                receipt.update(state="waiting", controller_pid=process.pid, process_group_id=process.pid,
+                               controller_process=approval_guard.process_identity(process.pid))
                 persist()
                 print(json.dumps({"state": "waiting", "receipt_file": str(receipt_file),
                                   "owner_task_id": owner_task_id, "controller_pid": process.pid}), flush=True)
@@ -594,6 +621,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--invocation-id")
     parser.add_argument("--tool-session-id")
     parser.add_argument("--wait-seconds", type=float, default=0)
+    parser.add_argument("--ignore-cooldown-once", choices=("YES",))
+    parser.add_argument("--original-receipt-file", type=Path)
+    parser.add_argument("--original-owner-task-id", type=UUID)
+    parser.add_argument("--original-tool-session-id")
     parser.add_argument("controller_args", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     arguments = args.controller_args
@@ -601,6 +632,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         arguments = arguments[1:]
     directory = None
     try:
+        original_fields = (args.original_receipt_file, args.original_owner_task_id, args.original_tool_session_id)
+        if args.ignore_cooldown_once or any(value is not None for value in original_fields):
+            if (args.ignore_cooldown_once != "YES" or any(value is None for value in original_fields)
+                    or args.progress or args.retrieve_result or args.bind_tool_session is not None
+                    or args.receipt_file is not None or args.invocation_id is not None
+                    or args.tool_session_id is not None or args.wait_seconds):
+                raise ValueError("approval_cooldown_override_arguments_invalid")
+            from apps.oa_finance_preaudit import cooldown_override
+            cooldown_override.validate_arguments(arguments)
         if args.progress or args.retrieve_result:
             if args.receipt_file is None or args.invocation_id is None or args.bind_tool_session is not None or arguments:
                 raise ValueError("controller_execution_readback_invalid")
@@ -620,16 +660,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.receipt_file is not None:
             raise ValueError("controller_tool_session_binding_invalid")
-        gate = approval_lifecycle.startup(PROJECT_ROOT)
-        if gate["status"] != "ready":
-            print(json.dumps({"schema_version": 1, "kind": "approval_startup_gate", **gate}, sort_keys=True))
-            return 0 if gate["status"] == "skipped" else 1
-        directory = controller_handoff.manifest_file().parent / "executions" / uuid4().hex
-        receipt = supervise(
-            [sys.executable, "-m", "scripts.finance_preaudit_concurrency_probe", *arguments],
-            directory=directory, owner_task_id=str(args.owner_task_id),
-            detached=True,
-        )
+        if approval_guard.COOLDOWN_OVERRIDE_ENV in os.environ:
+            raise ValueError("approval_cooldown_override_inherited")
+        invocation_directory = controller_handoff.manifest_file().parent / "executions" / uuid4().hex
+        scope = nullcontext()
+        if args.ignore_cooldown_once == "YES":
+            from apps.oa_finance_preaudit import cooldown_override, maintenance_runtime
+            scope = cooldown_override.one_round(PROJECT_ROOT, owner_task_id=str(args.owner_task_id),
+                invocation_id=invocation_directory.name,
+                original=maintenance_runtime.OriginalExecution(args.original_receipt_file,
+                    str(args.original_owner_task_id), args.original_tool_session_id))
+        with scope:
+            gate = approval_lifecycle.startup(PROJECT_ROOT)
+            if gate["status"] != "ready":
+                print(json.dumps({"schema_version": 1, "kind": "approval_startup_gate", **gate}, sort_keys=True))
+                return 0 if gate["status"] == "skipped" else 1
+            directory = invocation_directory
+            receipt = supervise(
+                [sys.executable, "-m", "scripts.finance_preaudit_concurrency_probe", *arguments],
+                directory=directory, owner_task_id=str(args.owner_task_id),
+                detached=True,
+            )
     except (OSError, RuntimeError, ValueError, TypeError, KeyError):
         print(json.dumps({"error_code": "controller_execution_evidence_failed", "receipt_file": str(directory / "execution.json") if directory else None}))
         return 1
