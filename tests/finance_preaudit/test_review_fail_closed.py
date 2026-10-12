@@ -25,6 +25,45 @@ _TRANSPORT_FALLBACK_WARNING = (
 )
 
 
+@pytest.mark.parametrize('owners', ['[]', 'not-json', json.dumps([{
+    'pid': 2147483647, 'pgid': 2147483647, 'uid': os.getuid(), 'birth': 'lost owner',
+}])])
+def test_untrusted_or_lost_execution_owner_never_launches_review_cli(tmp_path, monkeypatch, owners):
+    task, action = _task(tmp_path)
+    monkeypatch.setenv(guard.EXECUTION_OWNERS_ENV, owners)
+    monkeypatch.setattr(worker.subprocess, 'Popen', lambda *a, **kw: pytest.fail('CLI launched after owner loss'))
+    result = worker.review(task)
+    assert result['status'] == 'failed' and result['process_retries'] == 0
+    assert runtime_control.stop_reason() == 'codex_review_technical_failure'
+    assert guard.cooldown() is None
+    assert all(guard._slot(i) is None for i in range(3))
+    assert not action.with_name('execution-receipt.json').exists()
+
+
+def test_owner_loss_during_review_stops_same_cli_without_official_cooldown(tmp_path, monkeypatch):
+    task, action = _task(tmp_path)
+    monkeypatch.setenv(guard.EXECUTION_OWNERS_ENV, json.dumps([guard.process_identity(os.getpid())]))
+    original = worker.process_diagnostics.notice_payload
+
+    def lose_owner(event, **options):
+        result = original(event, **options)
+        if result is not None:
+            monkeypatch.setenv(guard.EXECUTION_OWNERS_ENV, '[]')
+        return result
+
+    monkeypatch.setattr(worker.process_diagnostics, 'notice_payload', lose_owner)
+    script = ('import sys,time,json;sys.stdin.read();'
+              'print(json.dumps({"type":"error","message":"Reconnecting... stream disconnected"}),flush=True);'
+              'time.sleep(10)')
+    monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
+    result = worker.review(task)
+    assert result['status'] == 'failed' and result['error_code'] == 'stop_requested'
+    assert result['process_attempts'] == 1 and result['process_retries'] == 0
+    assert runtime_control.stop_reason() == 'codex_review_technical_failure'
+    assert guard.cooldown() is None and guard.models_reaped()
+    assert not action.with_name('execution-receipt.json').exists()
+
+
 def test_approval_cli_disables_unbounded_connection_retries(tmp_path):
     command = worker._codex_command(tmp_path, tmp_path / 'schema', tmp_path / 'decision')
     assert 'features.unbounded_connection_retries=false' in command
@@ -282,11 +321,16 @@ def test_stop_publication_waits_for_launch_lease():
     assert runtime_control.stop_requested()
 
 
-def test_waiting_receipt_with_dead_supervisor_is_blocked_not_success(tmp_path, monkeypatch):
+@pytest.mark.parametrize('legacy', [True, False])
+def test_waiting_receipt_with_dead_supervisor_is_blocked_not_success(tmp_path, monkeypatch, legacy):
     path, owner = recorded_execution(tmp_path, monkeypatch)
     receipt = json.loads(path.read_text())
     receipt.update(state='waiting', supervisor_pid=2_000_000_000, exit_code=None,
                    exit_signal=None, completed_at=None)
+    if legacy:
+        receipt.pop('supervisor_process', None)
+    else:
+        receipt['supervisor_process'] = {**receipt['supervisor_process'], 'pid': 2_000_000_000, 'pgid': 2_000_000_000}
     path.write_text(json.dumps(receipt))
     original = path.read_bytes()
     report = finance_preaudit_run.wait_execution(

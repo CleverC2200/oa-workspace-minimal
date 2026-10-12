@@ -190,8 +190,15 @@ def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str
                   "controller_state": "unknown", "children_reaped": "unknown",
                   "exit_code": receipt.get("exit_code"), "exit_signal": receipt.get("exit_signal"),
                   "receipt_file": str(path)}
-        if state in {"starting", "waiting"} and not _process_alive(receipt.get("supervisor_pid")):
-            report.update(status="blocked", error_code="controller_supervisor_lost")
+        supervisor = receipt.get("supervisor_process")
+        if supervisor is not None and (not approval_guard._valid_identity(supervisor)
+                or supervisor["pid"] != receipt.get("supervisor_pid")):
+            raise ValueError("controller_execution_evidence_failed")
+        supervisor_alive = (approval_guard.process_identity(supervisor["pid"]) == supervisor
+                            if supervisor is not None else _process_alive(receipt.get("supervisor_pid")))
+        if state in {"starting", "waiting"} and not supervisor_alive:
+            report.update(state="supervisor_lost", recorded_state=state,
+                          status="blocked", error_code="controller_supervisor_lost")
         elif state in {"starting", "waiting"} and receipt.get("stop_wait_error"):
             report.update(status="blocked", error_code=receipt["stop_wait_error"])
         manifest_raw = _read_evidence(path.with_name("controller-manifest.json"))
@@ -312,10 +319,89 @@ def bind_tool_session(receipt_file: Path, *, owner_task_id: str, session_id: str
     return {"status": "bound", "tool_session_file": str(path.with_name("tool-session.json"))}
 
 
-def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str) -> dict:
+def _supervisor_entry() -> None:
+    request = _object(sys.stdin.buffer.read(EVIDENCE_LIMIT + 1))
+    if (set(request) != {"command", "directory", "owner_task_id", "owners"}
+            or not isinstance(request["command"], list) or not request["command"]
+            or any(not isinstance(arg, str) for arg in request["command"])
+            or not isinstance(request["owners"], list) or len(request["owners"]) != 2
+            or any(not approval_guard._valid_identity(owner) for owner in request["owners"])):
+        raise ValueError("controller_execution_owner_untrusted")
+    supervise(request["command"], directory=Path(request["directory"]),
+              owner_task_id=request["owner_task_id"], owners=request["owners"])
+
+
+def _supervise_detached(command: Sequence[str], *, directory: Path, owner_task_id: str) -> dict:
+    owners = [approval_guard.process_identity(os.getpid()), approval_guard.process_identity(os.getppid())]
+    if any(owner is None for owner in owners):
+        raise ValueError("controller_execution_owner_untrusted")
+    request = {"command": list(command), "directory": str(directory), "owner_task_id": owner_task_id, "owners": owners}
+    payload = json.dumps(request).encode()
+    if len(payload) > EVIDENCE_LIMIT:
+        raise ValueError("controller_execution_evidence_failed")
+    handlers = {}
+    received_signals = []
+    waiter = None
+    with runtime_control.pinned_directory(directory.parent, create=True) as parent:
+        descriptor = os.open(directory.name + "-supervisor.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+    try:
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            handlers[signum] = signal.signal(signum, lambda sig, _frame: received_signals.append(sig))
+        with os.fdopen(descriptor, "wb") as errors:
+            # This per-execution waiter survives the tool process group; it is not a daemon or model worker.
+            waiter = subprocess.Popen([sys.executable, "-c",
+                "from scripts.finance_preaudit_run import _supervisor_entry; _supervisor_entry()"],
+                cwd=PROJECT_ROOT, env=os.environ.copy(), stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=errors, start_new_session=True)
+            waiter.stdin.write(payload)
+            waiter.stdin.close()
+            announced = False
+            stop_sent = False
+            path = directory / "execution.json"
+            while True:
+                if received_signals and not stop_sent:
+                    try:
+                        waiter.send_signal(signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    stop_sent = True
+                if path.exists():
+                    try:
+                        receipt = _object(_read_evidence(path))
+                    except ValueError as error:
+                        if str(error) != "controller_execution_snapshot_changed":
+                            raise
+                        time.sleep(.1)
+                        continue
+                    if not announced and receipt.get("controller_pid"):
+                        print(json.dumps({"state": receipt["state"], "receipt_file": str(path),
+                                          "owner_task_id": owner_task_id, "controller_pid": receipt["controller_pid"]}), flush=True)
+                        announced = True
+                if waiter.poll() is not None:
+                    waiter.wait()
+                    receipt = _object(_read_evidence(path))
+                    if receipt.get("state") not in {"exited", "start_failed"} or "result" not in receipt:
+                        raise ValueError("controller_supervisor_lost")
+                    return {**receipt, "receipt_file": str(path)}
+                time.sleep(.1)
+    finally:
+        try:
+            if waiter is not None:
+                if waiter.poll() is None:
+                    waiter.send_signal(signal.SIGTERM)
+                waiter.wait()
+        finally:
+            for signum, handler in handlers.items():
+                signal.signal(signum, handler)
+
+
+def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str,
+              detached: bool = False, owners: list[dict] | None = None) -> dict:
     """Wait for one owned process; controller cleanup remains controller-owned."""
     UUID(owner_task_id)
     directory = Path(os.path.abspath(directory))
+    if detached:
+        return _supervise_detached(command, directory=directory, owner_task_id=owner_task_id)
     with runtime_control.pinned_directory(directory.parent, create=True) as parent:
         os.mkdir(directory.name, mode=0o700, dir_fd=parent)
     receipt_file = directory / "execution.json"
@@ -338,6 +424,9 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str) ->
     stop_attempted = False
     owner_parent_pid = os.getppid()
     receipt["owner_parent_pid"] = owner_parent_pid
+    receipt["supervisor_process"] = approval_guard.process_identity(os.getpid())
+    if owners is not None:
+        receipt["owner_processes"] = owners
 
     def persist() -> None:
         runtime_control.write_control_bytes_atomic(
@@ -365,6 +454,10 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str) ->
             if os.getppid() != owner_parent_pid and not receipt.get("owner_process_lost"):
                 receipt["owner_process_lost"] = True
                 persist()
+            if owners and any(approval_guard.process_identity(owner["pid"]) != owner for owner in owners):
+                if not receipt.get("owner_process_lost"):
+                    receipt["owner_process_lost"] = True
+                    persist()
             approval_stopped = list(command[1:3]) == ["-m", "scripts.finance_preaudit_concurrency_probe"] and runtime_control.stop_requested()
             cancelling = cancel or receipt["received_signals"] or receipt.get("owner_process_lost") or approval_stopped
             if cancelling and stop_deadline is None:
@@ -400,9 +493,14 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str) ->
         for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             handlers[signum] = signal.signal(signum, forward)
         environment = {**os.environ, MANIFEST_ENV: str(manifest_file), approval_guard.OWNER_ENV: owner_task_id}
+        supervisor_identity = receipt["supervisor_process"]
+        if not approval_guard._valid_identity(supervisor_identity):
+            raise ValueError("controller_execution_owner_untrusted")
+        environment[approval_guard.EXECUTION_OWNERS_ENV] = json.dumps([supervisor_identity, *(owners or [])])
         with open_log("stdout.log") as stdout, open_log("stderr.log") as stderr:
             try:
-                if receipt["received_signals"]:
+                if receipt["received_signals"] or (owners and any(
+                        approval_guard.process_identity(owner["pid"]) != owner for owner in owners)):
                     raise InterruptedError("controller_start_cancelled")
                 process = subprocess.Popen(
                     list(command), cwd=PROJECT_ROOT, env=environment,
@@ -530,6 +628,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         receipt = supervise(
             [sys.executable, "-m", "scripts.finance_preaudit_concurrency_probe", *arguments],
             directory=directory, owner_task_id=str(args.owner_task_id),
+            detached=True,
         )
     except (OSError, RuntimeError, ValueError, TypeError, KeyError):
         print(json.dumps({"error_code": "controller_execution_evidence_failed", "receipt_file": str(directory / "execution.json") if directory else None}))

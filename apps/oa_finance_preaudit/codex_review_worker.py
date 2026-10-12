@@ -1191,6 +1191,7 @@ def _execute_codex_raw(
                     output.close()
                     return CodexExecution("stop_requested", _unknown_usage(),
                                           process_state="not_started", decision_state="not_attempted")
+                approval_guard._assert_admission_locked()
                 process = subprocess.Popen(
                     command,
                     cwd=project_root,
@@ -1223,6 +1224,8 @@ def _execute_codex_raw(
             )
         except (ValueError, RuntimeError) as error:
             restore_sigterm()
+            if slot is not None and process is None:
+                approval_guard.cancel_unlaunched(slot)
             if process is not None:
                 _terminate_process_group(process, grace_seconds=0.2)
                 try:
@@ -1400,6 +1403,8 @@ def _execute_codex_raw(
         try:
             while True:
                 live_failure = observe_failure()
+                if not approval_guard.execution_owners_alive():
+                    runtime_control.request_stop("codex_review_technical_failure")
                 parent_lost = os.getppid() != review_parent_pid
                 interrupted = runtime_control.stop_requested() or parent_lost
                 if live_failure or interrupted:
