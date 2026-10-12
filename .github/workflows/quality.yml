@@ -48,4 +48,4 @@ jobs:
       - name: Python syntax
         run: python -m compileall -q apps scripts tests
       - name: Offline unit and golden replay tests
-        run: python -m pytest -v
+        run: python -m pytest -v -x --tb=short
