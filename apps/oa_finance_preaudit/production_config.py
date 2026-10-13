@@ -179,15 +179,17 @@ def _source_findings(root: Path) -> list[str]:
             findings.append("production_config_reviewer_drift")
     command = next((node for node in sources["codex_review_worker"].body
                     if isinstance(node, ast.FunctionDef) and node.name == "_codex_command"), None)
-    guard_test = ast.parse('REVIEW_SETTINGS["provider"] != "deepseek"', mode="eval").body
-    guards = [node for node in command.body if isinstance(node, ast.If)
-              and ast.dump(node.test) == ast.dump(guard_test)] if command else []
+    expected_command_guard = ast.parse(
+        'if REVIEW_SETTINGS["provider"] != "deepseek":\n'
+        '    raise ValueError("openai_review_cli_forbidden")').body[0]
+    expected_raw_guard = ast.parse(
+        'if REVIEW_SETTINGS["provider"] != "deepseek":\n'
+        '    return CodexExecution("openai_review_cli_forbidden", _unknown_usage(),\n'
+        '                          process_state="not_started", decision_state="not_attempted")').body[0]
     raw = next((node for node in sources["codex_review_worker"].body
                 if isinstance(node, ast.FunctionDef) and node.name == "_execute_codex_raw"), None)
-    if (not guards or not any(isinstance(node, ast.Raise) for node in guards[0].body)
-            or raw is None or not isinstance(raw.body[0], ast.If)
-            or ast.dump(raw.body[0].test) != ast.dump(guard_test)
-            or not any(isinstance(node, ast.Return) for node in raw.body[0].body)):
+    if (command is None or not command.body or ast.dump(command.body[0]) != ast.dump(expected_command_guard)
+            or raw is None or not raw.body or ast.dump(raw.body[0]) != ast.dump(expected_raw_guard)):
         findings.append("production_config_openai_cli_guard_drift")
     returns = [node.value for node in command.body if isinstance(node, ast.Return)] if command else []
     arguments = returns[0].elts if len(returns) == 1 and isinstance(returns[0], ast.List) else []
