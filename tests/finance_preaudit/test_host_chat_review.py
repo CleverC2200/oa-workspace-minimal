@@ -73,6 +73,15 @@ def native_call(source, name, arguments, call_id, output):
     return line
 
 
+
+def draft_source(source, request_file, target, owner, *, call_id='actual-host-call', payload=None):
+    payload = payload if payload is not None else json.loads(target.read_text())
+    if target.exists():
+        target.unlink()
+    receipt = host.publish_draft(request_file, target, payload, owner=owner)
+    code = 'text(await tools.exec_command(' + json.dumps({'cmd': host.draft_command(request_file, target, payload, owner=owner)}) + '));'
+    return native_call(source, 'functions.exec', code, call_id, {'exit_code': 0, 'output': json.dumps(receipt) + '\n'})
+
 def start(exchange):
     action, draft, owner, source, task, _, _ = exchange
     result = []
@@ -87,7 +96,7 @@ def start(exchange):
     dispatch = native_call(parent, 'collaboration.followup_task',
         {'target': '/root/reviewer_0', 'message': 'Read and audit ' + str(request)}, 'dispatch-0', {})
     host.assign(request, slot=0, owner=owner, source=parent, source_line=dispatch)
-    native_call(source, 'functions.exec', 'write ' + str(draft), 'actual-host-call', {'exit_code': 0})
+    draft_source(source, request, draft, owner)
     return thread, result, request
 
 
@@ -214,7 +223,7 @@ def test_same_registered_child_reviews_two_frozen_actions_without_recreation(exc
     parent = source.with_name('parent.jsonl')
     line = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(request2)}, 'second-dispatch', {})
     host.assign(request2, slot=0, owner=owner, source=parent, source_line=line)
-    source_line = native_call(source, 'functions.exec', 'write ' + str(draft2), 'second-review', {'exit_code': 0})
+    source_line = draft_source(source, request2, draft2, owner, call_id='second-review')
     host.submit(request2, draft2, owner=owner, source=source, source_line=source_line)
     reviewed = host.await_result(request2)
     engine.validate_review_decision(action2, reviewed['decision'])
@@ -343,10 +352,15 @@ def test_child_tool_source_must_match_assigned_native_slot_and_success(exchange,
     line = 2
     if damage == 'cross_slot':
         source = source.with_name('child-1.jsonl')
-        line = native_call(source, 'functions.exec', 'write ' + str(draft), 'cross-slot-call', {'exit_code': 0})
+        line = draft_source(source, request, draft, owner, call_id='cross-slot-call')
     elif damage == 'failed_output':
-        raw = source.read_text().replace('{\\"exit_code\\": 0}', '{\\"exit_code\\": 2}')
-        source.write_text(raw)
+        rows = source.read_text().splitlines()
+        row = json.loads(rows[2])
+        output = json.loads(row['payload']['output'])
+        output['exit_code'] = 2
+        row['payload']['output'] = json.dumps(output)
+        rows[2] = json.dumps(row)
+        source.write_text('\n'.join(rows) + '\n')
     elif damage == 'missing_output':
         source.write_text(''.join(source.read_text().splitlines(keepends=True)[:2]))
     else:
@@ -407,7 +421,7 @@ def test_first_review_waits_for_the_round_registration_in_its_original_worker(ex
     assert published.exists()
     dispatch = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(published)}, 'boot-dispatch', {})
     host.assign(published, slot=0, owner=owner, source=parent, source_line=dispatch)
-    source_line = native_call(child, 'exec', 'write ' + str(draft), 'boot-review', {'exit_code': 0})
+    source_line = draft_source(child, published, draft, owner, call_id='boot-review')
     host.submit(published, draft, owner=owner, source=child, source_line=source_line)
     thread.join(3)
     assert not thread.is_alive() and results[0]['status'] == 'reviewed'
@@ -503,3 +517,65 @@ def test_normal_close_rejects_malformed_or_active_native_status(exchange, status
         {'agent_name': '/root/reviewer_2', 'agent_status': 'idle'}]})
     with pytest.raises(ValueError, match='children_status_untrusted|children_not_idle'):
         host.close(owner=owner, source=parent, source_line=line)
+
+
+def test_child_decision_bytes_cannot_be_replaced_after_the_completed_native_write(exchange):
+    _, draft, owner, child, *_ = exchange
+    thread, results, request = start(exchange)
+    payload = json.loads(draft.read_text())
+    payload['items'][0]['conclusion'] = '父调用者替换后的有效决定'
+    host.guard.write(draft, payload)
+    with pytest.raises(ValueError, match='source_untrusted'):
+        host.submit(request, draft, owner=owner, source=child, source_line=2)
+    host.close(owner=owner, reason='cancelled')
+    thread.join(3)
+    assert not thread.is_alive()
+
+
+@pytest.mark.parametrize('damage', ['commented_command', 'unrelated_success', 'mixed_failure', 'actual_output_list'])
+def test_native_publisher_requires_executable_command_and_its_exact_receipt(exchange, damage):
+    _, draft, owner, child, *_ = exchange
+    thread, results, request = start(exchange)
+    rows = child.read_text().splitlines()
+    call, output = json.loads(rows[1]), json.loads(rows[2])
+    shell = json.loads(output['payload']['output'])
+    if damage == 'commented_command':
+        call['payload']['input'] = '// ' + call['payload']['input'] + '\ntext(await tools.exec_command({"cmd":"true"}));'
+    elif damage == 'unrelated_success':
+        output['payload']['output'] = json.dumps({'exit_code': 0, 'output': '{}'})
+    elif damage == 'mixed_failure':
+        output['payload']['output'] = json.dumps({'ok': shell, 'failed': {'exit_code': 1, 'output': 'failed'}})
+    else:
+        output['payload']['output'] = json.dumps([
+            {'type': 'input_text', 'text': 'Script completed\nWall time 0.1 seconds\nOutput:'},
+            {'type': 'input_text', 'text': json.dumps(shell)}])
+    rows[1], rows[2] = json.dumps(call), json.dumps(output)
+    child.write_text('\n'.join(rows) + '\n')
+    try:
+        if damage == 'actual_output_list':
+            assert host.submit(request, draft, owner=owner, source=child, source_line=2)['status'] == 'published'
+        else:
+            with pytest.raises(ValueError, match='source_untrusted'):
+                host.submit(request, draft, owner=owner, source=child, source_line=2)
+    finally:
+        if damage != 'actual_output_list':
+            host.close(owner=owner, reason='cancelled')
+        thread.join(3)
+    assert not thread.is_alive()
+
+
+def test_public_draft_publisher_command_returns_exact_exclusive_byte_receipt(exchange, capsys):
+    action, draft, owner, child, *_ = exchange
+    request = host.publish(action, prompt='Read current frozen facts.', timeout_seconds=60)
+    payload = json.loads(draft.read_text())
+    target = draft.with_name('exclusive-published.json')
+    args = ['--operation', 'write-draft', '--owner-task-id', owner, '--request-file', str(request),
+            '--decision-file', str(target), '--payload-json', json.dumps(payload, ensure_ascii=False)]
+    assert host.main(args) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    import hashlib
+    assert receipt['decision_sha256'] == hashlib.sha256(target.read_bytes()).hexdigest()
+    assert json.loads(target.read_text()) == payload and target.stat().st_mode & 0o777 == 0o600
+    with pytest.raises((FileExistsError, RuntimeError)):
+        host.main(args)
+    assert hashlib.sha256(target.read_bytes()).hexdigest() == receipt['decision_sha256']
