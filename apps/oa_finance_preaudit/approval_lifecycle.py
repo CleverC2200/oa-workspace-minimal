@@ -161,6 +161,19 @@ def heartbeat(run_id: str | None, instance: str | None, actions: set[Path], dead
     if now - value.get("execution_owner_checked_at", 0) >= guard.OBSERVATION_SECONDS:
         if not guard.execution_owners_alive():
             runtime_control.request_stop("codex_review_technical_failure")
+        manifest = controller_handoff._read_manifest()
+        if (manifest is not None and manifest["state"] == "running"
+                and manifest.get("review_configuration", {}).get("transport") == "host_chat"):
+            from . import host_chat_review
+            try:
+                owner = os.environ.get(guard.OWNER_ENV)
+                if (owner is None or manifest["run_id"] != run_id
+                        or manifest["controller_instance_id"] != instance):
+                    raise ValueError("host_review_parent_untrusted")
+                host_chat_review.assert_round_alive(owner=owner, manifest=manifest)
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                # Close admission through the existing stop gate; the Writer must finish normally.
+                runtime_control.request_cycle_stop()
         value["execution_owner_checked_at"] = now
     guard.write(path, {**value, "heartbeat_at": time.time(), "actions": sorted({*value["actions"], *(str(path) for path in actions)}),
                        "phase_deadlines": deadlines, "writer_active": writer_active})
