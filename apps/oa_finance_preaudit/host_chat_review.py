@@ -519,6 +519,7 @@ def _submission(request_file: Path, request: dict) -> tuple[bytes, dict]:
     registered = _registry(request['owner_task_id'])
     assigned = registered['assignments'].get(request['request_id'])
     if (assigned is None or assigned['state'] != 'submitted'
+            or assigned.get('submission_sha256') != hashlib.sha256(raw).hexdigest()
             or set(submitted) != ({'schema_version', 'kind', 'owner_task_id', 'request_sha256',
                                   'decision', 'source', 'assignment', 'submitted_at'} |
                                   ({'review_payload'} if request['review_kind'] != 'finance' else set()))
@@ -535,23 +536,31 @@ def _submission(request_file: Path, request: dict) -> tuple[bytes, dict]:
     return raw, submitted
 
 
+def read_result(request_file: Path) -> dict:
+    """Read one published result and revalidate the same immutable native evidence."""
+    request_raw, request = _read(request_file)
+    action = Path(request['action_file'])
+    _live(request, action)
+    raw, submitted = _submission(request_file, request)
+    return {**_base(), 'status': 'reviewed', 'error_code': None,
+            'agent_wall_seconds': max(0, int(submitted['submitted_at'] - request['created_at'])),
+            'decision': submitted['decision'], 'assignment': submitted['assignment'], 'source': submitted['source'],
+            **({'review_payload': submitted['review_payload']} if request['review_kind'] != 'finance' else {}),
+            'host_receipt': {'request_file': str(request_file), 'request_sha256': hashlib.sha256(request_raw).hexdigest(),
+                             'submission_file': str(_submission_file(request_file)),
+                             'submission_sha256': hashlib.sha256(raw).hexdigest()}}
+
+
 def await_result(request_file: Path) -> dict:
-    started = time.monotonic()
+    request = {}
     try:
-        request_raw, request = _read(request_file)
+        _, request = _read(request_file)
         action = Path(request['action_file'])
         submission = _submission_file(request_file)
         while not os.path.lexists(submission):
             _live(request, action)
             time.sleep(.2)
-        _live(request, action)
-        raw, submitted = _submission(request_file, request)
-        return {**_base(), 'status': 'reviewed', 'error_code': None,
-                'agent_wall_seconds': int(time.monotonic() - started), 'decision': submitted['decision'],
-                'assignment': submitted['assignment'], 'source': submitted['source'],
-                **({'review_payload': submitted['review_payload']} if request['review_kind'] != 'finance' else {}),
-                'host_receipt': {'request_file': str(request_file), 'request_sha256': hashlib.sha256(request_raw).hexdigest(),
-                                 'submission_file': str(submission), 'submission_sha256': hashlib.sha256(raw).hexdigest()}}
+        return read_result(request_file)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
         # Leave in-flight write classification to the original Writer. No signals here.
         try:
@@ -665,7 +674,8 @@ def submit(request_file: Path, decision_file: Path, *, owner: str, source: Path,
         with runtime_control.stop_control_lease():
             _live(request, action, owner=owner)
             _write_new(_submission_file(request_file), value)
-            assigned.update(state='submitted', submitted_at=value['submitted_at'])
+            assigned.update(state='submitted', submitted_at=value['submitted_at'],
+                            submission_sha256=hashlib.sha256(_read(_submission_file(request_file))[0]).hexdigest())
             guard.write(path, registered)
     return {'status': 'published', 'write_state': 'not_requested', 'request_id': request['request_id']}
 
