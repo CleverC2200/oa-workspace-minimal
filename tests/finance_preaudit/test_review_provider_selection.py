@@ -64,6 +64,7 @@ def test_successive_rounds_select_provider_before_startup_and_pass_it_to_supervi
 
 
 def test_readback_preserves_original_provider_and_rejects_mixed_round_configuration(tmp_path, monkeypatch):
+    monkeypatch.setenv(production_config.REVIEW_PROVIDER_ENV, 'deepseek')
     path, owner = recorded_execution(tmp_path, monkeypatch)
     receipt = json.loads(path.read_text())
     manifest_path = path.with_name('controller-manifest.json')
@@ -86,3 +87,31 @@ def test_unknown_provider_has_no_fallback(monkeypatch):
     monkeypatch.setenv(production_config.REVIEW_PROVIDER_ENV, 'unknown')
     with pytest.raises(ValueError, match='approval_review_provider_invalid'):
         production_config.review_settings()
+
+
+def test_unselected_fresh_process_defaults_to_native_codex_without_api_keys(tmp_path):
+    environment = dict(os.environ, CODEX_HOME=str(tmp_path / 'native-auth'),
+                       OA_REVIEW_API_KEY='offline-deepseek-key', OPENAI_API_KEY='offline-openai-key')
+    environment.pop(production_config.REVIEW_PROVIDER_ENV, None)
+    code = '''import json
+from pathlib import Path
+from apps.oa_finance_preaudit import codex_review_worker as w, production_config as c
+print(json.dumps({'settings':w.REVIEW_SETTINGS, 'snapshot':c.snapshot(),
+ 'command':w._codex_command(Path.cwd(),Path('schema'),Path('decision')),
+ 'environment':{k:v for k,v in w._reviewer_environment().items()
+                if k in {'CODEX_HOME','OA_REVIEW_API_KEY','OPENAI_API_KEY','CODEX_API_KEY'}}}))'''
+    result = subprocess.run([sys.executable, '-c', code], env=environment, capture_output=True, text=True, check=True)
+    actual = json.loads(result.stdout)
+    assert actual['settings'] == production_config.review_settings('openai')
+    assert actual['snapshot']['model'] == 'gpt-6.1-sol'
+    assert actual['snapshot']['reasoning_effort'] == 'medium'
+    assert actual['environment'] == {'CODEX_HOME': str(tmp_path / 'native-auth')}
+    assert actual['command'][actual['command'].index('--model') + 1] == 'gpt-6.1-sol'
+    assert 'model_provider="openai"' in actual['command']
+    assert not any('oa_deepseek' in value or 'model_catalog_json=' in value for value in actual['command'])
+
+
+def test_default_snapshot_is_not_changed_by_a_one_round_override(monkeypatch):
+    monkeypatch.setenv(production_config.REVIEW_PROVIDER_ENV, 'deepseek')
+    assert production_config.review_settings()['provider'] == 'deepseek'
+    assert production_config.snapshot()['model'] == 'gpt-6.1-sol'

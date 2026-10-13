@@ -4,9 +4,9 @@
 
 正常已授权调度使用 `python -m scripts.finance_preaudit_run --owner-task-id <当前聊天 UUID> -- <原滚动控制器参数>`。该入口仅监督现有 `scripts.finance_preaudit_concurrency_probe`，确认写入、范围、恢复参数和全部门禁仍由原入口校验；开发验证不传真实业务写入参数。
 
-每轮启动可在分隔符 `--` 之前传入 `--review-provider deepseek` 或 `--review-provider openai`。默认使用 DeepSeek Flash/high；OpenAI 使用 GPT 6.1 Sol/medium。选择只传给本轮新进程及其审核子进程，保存为 `execution.json` 和控制器清单的 `review_configuration`，进入配置指纹；运行中不更换供应商。下一轮可重新选择，无需修改源码或全局 Codex 配置。进度、取回和工具会话绑定入口拒绝混入供应商选择。切换不清冷却、停止门或未知写入，也不授权重新启动已有控制器。
+每轮启动可在分隔符 `--` 之前传入 `--review-provider deepseek` 或 `--review-provider openai`。默认使用 Codex/OpenAI GPT 6.1 Sol/medium；显式 DeepSeek 使用 Flash/high。选择只传给本轮新进程及其审核子进程，保存为 `execution.json` 和控制器清单的 `review_configuration`，进入配置指纹；运行中不更换供应商。下一轮可重新选择，无需修改源码或全局 Codex 配置。进度、取回和工具会话绑定入口拒绝混入供应商选择。切换不清冷却、停止门或未知写入，也不授权重新启动已有控制器。
 
-本轮后续独立包装 CLI 使用同一选择，例如 `OA_REVIEW_PROVIDER=deepseek python -m apps.oa_finance_preaudit.packaging_review --action-file <当前动作>`。财务滚动池仍不包含包装。DeepSeek 使用独立 API 密钥和空运行目录；OpenAI 使用现有原生认证，不接收 DeepSeek、OpenAI 或 Codex 的 API key 环境变量。
+本轮后续独立包装 CLI 使用同一选择，例如 `OA_REVIEW_PROVIDER=openai python -m apps.oa_finance_preaudit.packaging_review --action-file <当前动作>`。财务滚动池仍不包含包装。DeepSeek 使用独立 API 密钥和空运行目录；OpenAI 使用现有原生认证，不接收 DeepSeek、OpenAI 或 Codex 的 API key 环境变量。
 
 工具调用者与每轮监督者分开：入口启动一个独立进程组中的本轮监督者，由它创建、真实 wait 原控制器并独占保存 execution.json。它不是常驻 daemon 或额外模型 worker，不重复启动控制器。调用者收到停止信号时转交监督者；调用者或其原工具父进程消失或 PID 身份变化时，监督者请求既有停止门并继续等待 Writer 和控制器收尾，保留真实退出码。启动前和每次 CLI 启动前核对已绑定的 PID、出生时间、进程组及用户，不能仅凭 PID 仍存在放行。
 

@@ -63,13 +63,22 @@ def test_repository_drift_is_rejected_at_quality_seam(repository, monkeypatch, c
 
 def test_obsolete_active_provider_instruction_is_rejected(repository):
     path = repository / "docs/runbooks/hourly-production.md"
-    path.write_text(path.read_text() + "\n审核默认使用原生 OpenAI。\n")
+    path.write_text(path.read_text() + "\n审核默认使用 DeepSeek。\n")
     assert "production_config_provider_instruction_drift:runbook" in production_config.repository_findings(repository)
+
+
+def test_consistent_deepseek_template_cannot_override_the_codex_default(repository):
+    path = repository / 'config/automations/oa-skill-prompt.txt'
+    text = path.read_text().replace('--review-provider openai --', '--review-provider deepseek --')
+    text = text.replace('model=gpt-6.1-sol reasoning_effort=medium model_provider=openai',
+                        'model=deepseek-flash reasoning_effort=high model_provider=oa_deepseek')
+    path.write_text(text)
+    assert 'production_config_provider_selection_drift:template' in production_config.repository_findings(repository)
 
 
 def test_public_snapshot_matches_authorized_production_settings():
     assert production_config.snapshot() == {
-        "model": "deepseek-flash", "reasoning_effort": "high", "model_provider": "oa_deepseek",
+        "model": "gpt-6.1-sol", "reasoning_effort": "medium", "model_provider": "openai",
         "requested_service_tier": "default", "initial_capacity": 3, "max_capacity": 3,
         "workflows": ["travel_expense", "business_entertainment", "business_support_fee",
                       "small_marketing_fee", "tpm_small_marketing_fee", "general_expense"],

@@ -439,9 +439,18 @@ def test_interruption_count_and_start_gate_reject_damaged_or_unresolved_evidence
 
 
 def test_deepseek_admission_ignores_unrelated_openai_history(tmp_path, monkeypatch):
+    monkeypatch.setenv('OA_REVIEW_PROVIDER', 'deepseek')
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-openai-auth"))
     guard.observe_project_errors(tmp_path)
     assert guard.cooldown() is None
     guard.record_notice("rate_limit", "deepseek-cli:current")
     with pytest.raises(ValueError, match="approval_model_cooldown"):
         guard.assert_admission()
+
+
+def test_unselected_codex_admission_requires_native_history(tmp_path, monkeypatch):
+    monkeypatch.delenv('OA_REVIEW_PROVIDER', raising=False)
+    monkeypatch.setenv('CODEX_HOME', str(tmp_path / 'no-native-history'))
+    with pytest.raises(ValueError, match='approval_official_history_unavailable'):
+        guard.observe_project_errors(tmp_path)
+    assert guard.cooldown() is None
