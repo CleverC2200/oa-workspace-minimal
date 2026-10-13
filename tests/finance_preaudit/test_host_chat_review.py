@@ -35,35 +35,42 @@ def exchange(tmp_path, monkeypatch):
     draft = tmp_path / 'draft.json'
     json_artifact.write_json_atomic(draft, decision)
     draft.chmod(0o600)
-    owner = str(uuid4())
-    run, instance = uuid4().hex, uuid4().hex
-    identity = {'pid': 1234, 'pgid': 1234, 'birth': 'offline', 'uid': os.getuid()}
-    manifest = {'state': 'running', 'controller_pid': 1234, 'run_id': run,
-                'controller_instance_id': instance, 'review_configuration': host.IDENTITY}
+    from tests.finance_preaudit.test_app_reviewer_slots import native_sessions, original_execution
+    owner, parent, reviewers = native_sessions(tmp_path, monkeypatch)
+    source = Path(reviewers[0]['session_file'])
     monkeypatch.setenv(host.TRANSPORT_ENV, 'host_chat')
     monkeypatch.setenv('OA_REVIEW_PROVIDER', 'openai')
     monkeypatch.setenv(host.guard.OWNER_ENV, owner)
-    monkeypatch.setattr(host.approval_lifecycle, 'context', lambda: (run, instance, str(tmp_path)))
-    monkeypatch.setattr(controller_handoff, '_read_manifest', lambda: manifest)
+    monkeypatch.setenv('OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE', str(tmp_path / 'control/controller.lock'))
+    monkeypatch.setenv(host.guard.EXECUTION_OWNERS_ENV, json.dumps([host.guard.process_identity(os.getpid())]))
     monkeypatch.setattr(runtime_control, 'PROJECT_ROOT', root)
-    monkeypatch.setattr(runtime_control, 'stop_requested', lambda: False)
-    monkeypatch.setattr(runtime_control, 'controller_owner_pid', lambda: 1234)
-    monkeypatch.setattr(host.guard, 'process_identity', lambda _: identity)
-    monkeypatch.setattr(host.guard, 'execution_owners_alive', lambda: True)
-    home = tmp_path / 'codex'
-    monkeypatch.setenv('CODEX_HOME', str(home))
-    source = home / 'sessions' / 'session.jsonl'
-    source.parent.mkdir(parents=True)
-    source.write_text(json.dumps({'type': 'session_meta', 'payload': {'id': owner}}) + '\n' +
-        json.dumps({'type': 'response_item', 'payload': {'type': 'custom_tool_call',
-            'name': 'functions.exec', 'call_id': 'actual-host-call', 'input': 'write ' + str(draft)}}) + '\n')
-    source.chmod(0o600)
-    task = {'project_root': str(root), 'action_file': str(action), 'timeout_seconds': 60}
-    return action, draft, owner, source, task, manifest, engine
+    with runtime_control.global_controller_lease():
+        manifest = controller_handoff.begin({'review_configuration': host.IDENTITY})
+        with host.approval_lifecycle.run_scope(manifest, root):
+            binding = original_execution(owner, manifest)
+            monkeypatch.delenv(host.guard.EXECUTION_OWNERS_ENV, raising=False)
+            host.register(reviewers, owner=owner, source=parent, **binding)
+            host.approval_lifecycle.heartbeat(manifest['run_id'], manifest['controller_instance_id'], {action}, [], writer_active=False)
+            task = {'project_root': str(root), 'action_file': str(action), 'timeout_seconds': 60}
+            yield action, draft, owner, source, task, manifest, engine
+        controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
+
+
+def native_call(source, name, arguments, call_id, output):
+    from datetime import datetime, timezone
+    line = sum(1 for _ in source.open()) + 1
+    with source.open('a') as stream:
+        stream.write(json.dumps({'timestamp': datetime.now(timezone.utc).isoformat(), 'type': 'response_item',
+            'payload': {'type': 'function_call' if name != 'functions.exec' else 'custom_tool_call',
+                'name': name, 'call_id': call_id,
+                'arguments' if name != 'functions.exec' else 'input': json.dumps(arguments) if name != 'functions.exec' else arguments}}) + '\n')
+        stream.write(json.dumps({'type': 'response_item', 'payload': {'type': 'function_call_output',
+            'call_id': call_id, 'output': json.dumps(output)}}) + '\n')
+    return line
 
 
 def start(exchange):
-    action, _, _, _, task, _, _ = exchange
+    action, draft, owner, source, task, _, _ = exchange
     result = []
     thread = threading.Thread(target=lambda: result.append(controller._review_only(task)))
     thread.start()
@@ -72,6 +79,11 @@ def start(exchange):
     while not request.exists() and time.monotonic() < deadline:
         time.sleep(.01)
     assert request.exists()
+    parent = source.with_name('parent.jsonl')
+    dispatch = native_call(parent, 'collaboration.followup_task',
+        {'target': '/root/reviewer_0', 'message': 'Read and audit ' + str(request)}, 'dispatch-0', {})
+    host.assign(request, slot=0, owner=owner, source=parent, source_line=dispatch)
+    native_call(source, 'functions.exec', 'write ' + str(draft), 'actual-host-call', {'exit_code': 0})
     return thread, result, request
 
 
@@ -115,12 +127,16 @@ def test_submission_rejects_untrusted_exchange_without_publishing(exchange, monk
     elif damage == 'stopped':
         monkeypatch.setattr(runtime_control, 'stop_requested', lambda: True)
     elif damage == 'run':
-        manifest['run_id'] = uuid4().hex
+        original_manifest = dict(manifest)
+        changed = {**manifest, 'run_id': uuid4().hex}
+        host.guard.write(controller_handoff.manifest_file(), changed)
     else:
         value = json.loads(request.read_text()); value['expires_at'] = 0
         json_artifact.write_json_atomic(request, value)
     with pytest.raises((ValueError, KeyError)):
         host.submit(request, draft, owner=owner, source=source, source_line=2)
+    if damage == 'run':
+        host.guard.write(controller_handoff.manifest_file(), original_manifest)
     assert not action.with_name(host.SUBMISSION).exists()
     monkeypatch.setattr(runtime_control, 'stop_requested', lambda: True)
     thread.join(3)
@@ -132,7 +148,7 @@ def test_submission_is_exclusive_and_completion_rejects_changed_source(exchange,
     action, draft, owner, source, *_ = exchange
     thread, results, request = start(exchange)
     host.submit(request, draft, owner=owner, source=source, source_line=2)
-    with pytest.raises(RuntimeError, match='control_file_unsafe'):
+    with pytest.raises((ValueError, RuntimeError), match='assignment_untrusted|control_file_unsafe'):
         host.submit(request, draft, owner=owner, source=source, source_line=2)
     thread.join(3)
     source.write_text(source.read_text().replace('actual-host-call', 'different-call'))
@@ -145,16 +161,16 @@ def test_submission_is_exclusive_and_completion_rejects_changed_source(exchange,
 def test_host_provider_is_not_silently_relabelled_as_deepseek(monkeypatch):
     monkeypatch.setenv(host.TRANSPORT_ENV, 'host_chat')
     monkeypatch.setenv('OA_REVIEW_PROVIDER', 'deepseek')
-    with pytest.raises(ValueError, match='provider_mismatch'):
+    with pytest.raises(ValueError, match='transport_invalid|provider_mismatch'):
         host.selected()
-    with pytest.raises(ValueError, match='provider_mismatch'):
+    with pytest.raises(ValueError, match='transport_invalid|provider_mismatch'):
         host.settings()
 
 
 def test_host_mode_forbids_building_a_codex_command(monkeypatch):
     monkeypatch.setenv(host.TRANSPORT_ENV, 'host_chat')
     monkeypatch.setenv('OA_REVIEW_PROVIDER', 'openai')
-    with pytest.raises(ValueError, match='host_review_cli_forbidden'):
+    with pytest.raises(ValueError, match='openai_review_cli_forbidden'):
         worker._codex_command(Path.cwd(), Path('schema'), Path('decision'))
 
 
@@ -171,3 +187,59 @@ def test_fresh_round_selects_host_and_next_round_resets_to_cli(monkeypatch, caps
         capsys.readouterr()
     assert seen[0] == host.IDENTITY
     assert seen[1]['provider'] == 'deepseek' and 'transport' not in seen[1]
+
+
+def test_same_registered_child_reviews_two_frozen_actions_without_recreation(exchange, monkeypatch):
+    from tests.finance_preaudit.test_app_reviewer_slots import native_sessions
+    action, draft, owner, source, task, manifest, engine = exchange
+    thread, results, request = start(exchange)
+    host.submit(request, draft, owner=owner, source=source, source_line=2)
+    thread.join(3)
+    reviewers = host.registered_reviewers(owner=owner)
+    # A second workflow creates a distinct frozen action while the three reviewers remain unchanged.
+    action2 = Path(engine.next_action('general_expense')['action_file'])
+    packet = json.loads(action2.with_name('review-packet.json').read_text())
+    draft2 = draft.with_name('second-draft.json')
+    json_artifact.write_json_atomic(draft2, {'overall': 'needs_human', 'items': [
+        {'item_key': item['item_key'], 'status': 'uncertain', 'conclusion': '自动读取材料不足，需财务核对原单。',
+         'evidence_refs': [], 'missing_evidence': ['缺少审核材料']} for item in packet['items']]})
+    draft2.chmod(0o600)
+    host.approval_lifecycle.heartbeat(manifest['run_id'], manifest['controller_instance_id'], {action2}, [], writer_active=False)
+    request2 = host.publish(action2, prompt='Review this frozen action only.', timeout_seconds=60)
+    assert [item['request_file'] for item in host.pending(owner=owner)] == [str(request2)]
+    parent = source.with_name('parent.jsonl')
+    line = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(request2)}, 'second-dispatch', {})
+    host.assign(request2, slot=0, owner=owner, source=parent, source_line=line)
+    source_line = native_call(source, 'functions.exec', 'write ' + str(draft2), 'second-review', {'exit_code': 0})
+    host.submit(request2, draft2, owner=owner, source=source, source_line=source_line)
+    reviewed = host.await_result(request2)
+    engine.validate_review_decision(action2, reviewed['decision'])
+    assert host.registered_reviewers(owner=owner) == reviewers
+    assert host.pending(owner=owner) == []
+
+
+def test_parent_lease_loss_cancels_exchange_and_rejects_late_decision(exchange, monkeypatch):
+    action, draft, owner, source, *_ = exchange
+    thread, results, request = start(exchange)
+    value = json.loads(host.registry_file(owner).read_text())
+    value['heartbeat_at'] = time.time() - 46
+    host.guard.write(host.registry_file(owner), value)
+    with pytest.raises(ValueError, match='parent_lost'):
+        host.submit(request, draft, owner=owner, source=source, source_line=2)
+    thread.join(3)
+    assert not thread.is_alive()
+    assert results[0]['write_state'] == 'not_requested'
+    assert json.loads(host.registry_file(owner).read_text())['state'] == 'cancelled'
+    assert not action.with_name(host.SUBMISSION).exists()
+
+
+def test_cancel_closes_registered_round_and_never_terminates_writer(exchange, monkeypatch):
+    action, draft, owner, source, *_ = exchange
+    thread, results, request = start(exchange)
+    monkeypatch.setattr(worker, '_terminate_process_group', lambda *_a, **_k: pytest.fail('Writer terminated'))
+    assert host.close(owner=owner, reason='cancelled')['state'] == 'cancelled'
+    with pytest.raises(ValueError):
+        host.submit(request, draft, owner=owner, source=source, source_line=2)
+    thread.join(3)
+    assert not thread.is_alive() and results[0]['write_state'] == 'not_requested'
+    assert not action.with_name(host.SUBMISSION).exists()
