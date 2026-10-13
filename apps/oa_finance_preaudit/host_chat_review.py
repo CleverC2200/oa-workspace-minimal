@@ -204,10 +204,11 @@ def register(reviewers: list[dict], *, owner: str, source: Path, receipt_file: P
     owners = receipt.get('owner_processes', []) + [receipt.get('supervisor_process'), receipt.get('controller_process')]
     if not owners or not all(guard._valid_identity(item) and guard.process_identity(item['pid']) == item for item in owners):
         raise ValueError('host_review_parent_untrusted')
+    registered_at = time.time()
     value = {'schema_version': 1, 'kind': 'preaudit_app_review_round', 'owner_task_id': owner,
              'run_id': manifest['run_id'], 'controller_instance_id': manifest['controller_instance_id'],
              'reviewers': registered, 'original_execution': binding, 'execution_owners': owners, 'phase': 'finance', 'state': 'open',
-             'heartbeat_at': time.time(), 'assignments': {}}
+             'heartbeat_at': registered_at, 'registered_at': registered_at, 'assignments': {}}
     with _round_lease(owner) as path:
         if os.path.lexists(path):
             previous = _read(path)[1]
@@ -229,6 +230,31 @@ def _registry(owner: str, *, live: bool = True) -> dict:
                for item in value['reviewers']]
     if value['reviewers'] != _reviewers(entries, owner, Path(value['reviewers'][0]['spawn_source']['session_file'])):
         raise ValueError('host_review_registry_untrusted')
+    from datetime import datetime
+    heartbeat_proof = value.get('heartbeat_source')
+    if heartbeat_proof is not None:
+        if (not isinstance(heartbeat_proof, dict)
+                or heartbeat_proof.get('session_file') != value['reviewers'][0]['spawn_source']['session_file']):
+            raise ValueError('host_review_heartbeat_untrusted')
+        native, actual = _native_source(Path(heartbeat_proof['session_file']), owner, heartbeat_proof['line'])
+        payload = native['anchor'].get('payload', {})
+        text = str(payload.get('arguments', payload.get('input', '')))
+        timestamp = native['anchor'].get('timestamp')
+        if (actual != heartbeat_proof or payload.get('name') not in {'exec', 'functions.exec'}
+                or not payload.get('call_id') or 'heartbeat' not in text or owner not in text
+                or not isinstance(timestamp, str)
+                or datetime.fromisoformat(timestamp.replace('Z', '+00:00')).timestamp() != value.get('heartbeat_at')):
+            raise ValueError('host_review_heartbeat_untrusted')
+    else:
+        # Before the first parent renewal, registration shares the original
+        # bounded execution clock; it cannot invent a fresh startup budget.
+        binding = value['original_execution']
+        original = _read(Path(binding['receipt_file']).with_name('controller-manifest.json'))[1]
+        started = datetime.fromisoformat(original['started_at']).timestamp()
+        registered_at = value.get('registered_at')
+        if (not guard._timestamp(registered_at) or value.get('heartbeat_at') != registered_at
+                or not started <= registered_at < started + 900 or registered_at > time.time()):
+            raise ValueError('host_review_heartbeat_untrusted')
     if live:
         if (value.get('state') != 'open' or runtime_control.stop_requested()
                 or not guard._timestamp(value.get('heartbeat_at'))
@@ -302,6 +328,14 @@ def heartbeat(*, owner: str, source: Path, source_line: int) -> dict:
     return {'state': value['state'], 'phase': value['phase'], 'heartbeat_at': value['heartbeat_at']}
 
 
+
+def _native_agent_status(value) -> str:
+    if isinstance(value, str) and value in {'idle', 'completed', 'running'}:
+        return value
+    if isinstance(value, dict) and set(value) == {'completed'} and (value['completed'] is None or isinstance(value['completed'], str)):
+        return 'completed'
+    raise ValueError('host_review_children_status_untrusted')
+
 def close(*, owner: str, reason: str = 'completed', source: Path | None = None, source_line: int | None = None) -> dict:
     """Close the exchange; cancellation never signals the Writer process."""
     if reason not in {'completed', 'cancelled', 'parent_lost', 'reviewer_failed'}:
@@ -328,10 +362,21 @@ def close(*, owner: str, reason: str = 'completed', source: Path | None = None, 
             last_result = max([value['heartbeat_at'], *(item.get('submitted_at', 0) for item in value['assignments'].values())])
             if not isinstance(timestamp, str) or not last_result <= datetime.fromisoformat(timestamp.replace('Z', '+00:00')).timestamp() <= time.time():
                 raise ValueError('host_review_stale_source')
-            if (not isinstance(agents, list) or any(
-                    len([agent for agent in agents if agent.get('agent_name') == reviewer['agent_path']
-                         and agent.get('agent_status') in {'idle', 'completed'}]) != 1 for reviewer in value['reviewers'])):
-                raise ValueError('host_review_children_not_idle')
+            if not isinstance(agents, list) or any(not isinstance(agent, dict) for agent in agents):
+                raise ValueError('host_review_children_status_untrusted')
+            statuses = []
+            for reviewer in value['reviewers']:
+                matches = [agent for agent in agents if agent.get('agent_name') == reviewer['agent_path']]
+                if len(matches) != 1:
+                    raise ValueError('host_review_children_not_idle')
+                status = _native_agent_status(matches[0].get('agent_status'))
+                if status not in {'idle', 'completed'}:
+                    raise ValueError('host_review_children_not_idle')
+                statuses.append({'agent_name': reviewer['agent_path'], 'agent_status': status})
+            # Preserve native line hashes and canonical status evidence, never
+            # completed agent results or unrelated conversations' business text.
+            proof.pop('output')
+            proof['reviewers'] = statuses
             value['children_idle_source'] = proof
         value.update(state='closed' if reason == 'completed' else 'cancelled', close_reason=reason, closed_at=time.time())
         guard.write(path, value)
