@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 
-from .production_config import MODEL, REASONING_EFFORT, MODEL_PROVIDER, SERVICE_TIER
+from .production_config import MODEL, REASONING_EFFORT, MODEL_PROVIDER, SERVICE_TIER, HOST_REVIEW_IDENTITY
 # Frozen historical evidence keeps the model and effort used by that invocation.
 LEGACY_MODELS = frozenset({"gpt-5.6-terra"})
 ALTERNATE_MODELS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
@@ -32,6 +32,10 @@ def model_effort_matches(model: object, effort: object) -> bool:
 
 def read_model_identity(value: object) -> dict | None:
     """Validate invocation identity without adding settings to historical evidence."""
+    if isinstance(value, dict) and value.get("transport") == "host_chat":
+        if all(value.get(key) == expected for key, expected in HOST_REVIEW_IDENTITY.items()):
+            return dict(HOST_REVIEW_IDENTITY)
+        return None
     if not isinstance(value, dict) or not model_effort_matches(value.get("model"), value.get("reasoning_effort")):
         return None
     identity = {"model": value["model"], "reasoning_effort": value["reasoning_effort"]}

@@ -2752,3 +2752,14 @@ def test_missing_deepseek_key_never_starts_model_or_uses_native_auth(tmp_path, m
     result = codex_review_worker._execute_codex(Path(task["project_root"]), action_file, 60)
     assert result.error_code == "codex_process_start_failed"
     assert result.process_state == "start_failed"
+
+
+@pytest.fixture(autouse=True)
+def selected_deepseek_cli(monkeypatch):
+    # These tests exercise the retained API/CLI transport explicitly.
+    monkeypatch.setenv('OA_REVIEW_PROVIDER', 'deepseek')
+    monkeypatch.setenv('OA_REVIEW_TRANSPORT', 'cli')
+    profile = codex_review_worker.production_config.review_settings('deepseek', transport='cli')
+    monkeypatch.setattr(codex_review_worker, 'REVIEW_SETTINGS', profile)
+    monkeypatch.setattr(codex_review_worker, 'MODEL', profile['model'])
+    monkeypatch.setattr(codex_review_worker, 'REASONING_EFFORT', profile['reasoning_effort'])

@@ -2088,7 +2088,8 @@ class FlowEngine:
             or timing["wall_seconds"] < 0
             or not isinstance(timing.get("process_attempts"), int)
             or isinstance(timing.get("process_attempts"), bool)
-            or timing["process_attempts"] < 1
+            or (timing["process_attempts"] != 0 if identity and identity.get("transport") == "host_chat"
+                else timing["process_attempts"] < 1)
             or not isinstance(timing.get("token_usage"), dict)
         ):
             raise ValueError("agent_timing_invalid")
