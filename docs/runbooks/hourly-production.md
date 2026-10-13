@@ -1,6 +1,6 @@
 # 小时生产调度手册
 
-本手册与 `config/automations/oa-skill-prompt.txt` 是待发布的调度配置候选。启用前须按 [发布约定](../../CONTRIBUTING.md#开发与生产隔离及发布) 完成代码及手册发布、生产同步和只读核验，再通过原生 automation_update 更新现有自动化并回读。当前本地文件不表示生产已经加载。保留实际外层模型、推理级别、频率、状态、通知偏好、项目和目录；业务审核默认 model=gpt-6.1-sol reasoning_effort=medium model_provider=openai service_tier=default。外层调度保留 scheduler_model=gpt-6.1-sol scheduler_reasoning_effort=medium。Codex/OpenAI 审核使用现有原生认证，不接收 API key；显式选择 DeepSeek 时通过 Responses API 使用 OA_REVIEW_API_KEY，requires_openai_auth=false，CODEX_HOME 按调用隔离。不调用 codex login、不复制认证、不改全局配置。外层调度继续使用现有原生 OpenAI 认证。历史回执保留原供应商、模型和推理身份，不改写为当前配置。
+本手册与 `config/automations/oa-skill-prompt.txt` 是待发布的调度配置候选。启用前须按 [发布约定](../../CONTRIBUTING.md#开发与生产隔离及发布) 完成代码及手册发布、生产同步和只读核验，再通过原生 automation_update 更新现有自动化并回读。变更默认供应商时，先按[默认供应商迁移](production-source-release.md#默认供应商迁移)更新仍暂停的原 cron 提示词，使同步前的候选配置门可核验；源码同步失败时保持暂停。当前本地文件不表示生产已经加载。保留实际外层模型、推理级别、频率、状态、通知偏好、项目和目录；业务审核默认 model=gpt-6.1-sol reasoning_effort=medium model_provider=openai service_tier=default。外层调度保留 scheduler_model=gpt-6.1-sol scheduler_reasoning_effort=medium。Codex/OpenAI 审核使用现有原生认证，不接收 API key；显式选择 DeepSeek 时通过 Responses API 使用 OA_REVIEW_API_KEY，requires_openai_auth=false，CODEX_HOME 按调用隔离。不调用 codex login、不复制认证、不改全局配置。外层调度继续使用现有原生 OpenAI 认证。历史回执保留原供应商、模型和推理身份，不改写为当前配置。
 
 每轮必读“每轮启动与实时对账”；结束必读“结束对账与超期”和“清窗与留存”。其他章节仅在对应条件出现时读取，且原安全边界始终适用。
 

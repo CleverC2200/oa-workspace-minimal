@@ -520,6 +520,44 @@ def test_real_release_adapter_requires_actual_automation_contract(production):
         production_release.release_source(root, expected_revision=expected, expected_origin=str(remote))
 
 
+def test_default_provider_migration_requires_updating_paused_cron_before_release(production):
+    from apps.oa_finance_preaudit import production_config
+    root, remote, _ = production
+    source = Path(production_release.__file__).resolve().parents[2]
+    for name in production_config.REPOSITORY_INPUTS:
+        target = root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((source / name).read_bytes())
+    git(root, 'add', '.')
+    git(root, 'commit', '-qm', 'default Codex candidate')
+    git(root, 'push', '-q', 'origin', 'main')
+    revision = git(root, 'rev-parse', 'HEAD')
+    assert production_release.candidate_configuration_findings(root, revision) == []
+    prompt = (source / 'config/automations/oa-skill-prompt.txt').read_text()
+    old_prompt = prompt.replace('--review-provider openai --', '--review-provider deepseek --')
+    old_prompt = old_prompt.replace('model=gpt-6.1-sol reasoning_effort=medium model_provider=openai',
+                                    'model=deepseek-flash reasoning_effort=high model_provider=oa_deepseek')
+    cron = root.parent / 'paused-automation.toml'
+    def write_cron(text):
+        cron.write_text('id = "oa-skill"\nstatus = "PAUSED"\nkind = "cron"\nexecution_environment = "local"\n'
+            'model = "gpt-6.1-sol"\nreasoning_effort = "medium"\nrrule = "preserved"\n'
+            + 'cwds = ' + json.dumps([str(root)]) + '\nprompt = ' + json.dumps(text, ensure_ascii=False)
+            + '\n[target]\ntype = "project"\nproject_id = "production"\n')
+    write_cron(old_prompt)
+    before = cron.read_bytes()
+    automation = production_release.ProductionAutomation(cron, 'production', 'preserved')
+    with pytest.raises(RuntimeError, match='production_config_provider_selection_drift:automation'):
+        production_release.release_source(root, expected_revision=revision, expected_origin=str(remote),
+            automation=automation, check_live=lambda _: pytest.fail('old cron reached live release checks'))
+    assert cron.read_bytes() == before and git(root, 'rev-parse', 'HEAD') == revision
+    write_cron(prompt)
+    result = production_release.release_source(root, expected_revision=revision, expected_origin=str(remote),
+        automation=automation, check_live=lambda _: live_snapshot())
+    assert result['status'] == 'ready' and result['source_sync_requested'] is False
+    assert 'status = "PAUSED"' in cron.read_text()
+    assert result['production_acceptance'] == 'not_verified'
+
+
 def test_public_cli_returns_small_blocked_receipt_for_stop(production, capsys):
     import json
     root, remote, expected = production
