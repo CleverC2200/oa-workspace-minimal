@@ -38,7 +38,12 @@ def lost_execution(tmp_path, monkeypatch):
     flows = tmp_path / 'runtime/finance_preaudit_flows'
     engine = _engine(flows, 'offline-cancelled-collection')
     engine._collect_material = lambda *_: (_ for _ in ()).throw(ValueError('oa_run_stopped'))
-    action = engine.next_action('travel_expense')
+    # This fixture models the historical failure without an active stop gate.
+    # Public maintenance fixtures clear global control overrides, so isolate this
+    # collection from any pre-existing development runtime stop.
+    with monkeypatch.context() as control:
+        control.setenv('OA_FINANCE_PREAUDIT_STOP_FILE', str(tmp_path / 'runtime/stop-preaudit.flag'))
+        action = engine.next_action('travel_expense')
     action_file = Path(action['action_file'])
     directory = tmp_path / 'runtime/control/executions' / uuid4().hex
     owner = str(uuid4())
