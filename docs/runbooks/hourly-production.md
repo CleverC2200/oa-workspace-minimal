@@ -65,7 +65,11 @@ worker 与外层监督进程每 5 秒观察本地原生错误，不产生模型 
 
 ## 包装待审核
 
-财务终态及结束门禁可信后，才处理包装：.venv/bin/python -m apps.oa_finance_preaudit.cli next-action --workflow packaging_layout_approval --mode controlled-write --confirm-write YES。closed/not_available 即包装无工作，不看图、不生成决定、不调用完成入口。review_required 按当前冻结包逐页直接观察原图，不用OCR；承载单位/地址/许可证等固定项的外箱也需审核，不根据文件名、扩展名或字段自动分类，不跨版本拼证据。按 Skill 的必要条件独立复核；DeepSeek API 密钥或本轮供应商配置失信时停止当前包装，不回退到其他供应商。调用 `.venv/bin/python -m apps.oa_finance_preaudit.packaging_review --action-file <当前动作>`，等待其原 session 实际终态，按 [包装只读审核](../agents/packaging-review.md) 核对草稿、原始工具回执、逐页覆盖及必要复核。draft_ready 不表示已看图或已提交；缺真实工具证据或语义未确认时停在人工处置，禁止靠模型自述放行。宿主已仅绑定冻结协议，业务字段不改；核对后才使用原 complete-review --action-file ... --decision-file <回执的决定文件> --confirm-write YES。装配不改变业务结论，无效决定不写OA；包装缺失/不可读材料停止当前包装。不重提已提交意见。
+财务原工具 session 与原回执均可信正常终态、children_reaped=true 且新鲜结束门禁可信、Writer 空闲后才处理包装。OpenAI 主对话先 `host_chat_review --operation enter-packaging --owner-task-id <本轮主会话UUID>`，保留同一 3 个 Agent。随后使用原 `cli next-action --workflow packaging_layout_approval --mode controlled-write --confirm-write YES`。closed/not_available 不生成决定或调用完成。
+
+review_required 只读取当前冻结包装材料，逐页直接看原图，不用 OCR、不跨版本拼证据。按[包装只读审核](../agents/packaging-review.md)调用原 packaging_review；OpenAI 加本轮 owner-task-id 并持续原生派单/心跳，按需独立复核使用另一原槽，真实观察和父语义确认通过后走 App complete 包装入口。DeepSeek 沿用独立 API key/空 CODEX_HOME、原工具回执和调用者语义门，确认后才使用原 complete-review。供应商或来源失信不回退，不重提已提交意见。
+
+包装及结束对账完成后，保留原生 list_agents 确认本轮 3 个 Agent 均无运行任务的工具来源，再 close 同轮 App exchange，主对话才结束。取消先停止派单，原生中断原 Agent 并 close，继续等待原控制器与 Writer 收尾；迟到决定拒绝，未知写入保持原回执和人工处置。
 
 ## 结束对账与超期
 

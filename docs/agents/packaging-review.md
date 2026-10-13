@@ -18,4 +18,32 @@
 
 `draft_ready` 和 `contract_validation=passed` 表示草稿绑定后已通过完整只读合同校验，**不表示已提交、业务通过或图片阅读已验证**。`tool_receipt_files` 只是原生记录的路径；必须按真实 tool call/output、页面路径与版本核对实际查看及必要复核，记录缺口，不能凭文件存在、event 计数或模型自述证明已阅读。`semantic_acceptance=not_checked` 保持到独立业务验收。Schema/正常路径离线测试不证明供应商实际接受全部形状。
 
+## App 草稿、独立复核与完成
+
+OpenAI 包装调用加上 `--owner-task-id <本轮主会话UUID>`。返回原工具 session 后，主对话继续心跳和 pending 派单；不等该 session 结束才处理请求。主审使用已登记的空闲槽，读取当前冻结规则和原图，输出 App envelope：`draft` 保持原包装草稿，另有 `recheck_required`、`recheck_page_refs`、`recheck_reasons`。复核条件和原因由审核者按现行图片校对 Skill 判断，宿主不生成业务疑点。
+
+App 逐页看图需要当前派单之后、草稿写入之前的真实工具调用和配对图片输出。识别原生 `exec`/`functions.exec` 的单次 `tools.view_image({path:"原图绝对路径"})`，以及直接 view_image；一个调用对应一个原页。只提到路径、旧轮次看图、无图片输出或工具失败均不能成为主审覆盖。回执只保存原生调用/输出行哈希、页引用和材料摘要，不复制 Base64。缺失任何原页观察不进入 draft_ready。
+
+App `draft_ready` 保留主审 envelope、决定、真实来源和逐页观察，`semantic_acceptance=not_checked`。主对话核对原像素、意见及 Skill 的复核触发条件，不能只凭主审 false 布尔值判定无需复核。需要独立复核时执行：
+
+```bash
+python -B -m apps.oa_finance_preaudit.packaging_review --operation recheck --receipt-file <主审review-receipt.json> --owner-task-id <本轮主会话UUID>
+```
+
+返回请求经原 pending/followup/assign 派给另一个已登记槽；不创建新 Agent。复核提示只传当前区域和规则，避免传主审结论。复核 payload 绑定原决定 SHA-256、page_refs、outcome 和逐位置 findings，真实看图来源仍需验证。复核结果为不同或不确定时，主对话保留分歧。只有原主审决定已经将所有受影响页记录为 uncertain、overall=needs_human，才能保留该警示意见完成；宿主不会把 pass 改成 uncertain。独立读取 unavailable 必须有真实失败工具记录，受影响页仍须由主审原决定明确标为 uncertain。原主审 pass 不能靠复核失败放行，保持人工处置。
+
+主对话通过独立工具调用写出私有语义确认 JSON，字段为 `receipt_sha256`、`decision_sha256`、`accepted`、`requirements_checked`、`recheck_required`、`recheck_request_file`、`conclusion`。accepted 和 requirements_checked 必须为 true，且由主对话实际评估原页、业务结论和复核条件。无复核时 recheck_request_file 为 null；需要时指向可信的不同槽复核请求。等待该次写入工具成功，保留主会话真实来源行后执行：
+
+```bash
+python -B -m apps.oa_finance_preaudit.packaging_review --operation confirm --receipt-file <主审review-receipt.json> --confirmation-file <父语义确认.json> --owner-task-id <本轮主会话UUID> --source-session-file <父原生会话jsonl> --source-line <已完成确认写入行>
+```
+
+此入口校验原决定、逐页观察、父会话身份及必要的不同槽复核，独占保存 semantic-confirmation.json，仍不写 OA。只有已有 OA 写入授权且生产门禁可信时才执行 App 包装完成入口：
+
+```bash
+python -B -m apps.oa_finance_preaudit.packaging_review --operation complete --receipt-file <主审review-receipt.json> --confirm-write YES
+```
+
+完成入口重新核验原草稿、来源、冻结材料和语义确认，再调用原 FlowEngine complete_review。关闭/取消、来源漂移、主审或复核决定变更、超期、停止门或缺语义确认均不进入 Writer。不改通用手工 FlowEngine 语义。DeepSeek 继续使用下方原调用者确认门及 complete-review，不采用 App 确认回执。
+
 确认工具证据、页面合同及业务语义后，只有已有 OA 写入授权且生产门禁完整可信时，才可把 `decision_file` 交给原 `complete-review`。该消费者继续执行完整确定性校验和受控提交；本入口不替代它。全部非包装仍由模型逐页确认，原消费者生成对应跳过意见；包装材料不得扩展为法规审核。原输出包含业务材料，仅本地受控留存，不提交 Git/Issue。
