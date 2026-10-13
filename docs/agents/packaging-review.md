@@ -58,4 +58,6 @@ python -B -m apps.oa_finance_preaudit.packaging_review --operation complete --re
 
 完成入口重新核验原草稿、来源、冻结材料和语义确认，再调用原 FlowEngine complete_review。原消费者确认 closed 后，入口保存独占 app-completion.json，并在同轮槽位登记其摘要，绑定语义确认、原决定、闭合 action/state 和执行回执。正常 close 会重新核对这个完成回执；主审只提交草稿、未走完成入口或文件漂移时不能结束为 completed。关闭/取消、来源漂移、主审或复核决定变更、超期、停止门或缺语义确认均不进入 Writer。不改通用手工 FlowEngine 语义。DeepSeek 继续使用下方原调用者确认门及 complete-review，不采用 App 确认回执。
 
+如果原消费者已经返回 action=closed、write_state=submitted，随后 app-completion 本地封存失败，完成入口保留原提交结果，另返回 completion_seal.status=failed、error_code=packaging_completion_seal_failed，并请求原停止门。CLI 退出 1 表示封存未完成，不能据此把已提交单据判为未写或自动重试。若停止请求也失败，completion_seal.stop_requested=false，并保留 stop_request_error=packaging_stop_request_failed。保留原 OA 提交与回查回执及当前封存错误，正常 close 仍拒绝未封存的包装完成；转人工核验，不重放已写动作。
+
 确认工具证据、页面合同及业务语义后，只有已有 OA 写入授权且生产门禁完整可信时，才可把 `decision_file` 交给原 `complete-review`。该消费者继续执行完整确定性校验和受控提交；本入口不替代它。全部非包装仍由模型逐页确认，原消费者生成对应跳过意见；包装材料不得扩展为法规审核。原输出包含业务材料，仅本地受控留存，不提交 Git/Issue。
