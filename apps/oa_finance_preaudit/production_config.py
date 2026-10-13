@@ -35,22 +35,49 @@ REPOSITORY_INPUTS = (
 )
 
 
-def review_settings(provider: str | None = None) -> dict:
-    """Resolve the provider chosen for one fresh controller process."""
+HOST_REVIEW_IDENTITY = {
+    "provider": "openai", "model": "host-current-chat", "reasoning_effort": "unknown",
+    "model_provider": "openai", "requested_service_tier": "unknown", "transport": "host_chat",
+}
+LEGACY_OPENAI_IDENTITY = {"provider": "openai", "model": "gpt-6.1-sol", "reasoning_effort": "medium",
+                          "model_provider": "openai", "requested_service_tier": "default"}
+REVIEW_TRANSPORT_ENV = "OA_REVIEW_TRANSPORT"
+
+
+def review_settings(provider: str | None = None, *, transport: str | None = None) -> dict:
+    """Select the execution contract for one new round; never fall back to CLI."""
     provider = provider if provider is not None else os.environ.get(REVIEW_PROVIDER_ENV, DEFAULT_REVIEW_PROVIDER)
-    if provider == "deepseek":
-        return {"provider": provider, "model": MODEL, "reasoning_effort": REASONING_EFFORT,
-                "model_provider": MODEL_PROVIDER, "requested_service_tier": SERVICE_TIER}
+    if provider not in {"openai", "deepseek"}:
+        raise ValueError("approval_review_provider_invalid")
+    transport = transport if transport is not None else os.environ.get(
+        REVIEW_TRANSPORT_ENV, "host_chat" if provider == "openai" else "cli")
+    if transport not in {"cli", "host_chat"}:
+        raise ValueError("approval_review_transport_invalid")
     if provider == "openai":
-        return {"provider": provider, "model": "gpt-6.1-sol", "reasoning_effort": "medium",
-                "model_provider": "openai", "requested_service_tier": "default"}
-    raise ValueError("approval_review_provider_invalid")
+        if transport != "host_chat":
+            raise ValueError("openai_review_cli_forbidden")
+        return dict(HOST_REVIEW_IDENTITY)
+    if transport != "cli":
+        raise ValueError("host_review_provider_mismatch")
+    return {"provider": provider, "model": MODEL, "reasoning_effort": REASONING_EFFORT,
+            "model_provider": MODEL_PROVIDER, "requested_service_tier": SERVICE_TIER}
+
+
+def valid_review_configuration(configuration: object) -> bool:
+    """Read immutable identities independently of today's selected transport."""
+    if not isinstance(configuration, dict):
+        return False
+    if configuration == HOST_REVIEW_IDENTITY:
+        return True
+    if configuration == LEGACY_OPENAI_IDENTITY:
+        return True  # Historical CLI receipts remain readable, never selectable.
+    return configuration == review_settings("deepseek", transport="cli")
 
 
 def snapshot() -> dict:
-    settings = review_settings(DEFAULT_REVIEW_PROVIDER)
+    settings = review_settings(DEFAULT_REVIEW_PROVIDER, transport="host_chat")
     return {
-        **{key: settings[key] for key in ("model", "reasoning_effort", "model_provider", "requested_service_tier")},
+        **settings,
         "initial_capacity": INITIAL_CAPACITY, "max_capacity": MAX_CAPACITY,
         "workflows": list(FINANCE_WORKFLOWS),
     }
@@ -69,13 +96,16 @@ def _text_findings(text: str, source: str) -> list[str]:
         providers = [tokens[index + 1] for index, value in enumerate(tokens[:-1]) if value == "--review-provider"]
         if len(providers) != 1:
             raise ValueError("provider_selection")
-        settings = review_settings(providers[0])
+        transports = [tokens[index + 1] for index, value in enumerate(tokens[:-1]) if value == "--review-transport"]
+        if transports != ["host_chat"]:
+            raise ValueError("transport_selection")
+        settings = review_settings(providers[0], transport=transports[0])
         if providers[0] != DEFAULT_REVIEW_PROVIDER:
             findings.append(f"production_config_provider_selection_drift:{source}")
     except (ValueError, IndexError):
         return findings + [f"production_config_provider_selection_drift:{source}"]
     for key, expected in (("model", settings["model"]), ("reasoning_effort", settings["reasoning_effort"]),
-                          ("model_provider", settings["model_provider"]), ("service_tier", settings["requested_service_tier"])):
+                          ("model_provider", settings["model_provider"]), ("service_tier", settings["requested_service_tier"]), ("transport", settings["transport"])):
         values = re.findall(rf"\b{key}=[\"']?([a-zA-Z0-9._-]+)", text)
         if not values and source == "automation":
             if key == "model":
@@ -103,7 +133,8 @@ def _text_findings(text: str, source: str) -> list[str]:
         expected_arguments.extend(("--workflow", workflow))
     if (tokens[:4] != [".venv/bin/python", "-m", "scripts.finance_preaudit_run", "--owner-task-id"]
             or tokens[5:7] != ["--review-provider", settings["provider"]]
-            or len(tokens[:tokens.index("--")]) != 7 or Counter(arguments) != Counter(expected_arguments)):
+            or tokens[7:9] != ["--review-transport", "host_chat"]
+            or len(tokens[:tokens.index("--")]) != 9 or Counter(arguments) != Counter(expected_arguments)):
         findings.append(f"production_config_command_invalid:{source}")
     return findings
 
@@ -124,7 +155,7 @@ def _source_findings(root: Path) -> list[str]:
     for key in ("MODEL", "REASONING_EFFORT", "MODEL_PROVIDER", "SERVICE_TIER",
                 "INITIAL_CAPACITY", "MAX_CAPACITY", "FINANCE_WORKFLOWS",
                 "SCHEDULER_MODEL", "SCHEDULER_REASONING_EFFORT", "MODEL_CATALOG",
-                "DEFAULT_REVIEW_PROVIDER", "REVIEW_PROVIDER_ENV"):
+                "DEFAULT_REVIEW_PROVIDER", "REVIEW_PROVIDER_ENV", "REVIEW_TRANSPORT_ENV", "HOST_REVIEW_IDENTITY"):
         try:
             actual = ast.literal_eval(assignments["production_config"][key])
         except (KeyError, ValueError, TypeError):
@@ -148,6 +179,16 @@ def _source_findings(root: Path) -> list[str]:
             findings.append("production_config_reviewer_drift")
     command = next((node for node in sources["codex_review_worker"].body
                     if isinstance(node, ast.FunctionDef) and node.name == "_codex_command"), None)
+    guard_test = ast.parse('REVIEW_SETTINGS["provider"] != "deepseek"', mode="eval").body
+    guards = [node for node in command.body if isinstance(node, ast.If)
+              and ast.dump(node.test) == ast.dump(guard_test)] if command else []
+    raw = next((node for node in sources["codex_review_worker"].body
+                if isinstance(node, ast.FunctionDef) and node.name == "_execute_codex_raw"), None)
+    if (not guards or not any(isinstance(node, ast.Raise) for node in guards[0].body)
+            or raw is None or not isinstance(raw.body[0], ast.If)
+            or ast.dump(raw.body[0].test) != ast.dump(guard_test)
+            or not any(isinstance(node, ast.Return) for node in raw.body[0].body)):
+        findings.append("production_config_openai_cli_guard_drift")
     returns = [node.value for node in command.body if isinstance(node, ast.Return)] if command else []
     arguments = returns[0].elts if len(returns) == 1 and isinstance(returns[0], ast.List) else []
     optional = [node.value for node in arguments if isinstance(node, ast.Starred)]

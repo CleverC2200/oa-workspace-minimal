@@ -194,9 +194,7 @@ def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str
                   "receipt_file": str(path)}
         configuration = receipt.get("review_configuration")
         if configuration is not None:
-            if (not isinstance(configuration, dict)
-                    or configuration != (host_chat_review.IDENTITY if configuration.get('transport') == 'host_chat'
-                                          else production_config.review_settings(configuration.get("provider")))):
+            if (not production_config.valid_review_configuration(configuration)):
                 raise ValueError("controller_execution_review_configuration_mismatch")
             report["review_configuration"] = configuration
         override = receipt.get("cooldown_override")
@@ -673,10 +671,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.receipt_file is not None:
             raise ValueError("controller_tool_session_binding_invalid")
-        configuration = production_config.review_settings(args.review_provider)
+        configuration = production_config.review_settings(args.review_provider, transport=(
+            args.review_transport or ("host_chat" if (args.review_provider or production_config.DEFAULT_REVIEW_PROVIDER) == "openai" else "cli")))
         os.environ[production_config.REVIEW_PROVIDER_ENV] = configuration["provider"]
-        # An omitted transport always resets a fresh round to CLI; no inherited host mode.
-        os.environ[host_chat_review.TRANSPORT_ENV] = args.review_transport or 'cli'
+        # Reset the transport each round; environment from a prior round cannot override selection.
+        os.environ[host_chat_review.TRANSPORT_ENV] = configuration.get("transport", "cli")
         host_chat_review.settings()
         if approval_guard.COOLDOWN_OVERRIDE_ENV in os.environ:
             raise ValueError("approval_cooldown_override_inherited")
