@@ -1235,3 +1235,14 @@ def fake_review_api_key(monkeypatch):
     monkeypatch.setattr(worker, 'MODEL', settings['model'])
     monkeypatch.setattr(worker, 'REASONING_EFFORT', settings['reasoning_effort'])
     monkeypatch.setenv("OA_REVIEW_API_KEY", "offline-fake-key")
+
+
+@pytest.fixture(autouse=True)
+def selected_deepseek_cli(monkeypatch):
+    # These tests exercise the retained API/CLI transport explicitly.
+    monkeypatch.setenv('OA_REVIEW_PROVIDER', 'deepseek')
+    monkeypatch.setenv('OA_REVIEW_TRANSPORT', 'cli')
+    profile = worker.production_config.review_settings('deepseek', transport='cli')
+    monkeypatch.setattr(worker, 'REVIEW_SETTINGS', profile)
+    monkeypatch.setattr(worker, 'MODEL', profile['model'])
+    monkeypatch.setattr(worker, 'REASONING_EFFORT', profile['reasoning_effort'])
