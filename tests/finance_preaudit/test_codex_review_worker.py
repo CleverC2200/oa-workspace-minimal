@@ -2734,6 +2734,12 @@ def test_parent_completion_rejects_provider_tier_or_mixed_historical_identity(tm
 
 @pytest.fixture(autouse=True)
 def fake_review_api_key(monkeypatch):
+    # Recorded native doubles exercise DeepSeek; defaults are tested in fresh processes.
+    settings = codex_review_worker.production_config.review_settings('deepseek')
+    monkeypatch.setenv('OA_REVIEW_PROVIDER', 'deepseek')
+    monkeypatch.setattr(codex_review_worker, 'REVIEW_SETTINGS', settings)
+    monkeypatch.setattr(codex_review_worker, 'MODEL', settings['model'])
+    monkeypatch.setattr(codex_review_worker, 'REASONING_EFFORT', settings['reasoning_effort'])
     monkeypatch.setenv("OA_REVIEW_API_KEY", "offline-fake-key")
 
 
