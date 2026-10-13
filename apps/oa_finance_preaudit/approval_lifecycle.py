@@ -167,8 +167,7 @@ def heartbeat(run_id: str | None, instance: str | None, actions: set[Path], dead
             from . import host_chat_review
             try:
                 owner = os.environ.get(guard.OWNER_ENV)
-                if (owner is None or manifest["run_id"] != run_id
-                        or manifest["controller_instance_id"] != instance):
+                if owner is None:
                     raise ValueError("host_review_parent_untrusted")
                 host_chat_review.assert_round_alive(owner=owner, manifest=manifest)
             except (OSError, RuntimeError, ValueError, KeyError, TypeError):
