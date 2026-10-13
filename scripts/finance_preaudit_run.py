@@ -210,6 +210,12 @@ def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str
                     or audit.get("manifest_file") != str(path.with_name("controller-manifest.json"))):
                 raise ValueError("controller_execution_override_mismatch")
             report["cooldown_override"] = override
+        owners = receipt.get("owner_processes")
+        if owners is not None:
+            if (not isinstance(owners, list) or not owners
+                    or any(not approval_guard._valid_identity(owner) for owner in owners)):
+                raise ValueError("controller_execution_evidence_failed")
+            report["owner_processes"] = owners
         supervisor = receipt.get("supervisor_process")
         if supervisor is not None and (not approval_guard._valid_identity(supervisor)
                 or supervisor["pid"] != receipt.get("supervisor_pid")):
