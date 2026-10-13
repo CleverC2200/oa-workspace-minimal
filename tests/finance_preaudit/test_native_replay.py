@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# Select the retained supplier explicitly for recorded CLI/slot behavior.
+from tests.finance_preaudit.review_profiles import retained_deepseek_cli  # noqa: F401
+
 import hashlib
 import json
 from pathlib import Path
@@ -282,6 +285,7 @@ def test_verify_rejects_mismatching_independently_frozen_hash(acceptance_records
 def test_prepared_provider_is_frozen_and_cannot_change_at_run(recorded_case, capsys, monkeypatch, provider):
     from apps.oa_finance_preaudit import production_config, codex_review_worker
     monkeypatch.setenv(production_config.REVIEW_PROVIDER_ENV, provider)
+    monkeypatch.setenv(production_config.REVIEW_TRANSPORT_ENV, "cli" if provider == "deepseek" else "host_chat")
     monkeypatch.setattr(codex_review_worker, 'REVIEW_SETTINGS', production_config.review_settings(provider))
     arguments, _, _ = recorded_case
     assert finance_preaudit_native_replay.main(arguments) == 0
@@ -290,7 +294,7 @@ def test_prepared_provider_is_frozen_and_cannot_change_at_run(recorded_case, cap
     manifest = json.loads(manifest_file.read_text())
     assert manifest["review_configuration"] == production_config.review_settings(provider)
     other = 'openai' if provider == 'deepseek' else 'deepseek'
-    manifest["review_configuration"] = production_config.review_settings(other)
+    manifest["review_configuration"] = production_config.review_settings(other, transport="cli" if other == "deepseek" else "host_chat")
     manifest_file.write_text(json.dumps(manifest))
     with pytest.raises(RuntimeError, match="review_model_identity_changed"):
         finance_preaudit_native_replay.main(["--run" if arg == "--prepare" else arg for arg in arguments],

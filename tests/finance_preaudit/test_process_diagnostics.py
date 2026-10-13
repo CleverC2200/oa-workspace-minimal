@@ -1,3 +1,6 @@
+
+# Select the retained supplier explicitly for recorded CLI/slot behavior.
+from tests.finance_preaudit.review_profiles import retained_deepseek_cli  # noqa: F401
 import io
 import json
 import sys
