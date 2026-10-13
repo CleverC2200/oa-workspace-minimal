@@ -412,3 +412,42 @@ def test_first_review_waits_for_the_round_registration_in_its_original_worker(ex
     host.submit(published, draft, owner=owner, source=child, source_line=source_line)
     thread.join(3)
     assert not thread.is_alive() and results[0]['status'] == 'reviewed'
+
+
+def test_parent_lease_observation_stops_admission_during_prepare_without_review_waiter(exchange, monkeypatch):
+    _, _, owner, _, _, manifest, _ = exchange
+    # Preparing has no published App review request or waiting review thread.
+    assert host.pending(owner=owner) == []
+    value = json.loads(host.registry_file(owner).read_text())
+    value['heartbeat_at'] = time.time() - 46
+    host.guard.write(host.registry_file(owner), value)
+    monkeypatch.setattr(worker, '_terminate_process_group', lambda *_a, **_k: pytest.fail('Writer killed'))
+    with pytest.raises(ValueError, match='parent_lost'):
+        host.assert_round_alive(owner=owner, manifest=manifest)
+    assert runtime_control.stop_requested()
+    assert json.loads(host.registry_file(owner).read_text())['state'] == 'cancelled'
+
+
+@pytest.mark.parametrize('exchange', [False], indirect=True)
+def test_bootstrap_observation_grace_is_bounded_by_the_original_manifest_clock(exchange):
+    from datetime import datetime, timedelta, timezone
+    _, _, owner, _, _, manifest, _ = exchange
+    host.assert_round_alive(owner=owner, manifest=manifest)
+    assert not runtime_control.stop_requested()
+    original = dict(manifest)
+    expired = {**manifest, 'started_at': (datetime.now(timezone.utc) - timedelta(seconds=901)).isoformat()}
+    host.guard.write(controller_handoff.manifest_file(), expired)
+    try:
+        with pytest.raises(ValueError, match='parent_lost'):
+            host.assert_round_alive(owner=owner, manifest=expired)
+        assert runtime_control.stop_requested()
+    finally:
+        host.guard.write(controller_handoff.manifest_file(), original)
+
+
+def test_round_observer_cannot_accept_a_different_controller_instance(exchange):
+    _, _, owner, _, _, manifest, _ = exchange
+    changed = {**manifest, 'controller_instance_id': uuid4().hex}
+    with pytest.raises(ValueError, match='parent_lost'):
+        host.assert_round_alive(owner=owner, manifest=changed)
+    assert runtime_control.stop_requested()

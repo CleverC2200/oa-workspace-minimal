@@ -237,6 +237,44 @@ def _registry(owner: str, *, live: bool = True) -> dict:
 def registered_reviewers(*, owner: str) -> list[dict]:
     return _registry(owner)['reviewers']
 
+
+def assert_round_alive(*, owner: str, manifest: dict) -> None:
+    """Check App admission in the existing observer, including prepare-only periods."""
+    if manifest.get('review_configuration', {}).get('transport') != 'host_chat':
+        return
+    if manifest.get('state') != 'running':
+        return
+    from . import controller_handoff
+    try:
+        UUID(owner)
+        if controller_handoff._read_manifest() != manifest or runtime_control.stop_requested():
+            raise ValueError('host_review_run_untrusted')
+        path = registry_file(owner)
+        if not os.path.lexists(path):
+            from datetime import datetime
+            started = datetime.fromisoformat(manifest['started_at']).timestamp()
+            # Current review tasks have a 900-second original deadline. Registration
+            # cannot extend that budget, or an earlier already-recorded phase deadline.
+            deadline = started + 900
+            progress = approval_lifecycle._progress(manifest)
+            if progress is not None and progress['phase_deadlines']:
+                deadline = min(deadline, *progress['phase_deadlines'])
+            if not started <= time.time() < deadline or not guard.execution_owners_alive():
+                raise ValueError('host_review_bootstrap_expired')
+            return
+        registered = _registry(owner)
+        if (registered['run_id'] != manifest['run_id']
+                or registered['controller_instance_id'] != manifest['controller_instance_id']
+                or registered['phase'] != 'finance'):
+            raise ValueError('host_review_run_untrusted')
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+        try:
+            close(owner=owner, reason='parent_lost')
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            pass
+        runtime_control.request_cycle_stop()
+        raise ValueError('host_review_parent_lost_or_closed') from error
+
 def heartbeat(*, owner: str, source: Path, source_line: int) -> dict:
     """The main App conversation renews its round lease while it supervises work."""
     with _round_lease(owner) as path:
