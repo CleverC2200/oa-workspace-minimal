@@ -69,7 +69,7 @@ def native_call(source, name, arguments, call_id, output):
                 'name': name, 'call_id': call_id,
                 'arguments' if name != 'functions.exec' else 'input': json.dumps(arguments) if name != 'functions.exec' else arguments}}) + '\n')
         stream.write(json.dumps({'type': 'response_item', 'payload': {'type': 'function_call_output',
-            'call_id': call_id, 'output': json.dumps(output)}}) + '\n')
+            'call_id': call_id, 'output': output if isinstance(output, str) else json.dumps(output)}}) + '\n')
     return line
 
 
@@ -451,3 +451,15 @@ def test_round_observer_cannot_accept_a_different_controller_instance(exchange):
     with pytest.raises(ValueError, match='parent_lost'):
         host.assert_round_alive(owner=owner, manifest=changed)
     assert runtime_control.stop_requested()
+
+
+def test_assignment_accepts_actual_paired_empty_native_followup_acknowledgement(exchange):
+    action, _, owner, child, *_ = exchange
+    request = host.publish(action, prompt='Review assigned frozen action.', timeout_seconds=60)
+    parent = child.with_name('parent.jsonl')
+    source_line = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(request)},
+        'actual-empty-native-ack', '')
+    assigned = host.assign(request, slot=0, owner=owner, source=parent, source_line=source_line)
+    assert assigned['state'] == 'assigned'
+    assert assigned['dispatch_source']['output'] == {}
+    host.close(owner=owner, reason='cancelled')
