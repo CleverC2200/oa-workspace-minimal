@@ -4,13 +4,13 @@
 
 已有同轮 `action=review_required` 的冻结包装 V2 材料时，调用 `python -m apps.oa_finance_preaudit.packaging_review --action-file <绝对 action.json 路径>`。缺材料的恢复/领取仍使用原受控入口和独立授权。本入口不领取、恢复、提交或告警，不修改冻结 attempt；开发测试使用脱敏离线材料。
 
-审核进程通过 DeepSeek Responses API 使用 `deepseek-flash / high`，凭据仅通过 `OA_REVIEW_API_KEY` 注入，不写入配置、命令参数或证据。供应商固定 `requires_openai_auth=false`，每次调用使用独立、空的 `CODEX_HOME`；不读取或复制 OpenAI 认证。`--ignore-user-config` 不加载全局用户配置，记忆注入、记忆生成和全局 history 保存关闭。仓库内的 `config/deepseek-models.json` 声明图片输入和推理能力，仅在本次 CLI 加载，不改全局配置或自动化。`service_tier="default"` 保留为请求设置，DeepSeek 不提供该字段的实际档位遥测。
+包装审核通过 `OA_REVIEW_PROVIDER` 沿用本轮财务选择，未指定时默认 Codex/OpenAI `gpt-6.1-sol / medium`，使用现有原生认证，不接收 API key。显式 `deepseek` 使用 Responses API 和 `deepseek-flash / high`，凭据仅通过 `OA_REVIEW_API_KEY` 注入，不写入配置、命令参数或证据；`requires_openai_auth=false`，每次调用使用独立、空的 `CODEX_HOME`，不读取或复制 OpenAI 认证。`--ignore-user-config` 不加载全局用户配置，记忆注入、记忆生成和全局 history 保存关闭。仓库内的 `config/deepseek-models.json` 声明图片输入和推理能力，仅在本次 CLI 加载，不改全局配置或自动化。`service_tier="default"` 保留为请求设置，DeepSeek 不提供该字段的实际档位遥测。
 
 每次包装调用由 Worker 在自身独占证据目录创建 `visual-aux/`，权限为 0700，并在进程结束前复核目录身份、归属和私有权限。仅该子目录允许模型创建当前冻结原图的无损辅助裁图，其他目录、原图、action/state、冻结资料、源码和其他审计文件继续只读。模型使用 PIL 等工具保存 PNG 裁图，再用既有 `view_image` 读取文件路径；禁止 OCR 及 Shell Base64 分块传图。裁图沿用原版本和 `page_ref`，仅辅助读取，不成为新业务原始证据。调用者不传任意可写路径；普通 Worker 和无审计调用保持原权限。
 
 默认 900 秒，只可在 60～3600 秒内调整；超时和取消由原进程组回收处理。本次 stdout、stderr、原决定和 Schema 保存在独占的 `runtime/control/packaging-reviews/<id>/`。原生会话保留开启，状态数据库和日志目录隔离到该证据目录。宿主只用本次 `thread.started` 的 UUID 查询本次数据库，验证原生会话的 ID 和项目路径，再复制这一份工具记录到 `tool-receipts/`；不扫描或读取其他聊天。宿主固定父目录，以不跟随链接、非阻塞方式打开，只接受普通文件；元数据首行上限 1 MiB，完整记录上限 32 MiB，并核对打开前后的文件身份、大小和时间戳。缺失、FIFO、损坏、超限、读取中被替换或不能关联当前调用的记录统一返回 `codex_tool_receipt_unavailable`，不进入 `draft_ready`；原输出仍保留，不把空工具记录当成图片阅读证据。
 
-新回执记录模型、effort、供应商和 `requested_service_tier`。该档位字段是命令请求设置，不表示已经获得供应商实际服务档位遥测。历史证据保持原模型与推理级别，包括 `gpt-6.1-sol / medium` 和旧 DeepSeek 的 `high`；新审核使用 `deepseek-flash / high`。模型与 effort 不匹配时拒绝。
+新回执记录模型、effort、供应商和 `requested_service_tier`。该档位字段是命令请求设置，不表示已经获得供应商实际服务档位遥测。历史证据保持原模型与推理级别，包括 `gpt-6.1-sol / medium` 和旧 DeepSeek 的 `high`；新审核按本轮供应商配置执行，未指定时使用 `gpt-6.1-sol / medium`。模型与 effort 不匹配时拒绝。
 
 宿主只生成引用/类型合同，不做图片分类或业务判断。Schema 覆盖包装页、非包装页、不确定页、多版本及有无 Excel；空属性对象在调用前拒绝。结果只接受一个纯 JSON 或唯一 `json` 围栏，拆封只改格式，不更改字段。非 JSON、多围栏和不匹配 Schema 保留原输出并失败。包装版本 ID 由共享合同约束为 1～80 个 ASCII 字母、数字、点、下划线或短横线；非包装和不确定页继续使用 null。原生 Schema 使用供应商支持的普通锚定正则，不含 lookaround；本地草稿解析和提交消费者继续用同一正则的 fullmatch，拒绝中文、空串、超长值和尾部换行。宿主仅通过现有 `review_decision.bind_frozen_fields` 补齐协议绑定字段，并在前后核对冻结资料。绑定后调用 `FlowEngine.validate_review_decision`，复用提交消费者的项目、整体结论、逐页分类、版本覆盖、Excel 和补充项完整合同；该入口不续期授权，不改写 attempt，也不生成提交产物。校验失败返回 `packaging_review_contract_invalid`，原模型输出保留，不修复无效业务字段。
 

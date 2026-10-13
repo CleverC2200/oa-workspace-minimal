@@ -1,6 +1,6 @@
 # 小时生产调度手册
 
-本手册与 `config/automations/oa-skill-prompt.txt` 是待发布的调度配置候选。启用前须按 [发布约定](../../CONTRIBUTING.md#开发与生产隔离及发布) 完成代码及手册发布、生产同步和只读核验，再通过原生 automation_update 更新现有自动化并回读。当前本地文件不表示生产已经加载。保留实际外层模型、推理级别、频率、状态、通知偏好、项目和目录；业务审核默认 model=deepseek-flash reasoning_effort=high model_provider=oa_deepseek service_tier=default。外层调度保留 scheduler_model=gpt-6.1-sol scheduler_reasoning_effort=medium。业务审核只使用 OA_REVIEW_API_KEY，通过 Responses API 连接 DeepSeek，requires_openai_auth=false，CODEX_HOME 按调用隔离；不调用 codex login、不复制认证、不改全局配置。外层调度继续使用现有原生 OpenAI 认证。历史回执保留原供应商、模型和推理身份，不改写为当前配置。
+本手册与 `config/automations/oa-skill-prompt.txt` 是待发布的调度配置候选。启用前须按 [发布约定](../../CONTRIBUTING.md#开发与生产隔离及发布) 完成代码及手册发布、生产同步和只读核验，再通过原生 automation_update 更新现有自动化并回读。当前本地文件不表示生产已经加载。保留实际外层模型、推理级别、频率、状态、通知偏好、项目和目录；业务审核默认 model=gpt-6.1-sol reasoning_effort=medium model_provider=openai service_tier=default。外层调度保留 scheduler_model=gpt-6.1-sol scheduler_reasoning_effort=medium。Codex/OpenAI 审核使用现有原生认证，不接收 API key；显式选择 DeepSeek 时通过 Responses API 使用 OA_REVIEW_API_KEY，requires_openai_auth=false，CODEX_HOME 按调用隔离。不调用 codex login、不复制认证、不改全局配置。外层调度继续使用现有原生 OpenAI 认证。历史回执保留原供应商、模型和推理身份，不改写为当前配置。
 
 每轮必读“每轮启动与实时对账”；结束必读“结束对账与超期”和“清窗与留存”。其他章节仅在对应条件出现时读取，且原安全边界始终适用。
 
@@ -22,10 +22,10 @@ status_dir=$(mktemp -d /tmp/oa-status.XXXXXX) &&
 生产审核固定 3 槽，所有审批原生模型 CLI 共享持久的三个槽位，不能弹性扩容；材料准备和全局 Writer 均为 1。门禁通过后只调用一次：
 
 ```bash
-.venv/bin/python -m scripts.finance_preaudit_run --owner-task-id <当前任务真实UUID> --review-provider deepseek -- --rolling --fixed-capacity --capacity 3 --max-capacity 3 --confirm-write YES --recover-confirmed-no-write-once YES --workflow travel_expense --workflow business_entertainment --workflow business_support_fee --workflow small_marketing_fee --workflow tpm_small_marketing_fee --workflow general_expense
+.venv/bin/python -m scripts.finance_preaudit_run --owner-task-id <当前任务真实UUID> --review-provider openai -- --rolling --fixed-capacity --capacity 3 --max-capacity 3 --confirm-write YES --recover-confirmed-no-write-once YES --workflow travel_expense --workflow business_entertainment --workflow business_support_fee --workflow small_marketing_fee --workflow tpm_small_marketing_fee --workflow general_expense
 ```
 
-上述参数选择本轮 DeepSeek。用户要求某轮改用 OpenAI 时，仅把 `--review-provider` 的值改为 `openai`；审核型号与推理由现行供应商配置成对选择，原门禁继续有效。每轮回执记录实际配置，不改历史证据。不在原控制器未退出时发起另一个供应商的控制器。后续独立包装调用通过 `OA_REVIEW_PROVIDER` 沿用该轮选择，具体见[执行回执](../agents/controller-execution.md)。
+上述参数选择本轮 Codex/OpenAI。用户要求某轮改用 DeepSeek 时，仅把 `--review-provider` 的值改为 `deepseek`；审核型号与推理由现行供应商配置成对选择，原门禁继续有效。每轮回执记录实际配置，不改历史证据。不在原控制器未退出时发起另一个供应商的控制器。后续独立包装调用通过 `OA_REVIEW_PROVIDER` 沿用该轮选择，具体见[执行回执](../agents/controller-execution.md)。
 
 ### 原运行监视
 

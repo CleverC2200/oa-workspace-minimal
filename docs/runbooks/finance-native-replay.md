@@ -4,7 +4,7 @@
 
 准备时使用历史状态中的 `workflow_key`，保留对应流程的固定审核项；差旅材料不会转成通用费用审核。
 
-每次新回放在准备阶段冻结 `OA_REVIEW_PROVIDER` 选择的审核配置，默认 DeepSeek，显式 `openai` 使用原生 OpenAI；运行时必须沿用该配置。模型目录纳入准备源码快照。历史未记录配置的回放继续按原 OpenAI/medium 合同验证，不重写历史文件；运行这种历史输入时显式使用 `OA_REVIEW_PROVIDER=openai`。切换供应商应使用新标签重新准备，不能修改旧输入或以回放闭合代替独立业务验收。
+每次新回放在准备阶段冻结 `OA_REVIEW_PROVIDER` 选择的审核配置，默认 Codex/OpenAI，显式 `deepseek` 使用隔离 DeepSeek API；运行时必须沿用该配置。模型目录纳入准备源码快照。历史未记录配置的回放继续按原 OpenAI/medium 合同验证，不重写历史文件；运行这种历史输入时显式使用 `OA_REVIEW_PROVIDER=openai`。切换供应商应使用新标签重新准备，不能修改旧输入或以回放闭合代替独立业务验收。
 
 ## 准备私有输入
 

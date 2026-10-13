@@ -1228,4 +1228,10 @@ def test_controller_retains_failure_result_before_reaping_pool(tmp_path):
 
 @pytest.fixture(autouse=True)
 def fake_review_api_key(monkeypatch):
+    # Pin the recorded transport rather than inheriting the production default.
+    settings = worker.production_config.review_settings('deepseek')
+    monkeypatch.setenv('OA_REVIEW_PROVIDER', 'deepseek')
+    monkeypatch.setattr(worker, 'REVIEW_SETTINGS', settings)
+    monkeypatch.setattr(worker, 'MODEL', settings['model'])
+    monkeypatch.setattr(worker, 'REASONING_EFFORT', settings['reasoning_effort'])
     monkeypatch.setenv("OA_REVIEW_API_KEY", "offline-fake-key")

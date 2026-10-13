@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shlex
 
+# Keep the DeepSeek profile stable for explicit selection and historical receipts.
 MODEL = "deepseek-flash"
 REASONING_EFFORT = "high"
 MODEL_PROVIDER = "oa_deepseek"
@@ -16,7 +17,7 @@ SERVICE_TIER = "default"
 SCHEDULER_MODEL = "gpt-6.1-sol"
 SCHEDULER_REASONING_EFFORT = "medium"
 MODEL_CATALOG = "config/deepseek-models.json"
-DEFAULT_REVIEW_PROVIDER = "deepseek"
+DEFAULT_REVIEW_PROVIDER = "openai"
 REVIEW_PROVIDER_ENV = "OA_REVIEW_PROVIDER"
 INITIAL_CAPACITY = 3
 MAX_CAPACITY = 3
@@ -47,9 +48,9 @@ def review_settings(provider: str | None = None) -> dict:
 
 
 def snapshot() -> dict:
+    settings = review_settings(DEFAULT_REVIEW_PROVIDER)
     return {
-        "model": MODEL, "reasoning_effort": REASONING_EFFORT,
-        "model_provider": MODEL_PROVIDER, "requested_service_tier": SERVICE_TIER,
+        **{key: settings[key] for key in ("model", "reasoning_effort", "model_provider", "requested_service_tier")},
         "initial_capacity": INITIAL_CAPACITY, "max_capacity": MAX_CAPACITY,
         "workflows": list(FINANCE_WORKFLOWS),
     }
@@ -57,7 +58,7 @@ def snapshot() -> dict:
 
 def _text_findings(text: str, source: str) -> list[str]:
     findings = []
-    if re.search(r"审核默认使用.*原生 OpenAI|审核进程默认通过原生 OpenAI|使用原生 OpenAI 登录凭据", text):
+    if re.search(r"审核默认使用.*DeepSeek|业务审核只使用 OA_REVIEW_API_KEY", text):
         findings.append(f"production_config_provider_instruction_drift:{source}")
     commands = [line for line in text.splitlines() if "-m scripts.finance_preaudit_run " in line]
     if len(commands) != 1:
@@ -69,6 +70,8 @@ def _text_findings(text: str, source: str) -> list[str]:
         if len(providers) != 1:
             raise ValueError("provider_selection")
         settings = review_settings(providers[0])
+        if providers[0] != DEFAULT_REVIEW_PROVIDER:
+            findings.append(f"production_config_provider_selection_drift:{source}")
     except (ValueError, IndexError):
         return findings + [f"production_config_provider_selection_drift:{source}"]
     for key, expected in (("model", settings["model"]), ("reasoning_effort", settings["reasoning_effort"]),
