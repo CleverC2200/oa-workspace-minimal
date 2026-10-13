@@ -30,10 +30,10 @@
 python -B -m apps.oa_finance_preaudit.host_chat_review --operation register --owner-task-id <主会话UUID> --source-session-file <父原生会话jsonl> --reviewer-session-file <槽0子会话jsonl> --spawn-line <槽0spawn行> --reviewer-session-file <槽1子会话jsonl> --spawn-line <槽1spawn行> --reviewer-session-file <槽2子会话jsonl> --spawn-line <槽2spawn行> --receipt-file <原execution.json> --invocation-id <原调用ID> --tool-session-id <原session_id>
 ```
 
-2. 每次取得可信进度后读取当前请求，并在 30 秒以内续一次父任务心跳。维持原工具 session 的等待；不得等待直到控制器退出才派单。心跳到期关闭新增派单和结果接收，不把等待超时当审批重试授权。
+2. 每次取得可信进度后读取当前请求，并在 30 秒以内续一次父任务心跳。心跳必须来自主会话本次已落盘的原生调用，父会话 UUID 和实际调用时间均需可信。可在当前原生 exec 内调用 `source_anchor(owner, operation="heartbeat")` 取得当前来源，再调用 `heartbeat(owner=owner, **anchor)`；重复旧来源不延长租约。维持原工具 session 的等待；不得等待直到控制器退出才派单。心跳到期关闭新增派单和结果接收，不把等待超时当审批重试授权。
 
 ```bash
-python -B -m apps.oa_finance_preaudit.host_chat_review --operation heartbeat --owner-task-id <主会话UUID>
+python -B -m apps.oa_finance_preaudit.host_chat_review --operation heartbeat --owner-task-id <主会话UUID> --source-session-file <父原生会话jsonl> --source-line <本次heartbeat工具行>
 python -B -m apps.oa_finance_preaudit.host_chat_review --operation pending --owner-task-id <主会话UUID>
 ```
 
@@ -49,7 +49,7 @@ python -B -m apps.oa_finance_preaudit.host_chat_review --operation assign --owne
 python -B -m apps.oa_finance_preaudit.host_chat_review --operation submit --owner-task-id <主会话UUID> --request-file <本轮request.json> --decision-file <本单私有决定json> --source-session-file <已登记子会话jsonl> --source-line <已完成决定写入行>
 ```
 
-财务原工具 session 和原回执均确认 completed、children_reaped=true，且新鲜结束门禁可信、Writer 空闲后，执行 `host_chat_review --operation enter-packaging --owner-task-id <主会话UUID>`。该操作只推进同轮阶段，不重启控制器，不增加 Agent；包装请求继续使用上方 pending、followup、assign、submit。包装业务确认和完成动作见[包装审核](packaging-review.md)。包装及结束对账完成后，确认 3 个原 Agent 均无运行任务，再执行 `host_chat_review --operation close --owner-task-id <主会话UUID> --reason completed`，然后主对话才能结束。
+财务原工具 session 和原回执均确认 completed、children_reaped=true，且新鲜结束门禁可信、Writer 空闲后，执行 `host_chat_review --operation enter-packaging --owner-task-id <主会话UUID>`。该操作只推进同轮阶段，不重启控制器，不增加 Agent；包装请求继续使用上方 pending、followup、assign、submit。包装业务确认和完成动作见[包装审核](packaging-review.md)。包装及结束对账完成后，确认 3 个原 Agent 均无运行任务，再先执行原生 `collaboration.list_agents`，保留包含本轮 3 个 Agent 终态的实际工具来源，再执行 `host_chat_review --operation close --owner-task-id <主会话UUID> --reason completed --source-session-file <父原生会话jsonl> --source-line <该list_agents调用行>`，然后主对话才能结束。
 
 人工取消、官方限制、子 Agent 不可用或父任务即将退出时，先停止派单。对运行中的原子 Agent 使用原生 `interrupt_agent`，随后关闭同轮 exchange，reason 使用 cancelled、reviewer_failed 或 parent_lost，并继续监督原工具 session 与 Writer 收尾。中断保留子会话上下文，不证明 Agent 被销毁或回收；主对话仍须确认原生状态和程序回执。关闭后拒绝迟到决定，不自动替换 Agent、不回退 OpenAI CLI、不重放 unknown 写入。父任务突然丢失时，原父链门和租约失效负责止损；退出结果缺失保持 unknown。机器断电或全部保护进程同时被强杀不保证完整收尾。
 

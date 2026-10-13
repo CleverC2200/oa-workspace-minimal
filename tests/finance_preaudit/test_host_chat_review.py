@@ -225,9 +225,8 @@ def test_same_registered_child_reviews_two_frozen_actions_without_recreation(exc
 def test_parent_lease_loss_cancels_exchange_and_rejects_late_decision(exchange, monkeypatch):
     action, draft, owner, source, *_ = exchange
     thread, results, request = start(exchange)
-    value = json.loads(host.registry_file(owner).read_text())
-    value['heartbeat_at'] = time.time() - 46
-    host.guard.write(host.registry_file(owner), value)
+    now = time.time()
+    monkeypatch.setattr(host.time, 'time', lambda: now + 46)
     with pytest.raises(ValueError, match='parent_lost'):
         host.submit(request, draft, owner=owner, source=source, source_line=2)
     thread.join(3)
@@ -418,9 +417,8 @@ def test_parent_lease_observation_stops_admission_during_prepare_without_review_
     _, _, owner, _, _, manifest, _ = exchange
     # Preparing has no published App review request or waiting review thread.
     assert host.pending(owner=owner) == []
-    value = json.loads(host.registry_file(owner).read_text())
-    value['heartbeat_at'] = time.time() - 46
-    host.guard.write(host.registry_file(owner), value)
+    now = time.time()
+    monkeypatch.setattr(host.time, 'time', lambda: now + 46)
     monkeypatch.setattr(worker, '_terminate_process_group', lambda *_a, **_k: pytest.fail('Writer killed'))
     with pytest.raises(ValueError, match='parent_lost'):
         host.assert_round_alive(owner=owner, manifest=manifest)
@@ -463,3 +461,45 @@ def test_assignment_accepts_actual_paired_empty_native_followup_acknowledgement(
     assert assigned['state'] == 'assigned'
     assert assigned['dispatch_source']['output'] == {}
     host.close(owner=owner, reason='cancelled')
+
+
+def test_normal_close_accepts_actual_native_completed_status_objects_without_retaining_results(exchange):
+    _, _, owner, child, _, manifest, _ = exchange
+    controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
+    seal_execution(owner, manifest)
+    parent = child.with_name('parent.jsonl')
+    line = native_call(parent, 'list_agents', {}, 'actual-native-status', {'agents': [
+        {'agent_name': f'/root/reviewer_{slot}', 'agent_status': {'completed': 'private reviewer result'}}
+        for slot in range(3)] + [{'agent_name': '/root/other', 'agent_status': {'completed': 'unrelated private result'}}]})
+    assert host.close(owner=owner, source=parent, source_line=line)['state'] == 'closed'
+    stored = host.registry_file(owner).read_text()
+    assert 'private reviewer result' not in stored and 'unrelated private result' not in stored
+    proof = json.loads(stored)['children_idle_source']
+    assert proof['reviewers'] == [{'agent_name': f'/root/reviewer_{slot}', 'agent_status': 'completed'} for slot in range(3)]
+
+
+def test_registry_read_rejects_heartbeat_metadata_that_no_longer_matches_parent_source(exchange):
+    _, _, owner, child, *_ = exchange
+    parent = child.with_name('parent.jsonl')
+    line = native_call(parent, 'exec', 'heartbeat ' + owner, 'actual-heartbeat-proof', {'exit_code': 0})
+    host.heartbeat(owner=owner, source=parent, source_line=line)
+    time.sleep(.005)
+    value = json.loads(host.registry_file(owner).read_text())
+    value['heartbeat_at'] += .001
+    host.guard.write(host.registry_file(owner), value)
+    with pytest.raises(ValueError, match='heartbeat_untrusted'):
+        host.registered_reviewers(owner=owner)
+
+
+@pytest.mark.parametrize('status', [{'completed': 'done', 'running': None}, {'completed': 42}, 'running'])
+def test_normal_close_rejects_malformed_or_active_native_status(exchange, status):
+    _, _, owner, child, _, manifest, _ = exchange
+    controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
+    seal_execution(owner, manifest)
+    parent = child.with_name('parent.jsonl')
+    line = native_call(parent, 'list_agents', {}, 'invalid-native-status', {'agents': [
+        {'agent_name': '/root/reviewer_0', 'agent_status': status},
+        {'agent_name': '/root/reviewer_1', 'agent_status': {'completed': 'done'}},
+        {'agent_name': '/root/reviewer_2', 'agent_status': 'idle'}]})
+    with pytest.raises(ValueError, match='children_status_untrusted|children_not_idle'):
+        host.close(owner=owner, source=parent, source_line=line)

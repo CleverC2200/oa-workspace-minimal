@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import ast
+from datetime import datetime
+import hashlib
 from dataclasses import asdict
 import json
 import os
@@ -12,7 +15,7 @@ from uuid import uuid4
 from jsonschema import Draft202012Validator
 
 from apps.oa_approval import auth, runtime_control
-from . import codex_review_worker as worker, decision_validation, flow_engine, packaging_contract, review_decision
+from . import codex_review_worker as worker, decision_validation, flow_engine, packaging_contract, review_decision, host_chat_review, review_context
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -151,6 +154,285 @@ def _prompt(action_file: Path, packet: dict, material: dict) -> str:
 只输出schema规定的JSON业务草稿，宿主只装配冻结协议字段。业务判断只由你形成。只使用本次供应商配置；不调用OA、不领取、不恢复、不提交，不运行next-action/complete-review/告警，不修改冻结资料或项目文件。'''
 
 
+def _page_paths(action: Path) -> dict[str, str]:
+    packet = json.loads(review_context.read_input(action.with_name('review-packet.json')))
+    material = json.loads(review_context.read_input(action.with_name('material.json')))
+    paths = {}
+    for resource in material['resources']:
+        if resource.get('review_role') != 'packaging_image':
+            continue
+        resource_id = resource['resource_id']
+        pages = [page for page in material['prepared']['images']
+                 if str(page.get('parent_resource_id') or page['resource_id']) == resource_id]
+        for number, page in enumerate(pages, 1):
+            paths[f'material:prepared.images.{resource_id}.page-{number}'] = page['path']
+    if list(paths) != packet['packaging_visual_contract']['page_refs']:
+        raise ValueError('packaging_page_coverage')
+    return paths
+
+
+def _image_output(value) -> bool:
+    if isinstance(value, list):
+        return any(_image_output(item) for item in value)
+    if isinstance(value, dict):
+        if value.get('isError') is True or value.get('exit_code') not in {None, 0}:
+            return False
+        if value.get('type') == 'image' and isinstance(value.get('data'), str) and value.get('mimeType', '').startswith('image/'):
+            return True
+        if isinstance(value.get('image_url'), str) and value['image_url'].startswith('data:image/'):
+            return True
+        return any(_image_output(item) for item in value.values())
+    return False
+
+
+def _observations(action: Path, source: dict, refs: list[str] | None = None, *, allow_failed: bool = False) -> list[dict]:
+    """Pair actual original-page tool calls with image outputs in this assignment."""
+    paths = _page_paths(action)
+    required = set(paths if refs is None else refs)
+    if not required or not required.issubset(paths):
+        raise ValueError('packaging_page_coverage')
+    raw = review_context.read_input(Path(source['session_file']))
+    observed = {}
+    for number, line in enumerate(raw.splitlines(), 1):
+        if number >= source['line']:
+            break
+        row = json.loads(line)
+        payload = row.get('payload', {})
+        if row.get('type') != 'response_item' or payload.get('type') not in {'function_call', 'custom_tool_call'}:
+            continue
+        args = payload.get('arguments', payload.get('input', ''))
+        image_path = None
+        if payload.get('name') in {'view_image', 'functions.view_image'}:
+            try:
+                image_path = (json.loads(args) if isinstance(args, str) else args).get('path')
+            except (ValueError, AttributeError):
+                continue
+        elif payload.get('name') in {'functions.exec', 'exec'} and isinstance(args, str):
+            calls = re.findall(r'tools\.view_image\(\s*(\{[^{}]+\})\s*\)', args)
+            if len(calls) != 1:
+                continue
+            try:
+                image_path = json.loads(calls[0]).get('path')
+            except ValueError:
+                path_match = re.search(r'''(?:\"path\"|path)\s*:\s*(\"[^\"]+\"|'[^']+')''', calls[0])
+                if path_match is None:
+                    continue
+                image_path = ast.literal_eval(path_match.group(1))
+        if image_path not in paths.values():
+            continue
+        stamp = row.get('timestamp')
+        if not isinstance(stamp, str) or datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp() < source['dispatched_at']:
+            continue
+        _, proof = host_chat_review._native_source(Path(source['session_file']), source['session_id'], number, output=True)
+        output = proof.pop('output')
+        read = _image_output(output)
+        failed = isinstance(output, dict) and (output.get('isError') is True or output.get('error'))
+        if proof['output_line'] >= source['line'] or not (read or allow_failed and failed):
+            continue
+        proof['observation_state'] = 'read' if read else 'failed'
+        for ref, path in paths.items():
+            if path == image_path and ref in required:
+                observed[ref] = {**proof, 'page_ref': ref, 'path_sha256': hashlib.sha256(review_context.read_input(Path(path))).hexdigest()}
+    if set(observed) != required:
+        raise ValueError('packaging_observation_missing')
+    return [observed[ref] for ref in paths if ref in required]
+
+
+def validate_host_submission(action: Path, payload: dict, source: dict, kind: str, context: dict) -> dict:
+    """Validate App-authored business fields and actual observations without OA writes."""
+    packet = json.loads(review_context.read_input(action.with_name('review-packet.json')))
+    if kind == 'packaging_confirmation':
+        receipt, reviewed = _trusted_host_receipt(Path(context['draft_receipt_file']))
+        if (set(payload) != {'draft_sha256', 'page_refs', 'outcome', 'findings'}
+                or payload['draft_sha256'] != receipt['decision_sha256']
+                or context['draft_sha256'] != receipt['decision_sha256']
+                or payload['page_refs'] != context['page_refs']
+                or payload['outcome'] not in {'confirmed', 'different', 'uncertain', 'unavailable'}
+                or not isinstance(payload['findings'], list)
+                or any(not isinstance(item, str) or not item for item in payload['findings'])
+                or (payload['outcome'] == 'confirmed') != (not payload['findings'])
+                or source['reviewer_task_id'] == reviewed['assignment']['reviewer_task_id']):
+            raise ValueError('packaging_independent_review_untrusted')
+        observations = _observations(action, source, context['page_refs'], allow_failed=payload['outcome'] == 'unavailable')
+        if payload['outcome'] == 'unavailable' and not any(item['observation_state'] == 'failed' for item in observations):
+            raise ValueError('packaging_independent_review_untrusted')
+        return payload
+    if kind != 'packaging_draft':
+        raise ValueError('packaging_review_kind_invalid')
+    if (set(payload) != {'draft', 'recheck_required', 'recheck_page_refs', 'recheck_reasons'}
+            or type(payload['recheck_required']) is not bool
+            or not isinstance(payload['recheck_page_refs'], list) or not isinstance(payload['recheck_reasons'], list)
+            or any(not isinstance(reason, str) or not reason for reason in payload['recheck_reasons'])
+            or len(set(payload['recheck_page_refs'])) != len(payload['recheck_page_refs'])
+            or not set(payload['recheck_page_refs']).issubset(_page_paths(action))
+            or payload['recheck_required'] != bool(payload['recheck_page_refs'])
+            or payload['recheck_required'] != bool(payload['recheck_reasons'])):
+        raise ValueError('packaging_review_envelope_invalid')
+    draft = parse_draft(json.dumps(payload['draft'], ensure_ascii=False), draft_schema(packet))
+    _observations(action, source)
+    decision = review_decision.bind_frozen_fields(action, draft)
+    _readonly_engine(action.parents[6]).validate_review_decision(action, decision)
+    return decision
+
+
+def _trusted_host_receipt(receipt_file: Path) -> tuple[dict, dict]:
+    receipt = json.loads(review_context.read_input(receipt_file, private=True))
+    action = Path(receipt['action_file'])
+    if (receipt.get('transport') != 'host_chat' or receipt.get('status') != 'draft_ready'
+            or Path(receipt['decision_file']).parent != receipt_file.parent
+            or hashlib.sha256(review_context.read_input(Path(receipt['decision_file']), private=True)).hexdigest() != receipt['decision_sha256']):
+        raise ValueError('packaging_review_receipt_untrusted')
+    saved = receipt['host_result']
+    current = host_chat_review.read_result(Path(saved['host_receipt']['request_file']))
+    if (current.get('status') != 'reviewed' or any(current.get(key) != saved.get(key)
+            for key in ('host_receipt', 'decision', 'source', 'assignment', 'review_payload'))):
+        raise ValueError('packaging_review_receipt_untrusted')
+    decision = validate_host_submission(action, current['review_payload'], current['source'], 'packaging_draft', {})
+    if (decision != json.loads(review_context.read_input(Path(receipt['decision_file']), private=True))
+            or receipt['observations'] != _observations(action, current['source'])):
+        raise ValueError('packaging_review_receipt_untrusted')
+    return receipt, current
+
+
+def request_recheck(receipt_file: Path, *, timeout_seconds: int = 900, page_refs: list[str] | None = None) -> Path:
+    """Dispatch blind targeted review through a different existing registered slot."""
+    receipt_file = Path(receipt_file).absolute()
+    receipt, reviewed = _trusted_host_receipt(receipt_file)
+    refs = page_refs if page_refs is not None else reviewed['review_payload']['recheck_page_refs']
+    if not refs or not set(refs).issubset(_page_paths(Path(receipt['action_file']))):
+        raise ValueError('packaging_independent_review_scope_invalid')
+    context = {'draft_receipt_file': str(receipt_file), 'draft_sha256': receipt['decision_sha256'],
+               'page_refs': refs}
+    pages = {ref: _page_paths(Path(receipt['action_file']))[ref] for ref in refs}
+    prompt = f"""独立盲审当前冻结包装区域，逐页实际看原图 {json.dumps(pages, ensure_ascii=False)}。
+    读取现行 audit-chinese-image-text Skill，核对关键文字及高影响数字/专名；不读取其他审核者的决定、意见、草稿或语义确认。
+    用一个独立 exec 读取一个原图：image((await tools.view_image({{"path":"原页绝对路径"}})).image_url)，保留真实输出。
+    只输出 JSON：draft_sha256 固定 {receipt['decision_sha256']}；page_refs 为 {json.dumps(refs)}；outcome 为 confirmed/different/uncertain/unavailable；仅有真实工具读取失败才 unavailable；findings 为逐位置异常字符串数组，confirmed 才能为空。
+    保存私有 JSON 后等待成功工具输出，再交回当前请求。只审核，不调用 OA、不提交。"""
+    return host_chat_review.publish(Path(receipt['action_file']), prompt=prompt, timeout_seconds=timeout_seconds,
+        kind='packaging_confirmation', review_context=context)
+
+
+def _validated_recheck(receipt: dict, reviewed: dict, request_file: str) -> dict:
+    result = host_chat_review.read_result(Path(request_file))
+    request = json.loads(review_context.read_input(Path(request_file), private=True))
+    if (request['review_kind'] != 'packaging_confirmation' or request['action_file'] != receipt['action_file']
+            or request['review_context'].get('draft_sha256') != receipt['decision_sha256']
+            or result['assignment']['reviewer_task_id'] == reviewed['assignment']['reviewer_task_id']
+            or not set(reviewed['review_payload']['recheck_page_refs']).issubset(request['review_context']['page_refs'])):
+        raise ValueError('packaging_independent_review_untrusted')
+    validate_host_submission(Path(receipt['action_file']), result['review_payload'], result['source'],
+        'packaging_confirmation', request['review_context'])
+    if result['review_payload']['outcome'] != 'confirmed':
+        uncertain_refs = set()
+        for item in reviewed['decision']['items']:
+            if item['status'] == 'uncertain':
+                uncertain_refs.update(item['missing_evidence'])
+                uncertain_refs.update(item['evidence_refs'])
+        if (reviewed['decision']['overall'] != 'needs_human'
+                or not set(request['review_context']['page_refs']).issubset(uncertain_refs)):
+            raise ValueError('packaging_independent_review_unresolved')
+    return result
+
+
+def confirm_semantics(receipt_file: Path, confirmation_file: Path, *, owner: str,
+                      source: Path, source_line: int) -> dict:
+    """Record the parent-authored semantic assessment; never rewrite reviewer fields."""
+    receipt_file, confirmation_file = Path(receipt_file).absolute(), Path(confirmation_file).absolute()
+    receipt, reviewed = _trusted_host_receipt(receipt_file)
+    request = json.loads(review_context.read_input(Path(reviewed['host_receipt']['request_file']), private=True))
+    if request['owner_task_id'] != owner:
+        raise ValueError('host_review_owner_mismatch')
+    confirmation = json.loads(review_context.read_input(confirmation_file, private=True))
+    fields = {'receipt_sha256', 'decision_sha256', 'accepted', 'requirements_checked',
+              'recheck_required', 'recheck_request_file', 'conclusion'}
+    if (set(confirmation) != fields or confirmation['receipt_sha256'] != hashlib.sha256(review_context.read_input(receipt_file, private=True)).hexdigest()
+            or confirmation['decision_sha256'] != receipt['decision_sha256'] or confirmation['accepted'] is not True
+            or confirmation['requirements_checked'] is not True or type(confirmation['recheck_required']) is not bool
+            or not isinstance(confirmation['conclusion'], str) or not confirmation['conclusion']):
+        raise ValueError('packaging_semantic_confirmation_untrusted')
+    provenance = host_chat_review.validate_source(source, source_line, owner, confirmation_file,
+        dispatched_at=request['created_at'])
+    recheck = None
+    if confirmation['recheck_required'] or reviewed['review_payload']['recheck_required']:
+        if not isinstance(confirmation['recheck_request_file'], str):
+            raise ValueError('packaging_independent_review_missing')
+        recheck = _validated_recheck(receipt, reviewed, confirmation['recheck_request_file'])
+    elif confirmation['recheck_request_file'] is not None:
+        raise ValueError('packaging_independent_review_untrusted')
+    result = {'semantic_acceptance': 'confirmed', 'owner_task_id': owner,
+        'confirmation': confirmation, 'source': provenance, 'recheck_result': recheck}
+    with runtime_control.stop_control_lease():
+        _trusted_host_receipt(receipt_file)
+        host_chat_review._write_new(receipt_file.with_name('semantic-confirmation.json'), result)
+    return result
+
+
+def complete_host(receipt_file: Path, *, project_root: Path = PROJECT_ROOT, confirm_write: bool = False,
+                  engine: flow_engine.FlowEngine | None = None) -> dict:
+    """Require recorded App semantic acceptance before the original completion port."""
+    receipt_file = Path(receipt_file).absolute()
+    confirmation_file = receipt_file.with_name('semantic-confirmation.json')
+    if not confirmation_file.exists():
+        raise ValueError('packaging_semantic_confirmation_missing')
+    if confirm_write is not True:
+        raise ValueError('packaging_write_not_authorized')
+    receipt, reviewed = _trusted_host_receipt(receipt_file)
+    confirmed = json.loads(review_context.read_input(confirmation_file, private=True))
+    source = confirmed['source']
+    request = json.loads(review_context.read_input(Path(reviewed['host_receipt']['request_file']), private=True))
+    if (set(confirmed) != {'semantic_acceptance', 'owner_task_id', 'confirmation', 'source', 'recheck_result'}
+            or confirmed.get('semantic_acceptance') != 'confirmed'
+            or confirmed['owner_task_id'] != request['owner_task_id']
+            or confirmed['confirmation']['accepted'] is not True
+            or confirmed['confirmation']['requirements_checked'] is not True
+            or type(confirmed['confirmation']['recheck_required']) is not bool
+            or confirmed['confirmation']['decision_sha256'] != receipt['decision_sha256']
+            or confirmed['confirmation']['receipt_sha256'] != hashlib.sha256(review_context.read_input(receipt_file, private=True)).hexdigest()
+            or source != host_chat_review.validate_source(Path(source['session_file']), source['line'], confirmed['owner_task_id'],
+                Path(source['decision_file']), dispatched_at=source['dispatched_at'])
+            or confirmed['confirmation'] != json.loads(review_context.read_input(Path(source['decision_file']), private=True))):
+        raise ValueError('packaging_semantic_confirmation_untrusted')
+    if confirmed['confirmation']['recheck_required'] or reviewed['review_payload']['recheck_required']:
+        if confirmed['recheck_result'] != _validated_recheck(receipt, reviewed, confirmed['confirmation']['recheck_request_file']):
+            raise ValueError('packaging_independent_review_untrusted')
+    elif confirmed['recheck_result'] is not None:
+        raise ValueError('packaging_independent_review_untrusted')
+    if engine is None:
+        from . import cli
+        engine = cli._live_flow_engine(controlled=True)
+    with host_chat_review._round_lease(confirmed['owner_task_id']):
+        _trusted_host_receipt(receipt_file)
+        return engine.complete_review(Path(receipt['action_file']), Path(receipt['decision_file']))
+
+
+def _host_review(action: Path, project_root: Path, timeout_seconds: int, prompt: str) -> dict:
+    envelope_instruction = """App 输出使用单个 JSON envelope，字段为 draft、recheck_required、recheck_page_refs、recheck_reasons。
+    draft 保持上方原业务合同。后三项只记录按 audit-chinese-image-text 现行触发条件所需的独立复核；清晰单据可为 false、[]、[]，低置信、高影响数字/专名、Excel 差异或内部冲突命中时填写实际页引用和原因。
+    每次看原图使用一个独立 exec 调用：image((await tools.view_image({"path":"原页绝对路径"})).image_url)。先等图片输出真实返回，再继续；不以路径或模型自述充当看图证据。
+    将 envelope 写入私有文件，等待该 exec 的成功输出，再按请求来源登记 submit。"""
+    packet = json.loads(review_context.read_input(action.with_name('review-packet.json')))
+    envelope_instruction += '\ndraft 必须逐字段符合此 JSON Schema：' + json.dumps(draft_schema(packet), ensure_ascii=False)
+    request = host_chat_review.publish(action, prompt=prompt + '\n' + envelope_instruction,
+        timeout_seconds=timeout_seconds, kind='packaging_draft')
+    result = host_chat_review.await_result(request)
+    if result['status'] != 'reviewed':
+        return {'status': 'failed', 'error_code': result['error_code'], 'write_state': 'not_requested'}
+    decision = validate_host_submission(action, result['review_payload'], result['source'], 'packaging_draft', {})
+    directory = project_root / 'runtime/control/packaging-reviews' / uuid4().hex
+    with runtime_control.pinned_directory(directory, create=True):
+        decision_file = directory / 'bound-decision.json'
+        runtime_control.write_control_bytes_atomic(decision_file, (json.dumps(decision, ensure_ascii=False)+'\n').encode())
+        receipt = {**host_chat_review.IDENTITY, 'status': 'draft_ready', 'error_code': None,
+            'write_state': 'not_requested', 'business_fields_changed': False, 'action_file': str(action),
+            'decision_file': str(decision_file), 'decision_sha256': hashlib.sha256(review_context.read_input(decision_file, private=True)).hexdigest(),
+            'evidence_directory': str(directory), 'review_receipt_file': str(directory / 'review-receipt.json'), 'host_result': result,
+            'observations': _observations(action, result['source']), 'contract_validation': 'passed',
+            'semantic_acceptance': 'not_checked', 'token_usage': {'status': 'unknown'}}
+        runtime_control.write_control_bytes_atomic(directory / 'review-receipt.json', (json.dumps(receipt, ensure_ascii=False)+'\n').encode())
+    return receipt
+
+
 def review(action_file: Path, *, project_root: Path = PROJECT_ROOT, timeout_seconds: int = 900) -> dict:
     if type(timeout_seconds) is not int or not 60 <= timeout_seconds <= 3600:
         raise ValueError('codex_review_task_invalid')
@@ -160,6 +442,8 @@ def review(action_file: Path, *, project_root: Path = PROJECT_ROOT, timeout_seco
     schema = draft_schema(packet)
     material = json.loads(action_file.with_name('material.json').read_text())
     prompt = _prompt(action_file, packet, material)
+    if host_chat_review.selected():
+        return _host_review(action_file, project_root, timeout_seconds, prompt)
     directory = project_root / 'runtime' / 'control' / 'packaging-reviews' / uuid4().hex
     with runtime_control.pinned_directory(directory.parent, create=True) as parent:
         os.mkdir(directory.name, 0o700, dir_fd=parent)
@@ -239,16 +523,41 @@ def review(action_file: Path, *, project_root: Path = PROJECT_ROOT, timeout_seco
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--action-file', type=Path, required=True)
+    parser.add_argument('--operation', choices=('review', 'recheck', 'confirm', 'complete'), default='review')
+    parser.add_argument('--action-file', type=Path)
     parser.add_argument('--timeout-seconds', type=int, default=900)
+    parser.add_argument('--receipt-file', type=Path)
+    parser.add_argument('--confirmation-file', type=Path)
+    parser.add_argument('--owner-task-id')
+    parser.add_argument('--source-session-file', type=Path)
+    parser.add_argument('--source-line', type=int)
+    parser.add_argument('--confirm-write', choices=('YES',))
     args = parser.parse_args(argv)
+    if args.operation == 'review' and args.action_file is None:
+        parser.error('--action-file required for review')
+    if args.operation != 'review' and args.receipt_file is None:
+        parser.error('--receipt-file required')
     try:
-        auth.load_local_env()
-        result = review(args.action_file, timeout_seconds=args.timeout_seconds)
-    except (OSError, RuntimeError, ValueError):
+        if args.owner_task_id:
+            os.environ[host_chat_review.guard.OWNER_ENV] = args.owner_task_id
+        if args.operation == 'review':
+            auth.load_local_env()
+            result = review(args.action_file, timeout_seconds=args.timeout_seconds)
+        elif args.operation == 'recheck':
+            result = {'request_file': str(request_recheck(args.receipt_file, timeout_seconds=args.timeout_seconds)),
+                      'status': 'published', 'write_state': 'not_requested'}
+        elif args.operation == 'confirm':
+            if not all((args.confirmation_file, args.owner_task_id, args.source_session_file, args.source_line)):
+                parser.error('confirmation-file, owner-task-id, source-session-file and source-line required')
+            result = confirm_semantics(args.receipt_file, args.confirmation_file, owner=args.owner_task_id,
+                source=args.source_session_file, source_line=args.source_line)
+        else:
+            auth.load_local_env()
+            result = complete_host(args.receipt_file, confirm_write=args.confirm_write == 'YES')
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
         result = {'status': 'failed', 'error_code': 'packaging_review_setup_failed', 'write_state': 'not_requested'}
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-    return 1 if result['status'] == 'failed' else 0
+    return 1 if result.get('status') == 'failed' else 0
 
 
 if __name__ == '__main__':

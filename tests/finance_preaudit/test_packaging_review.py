@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.finance_preaudit.review_profiles import retained_deepseek_cli  # noqa: F401
 from apps.oa_finance_preaudit import packaging_review as reviewer
 from tests.finance_preaudit.test_flow_engine_packaging import _engine, WORKFLOW_KEY
 
