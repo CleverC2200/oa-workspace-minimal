@@ -26,7 +26,9 @@ from . import approval_guard, concurrency_control, decision_validation, fuel_tri
 from .review_output import parse_json as _parse_decision_json
 
 
-REVIEW_SETTINGS = production_config.review_settings()
+from . import host_chat_review
+
+REVIEW_SETTINGS = host_chat_review.settings()
 MODEL = REVIEW_SETTINGS["model"]
 REASONING_EFFORT = REVIEW_SETTINGS["reasoning_effort"]
 OBSERVATION_INTERVAL_SECONDS = 5
@@ -581,6 +583,8 @@ def _codex_command(
     decision_file: Path,
     *, visual_aux: Path | None = None,
 ) -> list[str]:
+    if host_chat_review.selected():
+        raise ValueError('host_review_cli_forbidden')
     native_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
     readable = (project_root, native_home / "skills", native_home / "RTK.md", native_home / "BUILD_EFFICIENCY.md")
     filesystem = {str(native_home): "deny", **{str(path): "read" for path in readable}}
@@ -2176,6 +2180,8 @@ def complete_review_result(
     defer_invalid_stop: bool = False,
 ) -> dict:
     """Complete one reviewed action in the non-killable parent writer path."""
+    if host_chat_review.selected():
+        return host_chat_review.complete(action_file, reviewed, completer=completer)
     decision = reviewed.get("decision") if isinstance(reviewed, dict) else None
     usage = reviewed.get("token_usage") if isinstance(reviewed, dict) else None
     attempts = reviewed.get("process_attempts") if isinstance(reviewed, dict) else None

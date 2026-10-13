@@ -19,6 +19,7 @@ from uuid import UUID, uuid4
 
 from apps.oa_approval import auth, runtime_control
 from apps.oa_finance_preaudit import controller_handoff, approval_guard, approval_lifecycle, production_config
+from apps.oa_finance_preaudit import host_chat_review
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_ENV = "OA_CONTROLLER_EXECUTION_MANIFEST_FILE"
@@ -194,7 +195,8 @@ def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str
         configuration = receipt.get("review_configuration")
         if configuration is not None:
             if (not isinstance(configuration, dict)
-                    or configuration != production_config.review_settings(configuration.get("provider"))):
+                    or configuration != (host_chat_review.IDENTITY if configuration.get('transport') == 'host_chat'
+                                          else production_config.review_settings(configuration.get("provider")))):
                 raise ValueError("controller_execution_review_configuration_mismatch")
             report["review_configuration"] = configuration
         override = receipt.get("cooldown_override")
@@ -442,7 +444,7 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str,
         "stop_requested_by_supervisor": False,
         "controller_state": "unknown", "children_reaped": "unknown",
         "run_id": None, "controller_instance_id": None,
-        "review_configuration": production_config.review_settings(),
+        "review_configuration": host_chat_review.settings(),
         "tool_session_file": str(directory / "tool-session.json"),
     }
     old_umask = os.umask(0o077)
@@ -623,6 +625,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--owner-task-id", required=True, type=UUID)
     parser.add_argument("--review-provider", choices=("deepseek", "openai"))
+    parser.add_argument("--review-transport", choices=("cli", "host_chat"))
     parser.add_argument("--bind-tool-session")
     parser.add_argument("--receipt-file", type=Path)
     reads = parser.add_mutually_exclusive_group()
@@ -652,7 +655,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             from apps.oa_finance_preaudit import cooldown_override
             cooldown_override.validate_arguments(arguments)
         if args.progress or args.retrieve_result:
-            if args.receipt_file is None or args.invocation_id is None or args.bind_tool_session is not None or arguments or args.review_provider:
+            if args.receipt_file is None or args.invocation_id is None or args.bind_tool_session is not None or arguments or args.review_provider or args.review_transport:
                 raise ValueError("controller_execution_readback_invalid")
             result = wait_execution(args.receipt_file, owner_task_id=str(args.owner_task_id),
                                     invocation_id=args.invocation_id, tool_session_id=args.tool_session_id,
@@ -663,7 +666,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("controller_execution_readback_invalid")
         auth.load_local_env()
         if args.bind_tool_session is not None:
-            if args.receipt_file is None or arguments or args.review_provider:
+            if args.receipt_file is None or arguments or args.review_provider or args.review_transport:
                 raise ValueError("controller_tool_session_binding_invalid")
             result = bind_tool_session(args.receipt_file, owner_task_id=str(args.owner_task_id), session_id=args.bind_tool_session)
             print(json.dumps(result))
@@ -672,6 +675,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("controller_tool_session_binding_invalid")
         configuration = production_config.review_settings(args.review_provider)
         os.environ[production_config.REVIEW_PROVIDER_ENV] = configuration["provider"]
+        # An omitted transport always resets a fresh round to CLI; no inherited host mode.
+        os.environ[host_chat_review.TRANSPORT_ENV] = args.review_transport or 'cli'
+        host_chat_review.settings()
         if approval_guard.COOLDOWN_OVERRIDE_ENV in os.environ:
             raise ValueError("approval_cooldown_override_inherited")
         invocation_directory = controller_handoff.manifest_file().parent / "executions" / uuid4().hex
