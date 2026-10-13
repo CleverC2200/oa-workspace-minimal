@@ -98,8 +98,13 @@ def _native_source(source: Path, session: str, line: int = 1, *, output: bool = 
     proof['session_id'] = session
     if output:
         try:
-            # Native collaboration function outputs are JSON strings.
-            result = json.loads(result) if isinstance(result, str) else result
+            # Native followup_task acknowledges successful dispatch with a paired
+            # empty output. Spawn and decision sources still require their payload.
+            if result == '' and anchor.get('payload', {}).get('name') in {
+                    'followup_task', 'collaboration.followup_task', 'functions.collaboration.followup_task'}:
+                result = {}
+            else:
+                result = json.loads(result) if isinstance(result, str) else result
         except (TypeError, ValueError) as error:
             raise ValueError('host_review_source_untrusted') from error
         if not isinstance(result, (dict, list)):

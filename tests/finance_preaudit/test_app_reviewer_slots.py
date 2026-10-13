@@ -92,3 +92,14 @@ def test_registry_keeps_exactly_three_fixed_native_conversations(tmp_path, monke
         with pytest.raises(ValueError):
             host.register(changed_reviewers, owner=owner, source=changed_parent)
         controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
+
+
+def test_empty_native_acknowledgement_cannot_replace_spawn_identity(tmp_path, monkeypatch):
+    owner, parent, reviewers = native_sessions(tmp_path, monkeypatch)
+    lines = parent.read_text().splitlines()
+    output = json.loads(lines[2])
+    output['payload']['output'] = ''
+    lines[2] = json.dumps(output)
+    parent.write_text('\n'.join(lines) + '\n')
+    with pytest.raises(ValueError, match='source_untrusted'):
+        host.register(reviewers, owner=owner, source=parent)
