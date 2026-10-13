@@ -53,7 +53,8 @@ def exchange(tmp_path, monkeypatch):
             host.approval_lifecycle.heartbeat(manifest['run_id'], manifest['controller_instance_id'], {action}, [], writer_active=False)
             task = {'project_root': str(root), 'action_file': str(action), 'timeout_seconds': 60}
             yield action, draft, owner, source, task, manifest, engine
-        controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
+        if controller_handoff._read_manifest()['state'] == 'running':
+            controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
 
 
 def native_call(source, name, arguments, call_id, output):
@@ -243,3 +244,77 @@ def test_cancel_closes_registered_round_and_never_terminates_writer(exchange, mo
     thread.join(3)
     assert not thread.is_alive() and results[0]['write_state'] == 'not_requested'
     assert not action.with_name(host.SUBMISSION).exists()
+
+
+def seal_execution(owner, manifest):
+    from datetime import datetime, timezone
+    import hashlib
+    value = json.loads(host.registry_file(owner).read_text())
+    path = Path(value['original_execution']['receipt_file'])
+    receipt = json.loads(path.read_text())
+    terminal = controller_handoff._read_manifest()
+    host.guard.write(path.with_name('controller-manifest.json'), terminal)
+    logs = {}
+    for name in ('stdout.log', 'stderr.log'):
+        path.with_name(name).write_bytes(b'{}\n')
+        path.with_name(name).chmod(0o600)
+        logs[name] = hashlib.sha256(b'{}\n').hexdigest()
+    receipt.update(state='exited', result='completed', exit_code=0, exit_signal=None,
+        completed_at=datetime.now(timezone.utc).isoformat(), output_sha256=logs,
+        run_id=manifest['run_id'], controller_instance_id=manifest['controller_instance_id'],
+        controller_state='completed', children_reaped=True, code_revision=manifest['code_revision'],
+        manifest_sha256=hashlib.sha256(path.with_name('controller-manifest.json').read_bytes()).hexdigest())
+    host.guard.write(path, receipt)
+    return path
+
+
+def test_packaging_reuses_original_round_only_after_sealed_finance_end(exchange):
+    action, _, owner, _, _, manifest, _ = exchange
+    with pytest.raises(ValueError, match='finance_incomplete'):
+        host.enter_packaging(owner=owner)
+    controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
+    seal_execution(owner, manifest)
+    original = host.registered_reviewers(owner=owner)
+    assert host.enter_packaging(owner=owner)['phase'] == 'packaging'
+    assert host.registered_reviewers(owner=owner) == original
+    draft_request = host.publish(action, prompt='Observe each package page.', timeout_seconds=60, kind='packaging_draft')
+    confirmation = host.publish(action, prompt='Independent targeted review.', timeout_seconds=60,
+        kind='packaging_confirmation', review_context={'draft_sha256': 'a' * 64})
+    assert draft_request != confirmation
+    assert json.loads(confirmation.read_text())['review_context']['draft_sha256'] == 'a' * 64
+    assert {item['request_file'] for item in host.pending(owner=owner)} == {str(draft_request), str(confirmation)}
+
+
+def test_only_fresh_parent_native_call_can_renew_round_lease(exchange):
+    _, _, owner, child, *_ = exchange
+    parent = child.with_name('parent.jsonl')
+    child_line = native_call(child, 'functions.exec', 'heartbeat ' + owner, 'child-heartbeat', {'exit_code': 0})
+    with pytest.raises(ValueError, match='source_untrusted'):
+        host.heartbeat(owner=owner, source=child, source_line=child_line)
+    parent_line = native_call(parent, 'functions.exec', 'heartbeat ' + owner, 'parent-heartbeat', {'exit_code': 0})
+    first = host.heartbeat(owner=owner, source=parent, source_line=parent_line)
+    assert first['state'] == 'open'
+    repeated = host.heartbeat(owner=owner, source=parent, source_line=parent_line)
+    assert repeated['heartbeat_at'] == first['heartbeat_at']
+
+
+def test_normal_close_requires_original_finance_terminal_and_no_pending_work(exchange):
+    action, _, owner, child, _, manifest, _ = exchange
+    with pytest.raises(ValueError, match='close_incomplete'):
+        host.close(owner=owner)
+    controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
+    seal_execution(owner, manifest)
+    host.enter_packaging(owner=owner)
+    host.publish(action, prompt='Review package draft.', timeout_seconds=60, kind='packaging_draft')
+    with pytest.raises(ValueError, match='close_incomplete'):
+        host.close(owner=owner)
+
+
+def test_normal_close_proves_all_three_native_reviewers_are_idle(exchange):
+    _, _, owner, child, _, manifest, _ = exchange
+    controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
+    seal_execution(owner, manifest)
+    parent = child.with_name('parent.jsonl')
+    line = native_call(parent, 'list_agents', {}, 'native-status', {'agents': [
+        {'agent_name': f'/root/reviewer_{slot}', 'agent_status': 'completed'} for slot in range(3)]})
+    assert host.close(owner=owner, source=parent, source_line=line)['state'] == 'closed'

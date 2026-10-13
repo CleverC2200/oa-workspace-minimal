@@ -4,13 +4,13 @@
 
 正常已授权调度使用 `python -m scripts.finance_preaudit_run --owner-task-id <当前聊天 UUID> -- <原滚动控制器参数>`。该入口仅监督现有 `scripts.finance_preaudit_concurrency_probe`，确认写入、范围、恢复参数和全部门禁仍由原入口校验；开发验证不传真实业务写入参数。
 
-每轮启动可在分隔符 `--` 之前传入 `--review-provider deepseek` 或 `--review-provider openai`。默认使用 Codex/OpenAI GPT 6.1 Sol/medium；显式 DeepSeek 使用 Flash/high。选择只传给本轮新进程及其审核子进程，保存为 `execution.json` 和控制器清单的 `review_configuration`，进入配置指纹；运行中不更换供应商。下一轮可重新选择，无需修改源码或全局 Codex 配置。进度、取回和工具会话绑定入口拒绝混入供应商选择。切换不清冷却、停止门或未知写入，也不授权重新启动已有控制器。
+每轮启动可在分隔符 `--` 之前传入 `--review-provider deepseek` 或 `--review-provider openai`。默认 OpenAI 使用 App 固定子 Agent 对话；显式 DeepSeek 使用 Flash/high 的原 CLI/API 路径。OpenAI 的审核模型和推理级别未观测时记录 unknown，不能用外层调度模型补填。选择只传给本轮新进程及其审核子进程，保存为 `execution.json` 和控制器清单的 `review_configuration`，进入配置指纹；运行中不更换供应商。下一轮可重新选择，无需修改源码或全局 Codex 配置。进度、取回和工具会话绑定入口拒绝混入供应商选择。切换不清冷却、停止门或未知写入，也不授权重新启动已有控制器。
 
-本轮后续独立包装 CLI 使用同一选择，例如 `OA_REVIEW_PROVIDER=openai python -m apps.oa_finance_preaudit.packaging_review --action-file <当前动作>`。财务滚动池仍不包含包装。DeepSeek 使用独立 API 密钥和空运行目录；OpenAI 使用现有原生认证，不接收 DeepSeek、OpenAI 或 Codex 的 API key 环境变量。
+本轮后续包装使用同一选择，OpenAI 进入本轮 App 包装阶段并复用已登记的 3 个子 Agent，DeepSeek 使用 `OA_REVIEW_PROVIDER=deepseek OA_REVIEW_TRANSPORT=cli python -m apps.oa_finance_preaudit.packaging_review --action-file <当前动作>`。财务滚动池仍不包含包装。DeepSeek 使用独立 API 密钥和空运行目录；OpenAI 使用现有原生认证，不接收 DeepSeek、OpenAI 或 Codex 的 API key 环境变量。
 
-工具调用者与每轮监督者分开：入口启动一个独立进程组中的本轮监督者，由它创建、真实 wait 原控制器并独占保存 execution.json。它不是常驻 daemon 或额外模型 worker，不重复启动控制器。调用者收到停止信号时转交监督者；调用者或其原工具父进程消失或 PID 身份变化时，监督者请求既有停止门并继续等待 Writer 和控制器收尾，保留真实退出码。启动前和每次 CLI 启动前核对已绑定的 PID、出生时间、进程组及用户，不能仅凭 PID 仍存在放行。
+工具调用者与每轮监督者分开：入口启动一个独立进程组中的本轮监督者，由它创建、真实 wait 原控制器并独占保存 execution.json。它不是常驻 daemon 或额外模型 worker，不重复启动控制器。调用者收到停止信号时转交监督者；调用者或其原工具父进程消失或 PID 身份变化时，监督者请求既有停止门并继续等待 Writer 和控制器收尾，保留真实退出码。启动前和每次 DeepSeek CLI 启动前核对已绑定的 PID、出生时间、进程组及用户，不能仅凭 PID 仍存在放行。
 
-监督者自身被强制终止时，控制器心跳及运行中的审核 worker 每 5 秒核对独立的父链身份，并通过技术停止门有序收尾；CLI 发起前的核验不等待这个间隔。不能强杀可能在途的 Writer。机器断电、所有保护进程同时被强杀、观察前已经发出的请求仍不保证有完整退出回执，不承诺操作系统任意终止下恢复真实 wait。
+监督者自身被强制终止时，控制器心跳及运行中的审核 worker 每 5 秒核对独立的父链身份，并通过技术停止门有序收尾；DeepSeek CLI 发起前的核验不等待这个间隔。不能强杀可能在途的 Writer。机器断电、所有保护进程同时被强杀、观察前已经发出的请求仍不保证有完整退出回执，不承诺操作系统任意终止下恢复真实 wait。
 
 启动输出给出 `receipt_file`、拥有者和控制器 PID。保持并等待原工具 session；工具返回 `session_id` 而没有 `exit_code` 时继续等待原 session。外层返回原工具 session ID 后，用 `python -m scripts.finance_preaudit_run --owner-task-id <同一任务 UUID> --bind-tool-session <原 ID> --receipt-file <启动给出的 execution.json>` 保存独立 `tool-session.json`，然后继续等待原 session。该元数据入口不启动控制器，只校验本次归属，拒绝冲突绑定，标记来源为 caller_reported_tool_result；不能把自行编造的 ID 当真实工具回执。Python 无法自己取得外层 ID，主执行回执该字段保持 unknown，指向单独绑定文件以避免并发覆盖；未绑定时如实记录缺口。禁止以函数单元的 `Script completed` 替代内部原进程终态。
 
@@ -19,6 +19,39 @@
 `state=exited` 只证明监督进程实际 `wait` 得到子控制器退出码；`result=completed` 还需要同 PID、本次开始时间之后的清单为 completed 且 children_reaped=true。终态缺口或不可信结果为 blocked，不证明已安全回收或可以再次启动。进程信号退出记录真实负退出码和信号。监督者被 SIGKILL 或机器断电时，原保存记录可能仍是 waiting；读取入口在可确认监督者丢失时投影 state=supervisor_lost、recorded_state=waiting、status=blocked、terminal=false，保留未知退出码，不改写原证据。新回执用 supervisor_process 核对 PID 复用，历史缺失该字段时只使用原兼容存活检查。子清单收尾或已确认回收不代替真实 wait，按原隔离排障入口核对，不能重放。
 
 启动竞争后，只有本次子进程退出0、确认没有本轮镜像且原输出完整验证正常活动控制器门禁时，才记录 result=skipped；此时不能认领他人 run、进入包装或清窗。存在但损坏/不匹配的镜像仍 blocked，不能靠 skipped 输出覆盖坏证据。
+
+## 固定 App 审核槽的原生派单
+
+本节只适用于 OpenAI `host_chat`。唯一滚动控制器启动一次后，主对话创建恰好 3 个原生 `collaboration.spawn_agent`，保留其真实 Agent 路径、子会话 UUID 和成功工具回执。每个 Agent 一次只审核一单，返回结果后空闲；下一单调用同一 Agent 的 `followup_task`，本轮不替换身份、不递归创建审核者。DeepSeek 不执行本节。
+
+1. 保留原 `execution.json`、`invocation_id` 和工具 `session_id`，按上方入口绑定原 session。用本轮父会话的 3 次真实 spawn 回执登记槽位。来源行必须指向原生工具调用及其已完成输出；来源文件和路径不能猜测。命令中 3 组子会话文件、spawn 行按槽位 0、1、2 排列。
+
+```bash
+python -B -m apps.oa_finance_preaudit.host_chat_review --operation register --owner-task-id <主会话UUID> --source-session-file <父原生会话jsonl> --reviewer-session-file <槽0子会话jsonl> --spawn-line <槽0spawn行> --reviewer-session-file <槽1子会话jsonl> --spawn-line <槽1spawn行> --reviewer-session-file <槽2子会话jsonl> --spawn-line <槽2spawn行> --receipt-file <原execution.json> --invocation-id <原调用ID> --tool-session-id <原session_id>
+```
+
+2. 每次取得可信进度后读取当前请求，并在 30 秒以内续一次父任务心跳。维持原工具 session 的等待；不得等待直到控制器退出才派单。心跳到期关闭新增派单和结果接收，不把等待超时当审批重试授权。
+
+```bash
+python -B -m apps.oa_finance_preaudit.host_chat_review --operation heartbeat --owner-task-id <主会话UUID>
+python -B -m apps.oa_finance_preaudit.host_chat_review --operation pending --owner-task-id <主会话UUID>
+```
+
+3. 对 pending 返回的本轮请求，调用空闲原 Agent 的 `followup_task`，只传请求绝对路径和当前单据边界。保留该次真实工具调用来源；它完成后执行 assign，把请求绑定到原槽位。一个槽位有未交回请求时不能再派单。dispatch 的原生时间、请求指纹、子会话和来源必须匹配。
+
+```bash
+python -B -m apps.oa_finance_preaudit.host_chat_review --operation assign --owner-task-id <主会话UUID> --request-file <本轮request.json> --slot <0或1或2> --source-session-file <父原生会话jsonl> --source-line <本次followup行>
+```
+
+4. 子 Agent 读取当前请求提示词、规则和冻结材料，写出本单决定或包装草稿。先通过独立 `functions.exec` 写入私有决定文件，等该次原工具输出成功，再用其来源行提交。正在执行的 submit 调用不能同时充当自己的已完成写文件证据。子 Agent 只交回决定，不调用 OA 完成动作。主对话保持心跳并等待原控制器，Writer 仍由控制器按认领顺序管理。
+
+```bash
+python -B -m apps.oa_finance_preaudit.host_chat_review --operation submit --owner-task-id <主会话UUID> --request-file <本轮request.json> --decision-file <本单私有决定json> --source-session-file <已登记子会话jsonl> --source-line <已完成决定写入行>
+```
+
+财务原工具 session 和原回执均确认 completed、children_reaped=true，且新鲜结束门禁可信、Writer 空闲后，执行 `host_chat_review --operation enter-packaging --owner-task-id <主会话UUID>`。该操作只推进同轮阶段，不重启控制器，不增加 Agent；包装请求继续使用上方 pending、followup、assign、submit。包装业务确认和完成动作见[包装审核](packaging-review.md)。包装及结束对账完成后，确认 3 个原 Agent 均无运行任务，再执行 `host_chat_review --operation close --owner-task-id <主会话UUID> --reason completed`，然后主对话才能结束。
+
+人工取消、官方限制、子 Agent 不可用或父任务即将退出时，先停止派单。对运行中的原子 Agent 使用原生 `interrupt_agent`，随后关闭同轮 exchange，reason 使用 cancelled、reviewer_failed 或 parent_lost，并继续监督原工具 session 与 Writer 收尾。中断保留子会话上下文，不证明 Agent 被销毁或回收；主对话仍须确认原生状态和程序回执。关闭后拒绝迟到决定，不自动替换 Agent、不回退 OpenAI CLI、不重放 unknown 写入。父任务突然丢失时，原父链门和租约失效负责止损；退出结果缺失保持 unknown。机器断电或全部保护进程同时被强杀不保证完整收尾。
 
 ## 只读进度、等待与终态取回
 
