@@ -7,6 +7,8 @@ import fcntl
 import hashlib
 import json
 import os
+import re
+import shlex
 from pathlib import Path
 import time
 from uuid import UUID, uuid4
@@ -15,6 +17,7 @@ from apps.oa_approval import runtime_control
 from . import approval_guard as guard, approval_lifecycle, production_config, review_context
 
 TRANSPORT_ENV = 'OA_REVIEW_TRANSPORT'
+MODULE = 'apps.oa_finance_preaudit.host_chat_review'
 IDENTITY = dict(production_config.HOST_REVIEW_IDENTITY)
 REQUEST = 'host-review-request.json'
 SUBMISSION = 'host-review-submission.json'
@@ -336,6 +339,27 @@ def _native_agent_status(value) -> str:
         return 'completed'
     raise ValueError('host_review_children_status_untrusted')
 
+
+def _package_completion(request: dict, assigned: dict) -> None:
+    try:
+        path = Path(assigned['completion_file'])
+        raw, marker = _read(path)
+        action = Path(request['action_file'])
+        if (hashlib.sha256(raw).hexdigest() != assigned['completion_sha256']
+                or marker.get('kind') != 'preaudit_app_packaging_completion' or marker.get('schema_version') != 1
+                or marker.get('request_id') != request['request_id'] or marker.get('request_sha256') != assigned['request_sha256']
+                or marker.get('submission_sha256') != assigned['submission_sha256'] or marker.get('action_file') != str(action)
+                or marker.get('write_state') not in {'not_requested', 'submitted'}
+                or not isinstance(marker.get('file_sha256'), dict)
+                or any(hashlib.sha256(review_context.read_input(Path(file))).hexdigest() != digest
+                       for file, digest in marker['file_sha256'].items())):
+            raise ValueError('invalid_completion')
+        closed = json.loads(review_context.read_input(action))
+        if closed.get('action') != 'closed' or closed.get('execution_state') != 'closed' or closed.get('write_state') != marker['write_state']:
+            raise ValueError('incomplete_action')
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+        raise ValueError('host_review_packaging_incomplete') from error
+
 def close(*, owner: str, reason: str = 'completed', source: Path | None = None, source_line: int | None = None) -> dict:
     """Close the exchange; cancellation never signals the Writer process."""
     if reason not in {'completed', 'cancelled', 'parent_lost', 'reviewer_failed'}:
@@ -352,6 +376,10 @@ def close(*, owner: str, reason: str = 'completed', source: Path | None = None, 
                     or any(value['assignments'].get(request_id, {}).get('state') != 'submitted' for request_id in value.get('requests', {}))
                     or runtime_control.writer_active() or runtime_control.active_request_writers()):
                 raise ValueError('host_review_close_incomplete')
+            for request_id, published in value.get('requests', {}).items():
+                request = _read(Path(published['request_file']))[1]
+                if request['review_kind'] == 'packaging_draft':
+                    _package_completion(request, value['assignments'][request_id])
             if source is None or source_line is None or str(source.absolute()) != value['reviewers'][0]['spawn_source']['session_file']:
                 raise ValueError('host_review_source_untrusted')
             native, proof = _native_source(source, owner, source_line, output=True)
@@ -359,7 +387,7 @@ def close(*, owner: str, reason: str = 'completed', source: Path | None = None, 
             agents = proof['output'].get('agents')
             from datetime import datetime
             timestamp = native['anchor'].get('timestamp')
-            last_result = max([value['heartbeat_at'], *(item.get('submitted_at', 0) for item in value['assignments'].values())])
+            last_result = max([value['heartbeat_at'], *(max(item.get('submitted_at', 0), item.get('completed_at', 0)) for item in value['assignments'].values())])
             if not isinstance(timestamp, str) or not last_result <= datetime.fromisoformat(timestamp.replace('Z', '+00:00')).timestamp() <= time.time():
                 raise ValueError('host_review_stale_source')
             if not isinstance(agents, list) or any(not isinstance(agent, dict) for agent in agents):
@@ -591,6 +619,15 @@ def publish(action: Path, *, prompt: str, timeout_seconds: int, kind: str = 'fin
                'expires_at': started_at + timeout_seconds, 'prompt': prompt, 'review_context': review_context or {}}
     _live(request, action, owner=owner)
     request_file = _request_file(action, kind)
+    request['prompt'] += (
+        '\n保存 model JSON 必须调用专用 write-draft 接口，不使用通用文件写入或已有文件。\n'
+        f'用 {MODULE}.draft_command(Path({str(request_file)!r}), Path(新的私有决定文件绝对路径), '
+        f'model_payload, owner={owner!r}) 生成规范命令。\n'
+        '将返回命令作为 JSON 字符串字面量，独立原生 exec 只执行 '
+        'text(await tools.exec_command({"cmd":规范命令字符串字面量}));。\n'
+        '专用接口独占写入并返回绑定本请求和实际字节 SHA256 的回执。'
+        '等待该次配对工具输出真实完成，再 submit；回执生成后禁止更改决定文件。\n'
+    )
     with _round_lease(owner) as path:
         registered = _registry(owner)
         _live(request, action, owner=owner)
@@ -673,31 +710,91 @@ def review(task: dict) -> dict:
 
 
 
-def _successful_output(output) -> bool:
-    if isinstance(output, dict):
-        if output.get('isError') is True or ('exit_code' in output and output['exit_code'] != 0):
-            return False
-        return output.get('exit_code') == 0 or any(_successful_output(value) for value in output.values())
-    if isinstance(output, list):
-        # Any structured shell/tool failure invalidates the whole source.
-        for item in output:
-            if isinstance(item, dict) and item.get('isError') is True:
-                return False
-            text = item.get('text', '') if isinstance(item, dict) else item
-            if isinstance(text, str):
-                try:
-                    parsed = json.loads(text)
-                except ValueError:
-                    parsed = None
-                if isinstance(parsed, dict) and ('exit_code' in parsed and parsed['exit_code'] != 0 or parsed.get('isError') is True):
-                    return False
-        return any(_successful_output(item) for item in output)
-    if isinstance(output, str):
-        try:
-            return _successful_output(json.loads(output))
-        except ValueError:
-            return output.startswith('Script completed')
-    return False
+def draft_command(request_file: Path, decision_file: Path, payload: dict, *, owner: str) -> str:
+    """The only accepted native command for publishing model-authored draft bytes."""
+    return shlex.join(['uv', 'run', '--no-sync', 'python', '-B', '-m', MODULE, '--operation', 'write-draft',
+                      '--owner-task-id', owner, '--request-file', str(request_file.absolute()),
+                      '--decision-file', str(decision_file.absolute()), '--payload-json', json.dumps(payload, ensure_ascii=False, sort_keys=True)])
+
+
+def publish_draft(request_file: Path, decision_file: Path, payload: dict, *, owner: str) -> dict:
+    """Write exactly the model's JSON once and return its request-bound byte receipt."""
+    request_file, decision_file = request_file.absolute(), decision_file.absolute()
+    raw, request = _read(request_file)
+    _live(request, Path(request['action_file']), owner=owner)
+    if request_file != _request_file(Path(request['action_file']), request['review_kind']) or not isinstance(payload, dict):
+        raise ValueError('host_review_draft_invalid')
+    with runtime_control.stop_control_lease():
+        _live(request, Path(request['action_file']), owner=owner)
+        _write_new(decision_file, payload)
+    return {'schema_version': 1, 'kind': 'preaudit_host_draft_publication', 'owner_task_id': owner,
+            'request_file': str(request_file), 'request_id': request['request_id'],
+            'request_sha256': hashlib.sha256(raw).hexdigest(), 'decision_file': str(decision_file),
+            'decision_sha256': hashlib.sha256(review_context.read_input(decision_file, private=True)).hexdigest()}
+
+
+def _shell_result(output) -> dict:
+    """Accept one completed exec_command result; any nested failure rejects it."""
+    results = []
+    failed = False
+    def visit(value):
+        nonlocal failed
+        if isinstance(value, str):
+            try:
+                visit(json.loads(value))
+            except ValueError:
+                pass
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+        elif isinstance(value, dict):
+            if value.get('isError') is True or ('exit_code' in value and (type(value['exit_code']) is not int or value['exit_code'] != 0)):
+                failed = True
+            if 'exit_code' in value and 'output' in value:
+                results.append(value)
+            for item in value.values():
+                visit(item)
+    visit(output)
+    if failed or len(results) != 1 or type(results[0].get('exit_code')) is not int or results[0]['exit_code'] != 0:
+        raise ValueError('host_review_source_untrusted')
+    return results[0]
+
+
+def _draft_publication(input_text, output, decision_file: Path) -> dict:
+    # A full single-statement match excludes commented paths, branches, extra
+    # commands, shell operators and unrelated successful results.
+    if not isinstance(input_text, str):
+        raise ValueError('host_review_source_untrusted')
+    match = re.fullmatch(r'\s*text\(await tools\.exec_command\((\{.*\})\)\);?\s*', input_text, re.DOTALL)
+    if match is None:
+        raise ValueError('host_review_source_untrusted')
+    try:
+        args = json.loads(match.group(1))
+        if set(args) != {'cmd'} or not isinstance(args['cmd'], str):
+            raise ValueError('invalid_command')
+        tokens = shlex.split(args['cmd'])
+        if tokens[:9] != ['uv', 'run', '--no-sync', 'python', '-B', '-m', MODULE, '--operation', 'write-draft'] or len(tokens) != 17:
+            raise ValueError('invalid_command')
+        if tokens[9] != '--owner-task-id' or tokens[11] != '--request-file' or tokens[13] != '--decision-file' or tokens[15] != '--payload-json':
+            raise ValueError('invalid_command')
+        owner, request_file, target = tokens[10], Path(tokens[12]), Path(tokens[14])
+        payload = json.loads(tokens[16])
+        if target != decision_file or args['cmd'] != draft_command(request_file, target, payload, owner=owner):
+            raise ValueError('invalid_command')
+        result = _shell_result(output)
+        receipt = json.loads(result['output'])
+        raw, request = _read(request_file)
+        expected = {'schema_version': 1, 'kind': 'preaudit_host_draft_publication', 'owner_task_id': owner,
+                    'request_file': str(request_file), 'request_id': request['request_id'],
+                    'request_sha256': hashlib.sha256(raw).hexdigest(), 'decision_file': str(target),
+                    'decision_sha256': hashlib.sha256((json.dumps(payload, ensure_ascii=False, sort_keys=True) + '\n').encode()).hexdigest()}
+        if owner != request['owner_task_id'] or receipt != expected:
+            raise ValueError('invalid_receipt')
+        if hashlib.sha256(review_context.read_input(target, private=True)).hexdigest() != receipt['decision_sha256']:
+            raise ValueError('changed_draft')
+        return receipt
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+        raise ValueError('host_review_source_untrusted') from error
 
 def validate_source(source: Path, line: int, session: str, decision_file: Path, *, dispatched_at: float) -> dict:
     """Validate a native observation source for the caller's public acceptance seam."""
@@ -710,10 +807,11 @@ def _source_receipt(source: Path, line: int, reviewer: str, decision_file: Path,
     if (native['anchor'].get('type') != 'response_item'
             or payload.get('type') not in {'function_call', 'custom_tool_call'}
             or payload.get('name') not in {'exec', 'functions.exec'} or not payload.get('call_id')
-            or str(decision_file) not in str(payload.get('arguments', payload.get('input', '')))):
+):
         raise ValueError('host_review_source_untrusted')
     output = proof.pop('output')
-    if not _successful_output(output):
+    publication = _draft_publication(payload.get('arguments', payload.get('input')), output, decision_file)
+    if assigned.get('request_sha256') is not None and publication['request_sha256'] != assigned['request_sha256']:
         raise ValueError('host_review_source_untrusted')
     from datetime import datetime
     timestamp = native['anchor'].get('timestamp')
@@ -721,7 +819,7 @@ def _source_receipt(source: Path, line: int, reviewer: str, decision_file: Path,
         raise ValueError('host_review_stale_source')
     return {**proof, 'call_id': payload['call_id'], 'reviewer_task_id': reviewer, 'model': 'unknown',
             'dispatched_at': assigned['dispatched_at'], 'decision_file': str(decision_file),
-            'decision_input_sha256': hashlib.sha256(review_context.read_input(decision_file, private=True)).hexdigest()}
+            'decision_input_sha256': publication['decision_sha256'], 'publication': publication}
 
 
 def submit(request_file: Path, decision_file: Path, *, owner: str, source: Path, source_line: int) -> dict:
@@ -832,10 +930,11 @@ def source_anchor(*, owner: str, operation: str = 'heartbeat') -> dict:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--operation', choices=['register', 'pending', 'assign', 'submit', 'heartbeat', 'enter-packaging', 'close'], default='submit')
+    parser.add_argument('--operation', choices=['register', 'pending', 'assign', 'submit', 'heartbeat', 'enter-packaging', 'close', 'write-draft'], default='submit')
     parser.add_argument('--owner-task-id', required=True)
     parser.add_argument('--request-file', type=Path)
     parser.add_argument('--decision-file', type=Path)
+    parser.add_argument('--payload-json')
     parser.add_argument('--source-session-file', type=Path)
     parser.add_argument('--source-line', type=int)
     parser.add_argument('--reviewer-session-file', type=Path, action='append')
@@ -848,7 +947,11 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     UUID(args.owner_task_id)
     owner = args.owner_task_id
-    if args.operation == 'register':
+    if args.operation == 'write-draft':
+        if args.request_file is None or args.decision_file is None or args.payload_json is None:
+            parser.error('write-draft requires request-file, exclusive decision-file and model payload-json')
+        result = publish_draft(args.request_file, args.decision_file, json.loads(args.payload_json), owner=owner)
+    elif args.operation == 'register':
         if (args.source_session_file is None or args.receipt_file is None or args.invocation_id is None or args.tool_session_id is None
                 or len(args.reviewer_session_file or []) != 3 or len(args.spawn_line or []) != 3):
             parser.error('register requires original execution binding, parent source and exactly three child sources/spawn lines')

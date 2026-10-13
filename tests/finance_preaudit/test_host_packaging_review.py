@@ -9,7 +9,7 @@ import pytest
 
 from apps.oa_finance_preaudit import packaging_review as packaging, host_chat_review as host, controller_handoff
 from tests.finance_preaudit.test_packaging_review import action, draft
-from tests.finance_preaudit.test_host_chat_review import exchange, native_call, seal_execution
+from tests.finance_preaudit.test_host_chat_review import exchange, native_call, seal_execution, draft_source
 
 
 def page_refs(path):
@@ -62,9 +62,7 @@ def observe_pages(path, child):
 
 def publish_payload(request, child, payload, owner, *, filename='draft.json'):
     target = request.parent / filename
-    target.write_text(json.dumps(payload, ensure_ascii=False))
-    target.chmod(0o600)
-    source_line = native_call(child, 'functions.exec', 'write private ' + str(target), 'write-' + filename, {'exit_code': 0})
+    source_line = draft_source(child, request, target, owner, payload=payload, call_id='write-' + filename)
     host.submit(request, target, owner=owner, source=child, source_line=source_line)
     return host.await_result(request)
 
@@ -74,8 +72,8 @@ def test_app_packaging_submission_requires_current_real_image_observation(packag
     child = package_round[3]
     payload = envelope(path)
     target = path.with_name('private-draft.json')
-    target.write_text(json.dumps(payload)); target.chmod(0o600)
-    line = native_call(child, 'functions.exec', 'write ' + str(target), 'write-draft', {'exit_code': 0})
+    request, child = assigned_package(package_round)
+    line = draft_source(child, request, target, owner, payload=payload, call_id='write-draft')
     session = json.loads(child.read_text().splitlines()[0])['payload']['id']
     source = host.validate_source(child, line, session, target, dispatched_at=time.time()-2)
     with pytest.raises(ValueError, match='packaging_observation_missing'):
@@ -156,9 +154,9 @@ def semantic_accept(receipt, package_round, **updates):
         'decision_sha256': recorded['decision_sha256'], 'accepted': True, 'requirements_checked': True,
         'recheck_required': False, 'recheck_request_file': None, 'conclusion': '已核对真实逐页观察、冻结意见和独立复核触发条件。'}
     payload.update(updates)
-    target.write_text(json.dumps(payload)); target.chmod(0o600)
     parent = child.with_name('parent.jsonl')
-    line = native_call(parent, 'functions.exec', 'write acceptance ' + str(target), 'acceptance', {'exit_code': 0})
+    request_file = Path(recorded['host_result']['host_receipt']['request_file'])
+    line = draft_source(parent, request_file, target, owner, payload=payload, call_id='acceptance')
     return packaging.confirm_semantics(receipt, target, owner=owner, source=parent, source_line=line)
 
 
@@ -260,13 +258,17 @@ def test_independent_recheck_rejects_primary_agent_reuse(package_round):
         publish_payload(request, child, payload, owner, filename='same-slot.json')
 
 
-def test_controlled_app_completion_keeps_existing_writer_grant_and_receipt(package_round):
+@pytest.mark.parametrize('expire_parent', [False, True])
+def test_controlled_app_completion_keeps_existing_writer_grant_and_receipt(package_round, monkeypatch, expire_parent):
     from tests.finance_preaudit.test_flow_engine_packaging import _material, _grant, REGION_KEYS, WORKFLOW_KEY
     from apps.oa_finance_preaudit.flow_engine import FlowEngine
     _, root, owner, child = package_round
     calls = []
     def submit(job):
         calls.append(job)
+        if expire_parent:
+            now = time.time()
+            monkeypatch.setattr(host.time, 'time', lambda: now + 46)
         return {'schema_version': 1, 'kind': 'preaudit_submission_result', 'submission_token': job['submission_token'],
                 'write': True, 'submit_ok': True, 'done_hit': True, 'postcheck_done_hit': True}
     engine = FlowEngine(root=root / 'runtime/finance_preaudit_flows',
@@ -283,3 +285,66 @@ def test_controlled_app_completion_keeps_existing_writer_grant_and_receipt(packa
     closed = packaging.complete_host(receipt, project_root=root, confirm_write=True, engine=engine)
     assert closed['action'] == 'closed' and closed['write_state'] == 'submitted'
     assert len(calls) == 1
+    assert receipt.with_name('app-completion.json').exists()
+
+
+def test_commented_original_image_and_unrelated_emit_cannot_cover_frozen_page(package_round):
+    path, _, owner, _ = package_round
+    request, child = assigned_package(package_round)
+    original = json.loads(path.with_name('material.json').read_text())['prepared']['images'][0]['path']
+    native_exec(child, '// tools.view_image(' + json.dumps({'path': original}) + ')\nimage("data:image/png;base64,UNRELATED");',
+        'comment-only-original', [{'type': 'input_text', 'text': 'Script completed'},
+                                  {'type': 'input_image', 'image_url': 'data:image/png;base64,UNRELATED'}])
+    with pytest.raises(ValueError, match='observation_missing'):
+        publish_payload(request, child, envelope(path), owner)
+
+
+def test_round_closes_only_after_package_semantics_and_original_completion(package_round):
+    from tests.finance_preaudit.test_flow_engine_packaging import _engine
+    receipt = ready_draft(package_round)
+    _, root, owner, child = package_round
+    parent = child.with_name('parent.jsonl')
+    def idle_source():
+        return native_call(parent, 'list_agents', {}, 'idle-for-close', {'agents': [
+            {'agent_name': f'/root/reviewer_{slot}', 'agent_status': {'completed': 'done'}} for slot in range(3)]})
+    line = idle_source()
+    with pytest.raises(ValueError, match='packaging_incomplete'):
+        host.close(owner=owner, source=parent, source_line=line)
+    semantic_accept(receipt, package_round)
+    completed = packaging.complete_host(receipt, project_root=root, confirm_write=True,
+        engine=_engine(root / 'runtime/finance_preaudit_flows'))
+    assert completed['action'] == 'closed'
+    assert host.close(owner=owner, source=parent, source_line=idle_source())['state'] == 'closed'
+
+
+@pytest.mark.parametrize('code_kind', ['dead_branch', 'unrelated_emit', 'mixed_failure'])
+def test_original_page_coverage_rejects_nonexecuted_or_failed_image_evidence(package_round, code_kind):
+    path, _, owner, _ = package_round
+    request, child = assigned_package(package_round)
+    original = json.loads(path.with_name('material.json').read_text())['prepared']['images'][0]['path']
+    read = 'const r=await tools.view_image({path:' + json.dumps(original) + '});image(r.image_url);'
+    code = 'if(false){' + read + '}' if code_kind == 'dead_branch' else read
+    if code_kind == 'unrelated_emit':
+        code = 'const r=await tools.view_image({path:' + json.dumps(original) + '});image("data:image/png;base64,OTHER");'
+    output = [{'type': 'input_text', 'text': 'Script completed'}, {'type': 'input_image', 'image_url': 'data:image/png;base64,recorded'}]
+    if code_kind == 'mixed_failure':
+        output.append({'type': 'input_text', 'text': json.dumps({'isError': True, 'error': 'failed image read'})})
+    native_exec(child, code, 'untrusted-original-look', output)
+    with pytest.raises(ValueError, match='observation_missing'):
+        publish_payload(request, child, envelope(path), owner)
+
+
+def test_package_completion_marker_detects_drift_before_normal_round_close(package_round):
+    from tests.finance_preaudit.test_flow_engine_packaging import _engine
+    receipt = ready_draft(package_round)
+    _, root, owner, child = package_round
+    semantic_accept(receipt, package_round)
+    packaging.complete_host(receipt, project_root=root, confirm_write=True,
+        engine=_engine(root / 'runtime/finance_preaudit_flows'))
+    recorded = json.loads(receipt.read_text())
+    Path(recorded['decision_file']).write_text('{}')
+    parent = child.with_name('parent.jsonl')
+    line = native_call(parent, 'list_agents', {}, 'final-status-after-drift', {'agents': [
+        {'agent_name': f'/root/reviewer_{slot}', 'agent_status': {'completed': 'done'}} for slot in range(3)]})
+    with pytest.raises(ValueError, match='packaging_incomplete'):
+        host.close(owner=owner, source=parent, source_line=line)

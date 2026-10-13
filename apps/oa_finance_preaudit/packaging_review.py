@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import ast
 from datetime import datetime
 import hashlib
 from dataclasses import asdict
@@ -10,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import time
 from uuid import uuid4
 
 from jsonschema import Draft202012Validator
@@ -185,6 +185,36 @@ def _image_output(value) -> bool:
     return False
 
 
+
+def _single_image_path(code: str) -> str | None:
+    """Accept only the two documented, unconditional single-page read/emit forms."""
+    quoted_path = r'("(?:[^"\\]|\\.)*")'
+    arguments = r'\{\s*(?:"path"|path)\s*:\s*' + quoted_path + r'\s*(?:,\s*(?:"detail"|detail)\s*:\s*"(?:original|high)"\s*)?\}'
+    patterns = [
+        r'\s*const r\s*=\s*await tools\.view_image\(\s*' + arguments + r'\s*\);\s*image\(r\.image_url\);?\s*',
+        r'\s*image\(\(await tools\.view_image\(\s*' + arguments + r'\s*\)\)\.image_url\);?\s*',
+    ]
+    for pattern in patterns:
+        match = re.fullmatch(pattern, code)
+        if match is not None:
+            return json.loads(match.group(1))
+    return None
+
+
+def _tool_failed(value) -> bool:
+    if isinstance(value, str):
+        try:
+            return _tool_failed(json.loads(value))
+        except ValueError:
+            return False
+    if isinstance(value, list):
+        return any(_tool_failed(item) for item in value)
+    if isinstance(value, dict):
+        return (value.get('isError') is True or bool(value.get('error'))
+                or ('exit_code' in value and value['exit_code'] != 0)
+                or any(_tool_failed(item) for item in value.values()))
+    return False
+
 def _observations(action: Path, source: dict, refs: list[str] | None = None, *, allow_failed: bool = False) -> list[dict]:
     """Pair actual original-page tool calls with image outputs in this assignment."""
     paths = _page_paths(action)
@@ -208,16 +238,7 @@ def _observations(action: Path, source: dict, refs: list[str] | None = None, *, 
             except (ValueError, AttributeError):
                 continue
         elif payload.get('name') in {'functions.exec', 'exec'} and isinstance(args, str):
-            calls = re.findall(r'tools\.view_image\(\s*(\{[^{}]+\})\s*\)', args)
-            if len(calls) != 1:
-                continue
-            try:
-                image_path = json.loads(calls[0]).get('path')
-            except ValueError:
-                path_match = re.search(r'''(?:\"path\"|path)\s*:\s*(\"[^\"]+\"|'[^']+')''', calls[0])
-                if path_match is None:
-                    continue
-                image_path = ast.literal_eval(path_match.group(1))
+            image_path = _single_image_path(args)
         if image_path not in paths.values():
             continue
         stamp = row.get('timestamp')
@@ -225,8 +246,8 @@ def _observations(action: Path, source: dict, refs: list[str] | None = None, *, 
             continue
         _, proof = host_chat_review._native_source(Path(source['session_file']), source['session_id'], number, output=True)
         output = proof.pop('output')
-        read = _image_output(output)
-        failed = isinstance(output, dict) and (output.get('isError') is True or output.get('error'))
+        failed = _tool_failed(output)
+        read = not failed and _image_output(output)
         if proof['output_line'] >= source['line'] or not (read or allow_failed and failed):
             continue
         proof['observation_state'] = 'read' if read else 'failed'
@@ -403,7 +424,32 @@ def complete_host(receipt_file: Path, *, project_root: Path = PROJECT_ROOT, conf
         engine = cli._live_flow_engine(controlled=True)
     with host_chat_review._round_lease(confirmed['owner_task_id']):
         _trusted_host_receipt(receipt_file)
-        return engine.complete_review(Path(receipt['action_file']), Path(receipt['decision_file']))
+        result = engine.complete_review(Path(receipt['action_file']), Path(receipt['decision_file']))
+        if result.get('action') == 'closed' and result.get('write_state') in {'not_requested', 'submitted'}:
+            action_file = Path(receipt['action_file'])
+            closed = json.loads(review_context.read_input(action_file))
+            if closed.get('action') != 'closed' or closed.get('execution_state') != 'closed':
+                raise ValueError('packaging_completion_untrusted')
+            files = [receipt_file, confirmation_file, Path(receipt['decision_file']), action_file,
+                     action_file.with_name('state.json'), action_file.with_name('execution-receipt.json'),
+                     Path(closed['decision_file'])]
+            marker = {'schema_version': 1, 'kind': 'preaudit_app_packaging_completion',
+                      'request_id': request['request_id'], 'request_sha256': reviewed['host_receipt']['request_sha256'],
+                      'submission_sha256': reviewed['host_receipt']['submission_sha256'],
+                      'decision_sha256': receipt['decision_sha256'], 'action_file': str(action_file),
+                      'file_sha256': {str(path): hashlib.sha256(review_context.read_input(path)).hexdigest() for path in files},
+                      'write_state': result['write_state']}
+            marker_file = receipt_file.with_name('app-completion.json')
+            host_chat_review._write_new(marker_file, marker)
+            # Seal an already-completed Writer even if the parent lease expired
+            # during its in-flight operation; this admits no new write.
+            registered = host_chat_review._registry(confirmed['owner_task_id'], live=False)
+            registered['assignments'][request['request_id']].update(
+                completion_file=str(marker_file), completion_sha256=hashlib.sha256(review_context.read_input(marker_file, private=True)).hexdigest(),
+                completed_at=time.time())
+            from . import approval_guard
+            approval_guard.write(host_chat_review.registry_file(confirmed['owner_task_id']), registered)
+        return result
 
 
 def _host_review(action: Path, project_root: Path, timeout_seconds: int, prompt: str) -> dict:
