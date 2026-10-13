@@ -155,7 +155,7 @@ def run(args, *, executor=None):
     if (audit / 'worker-result.json').exists() or (audit / 'native-attempt-1').exists():
         raise RuntimeError('native_run_already_started_do_not_repeat')
     project, action_file = Path(manifest['project_root']), Path(manifest['action_file'])
-    configuration = manifest.get('review_configuration', production_config.review_settings('openai'))
+    configuration = manifest.get('review_configuration', production_config.LEGACY_OPENAI_IDENTITY)
     if worker.REVIEW_SETTINGS != configuration:
         raise RuntimeError('review_model_identity_changed')
     # Import source must match the snapshot given to the reviewer.
@@ -242,9 +242,9 @@ def verify(args):
                 or closure.get('action') != 'closed' or closure.get('execution_state') != 'closed'
                 or closure.get('write_state') != 'not_requested' or closure.get('write_authorized') is not False):
             findings.append('native_preview_not_closed:finish the original native preview before business verification')
-        configuration = manifest.get('review_configuration', production_config.review_settings('openai'))
+        configuration = manifest.get('review_configuration', production_config.LEGACY_OPENAI_IDENTITY)
         if (result.get('execution_transport') != 'native'
-                or configuration != production_config.review_settings(configuration['provider'])
+                or not production_config.valid_review_configuration(configuration)
                 or any(result.get(key) != configuration[key] for key in ('model', 'reasoning_effort', 'requested_service_tier'))
                 or ('review_configuration' in manifest and result.get('model_provider') != configuration['model_provider'])):
             findings.append('native_model_evidence_unverified:require explicit native transport and model identity')
