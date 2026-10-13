@@ -133,3 +133,7 @@ python -m apps.oa_finance_preaudit.manual_stop_recovery \
 维护持有生产非阻塞 controller 和 global Writer 租约，拒绝环境停止、路径覆盖、活动请求 Writer、不可信权限、原标记替换或原证据改变。锁内等待生产只读 status 实际退出 0，并核对完整文件回执。目标解释器另调用既有只读策略及冻结校验器，要求当前 write-policy 覆盖六财务和包装、当前 review_required 冻结资料完整；collecting 按既有采集恢复合同校验身份与未写入边界，覆盖初始 claim、材料/packet 先落盘、state 先保存冻结字段、action 先转待审的四个阶段；已有材料按目标校验器核验，恢复 provenance 和原 receipt 必须可信。可信 item 隔离回执绑定失败产物，仅材料收集失败的可信 item 隔离免于重验已损坏材料，其他隔离仍走既有冻结校验。证明绑定本次 status SHA。原收尾状态保留旧字段兼容，不补造新证明。原证据读取仅兼容 macOS 系统所有的 `/tmp` 根别名，原调用路径字符串保持不变，其他目录或文件软链及文件替换仍拒绝。当前身份、认证、授权、冻结和 continuation 必须可信，当前未知写入或 pending/handled 冲突阻断；可信单项隔离可保留。通过后先 fsync 保存 0600 validated 回执，复查原证据与标记，再精确清除并保存 cleared 结果。
 
 结果必须同时读取 `status`、`stop_cleared`、`receipt_file` 和 `write_state`。`maintenance_completion_failed` 或 `audit_completion_failed` 表示维护结束有异常，清除可能已经发生；先核对回执和实际停止状态，不重复执行或声称仍未清除。恢复标记成功不代表生产审核验收成功。随后使用统一生产发布预检，同步通过后只有下一独立进程才加载新版本。
+
+## 宿主重启且原执行已真实退出
+
+用户已确认重启并授权继续，原回执为 owner_process_lost、监督者已停止原控制器且真实 failed/reaped 时，使用[宿主重启受控恢复](owner-restart-recovery.md)。它只清精确技术停止门，不改真实退出码或单据，不启动审核和调度；其他停止原因、未知 wait、未决写入及不可信证据仍阻断。
