@@ -15,8 +15,7 @@ from apps.oa_approval import runtime_control
 from . import approval_guard as guard, approval_lifecycle, production_config, review_context
 
 TRANSPORT_ENV = 'OA_REVIEW_TRANSPORT'
-IDENTITY = {'provider': 'openai', 'model': 'host-current-chat', 'reasoning_effort': 'unknown',
-            'model_provider': 'openai', 'requested_service_tier': 'unknown', 'transport': 'host_chat'}
+IDENTITY = dict(production_config.HOST_REVIEW_IDENTITY)
 REQUEST = 'host-review-request.json'
 SUBMISSION = 'host-review-submission.json'
 
@@ -238,16 +237,29 @@ def _registry(owner: str, *, live: bool = True) -> dict:
 def registered_reviewers(*, owner: str) -> list[dict]:
     return _registry(owner)['reviewers']
 
-def heartbeat(*, owner: str) -> dict:
+def heartbeat(*, owner: str, source: Path, source_line: int) -> dict:
     """The main App conversation renews its round lease while it supervises work."""
     with _round_lease(owner) as path:
         value = _registry(owner)
-        value['heartbeat_at'] = time.time()
+        from datetime import datetime
+        if str(source.absolute()) != value['reviewers'][0]['spawn_source']['session_file']:
+            raise ValueError('host_review_source_untrusted')
+        native, proof = _native_source(source, owner, source_line)
+        payload = native['anchor'].get('payload', {})
+        text = str(payload.get('arguments', payload.get('input', '')))
+        timestamp = native['anchor'].get('timestamp')
+        if (payload.get('name') not in {'exec', 'functions.exec'} or not payload.get('call_id')
+                or 'heartbeat' not in text or owner not in text or not isinstance(timestamp, str)):
+            raise ValueError('host_review_source_untrusted')
+        called_at = datetime.fromisoformat(timestamp.replace('Z', '+00:00')).timestamp()
+        if not value['heartbeat_at'] <= called_at <= time.time():
+            raise ValueError('host_review_stale_source')
+        value.update(heartbeat_at=called_at, heartbeat_source=proof)
         guard.write(path, value)
     return {'state': value['state'], 'phase': value['phase'], 'heartbeat_at': value['heartbeat_at']}
 
 
-def close(*, owner: str, reason: str = 'completed') -> dict:
+def close(*, owner: str, reason: str = 'completed', source: Path | None = None, source_line: int | None = None) -> dict:
     """Close the exchange; cancellation never signals the Writer process."""
     if reason not in {'completed', 'cancelled', 'parent_lost', 'reviewer_failed'}:
         raise ValueError('host_review_close_reason_invalid')
@@ -255,9 +267,29 @@ def close(*, owner: str, reason: str = 'completed') -> dict:
         value = _registry(owner, live=False)
         if value['state'] != 'open':
             return {'state': value['state'], 'reason': value['close_reason']}
-        if reason == 'completed' and (any(item['state'] == 'assigned' for item in value['assignments'].values())
-                                      or runtime_control.writer_active() or runtime_control.active_request_writers()):
-            raise ValueError('host_review_close_incomplete')
+        if reason == 'completed':
+            from scripts import finance_preaudit_run
+            report = finance_preaudit_run.read_execution(**value['original_execution'])
+            if (report.get('terminal') is not True or report.get('status') != 'completed'
+                    or report.get('run_id') != value['run_id'] or report.get('controller_instance_id') != value['controller_instance_id']
+                    or any(value['assignments'].get(request_id, {}).get('state') != 'submitted' for request_id in value.get('requests', {}))
+                    or runtime_control.writer_active() or runtime_control.active_request_writers()):
+                raise ValueError('host_review_close_incomplete')
+            if source is None or source_line is None or str(source.absolute()) != value['reviewers'][0]['spawn_source']['session_file']:
+                raise ValueError('host_review_source_untrusted')
+            native, proof = _native_source(source, owner, source_line, output=True)
+            _tool(native['anchor'], 'list_agents')
+            agents = proof['output'].get('agents')
+            from datetime import datetime
+            timestamp = native['anchor'].get('timestamp')
+            last_result = max([value['heartbeat_at'], *(item.get('submitted_at', 0) for item in value['assignments'].values())])
+            if not isinstance(timestamp, str) or not last_result <= datetime.fromisoformat(timestamp.replace('Z', '+00:00')).timestamp() <= time.time():
+                raise ValueError('host_review_stale_source')
+            if (not isinstance(agents, list) or any(
+                    len([agent for agent in agents if agent.get('agent_name') == reviewer['agent_path']
+                         and agent.get('agent_status') in {'idle', 'completed'}]) != 1 for reviewer in value['reviewers'])):
+                raise ValueError('host_review_children_not_idle')
+            value['children_idle_source'] = proof
         value.update(state='closed' if reason == 'completed' else 'cancelled', close_reason=reason, closed_at=time.time())
         guard.write(path, value)
     if reason != 'completed':
@@ -324,7 +356,7 @@ def pending(*, owner: str | None = None, manifest: dict | None = None) -> list[d
             return []
         paths = [Path(action_file).with_name(REQUEST) for action_file in progress['actions']]
     else:
-        paths = [Path(path) for path in registered.get('requests', {}).values()]
+        paths = [Path(item['request_file']) for item in registered.get('requests', {}).values()]
     results = []
     for request_file in paths:
         if not os.path.lexists(request_file):
@@ -353,6 +385,8 @@ def assign(request_file: Path, *, slot: int, owner: str, source: Path, source_li
         registered = _registry(owner)
         if type(slot) is not int or slot not in range(3):
             raise ValueError('host_review_slot_untrusted')
+        if registered.get('requests', {}).get(request['request_id']) != {'request_file': str(request_file), 'request_sha256': hashlib.sha256(raw).hexdigest()}:
+            raise ValueError('host_review_request_untrusted')
         reviewer = registered['reviewers'][slot]
         native, proof = _native_source(source, owner, source_line, output=True)
         arguments = _tool(native['anchor'], 'followup_task')
@@ -382,8 +416,7 @@ def assign(request_file: Path, *, slot: int, owner: str, source: Path, source_li
     return value
 
 def _fingerprints(action: Path) -> dict:
-    from . import codex_review_worker as worker
-    context = review_context.capture(action, worker._decision_schema(action))
+    context = review_context.capture(action, {})
     if context is None:
         raise ValueError('host_review_frozen_untrusted')
     # State is mutable authorization bookkeeping; frozen inputs and action remain bound.
@@ -403,7 +436,7 @@ def _live(request: dict, action: Path, *, owner: str | None = None) -> None:
     if (request.get('kind') != 'preaudit_host_review_request' or request.get('schema_version') != 1
             or request.get('review_configuration') != IDENTITY or request.get('action_file') != str(action)
             or request.get('input_fingerprints') != _fingerprints(action)
-            or type(request.get('expires_at')) not in {int, float} or time.time() >= request['expires_at']):
+            or not guard._timestamp(request.get('expires_at')) or time.time() >= request['expires_at']):
         raise ValueError('host_review_request_untrusted')
     registered = _registry(request['owner_task_id'])
     if (registered['run_id'] != request['run_id'] or registered['controller_instance_id'] != request['controller_instance_id']):
@@ -474,7 +507,8 @@ def publish(action: Path, *, prompt: str, timeout_seconds: int, kind: str = 'fin
         registered = _registry(owner)
         _live(request, action, owner=owner)
         _write_new(request_file, request)
-        registered.setdefault('requests', {})[request['request_id']] = str(request_file)
+        registered.setdefault('requests', {})[request['request_id']] = {'request_file': str(request_file),
+            'request_sha256': hashlib.sha256(_read(request_file)[0]).hexdigest()}
         guard.write(path, registered)
     return request_file
 
@@ -578,7 +612,7 @@ def _source_receipt(source: Path, line: int, reviewer: str, decision_file: Path,
     payload = native['anchor'].get('payload', {})
     if (native['anchor'].get('type') != 'response_item'
             or payload.get('type') not in {'function_call', 'custom_tool_call'}
-            or payload.get('name') != 'functions.exec' or not payload.get('call_id')
+            or payload.get('name') not in {'exec', 'functions.exec'} or not payload.get('call_id')
             or str(decision_file) not in str(payload.get('arguments', payload.get('input', '')))):
         raise ValueError('host_review_source_untrusted')
     output = proof.pop('output')
@@ -602,6 +636,8 @@ def submit(request_file: Path, decision_file: Path, *, owner: str, source: Path,
     _live(request, action, owner=owner)
     with _round_lease(owner) as path:
         registered = _registry(owner)
+        if registered.get('requests', {}).get(request['request_id']) != {'request_file': str(request_file), 'request_sha256': hashlib.sha256(raw).hexdigest()}:
+            raise ValueError('host_review_request_untrusted')
         assigned = registered['assignments'].get(request['request_id'])
         if assigned is None or assigned['state'] != 'assigned' or assigned['request_sha256'] != hashlib.sha256(raw).hexdigest():
             raise ValueError('host_review_assignment_untrusted')
@@ -629,7 +665,7 @@ def submit(request_file: Path, decision_file: Path, *, owner: str, source: Path,
         with runtime_control.stop_control_lease():
             _live(request, action, owner=owner)
             _write_new(_submission_file(request_file), value)
-            assigned['state'] = 'submitted'
+            assigned.update(state='submitted', submitted_at=value['submitted_at'])
             guard.write(path, registered)
     return {'status': 'published', 'write_state': 'not_requested', 'request_id': request['request_id']}
 
@@ -673,6 +709,29 @@ def complete(action: Path, reviewed: dict, *, completer=None) -> dict:
         return {**_base(), 'status': 'failed', 'error_code': 'host_review_result_untrusted'}
 
 
+
+def source_anchor(*, owner: str, operation: str = 'heartbeat') -> dict:
+    """Find the actual already-logged parent call from inside its current tool invocation."""
+    value = _registry(owner, live=False)
+    source = Path(value['reviewers'][0]['spawn_source']['session_file'])
+    _native_source(source, owner)
+    found = None
+    with source.open('rb') as stream:
+        for line, raw in enumerate(iter(lambda: stream.readline(32 * 1024 * 1024 + 1), b''), 1):
+            if len(raw) > 32 * 1024 * 1024:
+                raise ValueError('host_review_source_untrusted')
+            record = json.loads(raw)
+            payload = record.get('payload', {})
+            name = payload.get('name')
+            text = str(payload.get('arguments', payload.get('input', '')))
+            if (record.get('type') == 'response_item' and payload.get('type') in {'function_call', 'custom_tool_call'}
+                    and (name in {operation, 'collaboration.' + operation, 'functions.collaboration.' + operation}
+                         or name in {'exec', 'functions.exec'} and operation in text and owner in text)):
+                found = {'source': source, 'source_line': line}
+    if found is None:
+        raise ValueError('host_review_source_untrusted')
+    return found
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--operation', choices=['register', 'pending', 'assign', 'submit', 'heartbeat', 'enter-packaging', 'close'], default='submit')
@@ -702,12 +761,14 @@ def main(argv=None) -> int:
     elif args.operation == 'pending':
         result = {'requests': pending(owner=owner)}
     elif args.operation == 'heartbeat':
-        result = heartbeat(owner=owner)
+        if args.source_session_file is None or args.source_line is None:
+            parser.error('heartbeat requires the current parent native source call')
+        result = heartbeat(owner=owner, source=args.source_session_file, source_line=args.source_line)
     elif args.operation == 'enter-packaging':
         result = enter_packaging(owner=owner, receipt_file=args.receipt_file, invocation_id=args.invocation_id,
                                 tool_session_id=args.tool_session_id)
     elif args.operation == 'close':
-        result = close(owner=owner, reason=args.reason)
+        result = close(owner=owner, reason=args.reason, source=args.source_session_file, source_line=args.source_line)
     else:
         if args.request_file is None or args.source_session_file is None or args.source_line is None:
             parser.error('assign/submit requires request and actual source tool-call anchor')

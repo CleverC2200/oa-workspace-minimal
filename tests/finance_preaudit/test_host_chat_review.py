@@ -283,3 +283,38 @@ def test_packaging_reuses_original_round_only_after_sealed_finance_end(exchange)
     assert draft_request != confirmation
     assert json.loads(confirmation.read_text())['review_context']['draft_sha256'] == 'a' * 64
     assert {item['request_file'] for item in host.pending(owner=owner)} == {str(draft_request), str(confirmation)}
+
+
+def test_only_fresh_parent_native_call_can_renew_round_lease(exchange):
+    _, _, owner, child, *_ = exchange
+    parent = child.with_name('parent.jsonl')
+    child_line = native_call(child, 'functions.exec', 'heartbeat ' + owner, 'child-heartbeat', {'exit_code': 0})
+    with pytest.raises(ValueError, match='source_untrusted'):
+        host.heartbeat(owner=owner, source=child, source_line=child_line)
+    parent_line = native_call(parent, 'functions.exec', 'heartbeat ' + owner, 'parent-heartbeat', {'exit_code': 0})
+    first = host.heartbeat(owner=owner, source=parent, source_line=parent_line)
+    assert first['state'] == 'open'
+    repeated = host.heartbeat(owner=owner, source=parent, source_line=parent_line)
+    assert repeated['heartbeat_at'] == first['heartbeat_at']
+
+
+def test_normal_close_requires_original_finance_terminal_and_no_pending_work(exchange):
+    action, _, owner, child, _, manifest, _ = exchange
+    with pytest.raises(ValueError, match='close_incomplete'):
+        host.close(owner=owner)
+    controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
+    seal_execution(owner, manifest)
+    host.enter_packaging(owner=owner)
+    host.publish(action, prompt='Review package draft.', timeout_seconds=60, kind='packaging_draft')
+    with pytest.raises(ValueError, match='close_incomplete'):
+        host.close(owner=owner)
+
+
+def test_normal_close_proves_all_three_native_reviewers_are_idle(exchange):
+    _, _, owner, child, _, manifest, _ = exchange
+    controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
+    seal_execution(owner, manifest)
+    parent = child.with_name('parent.jsonl')
+    line = native_call(parent, 'list_agents', {}, 'native-status', {'agents': [
+        {'agent_name': f'/root/reviewer_{slot}', 'agent_status': 'completed'} for slot in range(3)]})
+    assert host.close(owner=owner, source=parent, source_line=line)['state'] == 'closed'
