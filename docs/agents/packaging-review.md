@@ -22,9 +22,21 @@
 
 OpenAI 包装调用加上 `--owner-task-id <本轮主会话UUID>`。返回原工具 session 后，主对话继续心跳和 pending 派单；不等该 session 结束才处理请求。主审使用已登记的空闲槽，读取当前冻结规则和原图，输出 App envelope：`draft` 保持原包装草稿，另有 `recheck_required`、`recheck_page_refs`、`recheck_reasons`。复核条件和原因由审核者按现行图片校对 Skill 判断，宿主不生成业务疑点。
 
-App 逐页看图需要当前派单之后、草稿写入之前的真实工具调用和配对图片输出。识别原生 `exec`/`functions.exec` 的单次 `tools.view_image({path:"原图绝对路径"})`，以及直接 view_image；一个调用对应一个原页。只提到路径、旧轮次看图、无图片输出或工具失败均不能成为主审覆盖。回执只保存原生调用/输出行哈希、页引用和材料摘要，不复制 Base64。缺失任何原页观察不进入 draft_ready。
+App 逐页看图需要当前派单之后、草稿发布之前的真实工具调用和配对图片输出。一个独立原生 `exec`/`functions.exec` 只执行以下一种完整形状，原页路径必须是字符串字面量，不附加注释、分支、变量替换、其他工具或其他图片输出；也接受直接 view_image 工具的真实调用和配对输出。一个调用对应一个原页。
 
-App `draft_ready` 保留主审 envelope、决定、真实来源和逐页观察，`semantic_acceptance=not_checked`。主对话核对原像素、意见及 Skill 的复核触发条件，不能只凭主审 false 布尔值判定无需复核。需要独立复核时执行：
+```javascript
+const r=await tools.view_image({path:"原页绝对路径"});image(r.image_url);
+```
+
+或使用：
+
+```javascript
+image((await tools.view_image({"path":"原页绝对路径"})).image_url);
+```
+
+只提到路径、旧轮次看图、无图片输出或工具失败均不能成为主审覆盖。回执只保存原生调用/输出行哈希、页引用和材料摘要，不复制 Base64。缺失任何原页观察不进入 draft_ready。
+
+主审和独立复核 payload 都按[规范决定发布](controller-execution.md#固定-app-审核槽的原生派单)使用 draft_command / write-draft，经单次 `text(await tools.exec_command({"cmd":"完整规范命令字符串"}));` 发布。原生输出必须是已完成命令的专用发布回执，其摘要绑定实际原 JSON 字节；通用写文件或自行声明完成均拒绝。App `draft_ready` 保留主审 envelope、决定、真实来源和逐页观察，`semantic_acceptance=not_checked`。主对话核对原像素、意见及 Skill 的复核触发条件，不能只凭主审 false 布尔值判定无需复核。需要独立复核时执行：
 
 ```bash
 python -B -m apps.oa_finance_preaudit.packaging_review --operation recheck --receipt-file <主审review-receipt.json> --owner-task-id <本轮主会话UUID>
@@ -32,7 +44,7 @@ python -B -m apps.oa_finance_preaudit.packaging_review --operation recheck --rec
 
 返回请求经原 pending/followup/assign 派给另一个已登记槽；不创建新 Agent。复核提示只传当前区域和规则，避免传主审结论。复核 payload 绑定原决定 SHA-256、page_refs、outcome 和逐位置 findings，真实看图来源仍需验证。复核结果为不同或不确定时，主对话保留分歧。只有原主审决定已经将所有受影响页记录为 uncertain、overall=needs_human，才能保留该警示意见完成；宿主不会把 pass 改成 uncertain。独立读取 unavailable 必须有真实失败工具记录，受影响页仍须由主审原决定明确标为 uncertain。原主审 pass 不能靠复核失败放行，保持人工处置。
 
-主对话通过独立工具调用写出私有语义确认 JSON，字段为 `receipt_sha256`、`decision_sha256`、`accepted`、`requirements_checked`、`recheck_required`、`recheck_request_file`、`conclusion`。accepted 和 requirements_checked 必须为 true，且由主对话实际评估原页、业务结论和复核条件。无复核时 recheck_request_file 为 null；需要时指向可信的不同槽复核请求。等待该次写入工具成功，保留主会话真实来源行后执行：
+主对话形成私有语义确认 JSON 后，用原主审 request_file 和新的确认文件路径调用 draft_command / write-draft，并使用上述严格单次 exec 发布形状，字段为 `receipt_sha256`、`decision_sha256`、`accepted`、`requirements_checked`、`recheck_required`、`recheck_request_file`、`conclusion`。accepted 和 requirements_checked 必须为 true，且由主对话实际评估原页、业务结论和复核条件。无复核时 recheck_request_file 为 null；需要时指向可信的不同槽复核请求。等待该次专用发布命令实际结束并核对 request/path/字节摘要回执，保留主会话真实来源行后执行：
 
 ```bash
 python -B -m apps.oa_finance_preaudit.packaging_review --operation confirm --receipt-file <主审review-receipt.json> --confirmation-file <父语义确认.json> --owner-task-id <本轮主会话UUID> --source-session-file <父原生会话jsonl> --source-line <已完成确认写入行>
@@ -44,6 +56,6 @@ python -B -m apps.oa_finance_preaudit.packaging_review --operation confirm --rec
 python -B -m apps.oa_finance_preaudit.packaging_review --operation complete --receipt-file <主审review-receipt.json> --confirm-write YES
 ```
 
-完成入口重新核验原草稿、来源、冻结材料和语义确认，再调用原 FlowEngine complete_review。关闭/取消、来源漂移、主审或复核决定变更、超期、停止门或缺语义确认均不进入 Writer。不改通用手工 FlowEngine 语义。DeepSeek 继续使用下方原调用者确认门及 complete-review，不采用 App 确认回执。
+完成入口重新核验原草稿、来源、冻结材料和语义确认，再调用原 FlowEngine complete_review。原消费者确认 closed 后，入口保存独占 app-completion.json，并在同轮槽位登记其摘要，绑定语义确认、原决定、闭合 action/state 和执行回执。正常 close 会重新核对这个完成回执；主审只提交草稿、未走完成入口或文件漂移时不能结束为 completed。关闭/取消、来源漂移、主审或复核决定变更、超期、停止门或缺语义确认均不进入 Writer。不改通用手工 FlowEngine 语义。DeepSeek 继续使用下方原调用者确认门及 complete-review，不采用 App 确认回执。
 
 确认工具证据、页面合同及业务语义后，只有已有 OA 写入授权且生产门禁完整可信时，才可把 `decision_file` 交给原 `complete-review`。该消费者继续执行完整确定性校验和受控提交；本入口不替代它。全部非包装仍由模型逐页确认，原消费者生成对应跳过意见；包装材料不得扩展为法规审核。原输出包含业务材料，仅本地受控留存，不提交 Git/Issue。

@@ -43,13 +43,21 @@ python -B -m apps.oa_finance_preaudit.host_chat_review --operation pending --own
 python -B -m apps.oa_finance_preaudit.host_chat_review --operation assign --owner-task-id <主会话UUID> --request-file <本轮request.json> --slot <0或1或2> --source-session-file <父原生会话jsonl> --source-line <本次followup行>
 ```
 
-4. 子 Agent 读取当前请求提示词、规则和冻结材料，写出本单决定或包装草稿。先通过独立 `functions.exec` 写入私有决定文件，等该次原工具输出成功，再用其来源行提交。正在执行的 submit 调用不能同时充当自己的已完成写文件证据。子 Agent 只交回决定，不调用 OA 完成动作。主对话保持心跳并等待原控制器，Writer 仍由控制器按认领顺序管理。
+4. 子 Agent 读取当前请求提示词、规则和冻结材料，形成本单决定或包装草稿。保存只使用专用 `write-draft`，目标必须是尚不存在的私有文件。先调用 `host_chat_review.draft_command(Path(request_file), Path(decision_file), payload, owner=owner)`，取得固定 `uv run --no-sync python -B -m ... --operation write-draft` 命令。payload 是审核者形成的原 JSON；不手工拼接 shell 参数，不使用通用写文件脚本，不覆盖已有文件。
+
+将该完整命令用 JSON 字符串字面量填入下方 cmd，再执行一个独立原生 exec。整个调用只含这一条表达式，不附加变量、注释、分支或其他工具。此示例中的占位文字必须替换为 draft_command 返回值，不能照字面执行：
+
+```javascript
+text(await tools.exec_command({"cmd":"完整规范命令字符串"}));
+```
+
+等该次原工具输出实际结束、exit_code=0，且 stdout 的专用发布回执匹配当前 request_id、request_sha256、目标文件和决定字节 SHA-256，再用其来源行 submit。仅文件存在、调用中提到路径、另一个命令成功或自行打印的成功对象均不构成证据。正在执行的 submit 不能充当自己的已完成发布证据。子 Agent 只交回决定，不调用 OA 完成动作。主对话保持心跳并等待原控制器，Writer 仍按认领顺序管理。
 
 ```bash
 python -B -m apps.oa_finance_preaudit.host_chat_review --operation submit --owner-task-id <主会话UUID> --request-file <本轮request.json> --decision-file <本单私有决定json> --source-session-file <已登记子会话jsonl> --source-line <已完成决定写入行>
 ```
 
-财务原工具 session 和原回执均确认 completed、children_reaped=true，且新鲜结束门禁可信、Writer 空闲后，执行 `host_chat_review --operation enter-packaging --owner-task-id <主会话UUID>`。该操作只推进同轮阶段，不重启控制器，不增加 Agent；包装请求继续使用上方 pending、followup、assign、submit。包装业务确认和完成动作见[包装审核](packaging-review.md)。包装及结束对账完成后，确认 3 个原 Agent 均无运行任务，再先执行原生 `collaboration.list_agents`，保留包含本轮 3 个 Agent 终态的实际工具来源，再执行 `host_chat_review --operation close --owner-task-id <主会话UUID> --reason completed --source-session-file <父原生会话jsonl> --source-line <该list_agents调用行>`，然后主对话才能结束。
+财务原工具 session 和原回执均确认 completed、children_reaped=true，且新鲜结束门禁可信、Writer 空闲后，执行 `host_chat_review --operation enter-packaging --owner-task-id <主会话UUID>`。该操作只推进同轮阶段，不重启控制器，不增加 Agent；包装请求继续使用上方 pending、followup、assign、submit。包装业务确认和完成动作见[包装审核](packaging-review.md)。包装主审请求还必须由 App 完成入口产生可信 app-completion.json，绑定语义确认、决定、闭合 action/state、执行回执和文件指纹；独立复核请求只是只读结果，不代替 OA 完成。仅主审 submitted 或 draft_ready 时 normal close 拒绝，不能直接把本轮报完成。包装及结束对账完成后，确认 3 个原 Agent 均无运行任务，再执行原生 `collaboration.list_agents`，保留包含本轮 3 个 Agent 终态的实际工具来源，再执行 `host_chat_review --operation close --owner-task-id <主会话UUID> --reason completed --source-session-file <父原生会话jsonl> --source-line <该list_agents调用行>`，然后主对话才能结束。
 
 人工取消、官方限制、子 Agent 不可用或父任务即将退出时，先停止派单。对运行中的原子 Agent 使用原生 `interrupt_agent`，随后关闭同轮 exchange，reason 使用 cancelled、reviewer_failed 或 parent_lost，并继续监督原工具 session 与 Writer 收尾。中断保留子会话上下文，不证明 Agent 被销毁或回收；主对话仍须确认原生状态和程序回执。关闭后拒绝迟到决定，不自动替换 Agent、不回退 OpenAI CLI、不重放 unknown 写入。父任务突然丢失时，原父链门和租约失效负责止损；退出结果缺失保持 unknown。机器断电或全部保护进程同时被强杀不保证完整收尾。
 
