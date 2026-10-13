@@ -123,3 +123,10 @@ def test_catalog_drift_blocks_production_configuration(repository, field, value)
     data["models"][0][field] = value
     path.write_text(json.dumps(data))
     assert "production_config_catalog_drift" in production_config.repository_findings(repository)
+
+
+def test_openai_cli_guard_cannot_be_replaced_with_a_different_failure(repository):
+    path = repository / 'apps/oa_finance_preaudit/codex_review_worker.py'
+    text = path.read_text().replace('openai_review_cli_forbidden', 'codex_process_failed')
+    path.write_text(text)
+    assert 'production_config_openai_cli_guard_drift' in production_config.repository_findings(repository)

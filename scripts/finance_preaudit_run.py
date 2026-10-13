@@ -677,8 +677,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.receipt_file is not None:
             raise ValueError("controller_tool_session_binding_invalid")
-        configuration = production_config.review_settings(args.review_provider, transport=(
-            args.review_transport or ("host_chat" if (args.review_provider or production_config.DEFAULT_REVIEW_PROVIDER) == "openai" else "cli")))
+        selected_provider = args.review_provider or os.environ.get(
+            production_config.REVIEW_PROVIDER_ENV, production_config.DEFAULT_REVIEW_PROVIDER)
+        configuration = production_config.review_settings(selected_provider, transport=(
+            args.review_transport or ("host_chat" if selected_provider == "openai" else "cli")))
         os.environ[production_config.REVIEW_PROVIDER_ENV] = configuration["provider"]
         # Reset the transport each round; environment from a prior round cannot override selection.
         os.environ[host_chat_review.TRANSPORT_ENV] = configuration.get("transport", "cli")
