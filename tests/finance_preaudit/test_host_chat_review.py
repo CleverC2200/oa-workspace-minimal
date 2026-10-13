@@ -16,7 +16,7 @@ from scripts import finance_preaudit_concurrency_probe as controller, finance_pr
 
 
 @pytest.fixture
-def exchange(tmp_path, monkeypatch):
+def exchange(tmp_path, monkeypatch, request):
     root = tmp_path / 'project'
     root.mkdir()
     engine = flow_engine.FlowEngine(root=root / 'runtime/finance_preaudit_flows',
@@ -49,7 +49,10 @@ def exchange(tmp_path, monkeypatch):
         with host.approval_lifecycle.run_scope(manifest, root):
             binding = original_execution(owner, manifest)
             monkeypatch.delenv(host.guard.EXECUTION_OWNERS_ENV, raising=False)
-            host.register(reviewers, owner=owner, source=parent, **binding)
+            request.node.original_binding = binding
+            request.node.native_reviewers = reviewers
+            if getattr(request, 'param', True):
+                host.register(reviewers, owner=owner, source=parent, **binding)
             host.approval_lifecycle.heartbeat(manifest['run_id'], manifest['controller_instance_id'], {action}, [], writer_active=False)
             task = {'project_root': str(root), 'action_file': str(action), 'timeout_seconds': 60}
             yield action, draft, owner, source, task, manifest, engine
@@ -318,3 +321,133 @@ def test_normal_close_proves_all_three_native_reviewers_are_idle(exchange):
     line = native_call(parent, 'list_agents', {}, 'native-status', {'agents': [
         {'agent_name': f'/root/reviewer_{slot}', 'agent_status': 'completed'} for slot in range(3)]})
     assert host.close(owner=owner, source=parent, source_line=line)['state'] == 'closed'
+
+
+def test_read_result_revalidates_original_child_decision_and_keeps_stable_receipt(exchange):
+    _, draft, owner, source, *_ = exchange
+    thread, results, request = start(exchange)
+    host.submit(request, draft, owner=owner, source=source, source_line=2)
+    thread.join(3)
+    first = host.read_result(request)
+    assert host.read_result(request) == first
+    assert first['host_receipt'] == results[0]['host_receipt']
+    json_artifact.write_json_atomic(draft, {'overall': 'pass', 'items': []})
+    draft.chmod(0o600)
+    with pytest.raises(ValueError, match='source_untrusted'):
+        host.read_result(request)
+
+
+@pytest.mark.parametrize('damage', ['cross_slot', 'failed_output', 'missing_output', 'bare_exec'])
+def test_child_tool_source_must_match_assigned_native_slot_and_success(exchange, monkeypatch, damage):
+    action, draft, owner, source, *_ = exchange
+    thread, results, request = start(exchange)
+    line = 2
+    if damage == 'cross_slot':
+        source = source.with_name('child-1.jsonl')
+        line = native_call(source, 'functions.exec', 'write ' + str(draft), 'cross-slot-call', {'exit_code': 0})
+    elif damage == 'failed_output':
+        raw = source.read_text().replace('{\\"exit_code\\": 0}', '{\\"exit_code\\": 2}')
+        source.write_text(raw)
+    elif damage == 'missing_output':
+        source.write_text(''.join(source.read_text().splitlines(keepends=True)[:2]))
+    else:
+        source.write_text(source.read_text().replace('functions.exec', 'exec'))
+    if damage == 'bare_exec':
+        assert host.submit(request, draft, owner=owner, source=source, source_line=line)['status'] == 'published'
+    else:
+        with pytest.raises(ValueError, match='source_untrusted'):
+            host.submit(request, draft, owner=owner, source=source, source_line=line)
+        assert not action.with_name(host.SUBMISSION).exists()
+        host.close(owner=owner, reason='cancelled')
+    thread.join(3)
+    assert not thread.is_alive()
+
+
+def test_fixed_slot_cannot_overlap_or_change_its_assignment(exchange):
+    action, draft, owner, source, _, _, engine = exchange
+    thread, results, request = start(exchange)
+    action2 = Path(engine.next_action('general_expense')['action_file'])
+    request2 = host.publish(action2, prompt='Review second action.', timeout_seconds=60)
+    parent = source.with_name('parent.jsonl')
+    dispatch = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(request2)}, 'busy-dispatch', {})
+    with pytest.raises(ValueError, match='slot_busy'):
+        host.assign(request2, slot=0, owner=owner, source=parent, source_line=dispatch)
+    line = native_call(parent, 'followup_task', {'target': '/root/reviewer_1', 'message': str(request)}, 'rebind-dispatch', {})
+    with pytest.raises(ValueError, match='assignment_rebinding'):
+        host.assign(request, slot=1, owner=owner, source=parent, source_line=line)
+    host.close(owner=owner, reason='cancelled')
+    thread.join(3)
+    assert not thread.is_alive()
+
+
+def test_public_heartbeat_command_can_discover_its_already_logged_parent_anchor(exchange, capsys):
+    _, _, owner, child, *_ = exchange
+    parent = child.with_name('parent.jsonl')
+    line = native_call(parent, 'functions.exec', 'heartbeat ' + owner, 'current-heartbeat', {'exit_code': 0})
+    anchor = host.source_anchor(owner=owner)
+    assert anchor == {'source': parent, 'source_line': line}
+    assert host.main(['--operation', 'heartbeat', '--owner-task-id', owner,
+        '--source-session-file', str(anchor['source']), '--source-line', str(anchor['source_line'])]) == 0
+    assert json.loads(capsys.readouterr().out)['state'] == 'open'
+
+
+@pytest.mark.parametrize('exchange', [False], indirect=True)
+def test_first_review_waits_for_the_round_registration_in_its_original_worker(exchange, request):
+    action, draft, owner, child, task, *_ = exchange
+    results = []
+    thread = threading.Thread(target=lambda: results.append(host.review(task)))
+    thread.start()
+    time.sleep(.05)
+    assert thread.is_alive() and not results and not action.with_name(host.REQUEST).exists()
+    parent = child.with_name('parent.jsonl')
+    host.register(request.node.native_reviewers, owner=owner, source=parent, **request.node.original_binding)
+    deadline = time.monotonic() + 3
+    published = action.with_name(host.REQUEST)
+    while not published.exists() and time.monotonic() < deadline:
+        time.sleep(.01)
+    assert published.exists()
+    dispatch = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(published)}, 'boot-dispatch', {})
+    host.assign(published, slot=0, owner=owner, source=parent, source_line=dispatch)
+    source_line = native_call(child, 'exec', 'write ' + str(draft), 'boot-review', {'exit_code': 0})
+    host.submit(published, draft, owner=owner, source=child, source_line=source_line)
+    thread.join(3)
+    assert not thread.is_alive() and results[0]['status'] == 'reviewed'
+
+
+def test_parent_lease_observation_stops_admission_during_prepare_without_review_waiter(exchange, monkeypatch):
+    _, _, owner, _, _, manifest, _ = exchange
+    # Preparing has no published App review request or waiting review thread.
+    assert host.pending(owner=owner) == []
+    value = json.loads(host.registry_file(owner).read_text())
+    value['heartbeat_at'] = time.time() - 46
+    host.guard.write(host.registry_file(owner), value)
+    monkeypatch.setattr(worker, '_terminate_process_group', lambda *_a, **_k: pytest.fail('Writer killed'))
+    with pytest.raises(ValueError, match='parent_lost'):
+        host.assert_round_alive(owner=owner, manifest=manifest)
+    assert runtime_control.stop_requested()
+    assert json.loads(host.registry_file(owner).read_text())['state'] == 'cancelled'
+
+
+@pytest.mark.parametrize('exchange', [False], indirect=True)
+def test_bootstrap_observation_grace_is_bounded_by_the_original_manifest_clock(exchange):
+    from datetime import datetime, timedelta, timezone
+    _, _, owner, _, _, manifest, _ = exchange
+    host.assert_round_alive(owner=owner, manifest=manifest)
+    assert not runtime_control.stop_requested()
+    original = dict(manifest)
+    expired = {**manifest, 'started_at': (datetime.now(timezone.utc) - timedelta(seconds=901)).isoformat()}
+    host.guard.write(controller_handoff.manifest_file(), expired)
+    try:
+        with pytest.raises(ValueError, match='parent_lost'):
+            host.assert_round_alive(owner=owner, manifest=expired)
+        assert runtime_control.stop_requested()
+    finally:
+        host.guard.write(controller_handoff.manifest_file(), original)
+
+
+def test_round_observer_cannot_accept_a_different_controller_instance(exchange):
+    _, _, owner, _, _, manifest, _ = exchange
+    changed = {**manifest, 'controller_instance_id': uuid4().hex}
+    with pytest.raises(ValueError, match='parent_lost'):
+        host.assert_round_alive(owner=owner, manifest=changed)
+    assert runtime_control.stop_requested()
