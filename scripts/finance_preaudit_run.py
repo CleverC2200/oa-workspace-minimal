@@ -301,6 +301,10 @@ def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str
                 else:
                     report["controller_stdout"] = logs["stdout.log"].decode("utf-8")
                 report["output_sha256"] = receipt["output_sha256"]
+        if (configuration is not None and configuration.get("transport") == "host_chat"
+                and manifest is not None and manifest["state"] == "running"
+                and state in {"starting", "waiting"} and report["status"] == "waiting"):
+            report["review_requests"] = host_chat_review.pending(owner=owner_task_id, manifest=manifest)
         # Atomic receipt replacement while the child exits requires a fresh snapshot, never mixed proof.
         if (_read_evidence(path) != raw
                 or _read_evidence(path.with_name("controller-manifest.json")) != manifest_raw
