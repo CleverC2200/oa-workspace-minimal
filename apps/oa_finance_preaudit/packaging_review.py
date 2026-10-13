@@ -1,4 +1,4 @@
-"""Bounded packaging review drafts; this entry never calls an OA write port."""
+"""Packaging drafts and authorized completion through the existing FlowEngine."""
 from __future__ import annotations
 
 import argparse
@@ -426,29 +426,40 @@ def complete_host(receipt_file: Path, *, project_root: Path = PROJECT_ROOT, conf
         _trusted_host_receipt(receipt_file)
         result = engine.complete_review(Path(receipt['action_file']), Path(receipt['decision_file']))
         if result.get('action') == 'closed' and result.get('write_state') in {'not_requested', 'submitted'}:
-            action_file = Path(receipt['action_file'])
-            closed = json.loads(review_context.read_input(action_file))
-            if closed.get('action') != 'closed' or closed.get('execution_state') != 'closed':
-                raise ValueError('packaging_completion_untrusted')
-            files = [receipt_file, confirmation_file, Path(receipt['decision_file']), action_file,
-                     action_file.with_name('state.json'), action_file.with_name('execution-receipt.json'),
-                     Path(closed['decision_file'])]
-            marker = {'schema_version': 1, 'kind': 'preaudit_app_packaging_completion',
-                      'request_id': request['request_id'], 'request_sha256': reviewed['host_receipt']['request_sha256'],
-                      'submission_sha256': reviewed['host_receipt']['submission_sha256'],
-                      'decision_sha256': receipt['decision_sha256'], 'action_file': str(action_file),
-                      'file_sha256': {str(path): hashlib.sha256(review_context.read_input(path)).hexdigest() for path in files},
-                      'write_state': result['write_state']}
-            marker_file = receipt_file.with_name('app-completion.json')
-            host_chat_review._write_new(marker_file, marker)
-            # Seal an already-completed Writer even if the parent lease expired
-            # during its in-flight operation; this admits no new write.
-            registered = host_chat_review._registry(confirmed['owner_task_id'], live=False)
-            registered['assignments'][request['request_id']].update(
-                completion_file=str(marker_file), completion_sha256=hashlib.sha256(review_context.read_input(marker_file, private=True)).hexdigest(),
-                completed_at=time.time())
-            from . import approval_guard
-            approval_guard.write(host_chat_review.registry_file(confirmed['owner_task_id']), registered)
+            try:
+                action_file = Path(receipt['action_file'])
+                closed = json.loads(review_context.read_input(action_file))
+                if closed.get('action') != 'closed' or closed.get('execution_state') != 'closed':
+                    raise ValueError('packaging_completion_untrusted')
+                files = [receipt_file, confirmation_file, Path(receipt['decision_file']), action_file,
+                         action_file.with_name('state.json'), action_file.with_name('execution-receipt.json'),
+                         Path(closed['decision_file'])]
+                marker = {'schema_version': 1, 'kind': 'preaudit_app_packaging_completion',
+                          'request_id': request['request_id'], 'request_sha256': reviewed['host_receipt']['request_sha256'],
+                          'submission_sha256': reviewed['host_receipt']['submission_sha256'],
+                          'decision_sha256': receipt['decision_sha256'], 'action_file': str(action_file),
+                          'file_sha256': {str(path): hashlib.sha256(review_context.read_input(path)).hexdigest() for path in files},
+                          'write_state': result['write_state']}
+                marker_file = receipt_file.with_name('app-completion.json')
+                host_chat_review._write_new(marker_file, marker)
+                # Seal an already-completed Writer even if the parent lease expired
+                # during its in-flight operation; this admits no new write.
+                registered = host_chat_review._registry(confirmed['owner_task_id'], live=False)
+                registered['assignments'][request['request_id']].update(
+                    completion_file=str(marker_file), completion_sha256=hashlib.sha256(review_context.read_input(marker_file, private=True)).hexdigest(),
+                    completed_at=time.time())
+                from . import approval_guard
+                approval_guard.write(host_chat_review.registry_file(confirmed['owner_task_id']), registered)
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                # The original consumer has already sealed the business outcome.
+                # A local App evidence failure cannot erase or replay that write.
+                seal = {'status': 'failed', 'error_code': 'packaging_completion_seal_failed', 'stop_requested': False}
+                try:
+                    runtime_control.request_cycle_stop()
+                    seal['stop_requested'] = True
+                except (OSError, RuntimeError, ValueError):
+                    seal['stop_request_error'] = 'packaging_stop_request_failed'
+                return {**result, 'completion_seal': seal}
         return result
 
 
@@ -567,7 +578,7 @@ def review(action_file: Path, *, project_root: Path = PROJECT_ROOT, timeout_seco
         os.umask(old_umask)
 
 
-def main(argv=None) -> int:
+def main(argv=None, *, completion_engine: flow_engine.FlowEngine | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--operation', choices=('review', 'recheck', 'confirm', 'complete'), default='review')
     parser.add_argument('--action-file', type=Path)
@@ -599,11 +610,11 @@ def main(argv=None) -> int:
                 source=args.source_session_file, source_line=args.source_line)
         else:
             auth.load_local_env()
-            result = complete_host(args.receipt_file, confirm_write=args.confirm_write == 'YES')
+            result = complete_host(args.receipt_file, confirm_write=args.confirm_write == 'YES', engine=completion_engine)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError):
         result = {'status': 'failed', 'error_code': 'packaging_review_setup_failed', 'write_state': 'not_requested'}
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-    return 1 if result.get('status') == 'failed' else 0
+    return 1 if result.get('status') == 'failed' or result.get('completion_seal', {}).get('status') == 'failed' else 0
 
 
 if __name__ == '__main__':

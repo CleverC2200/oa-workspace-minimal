@@ -348,3 +348,49 @@ def test_package_completion_marker_detects_drift_before_normal_round_close(packa
         {'agent_name': f'/root/reviewer_{slot}', 'agent_status': {'completed': 'done'}} for slot in range(3)]})
     with pytest.raises(ValueError, match='packaging_incomplete'):
         host.close(owner=owner, source=parent, source_line=line)
+
+
+@pytest.mark.parametrize('seal_failure', ['marker', 'hash', 'registry'])
+def test_public_completion_reports_confirmed_write_when_local_marker_seal_fails(package_round, monkeypatch, capsys, seal_failure):
+    from tests.finance_preaudit.test_flow_engine_packaging import _material, _grant, REGION_KEYS, WORKFLOW_KEY
+    from apps.oa_finance_preaudit.flow_engine import FlowEngine
+    _, root, owner, child = package_round
+    calls = []
+    def submit(job):
+        calls.append(job)
+        if seal_failure == 'hash':
+            receipt.with_name('semantic-confirmation.json').unlink()
+        elif seal_failure == 'registry':
+            registry_file = host.registry_file(owner)
+            registry_file.unlink()
+            registry_file.mkdir(mode=0o700)
+        return {'schema_version': 1, 'kind': 'preaudit_submission_result', 'submission_token': job['submission_token'],
+                'write': True, 'submit_ok': True, 'done_hit': True, 'postcheck_done_hit': True}
+    engine = FlowEngine(root=root / 'runtime/finance_preaudit_flows',
+        discover_candidates=lambda workflow: [{'request_id': 'postwrite-marker-failure',
+            'received_at': '2026-08-22T09:00:00+08:00', 'workflow_key': workflow}],
+        collect_material=lambda request, attempt: _material(request, attempt, workflow_key=WORKFLOW_KEY,
+            regions=dict.fromkeys(REGION_KEYS, 'clear'), excel=False, image_fixture='packaging_sample.png', excel_mismatch=False),
+        authorization_source=_grant, authorization_verifier=lambda grant, context: grant == _grant(context), submit_frozen=submit)
+    action = Path(engine.next_action(WORKFLOW_KEY, mode='controlled_write')['action_file'])
+    controlled_round = (action, root, owner, child)
+    receipt = ready_draft(controlled_round)
+    semantic_accept(receipt, controlled_round)
+    if seal_failure == 'marker':
+        receipt.with_name('app-completion.json').mkdir(mode=0o700)
+    monkeypatch.setattr(packaging.auth, 'load_local_env', lambda: None)
+    code = packaging.main(['--operation', 'complete', '--receipt-file', str(receipt), '--confirm-write', 'YES'],
+        completion_engine=engine)
+    output = json.loads(capsys.readouterr().out)
+    assert code == 1 and output['action'] == 'closed' and output['write_state'] == 'submitted'
+    assert output['completion_seal'] == {'status': 'failed', 'error_code': 'packaging_completion_seal_failed', 'stop_requested': True}
+    assert len(calls) == 1 and json.loads(action.read_text())['write_state'] == 'submitted'
+    assert host.runtime_control.stop_requested()
+    parent = child.with_name('parent.jsonl')
+    line = native_call(parent, 'list_agents', {}, 'native-after-seal-failure', {'agents': [
+        {'agent_name': f'/root/reviewer_{slot}', 'agent_status': {'completed': 'done'}} for slot in range(3)]})
+    with pytest.raises(ValueError):
+        host.close(owner=owner, source=parent, source_line=line)
+    if seal_failure != 'registry':
+        assert host.close(owner=owner, reason='cancelled')['state'] == 'cancelled'
+    assert len(calls) == 1 and json.loads(action.read_text())['write_state'] == 'submitted'
