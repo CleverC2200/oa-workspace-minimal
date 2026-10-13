@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -20,22 +22,11 @@ SUBMISSION = 'host-review-submission.json'
 
 
 def selected() -> bool:
-    value = os.environ.get(TRANSPORT_ENV, 'cli')
-    if value not in {'cli', 'host_chat'}:
-        raise ValueError('approval_review_transport_invalid')
-    if value == 'host_chat' and production_config.review_settings()['provider'] != 'openai':
-        raise ValueError('host_review_provider_mismatch')
-    return value == 'host_chat'
+    return settings().get('transport') == 'host_chat'
 
 
 def settings(provider: str | None = None) -> dict:
-    profile = production_config.review_settings(provider)
-    if os.environ.get(TRANSPORT_ENV, 'cli') == 'host_chat':
-        if profile['provider'] != 'openai':
-            raise ValueError('host_review_provider_mismatch')
-        return dict(IDENTITY)
-    selected()
-    return profile
+    return production_config.review_settings(provider)
 
 
 def _read(path: Path) -> tuple[bytes, dict]:
@@ -68,6 +59,286 @@ def _write_new(path: Path, value: dict) -> None:
             os.unlink(temporary, dir_fd=parent)
 
 
+
+def _native_source(source: Path, session: str, line: int = 1, *, output: bool = False) -> tuple[dict, dict]:
+    """Read native session ancestry and one immutable tool-call anchor."""
+    source = source.absolute()
+    home = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex').absolute()
+    if (not source.is_relative_to(home / 'sessions') or type(line) is not int or line < 1
+            or any(path.is_symlink() for path in (source, *source.parents))):
+        raise ValueError('host_review_source_untrusted')
+    metadata = source.stat()
+    if metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
+        raise ValueError('host_review_source_untrusted')
+    header = anchor = result = None
+    with source.open('rb') as stream:
+        for number, raw in enumerate(stream, 1):
+            if len(raw) > 32 * 1024 * 1024:
+                raise ValueError('host_review_source_untrusted')
+            value = json.loads(raw)
+            if number == 1:
+                header = value
+                if header.get('type') != 'session_meta' or header.get('payload', {}).get('id') != session:
+                    raise ValueError('host_review_source_untrusted')
+            if number == line:
+                anchor = value
+                proof = {'session_file': str(source), 'line': line,
+                         'line_sha256': hashlib.sha256(raw).hexdigest()}
+                if not output:
+                    break
+            if output and anchor is not None and number > line:
+                payload = value.get('payload', {})
+                if (value.get('type') == 'response_item' and payload.get('type') in {'function_call_output', 'custom_tool_call_output'}
+                        and payload.get('call_id') == anchor.get('payload', {}).get('call_id')):
+                    result = payload.get('output')
+                    proof.update(output_line=number, output_sha256=hashlib.sha256(raw).hexdigest())
+                    break
+    if header is None or anchor is None or (output and result is None):
+        raise ValueError('host_review_source_untrusted')
+    proof['session_id'] = session
+    if output:
+        try:
+            # Native collaboration function outputs are JSON strings.
+            result = json.loads(result) if isinstance(result, str) else result
+        except (TypeError, ValueError) as error:
+            raise ValueError('host_review_source_untrusted') from error
+        if not isinstance(result, (dict, list)):
+            raise ValueError('host_review_source_untrusted')
+        proof['output'] = result
+    return {'header': header['payload'], 'anchor': anchor}, proof
+
+
+def _tool(anchor: dict, name: str) -> dict:
+    payload = anchor.get('payload', {})
+    if (anchor.get('type') != 'response_item' or payload.get('type') not in {'function_call', 'custom_tool_call'}
+            or payload.get('name') not in {name, 'collaboration.' + name, 'functions.collaboration.' + name}
+            or not payload.get('call_id')):
+        raise ValueError('host_review_source_untrusted')
+    arguments = payload.get('arguments', payload.get('input'))
+    try:
+        value = json.loads(arguments) if isinstance(arguments, str) else arguments
+    except (ValueError, TypeError) as error:
+        raise ValueError('host_review_source_untrusted') from error
+    if not isinstance(value, dict):
+        raise ValueError('host_review_source_untrusted')
+    return value
+
+
+def registry_file(owner: str) -> Path:
+    UUID(owner)
+    from . import controller_handoff
+    return controller_handoff.manifest_file().parent / 'app-review-rounds' / owner / 'registry.json'
+
+
+@contextmanager
+def _round_lease(owner: str):
+    path = registry_file(owner)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with runtime_control.pinned_directory(path.parent) as parent:
+        fd = os.open('registry.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield path
+        finally:
+            os.close(fd)
+
+
+def _reviewers(reviewers: list[dict], owner: str, source: Path) -> list[dict]:
+    if not isinstance(reviewers, list) or len(reviewers) != 3:
+        raise ValueError('host_review_fixed_slots_required')
+    registered = []
+    for slot, entry in enumerate(reviewers):
+        child = Path(entry['session_file']).absolute()
+        # Read the header through the same native-source checks below.
+        home = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex').absolute()
+        if not child.is_relative_to(home / 'sessions') or any(path.is_symlink() for path in (child, *child.parents)):
+            raise ValueError('host_review_source_untrusted')
+        descriptor = os.open(child, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, 'rb') as stream:
+            import stat
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise ValueError('host_review_source_untrusted')
+            header = json.loads(stream.readline(1024 * 1024)).get('payload', {})
+        reviewer = header.get('id')
+        UUID(reviewer)
+        child_native, child_proof = _native_source(child, reviewer)
+        ancestry = child_native['header'].get('source', {}).get('subagent', {}).get('thread_spawn', {})
+        parent_native, spawn_proof = _native_source(source, owner, entry['spawn_line'], output=True)
+        arguments = _tool(parent_native['anchor'], 'spawn_agent')
+        agent_path = spawn_proof['output'].get('task_name')
+        if (ancestry.get('parent_thread_id') != owner or ancestry.get('depth') != 1
+                or ancestry.get('agent_path') != agent_path or not isinstance(agent_path, str)
+                or not agent_path.endswith('/' + str(arguments.get('task_name')))):
+            raise ValueError('host_review_source_untrusted')
+        registered.append({'slot': slot, 'reviewer_task_id': reviewer, 'agent_path': agent_path,
+                           'child_source': child_proof, 'spawn_source': spawn_proof})
+    if len({item['reviewer_task_id'] for item in registered}) != 3 or len({item['agent_path'] for item in registered}) != 3:
+        raise ValueError('host_review_fixed_slots_required')
+    return registered
+
+
+def register(reviewers: list[dict], *, owner: str, source: Path, receipt_file: Path | None = None,
+             invocation_id: str | None = None, tool_session_id: str | None = None) -> dict:
+    """Bind this round to exactly three actual native child conversations."""
+    registered = _reviewers(reviewers, owner, source)
+    from . import controller_handoff
+    manifest = controller_handoff._read_manifest()
+    if (manifest is None or manifest['state'] != 'running' or manifest.get('review_configuration') != IDENTITY
+            or not guard.execution_owners_alive() or runtime_control.stop_requested()):
+        raise ValueError('host_review_run_untrusted')
+    if receipt_file is None or invocation_id is None or tool_session_id is None:
+        raise ValueError('host_review_original_execution_required')
+    from scripts import finance_preaudit_run
+    binding = {'receipt_file': str(receipt_file.absolute()), 'owner_task_id': owner,
+               'invocation_id': invocation_id, 'tool_session_id': tool_session_id}
+    report = finance_preaudit_run.read_execution(**binding)
+    if (report['status'] != 'waiting' or report.get('run_id') != manifest['run_id']
+            or report.get('controller_instance_id') != manifest['controller_instance_id']):
+        raise ValueError('host_review_parent_untrusted')
+    receipt = _read(receipt_file)[1]
+    owners = receipt.get('owner_processes', []) + [receipt.get('supervisor_process'), receipt.get('controller_process')]
+    if not owners or not all(guard._valid_identity(item) and guard.process_identity(item['pid']) == item for item in owners):
+        raise ValueError('host_review_parent_untrusted')
+    value = {'schema_version': 1, 'kind': 'preaudit_app_review_round', 'owner_task_id': owner,
+             'run_id': manifest['run_id'], 'controller_instance_id': manifest['controller_instance_id'],
+             'reviewers': registered, 'original_execution': binding, 'execution_owners': owners, 'phase': 'finance', 'state': 'open',
+             'heartbeat_at': time.time(), 'assignments': {}}
+    with _round_lease(owner) as path:
+        if os.path.lexists(path):
+            previous = _read(path)[1]
+            if any(previous.get(key) != value[key] for key in ('owner_task_id', 'run_id', 'controller_instance_id', 'reviewers', 'original_execution')):
+                raise ValueError('host_review_registry_rebinding')
+            return previous
+        _write_new(path, value)
+    return value
+
+
+def _registry(owner: str, *, live: bool = True) -> dict:
+    value = _read(registry_file(owner))[1]
+    if (value.get('kind') != 'preaudit_app_review_round' or value.get('schema_version') != 1
+            or value.get('owner_task_id') != owner or value.get('phase') not in {'finance', 'packaging'}
+            or not isinstance(value.get('assignments'), dict)):
+        raise ValueError('host_review_registry_untrusted')
+    UUID(hex=value['run_id']); UUID(hex=value['controller_instance_id'])
+    entries = [{'session_file': item['child_source']['session_file'], 'spawn_line': item['spawn_source']['line']}
+               for item in value['reviewers']]
+    if value['reviewers'] != _reviewers(entries, owner, Path(value['reviewers'][0]['spawn_source']['session_file'])):
+        raise ValueError('host_review_registry_untrusted')
+    if live:
+        if (value.get('state') != 'open' or runtime_control.stop_requested()
+                or not guard._timestamp(value.get('heartbeat_at'))
+                or not 0 <= time.time() - value['heartbeat_at'] < approval_lifecycle.HEARTBEAT_MAX_AGE
+                or not all(guard.process_identity(item['pid']) == item for item in value['execution_owners'])):
+            raise ValueError('host_review_parent_lost_or_closed')
+    return value
+
+
+
+def registered_reviewers(*, owner: str) -> list[dict]:
+    return _registry(owner)['reviewers']
+
+def heartbeat(*, owner: str) -> dict:
+    """The main App conversation renews its round lease while it supervises work."""
+    with _round_lease(owner) as path:
+        value = _registry(owner)
+        value['heartbeat_at'] = time.time()
+        guard.write(path, value)
+    return {'state': value['state'], 'phase': value['phase'], 'heartbeat_at': value['heartbeat_at']}
+
+
+def close(*, owner: str, reason: str = 'completed') -> dict:
+    """Close the exchange; cancellation never signals the Writer process."""
+    if reason not in {'completed', 'cancelled', 'parent_lost', 'reviewer_failed'}:
+        raise ValueError('host_review_close_reason_invalid')
+    with _round_lease(owner) as path:
+        value = _registry(owner, live=False)
+        if value['state'] != 'open':
+            return {'state': value['state'], 'reason': value['close_reason']}
+        if reason == 'completed' and (any(item['state'] == 'assigned' for item in value['assignments'].values())
+                                      or runtime_control.writer_active() or runtime_control.active_request_writers()):
+            raise ValueError('host_review_close_incomplete')
+        value.update(state='closed' if reason == 'completed' else 'cancelled', close_reason=reason, closed_at=time.time())
+        guard.write(path, value)
+    if reason != 'completed':
+        runtime_control.request_cycle_stop()
+    return {'state': value['state'], 'reason': reason}
+
+
+def pending(*, owner: str | None = None, manifest: dict | None = None) -> list[dict]:
+    """Observe only requests listed in the current controller's bound progress."""
+    owner = owner or os.environ.get(guard.OWNER_ENV)
+    if owner is None:
+        return []
+    from . import controller_handoff
+    current = controller_handoff._read_manifest()
+    if current is None or (manifest is not None and current != manifest):
+        return []
+    try:
+        registered = _registry(owner)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        return []
+    if registered['run_id'] != current['run_id'] or registered['controller_instance_id'] != current['controller_instance_id']:
+        return []
+    progress = approval_lifecycle._progress(current)
+    if progress is None:
+        return []
+    results = []
+    for action_file in progress['actions']:
+        request_file = Path(action_file).with_name(REQUEST)
+        if not os.path.lexists(request_file):
+            continue
+        raw, request = _read(request_file)
+        try:
+            _live(request, Path(action_file), owner=owner)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            continue
+        assignment = registered['assignments'].get(request['request_id'])
+        if assignment is not None and assignment['state'] == 'submitted':
+            continue
+        results.append({'request_id': request['request_id'], 'request_file': str(request_file),
+                        'request_sha256': hashlib.sha256(raw).hexdigest(), 'expires_at': request['expires_at'],
+                        'review_kind': request['review_kind'], 'assignment': assignment})
+    return results
+
+
+def assign(request_file: Path, *, slot: int, owner: str, source: Path, source_line: int) -> dict:
+    """Bind one current request to a fixed child after an actual followup_task call."""
+    request_file = request_file.absolute()
+    raw, request = _read(request_file)
+    action = request_file.with_name('action.json')
+    _live(request, action, owner=owner)
+    with _round_lease(owner) as path:
+        registered = _registry(owner)
+        if type(slot) is not int or slot not in range(3):
+            raise ValueError('host_review_slot_untrusted')
+        reviewer = registered['reviewers'][slot]
+        native, proof = _native_source(source, owner, source_line, output=True)
+        arguments = _tool(native['anchor'], 'followup_task')
+        if (arguments.get('target') not in {reviewer['agent_path'], reviewer['agent_path'].rsplit('/', 1)[-1]}
+                or str(request_file) not in arguments.get('message', '')
+                or proof['output'].get('error') or proof['output'].get('isError') is True):
+            raise ValueError('host_review_source_untrusted')
+        existing = registered['assignments'].get(request['request_id'])
+        if existing is not None:
+            if existing['slot'] == slot and existing['dispatch_source'] == proof:
+                return existing
+            raise ValueError('host_review_assignment_rebinding')
+        if any(item['slot'] == slot and item['state'] == 'assigned' for item in registered['assignments'].values()):
+            raise ValueError('host_review_slot_busy')
+        from datetime import datetime
+        timestamp = native['anchor'].get('timestamp')
+        if not isinstance(timestamp, str):
+            raise ValueError('host_review_stale_dispatch')
+        dispatched_at = datetime.fromisoformat(timestamp.replace('Z', '+00:00')).timestamp()
+        if not request['created_at'] <= dispatched_at <= time.time():
+            raise ValueError('host_review_stale_dispatch')
+        value = {'request_id': request['request_id'], 'request_sha256': hashlib.sha256(raw).hexdigest(),
+                 'slot': slot, 'reviewer_task_id': reviewer['reviewer_task_id'], 'state': 'assigned',
+                 'dispatch_source': proof, 'dispatched_at': dispatched_at}
+        registered['assignments'][request['request_id']] = value
+        guard.write(path, registered)
+    return value
+
 def _fingerprints(action: Path) -> dict:
     from . import codex_review_worker as worker
     context = review_context.capture(action, worker._decision_schema(action))
@@ -92,6 +363,15 @@ def _live(request: dict, action: Path, *, owner: str | None = None) -> None:
             or request.get('input_fingerprints') != _fingerprints(action)
             or type(request.get('expires_at')) not in {int, float} or time.time() >= request['expires_at']):
         raise ValueError('host_review_request_untrusted')
+    registered = _registry(request['owner_task_id'])
+    if (registered['run_id'] != request['run_id'] or registered['controller_instance_id'] != request['controller_instance_id']):
+        raise ValueError('host_review_registry_untrusted')
+    if registered['phase'] == 'packaging':
+        if request.get('review_kind') not in {'packaging_draft', 'packaging_confirmation'}:
+            raise ValueError('host_review_phase_untrusted')
+        return
+    if request.get('review_kind') != 'finance':
+        raise ValueError('host_review_phase_untrusted')
     from . import controller_handoff
     manifest = controller_handoff._read_manifest()
     if (manifest is None or manifest['state'] != 'running'
@@ -112,106 +392,141 @@ def _base() -> dict:
             'business_state': 'not_available', 'write_state': 'not_requested'}
 
 
-def review(task: dict) -> dict:
-    from . import codex_review_worker as worker
+def publish(action: Path, *, prompt: str, timeout_seconds: int, kind: str = 'finance') -> Path:
+    """Publish frozen work only; Python never creates native agents."""
+    action = action.absolute()
+    owner = os.environ.get(guard.OWNER_ENV)
+    if owner is None or kind not in {'finance', 'packaging_draft', 'packaging_confirmation'}:
+        raise ValueError('host_review_run_untrusted')
+    registered = _registry(owner)
+    from . import controller_handoff
+    manifest = controller_handoff._read_manifest()
+    if manifest is None:
+        raise ValueError('host_review_run_untrusted')
+    request = {'schema_version': 1, 'kind': 'preaudit_host_review_request', 'review_kind': kind,
+               'request_id': uuid4().hex, 'owner_task_id': owner, 'run_id': registered['run_id'],
+               'controller_instance_id': registered['controller_instance_id'],
+               'controller_process': guard.process_identity(manifest['controller_pid']),
+               'action_file': str(action), 'input_fingerprints': _fingerprints(action),
+               'review_configuration': dict(IDENTITY), 'created_at': time.time(),
+               'expires_at': time.time() + timeout_seconds, 'prompt': prompt}
+    _live(request, action, owner=owner)
+    request_file = action.with_name(REQUEST)
+    _write_new(request_file, request)
+    return request_file
+
+
+def _submission(request_file: Path, request: dict) -> tuple[bytes, dict]:
+    action = Path(request['action_file'])
+    raw, submitted = _read(action.with_name(SUBMISSION))
+    registered = _registry(request['owner_task_id'])
+    assigned = registered['assignments'].get(request['request_id'])
+    if (assigned is None or assigned['state'] != 'submitted'
+            or set(submitted) != {'schema_version', 'kind', 'owner_task_id', 'request_sha256',
+                                  'decision', 'source', 'assignment', 'submitted_at'}
+            or submitted['schema_version'] != 1 or submitted['kind'] != 'preaudit_host_review_submission'
+            or submitted['owner_task_id'] != request['owner_task_id']
+            or submitted['request_sha256'] != hashlib.sha256(_read(request_file)[0]).hexdigest()
+            or submitted['assignment'] != {key: assigned[key] for key in ('slot', 'reviewer_task_id', 'dispatched_at')}
+            or not isinstance(submitted['decision'], dict)):
+        raise ValueError('host_review_submission_untrusted')
+    source = submitted['source']
+    if source != _source_receipt(Path(source['session_file']), source['line'], assigned['reviewer_task_id'],
+                                 Path(source['decision_file']), assigned=assigned):
+        raise ValueError('host_review_source_untrusted')
+    return raw, submitted
+
+
+def await_result(request_file: Path) -> dict:
     started = time.monotonic()
     try:
-        if not selected():
-            raise ValueError('host_review_transport_invalid')
-        root, action, timeout = worker._validated_task(task)
-        context = approval_lifecycle.context()
-        owner = os.environ.get(guard.OWNER_ENV)
-        if context is None or owner is None:
-            raise ValueError('host_review_run_untrusted')
-        UUID(owner)
-        run, instance, _ = context
-        from . import controller_handoff
-        manifest = controller_handoff._read_manifest()
-        request = {'schema_version': 1, 'kind': 'preaudit_host_review_request',
-                   'request_id': uuid4().hex, 'owner_task_id': owner,
-                   'run_id': run, 'controller_instance_id': instance,
-                   'controller_process': guard.process_identity(manifest['controller_pid']),
-                   'action_file': str(action), 'input_fingerprints': _fingerprints(action),
-                   'review_configuration': dict(IDENTITY), 'created_at': time.time(),
-                   'expires_at': time.time() + timeout,
-                   'prompt': worker._prompt(action)}
-        _live(request, action, owner=owner)
-        request_file = action.with_name(REQUEST)
-        _write_new(request_file, request)
-        request_sha = hashlib.sha256(review_context.read_input(request_file, private=True)).hexdigest()
+        request_raw, request = _read(request_file)
+        action = Path(request['action_file'])
         submission = action.with_name(SUBMISSION)
         while not os.path.lexists(submission):
-            _live(request, action, owner=owner)
+            _live(request, action)
             time.sleep(.2)
-        _live(request, action, owner=owner)
-        raw, submitted = _read(submission)
-        if (set(submitted) != {'schema_version', 'kind', 'owner_task_id', 'request_sha256',
-                               'decision', 'source', 'submitted_at'}
-                or submitted['schema_version'] != 1 or submitted['kind'] != 'preaudit_host_review_submission'
-                or submitted['owner_task_id'] != owner or submitted['request_sha256'] != request_sha
-                or not isinstance(submitted['decision'], dict)):
-            raise ValueError('host_review_submission_untrusted')
+        _live(request, action)
+        raw, submitted = _submission(request_file, request)
         return {**_base(), 'status': 'reviewed', 'error_code': None,
                 'agent_wall_seconds': int(time.monotonic() - started), 'decision': submitted['decision'],
-                'host_receipt': {'request_file': str(request_file), 'request_sha256': request_sha,
+                'host_receipt': {'request_file': str(request_file), 'request_sha256': hashlib.sha256(request_raw).hexdigest(),
                                  'submission_file': str(submission), 'submission_sha256': hashlib.sha256(raw).hexdigest()}}
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+        # Leave in-flight write classification to the original Writer. No signals here.
+        try:
+            close(owner=request['owner_task_id'], reason='parent_lost' if 'parent_lost' in str(error) else 'reviewer_failed')
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            pass
+        runtime_control.request_cycle_stop()
         return {**_base(), 'status': 'failed', 'error_code': 'host_review_exchange_failed'}
 
 
-def _source_receipt(source: Path, line: int, owner: str, decision_file: Path) -> dict:
-    """Bind the actual host tool call, preserving unknown host model identity."""
-    home = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex').absolute()
-    source = source.absolute()
-    if (not source.is_relative_to(home / 'sessions')
-            or any(path.is_symlink() for path in (source, *source.parents)) or line < 1):
-        raise ValueError('host_review_source_untrusted')
-    metadata = source.stat()
-    if metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
-        raise ValueError('host_review_source_untrusted')
-    header = anchor = None
-    with source.open('rb') as stream:
-        for index, raw in enumerate(stream, 1):
-            if index == 1:
-                header = json.loads(raw)
-            if index == line:
-                anchor = (raw, json.loads(raw)); break
-    if (header is None or header.get('type') != 'session_meta'
-            or header.get('payload', {}).get('id') != owner or anchor is None):
-        raise ValueError('host_review_source_untrusted')
-    raw, value = anchor
-    payload = value.get('payload', {})
-    if (value.get('type') != 'response_item' or payload.get('type') not in {'function_call', 'custom_tool_call'}
+def review(task: dict) -> dict:
+    from . import codex_review_worker as worker
+    try:
+        if not selected():
+            raise ValueError('host_review_transport_invalid')
+        _, action, timeout = worker._validated_task(task)
+        request_file = publish(action, prompt=worker._prompt(action), timeout_seconds=timeout)
+        return await_result(request_file)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        return {**_base(), 'status': 'failed', 'error_code': 'host_review_exchange_failed'}
+
+
+def _source_receipt(source: Path, line: int, reviewer: str, decision_file: Path, *, assigned: dict) -> dict:
+    """Bind the registered child and its successful native decision-writing call."""
+    native, proof = _native_source(source, reviewer, line, output=True)
+    payload = native['anchor'].get('payload', {})
+    if (native['anchor'].get('type') != 'response_item'
+            or payload.get('type') not in {'function_call', 'custom_tool_call'}
             or payload.get('name') != 'functions.exec' or not payload.get('call_id')
             or str(decision_file) not in str(payload.get('arguments', payload.get('input', '')))):
         raise ValueError('host_review_source_untrusted')
-    return {'session_file': str(source), 'line': line, 'line_sha256': hashlib.sha256(raw).hexdigest(),
-            'call_id': payload['call_id'], 'owner_task_id': owner, 'model': 'unknown',
-            'decision_file': str(decision_file),
+    output = proof.pop('output')
+    if isinstance(output, dict) and (output.get('exit_code') not in {None, 0} or output.get('isError') is True):
+        raise ValueError('host_review_source_untrusted')
+    from datetime import datetime
+    timestamp = native['anchor'].get('timestamp')
+    if not isinstance(timestamp, str) or not assigned['dispatched_at'] <= datetime.fromisoformat(timestamp.replace('Z', '+00:00')).timestamp() <= time.time():
+        raise ValueError('host_review_stale_source')
+    return {**proof, 'call_id': payload['call_id'], 'reviewer_task_id': reviewer, 'model': 'unknown',
+            'dispatched_at': assigned['dispatched_at'], 'decision_file': str(decision_file),
             'decision_input_sha256': hashlib.sha256(review_context.read_input(decision_file, private=True)).hexdigest()}
 
 
 def submit(request_file: Path, decision_file: Path, *, owner: str, source: Path, source_line: int) -> dict:
     request_file, decision_file = request_file.absolute(), decision_file.absolute()
     raw, request = _read(request_file)
-    action = request_file.with_name('action.json')
+    action = Path(request['action_file'])
     if request_file.name != REQUEST or not action.is_relative_to(runtime_control.PROJECT_ROOT / 'runtime/finance_preaudit_flows'):
         raise ValueError('host_review_request_untrusted')
     _live(request, action, owner=owner)
-    _, decision = _read(decision_file)
-    provenance = _source_receipt(source, source_line, owner, decision_file)
-    from .review_decision import bind_frozen_fields
-    decision = bind_frozen_fields(action, decision)
-    from .flow_engine import FlowEngine
-    engine = FlowEngine(root=action.parents[4], discover_candidates=lambda _: (), collect_material=lambda *_: {})
-    # Validate the complete decision before publishing; this performs no OA write.
-    engine.validate_review_decision(action, decision)
-    value = {'schema_version': 1, 'kind': 'preaudit_host_review_submission', 'owner_task_id': owner,
-             'request_sha256': hashlib.sha256(raw).hexdigest(), 'decision': decision,
-             'source': provenance, 'submitted_at': time.time()}
-    with runtime_control.stop_control_lease():
-        _live(request, action, owner=owner)
-        _write_new(action.with_name(SUBMISSION), value)
+    with _round_lease(owner) as path:
+        registered = _registry(owner)
+        assigned = registered['assignments'].get(request['request_id'])
+        if assigned is None or assigned['state'] != 'assigned' or assigned['request_sha256'] != hashlib.sha256(raw).hexdigest():
+            raise ValueError('host_review_assignment_untrusted')
+        _, decision = _read(decision_file)
+        provenance = _source_receipt(source, source_line, assigned['reviewer_task_id'], decision_file, assigned=assigned)
+        if request['review_kind'] == 'finance':
+            from .review_decision import bind_frozen_fields
+            decision = bind_frozen_fields(action, decision)
+            from .flow_engine import FlowEngine
+            engine = FlowEngine(root=action.parents[4], discover_candidates=lambda _: (), collect_material=lambda *_: {})
+            engine.validate_review_decision(action, decision)
+        else:
+            from . import packaging_review
+            decision = packaging_review.validate_host_submission(action, decision, provenance, request['review_kind'])
+        value = {'schema_version': 1, 'kind': 'preaudit_host_review_submission', 'owner_task_id': owner,
+                 'request_sha256': hashlib.sha256(raw).hexdigest(), 'decision': decision, 'source': provenance,
+                 'assignment': {key: assigned[key] for key in ('slot', 'reviewer_task_id', 'dispatched_at')},
+                 'submitted_at': time.time()}
+        with runtime_control.stop_control_lease():
+            _live(request, action, owner=owner)
+            _write_new(action.with_name(SUBMISSION), value)
+            assigned['state'] = 'submitted'
+            guard.write(path, registered)
     return {'status': 'published', 'write_state': 'not_requested', 'request_id': request['request_id']}
 
 
@@ -232,13 +547,15 @@ def complete(action: Path, reviewed: dict, *, completer=None) -> dict:
         _live(request, action)
         if submitted['decision'] != reviewed['decision'] or submitted['request_sha256'] != proof['request_sha256']:
             raise ValueError('host_review_result_untrusted')
+        _, submitted = _submission(request_file, request)
         source = submitted['source']
         draft = Path(source['decision_file'])
-        if source != _source_receipt(Path(source['session_file']), source['line'], request['owner_task_id'], draft):
-            raise ValueError('host_review_source_untrusted')
         from .review_decision import bind_frozen_fields
         if submitted['decision'] != bind_frozen_fields(action, _read(draft)[1]):
             raise ValueError('host_review_result_untrusted')
+        if not worker._write_agent_timing(action, wall_seconds=reviewed['agent_wall_seconds'], attempts=0,
+                                          token_usage={'status': 'unknown'}, identity=IDENTITY):
+            raise ValueError('host_review_timing_untrusted')
         error = (completer or worker._complete_decision)(action, reviewed['decision'])
         business = worker._read_completed(action)
         if error is None and business is not None:
@@ -247,7 +564,7 @@ def complete(action: Path, reviewed: dict, *, completer=None) -> dict:
         # Existing completer owns rejection/unknown-write classification and stop publication.
         return {**_base(), 'status': 'failed', 'error_code': error or 'host_review_submit_incomplete',
                 'write_state': 'unknown' if error in worker._UNKNOWN_WRITE_FAILURE_CODES else 'not_requested'}
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
         runtime_control.request_cycle_stop()
         return {**_base(), 'status': 'failed', 'error_code': 'host_review_result_untrusted'}
 
