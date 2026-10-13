@@ -1,3 +1,6 @@
+
+# Select the retained supplier explicitly for recorded CLI/slot behavior.
+from tests.finance_preaudit.review_profiles import retained_deepseek_cli  # noqa: F401
 from contextlib import ExitStack
 import json
 import os
@@ -72,6 +75,7 @@ def official_history(home, root, rows):
 
 def test_main_official_error_uses_original_time_and_project_scope(tmp_path, monkeypatch):
     monkeypatch.setenv(guard.production_config.REVIEW_PROVIDER_ENV, "openai")
+    monkeypatch.setenv(guard.production_config.REVIEW_TRANSPORT_ENV, "host_chat")
     now = time.time()
     error = json.dumps({"codexErrorInfo": "usageLimitExceeded"})
     home, root = tmp_path / "codex", tmp_path / "project"
@@ -88,6 +92,7 @@ def test_main_official_error_uses_original_time_and_project_scope(tmp_path, monk
 
 def test_unreadable_official_history_blocks_before_any_launch(tmp_path, monkeypatch):
     monkeypatch.setenv(guard.production_config.REVIEW_PROVIDER_ENV, "openai")
+    monkeypatch.setenv(guard.production_config.REVIEW_TRANSPORT_ENV, "host_chat")
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "missing"))
     with pytest.raises(ValueError, match="approval_official_history_unavailable"):
         lifecycle.startup(tmp_path)
@@ -95,6 +100,7 @@ def test_unreadable_official_history_blocks_before_any_launch(tmp_path, monkeypa
 
 def test_first_official_notice_stops_before_later_damaged_history(tmp_path, monkeypatch):
     monkeypatch.setenv(guard.production_config.REVIEW_PROVIDER_ENV, "openai")
+    monkeypatch.setenv(guard.production_config.REVIEW_TRANSPORT_ENV, "host_chat")
     now = time.time()
     home, root = tmp_path / "codex", tmp_path / "project"
     official_history(home, root, [
@@ -450,6 +456,7 @@ def test_deepseek_admission_ignores_unrelated_openai_history(tmp_path, monkeypat
 
 def test_unselected_codex_admission_requires_native_history(tmp_path, monkeypatch):
     monkeypatch.delenv('OA_REVIEW_PROVIDER', raising=False)
+    monkeypatch.delenv('OA_REVIEW_TRANSPORT', raising=False)
     monkeypatch.setenv('CODEX_HOME', str(tmp_path / 'no-native-history'))
     with pytest.raises(ValueError, match='approval_official_history_unavailable'):
         guard.observe_project_errors(tmp_path)
