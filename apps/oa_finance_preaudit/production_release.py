@@ -100,6 +100,20 @@ def _pinned_control(path: Path, *, private: bool = True,
     return identity, raw
 
 
+def _paused_cron(automation: ProductionAutomation) -> tuple:
+    native_home = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex').expanduser().absolute()
+    registered = native_home / 'automations/oa-skill/automation.toml'
+    if automation.file.expanduser().absolute() != registered:
+        raise RuntimeError('production_release_automation_identity_mismatch')
+    cron = _pinned_control(automation.file, private=False)
+    configuration = tomllib.loads(cron[1].decode('utf-8'))
+    if configuration.get('id') != 'oa-skill':
+        raise RuntimeError('production_release_automation_identity_mismatch')
+    if configuration.get('status') != 'PAUSED':
+        raise RuntimeError('production_release_automation_not_paused')
+    return cron
+
+
 def _stopped_controls(root: Path, automation: ProductionAutomation, *, official_stop_source_only: bool = False,
                       user_stop_source_only: bool = False) -> tuple:
     if os.environ.get('OA_FINANCE_PREAUDIT_STOP_REQUESTED', '').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}:
@@ -112,16 +126,7 @@ def _stopped_controls(root: Path, automation: ProductionAutomation, *, official_
                      else b'stop_requested:codex_review_technical_failure\n')
     if stop[1] != expected_stop:
         raise RuntimeError('production_release_stop_not_repairable')
-    native_home = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex').expanduser().absolute()
-    registered = native_home / 'automations/oa-skill/automation.toml'
-    if automation.file.expanduser().absolute() != registered:
-        raise RuntimeError('production_release_automation_identity_mismatch')
-    cron = _pinned_control(automation.file, private=False)
-    configuration = tomllib.loads(cron[1].decode('utf-8'))
-    if configuration.get('id') != 'oa-skill':
-        raise RuntimeError('production_release_automation_identity_mismatch')
-    if configuration.get('status') != 'PAUSED':
-        raise RuntimeError('production_release_automation_not_paused')
+    cron = _paused_cron(automation)
     findings = automation.findings(root)
     if findings:
         raise RuntimeError('production_release_configuration_invalid:' + ','.join(findings))
@@ -247,9 +252,7 @@ def release_source(
         if (confirmed_withdrawal is not True or stopped_maintenance or automation is None or original_execution is None):
             raise RuntimeError('production_release_withdrawal_confirmation_required')
         withdrawn_action = Path(withdrawn_action).expanduser().absolute()
-        withdrawal_cron = _control_proof(_pinned_control(automation.file))
-        if tomllib.loads(automation.file.read_text()).get('status') != 'PAUSED':
-            raise RuntimeError('production_release_withdrawal_cron_active')
+        withdrawal_cron = _control_proof(_paused_cron(automation))
     if (supervisor_loss_source_only or official_stop_source_only or user_stop_source_only) and not stopped_maintenance:
         raise RuntimeError('production_release_stopped_maintenance_required')
     if sum((supervisor_loss_source_only, official_stop_source_only, user_stop_source_only)) > 1:
@@ -273,7 +276,7 @@ def release_source(
     else:
         _assert_no_stop(root)
     def assert_controls() -> None:
-        if withdrawal_cron is not None and _control_proof(_pinned_control(automation.file)) != withdrawal_cron:
+        if withdrawal_cron is not None and _control_proof(_pinned_control(automation.file, private=False)) != withdrawal_cron:
             raise RuntimeError('production_release_withdrawal_controls_changed')
         if stopped_maintenance:
             if _stopped_controls(root, automation, official_stop_source_only=official_stop_source_only,

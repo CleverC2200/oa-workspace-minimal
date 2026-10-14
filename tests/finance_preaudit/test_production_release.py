@@ -598,10 +598,12 @@ def test_release_rejects_shared_git_directory(production):
             check_configuration=lambda target, revision: [])
 
 
-def test_confirmed_withdrawal_source_only_retains_block_and_original_success(stopped_production, monkeypatch):
+@pytest.mark.parametrize('cron_mode', [0o600, 0o644])
+def test_confirmed_withdrawal_source_only_retains_block_and_original_success(stopped_production, monkeypatch, cron_mode):
     from apps.oa_finance_preaudit import withdrawn_submission
     from tests.finance_preaudit.test_withdrawn_submission import submitted
     root, remote, revision, stop, automation, original, report=stopped_production
+    automation.file.chmod(cron_mode)
     stop.unlink()
     _, action, observation=submitted(root/'runtime/finance_preaudit_flows')
     state=json.loads(action.with_name('state.json').read_text())
@@ -623,6 +625,7 @@ def test_confirmed_withdrawal_source_only_retains_block_and_original_success(sto
         production_release.release_source(root,withdrawn_action=action,**options)
     old={p.name:p.read_bytes() for p in action.parent.iterdir() if p.is_file()}
     cron=automation.file.read_bytes()
+    cron_metadata=_control_metadata(automation.file.lstat())
     result=production_release.release_source(root,withdrawn_action=action,confirmed_withdrawal=True,
         confirmed_sync=True,**options)
     assert result['status']=='synced' and result['next_process_ready'] is False
@@ -631,3 +634,31 @@ def test_confirmed_withdrawal_source_only_retains_block_and_original_success(sto
     assert not action.parent.with_name('attempt-2').exists()
     assert {p.name:p.read_bytes() for p in action.parent.iterdir() if p.is_file()}==old
     assert automation.file.read_bytes()==cron and not stop.exists()
+    assert _control_metadata(automation.file.lstat()) == cron_metadata
+
+
+@pytest.mark.parametrize('substitution', ['copy', 'wrong_id', 'writable', 'symlink', 'active'])
+def test_withdrawal_source_only_requires_the_registered_paused_native_cron(stopped_production, substitution):
+    root, remote, revision, stop, automation, original, report = stopped_production
+    path = automation.file
+    if substitution == 'copy':
+        copied = root.parent / 'copied-automation.toml'
+        copied.write_bytes(path.read_bytes())
+        automation = production_release.ProductionAutomation(copied, automation.project_id, automation.schedule)
+    elif substitution == 'wrong_id':
+        path.write_text(path.read_text().replace('id = "oa-skill"', 'id = "other"'))
+    elif substitution == 'writable':
+        path.chmod(0o666)
+    elif substitution == 'symlink':
+        copied = path.with_name('copied.toml')
+        path.rename(copied)
+        path.symlink_to(copied)
+    else:
+        path.write_text(path.read_text().replace('status = "PAUSED"', 'status = "ACTIVE"'))
+    expected = ('production_release_automation_identity_mismatch' if substitution in {'copy', 'wrong_id'}
+                else 'production_release_automation_not_paused' if substitution == 'active'
+                else 'production_release_control_untrusted')
+    with pytest.raises(RuntimeError, match=expected):
+        production_release.release_source(root, expected_revision=revision, expected_origin=str(remote),
+            automation=automation, original_execution=original, withdrawn_action=root / 'unopened-action.json',
+            confirmed_withdrawal=True)
