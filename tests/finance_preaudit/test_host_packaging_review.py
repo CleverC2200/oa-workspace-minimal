@@ -268,7 +268,7 @@ def test_controlled_app_completion_keeps_existing_writer_grant_and_receipt(packa
         calls.append(job)
         if expire_parent:
             now = time.time()
-            monkeypatch.setattr(host.time, 'time', lambda: now + 46)
+            monkeypatch.setattr(host.time, 'time', lambda: now + host.PARENT_HEARTBEAT_MAX_AGE + 1)
         return {'schema_version': 1, 'kind': 'preaudit_submission_result', 'submission_token': job['submission_token'],
                 'write': True, 'submit_ok': True, 'done_hit': True, 'postcheck_done_hit': True}
     engine = FlowEngine(root=root / 'runtime/finance_preaudit_flows',

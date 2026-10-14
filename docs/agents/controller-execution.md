@@ -30,7 +30,7 @@
 python -B -m apps.oa_finance_preaudit.host_chat_review --operation register --owner-task-id <主会话UUID> --source-session-file <父原生会话jsonl> --reviewer-session-file <槽0子会话jsonl> --spawn-line <槽0spawn行> --reviewer-session-file <槽1子会话jsonl> --spawn-line <槽1spawn行> --reviewer-session-file <槽2子会话jsonl> --spawn-line <槽2spawn行> --receipt-file <原execution.json> --invocation-id <原调用ID> --tool-session-id <原session_id>
 ```
 
-2. 每次取得可信进度后读取当前请求，并在 30 秒以内续一次父任务心跳。心跳必须来自主会话本次已落盘的原生调用，父会话 UUID 和实际调用时间均需可信。可在当前原生 exec 内调用 `source_anchor(owner, operation="heartbeat")` 取得当前来源，再调用 `heartbeat(owner=owner, **anchor)`；重复旧来源不延长租约。维持原工具 session 的等待；不得等待直到控制器退出才派单。心跳到期关闭新增派单和结果接收，不把等待超时当审批重试授权。
+2. 每次取得可信进度后读取当前请求，并在 60 秒以内续一次父任务心跳。App 父租约独立为 300 秒，用于容忍原生派单和工具调度超过 45 秒；控制器自身的 45 秒进程心跳门保持原值。父租约到期阈值为 5 分钟，到期后的下一次既有检查拒绝派单和结果，控制器观察器再请求停止。原进程身份丢失、显式停止及单据截止时间仍在原检查点生效。心跳必须来自主会话本次已落盘的原生调用，父会话 UUID 和实际调用时间均需可信。可在当前原生 exec 内调用 `source_anchor(owner, operation="heartbeat")` 取得当前来源，再调用 `heartbeat(owner=owner, **anchor)`；重复旧来源不延长租约。维持原工具 session 的等待；不得等待直到控制器退出才派单。心跳到期后，新增派单和结果接收在下一次检查时拒绝，不把等待超时当审批重试授权。
 
 ```bash
 python -B -m apps.oa_finance_preaudit.host_chat_review --operation heartbeat --owner-task-id <主会话UUID> --source-session-file <父原生会话jsonl> --source-line <本次heartbeat工具行>

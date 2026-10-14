@@ -1,14 +1,14 @@
 import time
 
 from apps.oa_approval import runtime_control
-from apps.oa_finance_preaudit import approval_lifecycle
+from apps.oa_finance_preaudit import approval_lifecycle, host_chat_review
 from tests.finance_preaudit.test_host_chat_review import exchange
 
 
 def test_existing_controller_observer_stops_expired_app_parent_without_review_waiter(exchange, monkeypatch):
     _, _, _, _, _, manifest, _ = exchange
     now = time.time()
-    monkeypatch.setattr(time, 'time', lambda: now + approval_lifecycle.HEARTBEAT_MAX_AGE + 1)
+    monkeypatch.setattr(time, 'time', lambda: now + host_chat_review.PARENT_HEARTBEAT_MAX_AGE + 1)
     with runtime_control.global_writer_lease():
         approval_lifecycle.heartbeat(manifest['run_id'], manifest['controller_instance_id'],
                                      set(), [], writer_active=True)

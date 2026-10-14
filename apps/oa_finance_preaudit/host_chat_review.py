@@ -21,6 +21,9 @@ MODULE = 'apps.oa_finance_preaudit.host_chat_review'
 IDENTITY = dict(production_config.HOST_REVIEW_IDENTITY)
 REQUEST = 'host-review-request.json'
 SUBMISSION = 'host-review-submission.json'
+# App scheduling and native tool calls can exceed the controller observer's 45s.
+# Keep this parent lease bounded without changing process/Writer supervision.
+PARENT_HEARTBEAT_MAX_AGE = 300
 
 
 def selected() -> bool:
@@ -261,7 +264,7 @@ def _registry(owner: str, *, live: bool = True) -> dict:
     if live:
         if (value.get('state') != 'open' or runtime_control.stop_requested()
                 or not guard._timestamp(value.get('heartbeat_at'))
-                or not 0 <= time.time() - value['heartbeat_at'] < approval_lifecycle.HEARTBEAT_MAX_AGE
+                or not 0 <= time.time() - value['heartbeat_at'] < PARENT_HEARTBEAT_MAX_AGE
                 or not all(guard.process_identity(item['pid']) == item for item in value['execution_owners'])):
             raise ValueError('host_review_parent_lost_or_closed')
     return value
@@ -423,7 +426,7 @@ def enter_packaging(*, owner: str, receipt_file: Path | None = None, invocation_
         value = _registry(owner, live=False)
         if (value.get('state') != 'open' or runtime_control.stop_requested()
                 or not guard._timestamp(value.get('heartbeat_at'))
-                or not 0 <= time.time() - value['heartbeat_at'] < approval_lifecycle.HEARTBEAT_MAX_AGE):
+                or not 0 <= time.time() - value['heartbeat_at'] < PARENT_HEARTBEAT_MAX_AGE):
             raise ValueError('host_review_parent_lost_or_closed')
         binding = value['original_execution']
         if ((receipt_file is not None and str(receipt_file.absolute()) != binding['receipt_file'])

@@ -393,10 +393,11 @@ def test_same_registered_child_reviews_two_frozen_actions_without_recreation(exc
 
 
 def test_parent_lease_loss_cancels_exchange_and_rejects_late_decision(exchange, monkeypatch):
-    action, draft, owner, source, *_ = exchange
+    action, draft, owner, source, task, *_ = exchange
+    task['timeout_seconds'] = 600
     thread, results, request = start(exchange)
     now = time.time()
-    monkeypatch.setattr(host.time, 'time', lambda: now + 46)
+    monkeypatch.setattr(host.time, 'time', lambda: now + 301)
     with pytest.raises(ValueError, match='parent_lost'):
         host.submit(request, draft, owner=owner, source=source, source_line=2)
     thread.join(3)
@@ -455,6 +456,45 @@ def test_packaging_reuses_original_round_only_after_sealed_finance_end(exchange)
     assert draft_request != confirmation
     assert json.loads(confirmation.read_text())['review_context']['draft_sha256'] == 'a' * 64
     assert {item['request_file'] for item in host.pending(owner=owner)} == {str(draft_request), str(confirmation)}
+
+
+def test_app_parent_survives_a_native_dispatch_longer_than_45_seconds(exchange, monkeypatch):
+    _, _, owner, child, *_ = exchange
+    parent = child.with_name('parent.jsonl')
+    line = native_call(parent, 'functions.exec', 'heartbeat ' + owner, 'before-slow-native-dispatch', {'exit_code': 0})
+    initial = host.heartbeat(owner=owner, source=parent, source_line=line)
+    now = initial['heartbeat_at']
+    monkeypatch.setattr(host.time, 'time', lambda: now + 45.179)
+    assert len(host.registered_reviewers(owner=owner)) == 3
+    assert not runtime_control.stop_requested()
+
+
+@pytest.mark.parametrize('elapsed', [299.999, 300.0])
+def test_app_parent_lease_has_a_hard_five_minute_deadline(exchange, monkeypatch, elapsed):
+    _, _, owner, child, *_ = exchange
+    parent = child.with_name('parent.jsonl')
+    line = native_call(parent, 'functions.exec', 'heartbeat ' + owner, 'bounded-parent-lease', {'exit_code': 0})
+    initial = host.heartbeat(owner=owner, source=parent, source_line=line)
+    monkeypatch.setattr(host.time, 'time', lambda: initial['heartbeat_at'] + elapsed)
+    if elapsed < 300:
+        assert len(host.registered_reviewers(owner=owner)) == 3
+    else:
+        with pytest.raises(ValueError, match='parent_lost'):
+            host.registered_reviewers(owner=owner)
+        with pytest.raises(ValueError, match='parent_lost'):
+            host.heartbeat(owner=owner, source=parent, source_line=line)
+
+
+def test_app_parent_enters_packaging_after_a_long_native_dispatch(exchange, monkeypatch):
+    _, _, owner, child, _, manifest, _ = exchange
+    parent = child.with_name('parent.jsonl')
+    line = native_call(parent, 'functions.exec', 'heartbeat ' + owner, 'finance-before-native-delay', {'exit_code': 0})
+    initial = host.heartbeat(owner=owner, source=parent, source_line=line)
+    controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
+    seal_execution(owner, manifest)
+    monkeypatch.setattr(host.time, 'time', lambda: initial['heartbeat_at'] + 45.179)
+    assert host.enter_packaging(owner=owner)['phase'] == 'packaging'
+    assert len(host.registered_reviewers(owner=owner)) == 3
 
 
 def test_only_fresh_parent_native_call_can_renew_round_lease(exchange):
@@ -593,7 +633,7 @@ def test_parent_lease_observation_stops_admission_during_prepare_without_review_
     # Preparing has no published App review request or waiting review thread.
     assert host.pending(owner=owner) == []
     now = time.time()
-    monkeypatch.setattr(host.time, 'time', lambda: now + 46)
+    monkeypatch.setattr(host.time, 'time', lambda: now + 301)
     monkeypatch.setattr(worker, '_terminate_process_group', lambda *_a, **_k: pytest.fail('Writer killed'))
     with pytest.raises(ValueError, match='parent_lost'):
         host.assert_round_alive(owner=owner, manifest=manifest)
