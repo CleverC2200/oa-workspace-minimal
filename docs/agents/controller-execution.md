@@ -61,9 +61,30 @@ text(await tools.exec_command({"cmd":"完整规范命令字符串"}));
 python -B -m apps.oa_finance_preaudit.host_chat_review --operation submit --owner-task-id <主会话UUID> --request-file <本轮request.json> --decision-file <本单私有决定json> --source-session-file <已登记子会话jsonl> --source-line <已完成决定写入行>
 ```
 
-财务原工具 session 和原回执均确认 completed、children_reaped=true，且新鲜结束门禁可信、Writer 空闲后，执行 `host_chat_review --operation enter-packaging --owner-task-id <主会话UUID>`。该操作只推进同轮阶段，不重启控制器，不增加 Agent；包装请求继续使用上方 pending、followup、assign、submit。包装业务确认和完成动作见[包装审核](packaging-review.md)。包装主审请求还必须由 App 完成入口产生可信 app-completion.json，绑定语义确认、决定、闭合 action/state、执行回执和文件指纹；独立复核请求只是只读结果，不代替 OA 完成。仅主审 submitted 或 draft_ready 时 normal close 拒绝，不能直接把本轮报完成。包装及结束对账完成后，确认 3 个原 Agent 均无运行任务，再执行原生 `collaboration.list_agents`，保留包含本轮 3 个 Agent 终态的实际工具来源，再执行 `host_chat_review --operation close --owner-task-id <主会话UUID> --reason completed --source-session-file <父原生会话jsonl> --source-line <该list_agents调用行>`，然后主对话才能结束。
+财务原工具 session 和原回执均确认 completed、children_reaped=true，且新鲜结束门禁可信、Writer 空闲后，执行 `host_chat_review --operation enter-packaging --owner-task-id <主会话UUID>`。该操作只推进同轮阶段，不重启控制器，不增加 Agent；包装请求继续使用上方 pending、followup、assign、submit。包装业务确认和完成动作见[包装审核](packaging-review.md)。包装主审请求还必须由 App 完成入口产生可信 app-completion.json，绑定语义确认、决定、闭合 action/state、执行回执和文件指纹；独立复核请求只是只读结果，不代替 OA 完成。仅主审 submitted 或 draft_ready 时 normal close 拒绝，不能直接把本轮报完成。包装及结束对账完成后，执行下面的统一收尾。
 
-人工取消、官方限制、子 Agent 不可用或父任务即将退出时，先停止派单。对运行中的原子 Agent 使用原生 `interrupt_agent`，随后关闭同轮 exchange，reason 使用 cancelled、reviewer_failed 或 parent_lost，并继续监督原工具 session 与 Writer 收尾。中断保留子会话上下文，不证明 Agent 被销毁或回收；主对话仍须确认原生状态和程序回执。关闭后拒绝迟到决定，不自动替换 Agent、不回退 OpenAI CLI、不重放 unknown 写入。父任务突然丢失时，原父链门和租约失效负责止损；退出结果缺失保持 unknown。机器断电或全部保护进程同时被强杀不保证完整收尾。
+### App 统一收尾
+
+正常完成、人工取消、官方限制、子 Agent 异常和父任务主动退出均执行同一协议。主对话进入 final 前必须取得 `preaudit_app_shutdown` 的 `status=verified` 回执。父 final 不会可靠地中断仍运行的子 Agent。DeepSeek 保持原收尾路径。
+
+1. 调用 `begin-shutdown`，reason 选择 completed、cancelled、reviewer_failed 或 parent_lost。它冻结本轮派单、续租及迟到结果，返回原 3 个 `interrupt_targets` 和原工具 session ID。非正常原因同时关闭 exchange 并请求停止控制器；不发信号终止 Writer。begin 与在途包装完成共用原轮锁，可能等待已进入的 Writer 完成后才返回；不承诺抢占写入。单独的 exchange cancelled/closed 不代表统一收尾已完成。
+2. 对返回的每个原 Agent 调用一次原生 `collaboration.interrupt_agent`，即使它当前已经空闲，也保留实际配对回执。不得新增或替换 Agent。随后调用原生 `collaboration.list_agents`，确认本轮 3 槽全部为 idle、completed 或 interrupted；仍 running、缺失、工具失败或来源不可验证时保持 pending。
+3. 继续等待原工具 session 和 Writer。原工具必须有实际终态 `write_stdin` 回执，调用单独使用下方形状；只轮询、不写 stdin。财务阶段已经取得的同一原 session 退出回执可复用。进程回执必须 terminal、children_reaped=true，退出码与原生等待一致，Writer 和请求 Writer 均空闲。非零退出只可封存为取消/异常收尾，不能报业务完成；unknown 写入及封存失败保持原阻断，不重放。
+4. 调用 `finish-shutdown`，提供同一父原生来源文件、按槽位顺序的 3 个 interrupt 行、最终 list_agents 行以及原 write_stdin 行。它检查时间顺序和配对输出摘要，保留精简来源证明。正常完成额外执行财务及包装原闭合门禁。缺证据时保持 pending，可继续监督并补齐证据。若正常计划期间发生取消，重新 begin-shutdown 以已记录的取消原因降为异常计划，原冻结时点保持不变；不能升级回正常计划。此时不能把它当成功或重启原审批。verified 后才结束父回合。
+
+```bash
+python -B -m apps.oa_finance_preaudit.host_chat_review --operation begin-shutdown --owner-task-id <主会话UUID> --reason <原因>
+```
+
+```javascript
+text(await tools.write_stdin({"session_id":12345,"chars":"","yield_time_ms":1000}));
+```
+
+```bash
+python -B -m apps.oa_finance_preaudit.host_chat_review --operation finish-shutdown --owner-task-id <主会话UUID> --source-session-file <父原生会话jsonl> --interrupt-line <槽0interrupt行> --interrupt-line <槽1interrupt行> --interrupt-line <槽2interrupt行> --source-line <最终list_agents行> --wait-line <原session真实终态wait行>
+```
+
+CLI 的旧 `close` 操作也走相同收尾核验，不能省略证明参数。Python 内部 `close()` 只负责 exchange 止损，供父链失效观察器等使用，不构成主回合退出许可。突然失去整个父会话时仍由原父链门和300秒租约止损；没有活着的 App 主对话就无法补发原生中断。机器断电、App崩溃或所有保护进程同时被强杀不保证完整收尾，结果缺失保持 unknown。
 
 ## 只读进度、等待与终态取回
 

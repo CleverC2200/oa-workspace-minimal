@@ -262,7 +262,7 @@ def _registry(owner: str, *, live: bool = True) -> dict:
                 or not started <= registered_at < started + 900 or registered_at > time.time()):
             raise ValueError('host_review_heartbeat_untrusted')
     if live:
-        if (value.get('state') != 'open' or runtime_control.stop_requested()
+        if (value.get('state') != 'open' or value.get('shutdown') is not None or runtime_control.stop_requested()
                 or not guard._timestamp(value.get('heartbeat_at'))
                 or not 0 <= time.time() - value['heartbeat_at'] < PARENT_HEARTBEAT_MAX_AGE
                 or not all(guard.process_identity(item['pid']) == item for item in value['execution_owners'])):
@@ -336,7 +336,7 @@ def heartbeat(*, owner: str, source: Path, source_line: int) -> dict:
 
 
 def _native_agent_status(value) -> str:
-    if isinstance(value, str) and value in {'idle', 'completed', 'running'}:
+    if isinstance(value, str) and value in {'idle', 'completed', 'running', 'interrupted'}:
         return value
     if isinstance(value, dict) and set(value) == {'completed'} and (value['completed'] is None or isinstance(value['completed'], str)):
         return 'completed'
@@ -401,7 +401,7 @@ def close(*, owner: str, reason: str = 'completed', source: Path | None = None, 
                 if len(matches) != 1:
                     raise ValueError('host_review_children_not_idle')
                 status = _native_agent_status(matches[0].get('agent_status'))
-                if status not in {'idle', 'completed'}:
+                if status not in {'idle', 'completed', 'interrupted'}:
                     raise ValueError('host_review_children_not_idle')
                 statuses.append({'agent_name': reviewer['agent_path'], 'agent_status': status})
             # Preserve native line hashes and canonical status evidence, never
@@ -424,7 +424,7 @@ def enter_packaging(*, owner: str, receipt_file: Path | None = None, invocation_
     from . import controller_handoff
     with _round_lease(owner) as path:
         value = _registry(owner, live=False)
-        if (value.get('state') != 'open' or runtime_control.stop_requested()
+        if (value.get('state') != 'open' or value.get('shutdown') is not None or runtime_control.stop_requested()
                 or not guard._timestamp(value.get('heartbeat_at'))
                 or not 0 <= time.time() - value['heartbeat_at'] < PARENT_HEARTBEAT_MAX_AGE):
             raise ValueError('host_review_parent_lost_or_closed')
@@ -949,13 +949,15 @@ def source_anchor(*, owner: str, operation: str = 'heartbeat') -> dict:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--operation', choices=['register', 'pending', 'assign', 'submit', 'heartbeat', 'enter-packaging', 'close', 'write-draft'], default='submit')
+    parser.add_argument('--operation', choices=['register', 'pending', 'assign', 'submit', 'heartbeat', 'enter-packaging', 'close', 'begin-shutdown', 'finish-shutdown', 'write-draft'], default='submit')
     parser.add_argument('--owner-task-id', required=True)
     parser.add_argument('--request-file', type=Path)
     parser.add_argument('--decision-file', type=Path)
     parser.add_argument('--payload-json')
     parser.add_argument('--source-session-file', type=Path)
     parser.add_argument('--source-line', type=int)
+    parser.add_argument('--interrupt-line', type=int, action='append')
+    parser.add_argument('--wait-line', type=int)
     parser.add_argument('--reviewer-session-file', type=Path, action='append')
     parser.add_argument('--spawn-line', type=int, action='append')
     parser.add_argument('--slot', type=int)
@@ -987,8 +989,15 @@ def main(argv=None) -> int:
     elif args.operation == 'enter-packaging':
         result = enter_packaging(owner=owner, receipt_file=args.receipt_file, invocation_id=args.invocation_id,
                                 tool_session_id=args.tool_session_id)
-    elif args.operation == 'close':
-        result = close(owner=owner, reason=args.reason, source=args.source_session_file, source_line=args.source_line)
+    elif args.operation == 'begin-shutdown':
+        from . import app_review_shutdown
+        result = app_review_shutdown.begin(owner=owner, reason=args.reason)
+    elif args.operation in {'close', 'finish-shutdown'}:
+        from . import app_review_shutdown
+        if args.source_session_file is None or args.source_line is None or args.wait_line is None or len(args.interrupt_line or []) != 3:
+            parser.error('finish-shutdown requires parent source, three interrupt lines, list_agents source-line and original wait-line')
+        result = app_review_shutdown.finish(owner=owner, source=args.source_session_file, interrupt_lines=args.interrupt_line,
+                                            status_line=args.source_line, wait_line=args.wait_line)
     else:
         if args.request_file is None or args.source_session_file is None or args.source_line is None:
             parser.error('assign/submit requires request and actual source tool-call anchor')
