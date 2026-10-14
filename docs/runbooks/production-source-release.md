@@ -21,6 +21,8 @@ python -m apps.oa_finance_preaudit.production_release \
 
 普通发布拒绝所有停止标记与环境停止请求。当前身份、凭据、OA/web 认证及完整对账 continuation 必须可信；当前未知写入或 pending/handled 冲突拒绝。目标自身解释器另用既有只读校验器核验当前 write-policy 对六类财务和包装的授权，以及当前待办本地 attempt 的恢复合同：review_required 核验完整冻结资料，collecting 核验四个采集落盘阶段的原身份、已有材料、恢复 provenance 和未写入边界，可信 item 隔离回执核验失败产物绑定，仅材料收集失败免于重验已损坏材料；生成绑定本次 status SHA 的 current-input proof，不凭 continuation 推断这些条件。可信单据隔离允许保留，不因发布恢复、重试或清理单据。恢复审批资格须另按[停止恢复](blocking-recovery.md)的受控维护合同处理；禁止直接删除标记。业务资格未满足时保留停止门。
 
+普通源码发布的同步前检查可保留一种旧版准入阻断：待审状态、冻结指纹和现行本地授权均可信、五类提交产物全部不存在，但目标已安装材料门返回 `material_collection_failed`。固定只读桥逐项保存 `admission_blocked_actions`，仅当它们精确解释原始对账的唯一 `pending_write_state_unresolved` 计数且没有其他隔离时，允许安装源码；原始 continuation 不改写。这不用于停止恢复或 OA 提交。同步前状态与输入证明留在回执中，同步后关闭该桥并重新通过普通目标校验，否则仍为 blocked、`next_process_ready=false`。新进程中的 `next_action` / `complete_review` 继续执行材料准入，冻结可信不代表材料可审。
+
 ## 默认供应商迁移
 
 候选源码的配置门会核对实际 cron 提示词。变更默认供应商时，旧提示词即使与旧生产源码一致，也不能通过新候选配置门；不放宽该门禁。

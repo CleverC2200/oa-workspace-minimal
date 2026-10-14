@@ -65,6 +65,122 @@ def test_current_gate_requires_real_readonly_authorization_and_frozen_proof():
         maintenance_runtime.assert_live_safe(snapshot)
 
 
+def admission_blocked_snapshot(root):
+    snapshot = live_snapshot()
+    action = root / 'runtime/finance_preaudit_flows/general_expense/cases/case/attempt-1/action.json'
+    snapshot['maintenance_current_inputs'].update(target_root=str(root), pending_frozen_count=1,
+        validated_frozen_count=1, admission_blocked_actions=[str(action)])
+    snapshot['reconciliation'].update(
+        continuation={'status': 'blocked', 'scope': 'controller', 'isolated_pending': 0,
+            'blocking_reasons': {'pending_write_state_unresolved': 1}},
+        quarantine={'pending_quarantined': 0},
+        findings=[{'category': 'pending_not_handled', 'workflow_key': 'general_expense',
+            'item_key': 'case', 'attempt': 1, 'local_execution_state': 'review_required',
+            'local_write_state': 'authorized'}])
+    return snapshot
+
+
+def test_source_admission_bridge_is_opt_in_and_preserves_raw_block(tmp_path):
+    snapshot = admission_blocked_snapshot(tmp_path)
+    original = json.dumps(snapshot, sort_keys=True)
+    with pytest.raises(RuntimeError, match='maintenance_reconciliation_untrusted'):
+        maintenance_runtime.assert_live_safe(snapshot)
+    maintenance_runtime.assert_live_safe(snapshot, allow_admission_blocked=True)
+    assert json.dumps(snapshot, sort_keys=True) == original
+
+
+@pytest.mark.parametrize('invalid', ('extra_block', 'count', 'missing_proof', 'wrong_action',
+    'duplicate_proof', 'unknown_write', 'writer', 'status_sha', 'unvalidated', 'stop_mode'))
+def test_source_admission_bridge_keeps_other_safety_gates(tmp_path, invalid):
+    snapshot = admission_blocked_snapshot(tmp_path)
+    inputs = snapshot['maintenance_current_inputs']
+    extra = {}
+    if invalid == 'extra_block':
+        snapshot['reconciliation']['continuation']['blocking_reasons']['identity_conflict'] = 1
+    elif invalid == 'count':
+        snapshot['reconciliation']['continuation']['blocking_reasons']['pending_write_state_unresolved'] = 2
+    elif invalid == 'missing_proof':
+        inputs.pop('admission_blocked_actions')
+    elif invalid == 'wrong_action':
+        inputs['admission_blocked_actions'] = [str(tmp_path / 'another/action.json')]
+    elif invalid == 'duplicate_proof':
+        inputs['admission_blocked_actions'] *= 2
+    elif invalid == 'unknown_write':
+        snapshot['reconciliation']['findings'][0]['local_write_state'] = 'unknown'
+    elif invalid == 'writer':
+        snapshot['controller_handoff']['writer_active'] = True
+    elif invalid == 'status_sha':
+        inputs['status_sha256'] = 'c' * 64
+    elif invalid == 'unvalidated':
+        inputs['validated_frozen_count'] = 0
+    else:
+        extra['source_only_proof'] = {'historical_stopped_actions': []}
+    with pytest.raises(RuntimeError, match='maintenance_'):
+        maintenance_runtime.assert_live_safe(snapshot, allow_admission_blocked=True, **extra)
+
+
+@pytest.mark.parametrize('variant', ('old_gate', 'new_gate', 'frozen_drift', 'writer-boundary.json',
+    'execution-receipt.json', 'review-decision.json', 'remark.txt', 'submission-envelope.json'))
+def test_source_bridge_uses_installed_frozen_validator_without_writing(tmp_path, monkeypatch, variant):
+    import sys
+    from apps.oa_finance_preaudit import flow_engine, production_config, reconciliation
+    from tests.finance_preaudit.test_flow_engine_material_gaps import _engine, _unresolved_general_material
+    auth_env = tmp_path.parent / (tmp_path.name + '-auth.env')
+    auth_env.write_text('')
+    auth_env.chmod(0o600)
+    monkeypatch.setenv('OA_AUTH_ENV_FILE', str(auth_env))
+    monkeypatch.delenv('OA_FINANCE_PREAUDIT_WRITE_POLICY', raising=False)
+    source = Path(maintenance_runtime.__file__).resolve().parents[2]
+    shutil.copytree(source / 'apps', tmp_path / 'apps', ignore=shutil.ignore_patterns('__pycache__'))
+    installed = tmp_path / 'apps/oa_finance_preaudit/flow_engine.py'
+    if variant != 'new_gate':
+        new = '_action, persisted, _packet = reader._open_attempt(action_path, require_reviewable=False)'
+        text = installed.read_text()
+        assert new in text
+        installed.write_text(text.replace(new, '_action, persisted, _packet = reader._open_attempt(action_path)', 1))
+    interpreter = tmp_path / '.venv/bin/python'
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text('#!/bin/sh\nexec "' + sys.executable + '" "$@"\n')
+    interpreter.chmod(0o700)
+    flows = tmp_path / 'runtime/finance_preaudit_flows'
+    submissions = []
+    engine = _engine(flows, 'general_expense', RuntimeError('unused'), controlled=True, submissions=submissions)
+    engine._collect_material = lambda request, _: _unresolved_general_material(request)
+    with monkeypatch.context() as old:
+        old.setattr(flow_engine, '_require_reviewable_material', lambda *_: None)
+        action = engine.next_action('general_expense', mode='controlled_write')
+    attempt = Path(action['action_file']).parent
+    state = json.loads((attempt / 'state.json').read_text())
+    if variant == 'frozen_drift':
+        (attempt / 'material.json').write_text('{}')
+    elif variant.endswith('.json') or variant == 'remark.txt':
+        (attempt / variant).write_text('{}')
+    frozen = {p: p.read_bytes() for p in attempt.iterdir() if p.is_file()}
+    policy = tmp_path / 'runtime/control/write-policy.json'
+    policy.parent.mkdir(parents=True)
+    policy.write_text(json.dumps({'schema_version': 1, 'kind': 'preaudit_write_policy',
+        'authorized_workflows': [*production_config.FINANCE_WORKFLOWS, 'packaging_layout_approval']}))
+    snapshot = {'reconciliation': reconciliation.reconcile(flows, pending_rows=[
+        {'request_id': state['request_id'], 'received_at': state['received_at'], 'workflow_key': 'general_expense'}], handled_rows=[])}
+    status = tmp_path / 'status.json'
+    raw = json.dumps(snapshot).encode()
+    status.write_bytes(raw)
+    status.chmod(0o600)
+    receipt = {'path': str(status), 'sha256': hashlib.sha256(raw).hexdigest()}
+    if variant == 'old_gate':
+        with pytest.raises(RuntimeError, match='maintenance_frozen_inputs_untrusted'):
+            maintenance_runtime.read_current_inputs(tmp_path, receipt)
+    if variant in ('old_gate', 'new_gate'):
+        result = maintenance_runtime.read_current_inputs(tmp_path, receipt, allow_admission_blocked=True)
+        assert result['admission_blocked_actions'] == [str(attempt / 'action.json')]
+        assert result['pending_frozen_count'] == result['validated_frozen_count'] == 1
+    else:
+        with pytest.raises(RuntimeError, match='maintenance_frozen_inputs_untrusted'):
+            maintenance_runtime.read_current_inputs(tmp_path, receipt, allow_admission_blocked=True)
+    assert {p: p.read_bytes() for p in attempt.iterdir() if p.is_file()} == frozen
+    assert submissions == []
+
+
 @pytest.mark.parametrize('scenario,code', [
     ('valid_preview', None),
     ('valid_collecting', None),
