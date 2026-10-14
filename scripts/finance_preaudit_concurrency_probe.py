@@ -5200,6 +5200,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="生产审核并发上限，未指定时为 3",
     )
     parser.add_argument("--confirm-write", choices=("YES",))
+    parser.add_argument("--confirm-alerts", choices=("YES", "NO"), default="NO",
+                        help="仅本轮明确授权时发送自动故障告警；默认不发送")
     parser.add_argument("--read-only", action="store_true")
     parser.add_argument(
         "--adaptive",
@@ -5321,9 +5323,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 session_code = "controller_failed"
             if session_code:
                 payload["notification"] = session_alert.alert_from_environment(
-                    session_code
+                    session_code, authorized=args.confirm_alerts == "YES",
                 )
-            elif payload.get("status") == "completed":
+            elif payload.get("status") == "completed" and args.confirm_alerts == "YES":
                 reset = session_alert.clear_active_alert(session_only=True)
                 if reset and reset.get("status") == "unknown":
                     payload["notification_reset"] = reset
@@ -5374,7 +5376,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 failure_code if failure_code in session_alert.PRODUCTION_ERROR_CODES
                 else "controller_failed"
             )
-            payload["notification"] = session_alert.alert_from_environment(alert_code)
+            payload["notification"] = session_alert.alert_from_environment(
+                alert_code, authorized=args.confirm_alerts == "YES")
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return 1
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))

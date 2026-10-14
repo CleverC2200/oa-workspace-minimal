@@ -127,7 +127,7 @@ def _text_findings(text: str, source: str) -> list[str]:
     if arguments.count("--rolling") != 1 or arguments.count("--fixed-capacity") != 1 or "--adaptive" in arguments:
         findings.append(f"production_config_command_invalid:{source}")
     expected_arguments = ["--rolling", "--fixed-capacity", "--capacity", str(INITIAL_CAPACITY),
-                          "--max-capacity", str(MAX_CAPACITY), "--confirm-write", "YES",
+                          "--max-capacity", str(MAX_CAPACITY), "--confirm-write", "YES", "--confirm-alerts", "YES",
                           "--recover-confirmed-no-write-once", "YES"]
     for workflow in FINANCE_WORKFLOWS:
         expected_arguments.extend(("--workflow", workflow))

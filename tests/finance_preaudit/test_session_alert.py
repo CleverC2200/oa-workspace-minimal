@@ -223,7 +223,7 @@ def test_environment_alert_failure_returns_unknown_without_raising(
         ),
     ):
         result = session_alert.alert_from_environment(
-            "oa_session_expired",
+            "oa_session_expired", authorized=True,
             control_root=tmp_path,
             live_status_provider=lambda: (_ for _ in ()).throw(
                 RuntimeError("oa_session_expired")
@@ -247,7 +247,7 @@ def test_environment_alert_suppresses_historical_failure_when_live_session_is_ok
         patch.object(session_alert, "send_message") as send_message,
     ):
         result = session_alert.alert_from_environment(
-            "oa_session_expired",
+            "oa_session_expired", authorized=True,
             control_root=tmp_path,
             live_status_provider=lambda: {
                 "web_session": {
@@ -304,7 +304,7 @@ def test_recovered_live_session_clears_previous_alert_window(tmp_path: Path) -> 
     )
 
     result = session_alert.alert_from_environment(
-        "oa_session_expired",
+        "oa_session_expired", authorized=True,
         control_root=tmp_path,
         live_status_provider=lambda: {"status": "ok"},
     )
@@ -335,7 +335,7 @@ def test_environment_alert_sends_when_current_live_check_confirms_failure(
         ),
     ):
         result = session_alert.alert_from_environment(
-            error_code,
+            error_code, authorized=True,
             control_root=tmp_path,
             live_status_provider=lambda: (_ for _ in ()).throw(
                 RuntimeError(error_code)
@@ -345,6 +345,17 @@ def test_environment_alert_sends_when_current_live_check_confirms_failure(
     assert result["delivery_state"] == "sent"
     assert len(sent) == 1
     assert error_code in sent[0]
+
+
+def test_environment_alert_without_authorization_preserves_window_and_skips_transport(tmp_path, monkeypatch):
+    state = tmp_path / 'oa-session-alert.json'
+    original = b'{"status":"active","delivery_state":"unknown"}\n'
+    state.write_bytes(original)
+    monkeypatch.setattr(session_alert.auth, 'load_local_env', lambda: pytest.fail('unauthorized configuration read'))
+    monkeypatch.setattr(session_alert, 'send_message', lambda *_a, **_k: pytest.fail('unauthorized send'))
+    result = session_alert.alert_from_environment('controller_failed', control_root=tmp_path)
+    assert result['delivery_state'] == 'not_authorized'
+    assert state.read_bytes() == original
 
 
 def test_clear_active_alert_only_resets_an_existing_failure(
@@ -393,7 +404,7 @@ def test_non_session_failure_alerts_even_when_session_is_healthy(tmp_path, monke
     monkeypatch.setenv("OA_FEISHU_ALERT_CHAT_ID", "oc_recorded")
     monkeypatch.setattr(session_alert, "send_message", lambda *args, **kwargs: sent.append(args))
     result = session_alert.alert_from_environment(
-        code, control_root=tmp_path, live_status_provider=lambda: {"status": "ok"},
+        code, authorized=True, control_root=tmp_path, live_status_provider=lambda: {"status": "ok"},
     )
     assert result["delivery_state"] == "sent"
     assert code in sent[0][1]
@@ -417,7 +428,7 @@ def test_configuration_failure_leaves_local_alert_receipt(tmp_path, monkeypatch)
     def fail():
         raise RuntimeError("private configuration failure")
     monkeypatch.setattr(session_alert.auth, "load_local_env", fail)
-    result = session_alert.alert_from_environment("controller_failed", control_root=tmp_path)
+    result = session_alert.alert_from_environment("controller_failed", authorized=True, control_root=tmp_path)
     assert result["delivery_state"] == "unknown"
     stored = (tmp_path / session_alert.STATE_NAME).read_text()
     assert json.loads(stored)["delivery_state"] == "unknown"
@@ -426,7 +437,7 @@ def test_configuration_failure_leaves_local_alert_receipt(tmp_path, monkeypatch)
 
 def test_session_recovery_does_not_reset_active_production_fault(tmp_path):
     session_alert.alert_once("writer_result_unknown", chat_id="oc_recorded", control_root=tmp_path, sender=lambda *args: None)
-    session_alert.alert_from_environment("oa_session_expired", control_root=tmp_path, live_status_provider=lambda: {"status": "ok"})
+    session_alert.alert_from_environment("oa_session_expired", authorized=True, control_root=tmp_path, live_status_provider=lambda: {"status": "ok"})
     state = json.loads((tmp_path / session_alert.STATE_NAME).read_text())
     assert state["status"] == "active"
     assert state["error_code"] == "writer_result_unknown"
@@ -442,7 +453,7 @@ def test_startup_blockers_send_and_remain_queryable_after_recovery(tmp_path, mon
     monkeypatch.setattr(session_alert.auth, "load_local_env", lambda: None)
     monkeypatch.setenv("OA_FEISHU_ALERT_CHAT_ID", "oc_recorded")
     monkeypatch.setattr(session_alert, "send_message", lambda *a, **kw: sent.append(a))
-    result = session_alert.alert_from_environment(code, control_root=tmp_path)
+    result = session_alert.alert_from_environment(code, authorized=True, control_root=tmp_path)
     assert result["delivery_state"] == "sent"
     assert code in sent[0][1]
     before = (tmp_path / session_alert.STATE_NAME).read_bytes()

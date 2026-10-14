@@ -8,6 +8,8 @@
 
 本轮后续包装使用同一选择，OpenAI 进入本轮 App 包装阶段并复用已登记的 3 个子 Agent，DeepSeek 使用 `OA_REVIEW_PROVIDER=deepseek OA_REVIEW_TRANSPORT=cli python -m apps.oa_finance_preaudit.packaging_review --action-file <当前动作>`。财务滚动池仍不包含包装。DeepSeek 使用独立 API 密钥和空运行目录；OpenAI 使用现有原生认证，不接收 DeepSeek、OpenAI 或 Codex 的 API key 环境变量。
 
+自动告警由本轮控制器参数 `--confirm-alerts YES` 独立授权，放在监督入口的 `--` 后。缺省或 `NO` 返回本地 `not_authorized` 回执，不发送消息，也不清改已有告警窗口；审批写入授权、环境中的告警目标和 PAUSED 调度状态均不能代替本轮告警授权。获授权后继续使用现行去重和 unknown 保护。手工单次告警仍要求其专用 `--confirm-send YES`。
+
 工具调用者与每轮监督者分开：入口启动一个独立进程组中的本轮监督者，由它创建、真实 wait 原控制器并独占保存 execution.json。它不是常驻 daemon 或额外模型 worker，不重复启动控制器。调用者收到停止信号时转交监督者；调用者或其原工具父进程消失或 PID 身份变化时，监督者请求既有停止门并继续等待 Writer 和控制器收尾，保留真实退出码。启动前和每次 DeepSeek CLI 启动前核对已绑定的 PID、出生时间、进程组及用户，不能仅凭 PID 仍存在放行。
 
 监督者自身被强制终止时，控制器心跳及运行中的审核 worker 每 5 秒核对独立的父链身份，并通过技术停止门有序收尾；DeepSeek CLI 发起前的核验不等待这个间隔。不能强杀可能在途的 Writer。机器断电、所有保护进程同时被强杀、观察前已经发出的请求仍不保证有完整退出回执，不承诺操作系统任意终止下恢复真实 wait。
@@ -30,14 +32,14 @@
 python -B -m apps.oa_finance_preaudit.host_chat_review --operation register --owner-task-id <主会话UUID> --source-session-file <父原生会话jsonl> --reviewer-session-file <槽0子会话jsonl> --spawn-line <槽0spawn行> --reviewer-session-file <槽1子会话jsonl> --spawn-line <槽1spawn行> --reviewer-session-file <槽2子会话jsonl> --spawn-line <槽2spawn行> --receipt-file <原execution.json> --invocation-id <原调用ID> --tool-session-id <原session_id>
 ```
 
-2. 每次取得可信进度后读取当前请求，并在 60 秒以内续一次父任务心跳。App 父租约独立为 300 秒，用于容忍原生派单和工具调度超过 45 秒；控制器自身的 45 秒进程心跳门保持原值。父租约到期阈值为 5 分钟，到期后的下一次既有检查拒绝派单和结果，控制器观察器再请求停止。原进程身份丢失、显式停止及单据截止时间仍在原检查点生效。心跳必须来自主会话本次已落盘的原生调用，父会话 UUID 和实际调用时间均需可信。可在当前原生 exec 内调用 `source_anchor(owner, operation="heartbeat")` 取得当前来源，再调用 `heartbeat(owner=owner, **anchor)`；重复旧来源不延长租约。维持原工具 session 的等待；不得等待直到控制器退出才派单。心跳到期后，新增派单和结果接收在下一次检查时拒绝，不把等待超时当审批重试授权。
+2. 注册回执成功后，在下一次独立原生 `functions.exec` 中续首次父任务心跳，再读取 pending。注册与首次心跳不得合并在同一次原生调用中；其来源时间早于注册时，心跳拒绝且不会续租。请求发布会等待可信首次心跳，仍受原单据截止时间和父链门约束，等待期间 pending 为空不代表队列已完成。随后每次取得可信进度后读取当前请求，并在 60 秒以内续一次父任务心跳。App 父租约独立为 300 秒，用于容忍原生派单和工具调度超过 45 秒；控制器自身的 45 秒进程心跳门保持原值。父租约到期阈值为 5 分钟，到期后的下一次既有检查拒绝派单和结果，控制器观察器再请求停止。原进程身份丢失、显式停止及单据截止时间仍在原检查点生效。心跳必须来自主会话本次已落盘的原生调用，父会话 UUID 和实际调用时间均需可信。可在当前原生 exec 内调用 `source_anchor(owner=owner, operation="heartbeat")` 取得当前来源，再调用 `heartbeat(owner=owner, **anchor)`；重复旧来源不延长租约。维持原工具 session 的等待；不得等待直到控制器退出才派单。心跳到期后，新增派单和结果接收在下一次检查时拒绝，不把等待超时当审批重试授权。
 
 ```bash
 python -B -m apps.oa_finance_preaudit.host_chat_review --operation heartbeat --owner-task-id <主会话UUID> --source-session-file <父原生会话jsonl> --source-line <本次heartbeat工具行>
 python -B -m apps.oa_finance_preaudit.host_chat_review --operation pending --owner-task-id <主会话UUID>
 ```
 
-3. 对 pending 返回的本轮请求，调用空闲原 Agent 的 `followup_task`，只传请求绝对路径和当前单据边界。保留该次真实工具调用来源；它完成后执行 assign，把请求绑定到原槽位。一个槽位有未交回请求时不能再派单。dispatch 的原生时间、请求指纹、子会话和来源必须匹配。
+3. 请求文件名绑定本轮 owner，保留旧轮同 attempt 的请求、决定和提交证据。pending 只发现本轮注册表登记且属于当前 progress 的请求；派单使用返回的绝对路径，不拼接固定文件名。对 pending 返回的本轮请求，调用空闲原 Agent 的 `followup_task`，只传请求绝对路径和当前单据边界。保留该次真实工具调用来源；它完成后执行 assign，把请求绑定到原槽位。一个槽位有未交回请求时不能再派单。dispatch 的原生时间、请求指纹、子会话和来源必须匹配。
 
 派单来源必须是登记过的父会话文件，同一个原生 call_id 或来源行只能绑定一个请求；同请求、同槽、同来源的重复 assign 保持幂等。明文 message 仍核对请求路径。App 原生记录使用当前已识别的有界 opaque 格式时，只记录 dispatch_message_readable=false，不宣称正文或当前请求已送达；当前请求归属必须继续由已登记子会话真实 write-draft 调用及其专用回执中的相同 request SHA-256 确认。缺确认、不同请求、错槽、过期或已关闭均拒绝，不读取密钥或解密日志。
 

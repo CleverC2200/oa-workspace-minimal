@@ -48,6 +48,7 @@ def test_native_automation_shape_preserves_project_and_schedule():
     ("config/automations/oa-skill-prompt.txt", "--max-capacity 3", "--max-capacity 12", "production_config_capacity_drift:template"),
     ("docs/runbooks/hourly-production.md", "service_tier=unknown", "service_tier=priority", "production_config_service_tier_drift:runbook"),
     ("config/automations/oa-skill-prompt.txt", "--workflow general_expense", "--workflow packaging_layout_approval", "production_config_workflows_drift:template"),
+    ("config/automations/oa-skill-prompt.txt", "--confirm-alerts YES", "--confirm-alerts NO", "production_config_command_invalid:template"),
     ("config/automations/oa-skill-prompt.txt", "--confirm-write YES", "--read-only", "production_config_command_invalid:template"),
     ("apps/oa_finance_preaudit/codex_review_worker.py", 'f\'model_reasoning_effort="{REASONING_EFFORT}"\'', '\'model_reasoning_effort="medium"\'', "production_config_native_settings_drift"),
 ])

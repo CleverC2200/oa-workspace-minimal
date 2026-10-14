@@ -12,7 +12,7 @@ from scripts import finance_preaudit_concurrency_probe as probe
 @pytest.fixture
 def notifications(monkeypatch):
     alerts, clears = [], []
-    monkeypatch.setattr(probe.session_alert, "alert_from_environment", lambda code: (
+    monkeypatch.setattr(probe.session_alert, "alert_from_environment", lambda code, **_kwargs: (
         alerts.append(code) or {"error_code": code, "delivery_state": "sent"}
     ))
     monkeypatch.setattr(probe.session_alert, "clear_active_alert", lambda **kw: clears.append(kw))
@@ -23,7 +23,7 @@ def notifications(monkeypatch):
 
 
 def _call(capsys):
-    result = probe.main(["--rolling", "--fixed-capacity", "--capacity", "3", "--confirm-write", "YES"])
+    result = probe.main(["--rolling", "--fixed-capacity", "--capacity", "3", "--confirm-write", "YES", "--confirm-alerts", "YES"])
     return result, json.loads(capsys.readouterr().out)
 
 

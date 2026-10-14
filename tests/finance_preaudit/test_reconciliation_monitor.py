@@ -74,11 +74,11 @@ def test_terminal_cli_sends_the_specific_stop_once(monkeypatch, capsys):
         pipeline_runner=stopped_pipeline,
     ))
     notifications = []
-    monkeypatch.setattr(probe.session_alert, "alert_from_environment", lambda code: (
+    monkeypatch.setattr(probe.session_alert, "alert_from_environment", lambda code, **_kwargs: (
         notifications.append(code)
         or {"error_code": code, "delivery_state": "sent"}
     ))
-    exit_code = probe.main(["--rolling", "--capacity", "3", "--confirm-write", "YES"])
+    exit_code = probe.main(["--rolling", "--capacity", "3", "--confirm-write", "YES", "--confirm-alerts", "YES"])
     payload = json.loads(capsys.readouterr().out)
     assert exit_code == 1
     assert payload["primary_error_code"] == "production_reconciliation_blocked"
@@ -206,10 +206,10 @@ def test_first_writer_failure_is_not_replaced_by_a_later_stop(monkeypatch, capsy
         **kwargs, live_status=live_status, reconcile_status=reconciled, pipeline_runner=pipeline,
     ))
     alerts = []
-    monkeypatch.setattr(probe.session_alert, "alert_from_environment", lambda code: (
+    monkeypatch.setattr(probe.session_alert, "alert_from_environment", lambda code, **_kwargs: (
         alerts.append(code) or {"error_code": code, "delivery_state": "sent"}
     ))
-    assert probe.main(["--rolling", "--capacity", "3", "--confirm-write", "YES"]) == 1
+    assert probe.main(["--rolling", "--capacity", "3", "--confirm-write", "YES", "--confirm-alerts", "YES"]) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["primary_error_code"] == "writer_result_unknown"
     assert alerts == ["writer_result_unknown"]
@@ -227,8 +227,8 @@ rolling = probe.run_rolling_drain
 probe.run_rolling_drain = lambda **kw: rolling(**kw,
     live_status=helpers["live_status"], reconcile_status=helpers["reconciled"],
     pipeline_runner=helpers["stopped_pipeline"])
-probe.session_alert.alert_from_environment = lambda code: {{"error_code": code, "delivery_state": "sent"}}
-raise SystemExit(probe.main(["--rolling", "--capacity", "3", "--confirm-write", "YES"]))
+probe.session_alert.alert_from_environment = lambda code, **_kwargs: {{"error_code": code, "delivery_state": "sent"}}
+raise SystemExit(probe.main(["--rolling", "--capacity", "3", "--confirm-write", "YES", "--confirm-alerts", "YES"]))
 '''
     receipt = finance_preaudit_run.supervise(
         [sys.executable, "-B", "-c", code], directory=directory, owner_task_id=owner,
@@ -272,8 +272,8 @@ def pipeline(count, capacity):
         return helpers["stopped_pipeline"](count, capacity)
 probe.run_rolling_drain = lambda **kw: rolling(**kw,
     live_status=helpers["live_status"], reconcile_status=helpers["reconciled"], pipeline_runner=pipeline)
-probe.session_alert.alert_from_environment = lambda code: {{"error_code": code, "delivery_state": "sent"}}
-raise SystemExit(probe.main(["--rolling", "--capacity", "3", "--confirm-write", "YES"]))
+probe.session_alert.alert_from_environment = lambda code, **_kwargs: {{"error_code": code, "delivery_state": "sent"}}
+raise SystemExit(probe.main(["--rolling", "--capacity", "3", "--confirm-write", "YES", "--confirm-alerts", "YES"]))
 '''
     supervisor = (
         "from pathlib import Path; from scripts.finance_preaudit_run import supervise; import sys; "
@@ -330,10 +330,10 @@ def test_unreaped_children_remain_blocked_and_keep_the_specific_alert(first_erro
         **kwargs, live_status=live_status, reconcile_status=reconciled, pipeline_runner=pipeline,
     ))
     alerts = []
-    monkeypatch.setattr(probe.session_alert, "alert_from_environment", lambda code: (
+    monkeypatch.setattr(probe.session_alert, "alert_from_environment", lambda code, **_kwargs: (
         alerts.append(code) or {"error_code": code, "delivery_state": "sent"}
     ))
-    assert probe.main(["--rolling", "--capacity", "3", "--confirm-write", "YES"]) == 1
+    assert probe.main(["--rolling", "--capacity", "3", "--confirm-write", "YES", "--confirm-alerts", "YES"]) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["error_code"] == "production_controller_children_active"
     assert payload["primary_error_code"] == expected
@@ -412,11 +412,11 @@ def test_retry_pending_does_not_hide_a_specific_stop(stop_reason, expected_exit,
         **kwargs, live_status=live_status, reconcile_status=reconciled, pipeline_runner=pipeline,
     ))
     alerts, clears = [], []
-    monkeypatch.setattr(probe.session_alert, "alert_from_environment", lambda code: (
+    monkeypatch.setattr(probe.session_alert, "alert_from_environment", lambda code, **_kwargs: (
         alerts.append(code) or {"error_code": code, "delivery_state": "sent"}
     ))
     monkeypatch.setattr(probe.session_alert, "clear_active_alert", lambda **kwargs: clears.append(kwargs))
-    assert probe.main(["--rolling", "--capacity", "3", "--confirm-write", "YES"]) == expected_exit
+    assert probe.main(["--rolling", "--capacity", "3", "--confirm-write", "YES", "--confirm-alerts", "YES"]) == expected_exit
     payload = json.loads(capsys.readouterr().out)
     assert payload["completed"] == 1
     assert payload["failed"] == payload["stopped"] == 0
