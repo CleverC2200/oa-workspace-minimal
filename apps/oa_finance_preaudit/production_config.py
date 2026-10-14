@@ -74,6 +74,11 @@ def valid_review_configuration(configuration: object) -> bool:
     return configuration == review_settings("deepseek", transport="cli")
 
 
+def review_timeout_seconds() -> int:
+    """Bound new App reviews separately from the retained CLI execution budget."""
+    return 1800 if review_settings().get('transport') == 'host_chat' else 900
+
+
 def snapshot() -> dict:
     settings = review_settings(DEFAULT_REVIEW_PROVIDER, transport="host_chat")
     return {

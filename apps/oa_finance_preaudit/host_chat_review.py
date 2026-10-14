@@ -312,8 +312,8 @@ def assert_round_alive(*, owner: str, manifest: dict) -> None:
         if not os.path.lexists(path):
             from datetime import datetime
             started = datetime.fromisoformat(manifest['started_at']).timestamp()
-            # Current review tasks have a 900-second original deadline. Registration
-            # cannot extend that budget, or an earlier already-recorded phase deadline.
+            # Registration retains its own 900-second bootstrap bound, independent
+            # of the later per-case review budget and any earlier phase deadline.
             deadline = started + 900
             progress = approval_lifecycle._progress(manifest)
             if progress is not None and progress['phase_deadlines']:
@@ -592,7 +592,7 @@ def _live(request: dict, action: Path, *, owner: str | None = None) -> None:
     if (request.get('kind') != 'preaudit_host_review_request' or request.get('schema_version') != 1
             or request.get('review_configuration') != IDENTITY or request.get('action_file') != str(action)
             or request.get('input_fingerprints') != _fingerprints(action)
-            or not guard._timestamp(request.get('expires_at')) or time.time() >= request['expires_at']):
+            or not guard._timestamp(request.get('expires_at'))):
         raise ValueError('host_review_request_untrusted')
     registered = _registry(request['owner_task_id'])
     if (registered['run_id'] != request['run_id'] or registered['controller_instance_id'] != request['controller_instance_id']):
@@ -607,19 +607,21 @@ def _live(request: dict, action: Path, *, owner: str | None = None) -> None:
             raise ValueError('host_review_finance_incomplete')
         if request.get('review_kind') not in {'packaging_draft', 'packaging_confirmation'}:
             raise ValueError('host_review_phase_untrusted')
-        return
-    if request.get('review_kind') != 'finance':
-        raise ValueError('host_review_phase_untrusted')
-    from . import controller_handoff
-    manifest = controller_handoff._read_manifest()
-    if (manifest is None or manifest['state'] != 'running'
-            or manifest['run_id'] != request['run_id']
-            or manifest['controller_instance_id'] != request['controller_instance_id']
-            or manifest.get('review_configuration') != IDENTITY
-            or runtime_control.controller_owner_pid() != manifest['controller_pid']
-            or guard.process_identity(manifest['controller_pid']) != request['controller_process']
-            or not guard.execution_owners_alive()):
-        raise ValueError('host_review_run_untrusted')
+    else:
+        if request.get('review_kind') != 'finance':
+            raise ValueError('host_review_phase_untrusted')
+        from . import controller_handoff
+        manifest = controller_handoff._read_manifest()
+        if (manifest is None or manifest['state'] != 'running'
+                or manifest['run_id'] != request['run_id']
+                or manifest['controller_instance_id'] != request['controller_instance_id']
+                or manifest.get('review_configuration') != IDENTITY
+                or runtime_control.controller_owner_pid() != manifest['controller_pid']
+                or guard.process_identity(manifest['controller_pid']) != request['controller_process']
+                or not guard.execution_owners_alive()):
+            raise ValueError('host_review_run_untrusted')
+    if time.time() >= request['expires_at']:
+        raise ValueError('host_review_request_expired')
 
 
 def _base() -> dict:
@@ -721,6 +723,49 @@ def read_result(request_file: Path) -> dict:
                              'submission_sha256': hashlib.sha256(raw).hexdigest()}}
 
 
+def _failure_detail(error: Exception) -> dict:
+    codes = {
+        'host_review_request_expired', 'host_review_request_untrusted', 'host_review_run_untrusted',
+        'host_review_parent_lost_or_closed', 'host_review_registry_untrusted', 'host_review_frozen_untrusted',
+        'host_review_submission_untrusted', 'host_review_assignment_untrusted', 'host_review_source_untrusted',
+        'host_review_heartbeat_untrusted', 'host_review_phase_untrusted', 'host_review_finance_incomplete',
+        'host_review_bootstrap_failed', 'host_review_transport_invalid', 'codex_review_task_invalid', 'stop_requested',
+    }
+    classes = (ValueError, RuntimeError, OSError, KeyError, TypeError, FileNotFoundError, PermissionError, TimeoutError)
+    return {'failure_detail_code': str(error) if str(error) in codes else 'host_review_exception',
+            'exception_type': type(error).__name__ if type(error) in classes else 'Exception'}
+
+
+def _record_exchange_failure(request_file: Path, detail: dict) -> bool:
+    """Keep the first bounded, registered-request failure; never save exception bodies."""
+    try:
+        raw, request = _read(request_file)
+        owner = os.environ.get(guard.OWNER_ENV)
+        action = Path(request['action_file'])
+        if (owner != request['owner_task_id']
+                or request_file.absolute() != _request_file(action, request['review_kind'], owner=owner)
+                or not action.is_relative_to(runtime_control.PROJECT_ROOT / 'runtime/finance_preaudit_flows')):
+            return False
+        with _round_lease(owner) as path:
+            registered = _registry(owner, live=False)
+            fingerprint = {'request_file': str(request_file.absolute()), 'request_sha256': hashlib.sha256(raw).hexdigest()}
+            if (registered.get('requests', {}).get(request['request_id']) != fingerprint
+                    or registered['run_id'] != request['run_id']
+                    or registered['controller_instance_id'] != request['controller_instance_id']):
+                return False
+            if 'first_failure' not in registered:
+                registered['first_failure'] = {
+                    'kind': 'preaudit_host_exchange_failure', 'operation': 'await_result', **detail, **fingerprint,
+                    'observed_at': time.time(),
+                    'request_created_at': request.get('created_at') if guard._timestamp(request.get('created_at')) else None,
+                    'request_expires_at': request.get('expires_at') if guard._timestamp(request.get('expires_at')) else None,
+                }
+                guard.write(path, registered)
+        return True
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        return False
+
+
 def await_result(request_file: Path) -> dict:
     request = {}
     try:
@@ -735,13 +780,17 @@ def await_result(request_file: Path) -> dict:
         with _round_lease(request['owner_task_id']):
             return read_result(request_file)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+        detail = _failure_detail(error)
+        recorded = _record_exchange_failure(request_file, detail)
         # Leave in-flight write classification to the original Writer. No signals here.
         try:
-            close(owner=request['owner_task_id'], reason='parent_lost' if 'parent_lost' in str(error) else 'reviewer_failed')
+            close(owner=os.environ.get(guard.OWNER_ENV),
+                  reason='parent_lost' if 'parent_lost' in detail['failure_detail_code'] else 'reviewer_failed')
         except (OSError, RuntimeError, ValueError, KeyError, TypeError):
             pass
         runtime_control.request_cycle_stop()
-        return {**_base(), 'status': 'failed', 'error_code': 'host_review_exchange_failed'}
+        return {**_base(), 'status': 'failed', 'error_code': 'host_review_exchange_failed',
+                **detail, 'failure_recorded': recorded}
 
 
 def review(task: dict) -> dict:
@@ -752,8 +801,9 @@ def review(task: dict) -> dict:
         _, action, timeout = worker._validated_task(task)
         request_file = publish(action, prompt=worker._prompt(action), timeout_seconds=timeout)
         return await_result(request_file)
-    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-        return {**_base(), 'status': 'failed', 'error_code': 'host_review_exchange_failed'}
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+        return {**_base(), 'status': 'failed', 'error_code': 'host_review_exchange_failed',
+                **_failure_detail(error), 'failure_recorded': False}
 
 
 

@@ -2166,7 +2166,7 @@ def _run_dispatched_tasks(
     record_failure_round: FailureRoundRecorder | None = None,
     defer_review_failures: bool = True,
     executor_factory: ExecutorFactory = _process_executor,
-    task_timeout_sec: float = 960,
+    task_timeout_sec: float | None = None,
     prepare_timeout_sec: float = 300,
     heartbeat_interval_sec: float = 5,
     runtime_status: Callable[[], dict] = concurrency_control.sample_local_health,
@@ -2184,6 +2184,9 @@ def _run_dispatched_tasks(
     run_id: str | None = None,
     controller_instance_id: str | None = None,
 ) -> process_pool.PoolResult[dict]:
+    review_timeout_seconds = production_config.review_timeout_seconds()
+    if task_timeout_sec is None:
+        task_timeout_sec = review_timeout_seconds + 60
     maximum_capacity = capacity if max_capacity is None else max_capacity
     recovery_queue = tuple(
         Path(path).expanduser().resolve() for path in recovery_action_files
@@ -2564,7 +2567,7 @@ def _run_dispatched_tasks(
             {
                 "project_root": str(root),
                 "action_file": str(action_file),
-                "timeout_seconds": 900,
+                "timeout_seconds": review_timeout_seconds,
             },
             role="review",
         )
@@ -4279,7 +4282,7 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
         "watchdog": {
             "runtime_samples": len(result.runtime_samples),
             "maximum_task_seconds": result.max_task_elapsed_seconds,
-            "task_timeout_seconds": 960,
+            "task_timeout_seconds": production_config.review_timeout_seconds() + 60,
         },
         "business_results": dict(sorted(business_results.items())),
         "error_counts": dict(sorted(error_counts.items())),
@@ -4410,7 +4413,7 @@ def run_rolling_drain(
                     "review_configuration": codex_review_worker.REVIEW_SETTINGS,
                     "prepare_capacity": 1,
                     "prepare_timeout_seconds": 300,
-                    "review_timeout_seconds": 960,
+                    "review_timeout_seconds": production_config.review_timeout_seconds() + 60,
                     "writer_capacity": 1,
                     "recovery_count": len(recovery_queue),
                     "authorized_recovery_once": authorized_recovery_once,
