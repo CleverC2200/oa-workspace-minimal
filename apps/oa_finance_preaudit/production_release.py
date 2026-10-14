@@ -298,9 +298,11 @@ def release_source(
     loss_proof = None
     official_proof = None
     user_stop_proof = None
+    allow_admission_blocked = not stopped_maintenance and withdrawn_action is None
     live = check_live or (lambda target: maintenance_runtime.read_live_status(target,
         require_reaped=stopped_maintenance or withdrawn_action is not None,
-        source_only_proof=withdrawal_proof or loss_proof, official_stop_proof=official_proof))
+        source_only_proof=withdrawal_proof or loss_proof, official_stop_proof=official_proof,
+        allow_admission_blocked=allow_admission_blocked))
     manifest_file = root / 'runtime/control/rolling-controller-manifest.json'
     manifest = runtime_control.read_control_bytes(manifest_file)
     if manifest is None:
@@ -340,8 +342,10 @@ def release_source(
                 withdrawal_observation = withdrawn_submission.observe(root, withdrawn_action)
                 withdrawal_proof = withdrawn_submission.source_proof(withdrawal_observation)
             snapshot = live(root)
-            maintenance_runtime.assert_live_safe(snapshot, source_only_proof=withdrawal_proof or loss_proof, official_stop_proof=official_proof)
+            maintenance_runtime.assert_live_safe(snapshot, source_only_proof=withdrawal_proof or loss_proof,
+                official_stop_proof=official_proof, allow_admission_blocked=allow_admission_blocked)
             pre_sync_status = snapshot.get('maintenance_status_file')
+            pre_sync_inputs = snapshot.get('maintenance_current_inputs')
             if runtime_control.read_control_bytes(manifest_file) != manifest:
                 raise RuntimeError('production_release_manifest_changed')
             if _source(root, expected_revision, expected_origin) != before:
@@ -359,6 +363,7 @@ def release_source(
                     raise RuntimeError('production_release_withdrawal_changed')
                 sync_started = True
                 _git(root, 'merge', '--ff-only', expected_revision)
+                allow_admission_blocked = False
                 snapshot = live(root)
                 maintenance_runtime.assert_live_safe(snapshot, source_only_proof=withdrawal_proof or loss_proof, official_stop_proof=official_proof)
                 if check_configuration is None:
@@ -398,6 +403,8 @@ def release_source(
                 'status_file': snapshot.get('maintenance_status_file'),
                 'current_input_proof': snapshot.get('maintenance_current_inputs'),
                 'continuation': snapshot['reconciliation']['continuation'],
+                **({'pre_sync_status_file':pre_sync_status, 'pre_sync_current_input_proof':pre_sync_inputs}
+                    if pre_sync_inputs and pre_sync_inputs.get('admission_blocked_actions') else {}),
                 **({'withdrawn_submission_source_only':True, 'approval_recovery_allowed':False,
                     'withdrawal_observation':withdrawal_observation, 'original_evidence_preserved':True,
                     'automation_state':'PAUSED'} if withdrawn_action is not None else {}),

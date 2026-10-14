@@ -231,6 +231,7 @@ _SAFE_MATERIAL_FAILURE_DETAIL_CODES = (
     _SAFE_MATERIAL_GAP_CODES
     | _HARD_COLLECTION_FAILURE_CODES
     | {
+        "general_evidence_references_unresolved",
         "frozen_file_unreadable",
         "frozen_material_changed",
         "manifest_resource_coverage_incomplete",
@@ -681,7 +682,9 @@ def _require_reviewable_material(workflow_key: str, material: dict) -> None:
             {field["code"] for field in attachment_fields} == attachment_codes
             and all(field.get("read_status") == "unresolved" for field in attachment_fields)
         ):
-            raise ValueError("material_collection_failed")
+            error = ValueError("material_collection_failed")
+            error.code = "general_evidence_references_unresolved"
+            raise error
 
 
 def _stable_error_code(error: Exception, allowed: set[str] | frozenset[str]) -> str:
@@ -2899,7 +2902,7 @@ class FlowEngine:
 
     @classmethod
     def resumable_review(cls, root: Path, state: dict) -> bool:
-        """Validate frozen pre-submit state locally; do not renew or authorize writes."""
+        """Validate frozen pre-submit state; admission remains at resume/completion."""
         def unavailable(*_args, **_kwargs):
             raise ValueError("read_only_port_unavailable")
 
@@ -2912,7 +2915,7 @@ class FlowEngine:
             return False
         reader = cls(root=root, discover_candidates=unavailable, collect_material=unavailable)
         try:
-            _action, persisted, _packet = reader._open_attempt(action_path)
+            _action, persisted, _packet = reader._open_attempt(action_path, require_reviewable=False)
         except (OSError, ValueError):
             return False
         return persisted == state

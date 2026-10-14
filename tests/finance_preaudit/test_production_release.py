@@ -10,7 +10,7 @@ import pytest
 
 from apps.oa_approval import runtime_control
 from apps.oa_finance_preaudit import maintenance_runtime, production_release
-from tests.finance_preaudit.test_maintenance_runtime import live_snapshot
+from tests.finance_preaudit.test_maintenance_runtime import admission_blocked_snapshot, live_snapshot
 
 
 def git(root, *args):
@@ -382,6 +382,48 @@ def test_release_preflight_retains_leases_across_real_ff_and_readbacks(productio
     assert result['before_revision'] == before
     assert observations == [before, expected]
     assert git(root, 'rev-parse', 'HEAD') == expected
+
+
+@pytest.mark.parametrize('confirmed,post_blocked', ((False, False), (True, False), (True, True)))
+def test_source_admission_bridge_closes_before_ordinary_postcheck(production, monkeypatch, confirmed, post_blocked):
+    root, remote, before = production
+    source = remote.parent / 'source'
+    git(remote.parent, 'clone', '-q', str(remote), str(source))
+    (source / 'source.txt').write_text('new-frozen-validation')
+    git(source, 'add', '.')
+    git(source, 'commit', '-qm', 'separate admission from frozen validation')
+    git(source, 'push', '-q')
+    git(root, 'fetch', '-q', 'origin')
+    expected = git(source, 'rev-parse', 'HEAD')
+    calls = []
+    original = admission_blocked_snapshot(root)
+    original_bytes = json.dumps(original, sort_keys=True)
+    def read_live(target, **options):
+        assert runtime_control.controller_active(target / 'runtime/control/rolling-controller.lock')
+        assert runtime_control.active_request_writers(target / 'runtime/control/frozen-writer.lock') == 1
+        calls.append(options['allow_admission_blocked'])
+        if git(target, 'rev-parse', 'HEAD') == before or post_blocked:
+            return json.loads(original_bytes)
+        return live_snapshot()
+    monkeypatch.setattr(maintenance_runtime, 'read_live_status', read_live)
+    result = production_release.release_source(root, expected_revision=expected, expected_origin=str(remote),
+        confirmed_sync=confirmed, check_configuration=lambda *_: [])
+    assert calls == ([True, False] if confirmed else [True])
+    assert result['write_state'] == 'not_requested'
+    assert result['production_acceptance'] == 'not_verified'
+    assert json.dumps(original, sort_keys=True) == original_bytes
+    if confirmed and post_blocked:
+        assert result['status'] == 'blocked'
+        assert result['code'] == 'maintenance_reconciliation_untrusted'
+        assert result['source_sync_state'] == 'updated'
+        assert result['next_process_ready'] is False
+    else:
+        assert result['status'] == ('synced' if confirmed else 'ready')
+        assert result['next_process_ready'] is confirmed
+        assert result['pre_sync_status_file'] == original['maintenance_status_file']
+        assert result['pre_sync_current_input_proof'] == original['maintenance_current_inputs']
+        assert result['continuation']['status'] == ('ready' if confirmed else 'blocked')
+    assert git(root, 'rev-parse', 'HEAD') == (expected if confirmed else before)
 
 
 def test_release_reports_actual_source_after_post_sync_live_failure(production, monkeypatch, capsys):

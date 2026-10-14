@@ -94,6 +94,7 @@ def _unresolved_general_material(request_id):
 
 
 def test_general_unresolved_evidence_does_not_open_a_submittable_review(tmp_path):
+    from apps.oa_finance_preaudit import item_failure
     submissions = []
     engine = _engine(tmp_path, "general_expense", RuntimeError("unused"),
                      controlled=True, submissions=submissions)
@@ -101,13 +102,17 @@ def test_general_unresolved_evidence_does_not_open_a_submittable_review(tmp_path
     action = engine.next_action("general_expense", mode="controlled_write")
     assert action["action"] == "needs_admin"
     assert action["reason"] == "material_collection_failed"
+    assert action["failure_detail_code"] == "general_evidence_references_unresolved"
     assert action["write_state"] == "not_requested"
+    state = json.loads(Path(action["state_file"]).read_text())
+    assert item_failure.isolated(Path(action["action_file"]).parent, state)
     assert submissions == []
     assert not Path(action["action_file"]).with_name("review-packet.json").exists()
 
 
 @pytest.mark.parametrize("entrypoint", ("next_action", "complete_review"))
 def test_legacy_general_unresolved_evidence_stops_before_writer(tmp_path, monkeypatch, entrypoint):
+    from apps.oa_finance_preaudit import item_failure
     submissions = []
     engine = _engine(tmp_path, "general_expense", RuntimeError("unused"),
                      controlled=True, submissions=submissions)
@@ -118,6 +123,8 @@ def test_legacy_general_unresolved_evidence_stops_before_writer(tmp_path, monkey
     packet_path = Path(action["review_packet_file"])
     packet = json.loads(packet_path.read_bytes())
     frozen = {p: p.read_bytes() for p in (packet_path, Path(packet["material_file"]))}
+    state = json.loads(Path(action["state_file"]).read_text())
+    assert flow_engine.FlowEngine.resumable_review(tmp_path, state)
     decision_file = tmp_path / "unresolved-decision.json"
     json_artifact.write_json_atomic(decision_file, _uncertain_decision(action, packet), indent=2)
     if entrypoint == "next_action":
@@ -126,7 +133,10 @@ def test_legacy_general_unresolved_evidence_stops_before_writer(tmp_path, monkey
         result = engine.complete_review(Path(action["action_file"]), decision_file)
     assert result["action"] == "needs_admin"
     assert result["reason"] == "material_collection_failed"
+    assert result["failure_detail_code"] == "general_evidence_references_unresolved"
     assert result["write_state"] == "not_requested"
+    state = json.loads(Path(action["state_file"]).read_text())
+    assert item_failure.isolated(Path(action["action_file"]).parent, state)
     assert submissions == []
     assert all(p.read_bytes() == raw for p, raw in frozen.items())
     assert not any(Path(action["action_file"]).with_name(name).exists()
@@ -149,6 +159,39 @@ def test_general_unresolved_evidence_gate_preserves_reviewable_cases(tmp_path, v
     engine = _engine(tmp_path, workflow_key, RuntimeError("unused"))
     engine._collect_material = lambda *_: material
     assert engine.next_action(workflow_key)["action"] == "review_required"
+
+
+def test_unresolved_general_isolation_keeps_next_case_moving_without_replay(tmp_path):
+    from apps.oa_finance_preaudit import reconciliation
+    submissions = []
+    engine = _engine(tmp_path, 'general_expense', RuntimeError('unused'), controlled=True, submissions=submissions)
+    original = list(engine._discover_candidates('general_expense'))[0]
+    pending = [original, {**original, 'request_id': 'readable-next-request'}]
+    engine._discover_candidates = lambda _: pending
+    engine._collect_material = lambda request, _: (
+        _unresolved_general_material(request) if request == original['request_id'] else
+        _material(request, 'general_expense'))
+    failed = engine.next_action('general_expense', mode='controlled_write')
+    assert failed['reason'] == 'material_collection_failed'
+    assert submissions == []
+    failed_root = Path(failed['action_file']).parent
+    failure_bytes = {p: p.read_bytes() for p in failed_root.iterdir() if p.is_file() and p.suffix != '.lock'}
+    report = reconciliation.reconcile(tmp_path, pending_rows=pending, handled_rows=[])
+    assert report['continuation'] == {'status': 'ready', 'scope': 'item',
+        'isolated_pending': 1, 'blocking_reasons': {}}
+    following = engine.next_action('general_expense', mode='controlled_write')
+    assert following['action'] == 'review_required'
+    assert Path(following['action_file']).parent != failed_root
+    packet = json.loads(Path(following['review_packet_file']).read_text())
+    decision = tmp_path / 'next-decision.json'
+    json_artifact.write_json_atomic(decision, _uncertain_decision(following, packet), indent=2)
+    completed = engine.complete_review(Path(following['action_file']), decision)
+    assert completed['action'] == 'closed'
+    assert completed['write_state'] == 'submitted'
+    assert len(submissions) == 1
+    assert engine.complete_review(Path(following['action_file']), decision) == completed
+    assert len(submissions) == 1
+    assert {p: p.read_bytes() for p in failed_root.iterdir() if p.is_file() and p.suffix != '.lock'} == failure_bytes
 
 
 SESSION_BLOCKING_FAILURE_CODES = (
