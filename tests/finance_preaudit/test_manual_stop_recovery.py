@@ -4,9 +4,11 @@ import hashlib
 import json
 import copy
 import os
+import stat
 from datetime import datetime, timedelta, timezone
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -209,7 +211,7 @@ def test_original_mixed_stop_and_wait_event_is_verified(tmp_path):
     assert result['status'] == 'recovered'
 
 
-def _observed_birth(evidence):
+def _observed_birth(evidence, *, allow_synthetic_birthtime=False):
     binding = json.loads(evidence.read_text())
     stop = Path(binding['target_root']) / 'runtime/stop-preaudit.flag'
     stop.unlink()
@@ -217,13 +219,16 @@ def _observed_birth(evidence):
     os.write(descriptor, b'stop_requested\n')
     os.close(descriptor)
     info = stop.stat()
-    if not hasattr(info, 'st_birthtime'):
+    born = getattr(info, 'st_birthtime', None)
+    if born is None and not allow_synthetic_birthtime:
         pytest.skip('birth identity requires filesystem birthtime')
+    if born is None:
+        born = info.st_mtime
     at = datetime.fromtimestamp(info.st_mtime_ns / 1e9, tz=timezone.utc)
     binding['stop'].update(device=info.st_dev, inode=info.st_ino, mtime_ns=info.st_mtime_ns)
     observation = {'kind': 'preaudit_stop_identity_observation', 'path': str(stop),
                    'observed_at': (at + timedelta(seconds=4)).isoformat(), 'device': info.st_dev, 'inode': info.st_ino,
-                   'mtime_ns': info.st_mtime_ns, 'ctime_ns': info.st_ctime_ns, 'birthtime': info.st_birthtime,
+                   'mtime_ns': info.st_mtime_ns, 'ctime_ns': info.st_ctime_ns, 'birthtime': born,
                    'sha256': binding['stop']['sha256'], 'boundary': 'First maintenance observation; no historical inode claimed.'}
     binding['stop_identity_observation'] = _write(stop.parent.parent.parent / 'observation.json', observation)
     saved = stop.parent.parent.parent / 'saved-stop.flag'
@@ -263,6 +268,27 @@ def test_first_maintenance_identity_is_bound_to_original_file_birth(tmp_path):
     receipt = json.loads(Path(result['receipt_file']).read_text())
     assert result['status'] == 'recovered'
     assert receipt['stop_identity_source'] == 'maintenance_observation_with_original_birth'
+
+
+def test_recovery_rejects_filesystem_without_birthtime(tmp_path, monkeypatch):
+    from apps.oa_finance_preaudit.manual_stop_recovery import recover_manual_stop
+    target, evidence, current = _submission_conflict(tmp_path)
+    _mixed_stop_event(evidence)
+    # Synthetic input lets Linux exercise the rejection instead of skipping setup.
+    _observed_birth(evidence, allow_synthetic_birthtime=True)
+    stop = target / 'runtime/stop-preaudit.flag'
+    original_lstat = Path.lstat
+    info = original_lstat(stop)
+    without_birth = SimpleNamespace(**{
+        name: getattr(info, name) for name in dir(info)
+        if name.startswith('st_') and name != 'st_birthtime'
+    })
+    monkeypatch.setattr(Path, 'lstat', lambda path, *args, **kwargs:
+                        without_birth if path == stop else original_lstat(path, *args, **kwargs))
+    with pytest.raises(ValueError, match='manual_stop_recovery_blocked'):
+        recover_manual_stop(target_root=target, evidence_file=evidence, confirmed=True, check_live=lambda: current)
+    assert stop.read_bytes() == b'stop_requested\n'
+    assert not list((target / 'runtime/control').glob('manual-stop-recovery-*.json'))
 
 
 @pytest.mark.parametrize('defect', ['unknown', 'authorized', 'count', 'extra_cause', 'missing_closure',
@@ -635,3 +661,54 @@ def test_private_evidence_rejects_untrusted_tmp_alias(tmp_path, monkeypatch):
     monkeypatch.setattr(manual_stop_recovery.os, 'readlink', lambda _path: '/untrusted/tmp')
     with pytest.raises(ValueError, match='manual_stop_recovery_blocked'):
         manual_stop_recovery._private_bytes(Path('/tmp/never-read.json'))
+
+
+def test_recovery_rejects_system_tmp_alias_with_untrusted_owner(tmp_path, monkeypatch):
+    from apps.oa_finance_preaudit import manual_stop_recovery
+    target, _evidence, current = _environment(tmp_path)
+    original_lstat = Path.lstat
+    alias = SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_uid=1)
+    monkeypatch.setattr(manual_stop_recovery.sys, 'platform', 'darwin')
+    monkeypatch.setattr(Path, 'lstat', lambda path, *args, **kwargs:
+                        alias if path == Path('/tmp') else original_lstat(path, *args, **kwargs))
+    with pytest.raises(ValueError, match='manual_stop_recovery_blocked'):
+        manual_stop_recovery.recover_manual_stop(
+            target_root=target, evidence_file=Path('/tmp/never-read.json'),
+            confirmed=True, check_live=lambda: current)
+    assert (target / 'runtime/stop-preaudit.flag').read_bytes() == b'stop_requested\n'
+    assert not list((target / 'runtime/control').glob('manual-stop-recovery-*.json'))
+
+
+def test_recovery_rejects_system_tmp_alias_replaced_during_read(tmp_path, monkeypatch):
+    from apps.oa_finance_preaudit import manual_stop_recovery
+    target, evidence, current = _environment(tmp_path)
+    literal = Path('/tmp/stop-recovery-evidence.json')
+    physical = Path('/private/tmp/stop-recovery-evidence.json')
+    original_lstat = Path.lstat
+    original_read = manual_stop_recovery.runtime_control.read_control_bytes
+    alias = SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_uid=0, st_dev=1, st_ino=2, st_mtime_ns=3)
+    replacement = SimpleNamespace(**{**vars(alias), 'st_ino': 4})
+    read_completed = False
+
+    def lstat(path, *args, **kwargs):
+        if path == Path('/tmp'):
+            return replacement if read_completed else alias
+        return original_lstat(evidence if path == physical else path, *args, **kwargs)
+
+    def read_then_replace(path, **kwargs):
+        nonlocal read_completed
+        assert path == physical
+        raw = original_read(evidence, **kwargs)
+        read_completed = True
+        return raw
+
+    monkeypatch.setattr(manual_stop_recovery.sys, 'platform', 'darwin')
+    monkeypatch.setattr(Path, 'lstat', lstat)
+    monkeypatch.setattr(manual_stop_recovery.os, 'readlink', lambda _path: 'private/tmp')
+    monkeypatch.setattr(manual_stop_recovery.runtime_control, 'read_control_bytes', read_then_replace)
+    with pytest.raises(ValueError, match='manual_stop_recovery_blocked'):
+        manual_stop_recovery.recover_manual_stop(
+            target_root=target, evidence_file=literal, confirmed=True, check_live=lambda: current)
+    assert read_completed
+    assert (target / 'runtime/stop-preaudit.flag').read_bytes() == b'stop_requested\n'
+    assert not list((target / 'runtime/control').glob('manual-stop-recovery-*.json'))
