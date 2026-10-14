@@ -194,12 +194,13 @@ def test_wait_observes_original_supervisor_completion(tmp_path, monkeypatch):
     directory = tmp_path / 'executions' / uuid4().hex
     child = '''import os,json,datetime,time
 from pathlib import Path
+from apps.oa_approval import runtime_control
 time.sleep(.3)
-Path(os.environ['OA_CONTROLLER_EXECUTION_MANIFEST_FILE']).write_text(json.dumps({
+runtime_control.write_control_bytes_atomic(Path(os.environ['OA_CONTROLLER_EXECUTION_MANIFEST_FILE']), json.dumps({
  'kind':'preaudit_controller_run_manifest','controller_pid':os.getpid(),
  'run_id':'a'*32,'controller_instance_id':'b'*32,'state':'completed',
  'children_reaped':True,'code_revision':'c'*40,
- 'started_at':datetime.datetime.now(datetime.timezone.utc).isoformat()}))
+ 'started_at':datetime.datetime.now(datetime.timezone.utc).isoformat()}).encode())
 print('original terminal output')'''
     code = ('from pathlib import Path; import sys; from scripts.finance_preaudit_run import supervise; '
             f'supervise([sys.executable, "-c", {child!r}], directory=Path({str(directory)!r}), owner_task_id={owner!r})')
