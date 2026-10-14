@@ -4083,6 +4083,8 @@ class FlowEngine:
         if (confirmed is not True or not _is_attempt_action_path(path, self._root)
                 or not path.is_relative_to(self._root) or self._discover_handled is None
                 or mode not in {"preview", "controlled_write"}
+                or (mode == "preview" and any(port is not None for port in (
+                    self._authorization_source, self._authorization_verifier, self._submit_frozen)))
                 or (mode == "controlled_write" and (self._authorization_source is None
                     or self._authorization_verifier is None or self._submit_frozen is None))):
             raise ValueError(code)

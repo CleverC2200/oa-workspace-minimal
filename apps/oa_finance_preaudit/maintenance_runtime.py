@@ -513,6 +513,8 @@ def assert_live_safe(payload: dict, *, maintenance_leases_held: bool = True,
                 and type(isolated) is int and type(quarantined) is int and quarantined >= 0
                 and len(uncounted) > 0 and isolated == quarantined + len(uncounted))
     withdrawn_action = None
+    if source_only_proof is not None and not isinstance(source_only_proof, dict):
+        raise RuntimeError('maintenance_current_inputs_untrusted')
     if source_only_proof is not None and source_only_proof.get('kind') == 'preaudit_confirmed_withdrawal_source_only':
         inputs = payload.get('maintenance_current_inputs', {})
         withdrawn_action = source_only_proof.get('withdrawn_action')

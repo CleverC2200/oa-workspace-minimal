@@ -121,7 +121,9 @@ def projection(target: Path, state: dict) -> dict:
         required_fields.add("finished_at")
     if (set(receipt) != required_fields
             or (withdrawn and expected["recovery_reason"] != "user_confirmed_withdrawal")
-            or (not withdrawn and (expected["failure_code"] not in _CODES
+            or (not withdrawn and (not isinstance(expected["failure_code"], str)
+                or expected["failure_code"] not in _CODES
+                or not isinstance(expected["no_write_evidence"], str)
                 or expected["no_write_evidence"] not in {"confirmed_no_write", "human_confirmed_no_write"}))
             or (receipt.get("status") == "prepared") != (receipt.get("result_action") == "review_required")
             or any(path.is_symlink() for path in (target, source, *target.parents))

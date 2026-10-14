@@ -69,6 +69,41 @@ def test_withdrawal_recovery_rejects_unsafe_source_or_live_state(tmp_path, mutat
     assert not source.parent.with_name('attempt-2').exists()
 
 
+@pytest.mark.parametrize('port', ['authorization_source', 'authorization_verifier', 'submit_frozen', 'all'])
+def test_default_preview_rejects_write_ports_before_creating_attempt(tmp_path, port):
+    root = tmp_path / 'runtime/finance_preaudit_flows'
+    engine, source, observation = submitted(root)
+    ports = {'authorization_source': _grant, 'authorization_verifier': _verify_grant,
+             'submit_frozen': lambda _: pytest.fail('preview cannot write OA')}
+    for name, value in ports.items():
+        if port in {name, 'all'}:
+            setattr(engine, '_' + name, value)
+    with pytest.raises(ValueError, match='withdrawal_recovery_not_safe'):
+        engine.recover_withdrawn_submission(source, confirmed=True, observation=observation)
+    assert not source.parent.with_name('attempt-2').exists()
+
+
+@pytest.mark.parametrize('field', ['recovery_reason', 'recovery_no_write_evidence'])
+def test_corrupt_legacy_recovery_state_is_rejected_without_breaking_reconciliation(tmp_path, field):
+    from apps.oa_finance_preaudit import reconciliation
+    root = tmp_path / 'runtime/finance_preaudit_flows'
+    engine = _engine(root, 'recorded-legacy')
+    engine._discover_handled = lambda: []
+    action = engine.next_action('travel_expense')
+    source = Path(action['action_file'])
+    engine._persist_attempt_needs_admin(source, 'codex_decision_invalid')
+    result = engine.recover_confirmed_no_write(source, confirmed=True)
+    target = Path(result['action_file']).parent
+    state = json.loads((target / 'state.json').read_text())
+    assert recovery_receipt.projection(target, state)['receipt_status'] == 'verified'
+    state[field] = []
+    json_artifact.write_json_atomic(target / 'state.json', state)
+    assert recovery_receipt.projection(target, state)['receipt_status'] == 'missing_or_invalid'
+    report = reconciliation.reconcile(root, pending_rows=list(engine._discover_candidates('travel_expense')),
+                                      handled_rows=[])
+    assert isinstance(report, dict)
+
+
 def test_withdrawal_material_failure_is_isolated_without_reusing_old_opinion(tmp_path):
     root=tmp_path/'runtime/finance_preaudit_flows'
     engine, source, observation=submitted(root)
@@ -85,7 +120,7 @@ def test_withdrawal_material_failure_is_isolated_without_reusing_old_opinion(tmp
     assert item_failure.isolated(attempt,state)
 
 
-@pytest.mark.parametrize('mutation', ['valid', 'no_confirmation', 'extra_unresolved', 'wrong_action', 'unknown', 'proof_missing'])
+@pytest.mark.parametrize('mutation', ['valid', 'no_confirmation', 'extra_unresolved', 'wrong_action', 'unknown', 'proof_missing', 'non_object_proof'])
 def test_maintenance_explains_only_the_explicit_confirmed_withdrawal(tmp_path, mutation):
     from apps.oa_finance_preaudit import maintenance_runtime, withdrawn_submission
     from tests.finance_preaudit.test_maintenance_runtime import live_snapshot
@@ -107,6 +142,7 @@ def test_maintenance_explains_only_the_explicit_confirmed_withdrawal(tmp_path, m
     if mutation=='wrong_action':proof['withdrawn_action']=str(source.parent/'other.json')
     if mutation=='unknown':row['local_write_state']='unknown'
     if mutation=='proof_missing':snapshot['maintenance_current_inputs'].pop('verified_withdrawn_actions')
+    if mutation=='non_object_proof':proof=[]
     if mutation=='valid':
         with pytest.raises(RuntimeError):maintenance_runtime.assert_live_safe(snapshot)
         maintenance_runtime.assert_live_safe(snapshot,source_only_proof=proof)
