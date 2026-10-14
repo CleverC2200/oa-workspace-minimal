@@ -13,7 +13,7 @@ def _action(tmp_path: Path):
         collect_material=lambda request, _: {
             "schema_version": 1, "kind": "preaudit_material", "request_id": request,
             "workflow_key": "travel_expense", "workflow_name": "差旅费报销流程",
-            "declared_fields": [], "resources": [], "prepared": {
+            "declared_fields": [{"field_name": "period", "value": "2026-08"}], "resources": [], "prepared": {
                 "images": [], "structured_contents": [], "manifest": [],
             }, "authority_facts": [], "warnings": [],
         })

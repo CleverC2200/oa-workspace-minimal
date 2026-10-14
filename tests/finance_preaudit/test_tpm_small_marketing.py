@@ -384,7 +384,7 @@ def test_tpm_worker_uses_only_the_tpm_rule_pack(tmp_path: Path) -> None:
     assert "`references/flows/small-marketing-fee.md`" not in prompt
 
 
-def test_tpm_degraded_prompt_does_not_turn_read_failure_into_missing_data(
+def test_tpm_read_failure_never_enters_reviewer_prompt(
     tmp_path: Path,
 ) -> None:
     engine = flow_engine.FlowEngine(
@@ -402,10 +402,10 @@ def test_tpm_degraded_prompt_does_not_turn_read_failure_into_missing_data(
     )
     action = engine.next_action(WORKFLOW_KEY)
 
-    prompt = codex_review_worker._prompt(Path(action["action_file"]))
-
-    assert "只说明自动读取没有完成" in prompt
-    assert "不得声称申请人未填写字段、未上传附件或单据没有发票" in prompt
+    assert action["action"] == "needs_admin"
+    assert action["failure_detail_code"] == "attachment_content_incomplete"
+    with pytest.raises(ValueError, match="frozen_packet_changed"):
+        codex_review_worker._prompt(Path(action["action_file"]))
 
 
 @pytest.mark.parametrize("all_pass", [True, False])

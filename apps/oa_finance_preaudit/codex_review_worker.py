@@ -554,7 +554,7 @@ def _prompt(action_file: Path) -> str:
 要求：
 1. 完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由读取 `references/result-contract.md`、`references/observation-contract.md`、`{rule_reference}`，完整读取 `references/payment-screenshot-exemption.md`，再读取动作引用的审核包、材料和准备页；{workflow_requirement}{frozen_item_requirement}不得读取其他 attempt。
 2. 不修改任何文件、项目代码、Skill、配置、授权清单或冻结材料；不得调用 `next-action`、`complete-review` 或任何 OA 写入，不得领取其他单据；不得读取现有审核决定、意见或 `review-output-*.txt` 失败原输出。
-3. 根据审核包中的固定审核项动态形成结构化决定。证据不足使用 `uncertain` 交财务判断，不得因为材料缺口卡住业务流程；身份、归属、冻结或授权不可信时停止。审核包为 `material_state=degraded` 时，`collection_gaps` 只说明自动读取没有完成，不得声称申请人未填写字段、未上传附件或单据没有发票；结论直接说明自动读取失败、对应项目未完成核对，请财务查看原单。
+3. 根据审核包中的固定审核项动态形成结构化决定。证据不足使用 `uncertain` 交财务判断，不得因为材料缺口卡住业务流程；身份、归属、冻结或授权不可信时停止。自动读取失败、材料全空或旧降级审核包须停止当前单据，不生成可提交决定。`collection_gaps` 不证明申请人未填写、未上传或没有发票；按 FlowEngine 合同保留技术失败。
 4. {_OPINION_BREVITY_REQUIREMENT}结论内保留规则要求的具体金额、实际公司全称等必要业务原值；不得输出密钥、凭据或无关附件原文。宿主会校验并负责受控提交。
 
 5. {output_requirement}JSON 之外不添加 Markdown、解释、日志或额外意见正文。

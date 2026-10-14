@@ -51,6 +51,14 @@ python -B -m apps.oa_finance_preaudit.host_chat_review --operation assign --owne
 
 将该完整命令用 JSON 字符串字面量填入下方 cmd，再执行一个独立原生 exec。整个调用只含这一条表达式，不附加变量、注释、分支或其他工具。此示例中的占位文字必须替换为 draft_command 返回值，不能照字面执行：
 
+准备命令时用标准 JSON 编码器生成整条原生调用，再原样执行输出，避免手工转义或模板字符串破坏来源合同。下面只生成文本，不发布草稿；`command` 是上一步 `draft_command` 的完整返回值：
+
+```python
+print('text(await tools.exec_command(' + json.dumps({'cmd': command}, ensure_ascii=False) + '));')
+```
+
+草稿发布后的来源行由主聊天从已登记子会话定位；子 Agent 交回专用回执及决定路径即可返回空闲。
+
 默认工具目录与审核工作树不同的时候，可在 exec_command 的同一个 JSON 对象中增加 workdir。其值必须是当前审核项目根目录的完整绝对路径，与宿主 PROJECT_ROOT 字符串完全一致；其他目录、相对路径及其他工具参数仍拒绝。cmd 和专用发布回执的校验保持相同。
 
 ```javascript

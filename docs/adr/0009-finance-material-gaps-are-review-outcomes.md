@@ -1,6 +1,6 @@
 # ADR 0009：财务材料缺口属于预审结果
 
-- 状态：已接受
+- 状态：采集失败降级提交的决定已被 [ADR 0011](0011-collection-failure-blocks-opinions.md) 取代；正常材料上的业务缺口仍是预审结果
 - 日期：2026-08-23
 - 关联：GitHub Issue #73
 

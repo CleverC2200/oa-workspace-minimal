@@ -22,9 +22,9 @@ def exchange(tmp_path, monkeypatch, request):
     engine = flow_engine.FlowEngine(root=root / 'runtime/finance_preaudit_flows',
         discover_candidates=lambda workflow: [{'request_id': 'offline-request',
             'received_at': '2026-10-10T09:00:00+08:00', 'workflow_key': workflow}],
-        collect_material=lambda request, _: {'schema_version': 1, 'kind': 'preaudit_material',
-            'request_id': request, 'workflow_key': 'business_support_fee', 'workflow_name': '业务支持费',
-            'declared_fields': [], 'resources': [],
+        collect_material=lambda request, attempt: {'schema_version': 1, 'kind': 'preaudit_material',
+            'request_id': request, 'workflow_key': attempt.parents[2].name, 'workflow_name': 'offline form',
+            'declared_fields': [{'field_name': 'period', 'value': '2026-08'}], 'resources': [],
             'prepared': {'images': [], 'structured_contents': [], 'manifest': []},
             'authority_facts': [], 'warnings': []})
     action = Path(engine.next_action('business_support_fee')['action_file'])

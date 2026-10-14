@@ -26,7 +26,7 @@ def _material(request_id: str) -> dict:
         "request_id": request_id,
         "workflow_key": "travel_expense",
         "workflow_name": "差旅费报销流程",
-        "declared_fields": [],
+        "declared_fields": [{"field_name": "period", "value": "2026-08"}],
         "resources": [],
         "prepared": {"images": [], "structured_contents": [], "manifest": []},
         "authority_facts": [],
@@ -1366,17 +1366,14 @@ def test_shared_authorization_failure_stops_flow_but_item_failure_does_not(
         candidates=rows,
         collect_material=fail_one,
     )
-    degraded = item.next_action("travel_expense")
-    decision_file = tmp_path / "material-gap.json"
-    json_artifact.write_json_atomic(decision_file, _uncertain_decision(degraded))
-    closed = item.complete_review(Path(degraded["action_file"]), decision_file)
-    continued = item.next_action("travel_expense")
+    failed = item.next_action("travel_expense")
+    repeated = item.next_action("travel_expense")
 
-    assert degraded["action"] == "review_required"
-    assert closed["business_state"] == "needs_human"
-    assert continued["action"] == "review_required"
-    assert continued["case_key"] == degraded["case_key"]
-    assert collected == ["request-a", "request-a"]
+    assert failed["action"] == "needs_admin"
+    assert failed["reason"] == "material_collection_failed"
+    assert repeated["action"] == "review_required"
+    assert repeated["case_key"] != failed["case_key"]
+    assert collected == ["request-a", "request-b"]
 
 
 def test_unknown_write_blocks_later_items(tmp_path: Path) -> None:

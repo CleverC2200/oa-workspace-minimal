@@ -18,7 +18,7 @@ python3 -m apps.oa_finance_preaudit.cli next-action \
 stdout 只能解析为一个 `schema_version=1`、`kind=preaudit_action` 的 JSON：
 
 - `action=closed`：本轮结束，不取数、不等待。
-- `action=review_required`：只读取 `review_packet_file` 及审核包引用的 `material_file`，按审核包顺序完成当前流程的固定审核项。当前登录、会话、执行身份和流程授权可信时，六类财务流程的材料关系、规则口径或业务证据不足仍返回该动作；审核包标为 `material_state=degraded`，且 `required_uncertain_items` 列出必须交财务判断的项目。
+- `action=review_required`：只读取 `review_packet_file` 及审核包引用的 `material_file`，按审核包顺序完成当前流程的固定审核项。材料采集成功且存在可读取的当前证据时，业务材料缺项、规则口径模糊或证据冲突仍由 Agent 形成 `uncertain` / `fail` 意见。
 - `action=needs_admin`：当前登录/会话、执行身份、流程授权、单据身份、冻结 attempt、动作/状态、审核包完整性、写入授权或目标不再可信；这是退出码为 0 的正常动作结果。停止当前执行并报告 `reason`，不得生成财务意见、自行修复或重取。
 
 包装待办成功读取且为空时，入口另以只读已办结果核对历史材料失败。只有已办命中同一请求、action/state 身份及失败字段一致、`write_state=not_requested`，且无活动完成锁、Writer 边界、执行回执、审核决定、意见或提交信封时，才不再返回该旧失败。旧 attempt 和隔离证据保持不变，不创建新 attempt、不重新采集；没有其他动作时返回无工作 `closed`。已办不可读、未命中、身份冲突、未知写入和其他失败仍保留原阻断，已打开审核动作继续按原合同处理。其他六类财务流程不使用这一包装空队列规则。
@@ -43,7 +43,7 @@ FlowEngine 的隔离和恢复仍须在完成锁内复核失败凭据、动作、
 
 审核者不得修改 `action_file`、审核包或材料，不得读取其他 attempt，不得自行组织路径、计算指纹、选择 requestId 或调用 OA 写入。
 
-降级审核包的 `material_file` 不引用采集失败前的任何候选字段或资源，只保留脱敏 `collection_gaps`。审核者必须根据缺口和当前流程审核项生成可读的自然语言结论；脚本验证所有 `required_uncertain_items` 均为 `uncertain` 后，仍可正常闭合为 `business_state=needs_human`。OA 登录失败、OA 会话过期、当前 RPA/CDP 会话缺失/失效/不可用或执行身份不可信时，不使用降级包，直接返回 `needs_admin`，且不得生成材料、审核包、决定、意见或写入请求。包装图片材料不可读时也继续返回 `needs_admin`，不使用降级包。
+六类财务的自动采集、下载或读取失败返回 `needs_admin / material_collection_failed`，稳定细码及脱敏计数保留在失败回执；不生成可提交审核包或“全部未完成核对”的意见。采集返回成功但申报字段、资源、权威资料及准备内容全空时，同样停止。旧 `material_state=degraded` 冻结包只用于历史验真，重新领取及完成入口均在 Writer 前阻断，原材料、审核包和已提交回执保持原字节。正常材料上的业务 `fail` / `uncertain` 继续按原合同提交 AI 意见。包装图片不可读仍按其原技术失败合同处理。
 
 ### 审核未完成的人工交接
 

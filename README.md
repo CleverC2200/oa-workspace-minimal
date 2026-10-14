@@ -54,7 +54,7 @@ chmod 600 ~/.config/oa-workspace-minimal/oa-auth.env
 
 ## 只读 preview
 
-旧版 Word `.doc` 附件需要本机 LibreOffice（`soffice` 位于 PATH，或通过 `OA_LIBREOFFICE_BIN` 指定可执行文件）。采集器在独立临时配置中禁用宏、转换为 PDF 并逐页准备图片和确定性文本，保留原附件身份及哈希；单文件转换最多等待 60 秒，结束或超时时回收该转换进程组。转换器不可用、转换失败或超时分别保留 `legacy_doc_converter_unavailable`、`legacy_doc_conversion_failed`、`legacy_doc_conversion_timeout`。失败仍按现有材料降级路径处理，不把未读内容当作已审核；通用内容准备失败保留 `attachment_content_incomplete`。发布涉及此能力时须在生产执行环境核实转换器可用；仅安装 Python 依赖不能提供 LibreOffice。
+旧版 Word `.doc` 附件需要本机 LibreOffice（`soffice` 位于 PATH，或通过 `OA_LIBREOFFICE_BIN` 指定可执行文件）。采集器在独立临时配置中禁用宏、转换为 PDF 并逐页准备图片和确定性文本，保留原附件身份及哈希；单文件转换最多等待 60 秒，结束或超时时回收该转换进程组。转换器不可用、转换失败或超时分别保留 `legacy_doc_converter_unavailable`、`legacy_doc_conversion_failed`、`legacy_doc_conversion_timeout`。失败仍按材料技术失败停止当前单据，提交门见[FlowEngine 合同](.agents/skills/oa-finance-preaudit/references/flow-engine-contract.md)，不把未读内容当作已审核；通用内容准备失败保留 `attachment_content_incomplete`。发布涉及此能力时须在生产执行环境核实转换器可用；仅安装 Python 依赖不能提供 LibreOffice。
 
 六类财务流程和包装版面校对已经提供同一个本地深模块两动作接口。先取得指定流程的下一个动作：
 
@@ -71,7 +71,7 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
   --decision-file /absolute/path/to/review-decision.json
 ```
 
-两条命令默认都是 preview，动作固定 `write_authorized=false`，写入状态固定为 `not_requested`；不会调用 OA 提交。模块和 CLI 共用同一业务实现，大对象通过本地文件传递，stdout 只输出一个版本化 JSON。六类财务流程无法可信取得材料时生成不含可疑证据的降级审核包，由 Agent 输出 `⚠️` 意见交财务判断；流程身份、冻结 attempt、写入授权或目标不一致时才返回 `needs_admin`。包装图片不可读仍停止，避免生成貌似完成的校对意见。七类流程的目录和当前动作投影相互独立；不同单据的材料收集与 Agent 审核可以并发，每个 attempt 使用自己的完成锁，互不等待；所有 OA 写入入口共用一把全局锁并严格串行。
+两条命令默认都是 preview，动作固定 `write_authorized=false`，写入状态固定为 `not_requested`；不会调用 OA 提交。模块和 CLI 共用同一业务实现，大对象通过本地文件传递，stdout 只输出一个版本化 JSON。六类财务自动采集或读取失败、材料全空时返回 `needs_admin / material_collection_failed`，不生成可提交意见；正常材料中的业务缺项或冲突仍交财务判断。旧降级待审包在 Writer 前阻断，原历史提交继续只读验真。包装图片不可读仍停止，避免生成貌似完成的校对意见。七类流程的目录和当前动作投影相互独立；不同单据的材料收集与 Agent 审核可以并发，每个 attempt 使用自己的完成锁，互不等待；所有 OA 写入入口共用一把全局锁并严格串行。
 
 手工运行只使用 `next-action`、`complete-review`、`status`、`prune` 和 `clean` 五个命令；`clean --all-cache` 只清理当前配置的可重建附件缓存，并受控制器和 Writer 空闲门禁保护。六类财务的批量生产由唯一滚动控制器编排同一深模块：按 OA 操作时间选取，审核可并发，提交按认领顺序经过唯一 Writer；包装继续走单据级图片文字校对路径。候选发现、材料收集、冻结校验、单据锁、提交安全门和回执仍隐藏在模块内，没有角色 CLI、底层队列命令或跨任务消息协议。差旅手工受控入口默认拒绝；唯一例外是人工已核实未写入的 `writer_result_unknown` 恢复，它必须绑定精确 requestId，并在无活动控制器和 Writer 时仅创建新冻结 attempt，不直接提交 OA。
 
@@ -265,7 +265,7 @@ python3 -m apps.oa_finance_preaudit.cli prune \
 
 ## 离线质量回放
 
-离线基线包含七类流程的正常、业务异常、证据不足和技术失败场景，并为六类财务流程增加材料采集降级场景，共 34 个脱敏样本。回放比较固定审核项、状态/停止码、格式、耗时和精确 Token，不需要 OA 登录：
+离线基线包含七类流程的正常、业务异常、证据不足和技术失败场景，并为六类财务流程增加正常读取材料后的业务证据缺口场景，共 34 个脱敏样本。回放比较固定审核项、状态/停止码、格式、耗时和精确 Token，不需要 OA 登录：
 
 ```bash
 python3 -m pytest tests/finance_preaudit/test_flow_evals.py -v

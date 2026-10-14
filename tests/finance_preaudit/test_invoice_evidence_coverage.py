@@ -262,7 +262,7 @@ def test_six_finance_collectors_preserve_same_invoice_coverage(config, monkeypat
                for fact in material['authority_facts'])
 
 
-def test_service_failure_retains_existing_collection_failure_and_degraded_boundary(tmp_path, monkeypatch):
+def test_service_failure_stops_before_review_and_retains_detail(tmp_path, monkeypatch):
     from pathlib import Path
     from apps.oa_finance_preaudit import flow_engine
 
@@ -277,12 +277,10 @@ def test_service_failure_retains_existing_collection_failure_and_degraded_bounda
         collect_material=lambda _request, _root: collect(),
     )
     action = engine.next_action(CONFIG['flow_key'], mode='preview')
-    packet = json.loads(Path(action['review_packet_file']).read_text())
-    material = json.loads(Path(packet['material_file']).read_text())
-    assert packet['material_state'] == 'degraded'
-    assert material['authority_facts'] == []
-    assert 'invoice_evidence' not in material
-    assert material['collection_gaps'] == [{'code': 'invoice_buyer_read_failed'}]
+    assert action['action'] == 'needs_admin'
+    assert action['reason'] == 'material_collection_failed'
+    assert action['failure_detail_code'] == 'invoice_buyer_read_failed'
+    assert not Path(action['action_file']).with_name('review-packet.json').exists()
     assert action['write_state'] == 'not_requested'
 
 

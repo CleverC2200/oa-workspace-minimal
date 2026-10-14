@@ -27,13 +27,13 @@
       {"status":"pass","conclusion":"核销金额在上限内。","evidence_refs":["material:declared_fields.amount"],"missing_evidence":[]},
       {"status":"uncertain","conclusion":"报销公司、支付公司或购买方证据不足。","evidence_refs":[],"missing_evidence":["支付主体一致性证据"]}
     ]},
-    {"case_id":"marketing-collection-gap-v2","material_workflow":"travel_expense","facts":{},"items":[
-      {"status":"uncertain","conclusion":"预算科目材料未能可信取得，请财务结合原始单据判断。","evidence_refs":[],"missing_evidence":["可信预算科目材料"]},
-      {"status":"uncertain","conclusion":"附件材料未能可信取得，请财务结合原始单据判断。","evidence_refs":[],"missing_evidence":["可信附件材料"]},
-      {"status":"uncertain","conclusion":"费用承担主体材料未能可信取得，请财务结合原始单据判断。","evidence_refs":[],"missing_evidence":["可信费用承担主体材料"]},
-      {"status":"uncertain","conclusion":"SAP 客户编码材料未能可信取得，请财务结合原始单据判断。","evidence_refs":[],"missing_evidence":["可信 SAP 客户编码材料"]},
-      {"status":"uncertain","conclusion":"核销金额材料未能可信取得，请财务结合原始单据判断。","evidence_refs":[],"missing_evidence":["可信核销金额材料"]},
-      {"status":"uncertain","conclusion":"支付公司一致性材料未能可信取得，请财务结合原始单据判断。","evidence_refs":[],"missing_evidence":["可信支付主体材料"]}
+    {"case_id":"marketing-collection-gap-v2","material_workflow":"small_marketing_fee","facts":{"reimbursement_period":"2026-08"},"items":[
+      {"status":"uncertain","conclusion":"预算科目在已读取表单中缺少对应业务依据，请财务判断。","evidence_refs":[],"missing_evidence":["可信预算科目材料"]},
+      {"status":"uncertain","conclusion":"附件在已读取表单中缺少对应业务依据，请财务判断。","evidence_refs":[],"missing_evidence":["可信附件材料"]},
+      {"status":"uncertain","conclusion":"费用承担主体在已读取表单中缺少对应业务依据，请财务判断。","evidence_refs":[],"missing_evidence":["可信费用承担主体材料"]},
+      {"status":"uncertain","conclusion":"SAP 客户编码在已读取表单中缺少对应业务依据，请财务判断。","evidence_refs":[],"missing_evidence":["可信 SAP 客户编码材料"]},
+      {"status":"uncertain","conclusion":"核销金额在已读取表单中缺少对应业务依据，请财务判断。","evidence_refs":[],"missing_evidence":["可信核销金额材料"]},
+      {"status":"uncertain","conclusion":"支付公司一致性在已读取表单中缺少对应业务依据，请财务判断。","evidence_refs":[],"missing_evidence":["可信支付主体材料"]}
     ]}
   ]
 }
