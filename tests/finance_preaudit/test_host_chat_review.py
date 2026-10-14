@@ -36,7 +36,9 @@ def exchange(tmp_path, monkeypatch, request):
     json_artifact.write_json_atomic(draft, decision)
     draft.chmod(0o600)
     from tests.finance_preaudit.test_app_reviewer_slots import native_sessions, original_execution
-    owner, parent, reviewers = native_sessions(tmp_path, monkeypatch)
+    parameter = getattr(request, 'param', True)
+    owner_depth = parameter.get('owner_depth', 0) if isinstance(parameter, dict) else 0
+    owner, parent, reviewers = native_sessions(tmp_path, monkeypatch, owner_depth=owner_depth)
     source = Path(reviewers[0]['session_file'])
     monkeypatch.setenv(host.TRANSPORT_ENV, 'host_chat')
     monkeypatch.setenv('OA_REVIEW_PROVIDER', 'openai')
@@ -445,7 +447,7 @@ def start(exchange):
     assert request.exists()
     parent = source.with_name('parent.jsonl')
     dispatch = native_call(parent, 'collaboration.followup_task',
-        {'target': '/root/reviewer_0', 'message': 'Read and audit ' + str(request)}, 'dispatch-0', {})
+        {'target': host.registered_reviewers(owner=owner)[0]['agent_path'], 'message': 'Read and audit ' + str(request)}, 'dispatch-0', {})
     host.assign(request, slot=0, owner=owner, source=parent, source_line=dispatch)
     draft_source(source, request, draft, owner)
     return thread, result, request
@@ -553,6 +555,7 @@ def test_fresh_round_selects_host_and_next_round_resets_to_cli(monkeypatch, caps
     assert seen[1]['provider'] == 'deepseek' and 'transport' not in seen[1]
 
 
+@pytest.mark.parametrize('exchange', [{'owner_depth': 0}, {'owner_depth': 1}], indirect=True)
 def test_same_registered_child_reviews_two_frozen_actions_without_recreation(exchange, monkeypatch):
     from tests.finance_preaudit.test_app_reviewer_slots import native_sessions
     action, draft, owner, source, task, manifest, engine = exchange
@@ -572,7 +575,7 @@ def test_same_registered_child_reviews_two_frozen_actions_without_recreation(exc
     request2 = host.publish(action2, prompt='Review this frozen action only.', timeout_seconds=60)
     assert [item['request_file'] for item in host.pending(owner=owner)] == [str(request2)]
     parent = source.with_name('parent.jsonl')
-    line = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(request2)}, 'second-dispatch', {})
+    line = native_call(parent, 'followup_task', {'target': reviewers[0]['agent_path'], 'message': str(request2)}, 'second-dispatch', {})
     host.assign(request2, slot=0, owner=owner, source=parent, source_line=line)
     source_line = draft_source(source, request2, draft2, owner, call_id='second-review')
     host.submit(request2, draft2, owner=owner, source=source, source_line=source_line)

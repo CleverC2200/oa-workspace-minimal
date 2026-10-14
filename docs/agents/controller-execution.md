@@ -26,6 +26,8 @@
 
 本节只适用于 OpenAI `host_chat`。唯一滚动控制器启动一次后，主对话创建恰好 3 个原生 `collaboration.spawn_agent`，保留其真实 Agent 路径、子会话 UUID 和成功工具回执。每个 Agent 一次只审核一单，返回结果后空闲；下一单调用同一 Agent 的 `followup_task`，本轮不替换身份、不递归创建审核者。DeepSeek 不执行本节。
 
+用户明确要求在当前聊天另建审批监督子 Agent 时，该监督者以自己的真实原生会话 UUID 拥有新轮次，并创建三个直属审核者。登记以可信监督者的原生祖先深度加一核验直属关系，同时核对精确 parent_thread_id、Agent 路径和实际 spawn 回执；不把整个任务树的绝对 depth=1 当成所有轮次的要求。根聊天监督的审核者仍须 depth=1；跳级、同级及损坏祖先拒绝。旧轮拥有者和固定审核槽不重新绑定。
+
 1. 保留原 `execution.json`、`invocation_id` 和工具 `session_id`，按上方入口绑定原 session。用本轮父会话的 3 次真实 spawn 回执登记槽位。来源行必须指向原生工具调用及其已完成输出；来源文件和路径不能猜测。命令中 3 组子会话文件、spawn 行按槽位 0、1、2 排列。
 
 ```bash
