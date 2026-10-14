@@ -59,7 +59,7 @@ jobs:
         run: python -m pytest -q --collect-only -p scripts.pytest_evidence --ci-evidence-file="$RUNNER_TEMP/collection.json"
       - name: Full offline tests with balanced workers
         run: >-
-          python -m pytest -q --tb=short -n 6 --dist worksteal --max-worker-restart 0
+          python -m pytest -q --tb=short -n 8 --dist worksteal --max-worker-restart 0
           -p scripts.pytest_evidence --ci-expected-file="$RUNNER_TEMP/collection.json"
           --ci-evidence-file="$RUNNER_TEMP/execution.json" --ci-budget-seconds=170
           --junitxml="$RUNNER_TEMP/offline-tests.xml" --durations=20

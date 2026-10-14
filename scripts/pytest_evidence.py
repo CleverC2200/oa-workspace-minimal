@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import resource
 import sys
 import time
 
@@ -40,6 +41,9 @@ class Evidence:
         self.config = config
         self.path = config.getoption('ci_evidence_file')
         self.started = time.monotonic()
+        self.cpu_started = time.process_time()
+        usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+        self.child_cpu_started = usage.ru_utime + usage.ru_stime
         self.collections = {}
         self.outcomes = defaultdict(list)
         self.durations = defaultdict(float)
@@ -118,6 +122,11 @@ class Evidence:
             'outcomes': dict(self.outcomes), 'counts': dict(Counter(value for values in self.outcomes.values() for value in values)),
             'durations': dict(self.durations), 'workers': dict(self.workers),
             'elapsed_seconds': elapsed, 'timing_scope': scope,
+            'cpu_count': os.cpu_count(),
+            'cpu_seconds': time.process_time() - self.cpu_started,
+            'child_cpu_seconds': (resource.getrusage(resource.RUSAGE_CHILDREN).ru_utime
+                                  + resource.getrusage(resource.RUSAGE_CHILDREN).ru_stime
+                                  - self.child_cpu_started),
             'budget_seconds': self.config.getoption('ci_budget_seconds'), 'errors': self.errors,
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
