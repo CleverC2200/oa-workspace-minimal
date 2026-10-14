@@ -384,8 +384,9 @@ def test_release_preflight_retains_leases_across_real_ff_and_readbacks(productio
     assert git(root, 'rev-parse', 'HEAD') == expected
 
 
-@pytest.mark.parametrize('confirmed,post_blocked', ((False, False), (True, False), (True, True)))
-def test_source_admission_bridge_closes_before_ordinary_postcheck(production, monkeypatch, confirmed, post_blocked):
+@pytest.mark.parametrize('confirmed,post_blocked,pre_blocked',
+    ((False, False, False), (True, False, False), (True, True, False), (True, False, True)))
+def test_source_admission_bridge_closes_before_ordinary_postcheck(production, monkeypatch, confirmed, post_blocked, pre_blocked):
     root, remote, before = production
     source = remote.parent / 'source'
     git(remote.parent, 'clone', '-q', str(remote), str(source))
@@ -406,13 +407,25 @@ def test_source_admission_bridge_closes_before_ordinary_postcheck(production, mo
             return json.loads(original_bytes)
         return live_snapshot()
     monkeypatch.setattr(maintenance_runtime, 'read_live_status', read_live)
+    configuration_calls = 0
+    def configuration(*_):
+        nonlocal configuration_calls
+        configuration_calls += 1
+        return ['changed'] if pre_blocked and configuration_calls == 2 else []
     result = production_release.release_source(root, expected_revision=expected, expected_origin=str(remote),
-        confirmed_sync=confirmed, check_configuration=lambda *_: [])
-    assert calls == ([True, False] if confirmed else [True])
+        confirmed_sync=confirmed, check_configuration=configuration)
+    assert calls == ([True, False] if confirmed and not pre_blocked else [True])
     assert result['write_state'] == 'not_requested'
     assert result['production_acceptance'] == 'not_verified'
     assert json.dumps(original, sort_keys=True) == original_bytes
-    if confirmed and post_blocked:
+    assert result['pre_sync_status_file'] == original['maintenance_status_file']
+    assert result['pre_sync_current_input_proof'] == original['maintenance_current_inputs']
+    if pre_blocked:
+        assert result['status'] == 'blocked'
+        assert result['code'] == 'production_release_configuration_invalid:changed'
+        assert result['source_sync_state'] == 'not_updated'
+        assert result['next_process_ready'] is False
+    elif confirmed and post_blocked:
         assert result['status'] == 'blocked'
         assert result['code'] == 'maintenance_reconciliation_untrusted'
         assert result['source_sync_state'] == 'updated'
@@ -420,10 +433,8 @@ def test_source_admission_bridge_closes_before_ordinary_postcheck(production, mo
     else:
         assert result['status'] == ('synced' if confirmed else 'ready')
         assert result['next_process_ready'] is confirmed
-        assert result['pre_sync_status_file'] == original['maintenance_status_file']
-        assert result['pre_sync_current_input_proof'] == original['maintenance_current_inputs']
         assert result['continuation']['status'] == ('ready' if confirmed else 'blocked')
-    assert git(root, 'rev-parse', 'HEAD') == (expected if confirmed else before)
+    assert git(root, 'rev-parse', 'HEAD') == (expected if confirmed and not pre_blocked else before)
 
 
 def test_release_reports_actual_source_after_post_sync_live_failure(production, monkeypatch, capsys):
