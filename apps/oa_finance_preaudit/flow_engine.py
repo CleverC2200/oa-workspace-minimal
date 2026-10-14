@@ -645,20 +645,26 @@ def _material_failure_details(error: Exception) -> dict:
     }
 
 
-def _degraded_material(request_id: str, workflow_key: str, error: Exception) -> dict:
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "kind": "preaudit_material",
-        "request_id": request_id,
-        "workflow_key": workflow_key,
-        "workflow_name": workflow_key,
-        "declared_fields": {},
-        "resources": [],
-        "prepared": {"images": [], "structured_contents": [], "manifest": []},
-        "authority_facts": [],
-        "warnings": [],
-        "collection_gaps": [_material_gap(error)],
-    }
+def _require_reviewable_material(workflow_key: str, material: dict) -> None:
+    """A collection failure or an empty bundle cannot become an OA opinion.
+
+    Keep frozen validation independent so historical submissions remain verifiable.
+    This gate belongs to admission and completion, not evidence fingerprinting.
+    """
+    if workflow_key not in _FINANCE_WORKFLOW_KEYS:
+        return
+    prepared = material.get("prepared") or {}
+    if material.get("collection_gaps") or not any((
+        material.get("declared_fields"), material.get("resources"),
+        material.get("authority_facts"), prepared.get("images"),
+        prepared.get("structured_contents"), prepared.get("manifest"),
+    )):
+        error = ValueError("material_collection_failed")
+        gaps = material.get("collection_gaps") or []
+        if gaps:
+            error.code = gaps[0]["code"]
+            error.counts = gaps[0].get("counts", {})
+        raise error
 
 
 def _stable_error_code(error: Exception, allowed: set[str] | frozenset[str]) -> str:
@@ -2796,7 +2802,11 @@ class FlowEngine:
                 state,
             )
         except ValueError as error:
-            return self._persist_attempt_needs_admin(action_path, str(error))
+            return self._persist_attempt_needs_admin(
+                action_path, str(error),
+                failure_details=_material_failure_details(error)
+                if str(error) == "material_collection_failed" else None,
+            )
         return self._persist_current_action(workflow_root, action)
 
     @classmethod
@@ -2890,7 +2900,7 @@ class FlowEngine:
             return False
         return persisted == state
 
-    def _open_attempt(self, action_path: Path) -> tuple[dict, dict, dict]:
+    def _open_attempt(self, action_path: Path, *, require_reviewable: bool = True) -> tuple[dict, dict, dict]:
         action_path = action_path.expanduser().resolve()
         if (
             not action_path.is_relative_to(self._root)
@@ -3014,6 +3024,8 @@ class FlowEngine:
             )
         if packet not in accepted_packets:
             raise ValueError("frozen_packet_changed")
+        if require_reviewable:
+            _require_reviewable_material(workflow_key, material)
         return action, state, packet
 
     def _prepare_attempt(self, attempt_root: Path) -> dict:
@@ -3039,6 +3051,8 @@ class FlowEngine:
                     return self._persist_attempt_needs_admin(
                         attempt_root / "action.json",
                         str(error),
+                        failure_details=_material_failure_details(error)
+                        if str(error) == "material_collection_failed" else None,
                     )
                 return self._persist_current_action(workflow_root, action)
             if execution_state == "needs_admin":
@@ -3084,23 +3098,10 @@ class FlowEngine:
                         ))):
                     # Cancellation leaves the original claim for fresh collection, not material-failure isolation.
                     raise
-                failure_code = _stable_error_code(
-                    error,
-                    _HARD_COLLECTION_FAILURE_CODES,
-                )
-                if (
-                    workflow_key not in _FINANCE_WORKFLOW_KEYS
-                    or failure_code in _HARD_COLLECTION_FAILURE_CODES
-                ):
-                    return self._persist_attempt_needs_admin(
-                        attempt_root / "action.json",
-                        "material_collection_failed",
-                        failure_details=_material_failure_details(error),
-                    )
-                material = _degraded_material(
-                    claim["request_id"],
-                    workflow_key,
-                    error,
+                return self._persist_attempt_needs_admin(
+                    attempt_root / "action.json",
+                    "material_collection_failed",
+                    failure_details=_material_failure_details(error),
                 )
             if workflow_key == "tpm_small_marketing_fee" and tpm_price_reference.applies(material):
                 material["tpm_price_reference"] = tpm_price_reference.snapshot(
@@ -3122,6 +3123,7 @@ class FlowEngine:
                     attachment_root=attachment_root,
                     prepared_root=prepared_root,
                 )
+                _require_reviewable_material(workflow_key, material)
                 evidence_fingerprint = _evidence_fingerprint(material)
                 collection_seconds = max(
                     0,
@@ -4294,13 +4296,16 @@ class FlowEngine:
                 )
             return recovered
         try:
-            action, state, packet = self._open_attempt(action_path)
+            action, state, packet = self._open_attempt(
+                action_path, require_reviewable=recovered_submission_result is None,
+            )
         except ValueError as error:
             reason = str(error)
             if reason not in {
                 "persistent_state_invalid",
                 "frozen_packet_changed",
                 "frozen_material_changed",
+                "material_collection_failed",
             }:
                 reason = "persistent_state_invalid"
             if (
@@ -4334,7 +4339,11 @@ class FlowEngine:
                     ):
                         return existing
                 if existing.get("action") == "review_required":
-                    return self._persist_attempt_needs_admin(action_path, reason)
+                    return self._persist_attempt_needs_admin(
+                        action_path, reason,
+                        failure_details=_material_failure_details(error)
+                        if reason == "material_collection_failed" else None,
+                    )
             if (
                 action_path.is_relative_to(self._root)
                 and _is_attempt_action_path(action_path, self._root)

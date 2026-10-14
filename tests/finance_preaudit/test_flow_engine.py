@@ -20,7 +20,7 @@ def _travel_material(request_id: str) -> dict:
         "request_id": request_id,
         "workflow_key": "travel_expense",
         "workflow_name": "差旅费报销流程",
-        "declared_fields": [],
+        "declared_fields": [{"field_name": "period", "value": "2026-08"}],
         "resources": [],
         "prepared": {
             "images": [],
@@ -981,10 +981,10 @@ def test_concurrent_review_completion_cannot_overwrite_the_first_result(
     second_finished = threading.Event()
     open_calls = 0
 
-    def controlled_open(action_path: Path) -> tuple[dict, dict, dict]:
+    def controlled_open(action_path: Path, *, require_reviewable: bool = True) -> tuple[dict, dict, dict]:
         nonlocal open_calls
         open_calls += 1
-        result = original_open(action_path)
+        result = original_open(action_path, require_reviewable=require_reviewable)
         if open_calls == 1:
             first_opened.set()
             assert release_first.wait(timeout=2)

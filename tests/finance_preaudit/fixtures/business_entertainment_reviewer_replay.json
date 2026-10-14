@@ -35,7 +35,7 @@
     },
     {
       "case_id": "entertainment-collection-gap-v1",
-      "material_workflow": "travel_expense",
+      "material_workflow": "business_entertainment",
       "items": [
         {"status": "uncertain", "conclusion": "支付与附件材料未能可信取得，请财务结合原始单据判断。", "evidence_refs": [], "missing_evidence": ["可信支付与附件材料"]},
         {"status": "uncertain", "conclusion": "发票关联材料未能可信取得，请财务结合原始单据判断。", "evidence_refs": [], "missing_evidence": ["可信发票关联材料"]},

@@ -130,7 +130,7 @@ def test_real_completion_validator_keeps_rejections_classified(
         collect_material=lambda request_id, _root: {
             "schema_version": 1, "kind": "preaudit_material",
             "request_id": request_id, "workflow_key": "small_marketing_fee",
-            "workflow_name": "小额市场费报销流程", "declared_fields": [],
+            "workflow_name": "小额市场费报销流程", "declared_fields": [{"field_name": "period", "value": "2026-08"}],
             "resources": [], "prepared": {"images": [], "structured_contents": [], "manifest": []},
             "authority_facts": [], "warnings": [],
         },

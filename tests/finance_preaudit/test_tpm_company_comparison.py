@@ -44,7 +44,7 @@ def engine_for(tmp_path: Path, *, primary="甲公司", auxiliary="乙公司", bu
         collect_material=lambda request, attempt: {
             "schema_version": 1, "kind": "preaudit_material", "request_id": request,
             "workflow_key": "tpm_small_marketing_fee", "workflow_name": "TPM小额市场费",
-            "declared_fields": fields, "resources": [], "warnings": [],
+            "declared_fields": fields + [{"code": "period", "name": "报销周期", "path": "main[0].field[99]", "value": "2026-08", "value_source": "display", "read_status": "present"}], "resources": [], "warnings": [],
             "prepared": {"images": [], "structured_contents": [], "manifest": []},
             "authority_facts": [] if buyer is None else [{"source": "invoice_cloud",
                 "name": "发票购买方", "value": buyer, "subject_ref": "sanitized-invoice"}],

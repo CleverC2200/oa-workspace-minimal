@@ -138,9 +138,7 @@ def test_collection_gap_retains_safe_failure_code(tmp_path, code):
         collect_material=collect,
     )
     action = engine.next_action("small_marketing_fee")
-    assert action["action"] == "review_required"
-    packet = json.loads(Path(action["review_packet_file"]).read_text())
-    material = json.loads(Path(packet["material_file"]).read_text())
-    assert packet["material_state"] == "degraded"
-    assert material["collection_gaps"] == [{"code": code}]
-    assert len(packet["required_uncertain_items"]) == 6
+    assert action["action"] == "needs_admin"
+    assert action["reason"] == "material_collection_failed"
+    assert action["failure_detail_code"] == code
+    assert not Path(action["action_file"]).with_name("review-packet.json").exists()

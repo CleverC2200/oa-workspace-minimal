@@ -37,7 +37,7 @@ def _material(request_id: str) -> dict:
         "request_id": request_id,
         "workflow_key": "travel_expense",
         "workflow_name": "差旅费报销流程",
-        "declared_fields": [],
+        "declared_fields": [{"field_name": "period", "value": "2026-08"}],
         "resources": [],
         "prepared": {"images": [], "structured_contents": [], "manifest": []},
         "authority_facts": [],

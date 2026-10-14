@@ -789,7 +789,7 @@
                 "降级材料不包含失败前的候选字段、发票或附件内容"
             ],
             "incorrect_output": "把自动读取失败写成申请人未填写公司字段、未上传附件或单据没有关联发票",
-            "expected_output": "对应项目使用 uncertain，只说明自动读取失败、未完成核对，请财务查看原单；不推断申请人是否填写或上传",
+            "expected_output": "技术读取失败时停止当前单据，不生成可提交意见；不推断申请人是否填写或上传。正常材料真实缺项仍按业务 uncertain 处理。",
             "failure_mode": "把系统未读取到材料错误表述为申请人没有提供材料",
             "rule_ref": "flows/tpm-small-marketing-fee.md;SKILL.md#2-读取证据"
         },

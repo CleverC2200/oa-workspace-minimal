@@ -27,7 +27,7 @@ def _material(request_id):
     return {
         "schema_version": 1, "kind": "preaudit_material", "request_id": request_id,
         "workflow_key": WORKFLOW, "workflow_name": "通用费用报销申请流程",
-        "declared_fields": [], "resources": [], "authority_facts": [], "warnings": [],
+        "declared_fields": [{"field_name": "period", "value": "2026-08"}], "resources": [], "authority_facts": [], "warnings": [],
         "prepared": {"images": [], "structured_contents": [], "manifest": []},
     }
 

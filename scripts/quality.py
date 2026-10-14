@@ -264,7 +264,7 @@ def check_review_schemas() -> list[str]:
         for workflow in worker._FINANCE_RULES:
             def material(request, _attempt, key=workflow):
                 return {'schema_version': 1, 'kind': 'preaudit_material', 'request_id': request,
-                        'workflow_key': key, 'workflow_name': 'Offline schema check', 'declared_fields': [],
+                        'workflow_key': key, 'workflow_name': 'Offline schema check', 'declared_fields': [{'field_name': 'period', 'value': '2026-08'}],
                         'resources': [], 'prepared': {'images': [], 'structured_contents': [], 'manifest': []},
                         'authority_facts': [], 'warnings': []}
             engine = flow_engine.FlowEngine(root=Path(temporary) / workflow,

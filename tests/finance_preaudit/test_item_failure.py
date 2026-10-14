@@ -72,7 +72,7 @@ def test_cancelled_collection_recollects_fresh_input_on_later_attempt(tmp_path):
         return {
             'schema_version': 1, 'kind': 'preaudit_material', 'request_id': request_id,
             'workflow_key': workflow, 'workflow_name': 'offline',
-            'declared_fields': [], 'resources': [], 'authority_facts': [], 'warnings': ['fresh-input'],
+            'declared_fields': [{'field_name': 'period', 'value': '2026-08'}], 'resources': [], 'authority_facts': [], 'warnings': ['fresh-input'],
             'prepared': {'images': [], 'structured_contents': [], 'manifest': []},
         }
 

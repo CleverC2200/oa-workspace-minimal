@@ -34,7 +34,7 @@ python3 -m apps.oa_finance_preaudit.cli next-action \
 - 表单明细、相关资源和准备页全部覆盖；
 - 每条采用的证据同时证明资源归属和审核项关系；
 - 权威字段优先，图片不可见或关系不明的事实保持未知；
-- 审核包为 `material_state=degraded` 时，不使用任何候选材料；`collection_gaps` 只表示自动读取没有完成，不能据此声称申请人未填写字段、未上传附件或单据没有发票。按 `required_uncertain_items` 将对应项目写成简短的 `uncertain` 结论，说明自动读取失败、未完成核对并请财务查看原单，继续完成预审。
+- 自动读取失败、材料包全空或旧审核包为 `material_state=degraded` 时，停止当前单据的审核与提交，保留技术失败及原冻结证据。`collection_gaps` 不证明申请人未填写字段、未上传附件或没有发票。当前提交门见[FlowEngine 合同](references/flow-engine-contract.md)。
 - 当前登录、会话和执行身份可信时，规则口径模糊、材料关系不明或证据不足只影响业务判断；使用 `uncertain` / `needs_human` 继续完成预审，不得升级为技术阻断。
 
 包装流程同时调用项目的中文图片文字校对 Skill，直接观察原图；存在 Excel 时逐字符对照。包装只校对关键文字，不扩展为法规审核。

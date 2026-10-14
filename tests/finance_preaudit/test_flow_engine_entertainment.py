@@ -174,17 +174,14 @@ def test_entertainment_cli_returns_the_same_action_contract(
     assert payload["coordination_tokens"] == 0
 
 
-def test_entertainment_degrades_material_from_another_flow(tmp_path: Path) -> None:
+def test_entertainment_blocks_material_from_another_flow(tmp_path: Path) -> None:
     engine = _engine(tmp_path, material_workflow="travel_expense")
 
     action = engine.next_action(WORKFLOW_KEY)
-    packet = json.loads(
-        Path(action["review_packet_file"]).read_text(encoding="utf-8")
-    )
-
-    assert action["action"] == "review_required"
+    assert action["action"] == "needs_admin"
+    assert action["reason"] == "material_collection_failed"
+    assert action["failure_detail_code"] == "material_workflow_mismatch"
     assert action["workflow_key"] == WORKFLOW_KEY
-    assert packet["material_state"] == "degraded"
     assert not list(tmp_path.glob("travel_expense/cases/*/attempt-*"))
 
 
