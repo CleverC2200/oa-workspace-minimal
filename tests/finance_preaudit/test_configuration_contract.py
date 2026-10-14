@@ -76,7 +76,11 @@ class TestConfigurationContract:
         workflow = (PROJECT_ROOT / ".github/workflows/quality.yml").read_text(
             encoding="utf-8"
         )
-        commands = [shlex.split(step['run']) for step in yaml.safe_load(workflow)['jobs']['quality']['steps']
+        jobs = yaml.safe_load(workflow)['jobs']
+        assert jobs['quality']['strategy']['matrix']['shard'] == [0, 1]
+        assert jobs['quality']['strategy']['fail-fast'] is False
+        assert set(jobs['quality-complete']['needs']) == {'quality', 'macos-stop-recovery'}
+        commands = [shlex.split(step['run']) for step in jobs['quality']['steps']
                     if step.get('run', '').startswith('python -m pytest')]
         collection, execution = commands
         assert '--collect-only' in collection

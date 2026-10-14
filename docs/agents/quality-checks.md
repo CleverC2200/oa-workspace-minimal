@@ -18,7 +18,9 @@
 
 本地和 CI 使用同一 pytest 测试集合。完整 CI 的并行配置见 [quality workflow](../../.github/workflows/quality.yml)，使用 xdist 动态分配任务。`test_offline_network_guard.py` 通过独立 pytest 调用验证漏注入的默认发票客户端、线程内 IPv4/IPv6、显式 HTTP fake 和本地 IPC。子 pytest 加载同一 conftest；普通 Python 子进程、原生外部程序、独立临时脚本及模块导入期间的操作不在此夹具保护范围内，不能由 pytest 成功推断这些操作无网络访问。新增离线回放应放到既有测试入口，独立回放仍需显式录制客户端及单独的传输保护。
 
-完整 CI 先独立串行收集，再运行全量测试。`scripts.pytest_evidence` 核对各 worker 收集结果与基线一致、每项恰好执行一次，并记录分配数量和耗时；worker 丢失、失败、漏跑、重复或新增 skip 均失败。Linux 只允许既有文件出生时间相关的 12 项 skip，macOS 停止恢复任务继续要求全部执行、无 skip。JSON 和 JUnit 随工作流保留为 artifact，不自动重跑失败 worker。
+完整 CI 在两个标准 Ubuntu runner 上各自独立串行收集全套节点，再按节点 SHA256 的固定二分规则分配测试，每个 runner 使用动态 worker 分配。静态门在分片 0 执行。`scripts.pytest_evidence` 在筛选前核对完整收集，再核对本分片各 worker 的集合和每项执行次数，记录分配数量、CPU 和耗时；worker 丢失、失败、漏跑、重复或新增 skip 均失败。Linux 只允许既有文件出生时间相关的 12 项 skip，macOS 停止恢复任务继续要求全部执行、无 skip。
+
+`quality-complete` 等待两个分片和 macOS 专项，下载同一轮 artifact，要求所有必需任务成功，再核对两份完整收集、源码与 run 身份、分片归属、逐项并集恰好一次，以及 macOS JUnit 无跳过、无失败。汇总从最早必需任务的首个 step 计时，包含准备、运行、上传及汇总启动，保留收尾预算。JSON 和 JUnit 随工作流留存，不自动重跑失败 worker；实际全工作流耗时仍按 GitHub 完成记录验收。
 
 录制 CLI 的分类与回执用例通过共享 fixture 缩短观察间隔，仍启动真实子进程；超时用例在既有 executor 接口缩短测试期限，仍走真实超时和进程回收。`real_observation_interval` 用例保留生产 5 秒周期，核对首次错误在重试前停止。生产默认、停止门与历史证据不受这些测试参数影响。
 
