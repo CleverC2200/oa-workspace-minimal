@@ -78,6 +78,79 @@ def _legacy_material(request_id, workflow_key, error):
     return {**_material(request_id, workflow_key, {}), "collection_gaps": [{"code": str(error)}]}
 
 
+def _unresolved_general_material(request_id):
+    fields = [
+        {"path": "main[0].field[0]", "code": "cwzfje", "name": "财务审核金额",
+         "value": "100", "value_source": "display", "read_status": "present"},
+        *[
+            {"path": f"detail[0].row[0].field[{index}]", "code": code,
+             "name": name, "value": "", "value_source": "none", "read_status": "unresolved"}
+            for index, (code, name) in enumerate((
+                ("scfj", "上传附件"), ("fj", "附件"), ("glfp", "关联发票"),
+            ))
+        ],
+    ]
+    return _material(request_id, "general_expense", fields)
+
+
+def test_general_unresolved_evidence_does_not_open_a_submittable_review(tmp_path):
+    submissions = []
+    engine = _engine(tmp_path, "general_expense", RuntimeError("unused"),
+                     controlled=True, submissions=submissions)
+    engine._collect_material = lambda request, _: _unresolved_general_material(request)
+    action = engine.next_action("general_expense", mode="controlled_write")
+    assert action["action"] == "needs_admin"
+    assert action["reason"] == "material_collection_failed"
+    assert action["write_state"] == "not_requested"
+    assert submissions == []
+    assert not Path(action["action_file"]).with_name("review-packet.json").exists()
+
+
+@pytest.mark.parametrize("entrypoint", ("next_action", "complete_review"))
+def test_legacy_general_unresolved_evidence_stops_before_writer(tmp_path, monkeypatch, entrypoint):
+    submissions = []
+    engine = _engine(tmp_path, "general_expense", RuntimeError("unused"),
+                     controlled=True, submissions=submissions)
+    engine._collect_material = lambda request, _: _unresolved_general_material(request)
+    with monkeypatch.context() as old_policy:
+        old_policy.setattr(flow_engine, "_require_reviewable_material", lambda *_: None)
+        action = engine.next_action("general_expense", mode="controlled_write")
+    packet_path = Path(action["review_packet_file"])
+    packet = json.loads(packet_path.read_bytes())
+    frozen = {p: p.read_bytes() for p in (packet_path, Path(packet["material_file"]))}
+    decision_file = tmp_path / "unresolved-decision.json"
+    json_artifact.write_json_atomic(decision_file, _uncertain_decision(action, packet), indent=2)
+    if entrypoint == "next_action":
+        result = engine.next_action("general_expense", mode="controlled_write")
+    else:
+        result = engine.complete_review(Path(action["action_file"]), decision_file)
+    assert result["action"] == "needs_admin"
+    assert result["reason"] == "material_collection_failed"
+    assert result["write_state"] == "not_requested"
+    assert submissions == []
+    assert all(p.read_bytes() == raw for p, raw in frozen.items())
+    assert not any(Path(action["action_file"]).with_name(name).exists()
+                   for name in ("review-decision.json", "remark.txt", "submission-envelope.json", "execution-receipt.json"))
+
+
+@pytest.mark.parametrize("variant", ("confirmed_empty", "partial_unresolved", "authority_fact", "other_workflow"))
+def test_general_unresolved_evidence_gate_preserves_reviewable_cases(tmp_path, variant):
+    workflow_key = "travel_expense" if variant == "other_workflow" else "general_expense"
+    material = _unresolved_general_material("material-gap-request")
+    material["workflow_key"] = material["workflow_name"] = workflow_key
+    if variant == "confirmed_empty":
+        for field in material["declared_fields"][1:]:
+            field["read_status"] = "empty"
+    elif variant == "partial_unresolved":
+        material["declared_fields"][-1]["read_status"] = "empty"
+    elif variant == "authority_fact":
+        material["authority_facts"] = [{"source": "official_sql", "name": "关联流程字段",
+                                        "value": "可读", "subject_ref": "test-related-form"}]
+    engine = _engine(tmp_path, workflow_key, RuntimeError("unused"))
+    engine._collect_material = lambda *_: material
+    assert engine.next_action(workflow_key)["action"] == "review_required"
+
+
 SESSION_BLOCKING_FAILURE_CODES = (
     "oa_execution_identity_login_failed",
     "oa_session_expired",
@@ -187,15 +260,18 @@ def test_readable_material_with_business_uncertainty_still_closes(tmp_path):
     assert result["write_state"] == "not_requested"
 
 
-def test_historical_degraded_submission_remains_verifiable_without_replay(tmp_path, monkeypatch):
+@pytest.mark.parametrize("material_kind", ("collection_gap", "unresolved_general"))
+def test_historical_degraded_submission_remains_verifiable_without_replay(tmp_path, monkeypatch, material_kind):
     submissions = []
-    engine = _engine(tmp_path, "travel_expense", RuntimeError("unused"),
+    workflow_key = "general_expense" if material_kind == "unresolved_general" else "travel_expense"
+    engine = _engine(tmp_path, workflow_key, RuntimeError("unused"),
                      controlled=True, submissions=submissions)
-    engine._collect_material = lambda request, _: _legacy_material(
-        request, "travel_expense", RuntimeError("invoice_buyer_read_failed"))
+    engine._collect_material = lambda request, _: (
+        _unresolved_general_material(request) if material_kind == "unresolved_general" else
+        _legacy_material(request, workflow_key, RuntimeError("invoice_buyer_read_failed")))
     with monkeypatch.context() as old_policy:
         old_policy.setattr(flow_engine, "_require_reviewable_material", lambda *_: None)
-        action = engine.next_action("travel_expense", mode="controlled_write")
+        action = engine.next_action(workflow_key, mode="controlled_write")
         packet = json.loads(Path(action["review_packet_file"]).read_bytes())
         decision_file = tmp_path / "historical-decision.json"
         json_artifact.write_json_atomic(decision_file, _uncertain_decision(action, packet), indent=2)

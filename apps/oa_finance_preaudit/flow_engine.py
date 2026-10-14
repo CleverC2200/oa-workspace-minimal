@@ -665,6 +665,23 @@ def _require_reviewable_material(workflow_key: str, material: dict) -> None:
             error.code = gaps[0]["code"]
             error.counts = gaps[0].get("counts", {})
         raise error
+    if workflow_key == "general_expense" and not any((
+        material.get("resources"), material.get("authority_facts"),
+        prepared.get("images"), prepared.get("structured_contents"),
+        prepared.get("manifest"),
+        (material.get("invoice_evidence") or {}).get("invoices"),
+    )):
+        attachment_codes = {"scfj", "fj", "glfp"}
+        attachment_fields = [
+            field for field in material.get("declared_fields", [])
+            if isinstance(field, dict) and field.get("code") in attachment_codes
+        ]
+        # A form amount does not prove unresolved attachment references were empty.
+        if (
+            {field["code"] for field in attachment_fields} == attachment_codes
+            and all(field.get("read_status") == "unresolved" for field in attachment_fields)
+        ):
+            raise ValueError("material_collection_failed")
 
 
 def _stable_error_code(error: Exception, allowed: set[str] | frozenset[str]) -> str:
