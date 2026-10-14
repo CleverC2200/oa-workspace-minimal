@@ -69,6 +69,9 @@ TPM 新包若含 `company_comparison_contract.version=1`，决定顶层还须包
 
 有限跨轮恢复是生产宿主的独立显式授权：`--recover-confirmed-no-write-once YES` 只选择当前授权流程和可信单据级确认未写入的允许失败类别，且只对首个 attempt 恢复一次。候选选择不构成提交授权；后续仍执行恢复入口实时复核、单据 capability、唯一 Writer 和后置核验。已有后续 attempt 或恢复失败时给出人工接管与期限，不无限恢复。默认调用与未知写入规则保持原合同。
 
+已提交后由用户明确撤回的单据使用[撤回恢复](../../../../docs/agents/quarantine-repair.md#已成功提交后由用户撤回)。它保留原 `closed/submitted` 及成功回执，创建下一 attempt 重新取材，不属于 `confirmed_no_write`。原接收时间不变时，只有明确撤回确认、可信原成功提交及当前唯一归属验证才能恢复；普通控制器仍保留防重复提交门。恢复入口只准备资料和新授权，实际意见仍由新轮审核者生成并由 Writer 提交。
+
+
 审核决定必须是单个 JSON 对象，且只包含以下顶层字段：
 
 ```json

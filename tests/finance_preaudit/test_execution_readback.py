@@ -197,16 +197,16 @@ def test_wait_observes_original_supervisor_completion(tmp_path, monkeypatch):
     release = tmp_path / 'release-child'
     child = '''import os,json,datetime,time
 from pathlib import Path
-from apps.json_artifact import write_json_atomic
+from apps.oa_approval import runtime_control
 deadline = time.monotonic() + 5
 while not Path(RELEASE).exists() and time.monotonic() < deadline:
  time.sleep(.01)
 assert Path(RELEASE).exists(), 'test_child_not_released'
-write_json_atomic(Path(os.environ['OA_CONTROLLER_EXECUTION_MANIFEST_FILE']), {
+runtime_control.write_control_bytes_atomic(Path(os.environ['OA_CONTROLLER_EXECUTION_MANIFEST_FILE']), json.dumps({
  'kind':'preaudit_controller_run_manifest','controller_pid':os.getpid(),
  'run_id':'a'*32,'controller_instance_id':'b'*32,'state':'completed',
  'children_reaped':True,'code_revision':'c'*40,
- 'started_at':datetime.datetime.now(datetime.timezone.utc).isoformat()})
+ 'started_at':datetime.datetime.now(datetime.timezone.utc).isoformat()}).encode())
 print('original terminal output')'''.replace('RELEASE', repr(str(release)))
     code = ('from pathlib import Path; import sys; from scripts.finance_preaudit_run import supervise; '
             f'supervise([sys.executable, "-c", {child!r}], directory=Path({str(directory)!r}), owner_task_id={owner!r})')

@@ -596,3 +596,38 @@ def test_release_rejects_shared_git_directory(production):
         production_release.release_source(root, expected_revision=expected,
             expected_origin=str(remote), check_live=lambda target: live_snapshot(),
             check_configuration=lambda target, revision: [])
+
+
+def test_confirmed_withdrawal_source_only_retains_block_and_original_success(stopped_production, monkeypatch):
+    from apps.oa_finance_preaudit import withdrawn_submission
+    from tests.finance_preaudit.test_withdrawn_submission import submitted
+    root, remote, revision, stop, automation, original, report=stopped_production
+    stop.unlink()
+    _, action, observation=submitted(root/'runtime/finance_preaudit_flows')
+    state=json.loads(action.with_name('state.json').read_text())
+    snapshot=live_snapshot()
+    snapshot['reconciliation']['continuation']={'status':'blocked','scope':'controller','isolated_pending':0,
+        'blocking_reasons':{'pending_write_state_unresolved':1}}
+    snapshot['reconciliation']['quarantine']['pending_quarantined']=0
+    snapshot['reconciliation']['findings']=[{'category':'pending_not_handled','workflow_key':state['workflow_key'],
+        'item_key':state['case_key'],'attempt':1,'local_execution_state':'closed','local_write_state':'submitted'}]
+    snapshot['maintenance_current_inputs'].update(verified_withdrawn_actions=[str(action)],
+        pending_frozen_count=1,validated_frozen_count=1)
+    monkeypatch.setattr(withdrawn_submission,'observe',lambda *_:observation)
+    options=dict(expected_revision=revision,expected_origin=str(remote),automation=automation,
+        original_execution=original,check_original=lambda *_:report,check_live=lambda _:snapshot,
+        check_configuration=lambda *_:[])
+    with pytest.raises(RuntimeError,match='maintenance_reconciliation_untrusted'):
+        production_release.release_source(root,**options)
+    with pytest.raises(RuntimeError,match='withdrawal_confirmation_required'):
+        production_release.release_source(root,withdrawn_action=action,**options)
+    old={p.name:p.read_bytes() for p in action.parent.iterdir() if p.is_file()}
+    cron=automation.file.read_bytes()
+    result=production_release.release_source(root,withdrawn_action=action,confirmed_withdrawal=True,
+        confirmed_sync=True,**options)
+    assert result['status']=='synced' and result['next_process_ready'] is False
+    assert result['withdrawn_submission_source_only'] is True and result['original_evidence_preserved'] is True
+    assert result['continuation']['status']=='blocked' and result['write_state']=='not_requested'
+    assert not action.parent.with_name('attempt-2').exists()
+    assert {p.name:p.read_bytes() for p in action.parent.iterdir() if p.is_file()}==old
+    assert automation.file.read_bytes()==cron and not stop.exists()
