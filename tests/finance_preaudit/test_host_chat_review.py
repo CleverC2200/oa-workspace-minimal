@@ -109,6 +109,32 @@ def test_native_publication_allows_only_the_current_project_workdir(exchange, di
         thread.join(3)
     assert not thread.is_alive()
 
+
+def test_public_draft_command_emits_one_json_receipt_without_project_warning(exchange, monkeypatch):
+    import shlex
+    import shutil
+    import subprocess
+    if shutil.which('uv') is None:
+        pytest.skip('uv is required for the native publication command')
+    _, draft, owner, _, *_ = exchange
+    thread, _, request = start(exchange)
+    target = request.with_name('native-cli-draft.json')
+    monkeypatch.setenv('OA_FINANCE_PREAUDIT_STOP_FILE', str(request.parent / 'isolated-stop.flag'))
+    monkeypatch.setenv('UV_OFFLINE', '1')
+    try:
+        result = subprocess.run(shlex.split(host.draft_command(request, target, json.loads(draft.read_text()), owner=owner)),
+            cwd=Path(host.__file__).resolve().parents[2], capture_output=True, text=True, timeout=15)
+        assert result.returncode == 0, result.stderr
+        assert result.stderr == ''
+        receipt = json.loads(result.stdout)
+        assert receipt['kind'] == 'preaudit_host_draft_publication'
+        assert receipt['decision_file'] == str(target)
+        assert json.loads(target.read_text()) == json.loads(draft.read_text())
+    finally:
+        host.close(owner=owner, reason='cancelled')
+        thread.join(3)
+    assert not thread.is_alive()
+
 def start(exchange):
     action, draft, owner, source, task, _, _ = exchange
     result = []

@@ -712,7 +712,7 @@ def review(task: dict) -> dict:
 
 def draft_command(request_file: Path, decision_file: Path, payload: dict, *, owner: str) -> str:
     """The only accepted native command for publishing model-authored draft bytes."""
-    return shlex.join(['uv', 'run', '--no-sync', 'python', '-B', '-m', MODULE, '--operation', 'write-draft',
+    return shlex.join(['uv', 'run', '--quiet', 'python', '-B', '-m', MODULE, '--operation', 'write-draft',
                       '--owner-task-id', owner, '--request-file', str(request_file.absolute()),
                       '--decision-file', str(decision_file.absolute()), '--payload-json', json.dumps(payload, ensure_ascii=False, sort_keys=True)])
 
@@ -775,7 +775,7 @@ def _draft_publication(input_text, output, decision_file: Path) -> dict:
         if 'workdir' in args and args['workdir'] != str(runtime_control.PROJECT_ROOT.absolute()):
             raise ValueError('invalid_project_directory')
         tokens = shlex.split(args['cmd'])
-        if tokens[:9] != ['uv', 'run', '--no-sync', 'python', '-B', '-m', MODULE, '--operation', 'write-draft'] or len(tokens) != 17:
+        if tokens[:9] != ['uv', 'run', '--quiet', 'python', '-B', '-m', MODULE, '--operation', 'write-draft'] or len(tokens) != 17:
             raise ValueError('invalid_command')
         if tokens[9] != '--owner-task-id' or tokens[11] != '--request-file' or tokens[13] != '--decision-file' or tokens[15] != '--payload-json':
             raise ValueError('invalid_command')
