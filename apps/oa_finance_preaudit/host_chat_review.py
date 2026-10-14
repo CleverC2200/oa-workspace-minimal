@@ -504,10 +504,20 @@ def assign(request_file: Path, *, slot: int, owner: str, source: Path, source_li
         if registered.get('requests', {}).get(request['request_id']) != {'request_file': str(request_file), 'request_sha256': hashlib.sha256(raw).hexdigest()}:
             raise ValueError('host_review_request_untrusted')
         reviewer = registered['reviewers'][slot]
+        if str(source.absolute()) != registered['reviewers'][0]['spawn_source']['session_file']:
+            raise ValueError('host_review_source_untrusted')
         native, proof = _native_source(source, owner, source_line, output=True)
         arguments = _tool(native['anchor'], 'followup_task')
+        message = arguments.get('message')
+        readable = isinstance(message, str) and str(request_file) in message
+        # Some App recordings make messages opaque. This shape is not decrypted
+        # or authenticated here; the actual child's request-bound publication is
+        # still mandatory before any result can be accepted.
+        opaque = (isinstance(message, str) and 100 <= len(message) <= 1024 * 1024
+                  and re.fullmatch(r'gAAAA[A-Za-z0-9_-]+={0,2}', message) is not None)
+        call_id = native['anchor']['payload']['call_id']
         if (arguments.get('target') not in {reviewer['agent_path'], reviewer['agent_path'].rsplit('/', 1)[-1]}
-                or str(request_file) not in arguments.get('message', '')
+                or not (readable or opaque) or not isinstance(call_id, str)
                 or proof['output'].get('error') or proof['output'].get('isError') is True):
             raise ValueError('host_review_source_untrusted')
         existing = registered['assignments'].get(request['request_id'])
@@ -515,6 +525,10 @@ def assign(request_file: Path, *, slot: int, owner: str, source: Path, source_li
             if existing['slot'] == slot and existing['dispatch_source'] == proof:
                 return existing
             raise ValueError('host_review_assignment_rebinding')
+        if any(item.get('dispatch_call_id') == call_id
+               or (item['dispatch_source']['session_file'] == str(source.absolute()) and item['dispatch_source']['line'] == source_line)
+               for item in registered['assignments'].values()):
+            raise ValueError('host_review_dispatch_reused')
         if any(item['slot'] == slot and item['state'] == 'assigned' for item in registered['assignments'].values()):
             raise ValueError('host_review_slot_busy')
         from datetime import datetime
@@ -526,7 +540,8 @@ def assign(request_file: Path, *, slot: int, owner: str, source: Path, source_li
             raise ValueError('host_review_stale_dispatch')
         value = {'request_id': request['request_id'], 'request_sha256': hashlib.sha256(raw).hexdigest(),
                  'slot': slot, 'reviewer_task_id': reviewer['reviewer_task_id'], 'state': 'assigned',
-                 'dispatch_source': proof, 'dispatched_at': dispatched_at}
+                 'dispatch_source': proof, 'dispatch_call_id': call_id, 'dispatch_message_readable': readable,
+                 'dispatched_at': dispatched_at}
         registered['assignments'][request['request_id']] = value
         guard.write(path, registered)
     return value

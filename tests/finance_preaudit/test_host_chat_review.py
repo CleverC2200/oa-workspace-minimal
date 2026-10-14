@@ -135,6 +135,77 @@ def test_public_draft_command_emits_one_json_receipt_without_project_warning(exc
         thread.join(3)
     assert not thread.is_alive()
 
+
+@pytest.mark.parametrize('case', ['opaque', 'wrong_publication', 'malformed_opaque', 'wrong_plaintext', 'different_parent_file'])
+def test_opaque_dispatch_requires_registered_parent_and_actual_child_request_receipt(exchange, case):
+    import shutil
+    action, draft, owner, child, task, _, engine = exchange
+    results = []
+    thread = threading.Thread(target=lambda: results.append(controller._review_only(task)))
+    thread.start()
+    request = action.with_name(host.REQUEST)
+    deadline = time.monotonic() + 3
+    while not request.exists() and time.monotonic() < deadline: time.sleep(.01)
+    assert request.exists()
+    parent = child.with_name('parent.jsonl')
+    message = 'gAAAA' + 'A' * 120 + '=='
+    if case == 'malformed_opaque': message = 'gAAAA-not-a-native-record'
+    if case == 'wrong_plaintext': message = 'Read a different request.'
+    if case == 'different_parent_file':
+        message = str(request)
+        other = parent.with_name('copied-parent.jsonl')
+        shutil.copyfile(parent, other)
+        parent = other
+    dispatch = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': message}, 'opaque-dispatch', '')
+    try:
+        if case in {'malformed_opaque', 'wrong_plaintext', 'different_parent_file'}:
+            with pytest.raises(ValueError, match='source_untrusted'):
+                host.assign(request, slot=0, owner=owner, source=parent, source_line=dispatch)
+        else:
+            assigned = host.assign(request, slot=0, owner=owner, source=parent, source_line=dispatch)
+            assert assigned['dispatch_message_readable'] is False
+            published_request = request
+            if case == 'wrong_publication':
+                another = Path(engine.next_action('general_expense')['action_file'])
+                published_request = host.publish(another, prompt='Different frozen job.', timeout_seconds=60)
+            line = draft_source(child, published_request, draft, owner)
+            if case == 'wrong_publication':
+                with pytest.raises(ValueError, match='source_untrusted'):
+                    host.submit(request, draft, owner=owner, source=child, source_line=line)
+            else:
+                assert host.submit(request, draft, owner=owner, source=child, source_line=line)['status'] == 'published'
+    finally:
+        host.close(owner=owner, reason='cancelled')
+        thread.join(3)
+    assert not thread.is_alive()
+
+
+@pytest.mark.parametrize('opaque', [False, True])
+def test_one_native_dispatch_cannot_be_consumed_by_two_requests(exchange, opaque):
+    action, draft, owner, child, task, _, engine = exchange
+    results = []
+    thread = threading.Thread(target=lambda: results.append(controller._review_only(task)))
+    thread.start()
+    request = action.with_name(host.REQUEST)
+    deadline = time.monotonic() + 3
+    while not request.exists() and time.monotonic() < deadline: time.sleep(.01)
+    another = Path(engine.next_action('general_expense')['action_file'])
+    second = host.publish(another, prompt='Second frozen job.', timeout_seconds=60)
+    parent = child.with_name('parent.jsonl')
+    message = 'gAAAA' + 'A' * 120 + '==' if opaque else f'Read {request} and {second}'
+    dispatch = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': message}, 'single-native-ack', '')
+    try:
+        first = host.assign(request, slot=0, owner=owner, source=parent, source_line=dispatch)
+        assert host.assign(request, slot=0, owner=owner, source=parent, source_line=dispatch) == first
+        line = draft_source(child, request, draft, owner)
+        host.submit(request, draft, owner=owner, source=child, source_line=line)
+        with pytest.raises(ValueError, match='dispatch_reused'):
+            host.assign(second, slot=0, owner=owner, source=parent, source_line=dispatch)
+    finally:
+        host.close(owner=owner, reason='cancelled')
+        thread.join(3)
+    assert not thread.is_alive()
+
 def start(exchange):
     action, draft, owner, source, task, _, _ = exchange
     result = []
