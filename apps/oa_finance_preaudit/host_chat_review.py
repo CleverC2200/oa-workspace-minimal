@@ -708,7 +708,10 @@ def await_result(request_file: Path) -> dict:
         while not os.path.lexists(submission):
             _live(request, action)
             time.sleep(.2)
-        return read_result(request_file)
+        # submit publishes the file before committing its registry fingerprint.
+        # Wait for that same transaction before consuming either side.
+        with _round_lease(request['owner_task_id']):
+            return read_result(request_file)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
         # Leave in-flight write classification to the original Writer. No signals here.
         try:
