@@ -100,3 +100,20 @@ python -m apps.oa_finance_preaudit.production_release \
 成功回执增加 `official_stop_source_only=true`、`original_wait_verified=true`、`cooldown_preserved=true`、`original_evidence_preserved=true`、`approval_recovery_allowed=false` 和同步前完整 `pre_sync_status_file` 引用。源码安装后重新从目标生成完整只读状态和输入证明，不复用升级前的计数解释。`next_process_ready=false`、`write_state=not_requested`、`production_acceptance=not_verified` 保持；只有冷却到期后的独立恢复门禁和新进程验收才可证明审批恢复。同步后校验失败仍报告真实源码更新状态，停止门或冷却留证失信时明确未保留或 unknown，不自动重试、回滚或启动审批。
 
 上一审批真实退出后产生的主聊天 `run_id=null` 冷却也可保留用于源码维护。按[单轮豁免的来源合同](cooldown-override.md)分别核验目标本机官方历史和上一审批闭合，不把主聊天事件归为原审批错误。回执以 `cooldown_attribution=project_notice` 保存当前事件来源，上轮审批关闭证明及所有原证据不变。维护仍不清门、不恢复调度；提前运行必须有当前单轮豁免授权并经独立入口消费。
+
+## 已确认撤回后的源码维护
+
+用户明确确认原成功提交已撤回，且同一单据以原接收时间重新待办时，可在原普通同步入口增加以下参数。原 cron 必须 PAUSED、无停止门；该模式与停机维护分支互斥。
+
+```bash
+  --withdrawn-action-file "$withdrawn_action" --confirm-withdrawal YES \
+  --original-receipt-file "$original_receipt_file" \
+  --original-owner-task-id "$original_owner_task_id" \
+  --original-tool-session-id "$original_tool_session_id"
+```
+
+仍先核实已合并、CI 通过的候选及实际远端 SHA，从干净候选运行。`--confirm-sync YES` 才更新源码；上述参数仅声明本次单据的明确撤回确认，不能替代生产写入授权。
+
+入口用目标自己的 Python 和既有模块检查原成功回执、当前唯一待办及账户/流程/节点归属、未命中已办，保存精确源指纹。完整当前对账唯一阻断须为该项的 `pending_write_state_unresolved=1`，隔离数为 0；其余授权、冻结、原控制器真实终态与回收、Writer 和发布配置门保持。目标原验证器独立复核该成功项，拒绝 unknown、submitting、其他单据或额外阻断。同步前后核对原成功证据及官方归属观测一致，并保留 PAUSED cron 的文件身份和内容。
+
+成功回执记录 `withdrawn_submission_source_only=true`、`original_evidence_preserved=true`、`next_process_ready=false`、`approval_recovery_allowed=false`，原 raw continuation 继续 blocked。该模式只安装源码，不创建 attempt、不写 OA、不改旧意见或时间。随后按[单据级撤回恢复](../agents/quarantine-repair.md#已成功提交后由用户撤回)准备新 attempt，并再次通过完整审批启动门。同步后的检查失败仍报告真实 source_sync_state，不自动回滚或重试。
