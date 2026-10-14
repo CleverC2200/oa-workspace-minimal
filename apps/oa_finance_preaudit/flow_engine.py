@@ -4074,6 +4074,56 @@ class FlowEngine:
         recovery_receipt.finish(prepare_root, result_action=str(result.get("action") or ""))
         return result
 
+    def recover_withdrawn_submission(self, action_file: Path, *, confirmed: bool = False,
+                                    observation: dict, mode: str = "preview") -> dict:
+        """Prepare fresh material after an explicitly confirmed withdrawal; never write OA."""
+        from . import recovery_receipt, withdrawn_submission
+        path = Path(action_file).expanduser().absolute()
+        code = "withdrawal_recovery_not_safe"
+        if (confirmed is not True or not _is_attempt_action_path(path, self._root)
+                or not path.is_relative_to(self._root) or self._discover_handled is None
+                or mode not in {"preview", "controlled_write"}
+                or (mode == "controlled_write" and (self._authorization_source is None
+                    or self._authorization_verifier is None or self._submit_frozen is None))):
+            raise ValueError(code)
+        state = _read_object(path.with_name("state.json"), code=code)
+        if (state.get("workflow_key") not in _FINANCE_WORKFLOW_KEYS or not self.confirmed_submission(self._root, state)
+                or not withdrawn_submission.valid_observation(path, state, observation)):
+            raise ValueError(code)
+        candidates = list(self._discover_candidates(state["workflow_key"]))
+        handled = list(self._discover_handled())
+        matching = [row for row in candidates if row.get("request_id") == state["request_id"]]
+        if (len(matching) != 1 or matching[0].get("received_at") != state["received_at"]
+                or matching[0].get("workflow_key") != state["workflow_key"]
+                or any(str(row.get("request_id") or row.get("requestId") or "") == state["request_id"] for row in handled)):
+            raise ValueError(code)
+        workflow = self._root / state["workflow_key"]
+        with _exclusive_lock(workflow / "flow.lock"):
+            latest = [p for p in self._latest_case_attempts(workflow) if p.parent == path.parent.parent]
+            target = path.parent.with_name(f"attempt-{state['attempt'] + 1}")
+            if (latest != [path.parent] or target.exists()
+                    or not self.confirmed_submission(self._root, state)
+                    or not withdrawn_submission.valid_observation(path, state, observation)):
+                raise ValueError(code)
+            claim = _action_payload(action="collecting", execution_state="collecting",
+                business_state="not_available", write_state="not_requested", mode=mode, write_authorized=False,
+                workflow_key=state["workflow_key"], action_file=str(target / "action.json"),
+                state_file=str(target / "state.json"), case_key=state["case_key"], attempt=state["attempt"] + 1,
+                request_id=state["request_id"], received_at=state["received_at"],
+                created_at=datetime.now(timezone.utc).isoformat(), recovered_from_attempt=state["attempt"],
+                recovery_reason="user_confirmed_withdrawal")
+            target.mkdir()
+            json_artifact.write_json_atomic(target / "action.json", claim, indent=2)
+            json_artifact.write_json_atomic(target / "state.json", claim, indent=2)
+            recovery_receipt.begin_withdrawal(target, path.parent, state, observation)
+        try:
+            result = self._prepare_attempt(target)
+        except BaseException:
+            recovery_receipt.finish(target, result_action="not_available")
+            raise
+        recovery_receipt.finish(target, result_action=str(result.get("action") or ""))
+        return result
+
     def interrupt_unwritten_review(self, action_file: Path, *, run_id: str) -> bool:
         """Revoke one closed run's prewrite review without changing OA pending."""
         from . import review_interruption, approval_guard

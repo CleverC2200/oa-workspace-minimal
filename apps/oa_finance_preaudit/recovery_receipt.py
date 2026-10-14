@@ -63,6 +63,19 @@ def finish(target: Path, *, result_action: str) -> None:
     _write(target, receipt)
 
 
+def begin_withdrawal(target: Path, source: Path, state: dict, observation: dict) -> None:
+    _write(target, {
+        "schema_version": 2, "kind": "preaudit_recovery_receipt",
+        "item_key": state["case_key"], "workflow_key": state["workflow_key"],
+        "from_attempt": state["attempt"], "to_attempt": state["attempt"] + 1,
+        "recovery_reason": "user_confirmed_withdrawal",
+        "source_outcome": "submitted_then_withdrawn", "withdrawal_confirmed": True,
+        "source_fingerprints": _fingerprints(source), "observation": observation,
+        "status": "started", "started_at": datetime.now(timezone.utc).isoformat(),
+        "result_action": "not_available",
+    })
+
+
 def projection(target: Path, state: dict) -> dict:
     base = {"item_key": state["case_key"], "workflow_key": state["workflow_key"],
             "attempt": state["attempt"], "automatic_retry": False}
@@ -78,8 +91,9 @@ def projection(target: Path, state: dict) -> dict:
         fingerprints = _fingerprints(source)
     except (OSError, ValueError):
         return invalid
+    withdrawn = receipt.get("schema_version") == 2
     if any(not isinstance(receipt.get(name), str) for name in (
-        "status", "result_action", "failure_code", "no_write_evidence", "started_at",
+        "status", "result_action", "started_at",
     )):
         return invalid
     expected = {
@@ -90,15 +104,25 @@ def projection(target: Path, state: dict) -> dict:
         "no_write_evidence": state.get("recovery_no_write_evidence", "confirmed_no_write"),
         "source_fingerprints": fingerprints,
     }
+    if withdrawn:
+        from . import flow_engine, withdrawn_submission
+        source_state = evidence.read_receipt(source / "state.json")
+        if (source_state is None or receipt.get("withdrawal_confirmed") is not True
+                or not flow_engine.FlowEngine.confirmed_submission(target.parents[3], source_state)
+                or not withdrawn_submission.valid_observation(source / "action.json", source_state,
+                    receipt.get("observation"), fresh=False)):
+            return invalid
+        expected = {key: value for key, value in expected.items() if key not in {"failure_code", "no_write_evidence"}}
+        expected.update(schema_version=2, recovery_reason=state.get("recovery_reason"),
+            source_outcome="submitted_then_withdrawn", withdrawal_confirmed=True, observation=receipt["observation"])
     completed = receipt.get("status") in {"prepared", "preparation_failed"}
     required_fields = set(expected) | {"status", "result_action", "started_at"}
     if completed:
         required_fields.add("finished_at")
     if (set(receipt) != required_fields
-            or not isinstance(expected["failure_code"], str)
-            or expected["failure_code"] not in _CODES
-            or not isinstance(expected["no_write_evidence"], str)
-            or expected["no_write_evidence"] not in {"confirmed_no_write", "human_confirmed_no_write"}
+            or (withdrawn and expected["recovery_reason"] != "user_confirmed_withdrawal")
+            or (not withdrawn and (expected["failure_code"] not in _CODES
+                or expected["no_write_evidence"] not in {"confirmed_no_write", "human_confirmed_no_write"}))
             or (receipt.get("status") == "prepared") != (receipt.get("result_action") == "review_required")
             or any(path.is_symlink() for path in (target, source, *target.parents))
             or previous + 1 != state["attempt"]
@@ -117,6 +141,7 @@ def projection(target: Path, state: dict) -> dict:
                 times[name] = value.isoformat()
     except (TypeError, ValueError):
         return invalid
+    fields = ("recovery_reason", "source_outcome") if withdrawn else ("failure_code", "no_write_evidence")
     return {**base, "receipt_status": "verified", **{k: receipt[k] for k in (
-        "from_attempt", "to_attempt", "failure_code", "no_write_evidence", "status", "result_action",
+        "from_attempt", "to_attempt", "status", "result_action", *fields,
     )}, **times}

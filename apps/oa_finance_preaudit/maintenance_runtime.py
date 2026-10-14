@@ -512,7 +512,19 @@ def assert_live_safe(payload: dict, *, maintenance_leases_held: bool = True,
                 continuation == {'status': 'ready', 'scope': 'item', 'isolated_pending': isolated, 'blocking_reasons': {}}
                 and type(isolated) is int and type(quarantined) is int and quarantined >= 0
                 and len(uncounted) > 0 and isolated == quarantined + len(uncounted))
-    if source_only_proof is not None:
+    withdrawn_action = None
+    if source_only_proof is not None and source_only_proof.get('kind') == 'preaudit_confirmed_withdrawal_source_only':
+        inputs = payload.get('maintenance_current_inputs', {})
+        withdrawn_action = source_only_proof.get('withdrawn_action')
+        if (source_only_proof.get('withdrawal_confirmed') is not True or not isinstance(withdrawn_action, str)
+                or not Path(withdrawn_action).is_absolute()
+                or inputs.get('verified_withdrawn_actions') != [withdrawn_action]
+                or reconciled.get('continuation') != {'status':'blocked', 'scope':'controller',
+                    'isolated_pending':0, 'blocking_reasons':{'pending_write_state_unresolved':1}}
+                or reconciled.get('quarantine', {}).get('pending_quarantined') != 0):
+            raise RuntimeError('maintenance_reconciliation_untrusted')
+        trusted_continuation = True
+    elif source_only_proof is not None:
         current_inputs = payload.get('maintenance_current_inputs')
         if not isinstance(current_inputs, dict) or not isinstance(source_only_proof, dict):
             raise RuntimeError('maintenance_current_inputs_untrusted')
@@ -542,11 +554,16 @@ def assert_live_safe(payload: dict, *, maintenance_leases_held: bool = True,
     for finding in reconciled['findings']:
         if not isinstance(finding, dict):
             raise RuntimeError('maintenance_reconciliation_untrusted')
+        withdrawn = (withdrawn_action is not None and finding.get('category') == 'pending_not_handled'
+            and finding.get('local_execution_state') == 'closed' and finding.get('local_write_state') == 'submitted'
+            and str(Path(source_only_proof['target_root']) / 'runtime/finance_preaudit_flows'
+                / str(finding.get('workflow_key')) / 'cases' / str(finding.get('item_key'))
+                / ('attempt-' + str(finding.get('attempt'))) / 'action.json') == withdrawn_action)
         if (finding.get('category') == 'pending_handled_conflict'
                 or (finding.get('category') == 'identity_conflict'
                     and finding.get('recommendation') != 'deferred_historical_cleanup')
                 or (finding.get('category') == 'pending_not_handled'
-                    and finding.get('local_write_state') in {'unknown', 'submitting', 'submitted'})):
+                    and finding.get('local_write_state') in {'unknown', 'submitting', 'submitted'} and not withdrawn)):
             raise RuntimeError('maintenance_current_write_unresolved')
     if not original_closure:
         from .production_config import FINANCE_WORKFLOWS
@@ -693,6 +710,7 @@ try:
     preserved = []
     interrupted = []
     uncounted = []
+    withdrawn = []
     for item in pending:
         state = by_key[(item['workflow_key'], item['item_key'], item['attempt'])]
         attempt = flows / state['workflow_key'] / 'cases' / state['case_key'] / ('attempt-' + str(state['attempt']))
@@ -701,6 +719,16 @@ try:
         elif state['execution_state'] == 'review_required':
             if not flow_engine.FlowEngine.resumable_review(flows, state):
                 raise ValueError()
+        elif (state['execution_state'] == 'closed' and source_only is not None
+                and source_only.get('kind') == 'preaudit_confirmed_withdrawal_source_only'):
+            if (state['workflow_key'] not in flow_engine._FINANCE_WORKFLOW_KEYS
+                    or set(source_only) != {'kind','target_root','withdrawn_action','source_fingerprints','withdrawal_confirmed'}
+                    or source_only['target_root'] != str(root) or source_only['withdrawal_confirmed'] is not True
+                    or source_only['withdrawn_action'] != str(attempt / 'action.json')
+                    or source_only['source_fingerprints'] != recovery_receipt._fingerprints(attempt)
+                    or not flow_engine.FlowEngine.confirmed_submission(flows, state)):
+                raise ValueError()
+            withdrawn.append(str(attempt / 'action.json'))
         elif state['execution_state'] == 'needs_admin':
             isolated = item_failure.isolated(attempt, state)
             stopped_collection = False
@@ -726,6 +754,9 @@ try:
         else:
             raise ValueError()
         validated += 1
+    if (source_only is not None and source_only.get('kind') == 'preaudit_confirmed_withdrawal_source_only'
+            and withdrawn != [source_only['withdrawn_action']]):
+        raise ValueError()
     current_policy = policy.lstat()
     if ((metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns, metadata.st_mode)
             != (current_policy.st_dev, current_policy.st_ino, current_policy.st_mtime_ns, current_policy.st_mode)
@@ -735,7 +766,9 @@ try:
         'write_state':'not_requested','target_root':str(root),'status_sha256':expected_hash,
         'policy_sha256':policy_hash,'authorized_workflows':sorted(required),
         'pending_frozen_count':len(pending),'validated_frozen_count':validated,
-        **({'verified_interrupted_actions':sorted(interrupted),'uncounted_interrupted_actions':sorted(uncounted)}
+        **({'verified_withdrawn_actions':withdrawn}
+            if source_only is not None and source_only.get('kind') == 'preaudit_confirmed_withdrawal_source_only'
+            else {'verified_interrupted_actions':sorted(interrupted),'uncounted_interrupted_actions':sorted(uncounted)}
             if source_only is not None and source_only.get('kind') == 'preaudit_official_stop_source_only'
             else {'preserved_stop_failures':sorted(preserved)} if source_only is not None else {})}))
 except (OSError, ValueError, RuntimeError, KeyError, TypeError):

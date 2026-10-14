@@ -189,7 +189,8 @@ def _observed_revision(root: Path) -> str | None:
 def _failed_release(root: Path, before: str | None, expected: str, requested: bool, error: Exception,
                     *, stopped_maintenance: bool = False, automation: ProductionAutomation | None = None,
                     controls_before: dict | None = None, supervisor_loss_source_only: bool = False,
-                    official_stop_source_only: bool = False, user_stop_source_only: bool = False) -> dict:
+                    official_stop_source_only: bool = False, user_stop_source_only: bool = False,
+                    withdrawn_source_only: bool = False) -> dict:
     after = _observed_revision(root)
     state = 'unknown' if before is None or after is None else ('not_updated' if after == before else 'updated')
     return {'schema_version': 1, 'kind': 'production_source_release', 'status': 'blocked',
@@ -198,6 +199,8 @@ def _failed_release(root: Path, before: str | None, expected: str, requested: bo
             'requested_revision': expected, 'source_sync_requested': requested,
             'source_sync_state': state, 'next_process_ready': False,
             'production_acceptance': 'not_verified',
+            **({'withdrawn_submission_source_only': True, 'approval_recovery_allowed': False,
+                'original_evidence_preserved': 'unknown'} if withdrawn_source_only else {}),
             **({'supervisor_loss_source_only': True, 'original_wait_verified': False,
                 'approval_recovery_allowed': False, 'original_evidence_preserved': 'unknown'}
                 if supervisor_loss_source_only else {}),
@@ -222,6 +225,8 @@ def release_source(
     user_stop_source_only: bool = False,
     original_execution: maintenance_runtime.OriginalExecution | None = None,
     check_original: Callable[[Path, maintenance_runtime.OriginalExecution], dict] | None = None,
+    withdrawn_action: Path | None = None,
+    confirmed_withdrawal: bool = False,
 ) -> dict:
     """Preflight, optionally ff-only sync, and verify while retaining both leases.
 
@@ -233,6 +238,18 @@ def release_source(
     cron; it requires original execution readback and never makes approval ready.
     """
     root = Path(target_root).expanduser().absolute()
+    withdrawal_observation = None
+    withdrawal_proof = None
+    withdrawal_cron = None
+    if confirmed_withdrawal and withdrawn_action is None:
+        raise RuntimeError('production_release_withdrawal_action_required')
+    if withdrawn_action is not None:
+        if (confirmed_withdrawal is not True or stopped_maintenance or automation is None or original_execution is None):
+            raise RuntimeError('production_release_withdrawal_confirmation_required')
+        withdrawn_action = Path(withdrawn_action).expanduser().absolute()
+        withdrawal_cron = _control_proof(_pinned_control(automation.file))
+        if tomllib.loads(automation.file.read_text()).get('status') != 'PAUSED':
+            raise RuntimeError('production_release_withdrawal_cron_active')
     if (supervisor_loss_source_only or official_stop_source_only or user_stop_source_only) and not stopped_maintenance:
         raise RuntimeError('production_release_stopped_maintenance_required')
     if sum((supervisor_loss_source_only, official_stop_source_only, user_stop_source_only)) > 1:
@@ -256,6 +273,8 @@ def release_source(
     else:
         _assert_no_stop(root)
     def assert_controls() -> None:
+        if withdrawal_cron is not None and _control_proof(_pinned_control(automation.file)) != withdrawal_cron:
+            raise RuntimeError('production_release_withdrawal_controls_changed')
         if stopped_maintenance:
             if _stopped_controls(root, automation, official_stop_source_only=official_stop_source_only,
                                      user_stop_source_only=user_stop_source_only) != controls:
@@ -277,7 +296,8 @@ def release_source(
     official_proof = None
     user_stop_proof = None
     live = check_live or (lambda target: maintenance_runtime.read_live_status(target,
-        require_reaped=stopped_maintenance, source_only_proof=loss_proof, official_stop_proof=official_proof))
+        require_reaped=stopped_maintenance or withdrawn_action is not None,
+        source_only_proof=withdrawal_proof or loss_proof, official_stop_proof=official_proof))
     manifest_file = root / 'runtime/control/rolling-controller-manifest.json'
     manifest = runtime_control.read_control_bytes(manifest_file)
     if manifest is None:
@@ -304,7 +324,7 @@ def release_source(
     try:
         with maintenance_runtime.target_runtime_leases(root):
             assert_controls()
-            if stopped_maintenance:
+            if stopped_maintenance or withdrawn_action is not None:
                 report = original_readback()
                 if supervisor_loss_source_only:
                     loss_proof = report['source_only_proof']
@@ -312,8 +332,12 @@ def release_source(
                     official_proof = report['official_stop_proof']
                 if user_stop_source_only:
                     user_stop_proof = report['owner_restart_proof']
+            if withdrawn_action is not None:
+                from . import withdrawn_submission
+                withdrawal_observation = withdrawn_submission.observe(root, withdrawn_action)
+                withdrawal_proof = withdrawn_submission.source_proof(withdrawal_observation)
             snapshot = live(root)
-            maintenance_runtime.assert_live_safe(snapshot, source_only_proof=loss_proof, official_stop_proof=official_proof)
+            maintenance_runtime.assert_live_safe(snapshot, source_only_proof=withdrawal_proof or loss_proof, official_stop_proof=official_proof)
             pre_sync_status = snapshot.get('maintenance_status_file')
             if runtime_control.read_control_bytes(manifest_file) != manifest:
                 raise RuntimeError('production_release_manifest_changed')
@@ -327,10 +351,13 @@ def release_source(
                 original_readback()
             if confirmed_sync:
                 assert_controls()
+                if withdrawn_action is not None and not withdrawn_submission.same_observation(
+                        withdrawal_observation, withdrawn_submission.observe(root, withdrawn_action)):
+                    raise RuntimeError('production_release_withdrawal_changed')
                 sync_started = True
                 _git(root, 'merge', '--ff-only', expected_revision)
                 snapshot = live(root)
-                maintenance_runtime.assert_live_safe(snapshot, source_only_proof=loss_proof, official_stop_proof=official_proof)
+                maintenance_runtime.assert_live_safe(snapshot, source_only_proof=withdrawal_proof or loss_proof, official_stop_proof=official_proof)
                 if check_configuration is None:
                     from . import production_config
                     findings = production_config.repository_findings(root)
@@ -351,6 +378,10 @@ def release_source(
                 if (stopped_result['stopped_controls_after'] != controls_before
                         or not stopped_result['stop_preserved'] or not stopped_result['automation_preserved']):
                     raise RuntimeError('production_release_stopped_controls_changed')
+            if withdrawn_action is not None:
+                original_readback()
+                if not withdrawn_submission.same_observation(withdrawal_observation, withdrawn_submission.observe(root, withdrawn_action)):
+                    raise RuntimeError('production_release_withdrawal_changed')
             return {
                 'schema_version': 1, 'kind': 'production_source_release',
                 'status': 'synced' if confirmed_sync else 'ready',
@@ -359,11 +390,14 @@ def release_source(
                 'source_sync_state': 'updated' if after != before else 'not_updated',
                 'expected_revision': expected_revision, 'write_state': 'not_requested',
                 'source_sync_requested': confirmed_sync,
-                'next_process_ready': confirmed_sync and not stopped_maintenance,
+                'next_process_ready': confirmed_sync and not stopped_maintenance and withdrawn_action is None,
                 'production_acceptance': 'not_verified',
                 'status_file': snapshot.get('maintenance_status_file'),
                 'current_input_proof': snapshot.get('maintenance_current_inputs'),
                 'continuation': snapshot['reconciliation']['continuation'],
+                **({'withdrawn_submission_source_only':True, 'approval_recovery_allowed':False,
+                    'withdrawal_observation':withdrawal_observation, 'original_evidence_preserved':True,
+                    'automation_state':'PAUSED'} if withdrawn_action is not None else {}),
                 **({'supervisor_loss_source_only': True, 'original_wait_verified': False,
                     'approval_recovery_allowed': False, 'original_evidence_preserved': True}
                     if supervisor_loss_source_only else {}),
@@ -382,7 +416,7 @@ def release_source(
         return _failed_release(root, before, expected_revision, confirmed_sync, error,
             stopped_maintenance=stopped_maintenance, automation=automation, controls_before=controls_before,
             supervisor_loss_source_only=supervisor_loss_source_only, official_stop_source_only=official_stop_source_only,
-            user_stop_source_only=user_stop_source_only)
+            user_stop_source_only=user_stop_source_only, withdrawn_source_only=withdrawn_action is not None)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -400,6 +434,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--original-receipt-file', type=Path)
     parser.add_argument('--original-owner-task-id')
     parser.add_argument('--original-tool-session-id')
+    parser.add_argument('--withdrawn-action-file', type=Path)
+    parser.add_argument('--confirm-withdrawal', choices=('YES',))
     args = parser.parse_args(argv)
     before = _observed_revision(args.target_root)
     controls_before = None
@@ -410,7 +446,7 @@ def main(argv: list[str] | None = None) -> int:
             controls_before = _stopped_observation(args.target_root, automation,
                 official_stop_source_only=args.official_stop_source_only == 'YES')
         original = None
-        if args.stopped_maintenance == 'YES':
+        if args.stopped_maintenance == 'YES' or args.withdrawn_action_file is not None:
             if not all((args.original_receipt_file, args.original_owner_task_id, args.original_tool_session_id)):
                 raise RuntimeError('production_release_original_execution_required')
             original = maintenance_runtime.OriginalExecution(args.original_receipt_file,
@@ -420,13 +456,14 @@ def main(argv: list[str] | None = None) -> int:
                                  stopped_maintenance=args.stopped_maintenance == 'YES', original_execution=original,
                                  supervisor_loss_source_only=args.supervisor_loss_source_only == 'YES',
                                  official_stop_source_only=args.official_stop_source_only == 'YES',
-                                 user_stop_source_only=args.user_stop_source_only == 'YES')
+                                 user_stop_source_only=args.user_stop_source_only == 'YES',
+                                 withdrawn_action=args.withdrawn_action_file, confirmed_withdrawal=args.confirm_withdrawal == 'YES')
     except (OSError, ValueError, RuntimeError) as error:
         print(json.dumps(_failed_release(args.target_root, before, args.expected_revision, args.confirm_sync == 'YES', error,
             stopped_maintenance=args.stopped_maintenance == 'YES', automation=automation, controls_before=controls_before,
             supervisor_loss_source_only=args.supervisor_loss_source_only == 'YES',
             official_stop_source_only=args.official_stop_source_only == 'YES',
-            user_stop_source_only=args.user_stop_source_only == 'YES')))
+            user_stop_source_only=args.user_stop_source_only == 'YES', withdrawn_source_only=args.withdrawn_action_file is not None)))
         return 1
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return 1 if payload['status'] == 'blocked' else 0
