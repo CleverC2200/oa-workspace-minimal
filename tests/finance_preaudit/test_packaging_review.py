@@ -509,11 +509,5 @@ def test_packaging_review_rejects_audit_parent_drift_at_completion(tmp_path, mon
 
 
 @pytest.fixture(autouse=True)
-def fake_review_api_key(monkeypatch):
-    # These recorded process doubles model the isolated DeepSeek transport.
-    settings = reviewer.worker.production_config.review_settings('deepseek')
-    monkeypatch.setenv('OA_REVIEW_PROVIDER', 'deepseek')
-    monkeypatch.setattr(reviewer.worker, 'REVIEW_SETTINGS', settings)
-    monkeypatch.setattr(reviewer.worker, 'MODEL', settings['model'])
-    monkeypatch.setattr(reviewer.worker, 'REASONING_EFFORT', settings['reasoning_effort'])
+def fake_review_api_key(monkeypatch, retained_deepseek_cli):
     monkeypatch.setenv("OA_REVIEW_API_KEY", "offline-fake-key")

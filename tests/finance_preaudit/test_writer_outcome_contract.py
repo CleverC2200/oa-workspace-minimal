@@ -468,6 +468,9 @@ def test_mixed_batch_continues_after_verified_rejection(tmp_path: Path, monkeypa
     from apps.oa_finance_preaudit import cli, codex_review_worker
     from scripts import finance_preaudit_concurrency_probe as probe
 
+    # This recorded legacy receipt exercises the CLI parent Writer contract.
+    monkeypatch.setenv('OA_REVIEW_PROVIDER', 'deepseek')
+    monkeypatch.setenv('OA_REVIEW_TRANSPORT', 'cli')
     monkeypatch.setenv("OA_APP_SECRET", "local-test-secret")
     project = tmp_path.resolve()
     root = project / "runtime" / "finance_preaudit_flows"

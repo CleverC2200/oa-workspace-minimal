@@ -8,11 +8,17 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   quality:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      - name: Record CI step start
+        run: echo "OA_CI_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -42,18 +48,38 @@ jobs:
         run: python -m scripts.quality schema
       - name: Python critical lint
         run: python -m scripts.quality lint
+      - name: Unique test definitions
+        run: python -m scripts.quality test-names
       - name: PR contract
         if: github.event_name == 'pull_request'
         run: python -m scripts.quality pr --event "$GITHUB_EVENT_PATH"
       - name: Python syntax
         run: python -m compileall -q apps scripts tests
-      - name: Offline unit and golden replay tests
-        run: python -m pytest -v -x --tb=short
+      - name: Independent full test collection
+        run: python -m pytest -q --collect-only -p scripts.pytest_evidence --ci-evidence-file="$RUNNER_TEMP/collection.json"
+      - name: Full offline tests with balanced workers
+        run: >-
+          python -m pytest -q --tb=short -n 6 --dist worksteal --max-worker-restart 0
+          -p scripts.pytest_evidence --ci-expected-file="$RUNNER_TEMP/collection.json"
+          --ci-evidence-file="$RUNNER_TEMP/execution.json" --ci-budget-seconds=170
+          --junitxml="$RUNNER_TEMP/offline-tests.xml" --durations=20
+      - name: Preserve collection, coverage and timing evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-test-evidence
+          path: |
+            ${{ runner.temp }}/collection.json
+            ${{ runner.temp }}/execution.json
+            ${{ runner.temp }}/offline-tests.xml
+          if-no-files-found: warn
 
   macos-stop-recovery:
     runs-on: macos-latest
     timeout-minutes: 10
     steps:
+      - name: Record CI step start
+        run: echo "OA_CI_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
@@ -66,6 +92,7 @@ jobs:
           python -m pytest -q --tb=short --junitxml="$RUNNER_TEMP/stop-recovery.xml" tests/finance_preaudit/test_manual_stop_recovery.py
           python - <<'PY'
           import os
+          import time
           from pathlib import Path
           from xml.etree import ElementTree
 
@@ -74,5 +101,15 @@ jobs:
           skipped = [case.get('name') for case in cases if case.find('skipped') is not None]
           if not cases or skipped:
               raise SystemExit(f'stop_recovery_tests_incomplete: skipped={skipped}')
+          elapsed = time.time() - float(os.environ['OA_CI_STARTED_AT'])
+          if not 0 <= elapsed <= 170:
+              raise SystemExit(f'ci_time_budget_exceeded: {elapsed:.2f}s')
           print(f'Stop recovery: {len(cases)} tests, no skips')
           PY
+      - name: Preserve macOS stop recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-stop-recovery-evidence
+          path: ${{ runner.temp }}/stop-recovery.xml
+          if-no-files-found: warn

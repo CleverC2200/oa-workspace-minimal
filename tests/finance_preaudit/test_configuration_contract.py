@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 import sys
 import types
@@ -71,11 +72,20 @@ class TestConfigurationContract:
         assert offenders == []
 
     def test_ci_discovers_the_complete_test_tree(self) -> None:
+        import yaml
         workflow = (PROJECT_ROOT / ".github/workflows/quality.yml").read_text(
             encoding="utf-8"
         )
-
-        assert "python -m pytest -v" in workflow
+        commands = [shlex.split(step['run']) for step in yaml.safe_load(workflow)['jobs']['quality']['steps']
+                    if step.get('run', '').startswith('python -m pytest')]
+        collection, execution = commands
+        assert '--collect-only' in collection
+        assert any(arg.startswith('--ci-expected-file=') for arg in execution)
+        assert '--dist' in execution and execution[execution.index('--dist') + 1] == 'worksteal'
+        assert int(execution[execution.index('-n') + 1]) >= 2
+        for command in commands:
+            assert not any(arg.startswith('tests/') or arg in {'-k', '-m', '--ignore', '--lf', '--ff'}
+                           for arg in command[3:])
 
     def test_oa_host_requires_local_configuration(self) -> None:
         with (

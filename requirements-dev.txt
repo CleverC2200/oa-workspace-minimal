@@ -3,6 +3,7 @@ oracledb==4.0.1
 PyMuPDF==1.26.4
 playwright==1.62.0
 pytest==9.1.1
+pytest-xdist==3.8.0
 
 jsonschema==4.25.1
 PyYAML==6.0.3
