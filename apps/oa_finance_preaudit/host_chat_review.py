@@ -770,8 +770,10 @@ def _draft_publication(input_text, output, decision_file: Path) -> dict:
         raise ValueError('host_review_source_untrusted')
     try:
         args = json.loads(match.group(1))
-        if set(args) != {'cmd'} or not isinstance(args['cmd'], str):
+        if set(args) not in ({'cmd'}, {'cmd', 'workdir'}) or not isinstance(args['cmd'], str):
             raise ValueError('invalid_command')
+        if 'workdir' in args and args['workdir'] != str(runtime_control.PROJECT_ROOT.absolute()):
+            raise ValueError('invalid_project_directory')
         tokens = shlex.split(args['cmd'])
         if tokens[:9] != ['uv', 'run', '--no-sync', 'python', '-B', '-m', MODULE, '--operation', 'write-draft'] or len(tokens) != 17:
             raise ValueError('invalid_command')

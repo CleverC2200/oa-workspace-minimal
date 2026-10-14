@@ -47,6 +47,8 @@ python -B -m apps.oa_finance_preaudit.host_chat_review --operation assign --owne
 
 将该完整命令用 JSON 字符串字面量填入下方 cmd，再执行一个独立原生 exec。整个调用只含这一条表达式，不附加变量、注释、分支或其他工具。此示例中的占位文字必须替换为 draft_command 返回值，不能照字面执行：
 
+默认工具目录与审核工作树不同的时候，可在 exec_command 的同一个 JSON 对象中增加 workdir。其值必须是当前审核项目根目录的完整绝对路径，与宿主 PROJECT_ROOT 字符串完全一致；其他目录、相对路径及其他工具参数仍拒绝。cmd 和专用发布回执的校验保持相同。
+
 ```javascript
 text(await tools.exec_command({"cmd":"完整规范命令字符串"}));
 ```

@@ -82,6 +82,33 @@ def draft_source(source, request_file, target, owner, *, call_id='actual-host-ca
     code = 'text(await tools.exec_command(' + json.dumps({'cmd': host.draft_command(request_file, target, payload, owner=owner)}) + '));'
     return native_call(source, 'functions.exec', code, call_id, {'exit_code': 0, 'output': json.dumps(receipt) + '\n'})
 
+
+@pytest.mark.parametrize('directory', ['same_project', 'other_project', 'relative_project', 'extra_argument'])
+def test_native_publication_allows_only_the_current_project_workdir(exchange, directory):
+    action, draft, owner, child, *_ = exchange
+    thread, results, request = start(exchange)
+    command = host.draft_command(request, draft, json.loads(draft.read_text()), owner=owner)
+    arguments = {'cmd': command, 'workdir': str(runtime_control.PROJECT_ROOT)}
+    if directory == 'other_project':
+        arguments['workdir'] = str(runtime_control.PROJECT_ROOT.parent)
+    elif directory == 'relative_project':
+        arguments['workdir'] = '.'
+    elif directory == 'extra_argument':
+        arguments['shell'] = '/bin/sh'
+    output = json.loads(child.read_text().splitlines()[2])['payload']['output']
+    line = native_call(child, 'functions.exec', 'text(await tools.exec_command(' + json.dumps(arguments) + '));',
+                       'publication-in-current-project', output)
+    try:
+        if directory == 'same_project':
+            assert host.submit(request, draft, owner=owner, source=child, source_line=line)['status'] == 'published'
+        else:
+            with pytest.raises(ValueError, match='source_untrusted'):
+                host.submit(request, draft, owner=owner, source=child, source_line=line)
+    finally:
+        host.close(owner=owner, reason='cancelled')
+        thread.join(3)
+    assert not thread.is_alive()
+
 def start(exchange):
     action, draft, owner, source, task, _, _ = exchange
     result = []
