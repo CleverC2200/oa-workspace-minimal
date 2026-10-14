@@ -860,8 +860,8 @@ def submit(request_file: Path, decision_file: Path, *, owner: str, source: Path,
         review_payload = decision
         provenance = _source_receipt(source, source_line, assigned['reviewer_task_id'], decision_file, assigned=assigned)
         if request['review_kind'] == 'finance':
-            from .review_decision import bind_frozen_fields
-            decision = bind_frozen_fields(action, decision)
+            from . import codex_review_worker as worker
+            decision = worker._normalize_decision(action, decision)
             from .flow_engine import FlowEngine
             engine = FlowEngine(root=action.parents[4], discover_candidates=lambda _: (), collect_material=lambda *_: {})
             engine.validate_review_decision(action, decision)
@@ -903,8 +903,7 @@ def complete(action: Path, reviewed: dict, *, completer=None) -> dict:
         _, submitted = _submission(request_file, request)
         source = submitted['source']
         draft = Path(source['decision_file'])
-        from .review_decision import bind_frozen_fields
-        if submitted['decision'] != bind_frozen_fields(action, _read(draft)[1]):
+        if submitted['decision'] != worker._normalize_decision(action, _read(draft)[1]):
             raise ValueError('host_review_result_untrusted')
         if not worker._write_agent_timing(action, wall_seconds=reviewed['agent_wall_seconds'], attempts=0,
                                           token_usage={'status': 'unknown'}, identity=IDENTITY):

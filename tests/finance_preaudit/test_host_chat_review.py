@@ -206,6 +206,43 @@ def test_one_native_dispatch_cannot_be_consumed_by_two_requests(exchange, opaque
         thread.join(3)
     assert not thread.is_alive()
 
+
+def test_app_small_marketing_object_uses_existing_normalizer_and_keeps_raw_source(exchange):
+    _, _, owner, child, _, _, engine = exchange
+    action = Path(engine.next_action('small_marketing_fee')['action_file'])
+    packet = json.loads(action.with_name('review-packet.json').read_text())
+    keys = [item['item_key'] for item in packet['items']]
+    raw = {'overall': 'needs_human', 'items': {
+        key: {'status': 'uncertain', 'conclusion': '自动读取材料不足，需财务核对原单。',
+              'evidence_refs': [], 'missing_evidence': ['缺少审核材料']} for key in keys}}
+    task = {'project_root': str(runtime_control.PROJECT_ROOT), 'action_file': str(action), 'timeout_seconds': 60}
+    results = []
+    thread = threading.Thread(target=lambda: results.append(controller._review_only(task)))
+    thread.start()
+    request = action.with_name(host.REQUEST)
+    deadline = time.monotonic() + 3
+    while not request.exists() and time.monotonic() < deadline: time.sleep(.01)
+    parent = child.with_name('parent.jsonl')
+    dispatch = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(request)}, 'small-object-dispatch', '')
+    target = action.with_name('model-keyed-items.json')
+    try:
+        host.assign(request, slot=0, owner=owner, source=parent, source_line=dispatch)
+        line = draft_source(child, request, target, owner, payload=raw)
+        host.submit(request, target, owner=owner, source=child, source_line=line)
+        reviewed = host.read_result(request)
+        assert reviewed['status'] == 'reviewed'
+        assert [item['item_key'] for item in reviewed['decision']['items']] == keys
+        assert [{k: v for k, v in item.items() if k != 'item_key'} for item in reviewed['decision']['items']] == list(raw['items'].values())
+        assert json.loads(target.read_text()) == raw
+        consumer = []
+        completed = host.complete(action, reviewed, completer=lambda path, value: consumer.append(value))
+        assert consumer == [reviewed['decision']]
+        assert completed['error_code'] == 'host_review_submit_incomplete'
+    finally:
+        host.close(owner=owner, reason='cancelled')
+        thread.join(3)
+    assert not thread.is_alive()
+
 def start(exchange):
     action, draft, owner, source, task, _, _ = exchange
     result = []
