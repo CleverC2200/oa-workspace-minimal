@@ -177,8 +177,30 @@ def _reviewers(reviewers: list[dict], owner: str, source: Path) -> list[dict]:
         parent_native, spawn_proof = _native_source(source, owner, entry['spawn_line'], output=True)
         arguments = _tool(parent_native['anchor'], 'spawn_agent')
         agent_path = spawn_proof['output'].get('task_name')
-        if (ancestry.get('parent_thread_id') != owner or ancestry.get('depth') != 1
+        parent_source = parent_native['header'].get('source')
+        parent_depth, parent_path = 0, None
+        if parent_source is not None and not isinstance(parent_source, (str, dict)):
+            raise ValueError('host_review_source_untrusted')
+        if isinstance(parent_source, dict):
+            if 'subagent' not in parent_source:
+                raise ValueError('host_review_source_untrusted')
+            origin = parent_source['subagent']
+            parent_ancestry = origin.get('thread_spawn') if isinstance(origin, dict) else None
+            if (not isinstance(parent_ancestry, dict) or type(parent_ancestry.get('depth')) is not int
+                    or parent_ancestry['depth'] < 1 or not isinstance(parent_ancestry.get('agent_path'), str)
+                    or not isinstance(parent_ancestry.get('parent_thread_id'), str)
+                    or parent_ancestry['parent_thread_id'] == owner
+                    or not parent_ancestry['agent_path'].startswith('/')):
+                raise ValueError('host_review_source_untrusted')
+            try:
+                UUID(parent_ancestry['parent_thread_id'])
+            except ValueError as error:
+                raise ValueError('host_review_source_untrusted') from error
+            parent_depth, parent_path = parent_ancestry['depth'], parent_ancestry['agent_path']
+        if (ancestry.get('parent_thread_id') != owner or type(ancestry.get('depth')) is not int
+                or ancestry['depth'] != parent_depth + 1
                 or ancestry.get('agent_path') != agent_path or not isinstance(agent_path, str)
+                or (parent_path is not None and agent_path != parent_path + '/' + str(arguments.get('task_name')))
                 or not agent_path.endswith('/' + str(arguments.get('task_name')))):
             raise ValueError('host_review_source_untrusted')
         registered.append({'slot': slot, 'reviewer_task_id': reviewer, 'agent_path': agent_path,

@@ -8,17 +8,22 @@ import pytest
 from apps.oa_finance_preaudit import host_chat_review as host
 
 
-def native_sessions(tmp_path, monkeypatch):
+def native_sessions(tmp_path, monkeypatch, *, owner_depth=0):
     home = tmp_path / 'codex'
     sessions = home / 'sessions'
     sessions.mkdir(parents=True)
     monkeypatch.setenv('CODEX_HOME', str(home))
     owner = str(uuid4())
     parent = sessions / 'parent.jsonl'
-    lines = [{'type': 'session_meta', 'payload': {'id': owner}}]
+    owner_path = '/root' + ''.join(f'/supervisor_{level}' for level in range(owner_depth))
+    metadata = {'id': owner}
+    if owner_depth:
+        metadata['source'] = {'subagent': {'thread_spawn': {
+            'parent_thread_id': str(uuid4()), 'depth': owner_depth, 'agent_path': owner_path}}}
+    lines = [{'type': 'session_meta', 'payload': metadata}]
     reviewers = []
     for slot in range(3):
-        agent_path = f'/root/reviewer_{slot}'
+        agent_path = f'{owner_path}/reviewer_{slot}'
         call = f'spawn-{slot}'
         spawn_line = len(lines) + 1
         lines.extend([
@@ -29,7 +34,7 @@ def native_sessions(tmp_path, monkeypatch):
         ])
         child = sessions / f'child-{slot}.jsonl'
         child.write_text(json.dumps({'type': 'session_meta', 'payload': {'id': str(uuid4()),
-            'source': {'subagent': {'thread_spawn': {'parent_thread_id': owner, 'depth': 1, 'agent_path': agent_path}}}}}) + '\n')
+            'source': {'subagent': {'thread_spawn': {'parent_thread_id': owner, 'depth': owner_depth + 1, 'agent_path': agent_path}}}}}) + '\n')
         child.chmod(0o600)
         reviewers.append({'session_file': str(child), 'spawn_line': spawn_line})
     parent.write_text(''.join(json.dumps(line) + '\n' for line in lines))
@@ -67,11 +72,12 @@ def original_execution(owner, manifest):
     finance_preaudit_run.bind_tool_session(receipt_file, owner_task_id=owner, session_id='original-session')
     return {'receipt_file': receipt_file, 'invocation_id': invocation, 'tool_session_id': 'original-session'}
 
-def test_registry_keeps_exactly_three_fixed_native_conversations(tmp_path, monkeypatch):
+@pytest.mark.parametrize('owner_depth', [0, 1, 2])
+def test_registry_keeps_exactly_three_fixed_native_conversations(tmp_path, monkeypatch, owner_depth):
     from apps.oa_approval import runtime_control
     from apps.oa_finance_preaudit import controller_handoff, approval_guard
     import os
-    owner, parent, reviewers = native_sessions(tmp_path, monkeypatch)
+    owner, parent, reviewers = native_sessions(tmp_path, monkeypatch, owner_depth=owner_depth)
     monkeypatch.setenv('OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE', str(tmp_path / 'control/controller.lock'))
     monkeypatch.setenv('OA_REVIEW_PROVIDER', 'openai')
     monkeypatch.setenv(host.TRANSPORT_ENV, 'host_chat')
@@ -102,4 +108,59 @@ def test_empty_native_acknowledgement_cannot_replace_spawn_identity(tmp_path, mo
     lines[2] = json.dumps(output)
     parent.write_text('\n'.join(lines) + '\n')
     with pytest.raises(ValueError, match='source_untrusted'):
+        host.register(reviewers, owner=owner, source=parent)
+
+
+@pytest.mark.parametrize('depth', [None, True, '1', 0, -1, [], 2])
+def test_native_supervisor_rejects_invalid_or_non_direct_child_depth(tmp_path, monkeypatch, depth):
+    owner, parent, reviewers = native_sessions(tmp_path, monkeypatch, owner_depth=1)
+    lines = parent.read_text().splitlines()
+    metadata = json.loads(lines[0])
+    metadata['payload']['source']['subagent']['thread_spawn']['depth'] = depth
+    lines[0] = json.dumps(metadata)
+    parent.write_text('\n'.join(lines) + '\n')
+    for row in reviewers:
+        child = __import__('pathlib').Path(row['session_file'])
+        value = json.loads(child.read_text())
+        value['payload']['source']['subagent']['thread_spawn']['depth'] = 1
+        child.write_text(json.dumps(value) + '\n')
+    with pytest.raises(ValueError, match='host_review_source_untrusted'):
+        host.register(reviewers, owner=owner, source=parent)
+
+
+@pytest.mark.parametrize('depth', [True, 1, 3, None, '2'])
+def test_native_supervisor_rejects_sibling_grandchild_or_untyped_depth(tmp_path, monkeypatch, depth):
+    owner, parent, reviewers = native_sessions(tmp_path, monkeypatch, owner_depth=1)
+    child = __import__('pathlib').Path(reviewers[0]['session_file'])
+    value = json.loads(child.read_text())
+    value['payload']['source']['subagent']['thread_spawn']['depth'] = depth
+    child.write_text(json.dumps(value) + '\n')
+    with pytest.raises(ValueError, match='host_review_source_untrusted'):
+        host.register(reviewers, owner=owner, source=parent)
+
+
+@pytest.mark.parametrize('damage', ['source_type', 'missing_spawn', 'parent_missing', 'parent_invalid', 'parent_self', 'parent_path', 'unknown_origin', 'spawn_without_subagent', 'empty_origin'])
+def test_native_supervisor_rejects_malformed_parent_origin(tmp_path, monkeypatch, damage):
+    owner, parent, reviewers = native_sessions(tmp_path, monkeypatch, owner_depth=1)
+    lines = parent.read_text().splitlines()
+    metadata = json.loads(lines[0])['payload']
+    ancestry = metadata['source']['subagent']['thread_spawn']
+    if damage == 'source_type': metadata['source'] = []
+    if damage == 'missing_spawn': metadata['source']['subagent'] = {}
+    if damage == 'parent_missing': ancestry.pop('parent_thread_id')
+    if damage == 'parent_invalid': ancestry['parent_thread_id'] = 'not-a-uuid'
+    if damage == 'parent_self': ancestry['parent_thread_id'] = owner
+    if damage == 'parent_path': ancestry['agent_path'] = '/root/other-supervisor'
+    if damage == 'unknown_origin': metadata['source'] = {'unknown': 'root'}
+    if damage == 'spawn_without_subagent': metadata['source'] = {'thread_spawn': {'depth': True}}
+    if damage == 'empty_origin': metadata['source'] = {}
+    if damage in {'unknown_origin', 'spawn_without_subagent', 'empty_origin'}:
+        for row in reviewers:
+            child = __import__('pathlib').Path(row['session_file'])
+            value = json.loads(child.read_text())
+            value['payload']['source']['subagent']['thread_spawn']['depth'] = 1
+            child.write_text(json.dumps(value) + '\n')
+    lines[0] = json.dumps({'type': 'session_meta', 'payload': metadata})
+    parent.write_text('\n'.join(lines) + '\n')
+    with pytest.raises(ValueError, match='host_review_source_untrusted'):
         host.register(reviewers, owner=owner, source=parent)
