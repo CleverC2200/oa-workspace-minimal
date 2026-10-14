@@ -136,6 +136,86 @@ def test_public_draft_command_emits_one_json_receipt_without_project_warning(exc
     assert not thread.is_alive()
 
 
+def test_public_draft_command_carries_round_controls_into_independent_exec(exchange):
+    import shlex
+    import subprocess
+    _, draft, owner, child, *_ = exchange
+    thread, results, request = start(exchange)
+    target = request.with_name('independent-exec-draft.json')
+    command = host.draft_command(request, target, json.loads(draft.read_text()), owner=owner)
+    environment = dict(os.environ, UV_OFFLINE='1')
+    environment.pop('OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE', None)
+    environment.pop('OA_FINANCE_PREAUDIT_STOP_FILE', None)
+    try:
+        result = subprocess.run(shlex.split(command), env=environment,
+            cwd=Path(host.__file__).resolve().parents[2], capture_output=True, text=True, timeout=15)
+        assert result.returncode == 0, result.stderr
+        line = native_call(child, 'functions.exec',
+            'text(await tools.exec_command(' + json.dumps({'cmd': command}) + '));',
+            'independent-exec-publication', {'exit_code': result.returncode, 'output': result.stdout})
+        assert host.submit(request, target, owner=owner, source=child, source_line=line)['status'] == 'published'
+        thread.join(3)
+        assert results[0]['status'] == 'reviewed'
+        assert host.read_result(request)['write_state'] == 'not_requested'
+    finally:
+        host.close(owner=owner, reason='cancelled')
+        thread.join(3)
+    assert not thread.is_alive()
+
+
+@pytest.mark.parametrize('route', ['historical_bare', 'foreign_controller', 'foreign_stop', 'extra_env'])
+def test_native_publication_checks_fixed_controls_and_preserves_historical_bare_source(exchange, route):
+    import shlex
+    _, draft, owner, child, *_ = exchange
+    thread, _, request = start(exchange)
+    command = shlex.split(host.draft_command(request, draft, json.loads(draft.read_text()), owner=owner))
+    if route == 'historical_bare':
+        command = command[3:]
+    elif route == 'foreign_controller':
+        command[1] = 'OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE=' + str(request.parent / 'foreign.lock')
+    elif route == 'foreign_stop':
+        command[2] = 'OA_FINANCE_PREAUDIT_STOP_FILE=' + str(request.parent / 'foreign-stop.flag')
+    else:
+        command.insert(3, 'UNAPPROVED_ENV=1')
+    output = json.loads(child.read_text().splitlines()[2])['payload']['output']
+    line = native_call(child, 'functions.exec',
+        'text(await tools.exec_command(' + json.dumps({'cmd': shlex.join(command)}) + '));',
+        'fixed-control-publication', output)
+    try:
+        if route == 'historical_bare':
+            assert host.submit(request, draft, owner=owner, source=child, source_line=line)['status'] == 'published'
+        else:
+            with pytest.raises(ValueError, match='source_untrusted'):
+                host.submit(request, draft, owner=owner, source=child, source_line=line)
+    finally:
+        host.close(owner=owner, reason='cancelled')
+        thread.join(3)
+    assert not thread.is_alive()
+
+
+def test_independent_publication_enforces_the_original_stop_file(exchange):
+    import shlex
+    import subprocess
+    _, draft, owner, _, *_ = exchange
+    thread, _, request = start(exchange)
+    target = request.with_name('stopped-exec-draft.json')
+    command = host.draft_command(request, target, json.loads(draft.read_text()), owner=owner)
+    environment = dict(os.environ, UV_OFFLINE='1')
+    environment.pop('OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE', None)
+    environment.pop('OA_FINANCE_PREAUDIT_STOP_FILE', None)
+    try:
+        runtime_control.request_stop()
+        result = subprocess.run(shlex.split(command), env=environment,
+            cwd=Path(host.__file__).resolve().parents[2], capture_output=True, text=True, timeout=15)
+        assert result.returncode != 0
+        assert 'stop_requested' in result.stderr
+        assert not target.exists()
+    finally:
+        host.close(owner=owner, reason='cancelled')
+        thread.join(3)
+    assert not thread.is_alive()
+
+
 @pytest.mark.parametrize('case', ['opaque', 'wrong_publication', 'malformed_opaque', 'wrong_plaintext', 'different_parent_file'])
 def test_opaque_dispatch_requires_registered_parent_and_actual_child_request_receipt(exchange, case):
     import shutil

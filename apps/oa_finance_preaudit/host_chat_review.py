@@ -730,7 +730,10 @@ def review(task: dict) -> dict:
 
 def draft_command(request_file: Path, decision_file: Path, payload: dict, *, owner: str) -> str:
     """The only accepted native command for publishing model-authored draft bytes."""
-    return shlex.join(['uv', 'run', '--quiet', 'python', '-B', '-m', MODULE, '--operation', 'write-draft',
+    return shlex.join(['/usr/bin/env',
+                      'OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE=' + str(runtime_control.controller_lock_file().absolute()),
+                      'OA_FINANCE_PREAUDIT_STOP_FILE=' + str(runtime_control.stop_file().absolute()),
+                      'uv', 'run', '--quiet', 'python', '-B', '-m', MODULE, '--operation', 'write-draft',
                       '--owner-task-id', owner, '--request-file', str(request_file.absolute()),
                       '--decision-file', str(decision_file.absolute()), '--payload-json', json.dumps(payload, ensure_ascii=False, sort_keys=True)])
 
@@ -792,14 +795,21 @@ def _draft_publication(input_text, output, decision_file: Path) -> dict:
             raise ValueError('invalid_command')
         if 'workdir' in args and args['workdir'] != str(runtime_control.PROJECT_ROOT.absolute()):
             raise ValueError('invalid_project_directory')
-        tokens = shlex.split(args['cmd'])
+        command_tokens = shlex.split(args['cmd'])
+        if len(command_tokens) not in {17, 20}:
+            raise ValueError('invalid_command')
+        tokens = command_tokens[-17:]
         if tokens[:9] != ['uv', 'run', '--quiet', 'python', '-B', '-m', MODULE, '--operation', 'write-draft'] or len(tokens) != 17:
             raise ValueError('invalid_command')
         if tokens[9] != '--owner-task-id' or tokens[11] != '--request-file' or tokens[13] != '--decision-file' or tokens[15] != '--payload-json':
             raise ValueError('invalid_command')
         owner, request_file, target = tokens[10], Path(tokens[12]), Path(tokens[14])
         payload = json.loads(tokens[16])
-        if target != decision_file or args['cmd'] != draft_command(request_file, target, payload, owner=owner):
+        canonical = draft_command(request_file, target, payload, owner=owner)
+        # Historical native sources used the exact bare command and inherited
+        # their controls. New publications carry only the two fixed routes.
+        expected_command = shlex.join(shlex.split(canonical)[3:]) if len(command_tokens) == 17 else canonical
+        if target != decision_file or args['cmd'] != expected_command:
             raise ValueError('invalid_command')
         result = _shell_result(output)
         receipt = json.loads(result['output'])
