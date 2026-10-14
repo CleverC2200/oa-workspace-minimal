@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import html
 import json
@@ -88,16 +89,16 @@ def _invoice_refs(
             has_misaligned_refs = True
             invalid_invoice_numbers.extend(invoice_numbers)
             continue
-        for data_id, invoice_no in zip(data_ids, invoice_numbers):
+        group = (tuple(data_ids), tuple(invoice_numbers))
+        for data_id in data_ids:
             if data_id in seen:
-                if seen[data_id]["invoice_no"] != invoice_no:
-                    has_misaligned_refs = True
-                    invalid_invoice_numbers.extend((seen[data_id]["invoice_no"], invoice_no))
                 path = str(field.get("path") or "")
                 if path and path not in seen[data_id]["source_field_paths"]:
                     seen[data_id]["source_field_paths"].append(path)
+                if group not in seen[data_id]["_number_groups"]:
+                    seen[data_id]["_number_groups"].append(group)
                 continue
-            ref = {"data_id": data_id, "invoice_no": invoice_no,
+            ref = {"data_id": data_id, "_number_groups": [group],
                    "source_field_paths": [str(field.get("path") or "")]}
             seen[data_id] = ref
             refs.append(ref)
@@ -122,7 +123,14 @@ def _map_invoice_id(oa_api: OaApi, data_id: str) -> str:
 
 
 def _failed_result(refs: List[Dict[str, Any]]) -> Dict[str, Any]:
-    invoice_numbers = [item["invoice_no"] for item in refs]
+    invoice_numbers = list(dict.fromkeys(
+        number
+        for ref in refs
+        for number in (
+            [ref["invoice_no"]] if "invoice_no" in ref else
+            [number for _, numbers in ref["_number_groups"] for number in numbers]
+        )
+    ))
     return {
         "read_status": "failed",
         "invoices": [
@@ -130,6 +138,43 @@ def _failed_result(refs: List[Dict[str, Any]]) -> Dict[str, Any]:
         ],
         "fail_code": "invoice_buyer_read_failed",
     }
+
+
+def _bind_invoice_numbers(refs: List[dict], fids: List[str], details: List[dict]) -> List[dict]:
+    """Bind cloud records to their IDs, then verify each source field's number multiset."""
+    numbers_by_id = {}
+    for ref, fid, detail in zip(refs, fids, details):
+        data = detail.get("data") if isinstance(detail, dict) else None
+        if not isinstance(data, dict):
+            raise ValueError("invoice_record_unreadable")
+        grouped = any(len(set(ids)) > 1 for ids, _ in ref["_number_groups"])
+        raw_id = data.get("id")
+        if raw_id is not None and type(raw_id) not in (str, int):
+            raise ValueError("invoice_record_identity_invalid")
+        record_id = _display_text(raw_id) if type(raw_id) in (str, int) else ""
+        if (grouped and not record_id) or (record_id and record_id != fid):
+            raise ValueError("invoice_record_identity_mismatch")
+        raw_number = data.get("number")
+        if raw_number is not None and type(raw_number) not in (str, int):
+            raise ValueError("invoice_number_invalid")
+        number = _display_text(raw_number) if type(raw_number) in (str, int) else ""
+        if not number:
+            # A single explicitly linked record retains the older response contract.
+            # A grouped field requires every returned number; never infer by exclusion.
+            declared = {number for _, values in ref["_number_groups"] for number in values}
+            if grouped or len(declared) != 1:
+                raise ValueError("invoice_number_missing")
+            number = declared.pop()
+        numbers_by_id[ref["data_id"]] = number
+    groups = {group for ref in refs for group in ref["_number_groups"]}
+    for ids, numbers in groups:
+        if Counter(numbers_by_id[data_id] for data_id in ids) != Counter(numbers):
+            raise ValueError("invoice_number_group_mismatch")
+    return [
+        {"data_id": ref["data_id"], "invoice_no": numbers_by_id[ref["data_id"]],
+         "source_field_paths": ref["source_field_paths"]}
+        for ref in refs
+    ]
 
 
 def _invoice_evidence(ref: dict, detail: dict) -> dict:
@@ -226,14 +271,12 @@ def read_invoice_buyers(
                     zip(refs, fids),
                 )
             )
+        refs = _bind_invoice_numbers(refs, fids, details)
     except Exception:
         return _failed_result(refs)
 
     invoices: List[Dict[str, str]] = []
     for ref, detail in zip(refs, details):
-        returned_number = _display_text((detail.get("data") or {}).get("number"))
-        if returned_number and returned_number != ref["invoice_no"]:
-            return _failed_result(refs)
         comm_info = (detail.get("data") or {}).get("comm_info") or {}
         buyer = _display_text(
             (comm_info.get("buyer") or {}).get("company")
