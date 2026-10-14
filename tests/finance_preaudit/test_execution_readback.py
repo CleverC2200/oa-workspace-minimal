@@ -189,28 +189,46 @@ def test_verified_skip_retains_original_non_takeover_result(tmp_path, monkeypatc
 
 
 def test_wait_observes_original_supervisor_completion(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from scripts import finance_preaudit_run as run
     monkeypatch.setenv('OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE', str(tmp_path / 'rolling.lock'))
     owner = str(uuid4())
     directory = tmp_path / 'executions' / uuid4().hex
+    release = tmp_path / 'release-child'
     child = '''import os,json,datetime,time
 from pathlib import Path
 from apps.oa_approval import runtime_control
-time.sleep(.3)
+deadline = time.monotonic() + 5
+while not Path(RELEASE).exists() and time.monotonic() < deadline:
+ time.sleep(.01)
+assert Path(RELEASE).exists(), 'test_child_not_released'
 runtime_control.write_control_bytes_atomic(Path(os.environ['OA_CONTROLLER_EXECUTION_MANIFEST_FILE']), json.dumps({
  'kind':'preaudit_controller_run_manifest','controller_pid':os.getpid(),
  'run_id':'a'*32,'controller_instance_id':'b'*32,'state':'completed',
  'children_reaped':True,'code_revision':'c'*40,
  'started_at':datetime.datetime.now(datetime.timezone.utc).isoformat()}).encode())
-print('original terminal output')'''
+print('original terminal output')'''.replace('RELEASE', repr(str(release)))
     code = ('from pathlib import Path; import sys; from scripts.finance_preaudit_run import supervise; '
             f'supervise([sys.executable, "-c", {child!r}], directory=Path({str(directory)!r}), owner_task_id={owner!r})')
     with subprocess.Popen([sys.executable, '-B', '-c', code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as supervisor:
         started = json.loads(supervisor.stdout.readline())
         assert started['state'] == 'waiting'
+        waits = []
+        def observe_completion(interval):
+            waits.append(interval)
+            release.touch()
+            supervisor.communicate(timeout=2)
+        # Advance the real child only between complete read snapshots; a
+        # scheduler delay must not turn this wait contract into a publication race.
+        monkeypatch.setattr(run, 'time', SimpleNamespace(monotonic=time.monotonic, sleep=observe_completion))
+        receipt = directory / 'execution.json'
+        observed = run.wait_execution(receipt, owner_task_id=owner,
+            invocation_id=directory.name, retrieve=True, wait_seconds=2)
+        assert waits and observed['terminal'] is True
+        assert observed['controller_stdout'] == 'original terminal output\n'
         result = readback(directory / 'execution.json', owner, '--retrieve-result', '--wait-seconds', '2')
         assert result.returncode == 0, result.stderr + result.stdout
         assert json.loads(result.stdout)['controller_stdout'] == 'original terminal output\n'
-        supervisor.communicate(timeout=2)
         assert supervisor.returncode == 0
 
 

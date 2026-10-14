@@ -17,12 +17,20 @@ from scripts import finance_preaudit_run, finance_preaudit_concurrency_probe as 
 from tests.finance_preaudit.test_codex_review_worker import _task, _small_marketing_v2_task
 from tests.finance_preaudit.test_concurrency_probe import _open_action
 from tests.finance_preaudit.test_execution_readback import recorded_execution
+from tests.finance_preaudit.review_profiles import retained_deepseek_cli  # noqa: F401
 
 
 _TRANSPORT_FALLBACK_WARNING = (
     'Falling back from WebSockets to HTTPS transport. '
     'stream disconnected before completion: IO error: Broken pipe (os error 32)'
 )
+
+
+def _blocking_event_script(*events):
+    # Keep metadata cases alive for the real observer to terminate.
+    return ('import sys,time; sys.stdin.read(); '
+            + '; '.join(f'print({json.dumps(event)!r}, flush=True)' for event in events)
+            + '; time.sleep(10)')
 
 
 @pytest.mark.parametrize('owners', ['[]', 'not-json', json.dumps([{
@@ -112,7 +120,12 @@ def test_item_technical_failure_allows_next_native_review(tmp_path, monkeypatch,
                 'print(json.dumps({"type":"turn.completed"}),flush=True)']
 
     monkeypatch.setattr(worker, '_codex_command', command)
-    failed = worker.review(first_task)
+    def execute_first(root, action, timeout):
+        # Exercise actual TimeoutExpired handling and group reaping at the
+        # existing executor seam, without waiting a minute for synthetic work.
+        return worker._execute_codex(root, action, .2 if mode == 'timeout' else timeout)
+
+    failed = worker.review(first_task, executor=execute_first)
     assert failed['status'] == 'failed'
     assert failed['process_attempts'] == 1 and failed['process_retries'] == 0
     assert first_action.with_name('review-failure.json').exists()
@@ -400,6 +413,7 @@ def test_other_worker_stop_interrupts_live_cli(tmp_path, monkeypatch):
         stopper.join()
 
 
+@pytest.mark.real_observation_interval
 @pytest.mark.parametrize('channel', ['stdout', 'stderr', 'curly_stderr', 'split_stderr', 'backlogged_stdout'])
 def test_first_usage_warning_stops_before_ten_second_retry(tmp_path, monkeypatch, channel):
     task, _ = _task(tmp_path)
@@ -648,6 +662,7 @@ def test_native_transport_fallback_can_finish_same_review(tmp_path, monkeypatch,
     assert notice['error_message_sha256'] == hashlib.sha256(message.encode()).hexdigest()
 
 
+@pytest.mark.real_observation_interval
 @pytest.mark.parametrize('restriction,classification', [
     ({'message': 'usage limit exceeded'}, 'usage_limit'),
     ({'message': 'model is not available'}, 'model_unavailable'),
@@ -726,7 +741,7 @@ def test_official_error_after_transport_fallback_stops_before_retry(tmp_path, mo
 ])
 def test_transport_fallback_does_not_exempt_other_failures(tmp_path, monkeypatch, event, classification):
     task, action = _task(tmp_path)
-    script = f'import sys; sys.stdin.read(); print({json.dumps(event)!r}, flush=True)'
+    script = _blocking_event_script(event)
     monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
     result = worker.review(task)
     assert result['error_code'] == 'codex_process_failed'
@@ -762,7 +777,8 @@ def test_transport_fallback_cannot_hide_unknown_fields_before_valid_completion(t
                 'import sys,json; from pathlib import Path; sys.stdin.read(); '
                 f'print({json.dumps(event)!r},file=sys.{channel},flush=True); '
                 f'Path({str(decision)!r}).write_text(json.dumps({{"overall":"pass"}})); '
-                'print(json.dumps({"type":"turn.completed"}),flush=True)']
+                'print(json.dumps({"type":"turn.completed"}),flush=True); '
+                'import time; time.sleep(10)']
 
     monkeypatch.setattr(worker, '_codex_command', command)
     result = worker.review(task)
@@ -817,7 +833,7 @@ def test_reconnect_does_not_hide_first_official_blocking_notice(tmp_path, monkey
          'token': 'private-secret'},
         {'type': 'error', 'codexErrorInfo': 'usageLimitExceeded'},
     ]
-    script = 'import sys; sys.stdin.read(); ' + '; '.join(f'print({json.dumps(e)!r}, flush=True)' for e in events)
+    script = _blocking_event_script(*events)
     monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
     result = worker.review(task)
     assert result['error_code'] == 'codex_process_failed'
@@ -899,7 +915,7 @@ def test_review_preserves_error_metadata_sources_without_inventing_http_status(
     task, action = _task(tmp_path)
     monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
     event = {'type': 'turn.failed', 'error': error}
-    script = 'import sys; sys.stdin.read(); ' + f'print({json.dumps(event)!r}, flush=True)'
+    script = _blocking_event_script(event)
     monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
     assert worker.review(task)['error_code'] == 'codex_process_failed'
     notice = worker.process_diagnostics.read_notices(action)['first_blocking_notice']
@@ -924,7 +940,7 @@ def test_review_redacts_unqualified_addresses_and_relative_paths(tmp_path, monke
     task, action = _task(tmp_path)
     monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
     event = {'type': 'error', 'message': message}
-    script = 'import sys; sys.stdin.read(); ' + f'print({json.dumps(event)!r}, flush=True)'
+    script = _blocking_event_script(event)
     monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
     assert worker.review(task)['error_code'] == 'codex_process_failed'
     notice = worker.process_diagnostics.read_notices(action)['first_blocking_notice']
@@ -939,7 +955,7 @@ def test_review_bounds_long_error_messages_without_losing_notice(tmp_path, monke
     task, action = _task(tmp_path)
     monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
     event = {'type': 'error', 'message': message}
-    script = 'import sys; sys.stdin.read(); ' + f'print({json.dumps(event)!r}, flush=True)'
+    script = _blocking_event_script(event)
     monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
     assert worker.review(task)['error_code'] == 'codex_process_failed'
     notice = worker.process_diagnostics.read_notices(action)['first_blocking_notice']
@@ -953,7 +969,7 @@ def test_schema_one_notice_remains_readable_without_rewriting_history(tmp_path, 
     task, action = _task(tmp_path)
     monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
     event = {'type': 'error', 'codexErrorInfo': 'usageLimitExceeded'}
-    script = 'import sys; sys.stdin.read(); ' + f'print({json.dumps(event)!r}, flush=True)'
+    script = _blocking_event_script(event)
     monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
     assert worker.review(task)['error_code'] == 'codex_process_failed'
     legacy_fields = {'schema_version', 'kind', 'role', 'run_id_sha256', 'controller_instance_id_sha256',
@@ -983,7 +999,7 @@ def test_invalid_v2_error_evidence_is_rejected_even_when_rehashed(tmp_path, monk
     task, action = _task(tmp_path)
     monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
     event = {'type': 'error', 'message': 'stream disconnected before completion'}
-    script = 'import sys; sys.stdin.read(); ' + f'print({json.dumps(event)!r}, flush=True)'
+    script = _blocking_event_script(event)
     monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
     assert worker.review(task)['error_code'] == 'codex_process_failed'
     path = next(action.parent.glob('review-notice-*-first_blocking_notice-*.json'))
@@ -1003,7 +1019,7 @@ def test_v2_error_evidence_rejects_public_permissions_without_rewriting(tmp_path
     task, action = _task(tmp_path)
     monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
     event = {'type': 'error', 'message': 'connection failed'}
-    script = 'import sys; sys.stdin.read(); ' + f'print({json.dumps(event)!r}, flush=True)'
+    script = _blocking_event_script(event)
     monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
     assert worker.review(task)['error_code'] == 'codex_process_failed'
     path = next(action.parent.glob('review-notice-*-first_blocking_notice-*.json'))
@@ -1078,7 +1094,8 @@ def test_reconnect_never_exempts_terminal_unknown_or_corrupt_events(tmp_path, mo
     warning = json.dumps({'type': 'error', 'message': 'Reconnecting stream disconnected'})
     script = ('import sys; sys.stdin.read(); '
               f'print({warning!r}, flush=True); print({failure!r}, flush=True); '
-              'print(\'{"type":"turn.completed"}\', flush=True)')
+              'print(\'{"type":"turn.completed"}\', flush=True); '
+              'import time; time.sleep(10)')
     monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
     result = worker.review(task)
     assert result['status'] == 'failed'
@@ -1152,6 +1169,8 @@ else:
 if DAMAGE != "rehashed":
     print(json.dumps({"type":"error","message":"Reconnecting stream disconnected"}), flush=True)
 print(json.dumps({"type":"turn.completed"}), flush=True)
+if DAMAGE != "rehashed":
+    time.sleep(10)  # Keep the child alive until the real observer stops it.
 '''.replace('ROOT', repr(str(action.parent))).replace('DAMAGE', repr(damage))
     monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
     result = worker.review(task)
@@ -1227,22 +1246,5 @@ def test_controller_retains_failure_result_before_reaping_pool(tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def fake_review_api_key(monkeypatch):
-    # Pin the recorded transport rather than inheriting the production default.
-    settings = worker.production_config.review_settings('deepseek')
-    monkeypatch.setenv('OA_REVIEW_PROVIDER', 'deepseek')
-    monkeypatch.setattr(worker, 'REVIEW_SETTINGS', settings)
-    monkeypatch.setattr(worker, 'MODEL', settings['model'])
-    monkeypatch.setattr(worker, 'REASONING_EFFORT', settings['reasoning_effort'])
+def fake_review_api_key(monkeypatch, retained_deepseek_cli):
     monkeypatch.setenv("OA_REVIEW_API_KEY", "offline-fake-key")
-
-
-@pytest.fixture(autouse=True)
-def selected_deepseek_cli(monkeypatch):
-    # These tests exercise the retained API/CLI transport explicitly.
-    monkeypatch.setenv('OA_REVIEW_PROVIDER', 'deepseek')
-    monkeypatch.setenv('OA_REVIEW_TRANSPORT', 'cli')
-    profile = worker.production_config.review_settings('deepseek', transport='cli')
-    monkeypatch.setattr(worker, 'REVIEW_SETTINGS', profile)
-    monkeypatch.setattr(worker, 'MODEL', profile['model'])
-    monkeypatch.setattr(worker, 'REASONING_EFFORT', profile['reasoning_effort'])

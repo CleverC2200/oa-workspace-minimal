@@ -8,11 +8,21 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   quality:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
     timeout-minutes: 20
     steps:
+      - name: Record CI step start
+        run: echo "OA_CI_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -23,37 +33,73 @@ jobs:
           cache-dependency-path: requirements-dev.txt
       - run: python -m pip install --requirement requirements-dev.txt
       - name: Native local environment contract
+        if: matrix.shard == 0
         run: python -m scripts.quality environment
       - name: Production review configuration contract
+        if: matrix.shard == 0
         run: python -m scripts.quality production-config
       - name: Skill validation
+        if: matrix.shard == 0
         run: python -m scripts.quality skill
       - name: Payment relationship rule ownership
+        if: matrix.shard == 0
         run: python -m scripts.quality payment-rules
       - name: Text format
+        if: matrix.shard == 0
         run: python -m scripts.quality format
       - name: Sensitive files and secrets
+        if: matrix.shard == 0
         run: python -m scripts.quality hygiene
       - name: Markdown links
+        if: matrix.shard == 0
         run: python -m scripts.quality links
       - name: YAML and issue forms
+        if: matrix.shard == 0
         run: python -m scripts.quality yaml
       - name: Generated review schemas
+        if: matrix.shard == 0
         run: python -m scripts.quality schema
       - name: Python critical lint
+        if: matrix.shard == 0
         run: python -m scripts.quality lint
+      - name: Unique test definitions
+        if: matrix.shard == 0
+        run: python -m scripts.quality test-names
       - name: PR contract
-        if: github.event_name == 'pull_request'
+        if: matrix.shard == 0 && github.event_name == 'pull_request'
         run: python -m scripts.quality pr --event "$GITHUB_EVENT_PATH"
       - name: Python syntax
+        if: matrix.shard == 0
         run: python -m compileall -q apps scripts tests
-      - name: Offline unit and golden replay tests
-        run: python -m pytest -v -x --tb=short
+      - name: Independent full test collection
+        run: python -m pytest -q --collect-only -p scripts.pytest_evidence --ci-evidence-file="$RUNNER_TEMP/collection.json"
+      - name: Full offline tests with balanced workers
+        run: >-
+          python -m pytest -q --tb=short -n 4 --dist worksteal --max-worker-restart 0
+          --ci-shard=${{ matrix.shard }}
+          -p scripts.pytest_evidence --ci-expected-file="$RUNNER_TEMP/collection.json"
+          --ci-evidence-file="$RUNNER_TEMP/execution.json" --ci-budget-seconds=170
+          --junitxml="$RUNNER_TEMP/offline-tests.xml" --durations=20
+      - name: Preserve collection, coverage and timing evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-test-evidence-${{ matrix.shard }}
+          path: |
+            ${{ runner.temp }}/collection.json
+            ${{ runner.temp }}/execution.json
+            ${{ runner.temp }}/offline-tests.xml
+          if-no-files-found: warn
 
   macos-stop-recovery:
     runs-on: macos-latest
     timeout-minutes: 10
     steps:
+      - name: Record CI step start
+        run: |
+          oa_ci_started_at=$(date +%s)
+          echo "OA_CI_STARTED_AT=$oa_ci_started_at" >> "$GITHUB_ENV"
+          echo "$oa_ci_started_at" > "$RUNNER_TEMP/stop-recovery-started-at.txt"
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
@@ -66,6 +112,7 @@ jobs:
           python -m pytest -q --tb=short --junitxml="$RUNNER_TEMP/stop-recovery.xml" tests/finance_preaudit/test_manual_stop_recovery.py
           python - <<'PY'
           import os
+          import time
           from pathlib import Path
           from xml.etree import ElementTree
 
@@ -74,5 +121,46 @@ jobs:
           skipped = [case.get('name') for case in cases if case.find('skipped') is not None]
           if not cases or skipped:
               raise SystemExit(f'stop_recovery_tests_incomplete: skipped={skipped}')
+          elapsed = time.time() - float(os.environ['OA_CI_STARTED_AT'])
+          if not 0 <= elapsed <= 170:
+              raise SystemExit(f'ci_time_budget_exceeded: {elapsed:.2f}s')
           print(f'Stop recovery: {len(cases)} tests, no skips')
           PY
+      - name: Preserve macOS stop recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-stop-recovery-evidence
+          path: |
+            ${{ runner.temp }}/stop-recovery.xml
+            ${{ runner.temp }}/stop-recovery-started-at.txt
+          if-no-files-found: warn
+
+  quality-complete:
+    needs: [quality, macos-stop-recovery]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install pytest==9.1.1
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*evidence*'
+          path: ${{ runner.temp }}/evidence
+      - name: Verify complete coverage and total CI budget
+        env:
+          OA_CI_REQUIRED_RESULTS: ${{ toJSON(needs) }}
+        run: >-
+          python -m scripts.pytest_evidence --merge-directory="$RUNNER_TEMP/evidence"
+          --output="$RUNNER_TEMP/full-ci.json" --budget-seconds=170
+      - name: Preserve complete CI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: complete-ci-evidence
+          path: ${{ runner.temp }}/full-ci.json
+          if-no-files-found: warn

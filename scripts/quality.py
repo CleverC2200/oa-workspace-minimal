@@ -75,6 +75,37 @@ def check_skill(path: Path = SKILL_PATH) -> list[str]:
     return []
 
 
+def check_test_names(paths: Iterable[Path]) -> list[str]:
+    """Reject test definitions hidden by a later definition in the same scope."""
+    findings = []
+    for path in paths:
+        if not path.name.startswith('test_') or path.suffix != '.py':
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding='utf-8'))
+        except (OSError, UnicodeError, SyntaxError):
+            findings.append(f'test_source_invalid:{path.name}')
+            continue
+        scopes = [(tree.body, '')]
+        while scopes:
+            body, scope = scopes.pop()
+            names = set()
+            pending = list(body)
+            while pending:
+                node = pending.pop()
+                if isinstance(node, ast.ClassDef):
+                    scopes.append((node.body, scope + node.name + '.'))
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if node.name.startswith('test_'):
+                        if node.name in names:
+                            findings.append(f'duplicate_test_name:{path.name}:{scope}{node.name}')
+                        names.add(node.name)
+                else:
+                    # Control blocks retain their enclosing Python scope.
+                    pending.extend(ast.iter_child_nodes(node))
+    return sorted(findings)
+
+
 def check_payment_rule_ownership(
     path: Path = PROJECT_ROOT / 'apps/oa_finance_preaudit/codex_review_worker.py',
 ) -> list[str]:
@@ -299,12 +330,14 @@ def _event_body(path: Path) -> object:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="repository-quality")
-    parser.add_argument("check", choices=("skill", "hygiene", "format", "links", "pr", "yaml", "schema", "lint", "environment", "production-config", "payment-rules"))
+    parser.add_argument("check", choices=("skill", "hygiene", "format", "links", "pr", "yaml", "schema", "lint", "environment", "production-config", "payment-rules", "test-names"))
     parser.add_argument("--event", type=Path)
     args = parser.parse_args(argv)
     files = tracked_files()
     if args.check == "skill":
         findings = check_skill()
+    elif args.check == 'test-names':
+        findings = check_test_names(files)
     elif args.check == 'payment-rules':
         findings = check_payment_rule_ownership()
     elif args.check == "hygiene":

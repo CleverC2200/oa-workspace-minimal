@@ -4,7 +4,44 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from scripts import quality
+
+
+@pytest.mark.parametrize('source,scope', [
+    ('def test_stop(): pass\ndef test_stop(): pass\n', 'test_stop'),
+    ('class TestStop:\n def test_stop(self): pass\n def test_stop(self): pass\n', 'TestStop.test_stop'),
+])
+def test_test_names_reject_shadowed_discovered_tests(tmp_path, monkeypatch, capsys, source, scope):
+    path = tmp_path / 'test_stop.py'
+    path.write_text(source)
+    monkeypatch.setattr(quality, 'tracked_files', lambda: [path])
+    assert quality.main(['test-names']) == 1
+    assert f'duplicate_test_name:test_stop.py:{scope}' in capsys.readouterr().out
+
+
+def test_test_names_accept_fixture_imports_and_separate_scopes(tmp_path):
+    path = tmp_path / 'test_stop.py'
+    path.write_text('from shared import exchange\n'
+                    'def test_stop(exchange): pass\n'
+                    'class TestA:\n def test_stop(self): pass\n'
+                    'class TestB:\n def test_stop(self): pass\n')
+    assert quality.check_test_names([path]) == []
+
+
+def test_test_names_reject_definition_hidden_inside_control_block(tmp_path, monkeypatch, capsys):
+    path = tmp_path / 'test_stop.py'
+    path.write_text('def test_stop(): pass\nif True:\n    def test_stop(): pass\n')
+    monkeypatch.setattr(quality, 'tracked_files', lambda: [path])
+    assert quality.main(['test-names']) == 1
+    assert 'duplicate_test_name:test_stop.py:test_stop' in capsys.readouterr().out
+
+
+def test_test_names_reject_invalid_source_without_importing_it(tmp_path):
+    path = tmp_path / 'test_stop.py'
+    path.write_text('def test_stop(:\n')
+    assert quality.check_test_names([path]) == ['test_source_invalid:test_stop.py']
 
 
 def test_payment_rule_ownership_rejects_real_pr405_worker_instruction(tmp_path):
