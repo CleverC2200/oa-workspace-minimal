@@ -9,7 +9,7 @@ import pytest
 
 from apps.oa_finance_preaudit import packaging_review as packaging, host_chat_review as host, controller_handoff
 from tests.finance_preaudit.test_packaging_review import action, draft
-from tests.finance_preaudit.test_host_chat_review import exchange, native_call, seal_execution, draft_source
+from tests.finance_preaudit.test_host_chat_review import exchange, native_call, seal_execution, draft_source, wait_request
 
 
 def page_refs(path):
@@ -87,10 +87,7 @@ def test_current_observed_app_draft_preserves_business_fields_without_cli(packag
     results = []
     thread = threading.Thread(target=lambda: results.append(packaging.review(path, project_root=root, timeout_seconds=60)))
     thread.start()
-    request = path.with_name('packaging-draft-host-review-request.json')
-    deadline = time.monotonic()+3
-    while not request.exists() and time.monotonic() < deadline and thread.is_alive():
-        time.sleep(.01)
+    request = wait_request(path, owner, kind='packaging_draft')
     assert request.exists()
     parent = child.with_name('parent.jsonl')
     line = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(request)}, 'dispatch-package', {})
@@ -114,10 +111,7 @@ def ready_draft(package_round, *, recheck=False, uncertain=False):
     results = []
     thread = threading.Thread(target=lambda: results.append(packaging.review(path, project_root=root, timeout_seconds=60)))
     thread.start()
-    request = path.with_name('packaging-draft-host-review-request.json')
-    deadline = time.monotonic()+3
-    while not request.exists() and time.monotonic() < deadline:
-        time.sleep(.01)
+    request = wait_request(path, owner, kind='packaging_draft')
     parent = child.with_name('parent.jsonl')
     line = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(request)}, 'dispatch-package', {})
     host.assign(request, slot=0, owner=owner, source=parent, source_line=line)

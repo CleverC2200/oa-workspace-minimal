@@ -22,14 +22,14 @@ status_dir=$(mktemp -d /tmp/oa-status.XXXXXX) &&
 生产审核固定 3 槽，OpenAI 每轮只创建 3 个 App 子 Agent 并复用对话，DeepSeek 沿用独立 API key 的 CLI 工具承载；不能弹性扩容；材料准备和全局 Writer 均为 1。门禁通过后只调用一次：
 
 ```bash
-.venv/bin/python -m scripts.finance_preaudit_run --owner-task-id <当前任务真实UUID> --review-provider openai --review-transport host_chat -- --rolling --fixed-capacity --capacity 3 --max-capacity 3 --confirm-write YES --recover-confirmed-no-write-once YES --workflow travel_expense --workflow business_entertainment --workflow business_support_fee --workflow small_marketing_fee --workflow tpm_small_marketing_fee --workflow general_expense
+.venv/bin/python -m scripts.finance_preaudit_run --owner-task-id <当前任务真实UUID> --review-provider openai --review-transport host_chat -- --rolling --fixed-capacity --capacity 3 --max-capacity 3 --confirm-write YES --confirm-alerts YES --recover-confirmed-no-write-once YES --workflow travel_expense --workflow business_entertainment --workflow business_support_fee --workflow small_marketing_fee --workflow tpm_small_marketing_fee --workflow general_expense
 ```
 
-上述参数选择本轮 OpenAI App 审核。用户要求某轮改用 DeepSeek 时，同时把 `--review-provider` 改为 `deepseek`、`--review-transport` 改为 `cli`；审核型号与推理由现行供应商配置成对选择，原门禁继续有效。每轮回执记录实际配置，不改历史证据。不在原控制器未退出时发起另一个供应商的控制器。后续独立包装调用通过 `OA_REVIEW_PROVIDER` 沿用该轮选择，具体见[执行回执](../agents/controller-execution.md)。
+上述参数选择本轮 OpenAI App 审核；其中 `--confirm-alerts YES` 只适用于本轮明确授权自动告警的调度任务。手动单轮无告警授权时省略此参数或显式传 `NO`，按[执行回执](../agents/controller-execution.md)保留本地失败及历史告警窗口。用户要求某轮改用 DeepSeek 时，同时把 `--review-provider` 改为 `deepseek`、`--review-transport` 改为 `cli`；审核型号与推理由现行供应商配置成对选择，原门禁继续有效。每轮回执记录实际配置，不改历史证据。不在原控制器未退出时发起另一个供应商的控制器。后续独立包装调用通过 `OA_REVIEW_PROVIDER` 沿用该轮选择，具体见[执行回执](../agents/controller-execution.md)。
 
 ### 原运行监视
 
-OpenAI 原控制器启动后立即执行[固定 App 审核槽原生派单](../agents/controller-execution.md#固定-app-审核槽的原生派单)。主对话创建并登记本轮恰好 3 个原 Agent，逐单 `followup_task` 复用；在 30 秒以内续父任务心跳，读取原执行回执和本轮 pending，先真实派单再 assign。子 Agent 的完成只表示审核返回，Writer 仍串行提交。保持原 session 的等待与派单同时推进，不等控制器退出才处理请求。身份不能替换，不递归创建审核者，不回退 OpenAI CLI。
+OpenAI 原控制器启动后立即执行[固定 App 审核槽原生派单](../agents/controller-execution.md#固定-app-审核槽的原生派单)。主对话创建并登记本轮恰好 3 个原 Agent，注册成功后按执行回执入口独立续首次父心跳，再读 pending；逐单 `followup_task` 复用；在 30 秒以内续父任务心跳，读取原执行回执和本轮 pending，先真实派单再 assign。子 Agent 的完成只表示审核返回，Writer 仍串行提交。保持原 session 的等待与派单同时推进，不等控制器退出才处理请求。身份不能替换，不递归创建审核者，不回退 OpenAI CLI。
 
 入口在开始本轮审核及启动任何 DeepSeek CLI 前读取审批冷却记录以及审批 run/instance、PID 启动时间、进程组和心跳。可信正常活动的上一轮返回 `approval_startup_gate/skipped`，本轮不叠加控制器。45 秒以上没有可信心跳只返回 blocked，不以静默判断卡死；明确阶段超时或已失去原控制器且进程归属仍可信时，只收尾登记的审批只读进程。登记不完整、PID 被复用、进程组回收未知或 Writer 活动均阻断，不猜 PID、不批量杀 Codex。旧版本缺少归属登记时，即使传入人工确认回收参数，也不能绕过此启动门。发起前未登记成功的 CLI 槽位保持占用，须人工核验。
 

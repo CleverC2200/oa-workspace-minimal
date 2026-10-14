@@ -447,12 +447,13 @@ def enter_packaging(*, owner: str, receipt_file: Path | None = None, invocation_
     return {'phase': value['phase'], 'state': value['state'], 'reviewers': value['reviewers']}
 
 
-def _request_file(action: Path, kind: str) -> Path:
-    return action.with_name(REQUEST if kind == 'finance' else kind.replace('_', '-') + '-' + REQUEST)
+def _request_file(action: Path, kind: str, *, owner: str) -> Path:
+    UUID(owner)
+    return action.with_name(owner + '-' + kind.replace('_', '-') + '-' + REQUEST)
 
 
 def _submission_file(request_file: Path) -> Path:
-    return request_file.with_name(request_file.name.replace('request.json', 'submission.json'))
+    return request_file.with_name(request_file.name.replace(REQUEST, SUBMISSION))
 
 def pending(*, owner: str | None = None, manifest: dict | None = None) -> list[dict]:
     """Observe only requests listed in the current controller's bound progress."""
@@ -470,17 +471,16 @@ def pending(*, owner: str | None = None, manifest: dict | None = None) -> list[d
     if registered['run_id'] != current['run_id'] or registered['controller_instance_id'] != current['controller_instance_id']:
         return []
     progress = approval_lifecycle._progress(current)
-    if registered['phase'] == 'finance':
-        if progress is None:
-            return []
-        paths = [Path(action_file).with_name(REQUEST) for action_file in progress['actions']]
-    else:
-        paths = [Path(item['request_file']) for item in registered.get('requests', {}).values()]
+    if registered['phase'] == 'finance' and progress is None:
+        return []
+    paths = [Path(item['request_file']) for item in registered.get('requests', {}).values()]
     results = []
     for request_file in paths:
         if not os.path.lexists(request_file):
             continue
         raw, request = _read(request_file)
+        if registered['phase'] == 'finance' and request.get('action_file') not in progress['actions']:
+            continue
         try:
             _live(request, Path(request['action_file']), owner=owner)
         except (OSError, RuntimeError, ValueError, KeyError, TypeError):
@@ -625,6 +625,11 @@ def publish(action: Path, *, prompt: str, timeout_seconds: int, kind: str = 'fin
             raise ValueError('host_review_bootstrap_failed')
         time.sleep(.2)
     registered = _registry(owner)
+    while registered.get('heartbeat_source') is None:
+        if time.time() >= started_at + timeout_seconds:
+            raise ValueError('host_review_bootstrap_failed')
+        time.sleep(.2)
+        registered = _registry(owner)
     manifest = controller_handoff._read_manifest()
     if manifest is None:
         raise ValueError('host_review_run_untrusted')
@@ -636,7 +641,7 @@ def publish(action: Path, *, prompt: str, timeout_seconds: int, kind: str = 'fin
                'review_configuration': dict(IDENTITY), 'created_at': started_at,
                'expires_at': started_at + timeout_seconds, 'prompt': prompt, 'review_context': review_context or {}}
     _live(request, action, owner=owner)
-    request_file = _request_file(action, kind)
+    request_file = _request_file(action, kind, owner=owner)
     request['prompt'] += (
         '\n保存 model JSON 必须调用专用 write-draft 接口，不使用通用文件写入或已有文件。\n'
         f'用 {MODULE}.draft_command(Path({str(request_file)!r}), Path(新的私有决定文件绝对路径), '
@@ -743,7 +748,7 @@ def publish_draft(request_file: Path, decision_file: Path, payload: dict, *, own
     request_file, decision_file = request_file.absolute(), decision_file.absolute()
     raw, request = _read(request_file)
     _live(request, Path(request['action_file']), owner=owner)
-    if request_file != _request_file(Path(request['action_file']), request['review_kind']) or not isinstance(payload, dict):
+    if request_file != _request_file(Path(request['action_file']), request['review_kind'], owner=owner) or not isinstance(payload, dict):
         raise ValueError('host_review_draft_invalid')
     with runtime_control.stop_control_lease():
         _live(request, Path(request['action_file']), owner=owner)
@@ -856,7 +861,7 @@ def submit(request_file: Path, decision_file: Path, *, owner: str, source: Path,
     request_file, decision_file = request_file.absolute(), decision_file.absolute()
     raw, request = _read(request_file)
     action = Path(request['action_file'])
-    if request_file != _request_file(action, request['review_kind']) or not action.is_relative_to(runtime_control.PROJECT_ROOT / 'runtime/finance_preaudit_flows'):
+    if request_file != _request_file(action, request['review_kind'], owner=owner) or not action.is_relative_to(runtime_control.PROJECT_ROOT / 'runtime/finance_preaudit_flows'):
         raise ValueError('host_review_request_untrusted')
     _live(request, action, owner=owner)
     with _round_lease(owner) as path:
@@ -904,13 +909,15 @@ def complete(action: Path, reviewed: dict, *, completer=None) -> dict:
         if any(reviewed.get(key) != value for key, value in IDENTITY.items()):
             raise ValueError('host_review_result_untrusted')
         proof = reviewed['host_receipt']
-        request_file, submission_file = action.with_name(REQUEST), action.with_name(SUBMISSION)
+        owner = os.environ.get(guard.OWNER_ENV)
+        request_file = _request_file(action, 'finance', owner=owner)
+        submission_file = _submission_file(request_file)
         request_raw, request = _read(request_file)
         submission_raw, submitted = _read(submission_file)
         if proof != {'request_file': str(request_file), 'request_sha256': hashlib.sha256(request_raw).hexdigest(),
                      'submission_file': str(submission_file), 'submission_sha256': hashlib.sha256(submission_raw).hexdigest()}:
             raise ValueError('host_review_result_untrusted')
-        _live(request, action)
+        _live(request, action, owner=owner)
         if submitted['decision'] != reviewed['decision'] or submitted['request_sha256'] != proof['request_sha256']:
             raise ValueError('host_review_result_untrusted')
         _, submitted = _submission(request_file, request)

@@ -331,11 +331,14 @@ def clear_alert(
 def alert_from_environment(
     error_code: str,
     *,
+    authorized: bool = False,
     failure_detail_code: str | None = None,
     control_root: Path = Path("runtime/control"),
     live_status_provider: Callable[[], dict] | None = None,
 ) -> dict[str, str | int]:
     code = _alert_error_code(error_code, failure_detail_code)
+    if authorized is not True:
+        return _public_receipt(code, "not_authorized")
     if code in SESSION_ERROR_CODES:
         try:
             (live_status_provider or _live_status)()
@@ -468,6 +471,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             receipt = alert_from_environment(
                 error_code,
+                authorized=True,
                 control_root=args.control_root,
             )
     except (RuntimeError, ValueError):

@@ -4119,6 +4119,38 @@ def test_rolling_rejects_invalid_ceiling_before_acquiring_controller_lease(tmp_p
     assert not lock_file.exists()
 
 
+@pytest.mark.parametrize('raises', [False, True])
+@pytest.mark.parametrize('authorization', [None, 'NO', 'YES'])
+def test_production_cli_alerts_only_with_explicit_round_authorization(tmp_path, monkeypatch, capsys, raises, authorization):
+    probe = finance_preaudit_concurrency_probe
+    def fail(**_kwargs):
+        if raises:
+            raise RuntimeError('production_reconciliation_blocked')
+        return {'status': 'failed', 'error_counts': {'host_review_exchange_failed': 1}}
+    monkeypatch.setattr(probe, 'run_rolling_drain', fail)
+    sends = []
+    monkeypatch.setattr(probe.session_alert, 'send_message', lambda *_a, **_k: sends.append('sent'))
+    monkeypatch.setattr(probe.session_alert.auth, 'load_local_env', lambda: None)
+    monkeypatch.setenv('OA_FEISHU_ALERT_CHAT_ID', 'oc_offline')
+    original_alert = probe.session_alert.alert_from_environment
+    monkeypatch.setattr(probe.session_alert, 'alert_from_environment', lambda code, **kwargs: original_alert(
+        code, control_root=tmp_path / 'control', **kwargs))
+    options = [] if authorization is None else ['--confirm-alerts', authorization]
+    assert probe.main(['--rolling', '--capacity', '3', '--confirm-write', 'YES', *options]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['notification']['delivery_state'] == ('sent' if authorization == 'YES' else 'not_authorized')
+    assert sends == (['sent'] if authorization == 'YES' else [])
+    assert (tmp_path / 'alerts' / 'oa-session-alert.json').exists() == (authorization == 'YES')
+
+
+def test_production_cli_completed_without_alert_authorization_keeps_existing_window(monkeypatch, capsys):
+    probe = finance_preaudit_concurrency_probe
+    monkeypatch.setattr(probe, 'run_rolling_drain', lambda **_: {'status': 'completed', 'error_counts': {}})
+    monkeypatch.setattr(probe.session_alert, 'clear_active_alert', lambda **_: pytest.fail('unauthorized window clear'))
+    assert probe.main(['--rolling', '--capacity', '3', '--confirm-write', 'YES']) == 0
+    assert 'notification_reset' not in json.loads(capsys.readouterr().out)
+
+
 def test_production_cli_alerts_on_session_failure_without_masking_it(
     monkeypatch,
     capsys,
@@ -4134,7 +4166,7 @@ def test_production_cli_alerts_on_session_failure_without_masking_it(
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.session_alert,
         "alert_from_environment",
-        lambda code: alerts.append(code)
+        lambda code, **_kwargs: alerts.append(code)
         or {
             "schema_version": 1,
             "kind": "oa_session_alert_receipt",
@@ -4144,7 +4176,7 @@ def test_production_cli_alerts_on_session_failure_without_masking_it(
     )
 
     assert finance_preaudit_concurrency_probe.main(
-        ["--capacity", "3", "--confirm-write", "YES"]
+        ["--confirm-alerts", "YES", "--capacity", "3", "--confirm-write", "YES"]
     ) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["error_code"] == "oa_session_expired"
@@ -4169,7 +4201,7 @@ def test_production_cli_alerts_on_pipeline_session_failure_without_clearing(
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.session_alert,
         "alert_from_environment",
-        lambda code: alerts.append(code)
+        lambda code, **_kwargs: alerts.append(code)
         or {
             "schema_version": 1,
             "kind": "oa_session_alert_receipt",
@@ -4184,7 +4216,7 @@ def test_production_cli_alerts_on_pipeline_session_failure_without_clearing(
     )
 
     assert finance_preaudit_concurrency_probe.main(
-        ["--capacity", "3", "--confirm-write", "YES"]
+        ["--confirm-alerts", "YES", "--capacity", "3", "--confirm-write", "YES"]
     ) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["error_counts"] == {"oa_session_expired": 1}
@@ -4211,12 +4243,12 @@ def test_production_cli_alerts_only_on_current_failures(
     monkeypatch.setattr(probe, "run_rolling_drain", lambda **kw: {
         "status": status, "error_counts": error_counts, "quarantined_pending": 1,
     })
-    monkeypatch.setattr(probe.session_alert, "alert_from_environment", lambda code: (
+    monkeypatch.setattr(probe.session_alert, "alert_from_environment", lambda code, **_kwargs: (
         alerts.append(code) or {"error_code": code, "delivery_state": "sent"}
     ))
     monkeypatch.setattr(probe.session_alert, "clear_active_alert", lambda **kw: clears.append(kw))
 
-    exit_code = probe.main(["--rolling", "--capacity", "3", "--confirm-write", "YES"])
+    exit_code = probe.main(["--confirm-alerts", "YES", "--rolling", "--capacity", "3", "--confirm-write", "YES"])
     payload = json.loads(capsys.readouterr().out)
     assert exit_code == (1 if status == "failed" else 0)
     assert payload["status"] == status
@@ -4250,7 +4282,7 @@ def test_production_cli_finds_session_failure_in_exception_chain(
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.session_alert,
         "alert_from_environment",
-        lambda code: alerts.append(code)
+        lambda code, **_kwargs: alerts.append(code)
         or {
             "schema_version": 1,
             "kind": "oa_session_alert_receipt",
@@ -4260,7 +4292,7 @@ def test_production_cli_finds_session_failure_in_exception_chain(
     )
 
     assert finance_preaudit_concurrency_probe.main(
-        ["--capacity", "3", "--confirm-write", "YES"]
+        ["--confirm-alerts", "YES", "--capacity", "3", "--confirm-write", "YES"]
     ) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["error_code"] == "rpa_cdp_timeout"
@@ -4304,11 +4336,11 @@ def test_production_cli_preserves_known_error_prefix_with_detail(
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.session_alert,
         "alert_from_environment",
-        lambda code: alerts.append(code) or {"error_code": code},
+        lambda code, **_kwargs: alerts.append(code) or {"error_code": code},
     )
 
     assert finance_preaudit_concurrency_probe.main(
-        ["--capacity", "3", "--confirm-write", "YES"]
+        ["--confirm-alerts", "YES", "--capacity", "3", "--confirm-write", "YES"]
     ) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["error_code"] == "production_reconciliation_blocked"
@@ -4336,7 +4368,7 @@ def test_production_cli_does_not_mask_success_when_alert_reset_is_unknown(
     )
 
     assert finance_preaudit_concurrency_probe.main(
-        ["--capacity", "3", "--confirm-write", "YES"]
+        ["--capacity", "3", "--confirm-write", "YES", "--confirm-alerts", "YES"]
     ) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "completed"
@@ -8018,7 +8050,7 @@ def test_controller_current_failures_notify_without_session_failure(tmp_path, mo
     monkeypatch.setenv("OA_FEISHU_ALERT_CHAT_ID", "oc_recorded")
     monkeypatch.setattr(session_alert, "_live_status", lambda: {"status": "ok"})
     monkeypatch.setattr(session_alert, "send_message", lambda *args, **kwargs: sent.append(args))
-    finance_preaudit_concurrency_probe.main(["--capacity", "3", "--confirm-write", "YES"])
+    finance_preaudit_concurrency_probe.main(["--capacity", "3", "--confirm-write", "YES", "--confirm-alerts", "YES"])
     payload = json.loads(capsys.readouterr().out)
     assert payload["notification"]["delivery_state"] == "sent"
     assert len(sent) == 1
