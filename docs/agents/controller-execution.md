@@ -24,6 +24,10 @@
 
 ## 固定 App 审核槽的原生派单
 
+新财务 App 请求的审核预算为 1800 秒，进程 watchdog 使用同一预算加 60 秒回收余量；保留的 CLI 审核仍为 900 秒。注册 bootstrap 900 秒、父心跳 300 秒、准备 300 秒及领取窗口不变。预算只作用于新请求，不延长已经发布的 `expires_at`。期限到期仍停止交换，不能接收迟到决定。
+
+App 等待异常保留主码 `host_review_exchange_failed`，并返回安全的 `failure_detail_code`、异常类型及 `failure_recorded`。可信已登记请求的首错保存在本轮私有 registry 的 `first_failure`，绑定请求路径和 SHA-256；后续关闭或停止错误不覆盖它。未发布或无法安全留证时明确 `failure_recorded=false`，不保存任意异常正文。历史无细码的轮次保持未知，不追溯补造。
+
 本节只适用于 OpenAI `host_chat`。唯一滚动控制器启动一次后，主对话创建恰好 3 个原生 `collaboration.spawn_agent`，保留其真实 Agent 路径、子会话 UUID 和成功工具回执。每个 Agent 一次只审核一单，返回结果后空闲；下一单调用同一 Agent 的 `followup_task`，本轮不替换身份、不递归创建审核者。DeepSeek 不执行本节。
 
 用户明确要求在当前聊天另建审批监督子 Agent 时，该监督者以自己的真实原生会话 UUID 拥有新轮次，并创建三个直属审核者。登记以可信监督者的原生祖先深度加一核验直属关系，同时核对精确 parent_thread_id、Agent 路径和实际 spawn 回执；不把整个任务树的绝对 depth=1 当成所有轮次的要求。根聊天监督的审核者仍须 depth=1；跳级、同级及损坏祖先拒绝。旧轮拥有者和固定审核槽不重新绑定。
