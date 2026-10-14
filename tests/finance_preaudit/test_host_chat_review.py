@@ -139,6 +139,68 @@ def draft_source(source, request_file, target, owner, *, call_id='actual-host-ca
     return native_call(source, 'functions.exec', code, call_id, {'exit_code': 0, 'output': json.dumps(receipt) + '\n'})
 
 
+def test_result_read_waits_for_submission_registry_commit(exchange, monkeypatch):
+    """The submission file alone is not a complete publication."""
+    action, draft, owner, child, *_ = exchange
+    request = host.publish(action, prompt='Read current frozen material.', timeout_seconds=60)
+    parent = child.with_name('parent.jsonl')
+    dispatch = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(request)}, 'dispatch', {})
+    host.assign(request, slot=0, owner=owner, source=parent, source_line=dispatch)
+    line = draft_source(child, request, draft, owner)
+    published, release, reading, finished = (threading.Event() for _ in range(4))
+    original_write = host.guard.write
+    original_exists = host.os.path.lexists
+    observed = threading.Event()
+    writes, reads = [], []
+
+    def paused_commit(path, value):
+        if path == host.registry_file(owner) and any(
+                assignment['state'] == 'submitted' for assignment in value.get('assignments', {}).values()):
+            published.set()
+            assert release.wait(3), 'Test did not release the publication'
+        return original_write(path, value)
+
+    def observe_submission(path):
+        exists = original_exists(path)
+        if Path(path) == host._submission_file(request) and exists:
+            observed.set()
+        return exists
+
+    def submit():
+        try:
+            writes.append(host.submit(request, draft, owner=owner, source=child, source_line=line))
+        except Exception as error:
+            writes.append(error)
+
+    def read():
+        reading.set()
+        try:
+            reads.append(host.await_result(request))
+        except Exception as error:
+            reads.append(error)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(host.guard, 'write', paused_commit)
+    monkeypatch.setattr(host.os.path, 'lexists', observe_submission)
+    writer = threading.Thread(target=submit)
+    reader = threading.Thread(target=read)
+    writer.start()
+    try:
+        assert published.wait(3)
+        reader.start()
+        assert reading.wait(3) and observed.wait(3)
+        finished.wait(.1)
+    finally:
+        release.set()
+        writer.join(3)
+        if reader.ident is not None:
+            reader.join(3)
+    assert not writer.is_alive() and not reader.is_alive()
+    assert writes[0]['status'] == 'published'
+    assert reads[0]['status'] == 'reviewed'
+
+
 @pytest.mark.parametrize('directory', ['same_project', 'other_project', 'relative_project', 'extra_argument'])
 def test_native_publication_allows_only_the_current_project_workdir(exchange, directory):
     action, draft, owner, child, *_ = exchange
