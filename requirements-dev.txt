@@ -7,3 +7,4 @@ pytest==9.1.1
 jsonschema==4.25.1
 PyYAML==6.0.3
 ruff==0.13.2
+uv==0.11.6

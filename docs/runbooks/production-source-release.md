@@ -45,13 +45,27 @@ python -m apps.oa_finance_preaudit.production_release \
 
 原执行参数来自原轮监督执行的私有回执和原工具 session；不创建替代 attempt，不使用汇总 JSON 或人工写入的终态。程序使用目标解释器及既有 `read_execution` 只读接口重新核验原 invocation、owner、tool session、manifest 和完整日志哈希。原轮必须确实 exited、终态及 children_reaped 可信，与仍保留的 rolling manifest 相符，原 controller 进程组也必须已退出。目标状态、当前授权及冻结校验的每个只读子进程必须终态并无遗留进程组；异常或取消时阻断，只清理本次入口启动的只读进程组，等待退出并核验组内无遗留进程后才返回原异常。回收无法确认时保留原异常及回收失败，不报告同步就绪。
 
-该模式只接受本用户持有、私有普通文件中的精确 `stop_requested:codex_review_technical_failure` 标记。手动停止、未知原因、Writer 未知写入停止、官方错误冷却停止及环境停止请求仍拒绝。实际原 cron 必须是 `$CODEX_HOME/automations/oa-skill/automation.toml`，未配置 CODEX_HOME 时使用 `~/.codex`；文件内 ID 必须为 `oa-skill` 且状态为 PAUSED，拒绝副本和链接替换。项目、调度、模型、提示词及并发合同仍须通过原配置门。源码、身份、授权、冻结、continuation 和 controller/global/request Writer 门禁均保持。
+未指定其他源码维护分支时，该模式只接受本用户持有、私有普通文件中的精确 `stop_requested:codex_review_technical_failure` 标记。手动停止、未知原因、Writer 未知写入停止、官方错误冷却停止及环境停止请求仍拒绝。实际原 cron 必须是 `$CODEX_HOME/automations/oa-skill/automation.toml`，未配置 CODEX_HOME 时使用 `~/.codex`；文件内 ID 必须为 `oa-skill` 且状态为 PAUSED，拒绝副本和链接替换。项目、调度、模型、提示词及并发合同仍须通过原配置门。源码、身份、授权、冻结、continuation 和 controller/global/request Writer 门禁均保持。
 
 同一维护租约内，在原执行回读、实时状态、配置检查和源码快进前后重复核验停止门与原 cron 的身份、权限、内容哈希；同内容替换文件也拒绝。程序不写这两个文件、不恢复调度、不清停止门、不调用审批模型、不提交 OA。成功回执记录 `stopped_controls_before/after`、`stop_preserved=true`、`automation_preserved=true`、`automation_state=PAUSED`，并明确 `next_process_ready=false`、`write_state=not_requested`、`production_acceptance=not_verified`。停止门继续阻断审批，即使源码已更新也不表示恢复资格。
 
 任一末尾检查失败，回执保留实际更新状态及新鲜的停止门和 cron 观测。文件不可信时明确 untrusted，调度无法核实时明确 unknown；不自动回滚、重试、改标记或恢复调度。
 
 各发布模式的成功回执均区分 `ready` 和 `synced`，记录更新前后 SHA、完整状态证据引用及 continuation，明确 `write_state=not_requested`、`production_acceptance=not_verified`。若快进尝试后的检查失败，API 和命令均返回 blocked、原细码、before_revision、after_revision、requested_revision，以及 source_sync_state=updated/not_updated/unknown；读取 HEAD 失败时明确 unknown。next_process_ready=false、production_acceptance=not_verified 保持，不能把失败当作未更新，也不能自动回滚、重试或提交。普通发布只有源码同步和末尾检查通过，下一轮新进程才具备加载条件；停机维护始终保持 next_process_ready=false。实际生产恢复仍须独立授权、该轮版本、运行及提交后查证据。
+
+## 人工停止后仅同步源码
+
+用户已明确授权保留人工停止安装源码时，在停机维护参数和原执行绑定之外追加：
+
+```bash
+  --user-stop-source-only YES
+```
+
+该选项必须与 `--stopped-maintenance YES` 同用，与 `--supervisor-loss-source-only`、`--official-stop-source-only` 互斥。默认技术停机分支继续拒绝人工停止；本分支只接受私有普通文件中的精确 `stop_requested\n`，原 cron 仍须 PAUSED。
+
+目标原执行读取器核验真实非零退出、failed 清单、children_reaped、`stop_requested_by_supervisor=true`、停止文件时间归属、原 owner/invocation/tool session、原监督者与 controller 及全部登记进程退出。`owner_process_lost` 保存实际值。当前只读 OA/web 身份、授权、冻结、continuation、配置和 Writer 门禁保持。原执行、停止文件、冷却及 cron 的身份和字节哈希在同步前后必须一致。
+
+本分支可保留活动官方冷却，因为只更新源码，不调用模型、不提交 OA、不清停止或冷却、不恢复审批。成功回执记录 `user_stop_source_only=true`、`original_wait_verified=true`、`original_evidence_preserved=true`、`approval_recovery_allowed=false`，且 `next_process_ready=false`。失败仍保留模式，原终态与证据保全无法确认时填 `unknown`，并报告源码实际是否已更新，不自动重试或回滚。恢复审批另走[人工停止后的显式恢复](owner-restart-recovery.md#人工停止后的显式恢复)，活动冷却仍会阻断恢复。
 
 ## 失去监督后仅同步源码
 

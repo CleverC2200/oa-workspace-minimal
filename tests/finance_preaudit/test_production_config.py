@@ -46,7 +46,7 @@ def test_native_automation_shape_preserves_project_and_schedule():
 @pytest.mark.parametrize("relative,before,after,code", [
     ("config/automations/oa-skill-prompt.txt", "--capacity 3", "--capacity 4", "production_config_capacity_drift:template"),
     ("config/automations/oa-skill-prompt.txt", "--max-capacity 3", "--max-capacity 12", "production_config_capacity_drift:template"),
-    ("docs/runbooks/hourly-production.md", "service_tier=default", "service_tier=priority", "production_config_service_tier_drift:runbook"),
+    ("docs/runbooks/hourly-production.md", "service_tier=unknown", "service_tier=priority", "production_config_service_tier_drift:runbook"),
     ("config/automations/oa-skill-prompt.txt", "--workflow general_expense", "--workflow packaging_layout_approval", "production_config_workflows_drift:template"),
     ("config/automations/oa-skill-prompt.txt", "--confirm-write YES", "--read-only", "production_config_command_invalid:template"),
     ("apps/oa_finance_preaudit/codex_review_worker.py", 'f\'model_reasoning_effort="{REASONING_EFFORT}"\'', '\'model_reasoning_effort="medium"\'', "production_config_native_settings_drift"),
@@ -78,8 +78,9 @@ def test_consistent_deepseek_template_cannot_override_the_codex_default(reposito
 
 def test_public_snapshot_matches_authorized_production_settings():
     assert production_config.snapshot() == {
-        "model": "gpt-6.1-sol", "reasoning_effort": "medium", "model_provider": "openai",
-        "requested_service_tier": "default", "initial_capacity": 3, "max_capacity": 3,
+        "provider": "openai", "transport": "host_chat",
+        "model": "host-current-chat", "reasoning_effort": "unknown", "model_provider": "openai",
+        "requested_service_tier": "unknown", "initial_capacity": 3, "max_capacity": 3,
         "workflows": ["travel_expense", "business_entertainment", "business_support_fee",
                       "small_marketing_fee", "tpm_small_marketing_fee", "general_expense"],
     }
@@ -122,3 +123,10 @@ def test_catalog_drift_blocks_production_configuration(repository, field, value)
     data["models"][0][field] = value
     path.write_text(json.dumps(data))
     assert "production_config_catalog_drift" in production_config.repository_findings(repository)
+
+
+def test_openai_cli_guard_cannot_be_replaced_with_a_different_failure(repository):
+    path = repository / 'apps/oa_finance_preaudit/codex_review_worker.py'
+    text = path.read_text().replace('openai_review_cli_forbidden', 'codex_process_failed')
+    path.write_text(text)
+    assert 'production_config_openai_cli_guard_drift' in production_config.repository_findings(repository)

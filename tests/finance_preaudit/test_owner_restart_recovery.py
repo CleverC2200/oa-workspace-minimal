@@ -21,7 +21,7 @@ from tests.finance_preaudit.test_production_release import git
 
 
 @pytest.fixture
-def restart_target(tmp_path, monkeypatch):
+def restart_target(tmp_path, monkeypatch, request):
     root = tmp_path / 'oa-workspace-minimal'
     root.mkdir()
     source = Path(maintenance_runtime.__file__).resolve().parents[2]
@@ -64,6 +64,8 @@ manifest['completed_at']=datetime.datetime.now(datetime.timezone.utc).isoformat(
 for file in (Path(os.environ['OA_CONTROLLER_EXECUTION_MANIFEST_FILE']),root/'runtime/control/rolling-controller-manifest.json'):
  guard.write(file,manifest)
 raise SystemExit(1)'''
+    if getattr(request, 'param', None) == 'user_stop':
+        child = child.replace("runtime_control.request_stop('codex_review_technical_failure')", "runtime_control.request_stop()")
     supervisor = '''import json,sys
 from pathlib import Path
 from scripts.finance_preaudit_run import supervise

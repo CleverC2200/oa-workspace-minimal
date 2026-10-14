@@ -1951,6 +1951,9 @@ def run_adaptive_read_only_probe(
 
 
 def _review_only(task: dict) -> dict:
+    from apps.oa_finance_preaudit import host_chat_review
+    if host_chat_review.selected():
+        return host_chat_review.review(task)
     return codex_review_worker.review(task)
 
 

@@ -130,8 +130,7 @@ def _read_manifest() -> dict | None:
     if isinstance(value, dict) and "review_configuration" in value:
         from . import production_config
         configuration = value["review_configuration"]
-        if (not isinstance(configuration, dict) or configuration.get("provider") not in {"deepseek", "openai"}
-                or configuration != production_config.review_settings(configuration["provider"])):
+        if (not production_config.valid_review_configuration(configuration)):
             raise ValueError("controller_handoff_untrusted")
         expected_fields.add("review_configuration")
     if (

@@ -100,11 +100,15 @@ def _pinned_control(path: Path, *, private: bool = True,
     return identity, raw
 
 
-def _stopped_controls(root: Path, automation: ProductionAutomation, *, official_stop_source_only: bool = False) -> tuple:
+def _stopped_controls(root: Path, automation: ProductionAutomation, *, official_stop_source_only: bool = False,
+                      user_stop_source_only: bool = False) -> tuple:
     if os.environ.get('OA_FINANCE_PREAUDIT_STOP_REQUESTED', '').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}:
         raise RuntimeError('production_release_stop_requested')
     stop = _pinned_control(root / 'runtime/stop-preaudit.flag')
-    expected_stop = (b'stop_requested:codex_official_error_cooldown\n' if official_stop_source_only
+    if official_stop_source_only and user_stop_source_only:
+        raise RuntimeError('production_release_source_only_modes_conflict')
+    expected_stop = (b'stop_requested\n' if user_stop_source_only else
+                     b'stop_requested:codex_official_error_cooldown\n' if official_stop_source_only
                      else b'stop_requested:codex_review_technical_failure\n')
     if stop[1] != expected_stop:
         raise RuntimeError('production_release_stop_not_repairable')
@@ -185,7 +189,7 @@ def _observed_revision(root: Path) -> str | None:
 def _failed_release(root: Path, before: str | None, expected: str, requested: bool, error: Exception,
                     *, stopped_maintenance: bool = False, automation: ProductionAutomation | None = None,
                     controls_before: dict | None = None, supervisor_loss_source_only: bool = False,
-                    official_stop_source_only: bool = False) -> dict:
+                    official_stop_source_only: bool = False, user_stop_source_only: bool = False) -> dict:
     after = _observed_revision(root)
     state = 'unknown' if before is None or after is None else ('not_updated' if after == before else 'updated')
     return {'schema_version': 1, 'kind': 'production_source_release', 'status': 'blocked',
@@ -200,6 +204,9 @@ def _failed_release(root: Path, before: str | None, expected: str, requested: bo
             **({'official_stop_source_only': True, 'original_wait_verified': 'unknown',
                 'approval_recovery_allowed': False, 'original_evidence_preserved': 'unknown'}
                 if official_stop_source_only else {}),
+            **({'user_stop_source_only': True, 'original_wait_verified': 'unknown',
+                'approval_recovery_allowed': False, 'original_evidence_preserved': 'unknown'}
+                if user_stop_source_only else {}),
             **(_stopped_receipt(root, automation, controls_before,
                 official_stop_source_only=official_stop_source_only) if stopped_maintenance else {})}
 
@@ -212,6 +219,7 @@ def release_source(
     stopped_maintenance: bool = False,
     supervisor_loss_source_only: bool = False,
     official_stop_source_only: bool = False,
+    user_stop_source_only: bool = False,
     original_execution: maintenance_runtime.OriginalExecution | None = None,
     check_original: Callable[[Path, maintenance_runtime.OriginalExecution], dict] | None = None,
 ) -> dict:
@@ -221,13 +229,13 @@ def release_source(
     adapters are for offline callers/tests; the CLI never accepts cached JSON.
     No OA write, stop mutation, automation change, fetch, dependency installation,
     or forced reset is performed. Fetch origin explicitly before calling.
-    stopped_maintenance retains one trusted technical stop and the original PAUSED
+    stopped_maintenance retains the selected trusted stop and the original PAUSED
     cron; it requires original execution readback and never makes approval ready.
     """
     root = Path(target_root).expanduser().absolute()
-    if (supervisor_loss_source_only or official_stop_source_only) and not stopped_maintenance:
+    if (supervisor_loss_source_only or official_stop_source_only or user_stop_source_only) and not stopped_maintenance:
         raise RuntimeError('production_release_stopped_maintenance_required')
-    if supervisor_loss_source_only and official_stop_source_only:
+    if sum((supervisor_loss_source_only, official_stop_source_only, user_stop_source_only)) > 1:
         raise RuntimeError('production_release_source_only_modes_conflict')
     if not _REVISION.fullmatch(expected_revision):
         raise RuntimeError('production_release_revision_invalid')
@@ -239,7 +247,8 @@ def release_source(
             raise RuntimeError('production_release_automation_required')
         if original_execution is None:
             raise RuntimeError('production_release_original_execution_required')
-        controls = _stopped_controls(root, automation, official_stop_source_only=official_stop_source_only)
+        controls = _stopped_controls(root, automation, official_stop_source_only=official_stop_source_only,
+                                     user_stop_source_only=user_stop_source_only)
         controls_before = {'stop': _control_proof(controls[0]), 'automation': _control_proof(controls[1]),
                            'automation_state': 'PAUSED'}
         if official_stop_source_only:
@@ -248,7 +257,8 @@ def release_source(
         _assert_no_stop(root)
     def assert_controls() -> None:
         if stopped_maintenance:
-            if _stopped_controls(root, automation, official_stop_source_only=official_stop_source_only) != controls:
+            if _stopped_controls(root, automation, official_stop_source_only=official_stop_source_only,
+                                     user_stop_source_only=user_stop_source_only) != controls:
                 raise RuntimeError('production_release_stopped_controls_changed')
         else:
             _assert_no_stop(root)
@@ -265,6 +275,7 @@ def release_source(
         raise RuntimeError('production_release_configuration_invalid:' + ','.join(findings))
     loss_proof = None
     official_proof = None
+    user_stop_proof = None
     live = check_live or (lambda target: maintenance_runtime.read_live_status(target,
         require_reaped=stopped_maintenance, source_only_proof=loss_proof, official_stop_proof=official_proof))
     manifest_file = root / 'runtime/control/rolling-controller-manifest.json'
@@ -275,6 +286,9 @@ def release_source(
     def original_readback() -> dict:
         if check_original is not None:
             report = check_original(root, original_execution)
+        elif user_stop_source_only:
+            from .owner_restart_recovery import _read_original
+            report = _read_original(root, original_execution, manifest, user_stop=True, source_only=True)
         else:
             report = maintenance_runtime.read_original_execution(root, original_execution,
                 supervisor_loss_source_only=supervisor_loss_source_only, official_stop_source_only=official_stop_source_only)
@@ -283,6 +297,8 @@ def release_source(
         if loss_proof is not None and report.get('source_only_proof') != loss_proof:
             raise RuntimeError('production_release_original_evidence_changed')
         if official_proof is not None and report.get('official_stop_proof') != official_proof:
+            raise RuntimeError('production_release_original_evidence_changed')
+        if user_stop_proof is not None and report.get('owner_restart_proof') != user_stop_proof:
             raise RuntimeError('production_release_original_evidence_changed')
         return report
     try:
@@ -294,6 +310,8 @@ def release_source(
                     loss_proof = report['source_only_proof']
                 if official_stop_source_only:
                     official_proof = report['official_stop_proof']
+                if user_stop_source_only:
+                    user_stop_proof = report['owner_restart_proof']
             snapshot = live(root)
             maintenance_runtime.assert_live_safe(snapshot, source_only_proof=loss_proof, official_stop_proof=official_proof)
             pre_sync_status = snapshot.get('maintenance_status_file')
@@ -305,7 +323,7 @@ def release_source(
             findings = configuration(root, expected_revision)
             if findings:
                 raise RuntimeError('production_release_configuration_invalid:' + ','.join(findings))
-            if supervisor_loss_source_only or official_stop_source_only:
+            if supervisor_loss_source_only or official_stop_source_only or user_stop_source_only:
                 original_readback()
             if confirmed_sync:
                 assert_controls()
@@ -349,6 +367,9 @@ def release_source(
                 **({'supervisor_loss_source_only': True, 'original_wait_verified': False,
                     'approval_recovery_allowed': False, 'original_evidence_preserved': True}
                     if supervisor_loss_source_only else {}),
+                **({'user_stop_source_only': True, 'original_wait_verified': True,
+                    'approval_recovery_allowed': False, 'original_evidence_preserved': True}
+                    if user_stop_source_only else {}),
                 **({'official_stop_source_only': True, 'original_wait_verified': True,
                     'approval_recovery_allowed': False, 'original_evidence_preserved': True,
                     'pre_sync_status_file': pre_sync_status} if official_stop_source_only else {}),
@@ -360,7 +381,8 @@ def release_source(
             raise
         return _failed_release(root, before, expected_revision, confirmed_sync, error,
             stopped_maintenance=stopped_maintenance, automation=automation, controls_before=controls_before,
-            supervisor_loss_source_only=supervisor_loss_source_only, official_stop_source_only=official_stop_source_only)
+            supervisor_loss_source_only=supervisor_loss_source_only, official_stop_source_only=official_stop_source_only,
+            user_stop_source_only=user_stop_source_only)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -374,6 +396,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--stopped-maintenance', choices=('YES',))
     parser.add_argument('--supervisor-loss-source-only', choices=('YES',))
     parser.add_argument('--official-stop-source-only', choices=('YES',))
+    parser.add_argument('--user-stop-source-only', choices=('YES',))
     parser.add_argument('--original-receipt-file', type=Path)
     parser.add_argument('--original-owner-task-id')
     parser.add_argument('--original-tool-session-id')
@@ -396,12 +419,14 @@ def main(argv: list[str] | None = None) -> int:
                                  confirmed_sync=args.confirm_sync == 'YES', automation=automation,
                                  stopped_maintenance=args.stopped_maintenance == 'YES', original_execution=original,
                                  supervisor_loss_source_only=args.supervisor_loss_source_only == 'YES',
-                                 official_stop_source_only=args.official_stop_source_only == 'YES')
+                                 official_stop_source_only=args.official_stop_source_only == 'YES',
+                                 user_stop_source_only=args.user_stop_source_only == 'YES')
     except (OSError, ValueError, RuntimeError) as error:
         print(json.dumps(_failed_release(args.target_root, before, args.expected_revision, args.confirm_sync == 'YES', error,
             stopped_maintenance=args.stopped_maintenance == 'YES', automation=automation, controls_before=controls_before,
             supervisor_loss_source_only=args.supervisor_loss_source_only == 'YES',
-            official_stop_source_only=args.official_stop_source_only == 'YES')))
+            official_stop_source_only=args.official_stop_source_only == 'YES',
+            user_stop_source_only=args.user_stop_source_only == 'YES')))
         return 1
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return 1 if payload['status'] == 'blocked' else 0
