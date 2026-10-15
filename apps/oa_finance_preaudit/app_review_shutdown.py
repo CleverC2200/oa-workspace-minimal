@@ -55,9 +55,9 @@ def _source(value: dict, owner: str, source: Path, line: int, *, earliest: float
     return native['anchor'], proof
 
 
-def _wait_arguments(raw: str) -> dict:
-    """Parse only data literals from the native read-only wait call, never JS."""
-    key = r'(?:session_id|chars|yield_time_ms|max_output_tokens)'
+def _literal_arguments(raw: str, keys: set[str]) -> dict:
+    """Parse only whitelisted data literals from native calls, never JS."""
+    key = '(?:' + '|'.join(sorted(keys)) + ')'
     literal = r'(?:"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"|0|[1-9][0-9]*)'
     member = rf'(?:"{key}"|{key})\s*:\s*{literal}'
     if re.fullmatch(rf'\s*\{{\s*{member}(?:\s*,\s*{member})*\s*\}}\s*', raw) is None:
@@ -76,15 +76,23 @@ def _wait_result(anchor: dict, output: dict, session: str) -> dict:
     if payload.get('name') not in {'exec', 'functions.exec'} or not payload.get('call_id'):
         raise ValueError('host_review_source_untrusted')
     code = payload.get('input', payload.get('arguments'))
-    match = re.fullmatch(r'\s*text\(await tools\.write_stdin\((\{.*\})\)\);?\s*', code or '', re.DOTALL)
+    match = re.fullmatch(
+        r'\s*(?:text\(await tools\.exec_command\((?P<command>\{.*\})\)\);\s*)?'
+        r'text\(await tools\.write_stdin\((?P<wait>\{.*\})\)\);?\s*', code or '', re.DOTALL)
     if match is None:
         raise ValueError('host_review_source_untrusted')
-    args = _wait_arguments(match.group(1))
+    if match['command'] is not None:
+        command = _literal_arguments(match['command'], {'cmd', 'workdir', 'max_output_tokens', 'yield_time_ms'})
+        if (not isinstance(command.get('cmd'), str) or not command['cmd']
+                or 'workdir' in command and not isinstance(command['workdir'], str)
+                or any(type(command[key]) is not int for key in {'max_output_tokens', 'yield_time_ms'} & command.keys())):
+            raise ValueError('host_review_shutdown_wait_untrusted')
+    args = _literal_arguments(match['wait'], {'session_id', 'chars', 'yield_time_ms', 'max_output_tokens'})
     if (not isinstance(args, dict) or str(args.get('session_id')) != session or args.get('chars', '') != ''
             or set(args) - {'session_id', 'chars', 'yield_time_ms', 'max_output_tokens'}):
         raise ValueError('host_review_shutdown_wait_untrusted')
-    # Native exec may wrap text output in content blocks. Exactly one actual
-    # tool result is allowed; an unrelated successful command cannot vouch for it.
+    # Sequential text(await ...) calls emit their actual results in call order.
+    # Bind the final result to the sole wait, never to the preceding command.
     results = []
     def visit(item):
         if isinstance(item, str):
@@ -103,10 +111,11 @@ def _wait_result(anchor: dict, output: dict, session: str) -> dict:
             else:
                 for part in item.values(): visit(part)
     visit(output)
-    if (len(results) != 1 or type(results[0].get('exit_code')) is not int
-            or results[0].get('session_id') is not None or 'output' not in results[0]):
+    if (len(results) != (2 if match['command'] is not None else 1)
+            or any(type(result.get('exit_code')) is not int or result.get('session_id') is not None
+                   for result in results)):
         raise ValueError('host_review_shutdown_wait_untrusted')
-    return results[0]
+    return results[-1]
 
 
 def finish(*, owner: str, source: Path, interrupt_lines: list[int], status_line: int, wait_line: int) -> dict:
