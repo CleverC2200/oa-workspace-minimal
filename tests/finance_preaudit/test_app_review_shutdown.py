@@ -157,6 +157,60 @@ def test_old_interrupts_cannot_be_reused_for_a_new_shutdown(exchange):
         shutdown.finish(owner=owner, **args)
 
 
+@pytest.mark.parametrize('damage', [None, 'wrong_session', 'missing_result', 'extra_result',
+    'running_command', 'running_wait', 'wrong_exit', 'dynamic_command', 'duplicate_command_key',
+    'extra_wait', 'trailing_command'])
+def test_cli_shutdown_binds_wait_after_literal_command(exchange, damage):
+    _, _, owner, child, _, manifest, _ = exchange
+    shutdown.begin(owner=owner, reason='reviewer_failed')
+    controller_handoff.finish(manifest, status='failed', children_reaped=True, health='degraded')
+    path = seal_execution(owner, manifest)
+    receipt = json.loads(path.read_text())
+    receipt.update(result='failed', exit_code=1, controller_state='failed')
+    host.guard.write(path, receipt)
+    args = proofs(owner, child, exit_code=1)
+    command = 'text(await tools.exec_command({cmd:"heartbeat",workdir:"/offline",max_output_tokens:2200}));\n'
+    wait = 'text(await tools.write_stdin({session_id:"original-session",chars:"",yield_time_ms:1000}));'
+    results = [{'exit_code': 0, 'output': 'heartbeat returned'}, {'exit_code': 1, 'output': 'original driver exited'}]
+    if damage is None:
+        results[0]['exit_code'] = 1  # A failed heartbeat must not hide the actual nonzero wait.
+    elif damage == 'wrong_session': wait = wait.replace('original-session', 'another-session')
+    elif damage == 'missing_result': results.pop()
+    elif damage == 'extra_result': results.append({'exit_code': 1, 'output': 'unrelated'})
+    elif damage == 'running_command': results[0] = {'session_id': 123, 'output': 'running'}
+    elif damage == 'running_wait': results[1] = {'session_id': 'original-session', 'output': 'running'}
+    elif damage == 'wrong_exit': results[1]['exit_code'] = 0
+    elif damage == 'dynamic_command': command = 'text(await tools.exec_command(command));\n'
+    elif damage == 'duplicate_command_key': command = command.replace('cmd:"heartbeat"', 'cmd:"heartbeat",cmd:"other"')
+    elif damage == 'extra_wait': wait += wait
+    elif damage == 'trailing_command': wait += command
+    rows = args['source'].read_text().splitlines()
+    call = json.loads(rows[args['wait_line'] - 1])
+    call['payload']['input'] = command + wait
+    rows[args['wait_line'] - 1] = json.dumps(call)
+    output = json.loads(rows[args['wait_line']])
+    output['payload']['output'] = [{'type': 'input_text', 'text': 'Script completed'},
+        *[{'type': 'input_text', 'text': json.dumps(result)} for result in results]]
+    rows[args['wait_line']] = json.dumps(output)
+    args['source'].write_text('\n'.join(rows) + '\n')
+    original = args['source'].read_bytes()
+    cli = ['--operation', 'finish-shutdown', '--owner-task-id', owner,
+        '--source-session-file', str(args['source']), '--source-line', str(args['status_line']),
+        '--wait-line', str(args['wait_line'])]
+    for line in args['interrupt_lines']:
+        cli.extend(['--interrupt-line', str(line)])
+    if damage is None:
+        assert host.main(cli) == 0
+        sealed = json.loads(host.registry_file(owner).read_text())['shutdown']
+        assert sealed['status'] == 'verified'
+        assert sealed['receipt']['driver_exit_code'] == 1
+        assert sealed['receipt']['driver_wait_source']['line'] == args['wait_line']
+    else:
+        with pytest.raises(ValueError): host.main(cli)
+        assert json.loads(host.registry_file(owner).read_text())['shutdown']['status'] == 'pending'
+    assert args['source'].read_bytes() == original
+
+
 def test_cli_close_cannot_skip_unified_shutdown_proofs(exchange):
     _, _, owner, *_ = exchange
     with pytest.raises(SystemExit) as error:
