@@ -42,7 +42,7 @@ def _raw_field_is_business_value(field: dict[str, Any], value: str) -> bool:
             return bool(re.fullmatch(r"[0-9]+", value))
         return (
             (code, name) == ("bxgs", "报销公司")
-            and db_type in {"browser.5534", "browser.38009"}
+            and db_type in {"browser.5534", "browser.38009", "browser.19001"}
             and value.endswith("公司")
         )
     if html_type in {"1", "2"}:
