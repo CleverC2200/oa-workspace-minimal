@@ -1,4 +1,5 @@
 """Explicit recovery for a resolved writer-unknown failure stop; never writes OA."""
+
 from __future__ import annotations
 
 import argparse
@@ -72,12 +73,18 @@ def _bound_attempt(action_file: Path, root: Path) -> dict:
         if (
             state.get("execution_state") != "needs_admin"
             or state.get("write_state") != "unknown"
-            or state.get("reason") != "writer_result_unknown"
+            or state.get("reason")
+            not in {"writer_result_unknown", "writer_postcheck_timeout"}
             or state.get("action_file") != str(bound)
             or state.get("state_file") != str(attempt_root / "state.json")
             or os.path.lexists(attempt_root / "execution-receipt.json")
         ):
             raise ValueError(BLOCKED)
+        if state["reason"] == "writer_postcheck_timeout":
+            from .production_write import verified_unknown_write_failure
+
+            if not verified_unknown_write_failure(attempt_root, state, state["reason"]):
+                raise ValueError(BLOCKED)
         return state
     raise ValueError(BLOCKED)
 
@@ -85,6 +92,24 @@ def _bound_attempt(action_file: Path, root: Path) -> dict:
 def _require_historical(reconciled: dict, state: dict) -> None:
     if not controller_handoff._recovery_reconciliation_is_trusted(reconciled):
         raise ValueError(BLOCKED)
+    if state.get("reason") == "writer_postcheck_timeout":
+        findings = reconciled.get("findings")
+        if not isinstance(findings, list):
+            raise ValueError(BLOCKED)
+        matches = [
+            row
+            for row in findings
+            if isinstance(row, dict)
+            and (row.get("workflow_key"), row.get("item_key"), row.get("attempt"))
+            == (state["workflow_key"], state["case_key"], state["attempt"])
+        ]
+        if (
+            len(matches) != 1
+            or matches[0].get("category") != "handled_not_pending"
+            or matches[0].get("local_execution_state") != "needs_admin"
+            or matches[0].get("local_write_state") != "unknown"
+        ):
+            raise ValueError(BLOCKED)
     manual = reconciled.get("manual_review")
     items = manual.get("items") if isinstance(manual, dict) else None
     if not isinstance(items, list):
