@@ -343,6 +343,7 @@ def clear_failure_stop(
     *,
     expected_reason: str,
     expected_identity: tuple[int, int, int] | None = None,
+    target: Path | None = None,
 ) -> bool:
     """Remove one controller-owned failure stop after an operator reconciled it.
 
@@ -356,7 +357,7 @@ def clear_failure_stop(
     ):
         raise ValueError("stop_reason_invalid")
     payload = f"stop_requested:{expected_reason}\n".encode("ascii")
-    return _clear_stop(payload, expected_identity=expected_identity)
+    return _clear_stop(payload, expected_identity=expected_identity, target=target)
 
 
 def clear_manual_stop(

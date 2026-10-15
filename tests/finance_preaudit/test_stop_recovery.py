@@ -116,7 +116,9 @@ def test_pending_unknown_write_keeps_the_stop(environment) -> None:
 def test_untrusted_reconciliation_keeps_the_stop(environment) -> None:
     action_file, stop_file, item_key = environment
     reconciled = _trusted(item_key, "handled_not_pending")
-    reconciled["continuation"]["blocking_reasons"] = {"pending_write_state_unresolved": 1}
+    reconciled["continuation"]["blocking_reasons"] = {
+        "pending_write_state_unresolved": 1
+    }
     reconciled["continuation"]["status"] = "blocked"
     reconciled["continuation"]["scope"] = "controller"
     with pytest.raises(ValueError, match="writer_stop_recovery_blocked"):
@@ -124,8 +126,12 @@ def test_untrusted_reconciliation_keeps_the_stop(environment) -> None:
     assert stop_file.exists()
 
 
-@pytest.mark.parametrize("changed", ["wrong_reason", "env_stop", "loose_mode", "receipt_present"])
-def test_untrusted_stop_mark_or_evidence_keeps_the_stop(environment, monkeypatch, changed) -> None:
+@pytest.mark.parametrize(
+    "changed", ["wrong_reason", "env_stop", "loose_mode", "receipt_present"]
+)
+def test_untrusted_stop_mark_or_evidence_keeps_the_stop(
+    environment, monkeypatch, changed
+) -> None:
     action_file, stop_file, item_key = environment
     if changed == "wrong_reason":
         stop_file.write_text("stop_requested:controller_cycle_stop\n", encoding="utf-8")
@@ -135,7 +141,37 @@ def test_untrusted_stop_mark_or_evidence_keeps_the_stop(environment, monkeypatch
     elif changed == "loose_mode":
         os.chmod(stop_file, 0o644)
     else:
-        (action_file.parent / "execution-receipt.json").write_text("{}", encoding="utf-8")
+        (action_file.parent / "execution-receipt.json").write_text(
+            "{}", encoding="utf-8"
+        )
     with pytest.raises(ValueError, match="writer_stop_recovery_blocked"):
         _recover(action_file, _live(_trusted(item_key, "handled_not_pending")))
     assert stop_file.exists()
+
+
+def test_verified_postcheck_timeout_can_release_historical_stop(
+    environment, monkeypatch
+):
+    from apps.oa_finance_preaudit import production_write
+
+    action, stop, key = environment
+    state_file = action.with_name("state.json")
+    state = json.loads(state_file.read_text())
+    state["reason"] = "writer_postcheck_timeout"
+    state_file.write_text(json.dumps(state))
+    observed = []
+
+    def verified(attempt, value, code):
+        observed.append((attempt, value["reason"], code))
+        return True
+
+    monkeypatch.setattr(production_write, "verified_unknown_write_failure", verified)
+    before = {p: p.read_bytes() for p in action.parent.iterdir() if p.is_file()}
+    result = _recover(action, _live(_trusted(key, "handled_not_pending")))
+    assert result["status"] == "recovered"
+    assert observed and all(
+        x == (action.parent, "writer_postcheck_timeout", "writer_postcheck_timeout")
+        for x in observed
+    )
+    assert not stop.exists()
+    assert all(p.read_bytes() == raw for p, raw in before.items())

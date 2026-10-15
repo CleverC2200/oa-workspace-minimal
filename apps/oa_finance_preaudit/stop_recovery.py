@@ -72,12 +72,16 @@ def _bound_attempt(action_file: Path, root: Path) -> dict:
         if (
             state.get("execution_state") != "needs_admin"
             or state.get("write_state") != "unknown"
-            or state.get("reason") != "writer_result_unknown"
+            or state.get("reason") not in {"writer_result_unknown", "writer_postcheck_timeout"}
             or state.get("action_file") != str(bound)
             or state.get("state_file") != str(attempt_root / "state.json")
             or os.path.lexists(attempt_root / "execution-receipt.json")
         ):
             raise ValueError(BLOCKED)
+        if state["reason"] == "writer_postcheck_timeout":
+            from .production_write import verified_unknown_write_failure
+            if not verified_unknown_write_failure(attempt_root, state, state["reason"]):
+                raise ValueError(BLOCKED)
         return state
     raise ValueError(BLOCKED)
 

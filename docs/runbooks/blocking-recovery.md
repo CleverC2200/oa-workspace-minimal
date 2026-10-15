@@ -93,6 +93,14 @@ Writer 被停止门拦在提交之前时，仅精确签名边界为 `writer_pref
 
 ## 程序产生的无原因停止维护
 
+### Writer 后查未知的停止维护
+
+`writer_result_unknown` 停止标记可以绑定原 `writer_postcheck_timeout` 单据；已安装的 `stop_recovery` 仅在签名 Writer 边界可信时接受该具体错误。仍待办或对账阻断时拒绝，原 unknown 不因此成为成功或未写入，禁止重提。
+
+修复尚未安装时，从已审查、CI 通过、合并且 `HEAD == origin/main` 的干净候选运行 `python -m apps.oa_finance_preaudit.writer_stop_maintenance`。显式提供 `--target-root`、`--bind-action-file`、`--expected-candidate-revision`、原执行的 `--original-receipt-file` / `--original-owner-task-id` / `--original-tool-session-id`、原调度的 `--automation-file` / `--production-project-id` / `--expected-schedule`，以及本次授权的 `--confirm-reconciled YES`。
+
+维护复用 Controller/global Writer 租约，以目标自己的解释器核验本轮行动归属、冻结和签名边界，并取得新鲜完整状态与当前输入证明。只接受精确 `handled_not_pending`，要求原执行真实终态、已回收，原 cron 保持 PAUSED，生产唯一干净 main 可快进到候选。维护保存私有审计，仅按原身份清除停止标记；不改任何旧单据文件或 OA。必须同时读取 `status`、`stop_cleared` 和 `receipt_file`；结束留证失败时保留实际清除状态，不重复运行。随后按普通源码发布门同步，再启动独立审批新轮。
+
 `stop_requested\n` 只说明停止标记没有原因码，不能据此判断是用户主动停止。若原定时任务因 `production_reconciliation_blocked` 写入该标记，先追查原冲突、等待原控制器终态并完成子进程回收。当前冲突消失只满足恢复检查，不证明原根因已修复。模型资格和已授权恢复范围由本轮维护负责人核实，历史 unknown 保留，不重放单据或伪造人工接管。
 
 新增维护入口 `apps.oa_finance_preaudit.manual_stop_recovery` 只写私有审计回执并精确清除绑定的普通停止标记。它不执行 OA 提交，不改 attempt、授权、冻结或控制器历史。带原因码的停止继续使用匹配的既有处置入口，其中 `writer_result_unknown` 使用原 `stop_recovery` 合同。
