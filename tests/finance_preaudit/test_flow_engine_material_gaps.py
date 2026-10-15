@@ -86,8 +86,9 @@ def _unresolved_evidence_material(request_id, workflow_key="general_expense"):
         {"path": "main[0].field[0]", "code": "cwzfje", "name": "财务审核金额",
          "value": "100", "value_source": "display", "read_status": "present"},
         *[
-            {"path": f"detail[0].row[0].field[{index}]", "code": code,
+            {"path": f"detail[0].row[{row}].field[{index}]", "code": code,
              "name": name, "value": "", "value_source": "none", "read_status": "unresolved"}
+            for row in range(28 if workflow_key == "tpm_small_marketing_fee" else 1)
             for index, (code, name) in enumerate(references)
         ],
     ]
