@@ -918,12 +918,46 @@ def _recovery_candidates(
     return candidates
 
 
+def _deferred_action_states(
+    action_files: Sequence[Path], allowed_workflows: frozenset[str],
+) -> tuple[dict, ...]:
+    """Select trusted unwritten reviews without changing their persisted state."""
+    if not action_files:
+        return ()
+    root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
+    latest = {state.get("action_file"): state for state in _latest_local_states()}
+    selected: list[dict] = []
+    seen: set[Path] = set()
+    for raw in action_files:
+        path = Path(raw)
+        state = latest.get(str(path))
+        if (
+            not path.is_absolute() or path != path.resolve()
+            or any(parent.is_symlink() for parent in (path, *path.parents))
+            or not flow_engine._is_attempt_action_path(path, root)
+            or path in seen or not isinstance(state, dict)
+            or state.get("workflow_key") not in allowed_workflows
+            or state.get("mode") != "controlled_write"
+            or state.get("write_state") != "authorized"
+            or not flow_engine.FlowEngine.resumable_review(root, state)
+            or any(os.path.lexists(path.with_name(name)) for name in (
+                "writer-boundary.json", "execution-receipt.json",
+                "review-decision.json", "remark.txt", "submission-envelope.json",
+            ))
+        ):
+            raise ValueError("production_rolling_defer_invalid")
+        seen.add(path)
+        selected.append(state)
+    return tuple(selected)
+
+
 def _prepare_one(selection: PrepareSelection) -> dict:
     prepare_trace.stage("selection_contract")
     global_selection = False
     assigned_identities: set[tuple[str, str]] = set()
     historical_unknown_identities: set[tuple[str, str]] = set()
     recovery_action_files: tuple[Path, ...] = ()
+    deferred_action_files: tuple[Path, ...] = ()
     committed_received_at: datetime | None = None
     committed_request_id: str | None = None
     known_late_visible_keys: set[str] = set()
@@ -969,6 +1003,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
             [],
         )
         raw_recovery_actions = selection.get("recover_action_files", [])
+        raw_deferred_actions = selection.get("defer_action_files", [])
         raw_committed_received_at = selection.get("committed_received_at")
         raw_committed_request_id = selection.get("committed_request_id")
         raw_late_visible_keys = selection.get("known_late_visible_keys", [])
@@ -980,6 +1015,8 @@ def _prepare_one(selection: PrepareSelection) -> dict:
         if not isinstance(raw_assigned, list) or not isinstance(
             raw_historical_unknown,
             list,
+        ) or not isinstance(raw_deferred_actions, list) or any(
+            not isinstance(path, str) or not path for path in raw_deferred_actions
         ) or not isinstance(raw_recovery_actions, list) or not isinstance(
             raw_late_visible_keys,
             list,
@@ -1016,6 +1053,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 return failed("selection_contract")
             historical_unknown_identities.add((identity[0], identity[1]))
         recovery_action_files = tuple(Path(path) for path in raw_recovery_actions)
+        deferred_action_files = tuple(Path(path) for path in raw_deferred_actions)
         known_late_visible_keys.update(raw_late_visible_keys)
         try:
             if raw_committed_received_at is not None:
@@ -1080,6 +1118,8 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                         )
                         | historical_unknown_identities
                         | assigned_identities
+                        | {(state["request_id"], state["received_at"]) for state in
+                           _deferred_action_states(deferred_action_files, allowed_workflows)}
                     ),
                     allowed_workflows=allowed_workflows,
                 )
@@ -2175,6 +2215,7 @@ def _run_dispatched_tasks(
     max_capacity: int | None = None,
     historical_unknown_identities: frozenset[tuple[str, str]] = frozenset(),
     recovery_action_files: Sequence[Path] = (),
+    deferred_action_files: Sequence[Path] = (),
     committed_received_at: str | None = None,
     committed_request_id: str | None = None,
     known_late_visible_keys: frozenset[str] = frozenset(),
@@ -2197,7 +2238,7 @@ def _run_dispatched_tasks(
         or task_timeout_sec <= 0
         or prepare_timeout_sec <= 0
         or heartbeat_interval_sec <= 0
-        or (recovery_queue and not strict_global_fifo)
+        or ((recovery_queue or deferred_action_files) and not strict_global_fifo)
         or len(recovery_queue) > count
         or len(set(recovery_queue)) != len(recovery_queue)
         or not allowed_workflows
@@ -2638,6 +2679,8 @@ def _run_dispatched_tasks(
                 for identity in sorted(historical_unknown_identities)
             ],
         }
+        if deferred_action_files:
+            selection["defer_action_files"] = [str(path) for path in deferred_action_files]
         if recovery_queue:
             selection["recover_action_files"] = [
                 str(path) for path in recovery_queue
@@ -3614,6 +3657,7 @@ def _run_global_dispatched_tasks(
     max_capacity: int | None = None,
     historical_unknown_identities: frozenset[tuple[str, str]] | None = None,
     recovery_action_files: Sequence[Path] = (),
+    deferred_action_files: Sequence[Path] = (),
     committed_received_at: str | None = None,
     committed_request_id: str | None = None,
     known_late_visible_keys: frozenset[str] = frozenset(),
@@ -3646,6 +3690,8 @@ def _run_global_dispatched_tasks(
     }
     if recovery_action_files:
         dispatcher_args["recovery_action_files"] = recovery_action_files
+    if deferred_action_files:
+        dispatcher_args["deferred_action_files"] = deferred_action_files
     if not defer_review_failures:
         dispatcher_args["defer_review_failures"] = False
     return _run_dispatched_tasks(count, capacity, **dispatcher_args)
@@ -3859,6 +3905,7 @@ def _rolling_snapshot(
     reconcile_status: Callable[[], dict],
     workflow_keys: frozenset[str] = ROLLING_WORKFLOW_KEYS,
     *, recovery_action_files: Sequence[Path] = (),
+    deferred_action_files: Sequence[Path] = (),
 ) -> tuple[int, int, int, int]:
     live = live_status()
     pending = _supported_pending(live, workflow_keys)
@@ -3891,6 +3938,21 @@ def _rolling_snapshot(
         or not _continuation_is_ready(reconciled, recovery_action_files=recovery_action_files)
     ):
         raise ValueError("production_rolling_reconciliation_invalid")
+    if deferred_action_files:
+        selected = {(state["case_key"], state["workflow_key"], state["attempt"])
+                    for state in _deferred_action_states(deferred_action_files, workflow_keys)}
+        findings = reconciled.get("findings")
+        if not isinstance(findings, list) or any(not isinstance(row, dict) for row in findings):
+            raise ValueError("production_rolling_reconciliation_invalid")
+        deferred = [(row.get("item_key"), row.get("workflow_key"), row.get("attempt"))
+                    for row in findings
+                    if (row.get("item_key"), row.get("workflow_key"), row.get("attempt")) in selected
+                    and row.get("category") == "pending_not_handled"
+                    and row.get("local_execution_state") == "review_required"
+                    and row.get("local_write_state") == "authorized"]
+        if len(set(deferred)) != len(deferred) or len(deferred) > actionable:
+            raise ValueError("production_rolling_reconciliation_invalid")
+        actionable -= len(deferred)
     return pending, quarantined, actionable, unauthorized
 
 
@@ -4336,6 +4398,7 @@ def run_rolling_drain(
     reconcile_status: Callable[[], dict] = _production_reconciliation,
     max_waves: int = 10,
     recovery_action_files: Sequence[Path] = (),
+    deferred_action_files: Sequence[Path] = (),
     allowed_workflows: frozenset[str] = ROLLING_WORKFLOW_KEYS,
     confirm_stale_children_reaped: bool = False,
     authorized_recovery_once: bool = False,
@@ -4394,6 +4457,11 @@ def run_rolling_drain(
                     authorized_workflows = frozenset(production_write._authorized_workflows(production_write._policy_path()))
                     fresh_queue = review_interruption.select(flow_root, scoped_reconcile_status(), allowed_workflows & authorized_workflows)
                     recovery_queue = tuple(dict.fromkeys((*recovery_queue, *fresh_queue)))
+            deferred_states = _deferred_action_states(deferred_action_files, allowed_workflows)
+            if {Path(state["action_file"]).parent.parent for state in deferred_states} & {
+                path.parent.parent for path in recovery_queue
+            }:
+                raise ValueError("production_rolling_defer_recovery_overlap")
             cache_maintenance = attachment_cache.prune_expired()
             admission_cutoff = (
                 datetime.now(timezone.utc) + timedelta(minutes=60)
@@ -4416,6 +4484,8 @@ def run_rolling_drain(
                     "review_timeout_seconds": production_config.review_timeout_seconds() + 60,
                     "writer_capacity": 1,
                     "recovery_count": len(recovery_queue),
+                    **({"deferred_action_files": [str(path) for path in deferred_action_files],
+                        "deferred_selected_count": len(deferred_states)} if deferred_states else {}),
                     "authorized_recovery_once": authorized_recovery_once,
                     "admission_cutoff": admission_cutoff,
                 }
@@ -4446,6 +4516,7 @@ def run_rolling_drain(
                             historical_unknown_identities
                         ),
                         recovery_action_files=pending_recoveries,
+                        deferred_action_files=deferred_action_files,
                         committed_received_at=committed_received_at,
                         committed_request_id=committed_request_id,
                         known_late_visible_keys=known_late_visible_keys,
@@ -4480,6 +4551,7 @@ def run_rolling_drain(
                     max_waves=max_waves,
                     recovery_count=len(recovery_queue),
                     recovery_action_files=recovery_queue,
+                    deferred_action_files=deferred_action_files,
                     allowed_workflows=allowed_workflows,
                 )
                 if result.get("stop_reason") == approval_guard.STOP_REASON:
@@ -4713,6 +4785,7 @@ def _run_rolling_drain_locked(
     max_waves: int = 10,
     recovery_count: int = 0,
     recovery_action_files: Sequence[Path] = (),
+    deferred_action_files: Sequence[Path] = (),
     allowed_workflows: frozenset[str] = ROLLING_WORKFLOW_KEYS,
 ) -> dict:
     if (
@@ -4738,6 +4811,7 @@ def _run_rolling_drain_locked(
                 reconcile_status,
                 allowed_workflows,
                 recovery_action_files=recovery_action_files,
+                deferred_action_files=deferred_action_files,
             )
         )
     except ValueError as error:
@@ -4777,6 +4851,7 @@ def _run_rolling_drain_locked(
                     live_status,
                     reconcile_status,
                     allowed_workflows,
+                    deferred_action_files=deferred_action_files,
                 )
             except ValueError:
                 runtime_control.request_cycle_stop()
@@ -4882,6 +4957,7 @@ def _run_rolling_drain_locked(
                 live_status,
                 reconcile_status,
                 allowed_workflows,
+                deferred_action_files=deferred_action_files,
             )
         except ValueError:
             runtime_control.request_cycle_stop()
@@ -5124,6 +5200,8 @@ def _run_rolling_drain_locked(
             else "unknown"
         ),
         "quarantined_pending": quarantined_pending,
+        **({"deferred_action_files": [str(path) for path in deferred_action_files],
+            "deferred_selected_count": len(deferred_action_files)} if deferred_action_files else {}),
         "unauthorized_pending": unauthorized_pending,
         "empty_snapshots": empty_snapshots,
         "discovery_refreshes": discovery_refreshes,
@@ -5234,6 +5312,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         default=[],
     )
+    parser.add_argument("--defer-action-file", action="append", type=Path, default=[],
+                        help="仅本轮暂缓指定的可信未提交审核，保留原冻结和状态")
     parser.add_argument("--recover-confirmed-no-write-once", choices=("YES",))
     parser.add_argument(
         "--confirm-stale-children-reaped",
@@ -5247,6 +5327,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.drain
                 or args.rolling
                 or args.recover_action_file
+                or args.defer_action_file
                 or args.workflow
                 or args.confirm_stale_children_reaped
                 or args.recover_confirmed_no_write_once
@@ -5289,6 +5370,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 rolling_args["recovery_action_files"] = tuple(
                     args.recover_action_file
                 )
+            if args.defer_action_file:
+                rolling_args["deferred_action_files"] = tuple(args.defer_action_file)
             if args.recover_confirmed_no_write_once == "YES":
                 rolling_args["authorized_recovery_once"] = True
             if args.confirm_stale_children_reaped == "YES":
