@@ -153,3 +153,45 @@ def test_cli_requires_original_execution_for_material_source_only(failed_install
     assert result == 1 and value['code'] == 'production_release_original_execution_required'
     assert value['material_failure_source_only'] is True
     assert value['next_process_ready'] is False and value['approval_recovery_allowed'] is False
+
+
+@pytest.mark.parametrize('damage', [None, 'wrong_session', 'tampered_log'])
+def test_source_repair_uses_real_original_supervision_and_default_readback(failed_install, monkeypatch, damage):
+    from scripts.finance_preaudit_run import supervise, bind_tool_session
+    root, remote, revision, automation, _, _, action, live = failed_install
+    owner = str(uuid4())
+    directory = root / 'runtime/control/executions' / uuid4().hex
+    child = '''import os,json,datetime
+from pathlib import Path
+Path(os.environ['OA_CONTROLLER_EXECUTION_MANIFEST_FILE']).write_text(json.dumps({
+ 'kind':'preaudit_controller_run_manifest','controller_pid':os.getpid(),
+ 'run_id':'a'*32,'controller_instance_id':'b'*32,'state':'failed',
+ 'children_reaped':True,'code_revision':REVISION,
+ 'started_at':datetime.datetime.now(datetime.timezone.utc).isoformat()}))
+print('offline controller output')
+raise SystemExit(1)'''.replace('REVISION', repr(revision))
+    with monkeypatch.context() as binding:
+        binding.setenv('OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE', str(root / 'runtime/control/rolling-controller.lock'))
+        receipt = supervise([sys.executable, '-c', child], directory=directory, owner_task_id=owner)
+        original = maintenance_runtime.OriginalExecution(Path(receipt['receipt_file']), owner, 'real-original-session')
+        bind_tool_session(original.file, owner_task_id=owner, session_id=original.tool_session_id)
+    assert receipt['exit_code'] == 1 and receipt['children_reaped'] is True
+    (root / 'runtime/control/rolling-controller-manifest.json').write_bytes(
+        original.file.with_name('controller-manifest.json').read_bytes())
+    if damage == 'wrong_session':
+        original = maintenance_runtime.OriginalExecution(original.file, owner, 'wrong-session')
+    elif damage == 'tampered_log':
+        original.file.with_name('stdout.log').write_text('changed after the real exit')
+    expected = advance_source(root, remote)
+    options = dict(expected_revision=expected, expected_origin=str(remote), confirmed_sync=True,
+        automation=automation, original_execution=original, failed_material_actions=(action,),
+        check_live=live, check_configuration=lambda *_: [])
+    if damage is None:
+        result = production_release.release_source(root, **options)
+        assert result['status'] == 'synced' and result['source_sync_state'] == 'updated'
+        assert result['next_process_ready'] is False
+        assert result['continuation']['blocking_reasons'] == {'pending_failure_not_isolated': 1}
+    else:
+        with pytest.raises(RuntimeError, match='maintenance_original_execution_untrusted'):
+            production_release.release_source(root, **options)
+        assert git(root, 'rev-parse', 'HEAD') == revision
