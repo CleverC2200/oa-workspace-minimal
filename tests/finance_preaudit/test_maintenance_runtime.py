@@ -124,7 +124,7 @@ def test_source_admission_bridge_keeps_other_safety_gates(tmp_path, invalid):
 def test_source_bridge_uses_installed_frozen_validator_without_writing(tmp_path, monkeypatch, variant):
     import sys
     from apps.oa_finance_preaudit import flow_engine, production_config, reconciliation
-    from tests.finance_preaudit.test_flow_engine_material_gaps import _engine, _unresolved_general_material
+    from tests.finance_preaudit.test_flow_engine_material_gaps import _engine, _unresolved_evidence_material
     auth_env = tmp_path.parent / (tmp_path.name + '-auth.env')
     auth_env.write_text('')
     auth_env.chmod(0o600)
@@ -145,7 +145,7 @@ def test_source_bridge_uses_installed_frozen_validator_without_writing(tmp_path,
     flows = tmp_path / 'runtime/finance_preaudit_flows'
     submissions = []
     engine = _engine(flows, 'general_expense', RuntimeError('unused'), controlled=True, submissions=submissions)
-    engine._collect_material = lambda request, _: _unresolved_general_material(request)
+    engine._collect_material = lambda request, _: _unresolved_evidence_material(request)
     with monkeypatch.context() as old:
         old.setattr(flow_engine, '_require_reviewable_material', lambda *_: None)
         action = engine.next_action('general_expense', mode='controlled_write')
