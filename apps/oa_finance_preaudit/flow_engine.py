@@ -233,6 +233,7 @@ _SAFE_MATERIAL_FAILURE_DETAIL_CODES = (
     | _HARD_COLLECTION_FAILURE_CODES
     | {
         "general_evidence_references_unresolved",
+        "tpm_evidence_references_unresolved",
         "frozen_file_unreadable",
         "frozen_material_changed",
         "manifest_resource_coverage_incomplete",
@@ -667,13 +668,15 @@ def _require_reviewable_material(workflow_key: str, material: dict) -> None:
             error.code = gaps[0]["code"]
             error.counts = gaps[0].get("counts", {})
         raise error
-    if workflow_key == "general_expense" and not any((
+    if workflow_key in {"general_expense", "tpm_small_marketing_fee"} and not any((
         material.get("resources"), material.get("authority_facts"),
         prepared.get("images"), prepared.get("structured_contents"),
         prepared.get("manifest"),
         (material.get("invoice_evidence") or {}).get("invoices"),
     )):
-        attachment_codes = {"scfj", "fj", "glfp"}
+        attachment_codes = {"fj", "glfp"}
+        if workflow_key == "general_expense":
+            attachment_codes.add("scfj")
         attachment_fields = [
             field for field in material.get("declared_fields", [])
             if isinstance(field, dict) and field.get("code") in attachment_codes
@@ -684,7 +687,11 @@ def _require_reviewable_material(workflow_key: str, material: dict) -> None:
             and all(field.get("read_status") == "unresolved" for field in attachment_fields)
         ):
             error = ValueError("material_collection_failed")
-            error.code = "general_evidence_references_unresolved"
+            error.code = (
+                "general_evidence_references_unresolved"
+                if workflow_key == "general_expense"
+                else "tpm_evidence_references_unresolved"
+            )
             raise error
 
 
