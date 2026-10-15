@@ -61,6 +61,7 @@ ARCHIVE_EXTRACT_TIMEOUT_SEC = int(
     os.environ.get("OA_ATTACHMENT_ARCHIVE_EXTRACT_TIMEOUT_SEC", "30")
 )
 OA_SESSION_EXPIRED_CODE = "oa_session_expired"
+ATTACHMENT_ACCESS_DENIED_CODE = "attachment_access_denied"
 CHROME_LAUNCH_TIMEOUT_CODE = "attachment_download_launch_timeout"
 DOWNLOAD_TIMEOUT_CODE = "attachment_download_timeout"
 RESOURCE_SLOT_TIMEOUT_CODE = "attachment_download_capacity_timeout"
@@ -73,7 +74,6 @@ FATAL_DOWNLOAD_ERROR_CODES = {
     *rpa_session.FATAL_SESSION_CODES,
 }
 OA_SESSION_EXPIRED_MARKERS = (
-    "noright.jsp",
     "ddcodetimeout",
     "login_required",
     "loginrequired",
@@ -81,7 +81,6 @@ OA_SESSION_EXPIRED_MARKERS = (
     "login.jsp",
     "登录态失效",
     "登录超时",
-    "无权限",
 )
 RPA_STORAGE_STATE_CACHE_SEC = 60.0
 _RPA_STORAGE_STATE_CACHE: Tuple[float, Dict[str, Any]] | None = None
@@ -309,11 +308,15 @@ def detect_oa_download_fail_code(value: Any) -> str:
         marker in lowered or marker in text for marker in OA_SESSION_EXPIRED_MARKERS
     ):
         return OA_SESSION_EXPIRED_CODE
+    if "noright.jsp" in lowered or "无权限" in text:
+        return ATTACHMENT_ACCESS_DENIED_CODE
     return ""
 
 
 def download_error_code(message: str) -> str:
     text = str(message or "").strip()
+    if text.startswith(f"{ATTACHMENT_ACCESS_DENIED_CODE}:"):
+        return ATTACHMENT_ACCESS_DENIED_CODE
     for code in rpa_session.FATAL_SESSION_CODES:
         if text.startswith(f"{code}:"):
             return code
@@ -333,11 +336,13 @@ def download_error_code(message: str) -> str:
 
 
 def _download_block_message(code: str, name: str) -> str:
+    if code == ATTACHMENT_ACCESS_DENIED_CODE:
+        return f"{ATTACHMENT_ACCESS_DENIED_CODE}: {name}: 附件访问被拒绝，需人工核对权限"
     if code == runtime_control.STOP_CODE:
         return f"{runtime_control.STOP_CODE}: {name}: 已请求停止财务预审，停止附件下载"
     if code == OA_SESSION_EXPIRED_CODE:
         return (
-            f"{OA_SESSION_EXPIRED_CODE}: {name}: OA 登录态失效或无权限，已停止附件下载"
+            f"{OA_SESSION_EXPIRED_CODE}: {name}: OA 登录态失效，已停止附件下载"
         )
     if code == CHROME_LAUNCH_TIMEOUT_CODE:
         return f"{CHROME_LAUNCH_TIMEOUT_CODE}: {name}: Chrome 启动超时，已停止附件下载"
@@ -1504,6 +1509,7 @@ def download_resources(
             code = download_error_code(err)
             errors.append({"code": code, "message": err})
             if code in FATAL_DOWNLOAD_ERROR_CODES:
+                errors.insert(0, errors.pop())
                 break
             continue
         if item is None and path is not None:
@@ -1516,6 +1522,7 @@ def download_resources(
                     }
                 )
                 if code in FATAL_DOWNLOAD_ERROR_CODES:
+                    errors.insert(0, errors.pop())
                     break
                 continue
             item = {

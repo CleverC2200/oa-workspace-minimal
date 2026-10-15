@@ -549,7 +549,27 @@ def assert_live_safe(payload: dict, *, maintenance_leases_held: bool = True,
     withdrawn_action = None
     if source_only_proof is not None and not isinstance(source_only_proof, dict):
         raise RuntimeError('maintenance_current_inputs_untrusted')
-    if source_only_proof is not None and source_only_proof.get('kind') == 'preaudit_confirmed_withdrawal_source_only':
+    if source_only_proof is not None and source_only_proof.get('kind') == 'preaudit_material_failure_source_only':
+        inputs = payload.get('maintenance_current_inputs', {})
+        actions = source_only_proof.get('actions')
+        continuation = reconciled.get('continuation', {})
+        isolated = continuation.get('isolated_pending')
+        if (set(source_only_proof) != {'kind', 'target_root', 'actions'}
+                or not isinstance(actions, list) or not actions
+                or any(not isinstance(action, str) for action in actions)
+                or len(set(actions)) != len(actions)
+                or not isinstance(inputs, dict)
+                or inputs.get('target_root') != source_only_proof['target_root']
+                or inputs.get('verified_material_failure_actions') != actions
+                or inputs.get('material_failure_recovery_ready') is not True
+                or type(isolated) is not int or isolated < 0
+                or continuation != {'status': 'blocked', 'scope': 'controller', 'isolated_pending': isolated,
+                    'blocking_reasons': {'pending_failure_not_isolated': len(actions)}}
+                or type(reconciled.get('quarantine', {}).get('pending_quarantined')) is not int
+                or reconciled['quarantine']['pending_quarantined'] != isolated + len(actions)):
+            raise RuntimeError('maintenance_reconciliation_untrusted')
+        trusted_continuation = True
+    elif source_only_proof is not None and source_only_proof.get('kind') == 'preaudit_confirmed_withdrawal_source_only':
         inputs = payload.get('maintenance_current_inputs', {})
         withdrawn_action = source_only_proof.get('withdrawn_action')
         if (source_only_proof.get('withdrawal_confirmed') is not True or not isinstance(withdrawn_action, str)
@@ -638,6 +658,17 @@ required = set(json.loads(workflows_json))
 source_only = json.loads(source_only_json)
 allow_admission_blocked = json.loads(admission_json)
 code = 'maintenance_current_inputs_untrusted'
+
+def failure_files(attempt):
+    result = {}
+    for file in sorted(attempt.rglob('*')):
+        if file.is_symlink():
+            raise ValueError()
+        if file.is_file():
+            info = file.stat()
+            result[str(file.relative_to(attempt))] = [info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_mode, info.st_uid,
+                info.st_size, hashlib.sha256(file.read_bytes()).hexdigest()]
+    return result
 
 def validate_collecting(flows, attempt, state):
     reader = flow_engine.FlowEngine(root=flows, discover_candidates=None, collect_material=None)
@@ -749,6 +780,15 @@ try:
     uncounted = []
     withdrawn = []
     admission_blocked = []
+    material_failures = []
+    failure_fingerprints = {}
+    material_source_only = source_only is not None and source_only.get('kind') == 'preaudit_material_failure_source_only'
+    if material_source_only:
+        if (set(source_only) != {'kind', 'target_root', 'actions'} or source_only['target_root'] != str(root)
+                or not isinstance(source_only['actions'], list) or not source_only['actions']
+                or any(not isinstance(action, str) for action in source_only['actions'])
+                or len(set(source_only['actions'])) != len(source_only['actions'])):
+            raise ValueError()
     for item in pending:
         state = by_key[(item['workflow_key'], item['item_key'], item['attempt'])]
         attempt = flows / state['workflow_key'] / 'cases' / state['case_key'] / ('attempt-' + str(state['attempt']))
@@ -786,9 +826,18 @@ try:
         elif state['execution_state'] == 'needs_admin':
             isolated = item_failure.isolated(attempt, state)
             stopped_collection = False
+            selected_failure = material_source_only and str(attempt / 'action.json') in source_only['actions']
+            if selected_failure:
+                receipt = item_failure.verified_receipt(attempt, state)
+                if (receipt is None or receipt.get('scope') != 'controller'
+                        or not item_failure.material_failure_without_write(attempt, state)
+                        or not flow_engine.FlowEngine.recoverable_no_write(flows, attempt / 'action.json')):
+                    raise ValueError()
+                material_failures.append(str(attempt / 'action.json'))
+                failure_fingerprints[str(attempt / 'action.json')] = failure_files(attempt)
             if source_only is not None and str(attempt / 'action.json') in source_only.get('historical_stopped_actions', []):
                 stopped_collection = historical_stopped_collection(attempt, state)
-            if not (isolated or reconciliation._trusted_quarantine(flows, state) or stopped_collection):
+            if not (isolated or reconciliation._trusted_quarantine(flows, state) or stopped_collection or selected_failure):
                 raise ValueError()
             if stopped_collection:
                 preserved.append(str(attempt / 'action.json'))
@@ -802,7 +851,7 @@ try:
                     uncounted.append(action)
             # A verified item receipt binds the failure artifacts and proves no write;
             # a material failure cannot also promise a valid frozen material bundle.
-            material_failure = isolated and state.get('reason') == 'material_collection_failed'
+            material_failure = (isolated or selected_failure) and state.get('reason') == 'material_collection_failed'
             if not material_failure and (state.get('material_file') is not None or state.get('review_packet_file') is not None):
                 flow_engine.validate_frozen_review_inputs(attempt_root=attempt, state=state, workflow_key=state['workflow_key'])
         else:
@@ -811,6 +860,14 @@ try:
     if (source_only is not None and source_only.get('kind') == 'preaudit_confirmed_withdrawal_source_only'
             and withdrawn != [source_only['withdrawn_action']]):
         raise ValueError()
+    if material_source_only:
+        from scripts import finance_preaudit_concurrency_probe as controller
+        if (set(material_failures) != set(source_only['actions'])
+                or not controller._continuation_is_ready(snapshot['reconciliation'],
+                    recovery_action_files=[Path(action) for action in source_only['actions']])
+                or any(failure_files(Path(action).parent) != fingerprint
+                    for action, fingerprint in failure_fingerprints.items())):
+            raise ValueError()
     current_policy = policy.lstat()
     if ((metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns, metadata.st_mode)
             != (current_policy.st_dev, current_policy.st_ino, current_policy.st_mtime_ns, current_policy.st_mode)
@@ -821,6 +878,8 @@ try:
         'policy_sha256':policy_hash,'authorized_workflows':sorted(required),
         'pending_frozen_count':len(pending),'validated_frozen_count':validated,
         **({'admission_blocked_actions':admission_blocked} if allow_admission_blocked else {}),
+        **({'verified_material_failure_actions':source_only['actions'], 'material_failure_recovery_ready':True,
+            'material_failure_fingerprints':failure_fingerprints} if material_source_only else {}),
         **({'verified_withdrawn_actions':withdrawn}
             if source_only is not None and source_only.get('kind') == 'preaudit_confirmed_withdrawal_source_only'
             else {'verified_interrupted_actions':sorted(interrupted),'uncounted_interrupted_actions':sorted(uncounted)}

@@ -91,6 +91,7 @@ def test_cancelled_collection_recollects_fresh_input_on_later_attempt(tmp_path):
 
 @pytest.mark.parametrize("detail, scope", [
     ("attachment_download_failed", "item"),
+    ("attachment_access_denied", "item"),
     ("oa_session_expired", "controller"),
     ("resource_request_mismatch", "controller"),
 ])
@@ -145,9 +146,10 @@ def test_changed_failure_evidence_never_authorizes_continuation(tmp_path: Path, 
     assert not item_failure.isolated(attempt, state)
 
 
-def test_trusted_material_failure_does_not_block_fresh_case(tmp_path: Path) -> None:
+@pytest.mark.parametrize('detail', ['attachment_download_failed', 'attachment_access_denied'])
+def test_trusted_material_failure_does_not_block_fresh_case(tmp_path: Path, detail: str) -> None:
     def collect(_request_id, _root):
-        raise ValueError("attachment_download_failed")
+        raise ValueError(detail)
 
     root = tmp_path.resolve()
     failed = {"request_id": "bad-case", "received_at": "2026-09-09T09:00:00+08:00"}

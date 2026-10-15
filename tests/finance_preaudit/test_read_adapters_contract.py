@@ -813,7 +813,7 @@ class TestReadAdaptersContract:
                 )
 
         assert path is None
-        assert error.startswith("oa_session_expired:")
+        assert error.startswith("attachment_access_denied:")
 
     def test_handled_rows_use_readonly_endpoints_and_normalize_case_index(self) -> None:
         client = api.OaApi("token", "user", app_id="app", base_url="https://oa.example")
@@ -1643,3 +1643,25 @@ class TestReadAdaptersContract:
         ]
         assert facts[-2]["subject_ref"] == "11"
         assert facts[-2]["observed_at"] == "2026-08-01"
+
+
+@pytest.mark.parametrize('value, expected', [
+    ('https://oa.example/notice/noright.jsp', 'attachment_access_denied'),
+    ('您无权限查看此附件', 'attachment_access_denied'),
+    ('https://oa.example/login.jsp', 'oa_session_expired'),
+    ('/notice/noright.jsp\n/login.jsp', 'oa_session_expired'),
+])
+def test_attachment_permission_and_session_failure_are_distinct(value, expected):
+    assert attachments.detect_oa_download_fail_code(value) == expected
+
+
+def test_permission_failure_cannot_hide_a_later_real_session_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(attachments, '_download_resource_direct', lambda resource, **_: (
+        None, ('attachment_access_denied: denied' if resource['id'] == 'denied' else 'oa_session_expired: expired')))
+    downloaded, errors = attachments.download_resources([
+        {'id': 'denied', 'name': 'payment.png', 'downloadUrl': 'https://oa.example/file/1'},
+        {'id': 'expired', 'name': 'invoice.pdf', 'downloadUrl': 'https://oa.example/file/2'}],
+        dest_dir=tmp_path, timeout_sec=1, allow_browser_download=True, reuse_cache=False)
+    assert downloaded == []
+    assert errors[0]['code'] == 'oa_session_expired'
+    assert {error['code'] for error in errors} == {'attachment_access_denied', 'oa_session_expired'}
