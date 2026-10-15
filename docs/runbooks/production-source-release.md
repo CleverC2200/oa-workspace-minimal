@@ -119,3 +119,11 @@ python -m apps.oa_finance_preaudit.production_release \
 入口用目标自己的 Python 和既有模块检查原成功回执、当前唯一待办及账户/流程/节点归属、未命中已办，保存精确源指纹。完整当前对账唯一阻断须为该项的 `pending_write_state_unresolved=1`，隔离数为 0；其余授权、冻结、原控制器真实终态与回收、Writer 和发布配置门保持。目标原验证器独立复核该成功项，拒绝 unknown、submitting、其他单据或额外阻断。同步前后核对原成功证据及官方归属观测一致，并保留 PAUSED cron 的文件身份和内容。
 
 成功回执记录 `withdrawn_submission_source_only=true`、`original_evidence_preserved=true`、`next_process_ready=false`、`approval_recovery_allowed=false`，原 raw continuation 继续 blocked。该模式只安装源码，不创建 attempt、不写 OA、不改旧意见或时间。随后按[单据级撤回恢复](../agents/quarantine-repair.md#已成功提交后由用户撤回)准备新 attempt，并再次通过完整审批启动门。同步后的检查失败仍报告真实 source_sync_state，不自动回滚或重试。
+
+## 保留未写入的材料失败，仅安装修复源码
+
+已明确授权修复并同步源码，而最新材料失败因 controller 级分类阻断安装时，在普通发布入口增加 `--preserve-material-failure /absolute/path/to/action.json`，可重复指定精确清单。同时提供上述原执行的三个绑定参数。原 cron 必须 PAUSED，拒绝停止门，不与其他维护分支混用。
+
+目标自身的现有校验器核对最新待办、完整 action/state 归属、controller 级材料失败回执、未写入恢复合同及当前授权。清单必须精确解释全部 `pending_failure_not_isolated`，其他阻断、未知写入或 Writer 产物仍拒绝。其他待办继续核验冻结材料。原 action/state、回执和全部附件按文件身份与字节哈希在同步前后保留，原对账 continuation 不改写。
+
+本分支只安装源码，不创建 attempt、不调用模型、不提交 OA。回执记录 `material_failure_source_only=true`、`approval_recovery_allowed=false`、`next_process_ready=false` 和同步前后完整状态证明。随后按已有显式恢复合同重新取材；材料仍不可读取的单据保留待人工处理，不生成缺少数据的意见。权限拒绝与真正登录失效分别分类，前者局部隔离，后者仍阻断整轮。
