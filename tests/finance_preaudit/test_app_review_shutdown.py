@@ -8,14 +8,14 @@ from apps.oa_finance_preaudit import app_review_shutdown as shutdown, controller
 from tests.finance_preaudit.test_host_chat_review import exchange, native_call, seal_execution
 
 
-def proofs(owner, child, *, status='interrupted', exit_code=0, session='original-session'):
+def proofs(owner, child, *, status='interrupted', exit_code=0, session='original-session', wait_arguments=None):
     parent = child.with_name('parent.jsonl')
     interrupts = [native_call(parent, 'interrupt_agent', {'target': f'/root/reviewer_{slot}'},
         f'stop-{slot}', {'previous_status': 'running'}) for slot in range(3)]
     statuses = native_call(parent, 'list_agents', {}, 'shutdown-status', {'agents': [
         {'agent_name': f'/root/reviewer_{slot}', 'agent_status': status} for slot in range(3)]})
     wait = native_call(parent, 'functions.exec',
-        'text(await tools.write_stdin(' + json.dumps({'session_id': session, 'chars': '', 'yield_time_ms': 1000}) + '));',
+        'text(await tools.write_stdin(' + (wait_arguments or json.dumps({'session_id': session, 'chars': '', 'yield_time_ms': 1000})) + '));',
         'original-driver-wait', {'exit_code': exit_code, 'output': 'test driver exited'})
     return {'source': parent, 'interrupt_lines': interrupts, 'status_line': statuses, 'wait_line': wait}
 
@@ -104,6 +104,49 @@ def test_abort_can_verify_nonzero_driver_exit_without_reporting_business_success
     result = shutdown.finish(owner=owner, **proofs(owner, child, exit_code=1))
     assert result['status'] == 'verified'
     assert result['exchange_state'] == 'cancelled' and result['driver_exit_code'] == 1
+
+
+@pytest.mark.parametrize('arguments', [
+    '{session_id:"original-session",chars:"",yield_time_ms:1000,max_output_tokens:3000}',
+    '{"session_id":"original-session", chars:"", "yield_time_ms":1000}',
+])
+def test_shutdown_accepts_native_literal_keys_and_preserves_original_sources(exchange, arguments):
+    _, _, owner, child, _, manifest, _ = exchange
+    shutdown.begin(owner=owner, reason='reviewer_failed')
+    controller_handoff.finish(manifest, status='failed', children_reaped=True, health='degraded')
+    path = seal_execution(owner, manifest)
+    receipt = json.loads(path.read_text())
+    receipt.update(result='failed', exit_code=1, controller_state='failed')
+    host.guard.write(path, receipt)
+    args = proofs(owner, child, exit_code=1, wait_arguments=arguments)
+    original = args['source'].read_bytes()
+    result = shutdown.finish(owner=owner, **args)
+    assert result['status'] == 'verified' and result['driver_exit_code'] == 1
+    assert result['driver_wait_source']['line'] == args['wait_line']
+    assert args['source'].read_bytes() == original
+
+
+@pytest.mark.parametrize('arguments', [
+    '{session_id:session,chars:""}',
+    '{session_id:"original-"+"session",chars:""}',
+    '{...other,session_id:"original-session",chars:""}',
+    '{["session_id"]:"original-session",chars:""}',
+    '{session_id:"original-session",session_id:"original-session",chars:""}',
+    '{"session_id":"original-session","session_id":"original-session",chars:""}',
+    '{session_id:"another-session",chars:""}',
+    '{session_id:"original-session",chars:"x"}',
+    '{session_id:"original-session",chars:"",extra:0}',
+    '{session_id:"original-session",chars:"",yield_time_ms:call()}',
+    '{session_id:"original-session",chars:"",yield_time_ms:{value:1000}}',
+])
+def test_shutdown_rejects_nonliteral_or_ambiguous_wait_arguments(exchange, arguments):
+    _, _, owner, child, _, manifest, _ = exchange
+    shutdown.begin(owner=owner, reason='reviewer_failed')
+    controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
+    seal_execution(owner, manifest)
+    with pytest.raises(ValueError):
+        shutdown.finish(owner=owner, **proofs(owner, child, wait_arguments=arguments))
+    assert json.loads(host.registry_file(owner).read_text())['shutdown']['status'] == 'pending'
 
 
 def test_old_interrupts_cannot_be_reused_for_a_new_shutdown(exchange):
