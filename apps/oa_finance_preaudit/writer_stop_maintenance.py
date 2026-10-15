@@ -160,15 +160,6 @@ def recover(
             maintenance_runtime.assert_live_safe(snapshot)
             state = bound["state"]
             stop_recovery._require_historical(snapshot["reconciliation"], state)
-            findings = snapshot["reconciliation"]["findings"]
-            matches = [
-                r
-                for r in findings
-                if (r.get("workflow_key"), r.get("item_key"), r.get("attempt"))
-                == (state["workflow_key"], state["case_key"], state["attempt"])
-            ]
-            if len(matches) != 1 or matches[0].get("category") != "handled_not_pending":
-                raise ValueError(BLOCKED)
             if automation.findings(target):
                 raise ValueError(BLOCKED)
             receipt = {

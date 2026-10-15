@@ -167,7 +167,18 @@ def test_verified_postcheck_timeout_can_release_historical_stop(
 
     monkeypatch.setattr(production_write, "verified_unknown_write_failure", verified)
     before = {p: p.read_bytes() for p in action.parent.iterdir() if p.is_file()}
-    result = _recover(action, _live(_trusted(key, "handled_not_pending")))
+    report = _trusted(key, "handled_not_pending")
+    report["findings"] = [
+        {
+            "workflow_key": state["workflow_key"],
+            "item_key": state["case_key"],
+            "attempt": state["attempt"],
+            "category": "handled_not_pending",
+            "local_execution_state": "needs_admin",
+            "local_write_state": "unknown",
+        }
+    ]
+    result = _recover(action, _live(report))
     assert result["status"] == "recovered"
     assert observed and all(
         x == (action.parent, "writer_postcheck_timeout", "writer_postcheck_timeout")
@@ -175,3 +186,54 @@ def test_verified_postcheck_timeout_can_release_historical_stop(
     )
     assert not stop.exists()
     assert all(p.read_bytes() == raw for p, raw in before.items())
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "invisible",
+        "missing",
+        "duplicate",
+        "wrong_workflow",
+        "wrong_attempt",
+        "bad_signature",
+    ],
+)
+def test_postcheck_timeout_requires_one_exact_handled_item(
+    environment, monkeypatch, damage
+):
+    from apps.oa_finance_preaudit import production_write
+
+    action, stop, key = environment
+    path = action.with_name("state.json")
+    state = json.loads(path.read_text())
+    state["reason"] = "writer_postcheck_timeout"
+    path.write_text(json.dumps(state))
+    monkeypatch.setattr(
+        production_write,
+        "verified_unknown_write_failure",
+        lambda *_args: damage != "bad_signature",
+    )
+    report = _trusted(key, "handled_not_pending")
+    row = {
+        "workflow_key": state["workflow_key"],
+        "item_key": state["case_key"],
+        "attempt": state["attempt"],
+        "category": "handled_not_pending",
+        "local_execution_state": "needs_admin",
+        "local_write_state": "unknown",
+    }
+    report["findings"] = [row]
+    if damage == "invisible":
+        row["category"] = "invisible"
+    elif damage == "missing":
+        report["findings"] = []
+    elif damage == "duplicate":
+        report["findings"] *= 2
+    elif damage == "wrong_workflow":
+        row["workflow_key"] = "general_expense"
+    elif damage == "wrong_attempt":
+        row["attempt"] = 2
+    with pytest.raises(ValueError, match="writer_stop_recovery_blocked"):
+        _recover(action, _live(report))
+    assert stop.exists()
