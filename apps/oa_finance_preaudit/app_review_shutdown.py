@@ -55,6 +55,22 @@ def _source(value: dict, owner: str, source: Path, line: int, *, earliest: float
     return native['anchor'], proof
 
 
+def _wait_arguments(raw: str) -> dict:
+    """Parse only data literals from the native read-only wait call, never JS."""
+    key = r'(?:session_id|chars|yield_time_ms|max_output_tokens)'
+    literal = r'(?:"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"|0|[1-9][0-9]*)'
+    member = rf'(?:"{key}"|{key})\s*:\s*{literal}'
+    if re.fullmatch(rf'\s*\{{\s*{member}(?:\s*,\s*{member})*\s*\}}\s*', raw) is None:
+        raise ValueError('host_review_shutdown_wait_untrusted')
+    arguments = {}
+    for match in re.finditer(rf'(?P<key>"{key}"|{key})\s*:\s*(?P<value>{literal})', raw):
+        name = match['key'].strip('"')
+        if name in arguments:
+            raise ValueError('host_review_shutdown_wait_untrusted')
+        arguments[name] = json.loads(match['value'])
+    return arguments
+
+
 def _wait_result(anchor: dict, output: dict, session: str) -> dict:
     payload = anchor.get('payload', {})
     if payload.get('name') not in {'exec', 'functions.exec'} or not payload.get('call_id'):
@@ -63,7 +79,7 @@ def _wait_result(anchor: dict, output: dict, session: str) -> dict:
     match = re.fullmatch(r'\s*text\(await tools\.write_stdin\((\{.*\})\)\);?\s*', code or '', re.DOTALL)
     if match is None:
         raise ValueError('host_review_source_untrusted')
-    args = json.loads(match.group(1))
+    args = _wait_arguments(match.group(1))
     if (not isinstance(args, dict) or str(args.get('session_id')) != session or args.get('chars', '') != ''
             or set(args) - {'session_id', 'chars', 'yield_time_ms', 'max_output_tokens'}):
         raise ValueError('host_review_shutdown_wait_untrusted')
