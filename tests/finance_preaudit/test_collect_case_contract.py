@@ -1805,7 +1805,7 @@ class TestCollectCaseContract:
 
 
 @pytest.mark.parametrize("config", FLOW_CONFIGS)
-@pytest.mark.parametrize("company_browser", ["browser.5534", "browser.38009"])
+@pytest.mark.parametrize("company_browser", ["browser.5534", "browser.38009", "browser.19001"])
 def test_collection_preserves_populated_fields_and_reading_state(config: dict, company_browser: str) -> None:
     class FieldApi(RecordedOaApi):
         def request_context(self, request_id: str) -> tuple[dict, list]:
@@ -1866,6 +1866,9 @@ def test_collection_preserves_populated_fields_and_reading_state(config: dict, c
     ({"fieldHtmlType": "3", "fieldValue": "11", "fieldShowValue": None}, "", "unresolved", "none"),
     ({"fieldHtmlType": "5", "fieldValue": "0", "fieldShowValue": ""}, "", "unresolved", "none"),
     ({"fieldName": "bxgs", "fieldShowName": "报销公司", "fieldHtmlType": "3", "fieldType": "226", "fieldValue": "11", "fieldShowValue": ""}, "", "unresolved", "none"),
+    ({"fieldName": "bxgs", "fieldShowName": "报销公司", "fieldHtmlType": "3", "fieldType": "226", "fieldDBType": "browser.19001", "fieldValue": "11", "fieldShowValue": ""}, "", "unresolved", "none"),
+    ({"fieldName": "bxgs", "fieldShowName": "报销公司", "fieldHtmlType": "3", "fieldType": "161", "fieldDBType": "browser.19001", "fieldValue": "示例食品有限公司", "fieldShowValue": ""}, "", "unresolved", "none"),
+    ({"fieldName": "other", "fieldShowName": "其他字段", "fieldHtmlType": "3", "fieldType": "226", "fieldDBType": "browser.19001", "fieldValue": "示例食品有限公司", "fieldShowValue": ""}, "", "unresolved", "none"),
     ({"fieldName": "sapkhbm", "fieldShowName": "SAP客户编码", "fieldHtmlType": "3", "fieldType": "161", "fieldValue": "11", "fieldShowValue": ""}, "", "unresolved", "none"),
     ({"fieldShowName": "发票号码", "fieldValue": "12345", "fieldShowValue": ""}, "", "unresolved", "none"),
     ({"fieldShowName": "关联发票", "fieldValue": "12345", "fieldShowValue": ""}, "", "unresolved", "none"),
