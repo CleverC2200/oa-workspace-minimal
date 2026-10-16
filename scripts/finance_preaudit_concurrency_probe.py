@@ -1339,7 +1339,14 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 "action": "failed",
                 "error_code": "production_probe_stopped",
             }
-        if recovery_action_file is not None and action.get("action") != "review_required":
+        if (
+            recovery_action_file is not None
+            and action.get("action") != "review_required"
+            and not (
+                action.get("action") == "needs_admin"
+                and action.get("reason") in QUARANTINED_REASONS
+            )
+        ):
             runtime_control.request_stop("production_probe_prepare_failed")
             return failed(
                 "unexpected_action",
@@ -1472,6 +1479,10 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                     "action": "quarantined",
                     "error_code": str(action["reason"]),
                     "write_state": "not_requested",
+                    **(
+                        {"recovery_action_file": str(recovery_action_file)}
+                        if recovery_action_file is not None else {}
+                    ),
                     **(
                         {"late_visible_keys": sorted(newly_late_visible_keys)}
                         if newly_late_visible_keys
@@ -3065,6 +3076,10 @@ def _run_dispatched_tasks(
                     and prepared.get("write_state") == "not_requested"
                     and prepared.get("error_code") in ITEM_LOCAL_QUARANTINE_REASONS
                 ):
+                    recovery_queue = tuple(
+                        path for path in recovery_queue
+                        if str(path) != prepared.get("recovery_action_file")
+                    )
                     outcomes[index] = process_pool.TaskOutcome(
                         index=index,
                         status="completed",
