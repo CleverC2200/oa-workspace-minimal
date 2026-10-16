@@ -159,7 +159,7 @@ def test_writer_rejection_does_not_retry_after_resource_recovery(tmp_path: Path,
     assert probe.runtime_control.stop_reason() is None
 
 
-def test_prepared_work_waits_until_existing_reviews_drain_after_decrease(tmp_path: Path, monkeypatch):
+def test_prepared_work_waits_for_review_capacity_after_decrease(tmp_path: Path, monkeypatch):
     from tests.finance_preaudit.test_concurrency_probe import _open_action
     monkeypatch.setattr(probe.runtime_control, "stop_requested", lambda: False)
     monkeypatch.setattr(probe, "_preparation_executor", lambda: ThreadPoolExecutor(max_workers=1))
@@ -170,6 +170,7 @@ def test_prepared_work_waits_until_existing_reviews_drain_after_decrease(tmp_pat
     sixth_started = False
     release_preparation = threading.Event()
     release_reviews = threading.Event()
+    sixth_entered = threading.Event()
     guard = threading.Lock()
     def prepare(selection):
         nonlocal prepare_count
@@ -195,10 +196,15 @@ def test_prepared_work_waits_until_existing_reviews_drain_after_decrease(tmp_pat
         with guard:
             active += 1
             if prepared_order[Path(task["action_file"])] == 6:
+                sixth_entered.set()
                 assert release_reviews.is_set()
-                assert active == 1
+                # One old review deliberately stays in flight. The new review
+                # may start once the reduced two-slot capacity has room.
+                assert active == control.CAPACITY_STEPS[0] == 2
                 sixth_started = True
         assert release_reviews.wait(2)
+        if prepared_order[Path(task["action_file"])] == 5:
+            assert sixth_entered.wait(2)
         with guard:
             active -= 1
         return {"status": "reviewed", "decision": {}, "process_attempts": 1,
@@ -209,5 +215,6 @@ def test_prepared_work_waits_until_existing_reviews_drain_after_decrease(tmp_pat
         complete_review=lambda p,v: {**v, "status": "completed", "business_state": "pass", "write_state": "submitted"},
         executor_factory=lambda n: ThreadPoolExecutor(max_workers=n))
     assert result.completed == 6
+    assert result.failed == result.stopped == result.timed_out == 0
     assert sixth_started
     assert result.recommended_capacity == control.CAPACITY_STEPS[0] == 2
