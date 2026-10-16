@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from urllib.error import HTTPError
 
 import fitz
 import pytest
@@ -27,6 +28,28 @@ def fake_api(monkeypatch):
             'message': {'content': '读数 12345；右下角日期无法确认。'}}],
             'usage': {'total_tokens': 15}}
     monkeypatch.setattr(recognition, '_post', post)
+    return calls
+
+
+def fake_http(monkeypatch, respond):
+    monkeypatch.setenv('OA_REVIEW_API_KEY', 'offline-secret')
+    calls = []
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return None
+        def read(self, size):
+            return json.dumps(self.payload).encode()
+    class Opener:
+        def open(self, request, timeout):
+            assert request.full_url == recognition.ENDPOINT
+            body = json.loads(request.data)
+            calls.append(body)
+            return Response(respond(body))
+    monkeypatch.setattr(recognition, 'build_opener', lambda *args: Opener())
     return calls
 
 
@@ -81,6 +104,58 @@ def test_truncated_response_is_failed_and_preserves_partial_results(tmp_path, mo
     assert report['failed_part']['resource_id'] == 'file-1'
     assert json.loads(Path(report['report_file']).read_text())['status'] == 'failed'
     assert calls == []
+
+
+def test_direct_http_transcription_disables_default_thinking(tmp_path, monkeypatch, capsys):
+    def respond(body):
+        disabled = body.get('thinking') == {'type': 'disabled'}
+        return {'choices': [{'finish_reason': 'stop' if disabled else 'length',
+            'message': {'content': '完整转写' if disabled else ''}}]}
+    calls = fake_http(monkeypatch, respond)
+    output = tmp_path / 'out'
+    assert recognition.main(['--file', str(image(tmp_path)), '--prompt', '完整读取本页',
+                             '--output-dir', str(output)]) == 0
+    assert json.loads(capsys.readouterr().out)['status'] == 'complete'
+    assert len(calls) == 1
+    assert calls[0]['thinking'] == {'type': 'disabled'}
+    assert calls[0]['max_tokens'] == 8192
+    assert json.loads((output / 'recognition.json').read_text())['parts'][0]['answer'] == '完整转写'
+
+
+@pytest.mark.parametrize(('finish_reason', 'content', 'tool_calls'), [
+    ('length', 'partial private content', []),
+    ('stop', '', []),
+    ('tool_calls', None, [{'secret': 'private-tool-arguments'}]),
+    ('private-untrusted-reason', 'partial private content', []),
+])
+def test_incomplete_response_keeps_safe_diagnostics_without_retry(
+        tmp_path, monkeypatch, capsys, finish_reason, content, tool_calls):
+    def respond(body):
+        return {'choices': [{'finish_reason': finish_reason, 'message': {
+            'content': content, 'tool_calls': tool_calls, 'reasoning_content': 'private-reasoning'}}],
+            'usage': {'prompt_tokens': 100, 'completion_tokens': 8192, 'total_tokens': 8292,
+                      'completion_tokens_details': {'reasoning_tokens': 8192},
+                      'private': 'private-usage'}}
+    calls = fake_http(monkeypatch, respond)
+    output = tmp_path / 'out'
+    assert recognition.main(['--file', str(image(tmp_path)), '--prompt', '读图',
+                             '--output-dir', str(output)]) == 1
+    summary = json.loads(capsys.readouterr().out)
+    report = json.loads(Path(summary['report_file']).read_text())
+    assert report['status'] == 'failed'
+    assert report['error_code'] == 'attachment_response_incomplete'
+    assert report['parts'] == []
+    assert len(calls) == 1
+    assert report['failed_response'] == {
+        'finish_reason': finish_reason if finish_reason in {'length', 'stop', 'tool_calls'} else 'unknown',
+        'content_chars': len(content or ''), 'has_tool_calls': bool(tool_calls),
+        'usage': {'prompt_tokens': 100, 'completion_tokens': 8192, 'total_tokens': 8292,
+                  'reasoning_tokens': 8192}}
+    saved = (Path(report['report_file'])).read_text()
+    assert all(value not in saved for value in (
+        'partial private content', 'private-reasoning', 'private-tool-arguments',
+        'private-untrusted-reason', 'private-usage', 'offline-secret'))
+    assert json.loads(saved)['failed_response'] == report['failed_response']
 
 
 def test_no_model_process_or_subprocess_is_started(tmp_path, monkeypatch):
@@ -169,26 +244,41 @@ def test_http_request_uses_only_deepseek_endpoint_and_custom_prompt(monkeypatch)
                         'timeout': 15, 'authorization': 'Bearer private'}
 
 
-def test_failed_second_page_keeps_first_page_answer(tmp_path, monkeypatch):
-    fake_api(monkeypatch)
+@pytest.mark.parametrize('error_code', ['attachment_api_http_429', 'attachment_response_incomplete'])
+def test_failed_second_page_keeps_first_page_answer(tmp_path, monkeypatch, error_code):
     first = image(tmp_path)
     second = image(tmp_path, 'second.png')
     pix = fitz.Pixmap(second)
     pix.clear_with(0)
     pix.save(second)
     count = 0
-    def post(body, **kwargs):
+    def respond(body):
         nonlocal count
         count += 1
         if count == 2:
-            raise ValueError('attachment_api_http_429')
+            if error_code == 'attachment_response_incomplete':
+                return {'choices': [{'finish_reason': 'length', 'message': {'content': 'partial'}}]}
+            raise HTTPError(recognition.ENDPOINT, 429, 'offline', {}, None)
         return {'choices': [{'finish_reason': 'stop', 'message': {'content': 'first answer'}}]}
-    monkeypatch.setattr(recognition, '_post', post)
+    calls = fake_http(monkeypatch, respond)
     report = recognition.recognize(files=[first, second], prompt='读取', output_dir=tmp_path / 'out')
     assert report['status'] == 'failed'
     assert report['parts'][0]['answer'] == 'first answer'
     assert report['failed_part']['resource_id'] == 'file-2'
-    assert report['error_code'] == 'attachment_api_http_429'
+    assert report['error_code'] == error_code
+    assert count == 2
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize('response', [None, {'choices': []}, {'choices': [{'message': None}]}])
+def test_malformed_response_diagnostic_does_not_hide_original_error(tmp_path, monkeypatch, response):
+    fake_api(monkeypatch)
+    monkeypatch.setattr(recognition, '_post', lambda *args, **kwargs: response)
+    report = recognition.recognize(files=[image(tmp_path)], prompt='读图', output_dir=tmp_path / 'out')
+    assert report['status'] == 'failed'
+    assert report['error_code'] == 'attachment_response_invalid'
+    assert report['failed_response'] == {
+        'finish_reason': 'unknown', 'content_chars': 0, 'has_tool_calls': False, 'usage': {}}
 
 
 @pytest.mark.parametrize(('prepared', 'code'), [

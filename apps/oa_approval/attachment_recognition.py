@@ -109,6 +109,24 @@ def _answer(response: dict) -> tuple[str, dict]:
         raise ValueError('attachment_response_invalid') from None
 
 
+def _response_diagnostic(response: dict) -> dict:
+    choices = response.get('choices') if isinstance(response, dict) else None
+    choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+    message = choice.get('message')
+    message = message if isinstance(message, dict) else {}
+    reason = choice.get('finish_reason')
+    usage = response.get('usage') if isinstance(response, dict) else None
+    usage = usage if isinstance(usage, dict) else {}
+    counts = {key: usage[key] for key in ('prompt_tokens', 'completion_tokens', 'total_tokens')
+              if type(usage.get(key)) is int and usage[key] >= 0}
+    details = usage.get('completion_tokens_details')
+    if isinstance(details, dict) and type(details.get('reasoning_tokens')) is int and details['reasoning_tokens'] >= 0:
+        counts['reasoning_tokens'] = details['reasoning_tokens']
+    return {'finish_reason': reason if reason in ('stop', 'length', 'tool_calls', 'content_filter', 'insufficient_system_resource') else 'unknown',
+            'content_chars': len(message['content']) if isinstance(message.get('content'), str) else 0,
+            'has_tool_calls': bool(message.get('tool_calls')), 'usage': counts}
+
+
 def _image_block(raw: bytes) -> dict:
     if raw.startswith(b'\x89PNG\r\n\x1a\n'):
         mime = 'image/png'
@@ -267,10 +285,16 @@ def recognize(*, files: list[Path] | None = None, action_file: Path | None = Non
                 result = {**current, 'answer': previous['answer'], 'reused_from': previous['part_id']}
             else:
                 body = {'model': MODEL, 'stream': False, 'max_tokens': 8192,
+                        'thinking': {'type': 'disabled'},
                         'messages': [{'role': 'system', 'content': SYSTEM_PROMPT},
                                      {'role': 'user', 'content': [
                                          {'type': 'text', 'text': prompt}, block]}]}
-                answer, usage = _answer(_post(body, key=key, timeout=min(timeout_seconds, max(.1, deadline - time.monotonic()))))
+                response = _post(body, key=key, timeout=min(timeout_seconds, max(.1, deadline - time.monotonic())))
+                try:
+                    answer, usage = _answer(response)
+                except ValueError:
+                    report['failed_response'] = _response_diagnostic(response)
+                    raise
                 result = {**current, 'answer': answer, 'usage': usage}
                 cache[cache_key] = result
             report['parts'].append(result)
