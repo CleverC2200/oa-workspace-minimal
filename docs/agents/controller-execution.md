@@ -95,7 +95,7 @@ python -B -m apps.oa_finance_preaudit.host_chat_review --operation submit --owne
 
 正常完成、人工取消、官方限制、子 Agent 异常和父任务主动退出均执行同一协议。主对话进入 final 前必须取得 `preaudit_app_shutdown` 的 `status=verified` 回执。父 final 不会可靠地中断仍运行的子 Agent。DeepSeek 保持原收尾路径。
 
-1. 调用 `begin-shutdown`，reason 选择 completed、cancelled、reviewer_failed 或 parent_lost。它冻结本轮派单、续租及迟到结果，返回原 3 个 `interrupt_targets` 和原工具 session ID。非正常原因同时关闭 exchange 并请求停止控制器；不发信号终止 Writer。begin 与在途包装完成共用原轮锁，可能等待已进入的 Writer 完成后才返回；不承诺抢占写入。单独的 exchange cancelled/closed 不代表统一收尾已完成。
+1. 调用 `begin-shutdown`，reason 选择 completed、cancelled、reviewer_failed 或 parent_lost。它冻结本轮派单、续租及迟到结果，返回原 3 个 `interrupt_targets` 和原工具 session ID。非正常原因关闭 exchange；只有原执行终态与回收可信，且 Controller、全局及请求 Writer 均空闲时，才省略周期停止请求。不发信号终止 Writer。begin 与在途包装完成共用原轮锁，可能等待已进入的 Writer 完成后才返回；不承诺抢占写入。单独的 exchange cancelled/closed 不代表统一收尾已完成。
 2. 对返回的每个原 Agent 调用一次原生 `collaboration.interrupt_agent`，即使它当前已经空闲，也保留实际配对回执。不得新增或替换 Agent。随后调用原生 `collaboration.list_agents`，确认本轮 3 槽全部为 idle、completed 或 interrupted；仍 running、缺失、工具失败或来源不可验证时保持 pending。
 3. 继续等待原工具 session 和 Writer。原工具必须有实际终态 `write_stdin` 回执，调用单独使用下方形状；只轮询、不写 stdin。财务阶段已经取得的同一原 session 退出回执可复用。进程回执必须 terminal、children_reaped=true，退出码与原生等待一致，Writer 和请求 Writer 均空闲。非零退出只可封存为取消/异常收尾，不能报业务完成；unknown 写入及封存失败保持原阻断，不重放。
 4. 调用 `finish-shutdown`，提供同一父原生来源文件、按槽位顺序的 3 个 interrupt 行、最终 list_agents 行以及原 write_stdin 行。它检查时间顺序和配对输出摘要，保留精简来源证明。正常完成额外执行财务及包装原闭合门禁。缺证据时保持 pending，可继续监督并补齐证据。若正常计划期间发生取消，重新 begin-shutdown 以已记录的取消原因降为异常计划，原冻结时点保持不变；不能升级回正常计划。此时不能把它当成功或重启原审批。verified 后才结束父回合。

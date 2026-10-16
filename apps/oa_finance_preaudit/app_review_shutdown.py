@@ -40,7 +40,7 @@ def begin(*, owner: str, reason: str) -> dict:
     if reason != 'completed':
         host.close(owner=owner, reason=reason)
         if value['state'] != 'open':
-            runtime_control.request_cycle_stop()
+            host.request_abort_stop(value)
     return plan
 
 
