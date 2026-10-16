@@ -1517,7 +1517,7 @@ class TestReadAdaptersContract:
         assert images == []
         assert manifest[0]["status"] == "spreadsheet_read"
         assert structured[0]["document_type"] == "spreadsheet"
-        assert structured[0]["key_text"] == ["Sheet!R1: attendance evidence"]
+        assert structured[0]["key_text"] == ["Sheet!R1: C1=attendance evidence"]
 
     def test_true_legacy_xls_keeps_legacy_reader(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
