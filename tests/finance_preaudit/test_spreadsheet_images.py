@@ -1,4 +1,6 @@
 import io
+import hashlib
+import random
 import zipfile
 from pathlib import Path
 import openpyxl
@@ -7,11 +9,11 @@ import pytest
 from apps.oa_approval import attachment_extractors
 
 
-def book(tmp_path: Path, *, broken=False):
+def book(tmp_path: Path, *, broken=False, image_content=None):
     path = tmp_path / 'photos.xlsx'
     image = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 8, 8), False)
     image.clear_with(255)
-    png = io.BytesIO(image.tobytes('png'))
+    png = io.BytesIO(image_content or image.tobytes('png'))
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = '现场'
@@ -79,3 +81,48 @@ def test_image_relationship_cannot_escape_workbook(tmp_path):
     rewrite_part(path, 'xl/_rels/cellimages.xml.rels', lambda b: b.replace(b'media/cell.png', b'../../outside.png'))
     with pytest.raises(RuntimeError, match='attachment_content_incomplete'):
         attachment_extractors.prepare_materials([{'resource_id':'book', 'path':str(path)}], out_dir=tmp_path/'prepared')
+
+
+def test_compact_spreadsheet_keeps_pixels_anchors_and_original_source(tmp_path):
+    image = fitz.Pixmap(fitz.csRGB, 600, 840, random.Random(7).randbytes(600 * 840 * 3), 0)
+    image.set_dpi(144, 144)
+    content = image.tobytes('png')
+    source = book(tmp_path, image_content=content)
+    original = source.read_bytes()
+    descriptor = {'resource_id': 'book', 'path': str(source)}
+    normal, _, _ = attachment_extractors.prepare_materials([descriptor], out_dir=tmp_path/'normal')
+    compact, manifest, facts = attachment_extractors.prepare_materials(
+        [descriptor], out_dir=tmp_path/'compact', compact_spreadsheet=True,
+    )
+    assert source.read_bytes() == original
+    assert len(normal) == len(compact) == manifest[0]['image_count'] == 2
+    assert {item['spreadsheet_cell'] for item in compact} == {'现场!B2', '现场!C3'}
+    assert sum(Path(item['path']).stat().st_size for item in compact) < len(content) * 2 * 0.7
+    for before, after in zip(normal, compact):
+        assert Path(before['path']).read_bytes() == content
+        assert after['resource_id'] == before['resource_id'] == 'book'
+        assert after['source_content_sha256'] == hashlib.sha256(original).hexdigest()
+        prepared = Path(after['path'])
+        assert prepared.suffix == '.jpg'
+        assert after['content_sha256'] == hashlib.sha256(prepared.read_bytes()).hexdigest()
+        decoded = fitz.Pixmap(str(prepared))
+        assert (decoded.width, decoded.height) == (600, 840)
+    assert compact[0]['content_sha256'] == compact[1]['content_sha256']
+    assert any('B2' in text for text in facts[0]['key_text'])
+    assert any('C3' in text for text in facts[0]['key_text'])
+
+
+@pytest.mark.parametrize('transparent', [False, True])
+def test_compact_spreadsheet_keeps_small_or_transparent_images_lossless(tmp_path, transparent):
+    if transparent:
+        image = fitz.Pixmap(fitz.csRGB, 400, 400, random.Random(8).randbytes(400 * 400 * 4), 1)
+    else:
+        image = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 8, 8), False)
+        image.clear_with(255)
+    content = image.tobytes('png')
+    source = book(tmp_path, image_content=content)
+    images, _, _ = attachment_extractors.prepare_materials(
+        [{'resource_id': 'book', 'path': str(source)}],
+        out_dir=tmp_path/'prepared', compact_spreadsheet=True,
+    )
+    assert all(Path(item['path']).read_bytes() == content for item in images)

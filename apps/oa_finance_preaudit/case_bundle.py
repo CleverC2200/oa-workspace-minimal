@@ -570,6 +570,7 @@ def collect_case(
         images, manifest, structured_contents = attachment_extractors.prepare_materials(
             bound_downloads,
             compact_pdf=config.get("flow_key") == "general_expense",
+            compact_spreadsheet=config.get("flow_key") == "tpm_small_marketing_fee",
             out_dir=Path(
                 prepared_root or Path("runtime/finance_preaudit_prepared")
             ).expanduser().resolve()

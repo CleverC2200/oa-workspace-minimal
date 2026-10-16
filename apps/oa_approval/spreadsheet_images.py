@@ -17,7 +17,7 @@ _NS = {
 }
 
 
-def extract(path: Path, out_dir: Path, prefix: str) -> list[tuple[Path, str]]:
+def extract(path: Path, out_dir: Path, prefix: str, *, compact: bool = False) -> list[tuple[Path, str]]:
     from openpyxl.utils import get_column_letter
 
     output = []
@@ -67,12 +67,18 @@ def extract(path: Path, out_dir: Path, prefix: str) -> list[tuple[Path, str]]:
             suffix = Path(member).suffix.lower()
             if suffix not in {'.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tif', '.tiff', '.webp'}:
                 raise ValueError("spreadsheet_image_unsupported")
-            destination = out_dir / f'{prefix}_excel_{len(output)+1}{suffix}'
             content = read(member, 50_000_000)
             with fitz.open(stream=content) as image:
                 if image.is_pdf or image.page_count != 1 or image[0].rect.get_area() > 100_000_000:
                     raise ValueError("spreadsheet_image_unreadable")
                 image[0].get_pixmap()
+            if compact and suffix == '.png' and len(content) > 256 * 1024:
+                pixels = fitz.Pixmap(content)
+                if not pixels.alpha and pixels.colorspace.n == 3:
+                    jpeg = pixels.tobytes('jpeg', jpg_quality=95)
+                    if len(jpeg) < len(content):
+                        content, suffix = jpeg, '.jpg'
+            destination = out_dir / f'{prefix}_excel_{len(output)+1}{suffix}'
             destination.write_bytes(content)
             output.append((destination, cell))
 

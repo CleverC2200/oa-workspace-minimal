@@ -666,6 +666,7 @@ def _prepare_one_attachment(
     manifest: List[Dict[str, Any]],
     structured_contents: List[Dict[str, Any]],
     compact_pdf: bool = False,
+    compact_spreadsheet: bool = False,
 ) -> None:
     path = Path(str(item.get("path") or "")).expanduser()
     resource_id = str(item.get("resource_id") or "")
@@ -778,6 +779,7 @@ def _prepare_one_attachment(
 
             extracted_images = spreadsheet_images.extract(
                 path, out_dir, safe_name(resource_id, path.stem),
+                compact=compact_spreadsheet,
             )
             fact = spreadsheet_fact(path, resource_id=resource_id, name=name)
             for number, (image_path, cell) in enumerate(extracted_images, 1):
@@ -940,6 +942,7 @@ def prepare_materials(
     *,
     out_dir: Path,
     compact_pdf: bool = False,
+    compact_spreadsheet: bool = False,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     images: List[Dict[str, Any]] = []
     manifest: List[Dict[str, Any]] = []
@@ -964,6 +967,7 @@ def prepare_materials(
                         manifest=child_manifest,
                         structured_contents=structured_contents,
                         compact_pdf=compact_pdf,
+                        compact_spreadsheet=compact_spreadsheet,
                     )
             validation_manifest.extend(child_manifest)
             manifest.append(
@@ -984,6 +988,7 @@ def prepare_materials(
                 manifest=manifest,
                 structured_contents=structured_contents,
                 compact_pdf=compact_pdf,
+                compact_spreadsheet=compact_spreadsheet,
             )
             validation_manifest.extend(manifest[manifest_count_before:])
     successful_statuses = {
