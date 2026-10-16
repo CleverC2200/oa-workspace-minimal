@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from urllib.error import HTTPError
 
 import fitz
 import pytest
@@ -27,6 +28,28 @@ def fake_api(monkeypatch):
             'message': {'content': '读数 12345；右下角日期无法确认。'}}],
             'usage': {'total_tokens': 15}}
     monkeypatch.setattr(recognition, '_post', post)
+    return calls
+
+
+def fake_http(monkeypatch, respond):
+    monkeypatch.setenv('OA_REVIEW_API_KEY', 'offline-secret')
+    calls = []
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return None
+        def read(self, size):
+            return json.dumps(self.payload).encode()
+    class Opener:
+        def open(self, request, timeout):
+            assert request.full_url == recognition.ENDPOINT
+            body = json.loads(request.data)
+            calls.append(body)
+            return Response(respond(body))
+    monkeypatch.setattr(recognition, 'build_opener', lambda *args: Opener())
     return calls
 
 
@@ -84,23 +107,11 @@ def test_truncated_response_is_failed_and_preserves_partial_results(tmp_path, mo
 
 
 def test_direct_http_transcription_disables_default_thinking(tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv('OA_REVIEW_API_KEY', 'offline-secret')
-    calls = []
-    class Response:
-        def __enter__(self):
-            return self
-        def __exit__(self, *args):
-            return None
-        def read(self, size):
-            disabled = calls[-1].get('thinking') == {'type': 'disabled'}
-            return json.dumps({'choices': [{'finish_reason': 'stop' if disabled else 'length',
-                'message': {'content': '完整转写' if disabled else ''}}]}).encode()
-    class Opener:
-        def open(self, request, timeout):
-            assert request.full_url == recognition.ENDPOINT
-            calls.append(json.loads(request.data))
-            return Response()
-    monkeypatch.setattr(recognition, 'build_opener', lambda *args: Opener())
+    def respond(body):
+        disabled = body.get('thinking') == {'type': 'disabled'}
+        return {'choices': [{'finish_reason': 'stop' if disabled else 'length',
+            'message': {'content': '完整转写' if disabled else ''}}]}
+    calls = fake_http(monkeypatch, respond)
     output = tmp_path / 'out'
     assert recognition.main(['--file', str(image(tmp_path)), '--prompt', '完整读取本页',
                              '--output-dir', str(output)]) == 0
@@ -118,18 +129,19 @@ def test_direct_http_transcription_disables_default_thinking(tmp_path, monkeypat
     ('private-untrusted-reason', 'partial private content', []),
 ])
 def test_incomplete_response_keeps_safe_diagnostics_without_retry(
-        tmp_path, monkeypatch, finish_reason, content, tool_calls):
-    fake_api(monkeypatch)
-    calls = []
-    def post(body, **kwargs):
-        calls.append(body)
+        tmp_path, monkeypatch, capsys, finish_reason, content, tool_calls):
+    def respond(body):
         return {'choices': [{'finish_reason': finish_reason, 'message': {
             'content': content, 'tool_calls': tool_calls, 'reasoning_content': 'private-reasoning'}}],
             'usage': {'prompt_tokens': 100, 'completion_tokens': 8192, 'total_tokens': 8292,
                       'completion_tokens_details': {'reasoning_tokens': 8192},
                       'private': 'private-usage'}}
-    monkeypatch.setattr(recognition, '_post', post)
-    report = recognition.recognize(files=[image(tmp_path)], prompt='读图', output_dir=tmp_path / 'out')
+    calls = fake_http(monkeypatch, respond)
+    output = tmp_path / 'out'
+    assert recognition.main(['--file', str(image(tmp_path)), '--prompt', '读图',
+                             '--output-dir', str(output)]) == 1
+    summary = json.loads(capsys.readouterr().out)
+    report = json.loads(Path(summary['report_file']).read_text())
     assert report['status'] == 'failed'
     assert report['error_code'] == 'attachment_response_incomplete'
     assert report['parts'] == []
@@ -234,28 +246,28 @@ def test_http_request_uses_only_deepseek_endpoint_and_custom_prompt(monkeypatch)
 
 @pytest.mark.parametrize('error_code', ['attachment_api_http_429', 'attachment_response_incomplete'])
 def test_failed_second_page_keeps_first_page_answer(tmp_path, monkeypatch, error_code):
-    fake_api(monkeypatch)
     first = image(tmp_path)
     second = image(tmp_path, 'second.png')
     pix = fitz.Pixmap(second)
     pix.clear_with(0)
     pix.save(second)
     count = 0
-    def post(body, **kwargs):
+    def respond(body):
         nonlocal count
         count += 1
         if count == 2:
             if error_code == 'attachment_response_incomplete':
                 return {'choices': [{'finish_reason': 'length', 'message': {'content': 'partial'}}]}
-            raise ValueError(error_code)
+            raise HTTPError(recognition.ENDPOINT, 429, 'offline', {}, None)
         return {'choices': [{'finish_reason': 'stop', 'message': {'content': 'first answer'}}]}
-    monkeypatch.setattr(recognition, '_post', post)
+    calls = fake_http(monkeypatch, respond)
     report = recognition.recognize(files=[first, second], prompt='读取', output_dir=tmp_path / 'out')
     assert report['status'] == 'failed'
     assert report['parts'][0]['answer'] == 'first answer'
     assert report['failed_part']['resource_id'] == 'file-2'
     assert report['error_code'] == error_code
     assert count == 2
+    assert len(calls) == 2
 
 
 @pytest.mark.parametrize('response', [None, {'choices': []}, {'choices': [{'message': None}]}])
