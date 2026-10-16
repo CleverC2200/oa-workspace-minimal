@@ -177,6 +177,7 @@ def _quarantined_action(
     received_at: str,
     failure_detail_code: str | None = "attachment_download_failed",
     reason: str = "material_collection_failed",
+    attempt: int = 1,
 ) -> Path:
     case_key = hashlib.sha256(
         f"{request_id}\x1f{received_at}".encode("utf-8")
@@ -186,7 +187,7 @@ def _quarantined_action(
         / "travel_expense"
         / "cases"
         / case_key
-        / "attempt-1"
+        / f"attempt-{attempt}"
     )
     action_file = attempt_root / "action.json"
     state_file = attempt_root / "state.json"
@@ -202,7 +203,7 @@ def _quarantined_action(
         "request_id": request_id,
         "received_at": received_at,
         "case_key": case_key,
-        "attempt": 1,
+        "attempt": attempt,
         "action_file": str(action_file),
         "state_file": str(state_file),
         **(
@@ -2137,12 +2138,16 @@ def test_prepare_extends_skip_budget_when_new_item_is_quarantined(
 
 
 @pytest.mark.parametrize(
-    ("reason", "failure_detail_code"),
+    ("reason", "failure_detail_code", "recovery_mutation"),
     [
-        ("material_collection_failed", "attachment_download_failed"),
-        ("material_collection_failed", "attachment_archive_failed"),
-        ("codex_decision_invalid", None),
-        ("codex_review_failed", None),
+        ("material_collection_failed", "attachment_download_failed", None),
+        ("material_collection_failed", "attachment_archive_failed", None),
+        *(
+            ("material_collection_failed", "attachment_archive_failed", mutation)
+            for mutation in ("isolated", "writer", "unknown", "identity", "session")
+        ),
+        ("codex_decision_invalid", None, None),
+        ("codex_review_failed", None, None),
     ],
 )
 def test_prepare_global_fifo_returns_trusted_zero_write_quarantine(
@@ -2150,11 +2155,16 @@ def test_prepare_global_fifo_returns_trusted_zero_write_quarantine(
     monkeypatch,
     reason: str,
     failure_detail_code: str | None,
+    recovery_mutation: str | None,
 ) -> None:
     request_id = "quarantined-request"
     received_at = "2026-08-25T08:00:00+08:00"
     flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
     stop_requests: list[str | None] = []
+    recovery = (
+        _quarantined_action(flow_root, request_id=request_id, received_at=received_at)
+        if recovery_mutation else None
+    )
 
     class Engine:
         def next_action(self, *_args, **_kwargs) -> dict:
@@ -2163,9 +2173,24 @@ def test_prepare_global_fifo_returns_trusted_zero_write_quarantine(
                 request_id=request_id,
                 received_at=received_at,
                 reason=reason,
-                failure_detail_code=failure_detail_code,
+                failure_detail_code=(
+                    "rpa_session_invalid" if recovery_mutation == "session" else failure_detail_code
+                ),
+                attempt=2 if recovery else 1,
             )
+            if recovery_mutation == "writer":
+                action_file.with_name("writer-boundary.json").write_text("{}")
+            if recovery_mutation in {"unknown", "identity"}:
+                state_file = action_file.with_name("state.json")
+                state = json.loads(state_file.read_text())
+                state["write_state" if recovery_mutation == "unknown" else "request_id"] = "unknown"
+                json_artifact.write_json_atomic(state_file, state)
             return json.loads(action_file.read_text(encoding="utf-8"))
+
+        def recover_confirmed_no_write(self, path, **kwargs) -> dict:
+            assert path == recovery
+            assert kwargs == {"mode": "controlled_write", "confirmed": True}
+            return self.next_action()
 
     monkeypatch.setattr(finance_preaudit_concurrency_probe, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(
@@ -2184,7 +2209,7 @@ def test_prepare_global_fifo_returns_trusted_zero_write_quarantine(
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.cli,
         "_live_flow_engine",
-        lambda *, controlled, selected_identity: Engine(),
+        lambda *, controlled, selected_identity=None: Engine(),
     )
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.runtime_control,
@@ -2209,23 +2234,80 @@ def test_prepare_global_fifo_returns_trusted_zero_write_quarantine(
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe,
         "_local_quarantined_identities",
-        frozenset,
+        lambda: frozenset({(request_id, received_at)}) if recovery else frozenset(),
     )
 
-    assert finance_preaudit_concurrency_probe._prepare_one(
+    monkeypatch.setattr(
+        finance_preaudit_concurrency_probe.runtime_control,
+        "request_cycle_stop",
+        lambda: stop_requests.append("cycle_stop"),
+    )
+
+    result = finance_preaudit_concurrency_probe._prepare_one(
         {
             "workflow_key": "*",
             "assigned_identities": [],
             "historical_unknown_identities": [],
-            "recover_action_files": [],
+            "recover_action_files": [str(recovery)] if recovery else [],
         }
-    ) == {
+    )
+    if recovery_mutation in {"writer", "unknown", "identity", "session"}:
+        assert result["action"] == "failed"
+        assert result["error_code"] == (
+            "rpa_session_invalid" if recovery_mutation == "session"
+            else "production_probe_fifo_mismatch"
+        )
+        assert stop_requests == [
+            "cycle_stop" if recovery_mutation == "session"
+            else "production_probe_prepare_failed"
+        ]
+        return
+    assert result == {
         "action": "quarantined",
         "error_code": reason,
         "write_state": "not_requested",
+        **({"recovery_action_file": str(recovery)} if recovery else {}),
     }
     assert stop_requests == []
 
+
+
+def test_dispatcher_consumes_isolated_exact_recovery_before_ordinary_work(tmp_path, monkeypatch):
+    probe = finance_preaudit_concurrency_probe
+    root = tmp_path / "runtime" / "finance_preaudit_flows"
+    recovery = _quarantined_action(root, request_id="recovery", received_at="2026-08-23T07:00:00+08:00")
+    ordinary = _open_action(root, case_key="ordinary", created_at="2026-08-23T08:00:00+08:00")
+    selections = []
+    completed = []
+
+    def prepare(selection):
+        selections.append(selection)
+        if len(selections) == 1:
+            assert selection["recover_action_files"] == [str(recovery)]
+            return {"action": "quarantined", "error_code": "material_collection_failed",
+                    "write_state": "not_requested", "recovery_action_file": str(recovery)}
+        assert not selection.get("recover_action_files")
+        return {"action": "review_required", "action_file": str(ordinary)}
+
+    def complete(action, reviewed):
+        completed.append(action)
+        return {**reviewed, "status": "completed", "write_state": "submitted"}
+
+    monkeypatch.setattr(probe, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(probe, "_preparation_executor", lambda: ThreadPoolExecutor(max_workers=1))
+    monkeypatch.setattr(probe.runtime_control, "stop_requested", lambda: False)
+    result = probe._run_dispatched_tasks(
+        2, 1, project_root=tmp_path, strict_global_fifo=True,
+        recovery_action_files=(recovery,), prepare_action=prepare,
+        renew_actions=lambda paths: paths,
+        review_worker=lambda task: {"status": "reviewed", "decision": {"overall": "pass"}},
+        complete_review=complete,
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        runtime_status=lambda: {"status": "healthy"},
+    )
+    assert len(selections) == 2
+    assert [outcome.value["status"] for outcome in result.outcomes] == ["quarantined", "completed"]
+    assert completed == [ordinary]
 
 def test_prepare_global_fifo_stops_on_trusted_session_failure(
     tmp_path: Path,
