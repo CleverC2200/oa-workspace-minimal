@@ -189,3 +189,54 @@ def test_failed_second_page_keeps_first_page_answer(tmp_path, monkeypatch):
     assert report['parts'][0]['answer'] == 'first answer'
     assert report['failed_part']['resource_id'] == 'file-2'
     assert report['error_code'] == 'attachment_api_http_429'
+
+
+@pytest.mark.parametrize(('prepared', 'code'), [
+    ({'images': [], 'structured_contents': [], 'manifest': []}, 'attachment_content_empty'),
+    ({'images': [{'resource_id': 'pdf', 'content_sha256': 'a' * 64}],
+      'manifest': [{'resource_id': 'pdf', 'status': 'pdf_rendered', 'image_count': 2, 'page_count': 2}]},
+     'attachment_page_coverage_incomplete'),
+    ({'images': [{'resource_id': 'x', 'content_sha256': 'a' * 64}],
+      'manifest': [{'status': 'missing_file'}]}, 'attachment_content_incomplete'),
+    ({'images': [{'resource_id': 'x'}]}, 'attachment_page_digest_missing'),
+])
+def test_frozen_incomplete_preparation_never_calls_api(tmp_path, monkeypatch, prepared, code):
+    calls = fake_api(monkeypatch)
+    action = tmp_path / 'action.json'
+    action.write_text('{}')
+    monkeypatch.setattr(recognition, '_frozen', lambda _: ({'prepared': prepared}, {}))
+    report = recognition.recognize(action_file=action, prompt='读附件',
+                                   output_dir=tmp_path.parent / (tmp_path.name + '-out'))
+    assert report['status'] == 'failed'
+    assert report['error_code'] == code
+    assert calls == []
+
+
+def test_frozen_docx_embedded_image_uses_preparer_digest(tmp_path, monkeypatch):
+    import zipfile
+    from apps.oa_approval import attachment_extractors
+    calls = fake_api(monkeypatch)
+    picture = image(tmp_path)
+    document = tmp_path / 'evidence.docx'
+    with zipfile.ZipFile(document, 'w') as archive:
+        archive.writestr('word/document.xml', '<document><body><p><t>invoice 123</t></p></body></document>')
+        archive.writestr('word/media/image1.png', picture.read_bytes())
+    images, manifest, structured = attachment_extractors.prepare_materials(
+        [{'path': str(document), 'resource_id': 'doc', 'name': document.name}], out_dir=tmp_path / 'prepared')
+    assert images[0]['content_sha256'] == hashlib.sha256(picture.read_bytes()).hexdigest()
+    material = {'workflow_key': 'general_expense', 'prepared': {
+        'images': [{**page, 'path': str(page['path'])} for page in images],
+        'manifest': manifest, 'structured_contents': structured}}
+    material_file = tmp_path / 'material.json'
+    material_file.write_text(json.dumps(material))
+    packet = tmp_path / 'review-packet.json'
+    packet.write_text(json.dumps({'workflow_key': 'general_expense', 'material_file': str(material_file),
+        'material_fingerprint': 'sha256:' + hashlib.sha256(material_file.read_bytes()).hexdigest()}))
+    action = tmp_path / 'action.json'
+    action.write_text(json.dumps({'workflow_key': 'general_expense', 'review_packet_file': str(packet)}))
+    result = recognition.recognize(action_file=action, prompt='读取文字和图片',
+        output_dir=tmp_path.parent / (tmp_path.name + '-result'))
+    assert result['status'] == 'complete'
+    assert len(result['parts']) == 2
+    assert result['parts'][0]['parent_resource_id'] == 'doc'
+    assert len(calls) == 2

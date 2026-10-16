@@ -35,6 +35,19 @@ MAX_OFD_XML_FILES = 30
 MAX_OFD_XML_BYTES = 5_000_000
 
 
+SUCCESSFUL_PREPARATION_STATUSES = {
+    "archive_extracted",
+    "docx_read",
+    "image",
+    "image_converted",
+    "legacy_spreadsheet_read",
+    "ofd_invoice_read",
+    "pdf_rendered",
+    "spreadsheet_read",
+    "xml_invoice_read",
+}
+
+
 def safe_name(value: str, fallback: str) -> str:
     text = re.sub(r"[^0-9A-Za-z._-]+", "_", str(value or "").strip())
     return text or fallback
@@ -399,6 +412,7 @@ def docx_fact_and_images(
                     "parent_resource_id": resource_id,
                     "name": f"{name}::{item.filename}",
                     "kind": "docx_image",
+                    "content_sha256": _file_sha256(target),
                 }
             )
     if not texts and not images:
@@ -991,19 +1005,8 @@ def prepare_materials(
                 compact_spreadsheet=compact_spreadsheet,
             )
             validation_manifest.extend(manifest[manifest_count_before:])
-    successful_statuses = {
-        "archive_extracted",
-        "docx_read",
-        "image",
-        "image_converted",
-        "legacy_spreadsheet_read",
-        "ofd_invoice_read",
-        "pdf_rendered",
-        "spreadsheet_read",
-        "xml_invoice_read",
-    }
     if any(
-        str(item.get("status") or "") not in successful_statuses
+        str(item.get("status") or "") not in SUCCESSFUL_PREPARATION_STATUSES
         for item in validation_manifest
     ) or any(
         str(item.get("status") or "") == "pdf_rendered"

@@ -112,6 +112,8 @@ def _frozen(action: Path) -> tuple[dict, dict]:
     material_path = action.with_name('material.json')
     packet_raw, material_raw = _read(packet_path), _read(material_path)
     packet, material = json.loads(packet_raw), json.loads(material_raw)
+    if packet.get('material_state') == 'degraded' or material.get('material_state') == 'degraded':
+        raise ValueError('attachment_content_incomplete')
     if (action_data.get('review_packet_file') != str(packet_path)
             or packet.get('material_file') != str(material_path)
             or packet.get('material_fingerprint') != 'sha256:' + _digest(material_raw)
@@ -141,6 +143,31 @@ def _parts(prepared: dict):
                    'evidence_ref': f'material:prepared.structured_contents[{index}]',
                    'chunk_number': offset // TEXT_CHUNK_CHARS + 1,
                    'chunk_count': (len(text) + TEXT_CHUNK_CHARS - 1) // TEXT_CHUNK_CHARS}, text[offset:offset + TEXT_CHUNK_CHARS]
+
+
+def _validate_prepared(prepared: dict, *, frozen: bool) -> None:
+    if not isinstance(prepared, dict) or any(not isinstance(prepared.get(key, []), list)
+                                           for key in ('images', 'manifest', 'structured_contents')):
+        raise ValueError('attachment_content_incomplete')
+    images = prepared.get('images', [])
+    if not images and not prepared.get('structured_contents'):
+        raise ValueError('attachment_content_empty')
+    for entry in prepared.get('manifest', []):
+        if entry.get('status') not in attachment_extractors.SUCCESSFUL_PREPARATION_STATUSES:
+            raise ValueError('attachment_content_incomplete')
+        if 'image_count' in entry:
+            expected = entry['image_count']
+            actual = sum(entry.get('resource_id') in {page.get('resource_id'), page.get('parent_resource_id')}
+                         for page in images)
+            if type(expected) is not int or expected != actual:
+                raise ValueError('attachment_page_coverage_incomplete')
+            if entry['status'] == 'pdf_rendered' and (expected < 1 or expected != entry.get('page_count')):
+                raise ValueError('attachment_page_coverage_incomplete')
+    if frozen:
+        for page in images:
+            digest = page.get('content_sha256')
+            if not isinstance(digest, str) or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
+                raise ValueError('attachment_page_digest_missing')
 
 
 def recognize(*, files: list[Path] | None = None, action_file: Path | None = None,
@@ -194,6 +221,7 @@ def recognize(*, files: list[Path] | None = None, action_file: Path | None = Non
                     structured.append({'resource_id': item['resource_id'], 'name': item['name'],
                                        'text': _read(Path(item['path'])).decode('utf-8')})
             prepared = {'images': images, 'manifest': manifest, 'structured_contents': structured}
+        _validate_prepared(prepared, frozen=action_file is not None)
         save()
         for current, source in _parts(prepared):
             if time.monotonic() >= deadline:
