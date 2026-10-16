@@ -409,6 +409,22 @@ def _package_completion(request: dict, assigned: dict) -> None:
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
         raise ValueError('host_review_packaging_incomplete') from error
 
+def request_abort_stop(value: dict) -> None:
+    from scripts import finance_preaudit_run
+    try:
+        report = finance_preaudit_run.read_execution(**value['original_execution'])
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        report = {}
+    if (report.get('terminal') is True and report.get('children_reaped') is True
+            and report.get('run_id') == value['run_id']
+            and report.get('controller_instance_id') == value['controller_instance_id']
+            and not runtime_control.controller_active()
+            and not runtime_control.writer_active()
+            and not runtime_control.active_request_writers()):
+        return
+    runtime_control.request_cycle_stop()
+
+
 def close(*, owner: str, reason: str = 'completed', source: Path | None = None, source_line: int | None = None) -> dict:
     """Close the exchange; cancellation never signals the Writer process."""
     if reason not in {'completed', 'cancelled', 'parent_lost', 'reviewer_failed'}:
@@ -458,7 +474,7 @@ def close(*, owner: str, reason: str = 'completed', source: Path | None = None, 
         value.update(state='closed' if reason == 'completed' else 'cancelled', close_reason=reason, closed_at=time.time())
         guard.write(path, value)
     if reason != 'completed':
-        runtime_control.request_cycle_stop()
+        request_abort_stop(value)
     return {'state': value['state'], 'reason': reason}
 
 

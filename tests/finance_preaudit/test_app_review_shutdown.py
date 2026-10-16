@@ -229,3 +229,33 @@ def test_completed_shutdown_cannot_accept_an_exchange_cancelled_during_cleanup(e
     assert json.loads(host.registry_file(owner).read_text())['shutdown']['status'] == 'pending'
     assert shutdown.begin(owner=owner, reason='parent_lost')['reason'] == 'parent_lost'
     assert shutdown.finish(owner=owner, **proofs(owner, child))['reason'] == 'parent_lost'
+
+@pytest.mark.parametrize('already_closed', [False, True])
+def test_abort_after_terminal_wait_does_not_recreate_cycle_stop(exchange, already_closed, monkeypatch):
+    _, _, owner, _, _, manifest, _ = exchange
+    if already_closed:
+        host.close(owner=owner, reason='reviewer_failed')
+    controller_handoff.finish(manifest, status='failed', children_reaped=True, health='degraded')
+    path = seal_execution(owner, manifest)
+    receipt = json.loads(path.read_text())
+    receipt.update(result='blocked', exit_code=1, controller_state='failed')
+    host.guard.write(path, receipt)
+    runtime_control.clear_cycle_stop()
+    monkeypatch.setattr(runtime_control, 'controller_active', lambda: False)
+    shutdown.begin(owner=owner, reason='reviewer_failed')
+    assert not runtime_control.stop_requested()
+
+
+@pytest.mark.parametrize('active', ['controller_active', 'writer_active', 'active_request_writers'])
+def test_abort_after_terminal_wait_still_stops_for_active_runtime(exchange, monkeypatch, active):
+    _, _, owner, _, _, manifest, _ = exchange
+    controller_handoff.finish(manifest, status='failed', children_reaped=True, health='degraded')
+    path = seal_execution(owner, manifest)
+    receipt = json.loads(path.read_text())
+    receipt.update(result='blocked', exit_code=1, controller_state='failed')
+    host.guard.write(path, receipt)
+    for name in ('controller_active', 'writer_active', 'active_request_writers'):
+        monkeypatch.setattr(runtime_control, name, lambda *args: False)
+    monkeypatch.setattr(runtime_control, active, lambda *args: True)
+    shutdown.begin(owner=owner, reason='reviewer_failed')
+    assert runtime_control.stop_reason() == 'controller_cycle_stop'

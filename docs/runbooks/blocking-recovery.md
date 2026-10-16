@@ -145,3 +145,26 @@ python -m apps.oa_finance_preaudit.manual_stop_recovery \
 ## 宿主重启且原执行已真实退出
 
 用户已确认重启并授权继续，原回执为 owner_process_lost、监督者已停止原控制器且真实 failed/reaped 时，使用[宿主重启受控恢复](owner-restart-recovery.md)。它只清精确技术停止门，不改真实退出码或单据，不启动审核和调度；其他停止原因、未知 wait、未决写入及不可信证据仍阻断。
+
+## App 异常收尾后残留周期停止门
+
+原 App 轮次已真实失败退出、子进程回收且统一收尾 `verified`，但收尾调用留下精确 `controller_cycle_stop` 时，使用 `apps.oa_finance_preaudit.shutdown_stop_recovery`。此入口仅在当前明确恢复授权内清除绑定标记，默认只读。
+
+从已审查、完整 CI 通过并合并的干净同步候选 `main` 执行。生产须保持唯一干净 `main`，其修订精确等于原执行修订，且可快进至候选远端版本。这是安装前的引导恢复；清门后立即使用[统一源码发布门](production-source-release.md)，同步核验通过后才启动新业务进程。
+
+```bash
+python -m apps.oa_finance_preaudit.shutdown_stop_recovery \
+  --target-root "$production_root" \
+  --expected-candidate-revision "$reviewed_release_sha" \
+  --original-receipt-file "$original_receipt_file" \
+  --original-owner-task-id "$original_owner_task_id" \
+  --original-tool-session-id "$original_tool_session_id" \
+  --begin-shutdown-line "$original_begin_line" \
+  --automation-file "$approval_automation_file" \
+  --production-project-id "$production_project_id" \
+  --expected-schedule "$preserved_schedule"
+```
+
+原生来源必须完整匹配原 `begin-shutdown`，可随后包含精确绑定的只读 `--retrieve-result`；任意额外命令均拒绝。目标解释器重新核对原真实 wait、三个审核槽收尾、停止时间归属、进程身份及进程组、当前身份认证、授权、冻结和完整 continuation；原 cron 必须 PAUSED。确认执行追加 `--confirm-recovery YES`，在租约内复验并保存私有审计。历史证据、旧意见和隔离保持原样。
+
+读取结果的 `status`、`stop_cleared` 和 `receipt_file`。只有 `cleared` 才完成恢复；末尾审计失败时清门可能已发生，先核实际状态和回执，不重复执行。清门本身不表示源码已同步或审批已恢复。
