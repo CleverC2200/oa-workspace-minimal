@@ -5,6 +5,7 @@ import json
 import hashlib
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -49,7 +50,7 @@ MANIFEST_NAME = "manifest.json"
 EXTRACT_DIR_NAME = "extracted"
 ZIP_EXTS = {".zip"}
 RAR_EXTS = {".rar"}
-ARCHIVE_MAX_FILES = int(os.environ.get("OA_ATTACHMENT_ARCHIVE_MAX_FILES", "100"))
+ARCHIVE_MAX_FILES = int(os.environ.get("OA_ATTACHMENT_ARCHIVE_MAX_FILES", "128"))
 ARCHIVE_MAX_FILE_BYTES = int(
     os.environ.get("OA_ATTACHMENT_ARCHIVE_MAX_FILE_BYTES", str(50 * 1024 * 1024))
 )
@@ -1189,41 +1190,48 @@ def _archive_child_item(
     }
 
 
-def _rar_list_members(tool: str, path: Path) -> Tuple[List[str], str]:
+def _rar_list_members(tool: str, path: Path) -> Tuple[List[Dict[str, Any]], str]:
     try:
-        if Path(tool).name.startswith("7z"):
-            proc = subprocess.run(
-                [tool, "l", "-ba", str(path)],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=ARCHIVE_EXTRACT_TIMEOUT_SEC,
-            )
-            if proc.returncode != 0:
-                return (
-                    [],
-                    proc.stderr.strip() or proc.stdout.strip() or "rar 列表读取失败",
-                )
-            names = []
-            for line in proc.stdout.splitlines():
-                parts = line.split()
-                if len(parts) >= 6:
-                    names.append(" ".join(parts[5:]))
-            return [name for name in names if name and not name.endswith("/")], ""
+        command = (
+            [tool, "l", "-slt", "-ba", str(path)]
+            if Path(tool).name.startswith("7z")
+            else [tool, "-tvf", str(path), "--numeric-owner"]
+        )
         proc = subprocess.run(
-            [tool, "-tf", str(path)],
-            check=False,
-            capture_output=True,
-            text=True,
+            command, check=False, capture_output=True, text=True,
             timeout=ARCHIVE_EXTRACT_TIMEOUT_SEC,
         )
         if proc.returncode != 0:
             return [], proc.stderr.strip() or proc.stdout.strip() or "rar 列表读取失败"
-        return [
-            line.strip()
-            for line in proc.stdout.splitlines()
-            if line.strip() and not line.strip().endswith("/")
-        ], ""
+        members = []
+        if Path(tool).name.startswith("7z"):
+            for block in re.split(r"\n\s*\n", proc.stdout.strip()):
+                fields = {}
+                for line in block.splitlines():
+                    key, separator, value = line.partition(" = ")
+                    if not separator or key in fields:
+                        raise ValueError("rar 成员元数据无效")
+                    fields[key] = value
+                if (not fields.get("Path") or fields.get("Folder") not in {"+", "-"}
+                        or not fields.get("Size", "").isdigit()
+                        or fields.get("Symbolic Link") or fields.get("Hard Link")
+                        or fields.get("Anti") == "+"):
+                    raise ValueError("rar 成员类型或元数据不可信")
+                members.append({
+                    "name": fields["Path"], "is_dir": fields["Folder"] == "+",
+                    "size": int(fields["Size"]),
+                })
+        else:
+            for line in proc.stdout.splitlines():
+                fields = line.split(maxsplit=8)
+                if (len(fields) != 9 or len(fields[0]) != 10
+                        or fields[0][0] not in {"-", "d"} or not fields[4].isdigit()):
+                    raise ValueError("rar 成员类型或元数据不可信")
+                members.append({
+                    "name": fields[8], "is_dir": fields[0][0] == "d",
+                    "size": int(fields[4]),
+                })
+        return members, ""
     except Exception as err:
         return [], str(err)
 
@@ -1267,40 +1275,54 @@ def extract_rar_safely(
     if extract_root.exists():
         shutil.rmtree(extract_root)
     extract_root.mkdir(parents=True, exist_ok=True)
-    member_names, err = _rar_list_members(tool, path)
+    members, err = _rar_list_members(tool, path)
     if err:
         return [], f"{resource_name(resource) or path.name}: rar 列表读取失败: {err}"
-    if len(member_names) > ARCHIVE_MAX_FILES:
+    files = [member for member in members if not member["is_dir"]]
+    if len(files) > ARCHIVE_MAX_FILES:
         return (
             [],
             f"{resource_name(resource) or path.name}: rar 文件数超过限制 {ARCHIVE_MAX_FILES}",
         )
-    for member_name in member_names:
+    if len(members) > 2 * ARCHIVE_MAX_FILES:
+        return [], f"{resource_name(resource) or path.name}: rar 成员数超过限制 {2 * ARCHIVE_MAX_FILES}"
+    total_size = 0
+    for member in members:
+        member_name = member["name"]
         if _safe_archive_target(extract_root, member_name) is None:
             return (
                 [],
                 f"{resource_name(resource) or path.name}: rar 路径不安全 {member_name}",
             )
+        if not member["is_dir"]:
+            if member["size"] > ARCHIVE_MAX_FILE_BYTES:
+                return [], f"{resource_name(resource) or path.name}: rar 单文件超过限制 {member_name}"
+            total_size += member["size"]
+            if total_size > ARCHIVE_MAX_TOTAL_BYTES:
+                return [], f"{resource_name(resource) or path.name}: rar 总解压大小超过限制"
     err = _rar_extract(tool, path, extract_root)
     if err:
         return [], f"{resource_name(resource) or path.name}: rar 解压失败: {err}"
     extracted: List[Dict[str, Any]] = []
     total_size = 0
-    for index, member_name in enumerate(member_names, 1):
+    for index, member in enumerate(files, 1):
+        member_name = member["name"]
         target = _safe_archive_target(extract_root, member_name)
         if target is None:
             return (
                 [],
                 f"{resource_name(resource) or path.name}: rar 路径不安全 {member_name}",
             )
-        if not target.exists() or target.is_dir():
-            continue
+        if not target.is_file():
+            return [], f"{resource_name(resource) or path.name}: rar 成员文件缺失或类型不符 {member_name}"
         if target.is_symlink():
             return (
                 [],
                 f"{resource_name(resource) or path.name}: rar 包含符号链接 {member_name}",
             )
         size = target.stat().st_size
+        if size != member["size"]:
+            return [], f"{resource_name(resource) or path.name}: rar 成员文件大小不符 {member_name}"
         if size > ARCHIVE_MAX_FILE_BYTES:
             return (
                 [],
@@ -1339,36 +1361,36 @@ def _flatten_archive_children(
             leaf = dict(child)
             leaf["parent_resource_id"] = root_resource_id
             flattened.append(leaf)
-            continue
-        if depth >= ARCHIVE_MAX_DEPTH:
-            return (
-                [],
-                f"{child.get('name') or path.name}: 压缩包嵌套层数超过限制 {ARCHIVE_MAX_DEPTH}",
+        else:
+            if depth >= ARCHIVE_MAX_DEPTH:
+                return (
+                    [],
+                    f"{child.get('name') or path.name}: 压缩包嵌套层数超过限制 {ARCHIVE_MAX_DEPTH}",
+                )
+            nested_resource = {
+                "id": str(child.get("resource_id") or ""),
+                "name": str(child.get("name") or path.name),
+            }
+            nested_children, err = _extract_archive(
+                path, dest_dir=dest_dir, resource=nested_resource
             )
-        nested_resource = {
-            "id": str(child.get("resource_id") or ""),
-            "name": str(child.get("name") or path.name),
-        }
-        nested_children, err = _extract_archive(
-            path, dest_dir=dest_dir, resource=nested_resource
-        )
-        if err:
-            return [], err
-        nested_flattened, err = _flatten_archive_children(
-            dest_dir,
-            nested_children,
-            root_resource_id=root_resource_id,
-            depth=depth + 1,
-        )
-        if err:
-            return [], err
-        parent_archive_path = str(child.get("archive_path") or path.name)
-        for nested_child in nested_flattened:
-            nested_archive_path = str(nested_child.get("archive_path") or "")
-            nested_child["archive_path"] = "::".join(
-                part for part in (parent_archive_path, nested_archive_path) if part
+            if err:
+                return [], err
+            nested_flattened, err = _flatten_archive_children(
+                dest_dir,
+                nested_children,
+                root_resource_id=root_resource_id,
+                depth=depth + 1,
             )
-        flattened.extend(nested_flattened)
+            if err:
+                return [], err
+            parent_archive_path = str(child.get("archive_path") or path.name)
+            for nested_child in nested_flattened:
+                nested_archive_path = str(nested_child.get("archive_path") or "")
+                nested_child["archive_path"] = "::".join(
+                    part for part in (parent_archive_path, nested_archive_path) if part
+                )
+            flattened.extend(nested_flattened)
         if len(flattened) > ARCHIVE_MAX_FILES:
             return [], f"压缩包展开后文件数超过限制 {ARCHIVE_MAX_FILES}"
         total_size = sum(
