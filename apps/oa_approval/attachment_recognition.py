@@ -20,6 +20,7 @@ from . import attachment_extractors, auth, runtime_control
 MODEL = 'deepseek-flash'
 ENDPOINT = 'https://api.deepseek.com/chat/completions'
 MAX_FILE_BYTES = 32 * 1024 * 1024
+MAX_SOURCE_BYTES = 512 * 1024 * 1024
 TEXT_CHUNK_CHARS = 24000
 DEFAULT_PROMPT = '完整识别附件中的文字、表格和可见事实，保留数字、单位、日期、位置及看不清的内容。'
 SYSTEM_PROMPT = (
@@ -34,12 +35,36 @@ def _digest(raw: bytes) -> str:
 
 
 def _read(path: Path) -> bytes:
-    if not stat.S_ISREG(path.lstat().st_mode):
+    metadata = path.lstat()
+    if not stat.S_ISREG(metadata.st_mode):
         raise ValueError('attachment_file_invalid')
+    if metadata.st_size > MAX_FILE_BYTES:
+        raise ValueError('attachment_file_too_large')
     raw = runtime_control.read_control_bytes(path, max_bytes=MAX_FILE_BYTES)
     if raw is None:
         raise ValueError('attachment_file_missing')
     return raw
+
+
+def _source_digest(path: Path) -> str:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, 'rb') as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_SOURCE_BYTES:
+            raise ValueError('attachment_source_invalid_or_too_large')
+        digest = hashlib.sha256()
+        remaining = MAX_SOURCE_BYTES + 1
+        while remaining:
+            chunk = stream.read(min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            digest.update(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(stream.fileno())
+        if (not remaining or (before.st_ino, before.st_size, before.st_mtime_ns)
+                != (after.st_ino, after.st_size, after.st_mtime_ns)):
+            raise ValueError('attachment_source_changed')
+        return digest.hexdigest()
 
 
 def _api_key() -> str:
@@ -204,9 +229,9 @@ def recognize(*, files: list[Path] | None = None, action_file: Path | None = Non
             attachments = []
             for index, path in enumerate(files or [], 1):
                 path = path.resolve(strict=True)
-                raw = _read(path)
+                digest = _source_digest(path)
                 source = {'resource_id': f'file-{index}', 'path': str(path), 'name': path.name,
-                          'sha256': _digest(raw)}
+                          'sha256': digest}
                 report['sources'].append(source)
                 attachments.append(source)
             native = [item for item in attachments if Path(item['path']).suffix.lower() not in {
@@ -259,7 +284,7 @@ def recognize(*, files: list[Path] | None = None, action_file: Path | None = Non
                     if _digest(_read(Path(source['path']))) != observed['content_sha256']:
                         raise ValueError('attachment_page_changed')
         for source in report['sources']:
-            if _digest(_read(Path(source['path']))) != source['sha256']:
+            if _source_digest(Path(source['path'])) != source['sha256']:
                 raise ValueError('attachment_source_changed')
         report['status'] = 'complete'
     except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:

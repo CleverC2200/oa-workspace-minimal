@@ -240,3 +240,19 @@ def test_frozen_docx_embedded_image_uses_preparer_digest(tmp_path, monkeypatch):
     assert len(result['parts']) == 2
     assert result['parts'][0]['parent_resource_id'] == 'doc'
     assert len(calls) == 2
+
+
+def test_container_larger_than_page_limit_is_streamed(tmp_path, monkeypatch):
+    import openpyxl
+    calls = fake_api(monkeypatch)
+    source = tmp_path / 'large-container.xlsx'
+    book = openpyxl.Workbook()
+    book.active.append(['item', 'amount'])
+    book.active.append(['service', 82917])
+    book.save(source)
+    monkeypatch.setattr(recognition, 'MAX_FILE_BYTES', 1024)
+    assert source.stat().st_size > recognition.MAX_FILE_BYTES
+    result = recognition.recognize(files=[source], prompt='读取表格', output_dir=tmp_path / 'out')
+    assert result['status'] == 'complete'
+    assert len(calls) == 1
+    assert result['parts'][0]['kind'] == 'text'
