@@ -187,6 +187,7 @@ _SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_MATERIAL_GAP_CODES = {
     "attachment_access_denied",
+    "attachment_archive_failed",
     "attachment_content_incomplete",
     "legacy_doc_converter_unavailable",
     "legacy_doc_conversion_failed",

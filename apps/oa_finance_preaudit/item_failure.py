@@ -13,6 +13,7 @@ from . import review_failure_evidence as evidence
 RECEIPT_FILE = "manual-review-receipt.json"
 ITEM_LOCAL_MATERIAL_FAILURE_DETAILS = frozenset({
     "attachment_access_denied",
+    "attachment_archive_failed",
     "general_evidence_references_unresolved",
     "tpm_evidence_references_unresolved",
     "attachment_download_capacity_timeout",
