@@ -65,6 +65,28 @@ def _write_new(path: Path, value: dict) -> None:
 
 
 
+def _native_lines(stream):
+    """Keep native line numbers while draining oversized, unreferenced records.
+
+    None is never usable as identity, a call anchor, or a paired result. Read in
+    fixed chunks so observing many images cannot allocate their combined body.
+    """
+    number = 0
+    while chunk := stream.readline(64 * 1024):
+        chunks, size = [chunk], len(chunk)
+        while not chunk.endswith(b'\n'):
+            chunk = stream.readline(64 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size <= 32 * 1024 * 1024:
+                chunks.append(chunk)
+            else:
+                chunks.clear()
+        number += 1
+        yield number, b''.join(chunks) if size <= 32 * 1024 * 1024 else None
+
+
 def _native_source(source: Path, session: str, line: int = 1, *, output: bool = False) -> tuple[dict, dict]:
     """Read native session ancestry and one immutable tool-call anchor."""
     source = source.absolute()
@@ -78,9 +100,11 @@ def _native_source(source: Path, session: str, line: int = 1, *, output: bool = 
         raise ValueError('host_review_source_untrusted')
     header = anchor = result = None
     with source.open('rb') as stream:
-        for number, raw in enumerate(iter(lambda: stream.readline(32 * 1024 * 1024 + 1), b''), 1):
-            if len(raw) > 32 * 1024 * 1024:
-                raise ValueError('host_review_source_untrusted')
+        for number, raw in _native_lines(stream):
+            if raw is None:
+                if number in {1, line} or anchor is not None:
+                    raise ValueError('host_review_source_untrusted')
+                continue
             value = json.loads(raw)
             if number == 1:
                 header = value
@@ -1024,9 +1048,9 @@ def source_anchor(*, owner: str, operation: str = 'heartbeat') -> dict:
     _native_source(source, owner)
     found = None
     with source.open('rb') as stream:
-        for line, raw in enumerate(iter(lambda: stream.readline(32 * 1024 * 1024 + 1), b''), 1):
-            if len(raw) > 32 * 1024 * 1024:
-                raise ValueError('host_review_source_untrusted')
+        for line, raw in _native_lines(stream):
+            if raw is None:
+                continue
             record = json.loads(raw)
             payload = record.get('payload', {})
             name = payload.get('name')

@@ -73,6 +73,8 @@ text(await tools.exec_command({"cmd":"完整规范命令字符串"}));
 
 等该次原工具输出实际结束、exit_code=0，且 stdout 的专用发布回执匹配当前 request_id、request_sha256、目标文件和决定字节 SHA-256，再用其来源行 submit。仅文件存在、调用中提到路径、另一个命令成功或自行打印的成功对象均不构成证据。正在执行的 submit 不能充当自己的已完成发布证据。子 Agent 只交回决定，不调用 OA 完成动作。主对话保持心跳并等待原控制器，Writer 仍按认领顺序管理。
 
+原生日志可能在一次图片观察输出中内嵌多张大图。来源扫描按小块读取，保持原行号，跳过指定来源调用之前超过 32 MiB 的非目标记录；父心跳查找也跳过这些不可用作来源的记录。会话头、被引用调用及配对输出仍须在原 32 MiB 上限内，并按原字节计算指纹。调用之后、配对结果之前遇到超限记录时，无法确认它是否为目标输出，仍拒绝接收。原日志不改写；逐页业务观察要求不变。
+
 ```bash
 python -B -m apps.oa_finance_preaudit.host_chat_review --operation submit --owner-task-id <主会话UUID> --request-file <本轮request.json> --decision-file <本单私有决定json> --source-session-file <已登记子会话jsonl> --source-line <已完成决定写入行>
 ```
