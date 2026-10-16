@@ -31,7 +31,7 @@ python3 -m apps.oa_finance_preaudit.cli next-action \
 
 先确认审核包的 `workflow_key`，再从[共享结果接口与流程路由](references/result-contract.md)只加载对应的一个流程规则包。完整读取[证据阅读规则](references/observation-contract.md)，并满足以下完成条件：
 
-- 表单明细、相关资源和准备页全部覆盖；
+- 表单明细、相关资源和准备页全部覆盖；页面按证据阅读规则采用直接观察、足够的结构化内容或页级精确重复复用，保留每页资源归属；
 - 每条采用的证据同时证明资源归属和审核项关系；
 - 权威字段优先，图片不可见或关系不明的事实保持未知；
 - 自动读取失败、材料包全空或旧审核包为 `material_state=degraded` 时，停止当前单据的审核与提交，保留技术失败及原冻结证据。`collection_gaps` 不证明申请人未填写字段、未上传附件或没有发票。当前提交门见[FlowEngine 合同](references/flow-engine-contract.md)。

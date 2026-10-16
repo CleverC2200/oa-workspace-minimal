@@ -61,18 +61,18 @@ FLOW_CONFIGS = (
 )
 
 
-@pytest.mark.parametrize("flow_key,compact", [("general_expense", True), ("business_entertainment", False)])
-def test_scan_encoding_policy_is_applied_at_collection(tmp_path, monkeypatch, flow_key, compact):
-    config = next(value for value in FLOW_CONFIGS if value["flow_key"] == flow_key)
+@pytest.mark.parametrize("config", FLOW_CONFIGS, ids=lambda value: value['flow_key'])
+def test_image_encoding_policy_is_applied_at_collection(tmp_path, monkeypatch, config):
     resource = {"id": "resource-001", "name": "scan.pdf", "downloadUrl": "/download/scan.pdf"}
+    monkeypatch.setattr(case_bundle, "_travel_resources", lambda *_a, **_k: ([], []))
     monkeypatch.setattr(case_bundle.evidence_packet, "logical_attachment_resources", lambda *_: [resource])
     monkeypatch.setattr(case_bundle.attachments, "download_resources", lambda *_a, **_k: ([{
         "resource_id": "resource-001", "name": "scan.pdf", "path": str(tmp_path / "scan.pdf"),
     }], []))
     captured = []
 
-    def prepare(_downloads, *, out_dir, compact_pdf=False):
-        captured.append(compact_pdf)
+    def prepare(_downloads, *, out_dir, compact_pdf=False, compact_spreadsheet=False):
+        captured.append((compact_pdf, compact_spreadsheet))
         return [], [], []
 
     monkeypatch.setattr(case_bundle.attachment_extractors, "prepare_materials", prepare)
@@ -82,7 +82,7 @@ def test_scan_encoding_policy_is_applied_at_collection(tmp_path, monkeypatch, fl
     collect_case("recorded-request", oa_api=RecordedOaApi(config["workflow_id"], config["workflow_name"]),
                  configs=FLOW_CONFIGS, allow_browser_download=False,
                  attachment_root=tmp_path / "attachments", prepared_root=tmp_path / "prepared")
-    assert captured == [compact]
+    assert captured == [(config['flow_key'] == 'general_expense', config['flow_key'] == 'tpm_small_marketing_fee')]
 
 
 class RecordedOaApi:
@@ -162,7 +162,7 @@ class TestCollectCaseContract:
                 [],
             )
 
-        def recorded_prepare(_downloads: list[dict], *, out_dir: Path, compact_pdf=False):
+        def recorded_prepare(_downloads: list[dict], *, out_dir: Path, compact_pdf=False, compact_spreadsheet=False):
             captured["prepared_dir"] = out_dir
             return [], [{"resource_id": "resource-001"}], []
 
