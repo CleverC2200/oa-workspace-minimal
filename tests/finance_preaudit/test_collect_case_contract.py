@@ -1962,3 +1962,23 @@ def test_company_field_does_not_fall_back_to_a_present_browser_display() -> None
         "示例食品有限公司",
         "display",
     )
+
+
+def test_archive_limit_error_reaches_flow_admission_without_preparing_partial_files(tmp_path, monkeypatch):
+    archive = tmp_path / "too-many.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        for index in range(attachments.ARCHIVE_MAX_FILES + 1):
+            output.writestr(f"{index}.txt", "recorded")
+    resource = {"id": "recorded-archive", "name": archive.name, "downloadUrl": "/recorded/too-many.zip"}
+    monkeypatch.setattr(case_bundle, "_travel_resources", lambda **_kw: ([], []))
+    monkeypatch.setattr(case_bundle, "_authority_facts", lambda **_kw: [])
+    monkeypatch.setattr(evidence_packet, "logical_attachment_resources", lambda *_: [resource])
+    monkeypatch.setattr(attachments, "_download_resource_direct", lambda *_a, **_kw: (archive, ""))
+    monkeypatch.setattr(attachments.runtime_control, "stop_requested", lambda: False)
+    prepared = []
+    monkeypatch.setattr(attachment_extractors, "prepare_materials", lambda *_a, **_kw: prepared.append(True))
+    with pytest.raises(RuntimeError, match="^attachment_archive_failed$"):
+        collect_case("recorded-request", oa_api=RecordedOaApi("195039", "TPM小额市场费用报销申请流程"),
+                     configs=FLOW_CONFIGS, allow_browser_download=True,
+                     attachment_root=tmp_path / "attachments", prepared_root=tmp_path / "prepared")
+    assert prepared == []

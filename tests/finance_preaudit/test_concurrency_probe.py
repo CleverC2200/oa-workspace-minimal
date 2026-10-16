@@ -2140,6 +2140,7 @@ def test_prepare_extends_skip_budget_when_new_item_is_quarantined(
     ("reason", "failure_detail_code"),
     [
         ("material_collection_failed", "attachment_download_failed"),
+        ("material_collection_failed", "attachment_archive_failed"),
         ("codex_decision_invalid", None),
         ("codex_review_failed", None),
     ],

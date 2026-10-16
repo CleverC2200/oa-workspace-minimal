@@ -33,6 +33,33 @@ def test_collection_read_failure_never_opens_a_submittable_review(tmp_path, work
     assert not Path(action["action_file"]).with_name("review-packet.json").exists()
 
 
+def test_archive_failure_isolates_unwritten_case_and_keeps_next_case_moving(tmp_path):
+    from apps.oa_finance_preaudit import reconciliation
+    submissions = []
+    workflow = "tpm_small_marketing_fee"
+    engine = _engine(tmp_path, workflow, RuntimeError("attachment_archive_failed"),
+                     controlled=True, submissions=submissions)
+    first = list(engine._discover_candidates(workflow))[0]
+    pending = [first, {**first, "request_id": "next-readable-request"}]
+    engine._discover_candidates = lambda _: pending
+    original_collector = engine._collect_material
+    engine._collect_material = lambda request, root: (
+        original_collector(request, root) if request == first["request_id"] else _material(request, workflow))
+    failed = engine.next_action(workflow, mode="controlled_write")
+    assert failed["failure_detail_code"] == "attachment_archive_failed"
+    assert failed["write_state"] == "not_requested"
+    attempt = Path(failed["action_file"]).parent
+    saved = {p: p.read_bytes() for p in attempt.iterdir() if p.is_file() and p.suffix != ".lock"}
+    report = reconciliation.reconcile(tmp_path, pending_rows=pending, handled_rows=[])
+    assert report["continuation"] == {"status": "ready", "scope": "item",
+        "isolated_pending": 1, "blocking_reasons": {}}
+    following = engine.next_action(workflow, mode="controlled_write")
+    assert following["action"] == "review_required"
+    assert Path(following["action_file"]).parent != attempt
+    assert submissions == []
+    assert {p: p.read_bytes() for p in attempt.iterdir() if p.is_file() and p.suffix != ".lock"} == saved
+
+
 @pytest.mark.parametrize("entrypoint", ("next_action", "complete_review"))
 def test_legacy_degraded_review_is_blocked_before_writer(tmp_path, monkeypatch, entrypoint):
     submissions = []
