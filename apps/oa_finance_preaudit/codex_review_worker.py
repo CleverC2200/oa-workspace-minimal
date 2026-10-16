@@ -523,7 +523,7 @@ def _prompt(action_file: Path) -> str:
         "absent 表示原记录不存在的字段。保留原始读取状态与证据归属。"
         "命令输出较长，请设置足够的输出上限（max_output_tokens=60000）；"
         "如工具仍截断，按行分段读完。不要反复猜测材料 JSON 结构。"
-        "prepared.images 列出原图路径及表格单元格；必须通过看图工具阅读图片，"
+        "prepared.images 列出原图路径及表格单元格；通过下述附件识别工具读取内容，"
         "不能将索引或文件存在当成图片内容。"
         "evidence_refs 的表单字段引用必须逐字使用 declared_fields 中的 path，"
         "不使用视图行号、简写路径或范围表达式；权威事实使用 material.authority_facts[实际数组索引]。"
@@ -552,7 +552,7 @@ def _prompt(action_file: Path) -> str:
 {material_reading}
 
 要求：
-1. 完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由读取 `references/result-contract.md`、`references/observation-contract.md`、`{rule_reference}`，完整读取 `references/payment-screenshot-exemption.md`，再读取动作引用的审核包、材料和准备页；{workflow_requirement}{frozen_item_requirement}不得读取其他 attempt。
+1. 附件读取按 `docs/agents/attachment-recognition.md` 调用本地 DeepSeek HTTP API 工具，可传自定义问题；先完整覆盖当前单附件，再按需对单页定向复读。只读取文本回答及其逐页来源，不通过看图工具或附件上传把原文件传入本审核会话。完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由读取 `references/result-contract.md`、`references/observation-contract.md`、`{rule_reference}`，完整读取 `references/payment-screenshot-exemption.md`，再读取动作引用的审核包、材料和准备页；{workflow_requirement}{frozen_item_requirement}不得读取其他 attempt。
 2. 不修改任何文件、项目代码、Skill、配置、授权清单或冻结材料；不得调用 `next-action`、`complete-review` 或任何 OA 写入，不得领取其他单据；不得读取现有审核决定、意见或 `review-output-*.txt` 失败原输出。
 3. 根据审核包中的固定审核项动态形成结构化决定。证据不足使用 `uncertain` 交财务判断，不得因为材料缺口卡住业务流程；身份、归属、冻结或授权不可信时停止。自动读取失败、材料全空或旧降级审核包须停止当前单据，不生成可提交决定。`collection_gaps` 不证明申请人未填写、未上传或没有发票；按 FlowEngine 合同保留技术失败。
 4. {_OPINION_BREVITY_REQUIREMENT}结论内保留规则要求的具体金额、实际公司全称等必要业务原值；不得输出密钥、凭据或无关附件原文。宿主会校验并负责受控提交。
