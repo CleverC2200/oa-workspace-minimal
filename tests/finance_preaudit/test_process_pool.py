@@ -167,8 +167,9 @@ def _crashing_worker(name: str) -> str:
     return name
 
 
-def _slotted_worker(task: tuple[str, float]) -> dict:
-    root, delay = task
+def _slotted_worker(task: tuple[str, float, float]) -> dict:
+    root, delay, startup_delay = task
+    time.sleep(startup_delay)
     with resource_slots.acquire(
         "travel-browser",
         capacity=2,
@@ -176,6 +177,12 @@ def _slotted_worker(task: tuple[str, float]) -> dict:
         root=Path(root),
     ):
         started_at = time.monotonic()
+        (Path(root) / f"entered-{os.getpid()}").touch()
+        deadline = time.monotonic() + 1
+        while len(list(Path(root).glob("entered-*"))) < 2:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("resource_slot_overlap_not_observed")
+            time.sleep(0.005)
         time.sleep(delay)
         return {
             "started_at": started_at,
@@ -510,22 +517,24 @@ def test_drain_on_stop_finishes_active_tasks_without_starting_pending() -> None:
     assert [outcome.status for outcome in result.outcomes].count("stopped") == 4
 
 
+@pytest.mark.parametrize("startup_delay", [0.0, 0.12])
 def test_process_pool_respects_cross_process_resource_capacity(
-    tmp_path: Path,
+    tmp_path: Path, startup_delay: float,
 ) -> None:
     result = process_pool.run(
-        [(str(tmp_path), 0.08)] * 4,
+        [(str(tmp_path), 0.08, index * startup_delay) for index in range(4)],
         _slotted_worker,
         max_workers=4,
         batch_timeout_sec=2,
     )
 
+    assert result.completed == 4
+    assert result.peak_active == 4
+    assert result.processes_reaped
     intervals = [
         (outcome.value["started_at"], outcome.value["ended_at"])
         for outcome in result.outcomes
     ]
-    assert result.completed == 4
-    assert result.peak_active == 4
     assert _interval_peak(intervals) == 2
 
 
