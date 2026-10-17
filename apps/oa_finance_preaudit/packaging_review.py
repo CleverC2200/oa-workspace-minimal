@@ -422,7 +422,7 @@ def complete_host(receipt_file: Path, *, project_root: Path = PROJECT_ROOT, conf
     if engine is None:
         from . import cli
         engine = cli._live_flow_engine(controlled=True)
-    with host_chat_review._round_lease(confirmed['owner_task_id']):
+    with host_chat_review._round_lease(confirmed['owner_task_id'], request['run_id']):
         _trusted_host_receipt(receipt_file)
         result = engine.complete_review(Path(receipt['action_file']), Path(receipt['decision_file']))
         if result.get('action') == 'closed' and result.get('write_state') in {'not_requested', 'submitted'}:
@@ -444,12 +444,12 @@ def complete_host(receipt_file: Path, *, project_root: Path = PROJECT_ROOT, conf
                 host_chat_review._write_new(marker_file, marker)
                 # Seal an already-completed Writer even if the parent lease expired
                 # during its in-flight operation; this admits no new write.
-                registered = host_chat_review._registry(confirmed['owner_task_id'], live=False)
+                registered = host_chat_review._registry(confirmed['owner_task_id'], live=False, run_id=request['run_id'])
                 registered['assignments'][request['request_id']].update(
                     completion_file=str(marker_file), completion_sha256=hashlib.sha256(review_context.read_input(marker_file, private=True)).hexdigest(),
                     completed_at=time.time())
                 from . import approval_guard
-                approval_guard.write(host_chat_review.registry_file(confirmed['owner_task_id']), registered)
+                approval_guard.write(host_chat_review.registry_file(confirmed['owner_task_id'], request['run_id']), registered)
             except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                 # The original consumer has already sealed the business outcome.
                 # A local App evidence failure cannot erase or replay that write.

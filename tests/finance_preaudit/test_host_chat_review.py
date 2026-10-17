@@ -66,6 +66,8 @@ def exchange(tmp_path, monkeypatch, request):
 
 def native_call(source, name, arguments, call_id, output):
     from datetime import datetime, timezone
+    if name in {'exec', 'functions.exec'} and isinstance(arguments, str) and arguments.endswith('heartbeat ' + str(os.environ.get(host.guard.OWNER_ENV))):
+        arguments += ' ' + os.environ[host.guard.RUN_ENV]
     line = sum(1 for _ in source.open()) + 1
     with source.open('a') as stream:
         stream.write(json.dumps({'timestamp': datetime.now(timezone.utc).isoformat(), 'type': 'response_item',
@@ -793,7 +795,7 @@ def test_public_heartbeat_command_can_discover_its_already_logged_parent_anchor(
     line = native_call(parent, 'functions.exec', 'heartbeat ' + owner, 'current-heartbeat', {'exit_code': 0})
     anchor = host.source_anchor(owner=owner)
     assert anchor == {'source': parent, 'source_line': line}
-    assert host.main(['--operation', 'heartbeat', '--owner-task-id', owner,
+    assert host.main(['--operation', 'heartbeat', '--owner-task-id', owner, '--run-id', os.environ[host.guard.RUN_ENV],
         '--source-session-file', str(anchor['source']), '--source-line', str(anchor['source_line'])]) == 0
     assert json.loads(capsys.readouterr().out)['state'] == 'open'
 
@@ -985,3 +987,75 @@ def test_public_draft_publisher_command_returns_exact_exclusive_byte_receipt(exc
     with pytest.raises((FileExistsError, RuntimeError)):
         host.main(args)
     assert hashlib.sha256(target.read_bytes()).hexdigest() == receipt['decision_sha256']
+
+
+def next_native_reviewers(parent, owner):
+    reviewers = []
+    for slot in range(3):
+        task = f'reviewer_next_{slot}'
+        child = parent.with_name(task + '.jsonl')
+        child.write_text(json.dumps({'type': 'session_meta', 'payload': {'id': str(uuid4()),
+            'source': {'subagent': {'thread_spawn': {'parent_thread_id': owner,
+                'depth': 1, 'agent_path': '/root/' + task}}}}}) + '\n')
+        child.chmod(0o600)
+        line = native_call(parent, 'spawn_agent', {'task_name': task, 'message': 'Review only current frozen materials.'},
+            task, {'task_name': '/root/' + task})
+        reviewers.append({'session_file': str(child), 'spawn_line': line})
+    return reviewers
+
+
+def test_same_parent_runs_two_independent_rounds_after_verified_shutdown(exchange, monkeypatch):
+    from apps.oa_finance_preaudit import app_review_shutdown as shutdown
+    from tests.finance_preaudit.test_app_review_shutdown import proofs
+    from tests.finance_preaudit.test_app_reviewer_slots import original_execution
+    action, draft, owner, child, task, old, _ = exchange
+    parent = child.with_name('parent.jsonl')
+    old_request = host.publish(action, prompt='Old frozen review.', timeout_seconds=60)
+    shutdown.begin(owner=owner, reason='cancelled')
+    controller_handoff.finish(old, status='completed', children_reaped=True, health='healthy')
+    seal_execution(owner, old)
+    shutdown.finish(owner=owner, **proofs(owner, child))
+    protected = {path: path.read_bytes() for path in [host.registry_file(owner), old_request]}
+    assert runtime_control.clear_cycle_stop()
+    monkeypatch.setattr(controller_handoff, 'CONTROLLER_INSTANCE_ID', uuid4().hex)
+    current = controller_handoff.begin({'review_configuration': host.IDENTITY})
+    with host.approval_lifecycle.run_scope(current, runtime_control.PROJECT_ROOT):
+        reviewers = next_native_reviewers(parent, owner)
+        binding = original_execution(owner, current)
+        host.register(reviewers, owner=owner, source=parent, run_id=current['run_id'], **binding)
+        line = native_call(parent, 'functions.exec', 'heartbeat ' + owner + ' ' + current['run_id'], 'next-heartbeat', {})
+        host.heartbeat(owner=owner, source=parent, source_line=line, run_id=current['run_id'])
+        host.approval_lifecycle.heartbeat(current['run_id'], current['controller_instance_id'], {action}, [], writer_active=False)
+        request = host.publish(action, prompt='New frozen review.', timeout_seconds=60)
+        assert request != old_request
+        dispatch = native_call(parent, 'followup_task', {'target': '/root/reviewer_next_0', 'message': str(request)}, 'next-dispatch', {})
+        host.assign(request, slot=0, owner=owner, source=parent, source_line=dispatch, run_id=current['run_id'])
+        target = draft.with_name('next-decision.json')
+        source = draft_source(Path(reviewers[0]['session_file']), request, target, owner, payload=json.loads(draft.read_text()))
+        host.submit(request, target, owner=owner, source=Path(reviewers[0]['session_file']), source_line=source, run_id=current['run_id'])
+        assert host.read_result(request)['status'] == 'reviewed'
+        assert {path: path.read_bytes() for path in protected} == protected
+        with pytest.raises(ValueError):
+            host.submit(old_request, draft, owner=owner, source=child, source_line=2, run_id=current['run_id'])
+        host.close(owner=owner, reason='cancelled', run_id=current['run_id'])
+        controller_handoff.finish(current, status='failed', children_reaped=True, health='degraded')
+
+
+def test_parent_cli_requires_the_exact_round_and_native_heartbeat(exchange):
+    _, _, owner, child, _, manifest, _ = exchange
+    parent = child.with_name('parent.jsonl')
+    with pytest.raises(SystemExit) as error:
+        host.main(['--operation', 'pending', '--owner-task-id', owner])
+    assert error.value.code == 2
+    line = native_call(parent, 'functions.exec', 'heartbeat ' + owner + ' ' + uuid4().hex, 'wrong-round-heartbeat', {})
+    with pytest.raises(ValueError, match='source_untrusted'):
+        host.heartbeat(owner=owner, source=parent, source_line=line, run_id=manifest['run_id'])
+
+
+
+def test_new_controller_cannot_start_before_same_parent_shutdown_is_verified(exchange, monkeypatch, capsys):
+    _, _, owner, *_ = exchange
+    monkeypatch.setattr(finance_preaudit_run.auth, 'load_local_env', lambda: None)
+    monkeypatch.setattr(finance_preaudit_run.approval_lifecycle, 'startup', lambda _: pytest.fail('Unsealed prior round admitted'))
+    assert finance_preaudit_run.main(['--owner-task-id', owner, '--review-transport', 'host_chat', '--', '--rolling']) == 1
+    assert json.loads(capsys.readouterr().out)['error_code'] == 'controller_execution_evidence_failed'
