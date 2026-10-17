@@ -164,6 +164,20 @@ def _query_rows(
             pass
 
 
+def workflow_attachment_document(request_id: str, file_id: str) -> str:
+    if not all(re.fullmatch(r"[1-9][0-9]*", value) for value in (request_id, file_id)):
+        return ""
+    rows = _query_rows(
+        "workflow_attachment_document",
+        {"request_id": int(request_id), "file_id": int(file_id)},
+        require_connection=True,
+    )
+    if len(rows) != 1 or str(rows[0].get("imagefileid")) != file_id:
+        return ""
+    doc_id = str(rows[0].get("docid") or "")
+    return doc_id if re.fullmatch(r"[1-9][0-9]*", doc_id) else ""
+
+
 def resolve_request_id(flow_number: str) -> str:
     request_mark = str(flow_number or "").strip()
     if not request_mark:

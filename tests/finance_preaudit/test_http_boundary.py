@@ -14,6 +14,7 @@ from apps.oa_approval import (
     attachments,
     auth,
     invoice_buyers,
+    official_sql,
     overseas_invoice_api,
     writer_api,
     writer_outcomes,
@@ -102,7 +103,7 @@ def test_writer_refusal_remains_unknown_without_retry_or_postcheck(http_transpor
     assert [request.full_url for request in calls] == [url]
 
 
-def download(monkeypatch, tmp_path, *, extra_host=False):
+def download(monkeypatch, tmp_path, *, extra_host=False, workflow=False):
     monkeypatch.setattr(attachments, 'OA_HOST', 'https://oa.example.com')
     monkeypatch.setattr(attachments, 'EXTRA_DOWNLOAD_HOSTS', {'travel.example.com'})
     monkeypatch.setenv('OA_FINANCE_PREAUDIT_CACHE_DB', '0')
@@ -113,12 +114,13 @@ def download(monkeypatch, tmp_path, *, extra_host=False):
     monkeypatch.setattr(attachments, '_rpa_cookie_header', forbidden)
     monkeypatch.setattr(attachments, '_download_resource_with_browser', forbidden)
     origin = 'https://travel.example.com' if extra_host else 'https://oa.example.com'
-    resource = {'id': 'synthetic-resource', 'name': 'receipt.pdf',
-                'downloadUrl': origin + '/download/start', 'allowExtraDownloadHost': extra_host,
+    path = '/weaver/weaver.file.FileDownload?fileid=202' if workflow else '/download/start'
+    resource = {'id': '202' if workflow else 'synthetic-resource', 'name': 'receipt.pdf',
+                'downloadUrl': origin + path, 'allowExtraDownloadHost': extra_host,
                 '_ephemeral_cookie_header': 'session=synthetic-private'}
     return resource['downloadUrl'], lambda: attachments.download_resources(
         [resource], dest_dir=tmp_path / 'attachments', timeout_sec=5,
-        allow_browser_download=True, reuse_cache=False)
+        allow_browser_download=True, reuse_cache=False, request_id='101' if workflow else '')
 
 
 @pytest.mark.parametrize('extra_host', [False, True])
@@ -145,6 +147,63 @@ def test_download_refuses_unsafe_redirect_without_browser_fallback(
     assert [request.full_url for request in calls] == [url]
     assert all(response.closed for response in responses)
     assert not list((tmp_path / 'attachments').glob('*.part'))
+
+
+@pytest.mark.parametrize('location', [
+    'https://untrusted.invalid/receipt.pdf?token=synthetic-private',
+    'http://oa.example.com/receipt.pdf',
+    '/weaver/weaver.file.FileDownload?fileid=202',
+])
+def test_workflow_redirect_refusal_cannot_initialize_document_context(
+        http_transport, monkeypatch, tmp_path, location):
+    routes, calls, responses = http_transport
+    url, call = download(monkeypatch, tmp_path, workflow=True)
+    monkeypatch.setattr(official_sql, 'workflow_attachment_document',
+                        lambda *_args: pytest.fail('A refused redirect must not initialize a document'))
+    routes[url] = (302, location, b'synthetic-private-response')
+    files, errors = call()
+    assert files == [] and errors[0]['code'] == 'attachment_download_failed'
+    assert [request.full_url for request in calls] == [url]
+    assert 'synthetic-private' not in json.dumps(errors)
+    assert all(response.closed for response in responses)
+
+
+@pytest.mark.parametrize('stage,location,code', [
+    ('account', 'https://untrusted.invalid/collect?token=synthetic-private', 'rpa_session_invalid'),
+    ('preview', 'http://oa.example.com/collect', 'rpa_session_invalid'),
+    ('initialize', '/login.jsp', 'oa_session_expired'),
+    ('initialize', '/notice/noright.jsp', 'attachment_access_denied'),
+    ('retry', 'https://untrusted.invalid/collect?token=synthetic-private', 'attachment_download_failed'),
+])
+def test_workflow_context_or_retry_redirect_stops_without_further_requests(
+        http_transport, monkeypatch, tmp_path, stage, location, code):
+    routes, calls, _ = http_transport
+    url, call = download(monkeypatch, tmp_path, workflow=True)
+    queries = []
+
+    def query(name, params, **_kwargs):
+        queries.append((name, params))
+        return [{'docid': 303, 'imagefileid': 202}]
+
+    monkeypatch.setattr(official_sql, '_query_rows', query)
+    monkeypatch.setattr(auth, 'env', lambda name, default='': '77' if name == 'OA_UID' else default)
+    account = 'https://oa.example.com/api/hrm/login/getAccountList'
+    preview = 'https://oa.example.com/api/doc/detail/basicInfo?docid=303'
+    initialize = preview + '&isrequest=1&requestid=101'
+    routes[url] = lambda _request: ((302, location, b'synthetic-private-response')
+                                    if len(calls) > 1 else (200, None, b'<html>noright.jsp</html>'))
+    routes[account] = (200, None, b'{"data":{"userid":"77"}}')
+    routes[preview] = routes[initialize] = (200, None, b'{"status":1,"mainimagefile":"202"}')
+    if stage != 'retry':
+        routes[{'account': account, 'preview': preview, 'initialize': initialize}[stage]] = (
+            302, location, b'synthetic-private-response')
+    files, errors = call()
+    expected_count = {'account': 2, 'preview': 3, 'initialize': 4, 'retry': 5}[stage]
+    assert files == [] and errors[0]['code'] == code
+    assert queries == [('workflow_attachment_document', {'request_id': 101, 'file_id': 202})]
+    assert [request.full_url for request in calls] == [url, account, preview, initialize, url][:expected_count]
+    assert all(request.get_header('Cookie') == 'session=synthetic-private' for request in calls)
+    assert location not in json.dumps(errors) and 'synthetic-private' not in json.dumps(errors)
 
 
 @pytest.mark.parametrize('status', [301, 302, 303, 307, 308])
