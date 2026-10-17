@@ -160,6 +160,18 @@ def _stopped_observation(root: Path, automation: ProductionAutomation | None, *,
     return observed
 
 
+def _material_failure_controls(root: Path, automation: ProductionAutomation) -> tuple:
+    if os.environ.get('OA_FINANCE_PREAUDIT_STOP_REQUESTED', '').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}:
+        raise RuntimeError('production_release_stop_requested')
+    marker = root / 'runtime/stop-preaudit.flag'
+    stop = None
+    if marker.exists() or marker.is_symlink():
+        stop = _pinned_control(marker)
+        if stop[1] != b'stop_requested:production_probe_prepare_failed\n':
+            raise RuntimeError('production_release_stop_not_repairable')
+    return stop, _paused_cron(automation)
+
+
 def _stopped_receipt(root: Path, automation: ProductionAutomation | None, before: dict | None,
                      *, official_stop_source_only: bool = False) -> dict:
     after = _stopped_observation(root, automation, official_stop_source_only=official_stop_source_only)
@@ -251,6 +263,7 @@ def release_source(
     withdrawal_cron = None
     material_proof = None
     material_fingerprints = None
+    material_controls = None
     if failed_material_actions:
         if stopped_maintenance or withdrawn_action is not None or automation is None or original_execution is None:
             raise RuntimeError('production_release_material_failure_binding_required')
@@ -258,7 +271,7 @@ def release_source(
         if len(set(actions)) != len(actions):
             raise RuntimeError('production_release_material_failure_binding_required')
         material_proof = {'kind': 'preaudit_material_failure_source_only', 'target_root': str(root), 'actions': actions}
-        withdrawal_cron = _control_proof(_paused_cron(automation))
+        material_controls = _material_failure_controls(root, automation)
     if confirmed_withdrawal and withdrawn_action is None:
         raise RuntimeError('production_release_withdrawal_action_required')
     if withdrawn_action is not None:
@@ -286,7 +299,7 @@ def release_source(
                            'automation_state': 'PAUSED'}
         if official_stop_source_only:
             controls_before['cooldown'] = _control_proof(controls[2])
-    else:
+    elif material_proof is None:
         _assert_no_stop(root)
     def assert_controls() -> None:
         if withdrawal_cron is not None and _control_proof(_pinned_control(automation.file, private=False)) != withdrawal_cron:
@@ -295,6 +308,9 @@ def release_source(
             if _stopped_controls(root, automation, official_stop_source_only=official_stop_source_only,
                                      user_stop_source_only=user_stop_source_only) != controls:
                 raise RuntimeError('production_release_stopped_controls_changed')
+        elif material_proof is not None:
+            if _material_failure_controls(root, automation) != material_controls:
+                raise RuntimeError('production_release_material_controls_changed')
         else:
             _assert_no_stop(root)
     before = _source(root, expected_revision, expected_origin)
@@ -433,6 +449,7 @@ def release_source(
                 **pre_sync_evidence,
                 **({'material_failure_source_only': True, 'approval_recovery_allowed': False,
                     'original_evidence_preserved': True, 'automation_state': 'PAUSED',
+                    'material_stop_preserved': material_controls[0] is not None,
                     'preserved_material_actions': material_proof['actions'],
                     'material_failure_fingerprints': material_fingerprints} if material_proof is not None else {}),
                 **({'withdrawn_submission_source_only':True, 'approval_recovery_allowed':False,
