@@ -11,6 +11,8 @@ import urllib.request
 from pathlib import Path
 from typing import Dict
 
+from apps.oa_approval import safe_http
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 TIMEOUT = 30
 REQUIRED_AUTH_ENV = ("OA_BASE_URL", "OA_APP_ID", "OA_APP_SECRET", "OA_UID")
@@ -125,7 +127,7 @@ def auth_pair() -> tuple[str, str]:
 
 def _http_post(url: str, headers: Dict[str, str], body: str = "") -> dict:
     req = urllib.request.Request(url=url, data=body.encode("utf-8"), headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+    with safe_http.urlopen(req, timeout=TIMEOUT) as resp:
         return json.loads(resp.read().decode("utf-8", errors="ignore"))
 
 

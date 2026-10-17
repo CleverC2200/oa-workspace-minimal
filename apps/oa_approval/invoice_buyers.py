@@ -9,7 +9,7 @@ import time
 from typing import Any, Dict, List
 import urllib.request
 
-from apps.oa_approval import evidence_packet
+from apps.oa_approval import evidence_packet, safe_http
 from apps.oa_approval.api import OaApi
 
 
@@ -41,7 +41,7 @@ class InvoiceCloudClient:
             },
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=DETAIL_TIMEOUT_SEC) as response:
+        with safe_http.urlopen(request, timeout=DETAIL_TIMEOUT_SEC) as response:
             payload = json.loads(response.read().decode("utf-8", errors="ignore"))
         action = payload.get("actionMsg") if isinstance(payload, dict) else {}
         if not isinstance(action, dict) or str(action.get("code")) != "0":
