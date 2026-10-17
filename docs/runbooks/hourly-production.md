@@ -19,7 +19,7 @@ status_dir=$(mktemp -d /tmp/oa-status.XXXXXX) &&
 
 继续须凭据、OA 接口与专用浏览器会话正常、执行身份 verified、授权与冻结可信、所有控制器和 Writer 空闲、上一轮终态及子进程回收可信。continuation 须 status=ready、blocking_reasons={}、isolated_pending为非负整数且等于pending_quarantined、scope与计数一致。code_matches_current=false 若只表示已终态旧版本清单，且当前 Git干净同步、ready_for_start=true、children_reaped=true、restart_verified=true，其余门禁可信，可由 fresh process加载新版；不复用旧进程。不因笼统 degraded 或可信隔离数量停止其他待办。
 
-生产审核固定 3 槽，OpenAI 每轮只创建 3 个 App 子 Agent 并复用对话，DeepSeek 沿用独立 API key 的 CLI 工具承载；不能弹性扩容；材料准备和全局 Writer 均为 1。门禁通过后只调用一次：
+生产审核固定 3 槽，OpenAI 每轮只创建 3 个 App 子 Agent 并复用对话，DeepSeek 沿用独立 API key 的 CLI 工具承载；不能弹性扩容；材料准备和全局 Writer 均为 1。每次启动产生独立 `run_id`，后续 pending、heartbeat、派单、包装和收尾命令都必须显式带同一 `--run-id`；旧轮证据只按 legacy 只读路径核验，不能回退到旧轮。门禁通过后只调用一次：
 
 ```bash
 .venv/bin/python -m scripts.finance_preaudit_run --owner-task-id <当前任务真实UUID> --review-provider openai --review-transport host_chat -- --rolling --fixed-capacity --capacity 3 --max-capacity 3 --confirm-write YES --confirm-alerts YES --recover-confirmed-no-write-once YES --workflow travel_expense --workflow business_entertainment --workflow business_support_fee --workflow small_marketing_fee --workflow tpm_small_marketing_fee --workflow general_expense
@@ -29,7 +29,7 @@ status_dir=$(mktemp -d /tmp/oa-status.XXXXXX) &&
 
 ### 原运行监视
 
-OpenAI 原控制器启动后立即执行[固定 App 审核槽原生派单](../agents/controller-execution.md#固定-app-审核槽的原生派单)。主对话创建并登记本轮恰好 3 个原 Agent，注册成功后按执行回执入口独立续首次父心跳，再读 pending；逐单 `followup_task` 复用；在 30 秒以内续父任务心跳，读取原执行回执和本轮 pending，先真实派单再 assign。子 Agent 的完成只表示审核返回，Writer 仍串行提交。保持原 session 的等待与派单同时推进，不等控制器退出才处理请求。身份不能替换，不递归创建审核者，不回退 OpenAI CLI。
+OpenAI 原控制器启动后立即执行[固定 App 审核槽原生派单](../agents/controller-execution.md#固定-app-审核槽的原生派单)。主对话创建并登记本轮恰好 3 个原 Agent，注册成功后按执行回执入口独立续首次父心跳，再读带 `--run-id <本轮run_id>` 的 pending；逐单 `followup_task` 复用；在 30 秒以内续父任务心跳，读取原执行回执和本轮 pending，先真实派单再 assign。子 Agent 的完成只表示审核返回，Writer 仍串行提交。保持原 session 的等待与派单同时推进，不等控制器退出才处理请求。身份不能替换，不递归创建审核者，不回退 OpenAI CLI。
 
 入口在开始本轮审核及启动任何 DeepSeek CLI 前读取审批冷却记录以及审批 run/instance、PID 启动时间、进程组和心跳。可信正常活动的上一轮返回 `approval_startup_gate/skipped`，本轮不叠加控制器。45 秒以上没有可信心跳只返回 blocked，不以静默判断卡死；明确阶段超时或已失去原控制器且进程归属仍可信时，只收尾登记的审批只读进程。登记不完整、PID 被复用、进程组回收未知或 Writer 活动均阻断，不猜 PID、不批量杀 Codex。旧版本缺少归属登记时，即使传入人工确认回收参数，也不能绕过此启动门。发起前未登记成功的 CLI 槽位保持占用，须人工核验。
 
@@ -65,7 +65,7 @@ worker 与外层监督进程每 5 秒观察本地原生错误，不产生模型 
 
 ## 包装待审核
 
-财务原工具 session 与原回执均可信正常终态、children_reaped=true 且新鲜结束门禁可信、Writer 空闲后才处理包装。OpenAI 主对话先 `host_chat_review --operation enter-packaging --owner-task-id <本轮主会话UUID>`，保留同一 3 个 Agent。随后使用原 `cli next-action --workflow packaging_layout_approval --mode controlled-write --confirm-write YES`。closed/not_available 不生成决定或调用完成。
+财务原工具 session 与原回执均可信正常终态、children_reaped=true 且新鲜结束门禁可信、Writer 空闲后才处理包装。OpenAI 主对话先 `host_chat_review --operation enter-packaging --owner-task-id <本轮主会话UUID> --run-id <本轮run_id>`，保留同一 3 个 Agent。随后使用原 `cli next-action --workflow packaging_layout_approval --mode controlled-write --confirm-write YES`。closed/not_available 不生成决定或调用完成。
 
 review_required 只读取当前冻结包装材料，逐页直接看原图，不用 OCR、不跨版本拼证据。按[包装只读审核](../agents/packaging-review.md)调用原 packaging_review；OpenAI 加本轮 owner-task-id 并持续原生派单/心跳，按需独立复核使用另一原槽，真实观察和父语义确认通过后走 App complete 包装入口。DeepSeek 沿用独立 API key/空 CODEX_HOME、原工具回执和调用者语义门，确认后才使用原 complete-review。供应商或来源失信不回退，不重提已提交意见。
 
