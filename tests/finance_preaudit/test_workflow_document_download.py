@@ -14,7 +14,7 @@ from apps.oa_approval import attachments, auth, official_sql, sql_templates
 def document_transport(monkeypatch, tmp_path):
     state = SimpleNamespace(
         initialized=False, initially_readable=False, still_denied=False,
-        actor="77", main_file="202", response_status=1, queries=[], requests=[],
+        actor="77", main_file="202", context_main_file=None, response_status=1, queries=[], requests=[],
         bindings=[{"docid": 303, "imagefileid": 202}], database_error=False,
     )
     monkeypatch.setattr(attachments, "OA_HOST", "https://oa.example.test")
@@ -46,9 +46,10 @@ def document_transport(monkeypatch, tmp_path):
         if path == "/api/hrm/login/getAccountList":
             body = json.dumps({"status": True, "data": {"userid": state.actor}}).encode()
         elif path == "/api/doc/detail/basicInfo":
-            assert params == {"docid": ["303"], "isrequest": ["1"], "requestid": ["101"]}
-            state.initialized = True
-            body = json.dumps({"status": state.response_status, "mainimagefile": state.main_file}).encode()
+            assert params in [{"docid": ["303"]}, {"docid": ["303"], "isrequest": ["1"], "requestid": ["101"]}]
+            state.initialized = "requestid" in params
+            main_file = state.context_main_file if state.initialized and state.context_main_file is not None else state.main_file
+            body = json.dumps({"status": state.response_status, "mainimagefile": main_file}).encode()
         else:
             assert path in {"/weaver/weaver.file.FileDownload", "/news/download.do"}
             if not state.initially_readable and (not state.initialized or state.still_denied):
@@ -80,7 +81,7 @@ def test_public_download_initializes_bound_document_and_retries_same_cookie(docu
     assert document_transport.queries == [("workflow_attachment_document", {"request_id": 101, "file_id": 202})]
     assert [x[0] for x in document_transport.requests] == [
         "/weaver/weaver.file.FileDownload", "/api/hrm/login/getAccountList",
-        "/api/doc/detail/basicInfo", "/weaver/weaver.file.FileDownload",
+        "/api/doc/detail/basicInfo", "/api/doc/detail/basicInfo", "/weaver/weaver.file.FileDownload",
     ]
     assert all(x[2] == "session=fixed" for x in document_transport.requests)
 
@@ -114,6 +115,7 @@ def test_failed_context_validation_keeps_original_denial(document_transport, tmp
     files, errors = download(tmp_path)
     assert not files and errors[0]["code"] == "attachment_access_denied"
     assert sum(x[0] == "/weaver/weaver.file.FileDownload" for x in document_transport.requests) == 1
+    assert not document_transport.initialized
 
 
 def test_real_denial_after_initialization_is_returned_without_more_retries(document_transport, tmp_path):
@@ -159,3 +161,18 @@ def test_native_redirect_is_blocked_before_forwarding_cookie(target, code):
     with pytest.raises(attachments.rpa_session.RpaSessionError) as caught:
         attachments._DocumentContextRedirect().redirect_request(None, None, 302, "", {}, target)
     assert caught.value.code == code
+
+
+def test_stop_after_native_read_prevents_download_retry(document_transport, monkeypatch, tmp_path):
+    monkeypatch.setattr(attachments.runtime_control, "stop_requested", lambda: document_transport.initialized)
+    files, errors = download(tmp_path)
+    assert not files and errors[0]["code"] == "oa_run_stopped"
+    assert sum(x[0] == "/weaver/weaver.file.FileDownload" for x in document_transport.requests) == 1
+
+
+def test_main_file_change_during_initialization_is_not_downloaded(document_transport, tmp_path):
+    document_transport.context_main_file = "999"
+    files, errors = download(tmp_path)
+    assert not files and errors[0]["code"] == "attachment_access_denied"
+    assert document_transport.initialized
+    assert sum(x[0] == "/weaver/weaver.file.FileDownload" for x in document_transport.requests) == 1

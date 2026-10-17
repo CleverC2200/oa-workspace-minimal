@@ -1025,6 +1025,9 @@ def _initialize_workflow_document_context(
             raise rpa_session.RpaSessionError(
                 rpa_session.RPA_SESSION_INVALID_CODE, "RPA 文档读取账号与配置不一致"
             )
+        preview = read("/api/doc/detail/basicInfo", {"docid": doc_id})
+        if str(preview.get("status")) != "1" or str(preview.get("mainimagefile")) != file_id:
+            return False
         if runtime_control.stop_requested():
             raise rpa_session.RpaSessionError(runtime_control.STOP_CODE, "已请求停止")
         info = read(
