@@ -527,6 +527,12 @@ def _validate_job(job: dict, root: Path) -> tuple[str, dict[str, Path]]:
     if any(envelope.get(key) != value for key, value in expected_envelope.items()):
         raise ValueError("submission_job_invalid")
     try:
+        review_binding = submission.review_decision_binding(envelope).get(submission.REVIEW_BINDING)
+        if review_binding and submission.fingerprint(decision) != review_binding["normalized_fingerprint"]:
+            raise ValueError("submission_job_invalid")
+    except ValueError as error:
+        raise ValueError("submission_job_invalid") from error
+    try:
         remark = paths["remark_file"].read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as error:
         raise ValueError("submission_job_invalid") from error
@@ -554,6 +560,12 @@ def _verify_submit_gate(
     if state_path.is_symlink():
         raise ValueError("submission_job_invalid")
     state = _read_object(state_path, code="submission_job_invalid")
+    envelope = _read_object(paths["envelope_file"], code="submission_job_invalid")
+    try:
+        if submission.review_decision_binding(state) != submission.review_decision_binding(envelope):
+            raise ValueError("submission_job_invalid")
+    except ValueError as error:
+        raise ValueError("submission_job_invalid") from error
     if (
         state.get("schema_version") != 1
         or state.get("kind") != "preaudit_action"
@@ -855,6 +867,13 @@ def build_ports(
     def recover_frozen(job: dict) -> dict:
         try:
             _remark, paths = _validate_job(job, resolved_root)
+            state_path = paths["material_file"].with_name("state.json")
+            if state_path.is_symlink():
+                raise ValueError("submission_job_invalid")
+            state = _read_object(state_path, code="submission_job_invalid")
+            envelope = _read_object(paths["envelope_file"], code="submission_job_invalid")
+            if submission.review_decision_binding(state) != submission.review_decision_binding(envelope):
+                raise ValueError("submission_job_invalid")
         except Exception as error:
             raise ValueError("writer_result_unknown") from error
         boundary = _read_boundary(
