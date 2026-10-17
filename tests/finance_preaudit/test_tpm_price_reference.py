@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 
@@ -154,6 +155,7 @@ def test_missing_reference_only_downgrades_first_item_and_keeps_amount(tmp_path:
     original = copy.deepcopy(decision)
     decision_file = tmp_path / "decision.json"
     decision_file.write_text(json.dumps(decision, ensure_ascii=False))
+    candidate_bytes = decision_file.read_bytes()
     result = engine.complete_review(Path(action["action_file"]), decision_file)
     remark = Path(result["remark_file"]).read_text()
     assert result["write_state"] == "not_requested"
@@ -162,6 +164,14 @@ def test_missing_reference_only_downgrades_first_item_and_keeps_amount(tmp_path:
     assert "参考报价" in remark
     assert "✅ 3、金额孰低核销：按 500 元核销。" in remark
     assert len(remark.splitlines()) == 5
-    saved = json.loads(Path(result["decision_file"]).read_text())
-    assert saved["items"][0]["status"] == "pass"
+    saved_file = Path(result["decision_file"])
+    saved = json.loads(saved_file.read_text())
+    receipt = json.loads(Path(result["receipt_file"]).read_text())
+    item = saved["items"][0]
+    assert item["status"] == "uncertain"
+    assert item["conclusion"] in item["missing_evidence"]
+    assert "⚠️ 1、附件完整性：" + item["conclusion"] in remark
     assert saved["items"][2:] == original["items"][2:]
+    assert saved["overall"] == receipt["business_state"] == result["business_state"]
+    assert receipt["decision_fingerprint"] == "sha256:" + hashlib.sha256(saved_file.read_bytes()).hexdigest()
+    assert decision_file.read_bytes() == candidate_bytes
