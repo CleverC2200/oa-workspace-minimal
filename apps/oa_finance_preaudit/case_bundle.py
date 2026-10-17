@@ -49,7 +49,7 @@ class CollectionFailure(RuntimeError):
         }
 
 
-def _field_rows(workflow: dict[str, Any]) -> list[dict[str, str]]:
+def _field_rows(workflow: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         {
             "path": str(item.get("path") or ""),
@@ -597,6 +597,15 @@ def collect_case(
         )
     ]
 
+    declared_fields = _field_rows(workflow)
+    if (config.get("flow_key") == "general_expense" and not logical_resources
+            and not authority_facts and not invoice_evidence.get("invoices")):
+        empty_fields = official_sql.general_expense_empty_attachment_fields(workflow, request_id=str(request_id))
+        for field in declared_fields:
+            if field["path"] in empty_fields:
+                field["read_status"] = "empty"
+                field["empty_source"] = empty_fields[field["path"]]
+
     public_resources = [
         {key: value for key, value in descriptor.items() if key != "raw_resource_id"}
         for descriptor in descriptors
@@ -608,7 +617,7 @@ def collect_case(
         "request_id": str(request_id),
         "workflow_key": str(config.get("flow_key") or ""),
         "workflow_name": identity["workflow_name"],
-        "declared_fields": _field_rows(workflow),
+        "declared_fields": declared_fields,
         "resources": public_resources,
         "attachment_deduplication": attachment_deduplication,
         "prepared": prepared,
