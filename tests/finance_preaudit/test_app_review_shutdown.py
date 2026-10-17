@@ -194,7 +194,7 @@ def test_cli_shutdown_binds_wait_after_literal_command(exchange, damage):
     rows[args['wait_line']] = json.dumps(output)
     args['source'].write_text('\n'.join(rows) + '\n')
     original = args['source'].read_bytes()
-    cli = ['--operation', 'finish-shutdown', '--owner-task-id', owner,
+    cli = ['--operation', 'finish-shutdown', '--owner-task-id', owner, '--run-id', manifest['run_id'],
         '--source-session-file', str(args['source']), '--source-line', str(args['status_line']),
         '--wait-line', str(args['wait_line'])]
     for line in args['interrupt_lines']:

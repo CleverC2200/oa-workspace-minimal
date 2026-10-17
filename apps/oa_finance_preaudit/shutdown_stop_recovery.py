@@ -21,8 +21,8 @@ from apps.oa_finance_preaudit import approval_guard as guard, approval_lifecycle
 if any(not Path(module.__file__).resolve().is_relative_to(root) for module in
        (host, shutdown, guard, lifecycle, controller_handoff)):
     raise ValueError('shutdown_stop_source_untrusted')
-value=host._registry(owner,live=False)
 saved_execution=json.loads(finance_preaudit_run._read_evidence(Path(path)))
+value=host._registry(owner,live=False,run_id=report.get('run_id'))
 plan=value['shutdown']; receipt=plan['receipt']; mirror=controller_handoff._read_manifest()
 if (plan['status']!='verified' or plan['reason'] not in {'reviewer_failed','parent_lost','cancelled'}
     or value['state']!='cancelled' or value['close_reason']!=plan['reason']
@@ -140,7 +140,7 @@ for index in range(guard.MAX_MODEL_WORKERS):
             raise ValueError('shutdown_stop_process_active')
 cooldown=guard.cooldown()
 if cooldown and host.time.time()<cooldown['blocked_until']: raise ValueError('shutdown_stop_cooldown')
-files=[host.registry_file(owner),Path(path),Path(path).with_name('tool-session.json'),
+files=[host.registry_file(owner,report.get('run_id')),Path(path),Path(path).with_name('tool-session.json'),
        Path(path).with_name('controller-manifest.json'),controller_handoff.manifest_file(),
        lifecycle.run_directory(mirror['run_id'])/'progress.json',
        *(guard._slot_path(i) for i in range(guard.MAX_MODEL_WORKERS)),
