@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import nullcontext
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import stat
 import time
@@ -14,6 +17,8 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from uuid import uuid4
 
 import fitz
+
+from apps.oa_finance_preaudit import retention
 
 from . import attachment_extractors, auth, runtime_control
 
@@ -213,6 +218,28 @@ def _validate_prepared(prepared: dict, *, frozen: bool) -> None:
                 raise ValueError('attachment_page_digest_missing')
 
 
+def _retention_binding(root: Path, *, action_file: Path | None, files: list[Path]) -> dict:
+    owners = set()
+    unbound = False
+    for path in ([action_file] if action_file else files):
+        try:
+            relative = path.resolve().relative_to(root)
+        except (OSError, RuntimeError, ValueError):
+            unbound = unbound or action_file is not None
+            continue
+        parts = relative.parts
+        if parts and parts[0] == '.archive':
+            parts = parts[1:]
+        if (len(parts) >= 5 and re.fullmatch(r'[a-z_]+', parts[0])
+                and parts[1] == 'cases' and re.fullmatch(r'[0-9a-f]{64}', parts[2])
+                and re.fullmatch(r'attempt-[1-9][0-9]*', parts[3])):
+            owners.add(str(Path(*parts[:4])))
+        else:
+            unbound = True
+    scope = 'unmanaged' if unbound else 'attempt' if owners else 'standalone'
+    return {'scope': scope, 'owner_attempts': sorted(owners)}
+
+
 def recognize(*, files: list[Path] | None = None, action_file: Path | None = None,
               prompt: str = DEFAULT_PROMPT, output_dir: Path | None = None,
               timeout_seconds: float = 90, budget_seconds: float = 1800) -> dict:
@@ -223,21 +250,46 @@ def recognize(*, files: list[Path] | None = None, action_file: Path | None = Non
     key = _api_key()
     if not key:
         raise ValueError('attachment_api_key_missing')
-    output_dir = (output_dir or runtime_control.controller_lock_file().parent / 'attachment-recognitions' / uuid4().hex).resolve()
+    raw_root = Path(os.environ.get('OA_FINANCE_PREAUDIT_FLOW_ROOT')
+                    or runtime_control.PROJECT_ROOT / 'runtime' / 'finance_preaudit_flows').expanduser()
+    flow_root = raw_root.resolve()
+    managed = output_dir is None
+    reserved = flow_root / '.attachment-recognitions'
+    output_dir = Path(os.path.abspath(output_dir or reserved / uuid4().hex))
+    if not managed and (output_dir.is_relative_to(reserved)
+                        or output_dir.resolve().is_relative_to(reserved.resolve())):
+        raise ValueError('attachment_output_reserved')
     action_file = action_file.absolute() if action_file else None
-    if action_file and output_dir.is_relative_to(action_file.parent):
+    if managed:
+        if output_dir.parent.is_symlink() or output_dir.is_symlink():
+            raise ValueError('attachment_output_unsafe')
+        raw_root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        retention.initialize_root(raw_root)
+    output_dir = output_dir.resolve()
+    if action_file and output_dir.is_relative_to(action_file.parent.resolve()):
         raise ValueError('attachment_output_inside_frozen_attempt')
-    output_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
-    os.chmod(output_dir, 0o700)
     report_file = output_dir / 'recognition.json'
     report = {'schema_version': 1, 'kind': 'deepseek_attachment_recognition', 'model': MODEL,
               'transport': 'direct_http', 'prompt': prompt, 'status': 'running',
+              'created_at': datetime.now(timezone.utc).isoformat(), 'completed_at': None,
+              'retention': _retention_binding(flow_root, action_file=action_file, files=files or []),
               'report_file': str(report_file), 'parts': [], 'sources': []}
     deadline = time.monotonic() + budget_seconds
     cache = {}
     current = None
     def save():
         runtime_control.write_control_bytes_atomic(report_file, (json.dumps(report, ensure_ascii=False) + '\n').encode())
+        if managed:
+            lifecycle = {name: report[name] for name in (
+                'schema_version', 'kind', 'report_file', 'created_at', 'completed_at', 'status', 'retention')}
+            runtime_control.write_control_bytes_atomic(
+                output_dir / 'retention.json', (json.dumps(lifecycle, ensure_ascii=False) + '\n').encode())
+    # Register ownership before reading sources, under the existing prune lock.
+    # The lock is released before preparation and any model request.
+    with retention.maintenance_lock(raw_root) if managed else nullcontext():
+        output_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
+        os.chmod(output_dir, 0o700)
+        save()
     try:
         if action_file:
             material, binding = _frozen(action_file)
@@ -316,6 +368,7 @@ def recognize(*, files: list[Path] | None = None, action_file: Path | None = Non
         report.update(status='failed', error_code=code if code.startswith(('attachment_', 'frozen_')) else 'attachment_recognition_failed')
         if current:
             report['failed_part'] = current
+    report['completed_at'] = datetime.now(timezone.utc).isoformat()
     save()
     return report
 
