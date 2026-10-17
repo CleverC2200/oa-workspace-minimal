@@ -18,9 +18,7 @@ from uuid import uuid4
 
 import fitz
 
-from apps.oa_finance_preaudit import retention
-
-from . import attachment_extractors, auth, runtime_control
+from . import attachment_extractors, auth, retention, runtime_control
 
 MODEL = 'deepseek-flash'
 ENDPOINT = 'https://api.deepseek.com/chat/completions'
