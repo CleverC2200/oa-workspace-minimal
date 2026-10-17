@@ -172,6 +172,13 @@ def _material_failure_controls(root: Path, automation: ProductionAutomation) -> 
     return stop, _paused_cron(automation)
 
 
+def _prepare_failure_controls(root: Path, automation: ProductionAutomation) -> tuple:
+    controls = _material_failure_controls(root, automation)
+    if controls[0] is None:
+        raise RuntimeError('production_release_prepare_failure_stop_required')
+    return controls
+
+
 def _stopped_receipt(root: Path, automation: ProductionAutomation | None, before: dict | None,
                      *, official_stop_source_only: bool = False) -> dict:
     after = _stopped_observation(root, automation, official_stop_source_only=official_stop_source_only)
@@ -247,6 +254,7 @@ def release_source(
     withdrawn_action: Path | None = None,
     confirmed_withdrawal: bool = False,
     failed_material_actions: tuple[Path, ...] = (),
+    prepare_failure_recovery_preflight: bool = False,
 ) -> dict:
     """Preflight, optionally ff-only sync, and verify while retaining both leases.
 
@@ -264,6 +272,8 @@ def release_source(
     material_proof = None
     material_fingerprints = None
     material_controls = None
+    if prepare_failure_recovery_preflight and (confirmed_sync or not failed_material_actions):
+        raise RuntimeError('production_release_prepare_failure_preflight_invalid')
     if failed_material_actions:
         if stopped_maintenance or withdrawn_action is not None or automation is None or original_execution is None:
             raise RuntimeError('production_release_material_failure_binding_required')
@@ -272,6 +282,8 @@ def release_source(
             raise RuntimeError('production_release_material_failure_binding_required')
         material_proof = {'kind': 'preaudit_material_failure_source_only', 'target_root': str(root), 'actions': actions}
         material_controls = _material_failure_controls(root, automation)
+        if prepare_failure_recovery_preflight and material_controls[0] is None:
+            raise RuntimeError('production_release_prepare_failure_stop_required')
     if confirmed_withdrawal and withdrawn_action is None:
         raise RuntimeError('production_release_withdrawal_action_required')
     if withdrawn_action is not None:
@@ -451,7 +463,9 @@ def release_source(
                     'original_evidence_preserved': True, 'automation_state': 'PAUSED',
                     'material_stop_preserved': material_controls[0] is not None,
                     'preserved_material_actions': material_proof['actions'],
-                    'material_failure_fingerprints': material_fingerprints} if material_proof is not None else {}),
+                    'material_failure_fingerprints': material_fingerprints,
+                    **({'prepare_failure_recovery_preflight': True}
+                       if prepare_failure_recovery_preflight else {})} if material_proof is not None else {}),
                 **({'withdrawn_submission_source_only':True, 'approval_recovery_allowed':False,
                     'withdrawal_observation':withdrawal_observation, 'original_evidence_preserved':True,
                     'automation_state':'PAUSED'} if withdrawn_action is not None else {}),
@@ -496,6 +510,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--withdrawn-action-file', type=Path)
     parser.add_argument('--confirm-withdrawal', choices=('YES',))
     parser.add_argument('--preserve-material-failure', type=Path, action='append', default=[])
+    parser.add_argument('--prepare-failure-recovery-preflight', choices=('YES',))
     args = parser.parse_args(argv)
     before = _observed_revision(args.target_root)
     controls_before = None
@@ -518,7 +533,8 @@ def main(argv: list[str] | None = None) -> int:
                                  official_stop_source_only=args.official_stop_source_only == 'YES',
                                  user_stop_source_only=args.user_stop_source_only == 'YES',
                                  withdrawn_action=args.withdrawn_action_file, confirmed_withdrawal=args.confirm_withdrawal == 'YES',
-                                 failed_material_actions=tuple(args.preserve_material_failure))
+                                 failed_material_actions=tuple(args.preserve_material_failure),
+                                 prepare_failure_recovery_preflight=args.prepare_failure_recovery_preflight == 'YES')
     except (OSError, ValueError, RuntimeError) as error:
         print(json.dumps(_failed_release(args.target_root, before, args.expected_revision, args.confirm_sync == 'YES', error,
             stopped_maintenance=args.stopped_maintenance == 'YES', automation=automation, controls_before=controls_before,

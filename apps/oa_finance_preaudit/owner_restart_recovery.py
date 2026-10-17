@@ -19,6 +19,7 @@ _ORIGINAL_READER = maintenance_runtime._ORIGINAL_EXECUTION_READER + r'''
 import os,time
 user_stop = len(sys.argv)>4 and sys.argv[4]=='user_stop'
 source_only = len(sys.argv)>5 and sys.argv[5]=='source_only'
+prepare_failure = len(sys.argv)>6 and sys.argv[6]=='prepare_failure'
 from datetime import datetime
 from apps.oa_finance_preaudit import approval_guard as guard, approval_lifecycle as lifecycle, production_release
 if any(not Path(module.__file__).resolve().is_relative_to(root) for module in (guard,lifecycle,production_release)):
@@ -39,7 +40,9 @@ if (report.get('state')!='exited' or report.get('terminal') is not True
 stop=production_release._pinned_control(root/'runtime/stop-preaudit.flag')
 started=datetime.fromisoformat(saved['started_at']).timestamp()
 completed=datetime.fromisoformat(saved['completed_at']).timestamp()
-expected_stop = b'stop_requested\n' if user_stop else b'stop_requested:codex_review_technical_failure\n'
+expected_stop = (b'stop_requested:production_probe_prepare_failed\n' if prepare_failure else
+                 b'stop_requested\n' if user_stop else
+                 b'stop_requested:codex_review_technical_failure\n')
 if (stop[1]!=expected_stop
         or not started<=stop[0][2]/1e9<=completed):
     raise ValueError('owner_restart_stop_attribution_untrusted')
@@ -107,7 +110,8 @@ print(json.dumps(report))
 
 
 def _read_original(root: Path, original: maintenance_runtime.OriginalExecution, manifest: bytes,
-                   *, user_stop: bool = False, source_only: bool = False) -> dict:
+                   *, user_stop: bool = False, source_only: bool = False,
+                   prepare_failure: bool = False) -> dict:
     maintenance_runtime.assert_target_environment(root)
     if (root / '.venv').is_symlink() or not (root / '.venv/bin/python').is_file():
         raise RuntimeError('maintenance_interpreter_untrusted')
@@ -117,7 +121,8 @@ def _read_original(root: Path, original: maintenance_runtime.OriginalExecution, 
     result = maintenance_runtime._run_readonly(
         [str(root / '.venv/bin/python'), '-B', '-E', '-c', _ORIGINAL_READER,
          str(original.file), original.owner_task_id, original.tool_session_id,
-         'user_stop' if user_stop else 'owner_restart', 'source_only' if source_only else 'recovery'],
+         'user_stop' if user_stop else 'owner_restart', 'source_only' if source_only else 'recovery',
+         'prepare_failure' if prepare_failure else 'default'],
         target_root=root, environment=environment, timeout=60, require_reaped=True)
     if result.returncode or len(result.stdout.encode()) > 1_000_000:
         raise RuntimeError('owner_restart_original_untrusted')
@@ -132,6 +137,7 @@ def recover(
     original: maintenance_runtime.OriginalExecution,
     confirmed: bool = False, expected_origin: str = production_release.ORIGIN,
     check_live: Callable[[Path], dict] | None = None, user_stop: bool = False,
+    prepare_failure: bool = False, selected_action: Path | None = None,
 ) -> dict:
     """Preflight by default; confirmation clears only the selected bound stop."""
     root = Path(target_root).expanduser().absolute()
@@ -141,14 +147,23 @@ def recover(
         'original_wait_verified': False, 'original_exit_code': None,
         'automation_state': 'unknown', 'approval_started': False,
         'production_acceptance': 'not_verified', 'receipt_file': None}
+    material_proof = None
     audit = None
     clear_attempted = False
     try:
         maintenance_runtime.assert_target_environment(root)
         if not production_release._REVISION.fullmatch(expected_revision):
             raise RuntimeError('production_release_revision_invalid')
+        if prepare_failure and (user_stop or selected_action is None):
+            raise RuntimeError('owner_restart_prepare_failure_selection_required')
+        if prepare_failure:
+            selected = Path(selected_action).expanduser().absolute()
+            material_proof = {'kind': 'preaudit_material_failure_source_only',
+                              'target_root': str(root), 'actions': [str(selected)]}
         with maintenance_runtime.target_runtime_leases(root):
-            controls = production_release._stopped_controls(root, automation, user_stop_source_only=user_stop)
+            controls = (production_release._prepare_failure_controls(root, automation)
+                        if prepare_failure else
+                        production_release._stopped_controls(root, automation, user_stop_source_only=user_stop))
             policy = root / 'runtime/control/write-policy.json'
             pinned_policy = production_release._pinned_control(policy, private=False)
             result['automation_state'] = 'PAUSED'
@@ -156,9 +171,11 @@ def recover(
             if production_release.candidate_configuration_findings(root, expected_revision):
                 raise RuntimeError('production_release_configuration_invalid')
             manifest = runtime_control.read_control_bytes(root / 'runtime/control/rolling-controller-manifest.json')
-            report = _read_original(root, original, manifest, user_stop=user_stop)
-            snapshot = check_live(root) if check_live else maintenance_runtime.read_live_status(root, require_reaped=True)
-            maintenance_runtime.assert_live_safe(snapshot)
+            report = _read_original(root, original, manifest, user_stop=user_stop,
+                                    prepare_failure=prepare_failure)
+            snapshot = (check_live(root) if check_live else maintenance_runtime.read_live_status(
+                root, require_reaped=True, source_only_proof=material_proof))
+            maintenance_runtime.assert_live_safe(snapshot, source_only_proof=material_proof)
             receipt = snapshot['maintenance_status_file']
             result.update(target_root=str(root), revision=expected_revision,
                 original_wait_verified=True, original_exit_code=report['exit_code'],
@@ -168,23 +185,33 @@ def recover(
                 current_inputs=snapshot['maintenance_current_inputs'], continuation=snapshot['reconciliation']['continuation'],
                 stop_before=production_release._control_proof(controls[0]),
                 automation_before=production_release._control_proof(controls[1]))
+            if prepare_failure:
+                result.update(prepare_failure_recovery=True,
+                              selected_recovery_action=str(selected_action))
 
             def verify_unchanged() -> None:
-                if production_release._stopped_controls(root, automation, user_stop_source_only=user_stop) != controls:
+                current_controls = (production_release._prepare_failure_controls(root, automation)
+                                    if prepare_failure else
+                                    production_release._stopped_controls(root, automation, user_stop_source_only=user_stop))
+                if current_controls != controls:
                     raise RuntimeError('owner_restart_controls_changed')
                 if production_release._pinned_control(policy, private=False) != pinned_policy:
                     raise RuntimeError('owner_restart_policy_changed')
                 production_release._source(root, expected_revision, expected_origin, synchronized=True)
-                if _read_original(root, original, manifest, user_stop=user_stop) != report:
+                if _read_original(root, original, manifest, user_stop=user_stop,
+                                  prepare_failure=prepare_failure) != report:
                     raise RuntimeError('owner_restart_original_changed')
-                if maintenance_runtime.read_current_inputs(root, receipt, require_reaped=True) != snapshot['maintenance_current_inputs']:
+                if maintenance_runtime.read_current_inputs(
+                        root, receipt, require_reaped=True, source_only_proof=material_proof
+                ) != snapshot['maintenance_current_inputs']:
                     raise RuntimeError('owner_restart_inputs_changed')
 
             verify_unchanged()
             if not confirmed:
                 result['status'] = 'ready'
                 return result
-            directory = root / 'runtime/control' / ('owner-restart-recovery-' + uuid4().hex)
+            directory = root / 'runtime/control' / (('prepare-failure-recovery-' if prepare_failure
+                                                       else 'owner-restart-recovery-') + uuid4().hex)
             directory.mkdir(mode=0o700)
             audit = directory / 'receipt.json'
             result.update(status='validated', receipt_file=str(audit), recorded_at=datetime.now(timezone.utc).isoformat())
@@ -230,11 +257,17 @@ def main(argv: list[str] | None = None, *, check_live: Callable[[Path], dict] | 
     parser.add_argument('--original-tool-session-id', required=True)
     parser.add_argument('--confirm-recovery', choices=('YES',))
     parser.add_argument('--resume-user-stop', choices=('YES',))
+    parser.add_argument('--prepare-failure-recovery', choices=('YES',))
+    parser.add_argument('--recover-action-file', type=Path)
     args = parser.parse_args(argv)
+    prepare_failure = args.prepare_failure_recovery == 'YES'
+    if prepare_failure and args.recover_action_file is None:
+        parser.error('--recover-action-file is required with --prepare-failure-recovery YES')
     result = recover(args.target_root, expected_revision=args.expected_revision, expected_origin=args.expected_origin,
         automation=production_release.ProductionAutomation(args.automation_file, args.production_project_id, args.expected_schedule),
         original=maintenance_runtime.OriginalExecution(args.original_receipt_file, args.original_owner_task_id, args.original_tool_session_id),
-        confirmed=args.confirm_recovery == 'YES', check_live=check_live, user_stop=args.resume_user_stop == 'YES')
+        confirmed=args.confirm_recovery == 'YES', check_live=check_live, user_stop=args.resume_user_stop == 'YES',
+        prepare_failure=prepare_failure, selected_action=args.recover_action_file)
     print(json.dumps(result, sort_keys=True))
     return 0 if result['status'] in {'ready', 'cleared'} else 1
 
