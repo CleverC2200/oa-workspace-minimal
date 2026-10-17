@@ -127,3 +127,5 @@ python -m apps.oa_finance_preaudit.production_release \
 目标自身的现有校验器核对最新待办、完整 action/state 归属、controller 级材料失败回执、未写入恢复合同及当前授权。清单必须精确解释全部 `pending_failure_not_isolated`，其他阻断、未知写入或 Writer 产物仍拒绝。其他待办继续核验冻结材料。原 action/state、回执和全部附件按文件身份与字节哈希在同步前后保留，原对账 continuation 不改写。
 
 本分支只安装源码，不创建 attempt、不调用模型、不提交 OA。回执记录 `material_failure_source_only=true`、`approval_recovery_allowed=false`、`next_process_ready=false` 和同步前后完整状态证明。随后按已有显式恢复合同重新取材；材料仍不可读取的单据保留待人工处理，不生成缺少数据的意见。权限拒绝与真正登录失效分别分类，前者局部隔离，后者仍阻断整轮。
+
+当停止文件是精确的 `stop_requested:production_probe_prepare_failed` 时，材料失败 source-only 分支可以在完整 proof、原执行、失败指纹和 PAUSED cron 均可信的前提下安装源码。它必须在同步前后复核停止文件和 cron 身份及字节，保留停止文件，不把下一进程标记为可启动。其他停止原因继续拒绝，审批恢复资格保持关闭。
