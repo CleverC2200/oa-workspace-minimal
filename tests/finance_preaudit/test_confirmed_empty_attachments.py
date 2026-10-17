@@ -17,20 +17,24 @@ from tests.finance_preaudit.test_flow_engine_material_gaps import _engine, _unce
 def empty_source(monkeypatch, tmp_path):
     config = {"flow_key": "general_expense", "workflow_id": "195021", "workflow_name": "通用费用报销申请流程"}
     fields = [{"fieldName": code, "fieldShowName": name, "fieldValue": "",
-               "fieldShowValue": "[该字段暂不支持]", "fieldHtmlType": "3"}
+               "fieldShowValue": "[该字段暂不支持]", "fieldHtmlType": "3",
+               "filedHtmlShow": "<div style=\"width:100%;\"><span style='color:#ACA899'>[该字段暂不支持]</span></div>"}
               for code, name in [("scfj", "上传附件"), ("fj", "附件"), ("glfp", "关联发票")]]
     workflow = {"requestId": "101", "workflowBaseInfo": {"workflowId": "195021", "workflowName": config["workflow_name"]},
                 "workflowMainTableInfo": {"tableDBName": "formtable_main_569", "requestRecords": [{"workflowRequestTableFields": [
                     {"fieldName": "cwzfje", "fieldShowName": "财务审核金额", "fieldValue": "100", "fieldShowValue": "100"}]}]},
                 "workflowDetailTableInfos": [{"tableDBName": "formtable_main_569_dt1", "workflowRequestTableRecords": [
                     {"recordOrder": 202, "workflowRequestTableFields": fields}]}]}
-    state = SimpleNamespace(workflow=workflow, rows=[{"requestid": 101, "detail_id": 202, "scfj": None, "fj": None, "glfp": None}], queries=[], error=None)
+    state = SimpleNamespace(workflow=workflow, rows=[{"requestid": 101, "detail_id": 202, "scfj": None, "fj": None, "glfp": None}], queries=[], error=None, rows_by_detail={})
 
     def query(name, params, **kwargs):
         state.queries.append((name, params, kwargs))
         if state.error:
             raise state.error
-        return deepcopy(state.rows)
+        rows = state.rows_by_detail.get(params["detail_id"], state.rows)
+        if isinstance(rows, Exception):
+            raise rows
+        return deepcopy(rows)
 
     monkeypatch.setattr(official_sql, "_query_rows", query)
     monkeypatch.setattr(case_bundle.invoice_buyers, "read_invoice_buyers", lambda *_a, **_k: {"read_status": "not_applicable", "invoices": []})
@@ -123,15 +127,18 @@ def test_empty_source_uses_detail_identity_not_row_position(empty_source):
     table["workflowRequestTableRecords"].insert(0, second)
     material = empty_source.collect()
     fields = attachment_fields(material)
-    assert [f["read_status"] for f in fields] == ["unresolved"] * 3 + ["empty"] * 3
-    assert {f["empty_source"]["detail_id"] for f in fields if f["read_status"] == "empty"} == {"202"}
+    assert [f["read_status"] for f in fields] == ["unresolved"] * 6
+    empty_source.rows_by_detail[303] = [{**empty_source.rows[0], "detail_id": 303}]
+    fields = attachment_fields(empty_source.collect())
+    assert all(f["read_status"] == "empty" for f in fields)
+    assert [f["empty_source"]["detail_id"] for f in fields] == ["303"] * 3 + ["202"] * 3
 
 
 def test_nonempty_source_field_does_not_become_empty(empty_source):
     empty_source.rows[0]["glfp"] = "invoice-reference"
     fields = {f["code"]: f for f in attachment_fields(empty_source.collect())}
     assert fields["glfp"]["read_status"] == "unresolved"
-    assert fields["fj"]["read_status"] == "empty"
+    assert all(f["read_status"] == "unresolved" for f in fields.values())
 
 
 def test_empty_source_query_binds_both_workflow_and_detail():
@@ -156,3 +163,30 @@ def test_source_confirmation_does_not_mutate_api_response(empty_source):
     before = deepcopy(empty_source.workflow)
     assert all(f["read_status"] == "empty" for f in attachment_fields(empty_source.collect()))
     assert empty_source.workflow == before
+
+
+@pytest.mark.parametrize("variant", ["nonnull", "later_row_failure"])
+def test_partial_confirmation_cannot_open_business_preview(empty_source, tmp_path, variant):
+    for field in empty_source.workflow["workflowDetailTableInfos"][0]["workflowRequestTableRecords"][0]["workflowRequestTableFields"]:
+        field["filedHtmlShow"] = ""
+    if variant == "nonnull":
+        empty_source.rows[0]["glfp"] = "unread-invoice-reference"
+    else:
+        table = empty_source.workflow["workflowDetailTableInfos"][0]
+        later = deepcopy(table["workflowRequestTableRecords"][0]);later["recordOrder"] = 303
+        table["workflowRequestTableRecords"].append(later)
+        empty_source.rows_by_detail[303] = RuntimeError("official_sql_read_failed")
+    engine = _engine(tmp_path / "engine", "general_expense", RuntimeError("unused"))
+    engine._discover_candidates = lambda key: [{"request_id": "101", "workflow_key": key, "received_at": "2026-08-23T09:00:00+08:00"}]
+    engine._collect_material = empty_source.collect
+    action = engine.next_action("general_expense")
+    assert action["action"] == "needs_admin"
+    assert action["failure_detail_code"] == "general_evidence_references_unresolved"
+    assert action["write_state"] == "not_requested"
+
+
+def test_html_link_hidden_with_placeholder_is_not_confirmed_empty(empty_source):
+    field = empty_source.workflow["workflowDetailTableInfos"][0]["workflowRequestTableRecords"][0]["workflowRequestTableFields"][0]
+    field["filedHtmlShow"] = "<span onclick=\"toDocument(77)\">[该字段暂不支持]</span>"
+    material = empty_source.collect()
+    assert all(f["read_status"] == "unresolved" for f in attachment_fields(material))

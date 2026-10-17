@@ -164,6 +164,11 @@ def _query_rows(
             pass
 
 
+def _attachment_placeholder_html(value: str) -> bool:
+    content = re.sub(r"</?(?:span|div)(?:\s+style=(?:'[^'<>]*'|\"[^\"<>]*\"))?\s*>", "", value, flags=re.I).strip()
+    return content in {"", "[该字段暂不支持]", "[该字段仅支持显示]"}
+
+
 def general_expense_empty_attachment_fields(data: dict, *, request_id: str) -> dict[str, dict[str, str]]:
     if (not re.fullmatch(r"[1-9][0-9]*", request_id)
             or str(data.get("requestId") or "") != request_id
@@ -181,32 +186,32 @@ def general_expense_empty_attachment_fields(data: dict, *, request_id: str) -> d
         records = table.get("workflowRequestTableRecords") or []
         identities = [str(record.get("recordOrder") or "") for record in records]
         if len(identities) != len(set(identities)):
-            continue
+            return {}
         for row_index, (record, detail_id) in enumerate(zip(records, identities)):
             if not re.fullmatch(r"[1-9][0-9]*", detail_id):
-                continue
+                return {}
             fields = [extracted[f"detail[{table_index}].row[{row_index}].field[{index}]"]
                       for index, field in enumerate(record.get("workflowRequestTableFields") or [])
                       if field.get("fieldName") in codes]
             if ({field["field_name"] for field in fields} != codes or len(fields) != len(codes)
                     or any(field["read_status"] != "unresolved" or field["raw_value"].strip()
-                           or field["attachment_html"].strip() for field in fields)):
-                continue
+                           or not _attachment_placeholder_html(field["attachment_html"]) for field in fields)):
+                return {}
             try:
                 rows = _query_rows("general_expense_attachment_fields",
                                    {"request_id": int(request_id), "detail_id": int(detail_id)},
                                    require_connection=True)
             except RuntimeError:
-                continue
+                return {}
             if (len(rows) != 1 or not codes.issubset(rows[0])
                     or str(rows[0].get("requestid")) != request_id
-                    or str(rows[0].get("detail_id")) != detail_id):
-                continue
+                    or str(rows[0].get("detail_id")) != detail_id
+                    or any(rows[0][code] is not None for code in codes)):
+                return {}
             for field in fields:
                 code = field["field_name"]
-                if rows[0][code] is None:
-                    confirmed[field["path"]] = {"source": "official_sql", "request_id": request_id,
-                        "detail_id": detail_id, "table": "formtable_main_569_dt1", "field_name": code}
+                confirmed[field["path"]] = {"source": "official_sql", "request_id": request_id,
+                    "detail_id": detail_id, "table": "formtable_main_569_dt1", "field_name": code}
     return confirmed
 
 
