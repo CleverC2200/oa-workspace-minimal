@@ -23,6 +23,12 @@ python -m apps.oa_approval.attachment_recognition \
 
 标准输出只返回状态、结果文件、分段数量和错误码。读取返回的 `report_file` 获得 `parts[*].answer`，其中保留问题、模型、来源、页码或文本分段及 Token 用量。结果文件和展开页保存在独立私有目录，不覆盖冻结材料。可用 `--output-dir` 指定尚不存在的结果目录；冻结动作模式拒绝写入该 attempt 内部。
 
+默认目录为 `runtime/finance_preaudit_flows/.attachment-recognitions/<id>/`，也随 `OA_FINANCE_PREAUDIT_FLOW_ROOT` 使用指定的 flow 根。报告在读取原材料前记录 `created_at`、`retention` 和运行状态，结束时记录 `completed_at`；action 模式及直接读取该 flow 根内 attempt 文件时保留所属 attempt。独立的 `retention.json` 只保存这些生命周期字段，作为清理依据，避免大段转写正文影响原材料保护。每次先保存正文、再原子保存生命周期；中断时保留较早的运行状态。识别请求期间不持有维护锁。
+
+现有 `python -m apps.oa_finance_preaudit.cli prune` 按 30 天保留期清理已结束的默认识别输出。绑定 attempt 的输出只有在原 attempt 也允许删除时才清理；活跃、未知写入、最新任务或无法核对的归属继续保留。新近或运行中的识别会阻止其原材料提前归档或删除。受管目录中缺失、损坏或超过 64 KiB 的生命周期记录无法确认归属时，暂停该 flow 根内 attempt 的归档和删除，待人工核对；不根据报告文件时间猜测归属。清理计划只包含路径身份及原因，不包含转写正文。
+
+自定义 `--output-dir`、旧 `runtime/control/attachment-recognitions/` 和缺少可靠时间/归属的旧报告不自动迁移或删除，继续按原证据用途人工处理。自定义输出不得位于保留的 `.attachment-recognitions/` 命名空间，等价路径和符号链接也遵循该限制。需要长期独立保存的结果使用其他自定义目录；修改保留方式不授予生产清理权限。
+
 附件转写请求显式使用 `thinking.type=disabled`，把每页 8192 输出 Token 留给转写回答。工具不形成财务判断；业务审核仍由当前 Reviewer 按规则执行。
 
 源文件按流计算摘要，上限 512 MiB；单页图片、UTF-8 文本及冻结 JSON 的读取上限为 32 MiB，格式展开还遵循已有准备器的限制。大 PDF 或 Excel 按页或内嵌图发送，不把容器整体放进 API 请求。图片每次 HTTP 请求只有一页；PDF、Office、XML、OFD 复用现有本地展开，UTF-8 文本直接分段。相同类型和内容的重复页在本次问题内复用回答，各自保留来源映射。每次调用从空上下文开始，不累计前页图片。不支持的格式和展开失败明确返回失败，不标为已识别。只有文件记录、没有本地正文的附件仍未读取，工具不下载或猜测正文。
