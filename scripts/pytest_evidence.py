@@ -3,8 +3,10 @@ from collections import Counter, defaultdict
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
+import re
 import resource
 import sys
 import time
@@ -147,7 +149,7 @@ class Evidence:
         if exitstatus != pytest.ExitCode.OK:
             self.errors.append(f'pytest_exit:{int(exitstatus)}')
         report = {
-            'schema_version': 1, 'kind': 'offline_pytest_evidence', 'root': str(self.config.rootpath),
+            'schema_version': 2, 'kind': 'offline_pytest_evidence', 'root': str(self.config.rootpath),
             'status': 'failed' if self.errors else ('collected' if collecting else 'verified'),
             'nodeids': nodes, 'collection_sha256': digest, 'collected_count': len(nodes),
             'executed_count': sum(len(values) for values in self.outcomes.values()),
@@ -157,6 +159,8 @@ class Evidence:
             'started_at': float(self.job_started) if self.job_started is not None else self.wall_started,
             'shard': self.config.getoption('ci_shard'), 'platform': sys.platform,
             'code_revision': os.environ.get('GITHUB_SHA'), 'run_id': os.environ.get('GITHUB_RUN_ID'),
+            'run_attempt': int(os.environ.get('GITHUB_RUN_ATTEMPT', '1')),
+            'job': os.environ.get('GITHUB_JOB'),
             'cpu_count': os.cpu_count(),
             'cpu_seconds': time.process_time() - self.cpu_started,
             'child_cpu_seconds': (resource.getrusage(resource.RUSAGE_CHILDREN).ru_utime
@@ -172,25 +176,71 @@ class Evidence:
             session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
+def _positive_integer(value):
+    if not isinstance(value, str) or not re.fullmatch(r'[1-9][0-9]*', value):
+        raise ValueError('ci_job_output_invalid')
+    return int(value)
+
+
+def _job_evidence(directory):
+    """Use the attempts selected by needs, never search backwards for a passing report."""
+    attempt = _positive_integer(os.environ['GITHUB_RUN_ATTEMPT'])
+    required = json.loads(os.environ['OA_CI_REQUIRED_RESULTS'])
+    if set(required) != {'quality', 'macos-stop-recovery'}:
+        raise ValueError('ci_required_jobs_invalid')
+    errors = [] if all(job.get('result') == 'success' for job in required.values()) else ['required_job_failed']
+    selected, artifacts, paths = {}, {}, {}
+    for role, job, suffix in (('0', 'quality', '_0'), ('1', 'quality', '_1'), ('macos', 'macos-stop-recovery', '')):
+        outputs = required[job]['outputs']
+        selected[role] = _positive_integer(outputs['attempt' + suffix])
+        artifacts[role] = _positive_integer(outputs['artifact' + suffix])
+        if selected[role] > attempt:
+            raise ValueError('ci_job_attempt_invalid')
+        paths[role] = directory / f'offline-test-evidence-{role}-attempt-{selected[role]}'
+    if len(set(artifacts.values())) != 3:
+        raise ValueError('ci_duplicate_artifact')
+    for path in directory.glob('offline-test-evidence-*'):
+        # Legacy names cannot be selected, even if an old download left them behind.
+        if path.name in {'offline-test-evidence-0', 'offline-test-evidence-1'}:
+            continue
+        match = re.fullmatch(r'offline-test-evidence-(0|1|macos)-attempt-([1-9][0-9]*)', path.name)
+        if not match or int(match[2]) > selected[match[1]]:
+            raise ValueError('ci_unexpected_artifact')
+    return attempt, selected, artifacts, paths, errors
+
+
+def _valid_time(value):
+    return type(value) in (int, float) and math.isfinite(value) and value >= 0
+
+
+def macos_evidence(path, budget):
+    """Bind the existing no-skip macOS check to its actual job attempt."""
+    cases = ElementTree.parse(path).findall('.//testcase')
+    started = float(os.environ['OA_CI_STARTED_AT'])
+    elapsed = time.time() - started
+    errors = []
+    if not cases or any(case.find(tag) is not None for case in cases for tag in ('skipped', 'failure', 'error')):
+        errors.append('stop_recovery_tests_incomplete')
+    if not 0 <= elapsed <= budget:
+        errors.append('ci_time_budget_exceeded')
+    return {'schema_version': 2, 'kind': 'offline_macos_evidence',
+            'status': 'failed' if errors else 'verified', 'code_revision': os.environ['GITHUB_SHA'],
+            'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': _positive_integer(os.environ['GITHUB_RUN_ATTEMPT']),
+            'job': os.environ['GITHUB_JOB'], 'platform': sys.platform, 'started_at': started,
+            'elapsed_seconds': elapsed, 'budget_seconds': budget, 'test_count': len(cases), 'errors': errors}
+
+
 def merge_evidence(directory, budget):
-    """Join the fixed two-runner matrix against both independent full collections."""
-    references = [json.loads((directory / f'offline-test-evidence-{shard}' / 'collection.json').read_text())
+    """Join exact job-attempt evidence, retaining successful jobs not selected for rerun."""
+    attempt, selected, artifacts, paths, errors = _job_evidence(directory)
+    references = [json.loads((paths[str(shard)] / 'collection.json').read_text())
                   for shard in (0, 1)]
-    reports = [json.loads((directory / f'offline-test-evidence-{shard}' / 'execution.json').read_text())
+    reports = [json.loads((paths[str(shard)] / 'execution.json').read_text())
                for shard in (0, 1)]
     nodes = references[0]['nodeids']
     digest = collection_digest(nodes)
-    errors = []
-    required = os.environ.get('OA_CI_REQUIRED_RESULTS')
-    if required is not None:
-        required = json.loads(required)
-        if (set(required) != {'quality', 'macos-stop-recovery'}
-                or any(job.get('result') != 'success' for job in required.values())):
-            errors.append('required_job_failed')
-    if {path.name for path in directory.glob('offline-test-evidence-*')} != {
-            'offline-test-evidence-0', 'offline-test-evidence-1'}:
-        errors.append('shard_set_incomplete')
     outcomes = defaultdict(list)
+    starts = [float(os.environ['OA_CI_STARTED_AT'])]
     identity = {key: references[0].get(key) for key in ('root', 'platform', 'code_revision', 'run_id')}
     for shard, (reference, report) in enumerate(zip(references, reports)):
         if (reference.get('status') != 'collected' or reference.get('nodeids') != nodes
@@ -198,9 +248,18 @@ def merge_evidence(directory, budget):
             errors.append('full_collection_mismatch')
         if any({key: value.get(key) for key in identity} != identity for value in (reference, report)):
             errors.append('evidence_identity_mismatch')
+        if any(value.get('schema_version') != 2 or value.get('job') != 'quality'
+                or type(value.get('run_attempt')) is not int or value['run_attempt'] != selected[str(shard)]
+                for value in (reference, report)):
+            errors.append('evidence_attempt_mismatch')
         if (os.environ.get('GITHUB_SHA') != identity['code_revision']
                 or os.environ.get('GITHUB_RUN_ID') != identity['run_id']):
             errors.append('evidence_run_mismatch')
+        if (not _valid_time(reference.get('started_at')) or reference['started_at'] != report.get('started_at')
+                or not _valid_time(report.get('elapsed_seconds')) or report['elapsed_seconds'] > budget):
+            errors.append('evidence_timing_invalid')
+        elif selected[str(shard)] == attempt:
+            starts.append(reference['started_at'])
         expected = shard_nodes(nodes, shard)
         if (report.get('shard') != shard or report.get('status') != 'verified' or report.get('errors')
                 or report.get('nodeids') != expected
@@ -218,41 +277,56 @@ def merge_evidence(directory, budget):
     if any(values == ['skipped'] and node not in allowed for node, values in outcomes.items()):
         errors.append('unexpected_skip')
     manual_nodes = [node.split('::')[-1] for node in nodes if node.startswith(_MANUAL_STOP)]
-    macos_files = list(directory.rglob('stop-recovery.xml'))
-    starts = [reference['started_at'] for reference in references]
-    if manual_nodes or macos_files:
-        cases = ElementTree.parse(macos_files[0]).findall('.//testcase') if len(macos_files) == 1 else []
-        if (Counter(case.get('name') for case in cases) != Counter(manual_nodes)
-                or any(case.find(tag) is not None for case in cases for tag in ('skipped', 'failure', 'error'))):
-            errors.append('macos_stop_recovery_incomplete')
-        macos_starts = list(directory.rglob('stop-recovery-started-at.txt'))
-        if len(macos_starts) != 1:
-            errors.append('macos_start_evidence_missing')
-        else:
-            starts.append(float(macos_starts[0].read_text()))
+    macos = json.loads((paths['macos'] / 'macos.json').read_text())
+    if (macos.get('schema_version') != 2 or macos.get('job') != 'macos-stop-recovery'
+            or macos.get('platform') != 'darwin' or type(macos.get('run_attempt')) is not int
+            or macos['run_attempt'] != selected['macos']
+            or any(macos.get(key) != identity[key] for key in ('code_revision', 'run_id'))):
+        errors.append('macos_identity_mismatch')
+    cases = ElementTree.parse(paths['macos'] / 'stop-recovery.xml').findall('.//testcase')
+    if (macos.get('status') != 'verified' or macos.get('errors')
+            or Counter(case.get('name') for case in cases) != Counter(manual_nodes)
+            or any(case.find(tag) is not None for case in cases for tag in ('skipped', 'failure', 'error'))):
+        errors.append('macos_stop_recovery_incomplete')
+    if (not _valid_time(macos.get('started_at')) or not _valid_time(macos.get('elapsed_seconds'))
+            or macos['elapsed_seconds'] > budget):
+        errors.append('evidence_timing_invalid')
+    elif selected['macos'] == attempt:
+        starts.append(macos['started_at'])
     elapsed = time.time() - min(starts)
     if not 0 <= elapsed <= budget:
         errors.append('ci_time_budget_exceeded')
-    return {'schema_version': 1, 'kind': 'offline_pytest_matrix_evidence',
+    roles = {'0': 'quality-0', '1': 'quality-1', 'macos': 'macos-stop-recovery'}
+    return {'schema_version': 2, 'kind': 'offline_pytest_matrix_evidence',
             'status': 'failed' if errors else 'verified', **identity,
+            'run_attempt': attempt, 'evidence_attempts': {roles[role]: value for role, value in selected.items()},
+            'artifact_ids': {roles[role]: value for role, value in artifacts.items()},
+            'reused_jobs': [roles[role] for role, value in selected.items() if value < attempt],
             'nodeids': nodes, 'collection_sha256': digest, 'collected_count': len(nodes),
             'executed_count': sum(len(values) for values in outcomes.values()),
             'counts': dict(Counter(value for values in outcomes.values() for value in values)),
             'macos_stop_recovery_count': len(manual_nodes), 'shards': reports,
-            'elapsed_seconds': elapsed, 'timing_scope': 'matrix_and_aggregation',
+            'elapsed_seconds': elapsed, 'timing_scope': 'attempt_matrix_and_aggregation',
             'budget_seconds': budget, 'errors': errors}
 
 
 def main():
     parser = argparse.ArgumentParser(description='Verify complete two-runner offline CI evidence')
-    parser.add_argument('--merge-directory', type=Path, required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--merge-directory', type=Path)
+    mode.add_argument('--macos-report', type=Path)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--budget-seconds', type=float, default=170)
     args = parser.parse_args()
-    report = merge_evidence(args.merge_directory, args.budget_seconds)
+    try:
+        report = (merge_evidence(args.merge_directory, args.budget_seconds) if args.merge_directory
+                  else macos_evidence(args.macos_report, args.budget_seconds))
+    except (OSError, ValueError, KeyError, TypeError, ElementTree.ParseError) as error:
+        report = {'status': 'failed', 'counts': {}, 'elapsed_seconds': None,
+                  'errors': [str(error) if type(error) is ValueError else f'evidence_input_invalid:{type(error).__name__}']}
     with args.output.open('x', encoding='utf-8') as file:
         json.dump(report, file, ensure_ascii=False, indent=2)
-    print(json.dumps({key: report[key] for key in ('status', 'counts', 'elapsed_seconds', 'errors')}))
+    print(json.dumps({key: report[key] for key in ('status', 'counts', 'elapsed_seconds', 'errors') if key in report}))
     return int(report['status'] != 'verified')
 
 
