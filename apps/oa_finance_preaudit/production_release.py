@@ -172,6 +172,13 @@ def _material_failure_controls(root: Path, automation: ProductionAutomation) -> 
     return stop, _paused_cron(automation)
 
 
+def _prepare_failure_controls(root: Path, automation: ProductionAutomation) -> tuple:
+    controls = _material_failure_controls(root, automation)
+    if controls[0] is None:
+        raise RuntimeError('production_release_prepare_failure_stop_required')
+    return controls
+
+
 def _stopped_receipt(root: Path, automation: ProductionAutomation | None, before: dict | None,
                      *, official_stop_source_only: bool = False) -> dict:
     after = _stopped_observation(root, automation, official_stop_source_only=official_stop_source_only)
