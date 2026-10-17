@@ -16,11 +16,11 @@ from apps.oa_approval import runtime_control
 from . import host_chat_review as host
 
 
-def begin(*, owner: str, reason: str) -> dict:
+def begin(*, owner: str, reason: str, run_id: str | None = None) -> dict:
     if reason not in {'completed', 'cancelled', 'parent_lost', 'reviewer_failed'}:
         raise ValueError('host_review_close_reason_invalid')
-    with host._round_lease(owner) as path:
-        value = host._registry(owner, live=False)
+    with host._round_lease(owner, run_id) as path:
+        value = host._registry(owner, live=False, run_id=run_id)
         current = value.get('shutdown')
         if current is not None:
             if current['reason'] != reason:
@@ -38,7 +38,7 @@ def begin(*, owner: str, reason: str) -> dict:
     # Abort the exchange promptly, even while Writer is still finishing. This
     # stop request never sends a signal to Writer or the original tool session.
     if reason != 'completed':
-        host.close(owner=owner, reason=reason)
+        host.close(owner=owner, reason=reason, run_id=run_id)
         if value['state'] != 'open':
             host.request_abort_stop(value)
     return plan
@@ -118,11 +118,11 @@ def _wait_result(anchor: dict, output: dict, session: str) -> dict:
     return results[-1]
 
 
-def finish(*, owner: str, source: Path, interrupt_lines: list[int], status_line: int, wait_line: int) -> dict:
+def finish(*, owner: str, source: Path, interrupt_lines: list[int], status_line: int, wait_line: int, run_id: str | None = None) -> dict:
     """Seal only after three actual interruptions, terminal status and driver exit."""
     from scripts import finance_preaudit_run
-    with host._round_lease(owner):
-        value = host._registry(owner, live=False)
+    with host._round_lease(owner, run_id):
+        value = host._registry(owner, live=False, run_id=run_id)
         plan = value.get('shutdown')
         if plan is None:
             raise ValueError('host_review_shutdown_not_started')
@@ -170,12 +170,12 @@ def finish(*, owner: str, source: Path, interrupt_lines: list[int], status_line:
         if plan['reason'] == 'completed' and report.get('status') != 'completed':
             raise ValueError('host_review_shutdown_incomplete')
     # close owns its own round lease; do not recursively acquire flock.
-    closed = host.close(owner=owner, reason=plan['reason'], source=source, source_line=status_line)
+    closed = host.close(owner=owner, reason=plan['reason'], source=source, source_line=status_line, run_id=run_id)
     expected_state = 'closed' if plan['reason'] == 'completed' else 'cancelled'
     if closed != {'state': expected_state, 'reason': plan['reason']}:
         raise ValueError('host_review_shutdown_reason_conflict')
-    with host._round_lease(owner) as path:
-        current = host._registry(owner, live=False)
+    with host._round_lease(owner, run_id) as path:
+        current = host._registry(owner, live=False, run_id=run_id)
         if current['shutdown'] != plan:
             if current['shutdown']['status'] == 'verified':
                 return current['shutdown']['receipt']

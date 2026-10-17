@@ -206,6 +206,62 @@ def test_recovery_uses_live_gates_and_preserves_originals(sealed_target,monkeypa
         assert json.loads(Path(result['receipt_file']).read_text())==result
 
 
+def test_recovery_passes_exact_material_failure_source_only_proof(sealed_target, monkeypatch):
+    root, original, action, cron, _live, begin, _ = sealed_target
+    monkeypatch.setattr(recovery.production_release, '_git', candidate_git)
+    monkeypatch.setattr(recovery.production_release, '_source', lambda *_args, **_kwargs: 'c' * 40)
+    monkeypatch.setattr(recovery, '_bound', lambda *_args, **_kwargs: {
+        'execution': {'code_revision': 'c' * 40},
+    })
+    monkeypatch.setattr(recovery.maintenance_runtime, 'assert_original_execution_safe', lambda *_args, **_kwargs: None)
+    snapshot = {'maintenance_status_file': {'path': str(root / 'status.json')},
+                'maintenance_current_inputs': {'verified_material_failure_actions': [str(action)]}}
+    seen = []
+
+    def read_live(_target, **kwargs):
+        seen.append(('live', kwargs.get('source_only_proof')))
+        return snapshot
+
+    def read_current(_target, _receipt, **kwargs):
+        seen.append(('inputs', kwargs.get('source_only_proof')))
+        return snapshot['maintenance_current_inputs']
+
+    def assert_safe(_payload, **kwargs):
+        seen.append(('assert', kwargs.get('source_only_proof')))
+
+    monkeypatch.setattr(recovery.maintenance_runtime, 'read_live_status', read_live)
+    monkeypatch.setattr(recovery.maintenance_runtime, 'read_current_inputs', read_current)
+    monkeypatch.setattr(recovery.maintenance_runtime, 'assert_live_safe', assert_safe)
+    result = recovery.recover(
+        target_root=root, expected_revision='f' * 40,
+        original=original,
+        automation=production_release.ProductionAutomation(cron, 'production', 'preserved'),
+        begin_line=begin, material_failure_actions=(action,),
+    )
+    proof = {'kind': 'preaudit_material_failure_source_only', 'target_root': str(root),
+             'actions': [str(action)]}
+    assert result['status'] == 'ready'
+    assert result['material_failure_source_only'] is True
+    assert all(value == proof for _name, value in seen)
+
+
+def test_recovery_rejects_duplicate_material_failure_actions_before_live_read(sealed_target, monkeypatch):
+    root, original, action, cron, _live, begin, _ = sealed_target
+    monkeypatch.setattr(recovery.production_release, '_git', candidate_git)
+    monkeypatch.setattr(recovery.production_release, '_source', lambda *_args, **_kwargs: 'c' * 40)
+    monkeypatch.setattr(recovery, '_bound', lambda *_args, **_kwargs: {'execution': {'code_revision': 'c' * 40}})
+    monkeypatch.setattr(recovery.maintenance_runtime, 'read_live_status',
+                        lambda *_args, **_kwargs: pytest.fail('live read must not run'))
+    result = recovery.recover(
+        target_root=root, expected_revision='f' * 40,
+        original=original,
+        automation=production_release.ProductionAutomation(cron, 'production', 'preserved'),
+        begin_line=begin, material_failure_actions=(action, action),
+    )
+    assert result['status'] == 'blocked'
+    assert result['stop_cleared'] is False
+
+
 @pytest.mark.parametrize('damage',['plain_stop','cron_active','auth','continuation','stop_replaced','inputs_changed','bound_changed'])
 def test_recovery_refuses_current_gate_failures(sealed_target,monkeypatch,damage):
     root,original,_,cron,live,begin,_=sealed_target

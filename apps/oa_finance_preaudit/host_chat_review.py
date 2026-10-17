@@ -159,15 +159,28 @@ def _tool(anchor: dict, name: str) -> dict:
     return value
 
 
-def registry_file(owner: str) -> Path:
+def registry_file(owner: str, run_id: str | None = None, *, legacy: bool = False) -> Path:
     UUID(owner)
     from . import controller_handoff
-    return controller_handoff.manifest_file().parent / 'app-review-rounds' / owner / 'registry.json'
+    run_id = None if legacy else run_id
+    base = controller_handoff.manifest_file().parent / 'app-review-rounds' / owner
+    if run_id is not None:
+        if controller_handoff._RUN_ID.fullmatch(run_id) is None:
+            raise ValueError('host_review_run_untrusted')
+        base = base / run_id
+    elif not legacy and not os.path.lexists(base / 'registry.json'):
+        rounds = sorted(base.glob('*/registry.json'))
+        if len(rounds) == 1:
+            return rounds[0]
+    return base / 'registry.json'
 
 
 @contextmanager
-def _round_lease(owner: str):
-    path = registry_file(owner)
+def _round_lease(owner: str, run_id: str | None = None):
+    path = registry_file(owner, run_id)
+    legacy_path = registry_file(owner, legacy=True)
+    if run_id is None and os.path.lexists(legacy_path):
+        path = legacy_path
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with runtime_control.pinned_directory(path.parent) as parent:
         fd = os.open('registry.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600, dir_fd=parent)
@@ -176,6 +189,58 @@ def _round_lease(owner: str):
             yield path
         finally:
             os.close(fd)
+
+
+
+@contextmanager
+def _registration_lease(owner: str):
+    from . import controller_handoff
+    base = controller_handoff.manifest_file().parent / 'app-review-rounds' / owner
+    base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with runtime_control.pinned_directory(base) as parent:
+        fd = os.open('registration.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)
+
+
+def _previous_rounds_closed(owner: str, run_id: str | None = None, reviewers: list[dict] = ()) -> None:
+    from scripts import finance_preaudit_run
+    base = registry_file(owner, legacy=True).parent
+    paths = [base / 'registry.json', *base.glob('*/registry.json')]
+    for path in paths:
+        if not path.exists() or (run_id is not None and path == registry_file(owner, run_id)):
+            continue
+        previous = _read(path)[1]
+        previous = _registry(owner, run_id=previous['run_id'], live=False, legacy=path.parent == base)
+        plan = previous.get('shutdown', {})
+        receipt = plan.get('receipt', {})
+        binding = previous.get('original_execution', {})
+        if (previous.get('owner_task_id') != owner or previous.get('state') not in {'closed', 'cancelled'}
+                or plan.get('status') != 'verified' or receipt.get('status') != 'verified'
+                or receipt.get('kind') != 'preaudit_app_shutdown'
+                or any(receipt.get(key) != previous.get(key) for key in ('owner_task_id', 'run_id', 'controller_instance_id'))
+                or receipt.get('exchange_state') != previous['state']
+                or receipt.get('children_reaped') is not True or receipt.get('writer_active') is not False
+                or receipt.get('execution_sha256') != hashlib.sha256(_read(Path(binding['receipt_file']))[0]).hexdigest()
+                or {item['reviewer_task_id'] for item in previous['reviewers']} & {item['reviewer_task_id'] for item in reviewers}):
+            raise ValueError('host_review_previous_round_incomplete')
+        report = finance_preaudit_run.read_execution(**binding)
+        if (report.get('terminal') is not True or report.get('children_reaped') is not True
+                or report.get('exit_code') != receipt.get('driver_exit_code')
+                or any(report.get(key) != previous.get(key) for key in ('run_id', 'controller_instance_id'))):
+            raise ValueError('host_review_previous_round_incomplete')
+    if runtime_control.writer_active() or runtime_control.active_request_writers():
+        raise ValueError('host_review_previous_round_incomplete')
+
+
+
+def assert_previous_rounds_closed(*, owner: str) -> None:
+    UUID(owner)
+    with _registration_lease(owner):
+        _previous_rounds_closed(owner)
 
 
 def _reviewers(reviewers: list[dict], owner: str, source: Path) -> list[dict]:
@@ -235,7 +300,7 @@ def _reviewers(reviewers: list[dict], owner: str, source: Path) -> list[dict]:
 
 
 def register(reviewers: list[dict], *, owner: str, source: Path, receipt_file: Path | None = None,
-             invocation_id: str | None = None, tool_session_id: str | None = None) -> dict:
+             invocation_id: str | None = None, tool_session_id: str | None = None, run_id: str | None = None) -> dict:
     """Bind this round to exactly three actual native child conversations."""
     registered = _reviewers(reviewers, owner, source)
     from . import controller_handoff
@@ -256,28 +321,49 @@ def register(reviewers: list[dict], *, owner: str, source: Path, receipt_file: P
     owners = receipt.get('owner_processes', []) + [receipt.get('supervisor_process'), receipt.get('controller_process')]
     if not owners or not all(guard._valid_identity(item) and guard.process_identity(item['pid']) == item for item in owners):
         raise ValueError('host_review_parent_untrusted')
+    run_id = run_id or manifest['run_id']
+    if run_id != manifest['run_id']:
+        raise ValueError('host_review_run_untrusted')
     registered_at = time.time()
-    value = {'schema_version': 1, 'kind': 'preaudit_app_review_round', 'owner_task_id': owner,
+    value = {'schema_version': 2, 'kind': 'preaudit_app_review_round', 'owner_task_id': owner,
              'run_id': manifest['run_id'], 'controller_instance_id': manifest['controller_instance_id'],
              'reviewers': registered, 'original_execution': binding, 'execution_owners': owners, 'phase': 'finance', 'state': 'open',
              'heartbeat_at': registered_at, 'registered_at': registered_at, 'assignments': {}}
-    with _round_lease(owner) as path:
-        if os.path.lexists(path):
-            previous = _read(path)[1]
-            if any(previous.get(key) != value[key] for key in ('owner_task_id', 'run_id', 'controller_instance_id', 'reviewers', 'original_execution')):
-                raise ValueError('host_review_registry_rebinding')
-            return previous
-        _write_new(path, value)
+    with _registration_lease(owner):
+        with _round_lease(owner, run_id) as path:
+            if os.path.lexists(path):
+                previous = _read(path)[1]
+                if any(previous.get(key) != value[key] for key in ('owner_task_id', 'run_id', 'controller_instance_id', 'reviewers', 'original_execution')):
+                    raise ValueError('host_review_registry_rebinding')
+                if previous.get('state') != 'open' or previous.get('shutdown') is not None:
+                    raise ValueError('host_review_parent_lost_or_closed')
+                return previous
+            _previous_rounds_closed(owner, run_id, registered)
+            _write_new(path, value)
     return value
 
 
-def _registry(owner: str, *, live: bool = True) -> dict:
-    value = _read(registry_file(owner))[1]
-    if (value.get('kind') != 'preaudit_app_review_round' or value.get('schema_version') != 1
+def _registry(owner: str, *, live: bool = True, run_id: str | None = None, legacy: bool = False) -> dict:
+    path = registry_file(owner, run_id, legacy=legacy)
+    if not legacy and run_id is None and not os.path.lexists(path):
+        rounds = sorted(path.parent.glob('*/registry.json'))
+        if len(rounds) == 1:
+            path = rounds[0]
+            run_id = path.parent.name
+    if not legacy and not os.path.lexists(path) and os.path.lexists(registry_file(owner, legacy=True)):
+        path = registry_file(owner, legacy=True)
+        legacy = True
+    value = _read(path)[1]
+    if (value.get('kind') != 'preaudit_app_review_round' or value.get('schema_version') not in {1, 2}
             or value.get('owner_task_id') != owner or value.get('phase') not in {'finance', 'packaging'}
             or not isinstance(value.get('assignments'), dict)):
         raise ValueError('host_review_registry_untrusted')
     UUID(hex=value['run_id']); UUID(hex=value['controller_instance_id'])
+    if ((value['schema_version'] == 2 and path.parent.name != value['run_id'])
+            or (value['schema_version'] == 1 and live and path.parent.name != owner)):
+        raise ValueError('host_review_registry_untrusted')
+    if run_id is not None and value['run_id'] != run_id:
+        raise ValueError('host_review_run_untrusted')
     entries = [{'session_file': item['child_source']['session_file'], 'spawn_line': item['spawn_source']['line']}
                for item in value['reviewers']]
     if value['reviewers'] != _reviewers(entries, owner, Path(value['reviewers'][0]['spawn_source']['session_file'])):
@@ -294,6 +380,7 @@ def _registry(owner: str, *, live: bool = True) -> dict:
         timestamp = native['anchor'].get('timestamp')
         if (actual != heartbeat_proof or payload.get('name') not in {'exec', 'functions.exec'}
                 or not payload.get('call_id') or 'heartbeat' not in text or owner not in text
+                or (value['schema_version'] == 2 and value['run_id'] not in text)
                 or not isinstance(timestamp, str)
                 or datetime.fromisoformat(timestamp.replace('Z', '+00:00')).timestamp() != value.get('heartbeat_at')):
             raise ValueError('host_review_heartbeat_untrusted')
@@ -317,8 +404,8 @@ def _registry(owner: str, *, live: bool = True) -> dict:
 
 
 
-def registered_reviewers(*, owner: str) -> list[dict]:
-    return _registry(owner)['reviewers']
+def registered_reviewers(*, owner: str, run_id: str | None = None) -> list[dict]:
+    return _registry(owner, run_id=run_id)['reviewers']
 
 
 def assert_round_alive(*, owner: str, manifest: dict) -> None:
@@ -332,7 +419,7 @@ def assert_round_alive(*, owner: str, manifest: dict) -> None:
         UUID(owner)
         if controller_handoff._read_manifest() != manifest or runtime_control.stop_requested():
             raise ValueError('host_review_run_untrusted')
-        path = registry_file(owner)
+        path = registry_file(owner, manifest['run_id'])
         if not os.path.lexists(path):
             from datetime import datetime
             started = datetime.fromisoformat(manifest['started_at']).timestamp()
@@ -345,23 +432,25 @@ def assert_round_alive(*, owner: str, manifest: dict) -> None:
             if not started <= time.time() < deadline or not guard.execution_owners_alive():
                 raise ValueError('host_review_bootstrap_expired')
             return
-        registered = _registry(owner)
+        registered = _registry(owner, run_id=manifest['run_id'])
         if (registered['run_id'] != manifest['run_id']
                 or registered['controller_instance_id'] != manifest['controller_instance_id']
                 or registered['phase'] != 'finance'):
             raise ValueError('host_review_run_untrusted')
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
         try:
-            close(owner=owner, reason='parent_lost')
+            close(owner=owner, reason='parent_lost', run_id=manifest['run_id'])
         except (OSError, RuntimeError, ValueError, KeyError, TypeError):
             pass
         runtime_control.request_cycle_stop()
         raise ValueError('host_review_parent_lost_or_closed') from error
 
-def heartbeat(*, owner: str, source: Path, source_line: int) -> dict:
+def heartbeat(*, owner: str, source: Path, source_line: int, run_id: str | None = None) -> dict:
     """The main App conversation renews its round lease while it supervises work."""
-    with _round_lease(owner) as path:
-        value = _registry(owner)
+    if run_id is None:
+        run_id = _registry(owner, live=False)['run_id']
+    with _round_lease(owner, run_id) as path:
+        value = _registry(owner, run_id=run_id)
         from datetime import datetime
         if str(source.absolute()) != value['reviewers'][0]['spawn_source']['session_file']:
             raise ValueError('host_review_source_untrusted')
@@ -370,7 +459,8 @@ def heartbeat(*, owner: str, source: Path, source_line: int) -> dict:
         text = str(payload.get('arguments', payload.get('input', '')))
         timestamp = native['anchor'].get('timestamp')
         if (payload.get('name') not in {'exec', 'functions.exec'} or not payload.get('call_id')
-                or 'heartbeat' not in text or owner not in text or not isinstance(timestamp, str)):
+                or 'heartbeat' not in text or owner not in text or value['run_id'] not in text
+                or not isinstance(timestamp, str)):
             raise ValueError('host_review_source_untrusted')
         called_at = datetime.fromisoformat(timestamp.replace('Z', '+00:00')).timestamp()
         if not value['heartbeat_at'] <= called_at <= time.time():
@@ -425,12 +515,12 @@ def request_abort_stop(value: dict) -> None:
     runtime_control.request_cycle_stop()
 
 
-def close(*, owner: str, reason: str = 'completed', source: Path | None = None, source_line: int | None = None) -> dict:
+def close(*, owner: str, reason: str = 'completed', source: Path | None = None, source_line: int | None = None, run_id: str | None = None) -> dict:
     """Close the exchange; cancellation never signals the Writer process."""
     if reason not in {'completed', 'cancelled', 'parent_lost', 'reviewer_failed'}:
         raise ValueError('host_review_close_reason_invalid')
-    with _round_lease(owner) as path:
-        value = _registry(owner, live=False)
+    with _round_lease(owner, run_id) as path:
+        value = _registry(owner, live=False, run_id=run_id)
         if value['state'] != 'open':
             return {'state': value['state'], 'reason': value['close_reason']}
         if reason == 'completed':
@@ -480,12 +570,12 @@ def close(*, owner: str, reason: str = 'completed', source: Path | None = None, 
 
 
 def enter_packaging(*, owner: str, receipt_file: Path | None = None, invocation_id: str | None = None,
-                    tool_session_id: str | None = None) -> dict:
+                    tool_session_id: str | None = None, run_id: str | None = None) -> dict:
     """Keep the same three children after the original financial run is sealed."""
     from scripts import finance_preaudit_run
     from . import controller_handoff
-    with _round_lease(owner) as path:
-        value = _registry(owner, live=False)
+    with _round_lease(owner, run_id) as path:
+        value = _registry(owner, live=False, run_id=run_id)
         if (value.get('state') != 'open' or value.get('shutdown') is not None or runtime_control.stop_requested()
                 or not guard._timestamp(value.get('heartbeat_at'))
                 or not 0 <= time.time() - value['heartbeat_at'] < PARENT_HEARTBEAT_MAX_AGE):
@@ -509,15 +599,17 @@ def enter_packaging(*, owner: str, receipt_file: Path | None = None, invocation_
     return {'phase': value['phase'], 'state': value['state'], 'reviewers': value['reviewers']}
 
 
-def _request_file(action: Path, kind: str, *, owner: str) -> Path:
+def _request_file(action: Path, kind: str, *, owner: str, run_id: str | None = None) -> Path:
     UUID(owner)
-    return action.with_name(owner + '-' + kind.replace('_', '-') + '-' + REQUEST)
+    round_id = registry_file(owner, run_id).parent.name
+    prefix = owner + '-' + round_id if round_id != owner else owner
+    return action.with_name(prefix + '-' + kind.replace('_', '-') + '-' + REQUEST)
 
 
 def _submission_file(request_file: Path) -> Path:
     return request_file.with_name(request_file.name.replace(REQUEST, SUBMISSION))
 
-def pending(*, owner: str | None = None, manifest: dict | None = None) -> list[dict]:
+def pending(*, owner: str | None = None, manifest: dict | None = None, run_id: str | None = None) -> list[dict]:
     """Observe only requests listed in the current controller's bound progress."""
     owner = owner or os.environ.get(guard.OWNER_ENV)
     if owner is None:
@@ -526,8 +618,11 @@ def pending(*, owner: str | None = None, manifest: dict | None = None) -> list[d
     current = controller_handoff._read_manifest()
     if current is None or (manifest is not None and current != manifest):
         return []
+    if run_id is not None and current['run_id'] != run_id:
+        return []
+    run_id = current['run_id']
     try:
-        registered = _registry(owner)
+        registered = _registry(owner, run_id=run_id)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError):
         return []
     if registered['run_id'] != current['run_id'] or registered['controller_instance_id'] != current['controller_instance_id']:
@@ -556,14 +651,17 @@ def pending(*, owner: str | None = None, manifest: dict | None = None) -> list[d
     return results
 
 
-def assign(request_file: Path, *, slot: int, owner: str, source: Path, source_line: int) -> dict:
+def assign(request_file: Path, *, slot: int, owner: str, source: Path, source_line: int, run_id: str | None = None) -> dict:
     """Bind one current request to a fixed child after an actual followup_task call."""
     request_file = request_file.absolute()
     raw, request = _read(request_file)
+    if run_id is not None and run_id != request['run_id']:
+        raise ValueError('host_review_run_untrusted')
+    run_id = request['run_id']
     action = Path(request['action_file'])
     _live(request, action, owner=owner)
-    with _round_lease(owner) as path:
-        registered = _registry(owner)
+    with _round_lease(owner, run_id) as path:
+        registered = _registry(owner, run_id=run_id)
         if type(slot) is not int or slot not in range(3):
             raise ValueError('host_review_slot_untrusted')
         if registered.get('requests', {}).get(request['request_id']) != {'request_file': str(request_file), 'request_sha256': hashlib.sha256(raw).hexdigest()}:
@@ -634,7 +732,7 @@ def _live(request: dict, action: Path, *, owner: str | None = None) -> None:
             or request.get('input_fingerprints') != _fingerprints(action)
             or not guard._timestamp(request.get('expires_at'))):
         raise ValueError('host_review_request_untrusted')
-    registered = _registry(request['owner_task_id'])
+    registered = _registry(request['owner_task_id'], run_id=request['run_id'])
     if (registered['run_id'] != request['run_id'] or registered['controller_instance_id'] != request['controller_instance_id']):
         raise ValueError('host_review_registry_untrusted')
     if registered['phase'] == 'packaging':
@@ -673,27 +771,38 @@ def _base() -> dict:
 
 
 def publish(action: Path, *, prompt: str, timeout_seconds: int, kind: str = 'finance',
-            review_context: dict | None = None) -> Path:
+            review_context: dict | None = None, run_id: str | None = None) -> Path:
     """Publish frozen work only; Python never creates native agents."""
     action = action.absolute()
     owner = os.environ.get(guard.OWNER_ENV)
     if owner is None or kind not in {'finance', 'packaging_draft', 'packaging_confirmation'}:
         raise ValueError('host_review_run_untrusted')
     from . import controller_handoff
+    if run_id is None:
+        try:
+            registered = _registry(owner, live=False)
+            run_id = registered['run_id']
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            manifest = controller_handoff._read_manifest()
+            run_id = manifest.get('run_id') if manifest is not None else None
     started_at = time.time()
-    while not os.path.lexists(registry_file(owner)):
+    while not os.path.lexists(registry_file(owner, run_id)):
+        candidates = sorted(registry_file(owner, legacy=True).parent.glob('*/registry.json'))
+        if len(candidates) == 1:
+            run_id = candidates[0].parent.name
+            break
         manifest = controller_handoff._read_manifest()
         if (manifest is None or manifest['state'] != 'running' or manifest.get('review_configuration') != IDENTITY
                 or runtime_control.stop_requested() or not guard.execution_owners_alive()
                 or time.time() >= started_at + timeout_seconds):
             raise ValueError('host_review_bootstrap_failed')
         time.sleep(.2)
-    registered = _registry(owner)
+    registered = _registry(owner, run_id=run_id)
     while registered.get('heartbeat_source') is None:
         if time.time() >= started_at + timeout_seconds:
             raise ValueError('host_review_bootstrap_failed')
         time.sleep(.2)
-        registered = _registry(owner)
+        registered = _registry(owner, run_id=run_id)
     manifest = controller_handoff._read_manifest()
     if manifest is None:
         raise ValueError('host_review_run_untrusted')
@@ -705,7 +814,7 @@ def publish(action: Path, *, prompt: str, timeout_seconds: int, kind: str = 'fin
                'review_configuration': dict(IDENTITY), 'created_at': started_at,
                'expires_at': started_at + timeout_seconds, 'prompt': prompt, 'review_context': review_context or {}}
     _live(request, action, owner=owner)
-    request_file = _request_file(action, kind, owner=owner)
+    request_file = _request_file(action, kind, owner=owner, run_id=registered['run_id'])
     request['prompt'] += (
         '\n保存 model JSON 必须调用专用 write-draft 接口，不使用通用文件写入或已有文件。\n'
         f'用 {MODULE}.draft_command(Path({str(request_file)!r}), Path(新的私有决定文件绝对路径), '
@@ -715,8 +824,8 @@ def publish(action: Path, *, prompt: str, timeout_seconds: int, kind: str = 'fin
         '专用接口独占写入并返回绑定本请求和实际字节 SHA256 的回执。'
         '等待该次配对工具输出真实完成，再 submit；回执生成后禁止更改决定文件。\n'
     )
-    with _round_lease(owner) as path:
-        registered = _registry(owner)
+    with _round_lease(owner, registered['run_id']) as path:
+        registered = _registry(owner, run_id=registered['run_id'])
         _live(request, action, owner=owner)
         _write_new(request_file, request)
         registered.setdefault('requests', {})[request['request_id']] = {'request_file': str(request_file),
@@ -728,7 +837,7 @@ def publish(action: Path, *, prompt: str, timeout_seconds: int, kind: str = 'fin
 def _submission(request_file: Path, request: dict) -> tuple[bytes, dict]:
     action = Path(request['action_file'])
     raw, submitted = _read(_submission_file(request_file))
-    registered = _registry(request['owner_task_id'])
+    registered = _registry(request['owner_task_id'], run_id=request['run_id'])
     assigned = registered['assignments'].get(request['request_id'])
     if (assigned is None or assigned['state'] != 'submitted'
             or assigned.get('submission_sha256') != hashlib.sha256(raw).hexdigest()
@@ -783,11 +892,11 @@ def _record_exchange_failure(request_file: Path, detail: dict) -> bool:
         owner = os.environ.get(guard.OWNER_ENV)
         action = Path(request['action_file'])
         if (owner != request['owner_task_id']
-                or request_file.absolute() != _request_file(action, request['review_kind'], owner=owner)
+                or request_file.absolute() != _request_file(action, request['review_kind'], owner=owner, run_id=request['run_id'])
                 or not action.is_relative_to(runtime_control.PROJECT_ROOT / 'runtime/finance_preaudit_flows')):
             return False
-        with _round_lease(owner) as path:
-            registered = _registry(owner, live=False)
+        with _round_lease(owner, request['run_id']) as path:
+            registered = _registry(owner, live=False, run_id=request['run_id'])
             fingerprint = {'request_file': str(request_file.absolute()), 'request_sha256': hashlib.sha256(raw).hexdigest()}
             if (registered.get('requests', {}).get(request['request_id']) != fingerprint
                     or registered['run_id'] != request['run_id']
@@ -817,7 +926,7 @@ def await_result(request_file: Path) -> dict:
             time.sleep(.2)
         # submit publishes the file before committing its registry fingerprint.
         # Wait for that same transaction before consuming either side.
-        with _round_lease(request['owner_task_id']):
+        with _round_lease(request['owner_task_id'], request['run_id']):
             return read_result(request_file)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
         detail = _failure_detail(error)
@@ -825,7 +934,8 @@ def await_result(request_file: Path) -> dict:
         # Leave in-flight write classification to the original Writer. No signals here.
         try:
             close(owner=os.environ.get(guard.OWNER_ENV),
-                  reason='parent_lost' if 'parent_lost' in detail['failure_detail_code'] else 'reviewer_failed')
+                  reason='parent_lost' if 'parent_lost' in detail['failure_detail_code'] else 'reviewer_failed',
+                  run_id=request.get('run_id'))
         except (OSError, RuntimeError, ValueError, KeyError, TypeError):
             pass
         runtime_control.request_cycle_stop()
@@ -863,7 +973,7 @@ def publish_draft(request_file: Path, decision_file: Path, payload: dict, *, own
     request_file, decision_file = request_file.absolute(), decision_file.absolute()
     raw, request = _read(request_file)
     _live(request, Path(request['action_file']), owner=owner)
-    if request_file != _request_file(Path(request['action_file']), request['review_kind'], owner=owner) or not isinstance(payload, dict):
+    if request_file != _request_file(Path(request['action_file']), request['review_kind'], owner=owner, run_id=request['run_id']) or not isinstance(payload, dict):
         raise ValueError('host_review_draft_invalid')
     with runtime_control.stop_control_lease():
         _live(request, Path(request['action_file']), owner=owner)
@@ -972,15 +1082,18 @@ def _source_receipt(source: Path, line: int, reviewer: str, decision_file: Path,
             'decision_input_sha256': publication['decision_sha256'], 'publication': publication}
 
 
-def submit(request_file: Path, decision_file: Path, *, owner: str, source: Path, source_line: int) -> dict:
+def submit(request_file: Path, decision_file: Path, *, owner: str, source: Path, source_line: int, run_id: str | None = None) -> dict:
     request_file, decision_file = request_file.absolute(), decision_file.absolute()
     raw, request = _read(request_file)
+    if run_id is not None and run_id != request['run_id']:
+        raise ValueError('host_review_run_untrusted')
+    run_id = request['run_id']
     action = Path(request['action_file'])
-    if request_file != _request_file(action, request['review_kind'], owner=owner) or not action.is_relative_to(runtime_control.PROJECT_ROOT / 'runtime/finance_preaudit_flows'):
+    if request_file != _request_file(action, request['review_kind'], owner=owner, run_id=run_id) or not action.is_relative_to(runtime_control.PROJECT_ROOT / 'runtime/finance_preaudit_flows'):
         raise ValueError('host_review_request_untrusted')
     _live(request, action, owner=owner)
-    with _round_lease(owner) as path:
-        registered = _registry(owner)
+    with _round_lease(owner, run_id) as path:
+        registered = _registry(owner, run_id=run_id)
         if registered.get('requests', {}).get(request['request_id']) != {'request_file': str(request_file), 'request_sha256': hashlib.sha256(raw).hexdigest()}:
             raise ValueError('host_review_request_untrusted')
         assigned = registered['assignments'].get(request['request_id'])
@@ -1025,7 +1138,7 @@ def complete(action: Path, reviewed: dict, *, completer=None) -> dict:
             raise ValueError('host_review_result_untrusted')
         proof = reviewed['host_receipt']
         owner = os.environ.get(guard.OWNER_ENV)
-        request_file = _request_file(action, 'finance', owner=owner)
+        request_file = Path(proof['request_file'])
         submission_file = _submission_file(request_file)
         request_raw, request = _read(request_file)
         submission_raw, submitted = _read(submission_file)
@@ -1057,9 +1170,9 @@ def complete(action: Path, reviewed: dict, *, completer=None) -> dict:
 
 
 
-def source_anchor(*, owner: str, operation: str = 'heartbeat') -> dict:
+def source_anchor(*, owner: str, operation: str = 'heartbeat', run_id: str | None = None) -> dict:
     """Find the actual already-logged parent call from inside its current tool invocation."""
-    value = _registry(owner, live=False)
+    value = _registry(owner, live=False, run_id=run_id)
     source = Path(value['reviewers'][0]['spawn_source']['session_file'])
     _native_source(source, owner)
     found = None
@@ -1073,7 +1186,7 @@ def source_anchor(*, owner: str, operation: str = 'heartbeat') -> dict:
             text = str(payload.get('arguments', payload.get('input', '')))
             if (record.get('type') == 'response_item' and payload.get('type') in {'function_call', 'custom_tool_call'}
                     and (name in {operation, 'collaboration.' + operation, 'functions.collaboration.' + operation}
-                         or name in {'exec', 'functions.exec'} and operation in text and owner in text)):
+                         or name in {'exec', 'functions.exec'} and operation in text and owner in text and value['run_id'] in text)):
                 found = {'source': source, 'source_line': line}
     if found is None:
         raise ValueError('host_review_source_untrusted')
@@ -1083,6 +1196,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--operation', choices=['register', 'pending', 'assign', 'submit', 'heartbeat', 'enter-packaging', 'close', 'begin-shutdown', 'finish-shutdown', 'write-draft'], default='submit')
     parser.add_argument('--owner-task-id', required=True)
+    parser.add_argument('--run-id')
     parser.add_argument('--request-file', type=Path)
     parser.add_argument('--decision-file', type=Path)
     parser.add_argument('--payload-json')
@@ -1100,6 +1214,13 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     UUID(args.owner_task_id)
     owner = args.owner_task_id
+    if args.operation in {'pending', 'heartbeat', 'enter-packaging', 'begin-shutdown',
+                          'finish-shutdown', 'close', 'assign', 'submit'} and args.run_id is None:
+        parser.error('run-id required to select one independent round')
+    if args.run_id is not None:
+        from . import controller_handoff
+        if controller_handoff._RUN_ID.fullmatch(args.run_id) is None:
+            parser.error('run-id must be the original 32-character run identity')
     if args.operation == 'write-draft':
         if args.request_file is None or args.decision_file is None or args.payload_json is None:
             parser.error('write-draft requires request-file, exclusive decision-file and model payload-json')
@@ -1111,25 +1232,25 @@ def main(argv=None) -> int:
         result = register([{'session_file': str(path), 'spawn_line': line}
                            for path, line in zip(args.reviewer_session_file, args.spawn_line)],
                           owner=owner, source=args.source_session_file, receipt_file=args.receipt_file,
-                          invocation_id=args.invocation_id, tool_session_id=args.tool_session_id)
+                          invocation_id=args.invocation_id, tool_session_id=args.tool_session_id, run_id=args.run_id)
     elif args.operation == 'pending':
-        result = {'requests': pending(owner=owner)}
+        result = {'requests': pending(owner=owner, run_id=args.run_id)}
     elif args.operation == 'heartbeat':
         if args.source_session_file is None or args.source_line is None:
             parser.error('heartbeat requires the current parent native source call')
-        result = heartbeat(owner=owner, source=args.source_session_file, source_line=args.source_line)
+        result = heartbeat(owner=owner, source=args.source_session_file, source_line=args.source_line, run_id=args.run_id)
     elif args.operation == 'enter-packaging':
         result = enter_packaging(owner=owner, receipt_file=args.receipt_file, invocation_id=args.invocation_id,
-                                tool_session_id=args.tool_session_id)
+                                tool_session_id=args.tool_session_id, run_id=args.run_id)
     elif args.operation == 'begin-shutdown':
         from . import app_review_shutdown
-        result = app_review_shutdown.begin(owner=owner, reason=args.reason)
+        result = app_review_shutdown.begin(owner=owner, reason=args.reason, run_id=args.run_id)
     elif args.operation in {'close', 'finish-shutdown'}:
         from . import app_review_shutdown
         if args.source_session_file is None or args.source_line is None or args.wait_line is None or len(args.interrupt_line or []) != 3:
             parser.error('finish-shutdown requires parent source, three interrupt lines, list_agents source-line and original wait-line')
         result = app_review_shutdown.finish(owner=owner, source=args.source_session_file, interrupt_lines=args.interrupt_line,
-                                            status_line=args.source_line, wait_line=args.wait_line)
+                                            status_line=args.source_line, wait_line=args.wait_line, run_id=args.run_id)
     else:
         if args.request_file is None or args.source_session_file is None or args.source_line is None:
             parser.error('assign/submit requires request and actual source tool-call anchor')
@@ -1137,12 +1258,12 @@ def main(argv=None) -> int:
             if args.slot is None:
                 parser.error('assign requires fixed slot')
             result = assign(args.request_file, slot=args.slot, owner=owner,
-                            source=args.source_session_file, source_line=args.source_line)
+                            source=args.source_session_file, source_line=args.source_line, run_id=args.run_id)
         else:
             if args.decision_file is None:
                 parser.error('submit requires decision file')
             result = submit(args.request_file, args.decision_file, owner=owner,
-                            source=args.source_session_file, source_line=args.source_line)
+                            source=args.source_session_file, source_line=args.source_line, run_id=args.run_id)
     print(json.dumps(result)); return 0
 
 

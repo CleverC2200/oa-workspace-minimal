@@ -13,6 +13,7 @@ from apps.oa_approval import (
     evidence_packet,
     flow,
     invoice_buyers,
+    invoice_originals,
     official_sql,
     travel_orders,
 )
@@ -489,7 +490,16 @@ def collect_case(
         attachment_timeout_sec=attachment_timeout_sec,
     )
     authority_facts.extend(travel_facts)
-    logical_resources = _merge_resources(form_resources, discovered_resources)
+    original_resources = invoice_originals.resources(
+        str(request_id), workflow, str(config.get("flow_key") or ""), invoice_evidence,
+    )
+    logical_resources = _merge_resources(form_resources, discovered_resources + original_resources)
+    original_sources = {item["id"]: item["_invoice_original"] for item in original_resources}
+    logical_resources = [
+        {**item, "_invoice_original": original_sources[str(item["id"])]}
+        if str(item.get("id") or "") in original_sources else item
+        for item in logical_resources
+    ]
     attachment_deduplication: list[dict[str, str]] = []
     if str(config.get("flow_key") or "") == _PACKAGING_FLOW:
         logical_resources, attachment_deduplication = _prepare_packaging_resources(
@@ -582,6 +592,7 @@ def collect_case(
             "manifest": manifest,
         }
 
+    invoice_originals.bind_prepared_bodies(invoice_evidence, descriptors, prepared)
     warnings = [
         {
             "code": "invoice_document_reference_unresolved",
@@ -592,6 +603,7 @@ def collect_case(
         if str(config.get("flow_key") or "") != _PACKAGING_FLOW
         and field["field_name"] == "fpfj"
         and re.search(r"\btoDocument\s*\(", field["attachment_html"])
+        and not invoice_originals.field_body_read(field, invoice_evidence)
         and not any(
             item["source_field_path"] == field["path"] for item in descriptors
         )
