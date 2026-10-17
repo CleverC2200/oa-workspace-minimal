@@ -19,7 +19,7 @@ def candidate_git(_root, *args):
 
 
 @pytest.fixture
-def sealed_target(restart_target, tmp_path, monkeypatch):
+def sealed_target(restart_target, tmp_path, monkeypatch, request):
     root, original, action, cron, args, live = restart_target
     home = Path(__import__('os').environ['CODEX_HOME'])
     owner, parent, reviewers = native_sessions(tmp_path / 'native', monkeypatch)
@@ -64,6 +64,7 @@ def stop():
  plan.update(status='pending',reason='reviewer_failed',started_at=time.time(),
   interrupt_targets=[r['agent_path'] for r in value['reviewers']],original_tool_session_id='original-session')
  marker=Path.cwd()/'runtime/stop-preaudit.flag';marker.write_bytes(b'stop_requested:controller_cycle_stop\n');marker.chmod(0o600)
+ stamp=time.time_ns();__import__('os').utime(marker,ns=(stamp,stamp))
  value['shutdown']=dict(plan);h.guard.write(h.registry_file(owner),value)
  return {'exit_code':0,'output':json.dumps(plan)}
 cmd='.venv/bin/python -B -m apps.oa_finance_preaudit.host_chat_review --operation begin-shutdown --owner-task-id '+owner+' --reason reviewer_failed'
@@ -74,6 +75,8 @@ wait=call('functions.exec','text(await tools.write_stdin('+json.dumps({'session_
 s.finish(owner=owner,source=parent,interrupt_lines=interrupts,status_line=status,wait_line=wait)
 print(begin)
 '''
+    if getattr(request, 'param', None) == 'coarse_stop_clock':
+        program = program.replace("marker.chmod(0o600)", "marker.chmod(0o600); stamp=time.time_ns()-10_000_000; __import__('os').utime(marker,ns=(stamp,stamp))")
     result = subprocess.run([str(root / '.venv/bin/python'), '-B', '-c', program,
         original.owner_task_id, str(parent), str(spec), str(original.file)], cwd=root,
         text=True, capture_output=True, check=True)
@@ -81,7 +84,16 @@ print(begin)
     return root, original, action, cron, live, begin, parent
 
 
-def test_target_owned_bound_reader_revalidates_original_native_shutdown(sealed_target):
+@pytest.mark.parametrize('sealed_target', [None, 'coarse_stop_clock'], indirect=True)
+def test_target_owned_bound_reader_revalidates_original_native_shutdown(sealed_target, monkeypatch):
+    original_reader = maintenance_runtime._run_readonly
+
+    def checked_reader(*args, **kwargs):
+        result = original_reader(*args, **kwargs)
+        assert result.returncode == 0, result.stderr
+        return result
+
+    monkeypatch.setattr(maintenance_runtime, '_run_readonly', checked_reader)
     root, original, _, _, _, begin, parent = sealed_target
     protected = {p:p.read_bytes() for p in [parent,original.file,root/'runtime/control/rolling-controller-manifest.json']}
     bound = recovery._bound(root, original, begin)
