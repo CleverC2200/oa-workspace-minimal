@@ -1,6 +1,7 @@
 """Opt-in pytest evidence: independent collection, exact execution and time budget."""
 from collections import Counter, defaultdict
 import argparse
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -157,6 +158,7 @@ class Evidence:
             'started_at': float(self.job_started) if self.job_started is not None else self.wall_started,
             'shard': self.config.getoption('ci_shard'), 'platform': sys.platform,
             'code_revision': os.environ.get('GITHUB_SHA'), 'run_id': os.environ.get('GITHUB_RUN_ID'),
+            'run_attempt': os.environ.get('GITHUB_RUN_ATTEMPT'),
             'cpu_count': os.cpu_count(),
             'cpu_seconds': time.process_time() - self.cpu_started,
             'child_cpu_seconds': (resource.getrusage(resource.RUSAGE_CHILDREN).ru_utime
@@ -172,7 +174,49 @@ class Evidence:
             session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
-def merge_evidence(directory, budget):
+def matrix_timing(jobs, identity):
+    names = {'quality (0)', 'quality (1)', 'macos-stop-recovery', 'quality-complete'}
+    head = os.environ.get('OA_CI_HEAD_SHA')
+    if (not head or not identity['run_id'] or not identity['run_attempt']
+            or jobs['total_count'] != len(jobs['jobs'])
+            or len(jobs['jobs']) != 4 or {job['name'] for job in jobs['jobs']} != names):
+        raise ValueError('job_timing_set_untrusted')
+    observed = time.time()
+    intervals, timings = {}, {}
+    for job in jobs['jobs']:
+        name = job['name']
+        if (str(job['run_id']) != identity['run_id']
+                or str(job['run_attempt']) != identity['run_attempt'] or job['head_sha'] != head):
+            raise ValueError('job_timing_identity_mismatch')
+        current = name == 'quality-complete'
+        if (job['status'] != ('in_progress' if current else 'completed')
+                or job['conclusion'] != (None if current else 'success')):
+            raise ValueError('job_timing_status_untrusted')
+        start = datetime.fromisoformat(job['started_at'])
+        end = None if current else datetime.fromisoformat(job['completed_at'])
+        if start.tzinfo is None or (end is not None and end.tzinfo is None):
+            raise ValueError('job_timing_clock_untrusted')
+        started = start.timestamp()
+        finished = observed if current else end.timestamp()
+        if not 0 <= started <= finished <= observed:
+            raise ValueError('job_timing_clock_untrusted')
+        intervals[name] = (started, finished)
+        timings[name] = {'started_at': job['started_at'], 'completed_at': job['completed_at'],
+                         'elapsed_seconds': finished - started}
+    aggregation_start = intervals['quality-complete'][0]
+    if any(end > aggregation_start for name, (_, end) in intervals.items() if name != 'quality-complete'):
+        raise ValueError('job_timing_clock_untrusted')
+    upstream = max(end - start for name, (start, end) in intervals.items() if name != 'quality-complete')
+    aggregation = observed - aggregation_start
+    elapsed = upstream + aggregation
+    wall = observed - min(start for start, _ in intervals.values())
+    return {'elapsed_seconds': elapsed, 'timing_scope': 'active_critical_path',
+            'upstream_seconds': upstream, 'aggregation_seconds': aggregation,
+            'matrix_wall_seconds': wall, 'excluded_scheduling_seconds': wall - elapsed,
+            'timing_head_sha': head, 'timing_observed_at': observed, 'job_timings': timings}
+
+
+def merge_evidence(directory, budget, jobs):
     """Join the fixed two-runner matrix against both independent full collections."""
     references = [json.loads((directory / f'offline-test-evidence-{shard}' / 'collection.json').read_text())
                   for shard in (0, 1)]
@@ -191,7 +235,7 @@ def merge_evidence(directory, budget):
             'offline-test-evidence-0', 'offline-test-evidence-1'}:
         errors.append('shard_set_incomplete')
     outcomes = defaultdict(list)
-    identity = {key: references[0].get(key) for key in ('root', 'platform', 'code_revision', 'run_id')}
+    identity = {key: references[0].get(key) for key in ('root', 'platform', 'code_revision', 'run_id', 'run_attempt')}
     for shard, (reference, report) in enumerate(zip(references, reports)):
         if (reference.get('status') != 'collected' or reference.get('nodeids') != nodes
                 or reference.get('collection_sha256') != digest):
@@ -199,7 +243,8 @@ def merge_evidence(directory, budget):
         if any({key: value.get(key) for key in identity} != identity for value in (reference, report)):
             errors.append('evidence_identity_mismatch')
         if (os.environ.get('GITHUB_SHA') != identity['code_revision']
-                or os.environ.get('GITHUB_RUN_ID') != identity['run_id']):
+                or os.environ.get('GITHUB_RUN_ID') != identity['run_id']
+                or os.environ.get('GITHUB_RUN_ATTEMPT') != identity['run_attempt']):
             errors.append('evidence_run_mismatch')
         expected = shard_nodes(nodes, shard)
         if (report.get('shard') != shard or report.get('status') != 'verified' or report.get('errors')
@@ -219,19 +264,17 @@ def merge_evidence(directory, budget):
         errors.append('unexpected_skip')
     manual_nodes = [node.split('::')[-1] for node in nodes if node.startswith(_MANUAL_STOP)]
     macos_files = list(directory.rglob('stop-recovery.xml'))
-    starts = [reference['started_at'] for reference in references]
     if manual_nodes or macos_files:
         cases = ElementTree.parse(macos_files[0]).findall('.//testcase') if len(macos_files) == 1 else []
         if (Counter(case.get('name') for case in cases) != Counter(manual_nodes)
                 or any(case.find(tag) is not None for case in cases for tag in ('skipped', 'failure', 'error'))):
             errors.append('macos_stop_recovery_incomplete')
-        macos_starts = list(directory.rglob('stop-recovery-started-at.txt'))
-        if len(macos_starts) != 1:
-            errors.append('macos_start_evidence_missing')
-        else:
-            starts.append(float(macos_starts[0].read_text()))
-    elapsed = time.time() - min(starts)
-    if not 0 <= elapsed <= budget:
+    timing = {'elapsed_seconds': None, 'timing_scope': 'active_critical_path'}
+    try:
+        timing = matrix_timing(jobs, identity)
+    except (KeyError, TypeError, ValueError) as error:
+        errors.append(str(error) if str(error).startswith('job_timing_') else 'job_timing_untrusted')
+    if timing['elapsed_seconds'] is not None and not 0 <= timing['elapsed_seconds'] <= budget:
         errors.append('ci_time_budget_exceeded')
     return {'schema_version': 1, 'kind': 'offline_pytest_matrix_evidence',
             'status': 'failed' if errors else 'verified', **identity,
@@ -239,7 +282,7 @@ def merge_evidence(directory, budget):
             'executed_count': sum(len(values) for values in outcomes.values()),
             'counts': dict(Counter(value for values in outcomes.values() for value in values)),
             'macos_stop_recovery_count': len(manual_nodes), 'shards': reports,
-            'elapsed_seconds': elapsed, 'timing_scope': 'matrix_and_aggregation',
+            **timing,
             'budget_seconds': budget, 'errors': errors}
 
 
@@ -247,9 +290,10 @@ def main():
     parser = argparse.ArgumentParser(description='Verify complete two-runner offline CI evidence')
     parser.add_argument('--merge-directory', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--jobs-file', type=Path, required=True)
     parser.add_argument('--budget-seconds', type=float, default=170)
     args = parser.parse_args()
-    report = merge_evidence(args.merge_directory, args.budget_seconds)
+    report = merge_evidence(args.merge_directory, args.budget_seconds, json.loads(args.jobs_file.read_text()))
     with args.output.open('x', encoding='utf-8') as file:
         json.dump(report, file, ensure_ascii=False, indent=2)
     print(json.dumps({key: report[key] for key in ('status', 'counts', 'elapsed_seconds', 'errors')}))

@@ -20,11 +20,13 @@
 
 完整 CI 在两个标准 Ubuntu runner 上各自独立串行收集全套节点，再按节点 SHA256 的固定二分规则分配测试，每个 runner 使用动态 worker 分配。静态门在分片 0 执行。`scripts.pytest_evidence` 在筛选前核对完整收集，再核对本分片各 worker 的集合和每项执行次数，记录分配数量、CPU 和耗时；worker 丢失、失败、漏跑、重复或新增 skip 均失败。Linux 只允许既有文件出生时间相关的 12 项 skip，macOS 停止恢复任务继续要求全部执行、无 skip。
 
-`quality-complete` 等待两个分片和 macOS 专项，下载同一轮 artifact，要求所有必需任务成功，再核对两份完整收集、源码与 run 身份、分片归属、逐项并集恰好一次，以及 macOS JUnit 无跳过、无失败。汇总从最早必需任务的首个 step 计时，包含准备、运行、上传及汇总启动，保留收尾预算。JSON 和 JUnit 随工作流留存，不自动重跑失败 worker；实际全工作流耗时仍按 GitHub 完成记录验收。
+`quality-complete` 等待两个分片和 macOS 专项，下载同一轮 artifact，要求所有必需任务成功，再核对两份完整收集、源码与 run/attempt 身份、分片归属、逐项并集恰好一次，以及 macOS JUnit 无跳过、无失败。JSON 和 JUnit 随工作流留存，不自动重跑失败 worker。
+
+170 秒运行预算按并行上游任务中最长的实际执行时间，加汇总任务从开始执行到完成验证的时间计算。上游起止来自[GitHub 当前 workflow attempt 的任务元数据](https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-workflow-run-attempt)，包含检出、依赖安装、静态门、测试、证据上传和收尾；汇总包含检出、安装、下载和元数据查询。任务集合、成功状态、源码分支 SHA、run 和 attempt 必须匹配；PR 测试源码的合并候选 SHA 仍由原 artifact 校验独立绑定。缺少、重复、错轮或无效时间证据均拒绝。汇总完成后最终回执的上传和收尾按 GitHub 完成记录另报。
+
+完整回执分别记录运行关键路径、从最早上游开始到汇总验证的墙钟跨度，以及调度等待对关键路径的影响。分片启动错开和汇总等待执行器不计入运行预算；完整覆盖、必需任务状态和 170 秒阈值保持。真实主机的执行超限仍失败，不用本地通过或单个任务通过代替完整 hosted CI 验收。历史墙钟计时报告保持原判定，修复与验收见 [#554](https://github.com/CleverC2200/oa-workspace-minimal/issues/554)。
 
 录制 CLI 的分类与回执用例通过共享 fixture 缩短观察间隔，仍启动真实子进程；超时用例在既有 executor 接口缩短测试期限，仍走真实超时和进程回收。`real_observation_interval` 用例保留生产 5 秒周期，核对首次错误在重试前停止。生产默认、停止门与历史证据不受这些测试参数影响。
-
-耗时验收以真实 GitHub workflow 的全部必需任务完成时间为准，排队时间另列。工作流从首个 step 计时并留出收尾预算；本地测试耗时及 step 预算通过不能代替完整 CI 在 180 秒内完成的验收。尚未推送或实际运行未达标时，[#478](https://github.com/CleverC2200/oa-workspace-minimal/issues/478) 保持打开。
 
 证据覆盖沿用已接线的公开入口检查，不增加第二套结论规则。`test_invoice_linkage_preview.py` 核验上传附件不能代替可信 OA 关联；`test_invoice_evidence_coverage.py` 核验关联票面资料进入 collect_case、真实 Worker 冻结输入及 preview；`test_invoice_material_diagnostics.py` 核验文件记录与正文读取分别计数。这些检查不证明模型业务判断总是正确。
 
