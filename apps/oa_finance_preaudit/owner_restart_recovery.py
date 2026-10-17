@@ -131,6 +131,45 @@ def _read_original(root: Path, original: maintenance_runtime.OriginalExecution, 
     return report
 
 
+def _read_prepare_failure_original(
+    root: Path,
+    original: maintenance_runtime.OriginalExecution,
+    manifest: bytes,
+    stop_controls: tuple,
+) -> dict:
+    before = production_release._pinned_control(original.file, private=False, max_bytes=64 * 1024 * 1024)
+    report = maintenance_runtime.read_original_execution(root, original)
+    maintenance_runtime.assert_original_execution_safe(root, original, report, manifest)
+    after = production_release._pinned_control(original.file, private=False, max_bytes=64 * 1024 * 1024)
+    if before != after:
+        raise RuntimeError('prepare_failure_original_changed')
+    raw = before[1]
+    saved = json.loads(raw)
+    if (report.get('state') != 'exited' or report.get('terminal') is not True
+            or report.get('exit_code') == 0 or report.get('children_reaped') is not True
+            or saved.get('controller_state') != 'failed'):
+        raise RuntimeError('prepare_failure_original_untrusted')
+    try:
+        started = datetime.fromisoformat(saved['started_at']).timestamp()
+        completed = datetime.fromisoformat(saved['completed_at']).timestamp()
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError('prepare_failure_original_untrusted') from error
+    stop_mtime = stop_controls[0][2] / 1e9
+    if not started <= stop_mtime <= completed:
+        raise RuntimeError('prepare_failure_stop_attribution_untrusted')
+    return {
+        **report,
+        'prepare_failure_recovery_proof': {
+            'kind': 'preaudit_prepare_failure_recovery_proof',
+            'read_only': True,
+            'original_wait_verified': True,
+            'stop_attribution': 'original_terminal_interval',
+            'children_reaped': True,
+            'target_root': str(root),
+        },
+    }
+
+
 def recover(
     target_root: Path, *, expected_revision: str,
     automation: production_release.ProductionAutomation,
@@ -171,17 +210,19 @@ def recover(
             if production_release.candidate_configuration_findings(root, expected_revision):
                 raise RuntimeError('production_release_configuration_invalid')
             manifest = runtime_control.read_control_bytes(root / 'runtime/control/rolling-controller-manifest.json')
-            report = _read_original(root, original, manifest, user_stop=user_stop,
-                                    prepare_failure=prepare_failure)
+            report = (_read_prepare_failure_original(root, original, manifest, controls)
+                      if prepare_failure else
+                      _read_original(root, original, manifest, user_stop=user_stop))
             snapshot = (check_live(root) if check_live else maintenance_runtime.read_live_status(
                 root, require_reaped=True, source_only_proof=material_proof))
             maintenance_runtime.assert_live_safe(snapshot, source_only_proof=material_proof)
             receipt = snapshot['maintenance_status_file']
+            proof_key = 'prepare_failure_recovery_proof' if prepare_failure else 'owner_restart_proof'
             result.update(target_root=str(root), revision=expected_revision,
                 original_wait_verified=True, original_exit_code=report['exit_code'],
                 original_receipt_file=str(original.file), original_owner_task_id=original.owner_task_id,
                 original_tool_session_id=original.tool_session_id, original_invocation_id=original.file.parent.name,
-                owner_restart_proof=report['owner_restart_proof'], current_status_file=receipt,
+                owner_restart_proof=report[proof_key], current_status_file=receipt,
                 current_inputs=snapshot['maintenance_current_inputs'], continuation=snapshot['reconciliation']['continuation'],
                 stop_before=production_release._control_proof(controls[0]),
                 automation_before=production_release._control_proof(controls[1]))
@@ -198,8 +239,10 @@ def recover(
                 if production_release._pinned_control(policy, private=False) != pinned_policy:
                     raise RuntimeError('owner_restart_policy_changed')
                 production_release._source(root, expected_revision, expected_origin, synchronized=True)
-                if _read_original(root, original, manifest, user_stop=user_stop,
-                                  prepare_failure=prepare_failure) != report:
+                current_report = (_read_prepare_failure_original(root, original, manifest, controls)
+                                  if prepare_failure else
+                                  _read_original(root, original, manifest, user_stop=user_stop))
+                if current_report != report:
                     raise RuntimeError('owner_restart_original_changed')
                 if maintenance_runtime.read_current_inputs(
                         root, receipt, require_reaped=True, source_only_proof=material_proof

@@ -189,7 +189,10 @@ def test_prepare_failure_recovery_preflight_preserves_exact_stop_and_material_pr
         'tool_session_id': original.tool_session_id,
         'owner_restart_proof': {'kind': 'preaudit_owner_restart_proof', 'read_only': True},
     }
-    monkeypatch.setattr(owner_restart_recovery, '_read_original', lambda *_, **__: report)
+    monkeypatch.setattr(owner_restart_recovery, '_read_prepare_failure_original', lambda *_, **__: {
+        **report,
+        'prepare_failure_recovery_proof': report['owner_restart_proof'],
+    })
     monkeypatch.setattr(maintenance_runtime, 'assert_live_safe', lambda *_, **__: None)
     monkeypatch.setattr(maintenance_runtime, 'read_current_inputs', lambda *_, **__: current_inputs)
     code = owner_restart_recovery.main(
