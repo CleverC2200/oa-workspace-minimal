@@ -1047,6 +1047,8 @@ def test_parent_cli_requires_the_exact_round_and_native_heartbeat(exchange):
     with pytest.raises(SystemExit) as error:
         host.main(['--operation', 'pending', '--owner-task-id', owner])
     assert error.value.code == 2
+    assert host.main(['--operation', 'pending', '--owner-task-id', owner,
+                      '--run-id', manifest['run_id']]) == 0
     line = native_call(parent, 'functions.exec', 'heartbeat ' + owner + ' ' + uuid4().hex, 'wrong-round-heartbeat', {})
     with pytest.raises(ValueError, match='source_untrusted'):
         host.heartbeat(owner=owner, source=parent, source_line=line, run_id=manifest['run_id'])

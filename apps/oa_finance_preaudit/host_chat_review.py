@@ -1214,7 +1214,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     UUID(args.owner_task_id)
     owner = args.owner_task_id
-    if args.operation == 'pending' and args.run_id is None:
+    if args.operation in {'pending', 'heartbeat', 'enter-packaging', 'begin-shutdown',
+                          'finish-shutdown', 'close', 'assign', 'submit'} and args.run_id is None:
         parser.error('run-id required to select one independent round')
     if args.run_id is not None:
         from . import controller_handoff
