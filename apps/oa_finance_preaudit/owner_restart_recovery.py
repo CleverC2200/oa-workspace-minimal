@@ -154,7 +154,7 @@ def _read_prepare_failure_original(
         completed = datetime.fromisoformat(saved['completed_at']).timestamp()
     except (KeyError, TypeError, ValueError) as error:
         raise RuntimeError('prepare_failure_original_untrusted') from error
-    stop_mtime = stop_controls[0][2] / 1e9
+    stop_mtime = stop_controls[0][0][2] / 1e9
     if not started <= stop_mtime <= completed:
         raise RuntimeError('prepare_failure_stop_attribution_untrusted')
     return {
