@@ -176,3 +176,31 @@ def test_main_file_change_during_initialization_is_not_downloaded(document_trans
     assert not files and errors[0]["code"] == "attachment_access_denied"
     assert document_transport.initialized
     assert sum(x[0] == "/weaver/weaver.file.FileDownload" for x in document_transport.requests) == 1
+
+
+def test_opaque_api_download_token_keeps_original_url_and_cookie(document_transport, tmp_path):
+    url = "https://oa.example.test/weaver/weaver.file.FileDownload?fileid=recordedOpaqueToken&ddcode=recorded"
+    files, errors = download(tmp_path, resource_changes={"downloadUrl": url})
+    assert len(files) == 1 and not errors
+    requests = [x for x in document_transport.requests if x[0] == "/weaver/weaver.file.FileDownload"]
+    assert len(requests) == 2 and requests[0] == requests[1]
+    assert requests[0][1] == {"fileid": ["recordedOpaqueToken"], "ddcode": ["recorded"]}
+
+
+@pytest.mark.parametrize("condition", ["unbound", "wrong_actor"])
+def test_opaque_token_does_not_bypass_binding_or_actor(document_transport, tmp_path, condition):
+    if condition == "unbound":
+        document_transport.bindings = []
+    else:
+        document_transport.actor = "88"
+    files, errors = download(tmp_path, resource_changes={"downloadUrl": "https://oa.example.test/weaver/weaver.file.FileDownload?fileid=recordedOpaqueToken"})
+    assert not files
+    assert errors[0]["code"] == ("attachment_access_denied" if condition == "unbound" else "rpa_session_invalid")
+    assert not document_transport.initialized
+
+
+@pytest.mark.parametrize("token", ["", "202&fileid="])
+def test_empty_and_duplicate_blank_file_tokens_are_not_initialized(document_transport, tmp_path, token):
+    files, errors = download(tmp_path, resource_changes={"downloadUrl": "https://oa.example.test/weaver/weaver.file.FileDownload?fileid=" + token})
+    assert not files and errors[0]["code"] == "attachment_access_denied"
+    assert not document_transport.initialized

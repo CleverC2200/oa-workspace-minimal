@@ -994,10 +994,12 @@ def _initialize_workflow_document_context(
     request_id = str(resource.get("_workflow_request_id") or "")
     file_id = str(resource.get("id") or "")
     cookie = str(resource.get("_ephemeral_cookie_header") or "")
+    url_ids = urllib.parse.parse_qs(parsed.query, keep_blank_values=True).get("fileid", [])
     if (
         (parsed.scheme, parsed.netloc) != (origin.scheme, origin.netloc)
         or parsed.path not in {"/weaver/weaver.file.FileDownload", "/news/download.do"}
-        or urllib.parse.parse_qs(parsed.query).get("fileid") != [file_id]
+        or len(url_ids) != 1 or not url_ids[0].strip()
+        or (re.fullmatch(r"[0-9]+", url_ids[0]) and url_ids[0] != file_id)
         or not re.fullmatch(r"[1-9][0-9]*", request_id)
         or not cookie
     ):
