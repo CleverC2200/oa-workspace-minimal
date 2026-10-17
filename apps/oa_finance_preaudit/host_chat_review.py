@@ -168,6 +168,10 @@ def registry_file(owner: str, run_id: str | None = None, *, legacy: bool = False
         if controller_handoff._RUN_ID.fullmatch(run_id) is None:
             raise ValueError('host_review_run_untrusted')
         base = base / run_id
+    elif not legacy and not os.path.lexists(base / 'registry.json'):
+        rounds = sorted(base.glob('*/registry.json'))
+        if len(rounds) == 1:
+            return rounds[0]
     return base / 'registry.json'
 
 
