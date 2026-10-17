@@ -164,6 +164,57 @@ def _query_rows(
             pass
 
 
+def _attachment_placeholder_html(value: str) -> bool:
+    content = re.sub(r"</?(?:span|div)(?:\s+style=(?:'[^'<>]*'|\"[^\"<>]*\"))?\s*>", "", value, flags=re.I).strip()
+    return content in {"", "[该字段暂不支持]", "[该字段仅支持显示]"}
+
+
+def general_expense_empty_attachment_fields(data: dict, *, request_id: str) -> dict[str, dict[str, str]]:
+    if (not re.fullmatch(r"[1-9][0-9]*", request_id)
+            or str(data.get("requestId") or "") != request_id
+            or (data.get("workflowMainTableInfo") or {}).get("tableDBName") != "formtable_main_569"):
+        return {}
+    if sum(table.get("tableDBName") == "formtable_main_569_dt1"
+           for table in data.get("workflowDetailTableInfos") or []) != 1:
+        return {}
+    extracted = {field["path"]: field for field in evidence_packet.extract_fields(data)}
+    confirmed = {}
+    codes = {"scfj", "fj", "glfp"}
+    for table_index, table in enumerate(data.get("workflowDetailTableInfos") or []):
+        if table.get("tableDBName") != "formtable_main_569_dt1":
+            continue
+        records = table.get("workflowRequestTableRecords") or []
+        identities = [str(record.get("recordOrder") or "") for record in records]
+        if len(identities) != len(set(identities)):
+            return {}
+        for row_index, (record, detail_id) in enumerate(zip(records, identities)):
+            if not re.fullmatch(r"[1-9][0-9]*", detail_id):
+                return {}
+            fields = [extracted[f"detail[{table_index}].row[{row_index}].field[{index}]"]
+                      for index, field in enumerate(record.get("workflowRequestTableFields") or [])
+                      if field.get("fieldName") in codes]
+            if ({field["field_name"] for field in fields} != codes or len(fields) != len(codes)
+                    or any(field["read_status"] != "unresolved" or field["raw_value"].strip()
+                           or not _attachment_placeholder_html(field["attachment_html"]) for field in fields)):
+                return {}
+            try:
+                rows = _query_rows("general_expense_attachment_fields",
+                                   {"request_id": int(request_id), "detail_id": int(detail_id)},
+                                   require_connection=True)
+            except RuntimeError:
+                return {}
+            if (len(rows) != 1 or not codes.issubset(rows[0])
+                    or str(rows[0].get("requestid")) != request_id
+                    or str(rows[0].get("detail_id")) != detail_id
+                    or any(rows[0][code] is not None for code in codes)):
+                return {}
+            for field in fields:
+                code = field["field_name"]
+                confirmed[field["path"]] = {"source": "official_sql", "request_id": request_id,
+                    "detail_id": detail_id, "table": "formtable_main_569_dt1", "field_name": code}
+    return confirmed
+
+
 def workflow_attachment_document(request_id: str, file_id: str) -> str:
     if not all(re.fullmatch(r"[1-9][0-9]*", value) for value in (request_id, file_id)):
         return ""

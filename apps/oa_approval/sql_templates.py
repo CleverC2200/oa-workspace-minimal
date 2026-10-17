@@ -58,6 +58,21 @@ def validate_readonly_sql(sql: str) -> str:
 
 
 SQL_TEMPLATES: dict[str, SqlTemplate] = {
+    "general_expense_attachment_fields": SqlTemplate(
+        name="general_expense_attachment_fields",
+        purpose="按当前一般费用流程与精确明细身份核对附件及发票引用空值",
+        sql="""
+            select m.requestid, d.id as detail_id, d.scfj, d.fj, d.glfp
+            from ecology.formtable_main_569 m
+            join ecology.formtable_main_569_dt1 d on d.mainid = m.id
+            where m.requestid = :request_id
+              and d.id = :detail_id
+              and rownum <= 2
+        """,
+        params=("request_id", "detail_id"),
+        max_rows=2,
+        timeout_sec=5,
+    ),
     "workflow_attachment_document": SqlTemplate(
         name="workflow_attachment_document",
         purpose="按当前流程与文件的明确共享关联定位唯一文档",
