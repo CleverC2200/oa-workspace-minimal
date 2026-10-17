@@ -182,8 +182,22 @@ def _controls(target: Path, automation: production_release.ProductionAutomation)
     return stop, production_release._paused_cron(automation)
 
 
+def _material_failure_source_only(target: Path, actions: tuple[Path, ...] | None) -> dict | None:
+    if actions is None:
+        return None
+    target = target.absolute()
+    paths = [Path(action).expanduser() for action in actions]
+    if (not paths or any(not path.is_absolute() for path in paths)
+            or len({str(path) for path in paths}) != len(paths)
+            or any(not path.is_relative_to(target) for path in paths)):
+        raise ValueError(BLOCKED)
+    return {'kind': 'preaudit_material_failure_source_only', 'target_root': str(target),
+            'actions': [str(path) for path in paths]}
+
+
 def recover(*, target_root: Path, expected_revision: str, original: maintenance_runtime.OriginalExecution,
-            automation: production_release.ProductionAutomation, begin_line: int, confirmed: bool = False) -> dict:
+            automation: production_release.ProductionAutomation, begin_line: int,
+            confirmed: bool = False, material_failure_actions: tuple[Path, ...] | None = None) -> dict:
     target = Path(target_root).expanduser().absolute()
     maintenance_runtime.assert_target_environment(target)
     candidate = Path(__file__).resolve().parents[2]
@@ -197,6 +211,10 @@ def recover(*, target_root: Path, expected_revision: str, original: maintenance_
     result = {'kind':'preaudit_shutdown_stop_recovery','status':'blocked','stop_cleared':False,
               'write_state':'not_requested','approval_started':False,'production_acceptance':'not_verified'}
     try:
+        source_only_proof = _material_failure_source_only(target, material_failure_actions)
+        result['material_failure_source_only'] = source_only_proof is not None
+        if source_only_proof is not None:
+            result['material_failure_actions'] = source_only_proof['actions']
         with maintenance_runtime.target_runtime_leases(target):
             controls = _controls(target, automation)
             revision = production_release._source(target, expected_revision, production_release.ORIGIN)
@@ -205,8 +223,10 @@ def recover(*, target_root: Path, expected_revision: str, original: maintenance_
                 raise ValueError(BLOCKED)
             manifest = runtime_control.read_control_bytes(target / 'runtime/control/rolling-controller-manifest.json')
             maintenance_runtime.assert_original_execution_safe(target, original, bound['execution'], manifest)
-            snapshot = maintenance_runtime.read_live_status(target, require_reaped=True)
-            maintenance_runtime.assert_live_safe(snapshot)
+            snapshot = maintenance_runtime.read_live_status(
+                target, require_reaped=True, source_only_proof=source_only_proof,
+            )
+            maintenance_runtime.assert_live_safe(snapshot, source_only_proof=source_only_proof)
             result.update(target_root=str(target),candidate_revision=expected_revision,target_revision=revision,
                           bound_evidence=bound,current_status_file=snapshot['maintenance_status_file'],
                           current_inputs=snapshot['maintenance_current_inputs'],
@@ -215,9 +235,19 @@ def recover(*, target_root: Path, expected_revision: str, original: maintenance_
             def verify() -> None:
                 if (_controls(target, automation) != controls or _bound(target, original, begin_line) != bound
                         or production_release._source(target, expected_revision, production_release.ORIGIN) != revision
-                        or maintenance_runtime.read_current_inputs(target, snapshot['maintenance_status_file'], require_reaped=True)
-                        != snapshot['maintenance_current_inputs']):
+                        or maintenance_runtime.read_current_inputs(
+                            target, snapshot['maintenance_status_file'], require_reaped=True,
+                            source_only_proof=source_only_proof,
+                        ) != snapshot['maintenance_current_inputs']):
                     raise ValueError(BLOCKED)
+                current_inputs = maintenance_runtime.read_current_inputs(
+                    target, snapshot['maintenance_status_file'], require_reaped=True,
+                    source_only_proof=source_only_proof,
+                )
+                maintenance_runtime.assert_live_safe(
+                    {**snapshot, 'maintenance_current_inputs': current_inputs},
+                    source_only_proof=source_only_proof,
+                )
 
             verify()
             if not confirmed:
@@ -274,13 +304,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--automation-file',type=Path,required=True)
     parser.add_argument('--production-project-id',required=True)
     parser.add_argument('--expected-schedule',required=True)
+    parser.add_argument('--preserve-material-failure', type=Path, action='append', default=None)
     parser.add_argument('--confirm-recovery',choices=('YES',))
     args = parser.parse_args(argv)
     try:
         result = recover(target_root=args.target_root,expected_revision=args.expected_candidate_revision,
             original=maintenance_runtime.OriginalExecution(args.original_receipt_file,args.original_owner_task_id,args.original_tool_session_id),
             automation=production_release.ProductionAutomation(args.automation_file,args.production_project_id,args.expected_schedule),
-            begin_line=args.begin_shutdown_line,confirmed=args.confirm_recovery=='YES')
+            begin_line=args.begin_shutdown_line,confirmed=args.confirm_recovery=='YES',
+            material_failure_actions=(tuple(args.preserve_material_failure)
+                if args.preserve_material_failure is not None else None))
     except (OSError, ValueError, RuntimeError, KeyError, TypeError):
         result = {'status':'blocked','error_code':BLOCKED,'stop_cleared':False,'write_state':'not_requested'}
     print(json.dumps(result))
