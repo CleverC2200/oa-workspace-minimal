@@ -228,6 +228,7 @@ def test_tpm_attachment_pass_without_image_evidence_is_downgraded(
     decision_file.write_text(
         json.dumps(_all_pass_decision(action, attachment_refs=[]), ensure_ascii=False)
     )
+    candidate_bytes = decision_file.read_bytes()
 
     closed = engine.complete_review(Path(action["action_file"]), decision_file)
 
@@ -238,9 +239,18 @@ def test_tpm_attachment_pass_without_image_evidence_is_downgraded(
         in remark
     )
     assert "AI审核结论：需人工判断 ⚠️" in remark
-    # 冻结的 model 决定保持原样（receipt 指纹绑定它），降级只体现在公开意见与业务结论上。
-    frozen = json.loads(Path(closed["decision_file"]).read_text())
-    assert frozen["items"][0]["status"] == "pass"
+    # 候选输入保留原样；冻结结果、意见及回执共同记录确定性证据降级。
+    frozen_file = Path(closed["decision_file"])
+    frozen = json.loads(frozen_file.read_text())
+    receipt = json.loads(Path(closed["receipt_file"]).read_text())
+    item = frozen["items"][0]
+    assert item["status"] == "uncertain"
+    assert item["conclusion"] in item["missing_evidence"]
+    assert "⚠️ 1、附件完整性：" + item["conclusion"] in remark
+    assert frozen["overall"] == receipt["business_state"] == closed["business_state"]
+    assert receipt["decision_fingerprint"] == "sha256:" + hashlib.sha256(frozen_file.read_bytes()).hexdigest()
+    assert decision_file.read_bytes() == candidate_bytes
+    assert engine.complete_review(Path(action["action_file"]), decision_file) == closed
 
 
 def test_tpm_image_evidence_does_not_replace_price_evidence(tmp_path: Path) -> None:
