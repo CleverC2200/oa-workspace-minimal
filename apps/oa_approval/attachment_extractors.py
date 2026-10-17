@@ -256,19 +256,31 @@ def spreadsheet_fact(path: Path, *, resource_id: str, name: str) -> Dict[str, An
             sheet_summaries: List[str] = []
             key_text: List[str] = []
             for sheet in workbook.worksheets:
-                sheet_summaries.append(
-                    f"{sheet.title}({sheet.max_row}行{sheet.max_column}列)"
-                )
+                sheet.reset_dimensions()
+                last_row = 0
+                last_column = 0
                 for row_index, row in enumerate(
                     sheet.iter_rows(values_only=True), start=1
                 ):
                     values = [_cell_text(value) for value in row]
-                    nonempty = [value for value in values if value]
+                    nonempty = [
+                        (column, value)
+                        for column, value in enumerate(values, 1)
+                        if value
+                    ]
                     if not nonempty:
                         continue
+                    last_row = row_index
+                    last_column = max(last_column, nonempty[-1][0])
+                    located_values = [
+                        f"C{column}={value}" for column, value in nonempty
+                    ]
                     key_text.append(
-                        f"{sheet.title}!R{row_index}: {' | '.join(nonempty)}"
+                        f"{sheet.title}!R{row_index}: {' | '.join(located_values)}"
                     )
+                sheet_summaries.append(
+                    f"{sheet.title}({last_row}行{last_column}列)"
+                )
         finally:
             workbook.close()
     summary = f"Excel工作簿，包含工作表：{', '.join(sheet_summaries)}。"
