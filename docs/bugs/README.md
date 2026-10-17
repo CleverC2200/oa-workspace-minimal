@@ -16,6 +16,7 @@
 
 | 领域 | 症状 / 搜索词 | 主记录或历史组件 | 回归 / 经验入口 |
 |---|---|---|---|
+| HTTP 凭据边界 | Cookie、token、跨源跳转、HTTPS 降级、重定向循环、浏览器回退 | [#538](https://github.com/CleverC2200/oa-workspace-minimal/issues/538) | [真实 HTTP 处理链离线回归](../../tests/finance_preaudit/test_http_boundary.py)；API 拒绝跳转，附件仅允许有界 HTTPS 同源跳转，拒绝后不回退浏览器；不据此认定生产权限页问题同因 |
 | DeepSeek 附件转写 | attachment_response_incomplete、默认思考、8192 Token、length、空回答 | [#529](https://github.com/CleverC2200/oa-workspace-minimal/issues/529) | [HTTP 识别回归](../../tests/finance_preaudit/test_attachment_recognition.py)、[附件读取合同](../agents/attachment-recognition.md)；历史报告未保存终止原因，根因归属与新版本验证分别记录 |
 | 停止与发布 | 定时任务生成的无原因普通停止、待办/已办暂时冲突、模板模型或并发漂移、同步门禁 | [#393](https://github.com/CleverC2200/oa-workspace-minimal/issues/393)；工程子票 [#394](https://github.com/CleverC2200/oa-workspace-minimal/issues/394)、[#395](https://github.com/CleverC2200/oa-workspace-minimal/issues/395)、[#396](https://github.com/CleverC2200/oa-workspace-minimal/issues/396) | [阻断处置](../runbooks/blocking-recovery.md)、[发布约定](../../CONTRIBUTING.md#开发与生产隔离及发布)；采样时差是待确认解释，受控恢复与根因修复分开验收 |
 | 主聊天冷却归属 | run_id=null、源码维护、人工单轮豁免、maintenance_original_execution_untrusted | [#461](https://github.com/CleverC2200/oa-workspace-minimal/issues/461) | [单轮豁免](../runbooks/cooldown-override.md)、[源码维护回归](../../tests/finance_preaudit/test_official_stop_maintenance.py)；主聊天事件与上轮审批闭合分别留证 |
