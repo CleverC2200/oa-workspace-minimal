@@ -978,6 +978,66 @@ def _normalized_download_url(resource: Dict[str, Any]) -> Tuple[str, str]:
         return "", f"{name}: 下载链接不合法: {err}"
 
 
+class _DocumentContextRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        failure = detect_oa_download_fail_code(newurl) or rpa_session.RPA_SESSION_INVALID_CODE
+        raise rpa_session.RpaSessionError(failure, "原生文档接口发生重定向")
+
+
+def _initialize_workflow_document_context(
+    resource: Dict[str, Any], url: str, *, timeout_sec: int
+) -> bool:
+    from apps.oa_approval import official_sql
+
+    parsed = urllib.parse.urlsplit(url)
+    origin = urllib.parse.urlsplit(OA_HOST)
+    request_id = str(resource.get("_workflow_request_id") or "")
+    file_id = str(resource.get("id") or "")
+    cookie = str(resource.get("_ephemeral_cookie_header") or "")
+    if (
+        (parsed.scheme, parsed.netloc) != (origin.scheme, origin.netloc)
+        or parsed.path not in {"/weaver/weaver.file.FileDownload", "/news/download.do"}
+        or urllib.parse.parse_qs(parsed.query).get("fileid") != [file_id]
+        or not re.fullmatch(r"[1-9][0-9]*", request_id)
+        or not cookie
+    ):
+        return False
+
+    def read(path: str, params: Dict[str, str] | None = None) -> dict:
+        query = "?" + urllib.parse.urlencode(params) if params else ""
+        request = urllib.request.Request(
+            OA_HOST + path + query,
+            headers={"User-Agent": "Mozilla/5.0", "Cookie": cookie},
+        )
+        opener = urllib.request.build_opener(_DocumentContextRedirect())
+        with opener.open(request, timeout=max(1, timeout_sec)) as response:
+            payload = json.loads(response.read())
+        return payload if isinstance(payload, dict) else {}
+
+    try:
+        doc_id = official_sql.workflow_attachment_document(request_id, file_id)
+        if not doc_id:
+            return False
+        account = read("/api/hrm/login/getAccountList")
+        actual_user = str((account.get("data") or {}).get("userid") or "")
+        expected_user = auth.env("OA_UID")
+        if not expected_user or actual_user != expected_user:
+            raise rpa_session.RpaSessionError(
+                rpa_session.RPA_SESSION_INVALID_CODE, "RPA 文档读取账号与配置不一致"
+            )
+        if runtime_control.stop_requested():
+            raise rpa_session.RpaSessionError(runtime_control.STOP_CODE, "已请求停止")
+        info = read(
+            "/api/doc/detail/basicInfo",
+            {"docid": doc_id, "isrequest": "1", "requestid": request_id},
+        )
+        return str(info.get("status")) == "1" and str(info.get("mainimagefile")) == file_id
+    except rpa_session.RpaSessionError:
+        raise
+    except Exception:
+        return False
+
+
 def _download_resource_direct_uncoordinated(
     resource: Dict[str, Any], *, dest_dir: Path, timeout_sec: int
 ) -> Tuple[Path | None, str]:
@@ -990,9 +1050,27 @@ def _download_resource_direct_uncoordinated(
     )
     if direct_path is not None:
         return direct_path, ""
+    resource = dict(resource)
+    host = urllib.parse.urlsplit(url).hostname or ""
+    if host in {urllib.parse.urlsplit(OA_HOST).hostname, *EXTRA_DOWNLOAD_HOSTS}:
+        resource["_ephemeral_cookie_header"] = (
+            resource.get("_ephemeral_cookie_header") or _rpa_cookie_header(host)
+        )
     direct_path, direct_err = _direct_session_cookie_download(
         resource, url, dest_dir=dest_dir, timeout_sec=timeout_sec
     )
+    if direct_path is None and download_error_code(direct_err) == ATTACHMENT_ACCESS_DENIED_CODE:
+        try:
+            initialized = _initialize_workflow_document_context(resource, url, timeout_sec=timeout_sec)
+        except rpa_session.RpaSessionError as error:
+            return None, f"{error.code}: {resource_name(resource)}: {error}"
+        if initialized:
+            if runtime_control.stop_requested():
+                return None, _download_block_message(runtime_control.STOP_CODE, resource_name(resource))
+            retry_path, retry_error = _direct_session_cookie_download(
+                resource, url, dest_dir=dest_dir, timeout_sec=timeout_sec
+            )
+            return retry_path, retry_error or (direct_err if retry_path is None else "")
     if direct_path is not None or direct_err:
         return direct_path, direct_err
     return None, ""
@@ -1438,6 +1516,7 @@ def download_resources(
     targets, identity_errors = _unique_attachment_resources(resources)
     if identity_errors:
         return [], identity_errors
+    targets = [dict(resource, _workflow_request_id=str(request_id).strip()) for resource in targets]
     if not targets:
         return [], []
     if not allow_browser_download and not is_enabled(
