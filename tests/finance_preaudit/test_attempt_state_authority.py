@@ -42,6 +42,7 @@ def test_new_attempt_has_immutable_reference_and_one_mutable_state(tmp_path):
     completed = engine.complete_review(path, decision_file)
     assert completed["action"] == "closed"
     assert completed["write_state"] == "not_requested"
+    assert attempt_state.read_action(path) == completed
     assert path.read_bytes() == reference
     state = json.loads(path.with_name("state.json").read_text())
     assert state["execution_state"] == "closed"

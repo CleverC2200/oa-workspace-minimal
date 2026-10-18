@@ -314,7 +314,7 @@ def _page_routing_instruction(action_file: Path) -> str:
         return ""
     try:
         packet = json.loads(packet_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, json.JSONDecodeError):
         return ""
     if not isinstance(packet, dict):
         return ""
@@ -332,7 +332,7 @@ def _page_routing_instruction(action_file: Path) -> str:
         return ""
     try:
         material = json.loads(material_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, json.JSONDecodeError):
         return ""
     if not isinstance(material, dict):
         return ""
@@ -364,7 +364,7 @@ def _frozen_rule_version(action_file: Path, workflow_key: str) -> str | None:
         return None
     try:
         packet = json.loads(packet_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(packet, dict):
         return None
@@ -416,7 +416,7 @@ def _small_marketing_attachment_terms_required(action_file: Path) -> bool:
         return False
     try:
         material = json.loads(material_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, json.JSONDecodeError):
         return False
     if not isinstance(material, dict):
         return False
@@ -833,7 +833,7 @@ def _parse_token_usage(stream: TextIO) -> dict:
     for line in stream:
         try:
             event = json.loads(line)
-        except ValueError:
+        except json.JSONDecodeError:
             continue
         if not isinstance(event, dict) or event.get("type") != "turn.completed":
             continue
@@ -865,7 +865,7 @@ def _parse_event_counts(stream: TextIO) -> dict[str, int]:
     for line in stream:
         try:
             event = json.loads(line)
-        except ValueError:
+        except json.JSONDecodeError:
             continue
         event_type = event.get("type") if isinstance(event, dict) else None
         if not isinstance(event_type, str):
@@ -887,7 +887,7 @@ def _event_status(stream: TextIO, counts: dict[str, int]) -> str:
             continue
         try:
             event = json.loads(line)
-        except ValueError:
+        except json.JSONDecodeError:
             return "unknown"
         if (
             not isinstance(event, dict)

@@ -7,7 +7,7 @@ import time
 import pytest
 
 from apps.oa_approval import runtime_control
-from apps.oa_finance_preaudit import host_chat_review as host, production_config
+from apps.oa_finance_preaudit import attempt_state, host_chat_review as host, production_config
 from scripts import finance_preaudit_concurrency_probe as controller
 from tests.finance_preaudit.test_host_chat_review import exchange, draft_source, native_call
 from tests.finance_preaudit.test_host_review_failure import controlled_exchange
@@ -143,7 +143,7 @@ def test_native_dispatch_publishes_without_a_python_review_executor(exchange, co
         packet = json.loads(action.with_name('review-packet.json').read_text())
         draft = action.with_name('direct-model-decision.json')
         line = draft_source(child, request, draft, owner,
-                            payload=_uncertain_decision(json.loads(action.read_text()), packet))
+                            payload=_uncertain_decision(attempt_state.read_action(action), packet))
         host.submit(request, draft, owner=owner, source=child, source_line=line)
         thread.join(5)
         assert not errors and not thread.is_alive()
@@ -217,7 +217,7 @@ def test_native_dispatch_keeps_bootstrap_heartbeat_without_blocking_publication(
         line = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(published)}, 'direct-boot-dispatch', {})
         host.assign(published, slot=0, owner=owner, source=parent, source_line=line)
         packet = json.loads(action.with_name('review-packet.json').read_text())
-        payload = _uncertain_decision(json.loads(action.read_text()), packet)
+        payload = _uncertain_decision(attempt_state.read_action(action), packet)
         draft = action.with_name('direct-bootstrap-model.json')
         line = draft_source(child, published, draft, owner, call_id='direct-boot-result', payload=payload)
         host.submit(published, draft, owner=owner, source=child, source_line=line)
@@ -293,7 +293,7 @@ def test_native_dispatch_polls_original_three_requests_without_review_executor(
                 host.assign(path, slot=index, owner=owner, source=parent, source_line=line)
                 child = Path(request.node.native_reviewers[index]['session_file'])
                 packet = json.loads(action.with_name('review-packet.json').read_text())
-                payload = _uncertain_decision(json.loads(action.read_text()), packet)
+                payload = _uncertain_decision(attempt_state.read_action(action), packet)
                 if failure_kind == 'all_fenced' or (failure_kind == 'expired' and index == 0):
                     handled.add(path)
                     continue
@@ -317,7 +317,13 @@ def test_native_dispatch_polls_original_three_requests_without_review_executor(
         if failure_kind == 'shared_source_observed':
             assert writes == [] and oa_calls == []
             assert runtime_control.stop_requested()
-            assert all(item.value['status'] != 'completed' for item in results[0].outcomes)
+            assert all(
+                (item.status == 'stopped' and item.value is None)
+                or (item.status in {'completed', 'stopped'} and isinstance(item.value, dict)
+                    and item.value.get('status') in {'failed', 'stopped'})
+                for item in results[0].outcomes
+            )
+            assert results[0].processes_reaped is True
             assert not json.loads(host.registry_file(owner).read_text()).get('request_failures')
             return
         if failure_kind == 'all_fenced_observed':

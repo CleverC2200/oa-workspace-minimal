@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from apps.oa_finance_preaudit import attempt_state
+
 # Select the retained supplier explicitly for recorded CLI/slot behavior.
 from tests.finance_preaudit.review_profiles import retained_deepseek_cli  # noqa: F401
 
@@ -253,7 +255,7 @@ def test_actual_worker_uses_bound_company_schema_and_preserves_model_comparison(
     assert "不得仅给账户支付建议而判一致" in captured["prompt"]
     assert result["decision"]["company_comparison"] == decision["company_comparison"]
     engine.validate_review_decision(Path(action["action_file"]), result["decision"])
-    assert json.loads(Path(action["action_file"]).read_text())["action"] == "review_required"
+    assert attempt_state.read_action(Path(action["action_file"]))["action"] == "review_required"
 
 
 def test_bracket_values_stay_original_while_model_can_apply_allowed_normalization(tmp_path):

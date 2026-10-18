@@ -37,6 +37,8 @@ def _codex_task(tmp_path: Path) -> tuple[dict, Path]:
     json_artifact.write_json_atomic(
         action_file,
         {
+            "schema_version": 1,
+            "kind": "preaudit_action",
             "action": "review_required",
             "workflow_key": "travel_expense",
             "action_token": "test-action-token",

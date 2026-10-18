@@ -125,7 +125,7 @@ def view(path: Path, payload: dict, *, raw: bytes | None = None, state: dict | N
         return {key: value for key, value in state.items() if key in fields}
     excluded = {'action_reference_sha256'} if state.get('execution_state') == 'collecting' else _STATE_FIELDS
     if state.get('execution_state') == 'closed':
-        excluded = excluded | {'rule_version'}
+        excluded = (excluded | {'rule_version'}) - {'recovery_receipt_fingerprint'}
     return {key: value for key, value in state.items() if key not in excluded}
 
 

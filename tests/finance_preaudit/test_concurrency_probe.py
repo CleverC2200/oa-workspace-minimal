@@ -297,6 +297,7 @@ def _reviewable_action(root: Path, *, case_key: str) -> Path:
         "business_state": "needs_human",
         "write_state": "submitted",
         "receipt_file": str(receipt_file),
+        "review_packet_file": str(review_packet),
     }
     json_artifact.write_json_atomic(
         action_file,

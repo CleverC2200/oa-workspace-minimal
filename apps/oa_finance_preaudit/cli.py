@@ -181,6 +181,7 @@ def _live_flow_engine(
     *,
     controlled: bool = False,
     selected_identity: tuple[str, str] | None = None,
+    target_case_keys: frozenset[str] | None = None,
 ) -> flow_engine.FlowEngine:
     configs = legacy_flow.load_all_configs()
     oa_api = legacy_api.build_api(configs[0])
