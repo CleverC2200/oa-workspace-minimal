@@ -20,6 +20,11 @@ jobs:
       matrix:
         shard: [0, 1]
     timeout-minutes: 20
+    outputs:
+      attempt_0: ${{ matrix.shard == 0 && github.run_attempt || '' }}
+      artifact_0: ${{ matrix.shard == 0 && steps.evidence.outputs.artifact-id || '' }}
+      attempt_1: ${{ matrix.shard == 1 && github.run_attempt || '' }}
+      artifact_1: ${{ matrix.shard == 1 && steps.evidence.outputs.artifact-id || '' }}
     steps:
       - name: Record CI step start
         run: echo "OA_CI_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
@@ -81,19 +86,23 @@ jobs:
           --ci-evidence-file="$RUNNER_TEMP/execution.json" --ci-budget-seconds=170
           --junitxml="$RUNNER_TEMP/offline-tests.xml" --durations=20
       - name: Preserve collection, coverage and timing evidence
+        id: evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: offline-test-evidence-${{ matrix.shard }}
+          name: offline-test-evidence-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/collection.json
             ${{ runner.temp }}/execution.json
             ${{ runner.temp }}/offline-tests.xml
-          if-no-files-found: warn
+          if-no-files-found: error
 
   macos-stop-recovery:
     runs-on: macos-latest
     timeout-minutes: 10
+    outputs:
+      attempt: ${{ github.run_attempt }}
+      artifact: ${{ steps.evidence.outputs.artifact-id }}
     steps:
       - name: Record CI step start
         run: |
@@ -109,30 +118,17 @@ jobs:
       - name: Stop recovery tests with no skips
         run: |
           python -m pytest -q --tb=short --junitxml="$RUNNER_TEMP/stop-recovery.xml" tests/finance_preaudit/test_manual_stop_recovery.py
-          python - <<'PY'
-          import os
-          import time
-          from pathlib import Path
-          from xml.etree import ElementTree
-
-          report = Path(os.environ['RUNNER_TEMP']) / 'stop-recovery.xml'
-          cases = ElementTree.parse(report).findall('.//testcase')
-          skipped = [case.get('name') for case in cases if case.find('skipped') is not None]
-          if not cases or skipped:
-              raise SystemExit(f'stop_recovery_tests_incomplete: skipped={skipped}')
-          elapsed = time.time() - float(os.environ['OA_CI_STARTED_AT'])
-          if not 0 <= elapsed <= 170:
-              raise SystemExit(f'ci_time_budget_exceeded: {elapsed:.2f}s')
-          print(f'Stop recovery: {len(cases)} tests, no skips')
-          PY
+          python -m scripts.pytest_evidence --macos-report="$RUNNER_TEMP/stop-recovery.xml" --output="$RUNNER_TEMP/macos.json" --budget-seconds=170
       - name: Preserve macOS stop recovery evidence
+        id: evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: macos-stop-recovery-evidence
+          name: offline-test-evidence-macos-attempt-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/stop-recovery.xml
-          if-no-files-found: warn
+            ${{ runner.temp }}/macos.json
+          if-no-files-found: error
 
   quality-complete:
     needs: [quality, macos-stop-recovery]
@@ -150,9 +146,10 @@ jobs:
       - run: python -m pip install pytest==9.1.1
       - uses: actions/download-artifact@v4
         with:
-          pattern: '*evidence*'
+          artifact-ids: ${{ needs.quality.outputs.artifact_0 }},${{ needs.quality.outputs.artifact_1 }},${{ needs.macos-stop-recovery.outputs.artifact }}
           path: ${{ runner.temp }}/evidence
       - name: Verify complete coverage and total CI budget
+        if: always()
         env:
           OA_CI_REQUIRED_RESULTS: ${{ toJSON(needs) }}
           OA_CI_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -166,7 +163,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: complete-ci-evidence
+          name: complete-ci-evidence-attempt-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/full-ci.json
             ${{ runner.temp }}/job-timings.json
