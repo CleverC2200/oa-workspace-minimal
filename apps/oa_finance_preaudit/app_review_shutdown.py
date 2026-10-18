@@ -76,6 +76,11 @@ def _wait_result(anchor: dict, output: dict, session: str) -> dict:
     if payload.get('name') not in {'exec', 'functions.exec'} or not payload.get('call_id'):
         raise ValueError('host_review_source_untrusted')
     code = payload.get('input', payload.get('arguments'))
+    wrapped = re.fullmatch(
+        r'\s*const\s+(?P<variable>[A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*await tools\.write_stdin\((?P<wait>\{.*\})\);\s*'
+        r'text\((?:(?P=variable)|JSON\.stringify\((?P=variable)\))\);?\s*', code or '', re.DOTALL)
+    if wrapped is not None:
+        code = 'text(await tools.write_stdin(' + wrapped['wait'] + '));'
     match = re.fullmatch(
         r'\s*(?:text\(await tools\.exec_command\((?P<command>\{.*\})\)\);\s*)?'
         r'text\(await tools\.write_stdin\((?P<wait>\{.*\})\)\);?\s*', code or '', re.DOTALL)

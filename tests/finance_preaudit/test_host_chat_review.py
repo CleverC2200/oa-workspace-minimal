@@ -989,6 +989,34 @@ def test_public_draft_publisher_command_returns_exact_exclusive_byte_receipt(exc
     assert hashlib.sha256(target.read_bytes()).hexdigest() == receipt['decision_sha256']
 
 
+@pytest.mark.parametrize('safe_quoting', [True, False])
+def test_native_publication_checks_shell_quoting_with_payload_json_field_order(exchange, safe_quoting):
+    import shlex
+    _, draft, owner, child, *_ = exchange
+    payload = json.loads(draft.read_text())
+    payload['items'][0]['conclusion'] = '材料包含 $(printf unexpected) 字面文本，需人工核对。'
+    host.guard.write(draft, payload)
+    thread, results, request = start(exchange)
+    rows = child.read_text().splitlines()
+    output = json.loads(rows[2])['payload']['output']
+    command = shlex.split(host.draft_command(request, draft, payload, owner=owner))
+    command[-1] = json.dumps(dict(reversed(list(payload.items()))), ensure_ascii=False)
+    shell = shlex.join(command) if safe_quoting else shlex.join(command[:-1]) + ' ' + json.dumps(command[-1], ensure_ascii=False)
+    line = native_call(child, 'functions.exec',
+        'text(await tools.exec_command(' + json.dumps({'cmd': shell}) + '));',
+        'unsorted-payload-publication', output)
+    try:
+        if safe_quoting:
+            assert host.submit(request, draft, owner=owner, source=child, source_line=line)['status'] == 'published'
+        else:
+            with pytest.raises(ValueError, match='source_untrusted'):
+                host.submit(request, draft, owner=owner, source=child, source_line=line)
+    finally:
+        host.close(owner=owner, reason='cancelled')
+        thread.join(3)
+    assert not thread.is_alive()
+
+
 def next_native_reviewers(parent, owner):
     reviewers = []
     for slot in range(3):

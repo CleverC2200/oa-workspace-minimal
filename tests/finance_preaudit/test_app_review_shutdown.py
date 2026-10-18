@@ -106,6 +106,104 @@ def test_abort_can_verify_nonzero_driver_exit_without_reporting_business_success
     assert result['exchange_state'] == 'cancelled' and result['driver_exit_code'] == 1
 
 
+@pytest.mark.parametrize('render', ['text(r);', 'text(JSON.stringify(r));'])
+def test_shutdown_accepts_sole_wait_result_variable(exchange, render):
+    _, _, owner, child, _, manifest, _ = exchange
+    shutdown.begin(owner=owner, reason='reviewer_failed')
+    controller_handoff.finish(manifest, status='failed', children_reaped=True, health='degraded')
+    path = seal_execution(owner, manifest)
+    receipt = json.loads(path.read_text())
+    receipt.update(result='failed', exit_code=1, controller_state='failed')
+    host.guard.write(path, receipt)
+    args = proofs(owner, child, exit_code=1)
+    args['wait_line'] = native_call(args['source'], 'functions.exec',
+        'const r = await tools.write_stdin({session_id:"original-session",chars:"",yield_time_ms:1000}); ' + render,
+        'wrapped-original-wait', {'exit_code': 1, 'output': 'driver exited'})
+    original = args['source'].read_bytes()
+    result = shutdown.finish(owner=owner, **args)
+    assert result['driver_exit_code'] == 1 and result['status'] == 'verified'
+    assert args['source'].read_bytes() == original
+
+
+@pytest.mark.parametrize('code', [
+    'const r = await tools.write_stdin({session_id:"original-session"}); text(JSON.stringify(other));',
+    'const r = await tools.write_stdin({session_id:"original-session"}); r.exit_code=0; text(r);',
+    'const r = await tools.write_stdin({session_id:"original-session"}); text({...r,exit_code:0});',
+    'const r = await tools.write_stdin({session_id:"other-session"}); text(JSON.stringify(r));',
+    'const r = {exit_code:0,output:"fake"}; text(JSON.stringify(r));',
+])
+def test_shutdown_rejects_changed_or_unbound_wait_variable(exchange, code):
+    _, _, owner, child, _, manifest, _ = exchange
+    shutdown.begin(owner=owner, reason='reviewer_failed')
+    controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
+    seal_execution(owner, manifest)
+    args = proofs(owner, child)
+    args['wait_line'] = native_call(args['source'], 'functions.exec', code,
+        'untrusted-wait', {'exit_code': 0, 'output': 'driver exited'})
+    with pytest.raises(ValueError):
+        shutdown.finish(owner=owner, **args)
+    assert json.loads(host.registry_file(owner).read_text())['shutdown']['status'] == 'pending'
+
+
+def test_shutdown_reads_archived_native_sources_without_rewriting_proofs(exchange):
+    from pathlib import Path
+    import os
+    _, _, owner, child, _, manifest, _ = exchange
+    shutdown.begin(owner=owner, reason='reviewer_failed')
+    controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
+    seal_execution(owner, manifest)
+    args = proofs(owner, child)
+    archive = Path(os.environ['CODEX_HOME']) / 'archived_sessions'
+    archive.mkdir()
+    original = {}
+    for source in child.parent.glob('*.jsonl'):
+        original[source.name] = source.read_bytes()
+        source.rename(archive / source.name)
+    result = shutdown.finish(owner=owner, **args)
+    assert result['status'] == 'verified'
+    assert result['driver_wait_source']['session_file'] == str(args['source'])
+    assert all((archive / name).read_bytes() == raw for name, raw in original.items())
+
+
+@pytest.mark.parametrize('damage', ['wrong_session', 'changed_call', 'symlink', 'writable', 'existing_invalid_source'])
+def test_shutdown_rejects_untrusted_archived_native_sources(exchange, damage):
+    from pathlib import Path
+    import os
+    _, _, owner, child, _, manifest, _ = exchange
+    shutdown.begin(owner=owner, reason='reviewer_failed')
+    controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
+    seal_execution(owner, manifest)
+    args = proofs(owner, child)
+    archive = Path(os.environ['CODEX_HOME']) / 'archived_sessions'
+    archive.mkdir()
+    archived = archive / args['source'].name
+    args['source'].rename(archived)
+    original = archived.read_bytes()
+    if damage in {'wrong_session', 'changed_call'}:
+        rows = archived.read_text().splitlines()
+        index = 0 if damage == 'wrong_session' else 1
+        record = json.loads(rows[index])
+        if damage == 'wrong_session':
+            record['payload']['id'] = '00000000-0000-0000-0000-000000000000'
+        else:
+            record['payload']['arguments'] = json.dumps({'task_name': 'unrelated', 'message': 'different child'})
+        rows[index] = json.dumps(record)
+        archived.write_text('\n'.join(rows) + '\n')
+    elif damage == 'symlink':
+        target = archive / 'other.jsonl'
+        archived.rename(target)
+        archived.symlink_to(target)
+    elif damage == 'writable':
+        archived.chmod(0o666)
+    else:
+        args['source'].write_text('{}\n')
+    with pytest.raises((ValueError, RuntimeError)):
+        shutdown.finish(owner=owner, **args)
+    assert json.loads(host.registry_file(owner).read_text())['shutdown']['status'] == 'pending'
+    if damage not in {'wrong_session', 'changed_call'}:
+        assert archived.read_bytes() == original
+
+
 @pytest.mark.parametrize('arguments', [
     '{session_id:"original-session",chars:"",yield_time_ms:1000,max_output_tokens:3000}',
     '{"session_id":"original-session", chars:"", "yield_time_ms":1000}',
