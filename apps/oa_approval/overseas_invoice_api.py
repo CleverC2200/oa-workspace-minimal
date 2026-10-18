@@ -7,7 +7,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from apps.oa_approval import attachments, auth, writer_api
+from apps.oa_approval import attachments, auth, safe_http, writer_api
 from apps.oa_approval.api import OaApi, TIMEOUT, _decode_json
 from apps.oa_approval.overseas_invoice import FIELDS, _require
 
@@ -42,7 +42,7 @@ class InvoiceApi(OaApi):
             headers={**self._headers(), 'content-type': 'application/x-www-form-urlencoded'},
             method='POST',
         )
-        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        with safe_http.urlopen(request, timeout=TIMEOUT) as response:
             return _decode_json(response.read().decode('utf-8'))
 
 

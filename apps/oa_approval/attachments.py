@@ -22,6 +22,7 @@ from apps.oa_approval import (
     resource_slots,
     rpa_session,
     runtime_control,
+    safe_http,
 )
 
 auth.load_local_env()
@@ -769,7 +770,8 @@ def _direct_extra_host_download(
     )
     try:
         with (
-            urllib.request.urlopen(request, timeout=max(1, int(timeout_sec))) as resp,
+            safe_http.urlopen(request, timeout=max(1, int(timeout_sec)),
+                              allow_same_origin_redirects=True) as resp,
             temp.open("wb") as out,
         ):
             shutil.copyfileobj(resp, out)
@@ -780,6 +782,8 @@ def _direct_extra_host_download(
             temp.unlink()
         except Exception:
             pass
+        if isinstance(err, safe_http.HttpBoundaryError):
+            raise
         return (
             None,
             f"attachment_download_failed: {name}: 直连下载失败: {str(err).strip()[:300]}",
@@ -843,8 +847,8 @@ def _direct_session_cookie_download(
         headers={"User-Agent": "Mozilla/5.0", "Cookie": cookie_header},
     )
     try:
-        with urllib.request.urlopen(
-            request, timeout=max(1, int(timeout_sec))
+        with safe_http.urlopen(
+            request, timeout=max(1, int(timeout_sec)), allow_same_origin_redirects=True
         ) as resp:
             response_code = detect_oa_download_fail_code(resp.geturl())
             if response_code:
@@ -862,11 +866,13 @@ def _direct_session_cookie_download(
             return None, ""
         temp.replace(dest)
         return dest, ""
-    except Exception:
+    except Exception as error:
         try:
             temp.unlink()
         except Exception:
             pass
+        if isinstance(error, safe_http.HttpBoundaryError):
+            raise
         return None, ""
 
 

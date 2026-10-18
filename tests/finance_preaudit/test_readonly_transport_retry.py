@@ -14,7 +14,7 @@ def test_read_transport_retry_is_bounded_and_preserves_request(monkeypatch, meth
         calls.append(request)
         if len(calls) == 1: raise urllib.error.URLError("temporary")
         return io.BytesIO(b'{"ok":true}')
-    monkeypatch.setattr(api.urllib.request, "urlopen", open_request)
+    monkeypatch.setattr(api.safe_http, "urlopen", open_request)
     monkeypatch.setattr(api.time, "sleep", lambda _: None)
     result = (instance.get("/read") if method == "GET"
               else instance._post_readonly(api.TODO_ENDPOINT, {"pageNo": 1}))
@@ -22,7 +22,7 @@ def test_read_transport_retry_is_bounded_and_preserves_request(monkeypatch, meth
     calls.clear()
     def unavailable(request, **kwargs):
         calls.append(request); raise urllib.error.URLError("unavailable")
-    monkeypatch.setattr(api.urllib.request, "urlopen", unavailable)
+    monkeypatch.setattr(api.safe_http, "urlopen", unavailable)
     with pytest.raises(urllib.error.URLError): instance.get("/read")
     assert len(calls) == 2
 
@@ -33,7 +33,7 @@ def test_write_or_authentication_failure_does_not_enter_read_retry(monkeypatch):
     def denied(request, **kwargs):
         calls.append(request)
         raise urllib.error.HTTPError(request.full_url, 401, "unauthorized", {}, io.BytesIO(b'{}'))
-    monkeypatch.setattr(api.urllib.request, "urlopen", denied)
+    monkeypatch.setattr(api.safe_http, "urlopen", denied)
     assert instance.get("/read")["http_status"] == 401 and len(calls) == 1
     with pytest.raises(ValueError, match="readonly_endpoint_not_allowed"):
         instance._post_readonly("/api/workflow/request/submitRequest", {})

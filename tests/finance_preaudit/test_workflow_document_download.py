@@ -57,7 +57,7 @@ def document_transport(monkeypatch, tmp_path):
             body = b"synthetic attachment bytes"
         return Response(body, request.full_url)
 
-    monkeypatch.setattr(attachments.urllib.request, "urlopen", open_request)
+    monkeypatch.setattr(attachments.safe_http, "urlopen", open_request)
     monkeypatch.setattr(attachments.urllib.request, "build_opener", lambda *_args: SimpleNamespace(open=open_request))
     monkeypatch.setattr(attachments, "_download_resource_with_browser", lambda *_a, **_kw: pytest.fail("must not mask a classified denial with browser fallback"))
     return state
