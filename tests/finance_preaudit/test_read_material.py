@@ -112,6 +112,7 @@ def test_reader_labels_source_rows_per_table_without_using_array_position(tmp_pa
     assert "明细表1第1行：detail[0].row[0]" in view
     assert "零基数组索引，不是明细行号" in view
     assert "完整字段路径" in view and "标签不证明业务事实" in view
+    assert "引用表单字段时" in view and "其他证据引用按原合同" in view
     assert view.index("main.field[0]") < view.index("detail[1].row[2].field[4]")
     assert view.index("detail[1].row[2].field[7]") < view.index("detail[0].row[0].field[4]")
     assert 'absent=["value"]' in view and "null" in view
