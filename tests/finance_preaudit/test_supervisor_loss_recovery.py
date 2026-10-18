@@ -13,7 +13,7 @@ from apps.oa_approval import runtime_control
 from apps.oa_finance_preaudit import item_failure, maintenance_runtime, production_config, reconciliation, supervisor_loss_recovery
 from scripts.finance_preaudit_run import read_execution
 from tests.finance_preaudit.test_production_release import git
-from tests.finance_preaudit.test_maintenance_runtime import clean_control_environment
+from tests.finance_preaudit.test_maintenance_runtime import clean_control_environment, compiled_maintenance_source
 from tests.finance_preaudit.test_supervisor_loss_maintenance import (
     current_snapshot,
     lost_execution,
@@ -28,7 +28,7 @@ def recovery_target(lost_execution, monkeypatch):
         target = root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes((source / relative).read_bytes())
-    (root / '.gitignore').write_text('runtime/\n.venv/\nstatus.json\n')
+    (root / '.gitignore').write_text('runtime/\n.venv/\nstatus.json\n__pycache__/\n')
     git(root, 'init', '-q', '-b', 'main')
     git(root, 'add', '.')
     git(root, 'commit', '-qm', 'offline recovery source')
