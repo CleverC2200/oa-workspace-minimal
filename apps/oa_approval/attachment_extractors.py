@@ -28,6 +28,7 @@ LEGACY_DOC_TIMEOUT_SECONDS = 60
 XML_EXTS = {".xml"}
 OFD_EXTS = {".ofd"}
 RAR_EXTS = {".rar"}
+VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".wmv", ".flv", ".mpeg", ".mpg", ".3gp", ".mts", ".m2ts", ".ogv", ".vob"}
 MAX_DOCX_XML_BYTES = 10_000_000
 MAX_DOCX_MEDIA_FILES = 30
 MAX_DOCX_MEDIA_BYTES = 50_000_000
@@ -47,6 +48,13 @@ SUCCESSFUL_PREPARATION_STATUSES = {
     "video_rendered",
     "xml_invoice_read",
 }
+SKIPPED_PREPARATION_STATUSES = {"video_skipped"}
+
+
+def skipped_video_sources(manifest: list[dict]) -> list[dict]:
+    return [source for entry in manifest for source in (
+        [entry] if entry.get("status") == "video_skipped" else entry.get("skipped_videos", [])
+    )]
 
 
 def safe_name(value: str, fallback: str) -> str:
@@ -754,24 +762,13 @@ def _prepare_one_attachment(
                 "image_count": 1,
             }
         )
-    elif suffix == ".mp4":
-        from apps.oa_approval import silent_video
-
-        pages, video = silent_video.render(
-            path, out_dir=out_dir, prefix=safe_name(resource_id, path.stem),
-            source_sha256=source_content_sha256,
-        )
-        images.extend({**base, **page} for page in pages)
-        manifest.append({"resource_id": resource_id, "name": name,
-                         "status": "video_rendered", "image_count": len(pages), **video})
-        structured_contents.append({
+    elif suffix in VIDEO_EXTS:
+        manifest.append({
             "resource_id": resource_id, "name": name,
+            **({"parent_resource_id": parent_resource_id} if parent_resource_id else {}),
             "source_content_sha256": source_content_sha256,
-            "document_type": "video", **video,
-            "summary": f"完整解码 {video['frame_count']} 帧，按时间顺序每图最多两帧，保持原始像素。",
-            "key_text": [f"audio_state={video['audio_state']}",
-                         f"duration_seconds={video['duration_seconds']}",
-                         f"frame_count={video['frame_count']}"],
+            "status": "video_skipped", "body_read_status": "not_read", "image_count": 0,
+            "reason": "video_content_excluded",
         })
     elif suffix in PDF_EXTS or suffix in {".doc", ".pptx"}:
         renderer = render_office_document if suffix in {".doc", ".pptx"} else render_pdf
@@ -1023,6 +1020,7 @@ def prepare_materials(
                     "status": "archive_extracted",
                     "archive_extracted_count": len(extracted),
                     "image_count": len(images) - image_count_before,
+                    "skipped_videos": skipped_video_sources(child_manifest),
                 }
             )
         else:
@@ -1038,7 +1036,7 @@ def prepare_materials(
             )
             validation_manifest.extend(manifest[manifest_count_before:])
     if any(
-        str(item.get("status") or "") not in SUCCESSFUL_PREPARATION_STATUSES
+        str(item.get("status") or "") not in SUCCESSFUL_PREPARATION_STATUSES | SKIPPED_PREPARATION_STATUSES
         for item in validation_manifest
     ) or any(
         str(item.get("status") or "") == "pdf_rendered"

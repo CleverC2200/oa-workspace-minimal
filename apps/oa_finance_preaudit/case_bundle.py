@@ -610,6 +610,12 @@ def collect_case(
     ]
 
     declared_fields = _field_rows(workflow)
+    warnings.extend({
+        "code": "video_attachment_skipped",
+        "resource_id": source.get("parent_resource_id") or source["resource_id"],
+        "source_resource_id": source["resource_id"],
+        "message": "视频附件已跳过，画面及音频未读取；不得据此确认视频中的事实，需要视频证明的事项保留具体缺口并交人工核对。",
+    } for source in attachment_extractors.skipped_video_sources(prepared["manifest"]))
     if (config.get("flow_key") in {"general_expense", "tpm_small_marketing_fee"} and not logical_resources
             and not authority_facts and not invoice_evidence.get("invoices")):
         empty_fields = official_sql.confirmed_empty_attachment_fields(

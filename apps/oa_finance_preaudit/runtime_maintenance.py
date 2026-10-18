@@ -1269,7 +1269,7 @@ def _recognition_actions(root: Path, attempt_actions: list[dict], *,
                 reason = "owner_unverified"
             elif report.get("status") == "running":
                 reason = "not_closed"
-            elif report.get("status") in {"complete", "failed"}:
+            elif report.get("status") in {"complete", "failed", "skipped"}:
                 completed_at = _timestamp(report.get("completed_at"))
                 if not created_at <= completed_at <= now:
                     raise ValueError("recognition_time_invalid")
