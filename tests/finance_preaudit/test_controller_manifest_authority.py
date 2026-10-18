@@ -139,6 +139,9 @@ with runtime_control.global_controller_lease():
 
 @pytest.mark.parametrize("damage", ["version", "owner", "invocation", "run", "instance", "path", "missing", "symlink", "authority_owner", "authority_version"])
 def test_invalid_pointer_is_blocked_in_status_and_start(damage, monkeypatch):
+    from scripts import finance_preaudit_concurrency_probe as probe
+    from tests.finance_preaudit.test_controller_handoff import _live_status, _reconciliation
+
     with runtime_control.global_controller_lease():
         manifest = controller_handoff.begin({"capacity": 3})
         controller_handoff.finish(manifest, status="completed", children_reaped=True, health="healthy")
@@ -165,9 +168,22 @@ def test_invalid_pointer_is_blocked_in_status_and_start(damage, monkeypatch):
     with runtime_control.global_controller_lease():
         with pytest.raises(ValueError, match="controller_handoff_untrusted"):
             controller_handoff.begin({"capacity": 3})
+    runtime_control.request_cycle_stop()
+    with pytest.raises(ValueError, match="production_cycle_stop_recovery_blocked"):
+        probe.run_rolling_drain(capacity=3, live_status=_live_status, reconcile_status=_reconciliation,
+            pipeline_runner=lambda *_args: pytest.fail("untrusted pointer started work"))
+    assert runtime_control.stop_reason() == "controller_cycle_stop"
 
 
-def test_pointer_activation_failure_does_not_report_idle(monkeypatch):
+@pytest.mark.parametrize("previous", [False, True])
+def test_pointer_activation_failure_does_not_report_idle(monkeypatch, previous):
+    from scripts import finance_preaudit_concurrency_probe as probe
+
+    if previous:
+        with runtime_control.global_controller_lease():
+            manifest = controller_handoff.begin({"capacity": 3})
+            controller_handoff.finish(manifest, status="completed", children_reaped=True, health="healthy")
+        monkeypatch.setattr(controller_handoff, "CONTROLLER_INSTANCE_ID", "f" * 32)
     write = runtime_control.write_control_bytes_atomic
     def interrupt(path, raw):
         if path == controller_handoff.manifest_file():
@@ -179,6 +195,12 @@ def test_pointer_activation_failure_does_not_report_idle(monkeypatch):
             controller_handoff.begin({"capacity": 3})
     assert runtime_control.stop_requested()
     assert controller_handoff.status()["ready_for_start"] is False
+    assert not runtime_control.clear_cycle_stop()
+    assert runtime_control.stop_reason() == "codex_review_technical_failure"
+    with pytest.raises(ValueError, match="production_probe_stopped"):
+        probe.run_rolling_drain(capacity=3, live_status=lambda: pytest.fail("failed activation requested live data"),
+            reconcile_status=lambda: pytest.fail("failed activation reconciled"),
+            pipeline_runner=lambda *_args: pytest.fail("failed activation started work"))
 
 
 def test_direct_offline_handoff_retains_absent_owner(monkeypatch):
@@ -274,14 +296,16 @@ def test_new_start_preserves_legacy_bytes_and_refuses_an_archive_conflict(monkey
     assert path.read_bytes() == original
     assert archive.read_bytes() == b"conflicting original"
     archive.unlink()
-    assert runtime_control.clear_cycle_stop()
+    assert not runtime_control.clear_cycle_stop()
+    assert runtime_control.clear_failure_stop(expected_reason="codex_review_technical_failure")
     with runtime_control.global_controller_lease():
         current = controller_handoff.begin({"capacity": 3})
         controller_handoff.finish(current, status="completed", children_reaped=True, health="healthy")
     assert archive.read_bytes() == original
 
 
-def test_finish_rejects_pointer_replaced_during_authority_write(monkeypatch):
+@pytest.mark.parametrize("damage", ["pointer_replaced", "authority_missing"])
+def test_finish_rejects_pointer_replaced_during_authority_write(monkeypatch, damage):
     write = runtime_control.write_control_bytes_atomic
     path = controller_handoff.manifest_file()
     with runtime_control.global_controller_lease():
@@ -290,9 +314,40 @@ def test_finish_rejects_pointer_replaced_during_authority_write(monkeypatch):
         def replacing(target, raw):
             write(target, raw)
             if target == authority:
-                write(path, path.read_bytes())
+                if damage == "authority_missing":
+                    authority.unlink()
+                else:
+                    write(path, path.read_bytes())
         monkeypatch.setattr(runtime_control, "write_control_bytes_atomic", replacing)
-        with pytest.raises(ValueError, match="controller_handoff_untrusted"):
+        with pytest.raises(ValueError, match=("controller_execution_evidence_failed" if damage == "authority_missing"
+                                             else "controller_handoff_untrusted")):
             controller_handoff.finish(manifest, status="completed", children_reaped=True, health="healthy")
     assert runtime_control.stop_requested()
     assert controller_handoff.status()["ready_for_start"] is False
+    assert not runtime_control.clear_cycle_stop()
+    assert runtime_control.stop_reason() == "codex_review_technical_failure"
+
+
+@pytest.mark.parametrize("payload", [b"stop_requested\n", b"unrecognized_stop\n", b"stop_requested:writer_result_unknown\n",
+                                     b"stop_requested:controller_cycle_stop\n"])
+def test_failed_activation_preserves_a_stronger_or_unknown_stop(monkeypatch, payload):
+    from scripts import finance_preaudit_concurrency_probe as probe
+
+    write = runtime_control.write_control_bytes_atomic
+    def interrupt(path, raw):
+        if path == controller_handoff.manifest_file():
+            write(runtime_control.stop_file(), payload)
+            raise RuntimeError("synthetic_activation_interrupted")
+        return write(path, raw)
+    monkeypatch.setattr(runtime_control, "write_control_bytes_atomic", interrupt)
+    with runtime_control.global_controller_lease():
+        with pytest.raises(RuntimeError, match="synthetic_activation_interrupted"):
+            controller_handoff.begin({"capacity": 3})
+    expected = b"stop_requested:codex_review_technical_failure\n" if payload.endswith(b":controller_cycle_stop\n") else payload
+    assert runtime_control.stop_file().read_bytes() == expected
+    assert controller_handoff.status()["ready_for_start"] is False
+    assert not runtime_control.clear_cycle_stop()
+    with pytest.raises(ValueError, match="production_probe_stopped"):
+        probe.run_rolling_drain(capacity=3, live_status=lambda: pytest.fail("failed activation requested live data"),
+            reconcile_status=lambda: pytest.fail("failed activation reconciled"),
+            pipeline_runner=lambda *_args: pytest.fail("failed activation started work"))

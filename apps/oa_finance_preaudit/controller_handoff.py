@@ -494,7 +494,7 @@ def _activate_manifest(manifest: Mapping[str, object], snapshot: tuple) -> None:
         if _read_manifest() != dict(manifest):
             raise ValueError("controller_handoff_untrusted")
     except (OSError, RuntimeError, ValueError):
-        runtime_control.request_cycle_stop()
+        runtime_control.request_stop("codex_review_technical_failure")
         raise
 
 
@@ -555,12 +555,15 @@ def _write_manifest(manifest: Mapping[str, object], *, previous: Mapping[str, ob
                 raise ValueError("controller_handoff_untrusted")
             if manifest_snapshot() != snapshot:
                 raise ValueError("controller_handoff_untrusted")
-            _record_execution_manifest(result)
-            readback = manifest_snapshot()
-            if (readback[0] != snapshot[0] or readback[2][0] != snapshot[2][0]
-                    or _validate_manifest(json.loads(manifest_payload(readback))) != result):
-                runtime_control.request_cycle_stop()
-                raise ValueError("controller_handoff_untrusted")
+            try:
+                _record_execution_manifest(result)
+                readback = manifest_snapshot()
+                if (readback[0] != snapshot[0] or readback[2][0] != snapshot[2][0]
+                        or _validate_manifest(json.loads(manifest_payload(readback))) != result):
+                    raise ValueError("controller_handoff_untrusted")
+            except (OSError, RuntimeError, ValueError):
+                runtime_control.request_stop("codex_review_technical_failure")
+                raise
     except (OSError, RuntimeError) as error:
         raise ValueError("controller_handoff_untrusted") from error
     return result
@@ -673,6 +676,17 @@ def finish(
 
 
 def status() -> dict:
+    return _status(stopped=runtime_control.stop_requested())
+
+
+def _cycle_stop_recovery_status() -> dict:
+    with runtime_control.stop_control_lease():
+        if runtime_control.stop_reason() != "controller_cycle_stop":
+            raise ValueError("controller_handoff_recovery_blocked")
+        return _status(stopped=False)
+
+
+def _status(*, stopped: bool) -> dict:
     controller_active = runtime_control.controller_active()
     writer_active = runtime_control.writer_active()
     active_request_writers = runtime_control.active_request_writers()
@@ -686,7 +700,7 @@ def status() -> dict:
     if manifest is None:
         ready = (
             manifest_valid
-            and not runtime_control.stop_requested()
+            and not stopped
             and not controller_active
             and not writer_active
             and active_request_writers == 0
@@ -724,7 +738,7 @@ def status() -> dict:
         and manifest["children_reaped"] is True
         and manifest["controller_instance_id"] != CONTROLLER_INSTANCE_ID
         and not controller_active
-        and not runtime_control.stop_requested()
+        and not stopped
         and not writer_active
         and active_request_writers == 0
         and lock_owner_consistent
