@@ -521,13 +521,14 @@ def _prompt(action_file: Path) -> str:
         + shlex.quote(str(action_file))
         + "` 读取；这是冻结材料的无损表格视图，列名后每行按列顺序给值，"
         "absent 表示原记录不存在的字段。保留原始读取状态与证据归属。"
+        "完整读完视图即完成材料文本读取，无需再重复展开同一 material.json；"
+        "审核包、流程规则和必要附件内容仍须完整读取。"
         "命令输出较长，请设置足够的输出上限（max_output_tokens=60000）；"
         "如工具仍截断，按行分段读完。不要反复猜测材料 JSON 结构。"
         "prepared.images 列出原图路径及表格单元格；通过下述附件识别工具读取内容，"
         "不能将索引或文件存在当成图片内容。"
         "evidence_refs 的表单字段引用必须逐字使用 declared_fields 中的 path，"
         "不使用视图行号、简写路径或范围表达式；权威事实使用 material.authority_facts[实际数组索引]。"
-        if workflow_key == "tpm_small_marketing_fee" else ""
     )
     material_reading += (
         "材料含 material.invoice_evidence 时，逐票按 source_field_paths 与 data_id 核对 OA 关联，"
@@ -841,7 +842,7 @@ def _parse_token_usage(stream: TextIO) -> dict:
         if not isinstance(usage, dict):
             continue
         values = {
-            field: usage.get(field, 0)
+            field: usage.get(field)
             for field in ("input_tokens", "cached_input_tokens", "output_tokens")
         }
         if any(
@@ -849,11 +850,13 @@ def _parse_token_usage(stream: TextIO) -> dict:
             for value in values.values()
         ):
             continue
-        return {
+        recorded = {
             "status": "recorded",
             **values,
             "total_tokens": values["input_tokens"] + values["output_tokens"],
         }
+        if _valid_token_usage(recorded):
+            return recorded
     return _unknown_usage()
 
 
