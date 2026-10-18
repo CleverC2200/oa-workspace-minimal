@@ -412,7 +412,7 @@ class TestReadAdaptersContract:
         with tempfile.TemporaryDirectory() as tmp:
             with (
                 patch.object(
-                    attachments.urllib.request,
+                    attachments.safe_http,
                     "urlopen",
                     side_effect=recorded_urlopen,
                 ),
@@ -594,7 +594,7 @@ class TestReadAdaptersContract:
         with tempfile.TemporaryDirectory() as tmp:
             with (
                 patch.object(
-                    attachments.urllib.request,
+                    attachments.safe_http,
                     "urlopen",
                     side_effect=recorded_urlopen,
                 ),
@@ -630,7 +630,7 @@ class TestReadAdaptersContract:
             },
         ]
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(attachments.urllib.request, "urlopen") as urlopen:
+            with patch.object(attachments.safe_http, "urlopen") as urlopen:
                 downloaded, errors = attachments.download_resources(
                     resources,
                     dest_dir=Path(tmp),
@@ -679,7 +679,7 @@ class TestReadAdaptersContract:
         with tempfile.TemporaryDirectory() as tmp:
             with (
                 patch.object(
-                    attachments.urllib.request,
+                    attachments.safe_http,
                     "urlopen",
                     side_effect=recorded_urlopen,
                 ),
@@ -731,7 +731,7 @@ class TestReadAdaptersContract:
             cache_db = root / "cache.sqlite3"
             with (
                 patch.object(
-                    attachments.urllib.request,
+                    attachments.safe_http,
                     "urlopen",
                     side_effect=recorded_urlopen,
                 ),
@@ -794,7 +794,7 @@ class TestReadAdaptersContract:
                     return_value="session=recorded",
                 ),
                 patch.object(
-                    attachments.urllib.request,
+                    attachments.safe_http,
                     "urlopen",
                     return_value=RedirectedResponse(b"<html>permission page</html>"),
                 ),

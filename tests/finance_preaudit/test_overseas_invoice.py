@@ -267,7 +267,7 @@ def test_transport_uses_only_official_detail_payload(monkeypatch):
     response = Mock(); response.read.return_value = b'{"code":"SUCCESS"}'
     context = Mock(); context.__enter__ = Mock(return_value=response); context.__exit__ = Mock(return_value=None)
     request = Mock(return_value=context)
-    monkeypatch.setattr('urllib.request.urlopen', request)
+    monkeypatch.setattr('apps.oa_approval.safe_http.urlopen', request)
     api = InvoiceApi('token-for-test', 'actor-for-test', app_id='test', base_url='https://example.invalid')
     details = [{'tableDBName': 'formtable_main_100_dt1', 'workflowRequestTableRecords': [{
         'recordOrder': 4, 'workflowRequestTableFields': [{'fieldName': 'fphm', 'fieldValue': 'INV-01'}]}]}]

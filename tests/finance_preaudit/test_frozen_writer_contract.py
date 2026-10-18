@@ -501,7 +501,7 @@ class TestFrozenWriterApi:
             base_url="https://oa.invalid",
         )
         with patch.object(
-            writer_api.urllib.request,
+            writer_api.safe_http,
             "urlopen",
             return_value=_Response(),
         ) as urlopen:
@@ -647,7 +647,7 @@ class TestFrozenWriterApi:
         )
 
         with patch(
-            "apps.oa_approval.writer_api.urllib.request.urlopen",
+            "apps.oa_approval.writer_api.safe_http.urlopen",
             side_effect=error,
         ):
             result = api.submit_and_verify("1004", "冻结意见")
