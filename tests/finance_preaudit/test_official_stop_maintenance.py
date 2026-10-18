@@ -18,18 +18,18 @@ from apps.oa_finance_preaudit import maintenance_runtime, production_config, pro
 from scripts.finance_preaudit_run import bind_tool_session
 from tests.finance_preaudit.test_approval_guard import prepared_case
 from tests.finance_preaudit.test_flow_engine_submission import _decision, _engine, _grant, _success, _verify_grant
-from tests.finance_preaudit.test_maintenance_runtime import clean_control_environment, live_snapshot
+from tests.finance_preaudit.test_maintenance_runtime import clean_control_environment, compiled_maintenance_source, live_snapshot
 from tests.finance_preaudit.test_production_release import git
 from tests.finance_preaudit.test_reconciliation import _state
 
 
 @pytest.fixture
-def official_production(tmp_path, monkeypatch):
+def official_production(tmp_path, monkeypatch, compiled_maintenance_source):
     root = tmp_path / 'oa-workspace-minimal'
     root.mkdir()
     source = Path(maintenance_runtime.__file__).resolve().parents[2]
     for name in ('apps', 'scripts'):
-        shutil.copytree(source / name, root / name, ignore=shutil.ignore_patterns('__pycache__'))
+        shutil.copytree(compiled_maintenance_source / name, root / name)
     for name in (*production_config.REPOSITORY_INPUTS[:2], production_config.MODEL_CATALOG):
         target = root / name
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -100,7 +100,7 @@ print(json.dumps(result))'''
     # Preserve the installed pre-#452 count bug in the target, not in candidate code.
     old = root / 'apps/oa_finance_preaudit/reconciliation.py'
     old.write_text(old.read_text().replace('        "codex_review_interrupted",\n', ''))
-    (root / '.gitignore').write_text('runtime/\n.venv/\nstatus.json\n')
+    (root / '.gitignore').write_text('runtime/\n.venv/\nstatus.json\n__pycache__/\n')
     git(root, 'init', '-q', '-b', 'main')
     git(root, 'add', '.')
     git(root, 'commit', '-qm', 'old installed source')
