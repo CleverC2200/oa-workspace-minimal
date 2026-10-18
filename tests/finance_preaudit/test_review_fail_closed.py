@@ -662,9 +662,8 @@ def test_native_transport_fallback_can_finish_same_review(tmp_path, monkeypatch,
     assert notice['error_message_sha256'] == hashlib.sha256(message.encode()).hexdigest()
 
 
-@pytest.mark.real_observation_interval
 @pytest.mark.parametrize('restriction,classification', [
-    ({'message': 'usage limit exceeded'}, 'usage_limit'),
+    pytest.param({'message': 'usage limit exceeded'}, 'usage_limit', marks=pytest.mark.real_observation_interval),
     ({'message': 'model is not available'}, 'model_unavailable'),
     ({'message': 'authentication failed'}, 'authentication'),
     ({'message': 'too many requests'}, 'rate_limit'),
@@ -676,11 +675,12 @@ def test_native_transport_fallback_can_finish_same_review(tmp_path, monkeypatch,
     ({'code': 'serverOverloaded'}, 'server_overloaded'),
     ({'httpStatusCode': 401}, 'authentication'),
     ({'httpStatusCode': 403}, 'authentication'),
-    ({'httpStatusCode': 429, 'codexErrorInfo': {'httpConnectionFailed': {'httpStatusCode': 502}}}, 'rate_limit'),
+    pytest.param({'httpStatusCode': 429, 'codexErrorInfo': {'httpConnectionFailed': {'httpStatusCode': 502}}},
+                 'rate_limit', marks=pytest.mark.real_observation_interval),
     ({'httpStatusCode': 429, 'codexErrorInfo': {'responseStreamDisconnected': {'httpStatusCode': 401}}}, 'rate_limit'),
     ({'httpStatusCode': 503}, 'server_overloaded'),
 ])
-def test_official_error_after_transport_fallback_stops_before_retry(tmp_path, monkeypatch, restriction, classification):
+def test_official_error_after_transport_fallback_stops_before_retry(tmp_path, monkeypatch, request, restriction, classification):
     task, action = _task(tmp_path)
     retry = tmp_path / 'retry-started'
     child_pid = tmp_path / 'model-pid'
@@ -702,7 +702,8 @@ def test_official_error_after_transport_fallback_stops_before_retry(tmp_path, mo
     started = time.monotonic()
     result = worker.review(task)
     assert time.monotonic() - started < 8
-    assert worker.OBSERVATION_INTERVAL_SECONDS == 5
+    if request.node.get_closest_marker('real_observation_interval') is not None:
+        assert worker.OBSERVATION_INTERVAL_SECONDS == 5
     assert result['error_code'] == 'codex_process_failed'
     assert result['process_attempts'] == 1
     assert result['process_retries'] == 0

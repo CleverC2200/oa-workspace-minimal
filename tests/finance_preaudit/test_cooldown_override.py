@@ -14,7 +14,7 @@ from apps.oa_finance_preaudit import approval_guard as guard, approval_lifecycle
 from apps.oa_finance_preaudit import maintenance_runtime, production_config, production_release
 from scripts import finance_preaudit_run
 from tests.finance_preaudit.test_official_stop_maintenance import official_production, offline_live, project_notice_cooldown
-from tests.finance_preaudit.test_maintenance_runtime import clean_control_environment
+from tests.finance_preaudit.test_maintenance_runtime import clean_control_environment, compiled_maintenance_source
 from tests.finance_preaudit.test_production_release import git
 
 

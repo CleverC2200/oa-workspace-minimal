@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import compileall
 import hashlib
 import json
+import py_compile
 import shutil
 
 import pytest
@@ -16,6 +18,38 @@ def clean_control_environment(monkeypatch):
     for key in ('OA_FROZEN_WRITER_LOCK_FILE', 'OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE',
                 'OA_FINANCE_PREAUDIT_STOP_FILE', 'OA_FINANCE_PREAUDIT_RUNTIME_ROOT'):
         monkeypatch.delenv(key, raising=False)
+
+
+@pytest.fixture(scope='session')
+def compiled_maintenance_source(tmp_path_factory):
+    source = Path(maintenance_runtime.__file__).resolve().parents[2]
+    target = tmp_path_factory.mktemp('maintenance-source')
+    for name in ('apps', 'scripts'):
+        shutil.copytree(source / name, target / name, ignore=shutil.ignore_patterns('__pycache__'))
+        assert compileall.compile_dir(target / name, quiet=2,
+            invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH)
+    return target
+
+
+def test_maintenance_source_cache_reads_changed_bytes_with_same_size_and_mtime(
+    compiled_maintenance_source, tmp_path,
+):
+    import os
+    import subprocess
+    import sys
+
+    shutil.copytree(compiled_maintenance_source / 'apps', tmp_path / 'apps')
+    source = tmp_path / 'apps/oa_finance_preaudit/__init__.py'
+    cache = next(source.parent.glob('__pycache__/__init__.*.pyc'))
+    assert int.from_bytes(cache.read_bytes()[4:8], 'little') == 3
+    command = [sys.executable, '-B', '-E', '-c',
+        'from apps import oa_finance_preaudit; print(oa_finance_preaudit.__all__[0])']
+    assert subprocess.check_output(command, cwd=tmp_path, text=True).strip() == 'FlowEngine'
+    before = source.stat()
+    source.write_bytes(source.read_bytes().replace(b'FlowEngine', b'FlowEnginf'))
+    os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert source.stat().st_size == before.st_size
+    assert subprocess.check_output(command, cwd=tmp_path, text=True).strip() == 'FlowEnginf'
 
 
 def live_snapshot():
