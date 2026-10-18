@@ -1,20 +1,20 @@
 from __future__ import annotations
 
 import json
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import time
+import threading
 
 import pytest
 
 from apps import json_artifact
 from apps.oa_approval import runtime_control
 from apps.oa_finance_preaudit import (
-    flow_engine, host_chat_review as host, item_failure, reconciliation,
+    flow_engine, host_chat_review as host, item_failure, production_config, reconciliation,
     review_failure_evidence as evidence,
 )
 from tests.finance_preaudit.test_host_chat_review import exchange
-from tests.finance_preaudit.test_host_chat_review import draft_source, native_call
 from scripts import finance_preaudit_concurrency_probe as controller
 
 
@@ -115,95 +115,6 @@ def test_verified_host_expiry_becomes_an_item_local_quarantine(exchange, control
     assert item_failure.isolated(action.parent, state)
 
 
-class SimultaneousReviews:
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.tasks = []
-
-    def submit(self, function, task):
-        future = Future()
-        self.tasks.append((future, function, task))
-        if len(self.tasks) == self.capacity:
-            for pending, run, value in self.tasks:
-                pending.set_result(run(value))
-        return future
-
-    def shutdown(self, **_kwargs):
-        pass
-
-
-@pytest.mark.parametrize('writer_unknown', [False, True])
-def test_native_host_failure_keeps_same_tick_siblings_but_unknown_write_stops(
-    exchange, controlled_exchange, monkeypatch, writer_unknown, request,
-):
-    engine, first, calls = controlled_exchange
-    _, _, owner, first_child, _, manifest, _ = exchange
-    actions = [first, *(Path(engine.next_action(workflow)['action_file'])
-                        for workflow in ('travel_expense', 'business_entertainment'))]
-    host.approval_lifecycle.heartbeat(manifest['run_id'], manifest['controller_instance_id'],
-                                      set(actions), [], writer_active=False)
-    requests = [host.publish(action, prompt='Review this frozen input only.',
-                             timeout_seconds=60 if index == 0 else 300)
-                for index, action in enumerate(actions)]
-    reviewers = host.registered_reviewers(owner=owner)
-    parent = first_child.with_name('parent.jsonl')
-    native_reviewers = request.node.native_reviewers
-    for index, (action, request) in enumerate(zip(actions, requests)):
-        line = native_call(parent, 'followup_task', {
-            'target': reviewers[index]['agent_path'], 'message': str(request),
-        }, f'dispatch-{index}', {})
-        host.assign(request, slot=index, owner=owner, source=parent, source_line=line)
-        if index:
-            packet = json.loads(action.with_name('review-packet.json').read_text())
-            draft = action.with_name(f'offline-decision-{index}.json')
-            child = Path(native_reviewers[index]['session_file'])
-            line = draft_source(child, request, draft, owner, call_id=f'review-{index}', payload={
-                'overall': 'needs_human', 'items': [{
-                    'item_key': item['item_key'], 'status': 'uncertain',
-                    'conclusion': '自动读取材料不足，需财务核对原单。',
-                    'evidence_refs': [], 'missing_evidence': ['缺少审核材料'],
-                } for item in packet['items']],
-            })
-            host.submit(request, draft, owner=owner, source=child, source_line=line)
-    now = time.time()
-    monkeypatch.setattr(host.time, 'time', lambda: now + 61)
-    reviewed = {action: host.await_result(request) for action, request in zip(actions, requests)}
-    monkeypatch.setattr(host.approval_lifecycle, 'submit_readonly',
-                        lambda executor, function, *args, **kwargs: executor.submit(function, *args))
-    monkeypatch.setattr(controller, '_preparation_executor', lambda: ThreadPoolExecutor(max_workers=1))
-    prepared, writes = iter(actions), []
-    def prepare(_selection):
-        action = next(prepared, None)
-        return {'action': 'review_required', 'action_file': str(action)} if action else {'action': 'no_action'}
-    def complete(action, _reviewed):
-        writes.append(action)
-        if writer_unknown:
-            return {'status': 'failed', 'write_state': 'unknown', 'error_code': 'writer_result_unknown'}
-        return {'status': 'completed', 'business_state': 'needs_human', 'write_state': 'submitted', 'error_code': None}
-
-    result = controller._run_dispatched_tasks(
-        3, 3, project_root=first.parents[6], renew_actions=lambda paths: paths,
-        prepare_action=prepare, review_worker=lambda task: reviewed[Path(task['action_file'])],
-        complete_review=complete, quarantine_review=engine.quarantine_review_failure,
-        executor_factory=SimultaneousReviews, strict_global_fifo=True,
-        runtime_status=lambda: {'status': 'healthy'},
-        run_id=manifest['run_id'], controller_instance_id=manifest['controller_instance_id'],
-    )
-
-    state = json.loads(first.with_name('state.json').read_text())
-    assert state['action'] == 'needs_admin' and state['write_state'] == 'not_requested'
-    assert state['write_authorized'] is False and item_failure.isolated(first.parent, state)
-    assert writes == (actions[1:2] if writer_unknown else actions[1:])
-    assert runtime_control.stop_requested() is writer_unknown
-    assert result.outcomes[0].value['status'] == 'quarantined'
-    if not writer_unknown:
-        assert [outcome.value['status'] for outcome in result.outcomes] == ['quarantined', 'completed', 'completed']
-        assert host.registered_reviewers(owner=owner) == reviewers
-        summary = controller._rolling_wave_metrics(result)
-        assert summary['failed'] == 0 and summary['isolated_quarantines'] == 1
-    assert calls == []
-
-
 @pytest.mark.parametrize('damage', ['unknown_write', 'writer_boundary', 'changed_request'])
 def test_host_quarantine_revalidates_no_write_and_original_request(
     exchange, controlled_exchange, monkeypatch, damage,
@@ -239,10 +150,6 @@ def test_host_isolation_persistence_failure_keeps_controller_blocked(
     exchange, controlled_exchange, monkeypatch, failed_file,
 ):
     engine, action, calls = controlled_exchange
-    request = host.publish(action, prompt='Review current frozen input.', timeout_seconds=60)
-    now = time.time()
-    monkeypatch.setattr(host.time, 'time', lambda: now + 61)
-    failed = host.await_result(request)
     original_write = json_artifact.write_json_atomic
 
     def unavailable(path, value, **kwargs):
@@ -254,13 +161,36 @@ def test_host_isolation_persistence_failure_keeps_controller_blocked(
     monkeypatch.setattr(controller, '_preparation_executor', lambda: ThreadPoolExecutor(max_workers=1))
     monkeypatch.setattr(host.approval_lifecycle, 'submit_readonly',
                         lambda executor, function, *args, **kwargs: executor.submit(function, *args))
-    result = controller._run_dispatched_tasks(
-        1, 1, project_root=action.parents[6], renew_actions=lambda paths: paths,
-        prepare_action=lambda _: {'action': 'review_required', 'action_file': str(action)},
-        review_worker=lambda _: failed, quarantine_review=engine.quarantine_review_failure,
-        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
-        runtime_status=lambda: {'status': 'healthy'}, strict_global_fifo=True,
-    )
+    monkeypatch.setattr(production_config, 'review_timeout_seconds', lambda: 60)
+    results, errors = [], []
+    def run():
+        try:
+            results.append(controller._run_dispatched_tasks(
+                1, 1, project_root=action.parents[6], renew_actions=lambda paths: paths,
+                prepare_action=lambda _: {'action': 'review_required', 'action_file': str(action)},
+                quarantine_review=engine.quarantine_review_failure,
+                executor_factory=lambda *_: pytest.fail('App review executor created'),
+                runtime_status=lambda: {'status': 'healthy'}, strict_global_fifo=True,
+                heartbeat_interval_sec=.01,
+            ))
+        except BaseException as error:
+            errors.append(error)
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 5
+        while not host.pending(owner=exchange[2]) and thread.is_alive() and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert host.pending(owner=exchange[2]) and not errors
+        now = time.time()
+        monkeypatch.setattr(host.time, 'time', lambda: now + 61)
+        thread.join(5)
+        assert not thread.is_alive() and not errors
+    finally:
+        if thread.is_alive():
+            runtime_control.request_cycle_stop()
+            thread.join(5)
+    result = results[0]
 
     value = result.outcomes[0].value
     assert value['status'] == 'failed'

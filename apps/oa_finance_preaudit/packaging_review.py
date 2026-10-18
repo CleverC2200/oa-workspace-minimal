@@ -474,7 +474,10 @@ def _host_review(action: Path, project_root: Path, timeout_seconds: int, prompt:
     envelope_instruction += '\ndraft 必须逐字段符合此 JSON Schema：' + json.dumps(draft_schema(packet), ensure_ascii=False)
     request = host_chat_review.publish(action, prompt=prompt + '\n' + envelope_instruction,
         timeout_seconds=timeout_seconds, kind='packaging_draft')
-    result = host_chat_review.await_result(request)
+    result = host_chat_review.poll_result(request)
+    while result is None:
+        time.sleep(.2)
+        result = host_chat_review.poll_result(request)
     if result['status'] != 'reviewed':
         return {'status': 'failed', 'error_code': result['error_code'], 'write_state': 'not_requested'}
     decision = validate_host_submission(action, result['review_payload'], result['source'], 'packaging_draft', {})

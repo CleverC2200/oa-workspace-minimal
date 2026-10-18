@@ -3913,7 +3913,8 @@ def test_rolling_drain_uses_continuous_dispatcher_completion_boundary(
     assert result["final_pending"] == 1
 
 
-def test_rolling_drain_stops_at_admission_cutoff_boundary() -> None:
+@pytest.mark.parametrize('admission_reason', [None, 'host_review_slots_fenced'])
+def test_rolling_drain_stops_at_admission_cutoff_boundary(admission_reason) -> None:
     counts = iter((1, 2))
     current = [0]
 
@@ -3953,11 +3954,17 @@ def test_rolling_drain_stops_at_admission_cutoff_boundary() -> None:
                 ),
             ),
             admission_closed=True,
+            admission_reason=admission_reason,
+            deferred_count=2 if admission_reason else 0,
         ),
     )
 
     assert result["admission_closed"] is True
-    assert result["unauthorized_pending"] == 2
+    assert result['admission_reason'] == admission_reason
+    assert result['deferred_count'] == (2 if admission_reason else 0)
+    assert result['stop_reason'] == admission_reason
+    assert result['post_boundary_actionable'] == (2 if admission_reason else 0)
+    assert result["unauthorized_pending"] == (0 if admission_reason else 2)
     assert result["final_pending"] == 2
 
 
