@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from scripts.finance_preaudit_concurrency_probe import PoolResult, TaskOutcome
+
 import hashlib
 from dataclasses import replace
 import json
@@ -13,7 +15,7 @@ from uuid import uuid4
 import pytest
 
 from apps.oa_approval import runtime_control
-from apps.oa_finance_preaudit import cli, controller_handoff, process_pool, reconciliation, session_alert
+from apps.oa_finance_preaudit import cli, controller_handoff, reconciliation, session_alert
 from scripts import finance_preaudit_concurrency_probe as probe, finance_preaudit_run
 
 
@@ -40,12 +42,12 @@ def reconciled() -> dict:
     }
 
 
-def stopped_pipeline(count: int, capacity: int) -> process_pool.PoolResult[dict]:
+def stopped_pipeline(count: int, capacity: int) -> PoolResult[dict]:
     runtime_control.request_stop("production_reconciliation_blocked")
-    return process_pool.PoolResult(
+    return PoolResult(
         requested=count, started=1, completed=0, failed=0, timed_out=0,
         stopped=1, peak_active=capacity, elapsed_seconds=0.01,
-        outcomes=(process_pool.TaskOutcome(
+        outcomes=(TaskOutcome(
             index=0, status="stopped", value=None, error_code="stop_requested",
         ),),
     )
@@ -192,11 +194,11 @@ def test_prior_stops_are_not_replaced_by_reconciliation(prior, expected_code, ex
 def test_first_writer_failure_is_not_replaced_by_a_later_stop(monkeypatch, capsys):
     def pipeline(count, capacity):
         runtime_control.request_stop("production_reconciliation_blocked")
-        return process_pool.PoolResult(
+        return PoolResult(
             requested=count, started=1, completed=0, failed=1, timed_out=0,
             stopped=0, peak_active=capacity, elapsed_seconds=0.01,
             primary_error_code="writer_result_unknown",
-            outcomes=(process_pool.TaskOutcome(
+            outcomes=(TaskOutcome(
                 index=0, status="failed", value=None, error_code="writer_result_unknown",
             ),),
         )
@@ -357,10 +359,10 @@ def test_specific_stop_is_retained_when_the_last_writer_finishes(
     def pipeline(count, capacity):
         runtime_control.request_stop(stop_reason)
         pending[0] = 0
-        return process_pool.PoolResult(
+        return PoolResult(
             requested=count, started=1, completed=1, failed=0, timed_out=0,
             stopped=0, peak_active=capacity, elapsed_seconds=0.01,
-            outcomes=(process_pool.TaskOutcome(
+            outcomes=(TaskOutcome(
                 index=0, status="completed", value={
                     "status": "completed", "business_state": "needs_human", "write_state": "submitted",
                 },
@@ -396,10 +398,10 @@ def test_specific_stop_is_retained_when_the_last_writer_finishes(
 def test_retry_pending_does_not_hide_a_specific_stop(stop_reason, expected_exit, expected_alert, monkeypatch, capsys):
     def pipeline(count, capacity):
         runtime_control.request_stop(stop_reason)
-        return process_pool.PoolResult(
+        return PoolResult(
             requested=count, started=1, completed=1, failed=0, timed_out=0,
             stopped=0, peak_active=capacity, elapsed_seconds=0.01,
-            outcomes=(process_pool.TaskOutcome(
+            outcomes=(TaskOutcome(
                 index=0, status="completed", value={
                     "status": "retry_pending", "error_code": "codex_review_retry_pending",
                     "write_state": "not_requested", "process_attempts": 1,

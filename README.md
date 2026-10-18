@@ -101,22 +101,22 @@ python3 -m apps.oa_finance_preaudit.cli complete-review \
 
 每次手工 `next-action` 只处理参数指定的一类流程，规则包、状态目录和当前单据相互隔离，且固定为 preview。批量生产处理只允许从滚动控制器进入；差旅旧的受控手工 CLI 和旧批次/drain 入口明确拒绝。仓库合并不会创建或启用生产 cron；每类流程仍需单独完成真实环境验收和当前授权后，才能建立并启用自己的定时入口。
 
-内部并发使用有界、可复用的 Python 进程池，保持同一流程一个控制入口。子进程只执行一个单据动作；普通异常、进程崩溃、单任务超时、批次超时和人工停止分别输出稳定错误码，不携带异常正文，也不自动重试。每 15 秒只采集可用内存、按 CPU 归一化负载、宿主线程数、活动 Worker 和最老任务年龄；单任务 960 秒仍未返回时终止该进程池和任务拥有的独立 Codex 进程组，下一轮只使用全新进程池。进程池容量、Codex 会话槽和商旅浏览器资源槽分别配置和测量；资源槽继续提供跨进程硬上限。
+现役滚动控制器直接发布并轮询 App 审核请求，材料准备使用隔离的标准库进程，DeepSeek CLI 保留标准库审核执行器，Writer 在父进程串行完成。只读容量诊断为每个在途任务使用独立标准库执行器，超时或崩溃时只回收该任务的工作进程与已登记模型进程组；回收无法证实时停止接纳新任务并保留失败。商旅浏览器等资源槽继续提供跨进程硬上限。
 
-离线稳定性门覆盖进程复用、失败隔离、任务超时回收、强制停止和重复单据单飞。现行调度候选固定 3 槽，不弹性扩容。OpenAI 本轮只创建 3 个 App 子 Agent，逐单追加任务并复用对话，所有 OpenAI CLI 审核入口拒绝；DeepSeek 保留独立 API key 的原 CLI 工具承载。材料取数和 OA Writer 仍各为 1。开发实现、离线测试与生产实际验收分别留证；本地文件不表示生产已启用。历史弹性设计与验证见 [ADR 0010](docs/adr/0010-bounded-process-pool.md)，当前原生派单及收尾见[控制器执行回执](docs/agents/controller-execution.md)。
+离线稳定性门覆盖失败隔离、任务超时回收、强制停止和重复单据单飞。现行调度候选固定 3 槽，不弹性扩容。OpenAI 本轮只创建 3 个 App 子 Agent，逐单追加任务并复用对话，所有 OpenAI CLI 审核入口拒绝；DeepSeek 保留独立 API key 的原 CLI 工具承载。材料取数和 OA Writer 仍各为 1。开发实现、离线测试与生产实际验收分别留证；本地文件不表示生产已启用。当前决定及历史验证见 [ADR 0010](docs/adr/0010-bounded-process-pool.md)，原生派单及收尾见[控制器执行回执](docs/agents/controller-execution.md)。
 
 生产滚动控制器不属于五个手工 JSON CLI 命令，也不创建定时任务。它先对六类财务流程完成只读对账，再由单调度器按 OA 操作时间串行发现和冻结材料；包装不进入该滚动池。每个审核槽一次处理一单，OpenAI 子 Agent 在本轮内复用同一对话，宿主按认领顺序在完成边界再次验证单据 capability 后通过全局单写提交。使用时仍要求本地流程授权清单和当前人工确认：
 
 ```bash
-python3 -m scripts.finance_preaudit_concurrency_probe \
-  --capacity 4 \
+python3 -m scripts.finance_preaudit_run --owner-task-id <当前聊天UUID> -- \
+  --rolling --fixed-capacity --capacity 3 --max-capacity 3 \
   --confirm-write YES
 ```
 
 历史 CLI 容量诊断仅在显式选择 DeepSeek 时使用只读探针，OpenAI CLI 入口拒绝。它复核已有冻结证据，只要求 Agent 输出结构化决定，不领取单据、不访问实时待办、不完成动作、不提交 OA，也不会清除生产止损文件：
 
 ```bash
-python3 -m scripts.finance_preaudit_concurrency_probe \
+OA_REVIEW_PROVIDER=deepseek OA_REVIEW_TRANSPORT=cli python3 -m scripts.finance_preaudit_concurrency_probe \
   --read-only \
   --capacity 12 \
   --samples 20
@@ -125,7 +125,7 @@ python3 -m scripts.finance_preaudit_concurrency_probe \
 只读弹性验证从 6 槽开始，每档至少经过两个健康窗口：
 
 ```bash
-python3 -m scripts.finance_preaudit_concurrency_probe \
+OA_REVIEW_PROVIDER=deepseek OA_REVIEW_TRANSPORT=cli python3 -m scripts.finance_preaudit_concurrency_probe \
   --read-only --adaptive \
   --capacity 6 \
   --samples 20 \
@@ -134,14 +134,7 @@ python3 -m scripts.finance_preaudit_concurrency_probe \
 
 首轮真实写入递增验证中，容量 `1/2/4/6` 均完成；旧版容量 `8` 出现一次 Codex 进程退出码为 0、但业务动作未完成的 `codex_process_incomplete`。结构化只读复验使用同一组 20 个冻结样本，容量 `8/10/12` 均为 20/20 有效决定，证明旧故障不是 8 槽资源上限，而是旧版让 Agent 同时承担判断和动作完成时的语义完成缺陷。当前只读审核验证上限为 `12`，尚未触达边界；这不代表材料采集或 OA 写入已验证到 12 并发，OA 写入仍固定串行。真实停止文件不会由测试或代码自动清除。
 
-历史弹性滚动诊断入口仍受当前授权、写策略、停止文件和显式确认约束。当前生产调度候选固定 3 槽；下方弹性参数不属于默认调度，OpenAI CLI 审核已禁止。`--max-capacity` 只用于生产滚动入口，不能与 `--read-only` 混用：
-
-```bash
-python3 -m scripts.finance_preaudit_concurrency_probe \
-  --rolling --adaptive \
-  --capacity 3 --max-capacity 6 \
-  --confirm-write YES
-```
+生产滚动入口拒绝 `--adaptive` 及超过 3 槽的配置。`--max-capacity` 只用于生产滚动入口，不能与 `--read-only` 混用；弹性容量决策只保留在只读诊断中。
 
 若上轮控制器已失败且终态清单仅因瞬时回收误报保留
 `children_reaped=false`，不得自动改写或清除止损。操作人必须先用只读状态与系统进程核实：

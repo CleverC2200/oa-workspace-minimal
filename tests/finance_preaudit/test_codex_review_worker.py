@@ -732,7 +732,6 @@ def test_failed_output_retention_failure_remains_unwritten(tmp_path, monkeypatch
     assert "review-output-*.txt" in codex_review_worker._prompt(action_file)
 
 
-
 def test_general_expense_worker_uses_bound_rule_pack(tmp_path: Path) -> None:
     _task_payload, action_file = _task(
         tmp_path,
@@ -910,7 +909,6 @@ def test_mixed_general_review_loads_subject_requirements_and_keeps_real_gap(
     remark = Path(closed["remark_file"]).read_text()
     assert "邮寄费发票与运单符合" in remark
     assert "维修费实际交易收款对象与发票销售方的关系待核" in remark
-
 
 
 @pytest.mark.parametrize("gap,attachment_missing,amount_status,amount_conclusion,amount_missing", [
@@ -1323,196 +1321,6 @@ def test_worker_rejects_non_object_frozen_packet(tmp_path: Path) -> None:
     assert result["error_code"] == "codex_review_task_invalid"
 
 
-def test_worker_returns_sanitized_success_only_after_bound_receipt(
-    tmp_path: Path,
-) -> None:
-    task, action_file = _task(tmp_path)
-    stopped: list[bool] = []
-
-    def execute(
-        _project_root: Path,
-        current_action: Path,
-        _timeout: int,
-    ) -> codex_review_worker.CodexExecution:
-        receipt_file = current_action.with_name("execution-receipt.json")
-        json_artifact.write_json_atomic(
-            receipt_file,
-            {
-                "write": True,
-                "submit_ok": True,
-                "done_hit": True,
-                "postcheck_done_hit": True,
-            },
-        )
-        payload = json.loads(current_action.read_text(encoding="utf-8"))
-        json_artifact.write_json_atomic(
-            current_action,
-            {
-                **payload,
-                "action": "closed",
-                "execution_state": "closed",
-                "business_state": "needs_human",
-                "write_state": "submitted",
-                "receipt_file": str(receipt_file),
-            },
-        )
-        return codex_review_worker.CodexExecution(
-            error_code=None,
-            token_usage={
-                "status": "recorded",
-                "input_tokens": 120,
-                "cached_input_tokens": 20,
-                "output_tokens": 30,
-                "total_tokens": 150,
-            },
-        )
-
-    result = codex_review_worker._legacy_run_with_completion(
-        task,
-        executor=execute,
-        request_stop=lambda: stopped.append(True),
-    )
-
-    assert result == {
-        "schema_version": 1,
-        "kind": "preaudit_review_worker_result",
-        "status": "completed",
-        "execution_state": "closed",
-        "business_state": "needs_human",
-        "write_state": "submitted",
-        "error_code": None,
-        "model": codex_review_worker.MODEL,
-        "reasoning_effort": codex_review_worker.REASONING_EFFORT,
-        "model_provider": review_failure_evidence.MODEL_PROVIDER,
-        "requested_service_tier": "default",
-        "process_attempts": 1,
-        "process_retries": 0,
-        "token_usage": {
-            "status": "recorded",
-            "input_tokens": 120,
-            "cached_input_tokens": 20,
-            "output_tokens": 30,
-            "total_tokens": 150,
-        },
-    }
-    assert str(action_file) not in repr(result)
-    assert stopped == []
-
-
-def test_worker_requests_global_stop_on_codex_process_failure(tmp_path: Path) -> None:
-    task, action_file = _task(tmp_path)
-    stopped: list[bool] = []
-
-    result = codex_review_worker._legacy_run_with_completion(
-        task,
-        executor=lambda *_args: codex_review_worker.CodexExecution(
-            error_code="codex_process_failed",
-            token_usage={"status": "unknown"},
-        ),
-        request_stop=lambda: stopped.append(True),
-    )
-
-    assert result["status"] == "failed"
-    assert result["error_code"] == "codex_process_failed"
-    assert str(action_file) not in repr(result)
-    assert stopped == [True]
-
-
-def test_worker_retries_once_only_when_first_process_left_action_untouched(
-    tmp_path: Path,
-) -> None:
-    task, action_file = _task(tmp_path)
-    attempts: list[int] = []
-    stopped: list[bool] = []
-
-    def execute(
-        _project_root: Path,
-        current_action: Path,
-        _timeout: int,
-    ) -> codex_review_worker.CodexExecution:
-        attempts.append(1)
-        if len(attempts) == 1:
-            return codex_review_worker.CodexExecution(
-                error_code="codex_process_failed",
-                token_usage={
-                    "status": "recorded",
-                    "input_tokens": 10,
-                    "cached_input_tokens": 0,
-                    "output_tokens": 2,
-                    "total_tokens": 12,
-                },
-            )
-        receipt_file = current_action.with_name("execution-receipt.json")
-        json_artifact.write_json_atomic(
-            receipt_file,
-            {
-                "write": True,
-                "submit_ok": True,
-                "done_hit": True,
-                "postcheck_done_hit": True,
-            },
-        )
-        payload = json.loads(current_action.read_text(encoding="utf-8"))
-        json_artifact.write_json_atomic(
-            current_action,
-            {
-                **payload,
-                "action": "closed",
-                "execution_state": "closed",
-                "business_state": "pass",
-                "write_state": "submitted",
-                "receipt_file": str(receipt_file),
-            },
-        )
-        return codex_review_worker.CodexExecution(
-            error_code=None,
-            token_usage={
-                "status": "recorded",
-                "input_tokens": 20,
-                "cached_input_tokens": 5,
-                "output_tokens": 3,
-                "total_tokens": 23,
-            },
-        )
-
-    result = codex_review_worker._legacy_run_with_completion(
-        task,
-        executor=execute,
-        request_stop=lambda: stopped.append(True),
-    )
-
-    assert result["status"] == "completed"
-    assert result["process_attempts"] == 2
-    assert result["process_retries"] == 1
-    assert result["token_usage"] == {
-        "status": "recorded",
-        "input_tokens": 30,
-        "cached_input_tokens": 5,
-        "output_tokens": 5,
-        "total_tokens": 35,
-    }
-    assert stopped == []
-
-
-def test_worker_does_not_retry_timeout_or_changed_action(tmp_path: Path) -> None:
-    task, action_file = _task(tmp_path)
-    stopped: list[bool] = []
-
-    result = codex_review_worker._legacy_run_with_completion(
-        task,
-        executor=lambda *_args: codex_review_worker.CodexExecution(
-            error_code="codex_process_timeout",
-            token_usage={"status": "unknown"},
-        ),
-        request_stop=lambda: stopped.append(True),
-    )
-
-    assert result["process_attempts"] == 1
-    assert result["process_retries"] == 0
-    assert stopped == [True]
-    assert action_file.exists()
-
-
 def test_codex_command_pins_deepseek_high_and_json_output(tmp_path: Path) -> None:
     command = codex_review_worker._codex_command(
         tmp_path, tmp_path / "schema.json", tmp_path / "decision.json",
@@ -1745,61 +1553,6 @@ def test_codex_process_receives_only_reviewer_runtime_environment(
     assert "OA_BASE_URL" not in captured_environment
     assert "OA_UID" not in captured_environment
     assert "UNRELATED_SECRET" not in captured_environment
-
-
-def test_worker_submits_structured_agent_decision_through_host(
-    tmp_path: Path,
-) -> None:
-    task, action_file = _task(tmp_path)
-    decision = {"kind": "preaudit_review_decision", "items": []}
-    completed: list[dict] = []
-
-    def complete(current_action: Path, current_decision: dict) -> str | None:
-        assert current_decision == decision
-        completed.append(current_decision)
-        receipt_file = current_action.with_name("execution-receipt.json")
-        json_artifact.write_json_atomic(
-            receipt_file,
-            {
-                "write": True,
-                "submit_ok": True,
-                "done_hit": True,
-                "postcheck_done_hit": True,
-            },
-        )
-        payload = json.loads(current_action.read_text(encoding="utf-8"))
-        closed = {
-            **payload,
-            "action": "closed",
-            "execution_state": "closed",
-            "business_state": "needs_human",
-            "write_state": "submitted",
-            "receipt_file": str(receipt_file),
-        }
-        json_artifact.write_json_atomic(current_action, closed)
-        return None
-
-    result = codex_review_worker._legacy_run_with_completion(
-        task,
-        executor=lambda *_args: codex_review_worker.CodexExecution(
-            error_code=None,
-            token_usage={"status": "unknown"},
-            decision=decision,
-        ),
-        completer=complete,
-        request_stop=lambda: None,
-    )
-
-    assert result["status"] == "completed"
-    assert result["business_state"] == "needs_human"
-    assert completed == [decision]
-    timing = json.loads(
-        action_file.with_name("agent-timing.json").read_text(encoding="utf-8")
-    )
-    assert timing["action_token"] == "test-action-token"
-    assert timing["model"] == "deepseek-flash"
-    assert timing["process_attempts"] == 1
-    assert "request_id" not in timing
 
 
 def test_production_review_phase_returns_decision_without_completing_action(
