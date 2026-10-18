@@ -49,6 +49,7 @@ from apps.oa_finance_preaudit import (
     review_failure_evidence,
     runtime_maintenance,
     session_alert,
+    target_scope,
 )
 from apps.oa_finance_preaudit import runtime_doctor
 
@@ -521,7 +522,7 @@ def _prepared_action_matches_selection(
     selected: dict,
     workflow_key: str,
     *,
-    project_root: Path = PROJECT_ROOT,
+    project_root: Path | None = None,
 ) -> bool:
     request_id = str(selected.get("requestId") or "").strip()
     received_at = str(selected.get("received_at") or "").strip()
@@ -537,7 +538,7 @@ def _prepared_action_matches_selection(
     case_key = hashlib.sha256(
         f"{request_id}\x1f{received_at}".encode("utf-8")
     ).hexdigest()
-    root = Path(project_root).expanduser().resolve()
+    root = Path(project_root or PROJECT_ROOT).expanduser().resolve()
     expected_action = (
         root
         / "runtime"
@@ -581,7 +582,7 @@ def _material_failure_action_matches_selection(
     allowed_failure_details: frozenset[str],
     forbidden_names: tuple[str, ...],
     expected_reason: str = "material_collection_failed",
-    project_root: Path = PROJECT_ROOT,
+    project_root: Path | None = None,
 ) -> bool:
     request_id = str(selected.get("requestId") or "").strip()
     received_at = str(selected.get("received_at") or "").strip()
@@ -603,7 +604,7 @@ def _material_failure_action_matches_selection(
     case_key = hashlib.sha256(
         f"{request_id}\x1f{received_at}".encode("utf-8")
     ).hexdigest()
-    root = Path(project_root).expanduser().resolve()
+    root = Path(project_root or PROJECT_ROOT).expanduser().resolve()
     expected_action = (
         root
         / "runtime"
@@ -655,10 +656,10 @@ def _quarantined_action_matches_selection(
     selected: dict,
     workflow_key: str,
     *,
-    project_root: Path = PROJECT_ROOT,
+    project_root: Path | None = None,
 ) -> bool:
     if state.get("reason") == "writer_submit_rejected":
-        expected_root = Path(project_root).expanduser().resolve() / "runtime" / "finance_preaudit_flows"
+        expected_root = Path(project_root or PROJECT_ROOT).expanduser().resolve() / "runtime" / "finance_preaudit_flows"
         return (
             action_path == expected_root / workflow_key / "cases"
             / str(state.get("case_key")) / f"attempt-{state.get('attempt')}" / "action.json"
@@ -1007,6 +1008,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
     known_late_visible_keys: set[str] = set()
     admission_cutoff: datetime | None = None
     allowed_workflows = ROLLING_WORKFLOW_KEYS
+    selected_targets: dict[tuple[str, str, str], dict] | None = None
 
     def failed(
         stage: str,
@@ -1080,6 +1082,15 @@ def _prepare_one(selection: PrepareSelection) -> dict:
         ):
             return failed("selection_contract")
         allowed_workflows = frozenset(raw_allowed_workflows)
+        raw_targets = selection.get("target_actions")
+        if raw_targets is not None:
+            if not isinstance(raw_targets, list) or not raw_targets:
+                return failed("selection_contract")
+            try:
+                selected_targets = {(row["request_id"], row["received_at"], row["workflow_key"]): row
+                                    for row in raw_targets}
+            except (TypeError, KeyError):
+                return failed("selection_contract")
         for identity in raw_assigned:
             if (
                 not isinstance(identity, list)
@@ -1184,6 +1195,8 @@ def _prepare_one(selection: PrepareSelection) -> dict:
             for candidate in live_candidates:
                 request_id = str(candidate.get("requestId") or "")
                 received_at = str(candidate.get("received_at") or "")
+                if selected_targets is not None and (request_id, received_at, candidate.get("flow_key")) not in selected_targets:
+                    continue
                 identity_key = _pending_identity_key(request_id, received_at)
                 if identity_key in known_late_visible_keys:
                     late_visible_pending_count += 1
@@ -1259,20 +1272,28 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 and datetime.now(timezone.utc) > admission_cutoff
             ):
                 return {"action": "admission_closed"}
+        selected_target = None
+        if selected_targets is not None and selected is not None:
+            selected_target = selected_targets[(selected["requestId"], selected["received_at"], selected_workflow)]
+            try:
+                bound = flow_engine.FlowEngine.inspect_target_action(
+                    PROJECT_ROOT / "runtime/finance_preaudit_flows", Path(selected_target["action_file"]),
+                    recovery=selected_target["recovery"],
+                )
+                if (bound["case_key"] != selected_target["item_key"]
+                        or bound["attempt"] != selected_target["source_attempt"]
+                        or bound.get("material_fingerprint") != selected_target["material_fingerprint"]):
+                    raise ValueError("production_target_action_changed")
+            except (KeyError, OSError, ValueError):
+                return failed("identity_contract", error_code="production_target_action_changed")
         prepare_trace.stage("engine_build")
         try:
-            if selected is None:
-                engine = cli._live_flow_engine(controlled=True)
-            elif recovery_action_file is not None:
-                engine = cli._live_flow_engine(controlled=True)
-            else:
-                engine = cli._live_flow_engine(
-                    controlled=True,
-                    selected_identity=(
-                        str(selected["requestId"]),
-                        str(selected["received_at"]),
-                    ),
-                )
+            engine_args = {"controlled": True}
+            if selected_targets is not None:
+                engine_args["target_case_keys"] = frozenset(row["item_key"] for row in selected_targets.values())
+            if selected is not None and recovery_action_file is None:
+                engine_args["selected_identity"] = (str(selected["requestId"]), str(selected["received_at"]))
+            engine = cli._live_flow_engine(**engine_args)
         except Exception as error:
             runtime_control.request_cycle_stop()
             return failed(
@@ -1305,6 +1326,8 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                         mode="controlled_write",
                         confirmed=True,
                     )
+                elif selected_target is not None:
+                    action = engine.resume_target_review(Path(selected_target["action_file"]))
                 else:
                     action = engine.next_action(
                         selected_workflow,
@@ -2387,7 +2410,7 @@ def _run_dispatched_tasks(
     count: int,
     capacity: int,
     *,
-    project_root: Path = PROJECT_ROOT,
+    project_root: Path | None = None,
     renew_actions: RenewActions = _renew_actions,
     prepare_action: PrepareAction | None = None,
     review_worker: ReviewWorker = _review_only,
@@ -2401,12 +2424,13 @@ def _run_dispatched_tasks(
     task_timeout_sec: float | None = None,
     prepare_timeout_sec: float = 300,
     heartbeat_interval_sec: float = 5,
-    runtime_status: Callable[[], dict] = concurrency_control.sample_local_health,
+    runtime_status: Callable[[], dict] | None = None,
     strict_global_fifo: bool = False,
     adaptive: bool = False,
     max_capacity: int | None = None,
     historical_unknown_identities: frozenset[tuple[str, str]] = frozenset(),
     recovery_action_files: Sequence[Path] = (),
+    target_actions: Sequence[dict] = (),
     deferred_action_files: Sequence[Path] = (),
     committed_received_at: str | None = None,
     committed_request_id: str | None = None,
@@ -2417,6 +2441,8 @@ def _run_dispatched_tasks(
     run_id: str | None = None,
     controller_instance_id: str | None = None,
 ) -> PoolResult[dict]:
+    project_root = Path(project_root or PROJECT_ROOT)
+    runtime_status = runtime_status or concurrency_control.sample_local_health
     native_review = host_chat_review.selected()
     native_bootstrapped = False
     native_ready = not native_review
@@ -2789,6 +2815,8 @@ def _run_dispatched_tasks(
                 for identity in sorted(historical_unknown_identities)
             ],
         }
+        if target_actions:
+            selection["target_actions"] = list(target_actions)
         if deferred_action_files:
             selection["defer_action_files"] = [str(path) for path in deferred_action_files]
         if recovery_queue:
@@ -3814,6 +3842,7 @@ def _run_global_dispatched_tasks(
     max_capacity: int | None = None,
     historical_unknown_identities: frozenset[tuple[str, str]] | None = None,
     recovery_action_files: Sequence[Path] = (),
+    target_actions: Sequence[dict] = (),
     deferred_action_files: Sequence[Path] = (),
     committed_received_at: str | None = None,
     committed_request_id: str | None = None,
@@ -3847,6 +3876,8 @@ def _run_global_dispatched_tasks(
         "run_id": run_id,
         "controller_instance_id": controller_instance_id,
     }
+    if target_actions:
+        dispatcher_args["target_actions"] = target_actions
     if recovery_action_files:
         dispatcher_args["recovery_action_files"] = recovery_action_files
     if deferred_action_files:
@@ -3898,10 +3929,11 @@ def _rolling_snapshot(
     reconcile_status: Callable[[], dict],
     workflow_keys: frozenset[str] = ROLLING_WORKFLOW_KEYS,
     *, recovery_action_files: Sequence[Path] = (),
+    targets: target_scope.TargetScope | None = None,
     deferred_action_files: Sequence[Path] = (),
 ) -> tuple[int, int, int, int]:
     live = live_status()
-    pending = _supported_pending(live, workflow_keys)
+    pending = _supported_pending(live, ROLLING_WORKFLOW_KEYS if targets else workflow_keys)
     oa = live.get("oa")
     unauthorized = oa.get("unsupported", 0) if isinstance(oa, dict) else 0
     if (
@@ -3946,6 +3978,8 @@ def _rolling_snapshot(
         if len(set(deferred)) != len(deferred) or len(deferred) > actionable:
             raise ValueError("production_rolling_reconciliation_invalid")
         actionable -= len(deferred)
+    if targets is not None:
+        pending, quarantined, actionable = targets.counts(reconciled)
     return pending, quarantined, actionable, unauthorized
 
 
@@ -4313,6 +4347,8 @@ def run_rolling_drain(
     allowed_workflows: frozenset[str] = ROLLING_WORKFLOW_KEYS,
     confirm_stale_children_reaped: bool = False,
     authorized_recovery_once: bool = False,
+    targets_only: bool = False,
+    resume_action_files: Sequence[Path] = (),
 ) -> dict:
     native_pipeline = pipeline_runner is _run_global_dispatched_tasks
     max_capacity = (3 if native_pipeline else 12) if max_capacity is None else max_capacity
@@ -4322,9 +4358,6 @@ def run_rolling_drain(
     if native_pipeline:
         if capacity > approval_guard.MAX_MODEL_WORKERS or max_capacity > approval_guard.MAX_MODEL_WORKERS:
             raise ValueError("approval_global_capacity_invalid")
-        gate = approval_lifecycle.startup(PROJECT_ROOT, observe_errors=not bool(os.environ.get(approval_guard.OWNER_ENV)))
-        if gate["status"] != "ready":
-            return {"schema_version": 1, "kind": "approval_startup_gate", **gate}
     recovery_queue = tuple(
         Path(path).expanduser().resolve() for path in recovery_action_files
     )
@@ -4337,21 +4370,46 @@ def run_rolling_drain(
         raise ValueError("production_rolling_recovery_runner_invalid")
     if authorized_recovery_once and (recovery_queue or pipeline_runner is not _run_global_dispatched_tasks):
         raise ValueError("production_rolling_recovery_runner_invalid")
+    if resume_action_files and not targets_only:
+        raise ValueError("production_target_mode_required")
+    if targets_only and (authorized_recovery_once or deferred_action_files or not native_pipeline):
+        raise ValueError("production_target_scope_conflict")
+    targets = (target_scope.TargetScope.bind(
+        PROJECT_ROOT / "runtime/finance_preaudit_flows", resume=resume_action_files,
+        recover=recovery_action_files, workflows=allowed_workflows,
+    ) if targets_only else None)
+    if targets is not None:
+        recovery_queue = tuple(target.action_file for target in targets.targets if target.recovery)
+    if native_pipeline:
+        gate = approval_lifecycle.startup(PROJECT_ROOT, observe_errors=not bool(os.environ.get(approval_guard.OWNER_ENV)))
+        if gate["status"] != "ready":
+            return {"schema_version": 1, "kind": "approval_startup_gate", **gate,
+                    **({"target_outcome": targets.outcome({}, controller_completed=False)} if targets else {})}
     scoped_reconcile_status = (
-        (lambda: _production_reconciliation(allowed_workflows))
+        (lambda: _production_reconciliation(ROLLING_WORKFLOW_KEYS if targets else allowed_workflows))
         if reconcile_status is _production_reconciliation
         else reconcile_status
     )
-    recovered_cycle_stop = _recover_stale_cycle_stop(
-        live_status=live_status,
-        reconcile_status=scoped_reconcile_status,
-        allowed_workflows=allowed_workflows,
-        confirm_stale_children_reaped=confirm_stale_children_reaped,
-        recovery_action_files=recovery_queue,
-    )
-    controller_handoff.assert_ready_for_start()
+    latest_reconciled: dict = {}
+    if targets is not None:
+        original_reconcile = scoped_reconcile_status
+        def target_reconcile() -> dict:
+            nonlocal latest_reconciled
+            latest_reconciled = original_reconcile()
+            return latest_reconciled
+        scoped_reconcile_status = target_reconcile
     try:
+        recovered_cycle_stop = _recover_stale_cycle_stop(
+            live_status=live_status,
+            reconcile_status=scoped_reconcile_status,
+            allowed_workflows=ROLLING_WORKFLOW_KEYS if targets else allowed_workflows,
+            confirm_stale_children_reaped=confirm_stale_children_reaped,
+            recovery_action_files=recovery_queue,
+        )
+        controller_handoff.assert_ready_for_start()
         with runtime_control.global_controller_lease(), ExitStack() as run_context:
+            if targets and recovery_queue:
+                recovery_queue = targets.pending_recovery_actions(scoped_reconcile_status())
             if authorized_recovery_once:
                 from apps.oa_finance_preaudit.case_recovery import select_once
                 from apps.oa_finance_preaudit import production_write
@@ -4362,7 +4420,7 @@ def run_rolling_drain(
                     PROJECT_ROOT / "runtime" / "finance_preaudit_flows",
                     scoped_reconcile_status(), allowed_workflows & authorized_workflows,
                 )
-            if native_pipeline:
+            if native_pipeline and targets is None:
                 from apps.oa_finance_preaudit import production_write, review_interruption
                 flow_root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
                 if flow_root.exists() and any(state.get("reason") == review_interruption.REASON for state in reconciliation.latest_states(flow_root)):
@@ -4428,6 +4486,7 @@ def run_rolling_drain(
                             historical_unknown_identities
                         ),
                         recovery_action_files=pending_recoveries,
+                        **({"target_actions": targets.selections()} if targets else {}),
                         deferred_action_files=deferred_action_files,
                         committed_received_at=committed_received_at,
                         committed_request_id=committed_request_id,
@@ -4462,6 +4521,7 @@ def run_rolling_drain(
                     reconcile_status=scoped_reconcile_status,
                     max_waves=max_waves,
                     recovery_count=len(recovery_queue),
+                    targets=targets,
                     recovery_action_files=recovery_queue,
                     deferred_action_files=deferred_action_files,
                     allowed_workflows=allowed_workflows,
@@ -4515,10 +4575,24 @@ def run_rolling_drain(
                 "recovered_cycle_stop": recovered_cycle_stop,
                 "cache_maintenance": cache_maintenance,
                 "controller_handoff": handoff,
+                **({"target_outcome": targets.outcome(
+                    scoped_reconcile_status(), controller_completed=(handoff["status"] == "completed"
+                        and not runtime_control.stop_requested() and not runtime_control.writer_active()
+                        and runtime_control.active_request_writers() == 0),
+                )} if targets else {}),
             }
     except RuntimeError as error:
         if str(error) == "controller_already_active":
-            raise ValueError("production_rolling_controller_active") from error
+            converted = ValueError("production_rolling_controller_active")
+            if targets:
+                converted.target_outcome = targets.outcome(latest_reconciled, controller_completed=False)
+            raise converted from error
+        if targets:
+            error.target_outcome = targets.outcome(latest_reconciled, controller_completed=False)
+        raise
+    except Exception as error:
+        if targets:
+            error.target_outcome = targets.outcome(latest_reconciled, controller_completed=False)
         raise
 
 
@@ -4696,6 +4770,7 @@ def _run_rolling_drain_locked(
     reconcile_status: Callable[[], dict] = _production_reconciliation,
     max_waves: int = 10,
     recovery_count: int = 0,
+    targets: target_scope.TargetScope | None = None,
     recovery_action_files: Sequence[Path] = (),
     deferred_action_files: Sequence[Path] = (),
     allowed_workflows: frozenset[str] = ROLLING_WORKFLOW_KEYS,
@@ -4726,6 +4801,7 @@ def _run_rolling_drain_locked(
                 allowed_workflows,
                 recovery_action_files=recovery_action_files,
                 deferred_action_files=deferred_action_files,
+                targets=targets,
             )
         )
     except ValueError as error:
@@ -4767,6 +4843,7 @@ def _run_rolling_drain_locked(
                     reconcile_status,
                     allowed_workflows,
                     deferred_action_files=deferred_action_files,
+                    targets=targets,
                 )
             except ValueError:
                 runtime_control.request_cycle_stop()
@@ -4854,6 +4931,7 @@ def _run_rolling_drain_locked(
                 reconcile_status,
                 allowed_workflows,
                 deferred_action_files=deferred_action_files,
+                targets=targets,
             )
         except ValueError:
             runtime_control.request_cycle_stop()
@@ -5168,6 +5246,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--samples", type=int, default=20)
     parser.add_argument("--drain", action="store_true")
     parser.add_argument("--rolling", action="store_true")
+    parser.add_argument("--targets-only", action="store_true")
+    parser.add_argument("--resume-action-file", action="append", type=Path, default=[])
     parser.add_argument(
         "--workflow",
         action="append",
@@ -5195,6 +5275,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.drain
                 or args.rolling
                 or args.recover_action_file
+                or args.targets_only
+                or args.resume_action_file
                 or args.defer_action_file
                 or args.workflow
                 or args.confirm_stale_children_reaped
@@ -5232,6 +5314,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     else ROLLING_WORKFLOW_KEYS
                 ),
             }
+            if args.targets_only:
+                rolling_args["targets_only"] = True
+            if args.resume_action_file:
+                rolling_args["resume_action_files"] = tuple(args.resume_action_file)
             if args.max_capacity is not None:
                 rolling_args["max_capacity"] = args.max_capacity
             if args.recover_action_file:
@@ -5300,6 +5386,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "status": "skipped",
                     "reason": "production_rolling_controller_active",
                     "controller_handoff": handoff,
+                    **({"target_outcome": error.target_outcome} if hasattr(error, "target_outcome") else {}),
                 }, ensure_ascii=False, sort_keys=True))
                 return 0
         error_code = session_code or str(error)
@@ -5318,6 +5405,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             "error_code": error_code,
         }
+        if hasattr(error, "target_outcome"):
+            payload["target_outcome"] = error.target_outcome
         if (
             isinstance(error, ControllerChildrenActiveError)
             and error.primary_error_code
