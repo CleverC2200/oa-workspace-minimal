@@ -2335,12 +2335,13 @@ def complete_review_attempt(action_file: Path, reviewed: dict) -> dict:
     )
 
 
-def quarantine_review_failure(action_file: Path, failure_code: str) -> dict:
+def quarantine_review_failure(action_file: Path, failure_code: str, *, host_failure_reference: dict | None = None) -> dict:
     from apps.oa_finance_preaudit import cli
 
     return cli._live_flow_engine(controlled=True).quarantine_review_failure(
         action_file,
         failure_code,
+        host_failure_reference=host_failure_reference,
     )
 
 

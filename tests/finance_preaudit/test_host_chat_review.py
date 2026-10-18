@@ -143,6 +143,82 @@ def draft_source(source, request_file, target, owner, *, call_id='actual-host-ca
     return native_call(source, 'functions.exec', code, call_id, {'exit_code': 0, 'output': json.dumps(receipt) + '\n'})
 
 
+def test_host_entertainment_rule_and_preview_keep_payment_distinct_from_attribution(exchange, tmp_path):
+    import re
+    import shlex
+
+    from apps.oa_finance_preaudit import read_material
+    from tests.finance_preaudit.test_flow_engine_entertainment import _material, _decision
+
+    _, draft, owner, child, task, manifest, _ = exchange
+    project = Path(task['project_root'])
+    relative_rule = Path('.agents/skills/oa-finance-preaudit/references/flows/business-entertainment.md')
+    rule = project / relative_rule
+    rule.parent.mkdir(parents=True)
+    rule.write_bytes((Path(__file__).resolve().parents[2] / relative_rule).read_bytes())
+
+    def collect(request_id, _):
+        material = _material(request_id)
+        material['declared_fields'].extend([
+            {'path': 'detail[0].row[0].field[6]', 'name': '原付款与发票事实',
+             'value': '付款65元成功，原票记载餐饮服务，但当前资料未确认两者的费用或结算关系。'},
+            {'path': 'detail[0].row[1].field[6]', 'name': '原付款展示',
+             'value': '付款40元成功，商品栏仅重复商户名；有OA发票关联字段，无独立消费内容。'},
+        ])
+        return material
+
+    engine = flow_engine.FlowEngine(
+        root=project / 'runtime/finance_preaudit_flows',
+        discover_candidates=lambda key: [{'request_id': 'synthetic-entertainment',
+            'workflow_key': key, 'received_at': '2026-10-10T09:00:00+08:00'}],
+        collect_material=collect,
+    )
+    action = engine.next_action('business_entertainment', mode='preview')
+    action_file = Path(action['action_file'])
+    frozen = action_file.with_name('material.json').read_bytes()
+    decision = _decision(action)
+    decision['overall'] = 'needs_human'
+    for index in (0, 3):
+        decision['items'][index].update(
+            status='uncertain', missing_evidence=['两笔付款与本次招待费用的对应关系'],
+            conclusion='两笔支付105元已确认，费用对应待核，暂不能确定核销范围。',
+        )
+    decision['items'][2]['conclusion'] = '当前阶段按既定策略暂不校验，OA 暂未提供预算数据。'
+    host.approval_lifecycle.heartbeat(manifest['run_id'], manifest['controller_instance_id'], {action_file}, [], writer_active=False)
+    results = []
+    thread = threading.Thread(target=lambda: results.append(host.review({**task, 'action_file': str(action_file)})))
+    thread.start()
+    try:
+        request = wait_request(action_file, owner)
+        prompt = json.loads(request.read_text())['prompt']
+        assert 'references/flows/business-entertainment.md' in prompt
+        assert '## 支付事实与费用归属' in rule.read_text()
+        command = re.search(r'`(python3 -m apps.oa_finance_preaudit.read_material [^`]+)`', prompt)
+        assert command
+        view = read_material.read(Path(shlex.split(command.group(1))[-1]))
+        assert '付款65元成功' in view and '付款40元成功' in view
+        parent = child.with_name('parent.jsonl')
+        dispatch = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(request)}, 'attribution-dispatch', {})
+        host.assign(request, slot=0, owner=owner, source=parent, source_line=dispatch)
+        line = draft_source(child, request, draft, owner, payload=decision)
+        host.submit(request, draft, owner=owner, source=child, source_line=line)
+        thread.join(3)
+    finally:
+        if thread.is_alive():
+            host.close(owner=owner, reason='cancelled')
+            thread.join(3)
+    assert not thread.is_alive()
+    assert results[0]['status'] == 'reviewed'
+    assert results[0]['decision'] == decision
+    decision_file = tmp_path / 'consumed-entertainment.json'
+    json_artifact.write_json_atomic(decision_file, results[0]['decision'])
+    closed = engine.complete_review(action_file, decision_file)
+    assert closed['business_state'] == 'needs_human' and closed['write_state'] == 'not_requested'
+    assert json.loads(Path(closed['decision_file']).read_text()) == decision
+    assert '两笔支付105元已确认，费用对应待核' in Path(closed['remark_file']).read_text()
+    assert action_file.with_name('material.json').read_bytes() == frozen
+
+
 def test_result_read_waits_for_submission_registry_commit(exchange, monkeypatch):
     """The submission file alone is not a complete publication."""
     action, draft, owner, child, *_ = exchange
@@ -600,6 +676,28 @@ def test_parent_lease_loss_cancels_exchange_and_rejects_late_decision(exchange, 
     assert results[0]['write_state'] == 'not_requested'
     assert json.loads(host.registry_file(owner).read_text())['state'] == 'cancelled'
     assert not request.with_name(request.name.replace(host.REQUEST, host.SUBMISSION)).exists()
+
+
+def test_expired_finance_request_fences_only_its_assignment(exchange, monkeypatch):
+    action, draft, owner, child, *_ = exchange
+    request = host.publish(action, prompt='Review current frozen facts.', timeout_seconds=60)
+    parent = child.with_name('parent.jsonl')
+    line = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(request)}, 'expiry-dispatch', {})
+    host.assign(request, slot=0, owner=owner, source=parent, source_line=line)
+    now = time.time()
+    monkeypatch.setattr(host.time, 'time', lambda: now + 61)
+
+    failed = host.await_result(request)
+
+    assert failed['failure_detail_code'] == 'host_review_request_expired'
+    assert failed['failure_recorded'] is True
+    assert runtime_control.stop_requested() is False
+    registered = json.loads(host.registry_file(owner).read_text())
+    assert registered['state'] == 'open'
+    assert next(iter(registered['assignments'].values()))['state'] == 'failed_fenced'
+    assert host.failure_reference(action, failed) is not None
+    with pytest.raises(ValueError, match='request_expired'):
+        host.submit(request, draft, owner=owner, source=child, source_line=2)
 
 
 def test_cancel_closes_registered_round_and_never_terminates_writer(exchange, monkeypatch):
@@ -1089,3 +1187,63 @@ def test_new_controller_cannot_start_before_same_parent_shutdown_is_verified(exc
     monkeypatch.setattr(finance_preaudit_run.approval_lifecycle, 'startup', lambda _: pytest.fail('Unsealed prior round admitted'))
     assert finance_preaudit_run.main(['--owner-task-id', owner, '--review-transport', 'host_chat', '--', '--rolling']) == 1
     assert json.loads(capsys.readouterr().out)['error_code'] == 'controller_execution_evidence_failed'
+
+def test_failed_slot_reuse_requires_fresh_native_idle_proof(exchange, monkeypatch):
+    action, _, owner, child, _, manifest, engine = exchange
+    parent = child.with_name('parent.jsonl')
+    request = host.publish(action, prompt='A', timeout_seconds=1)
+    line = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(request)}, 'expiry-dispatch', {})
+    host.assign(request, slot=0, owner=owner, source=parent, source_line=line)
+    stale = native_call(parent, 'list_agents', {}, 'old-idle', {'agents': [{'agent_name': '/root/reviewer_0', 'agent_status': 'idle'}]})
+    sibling_action = Path(engine.next_action('general_expense')['action_file'])
+    host.approval_lifecycle.heartbeat(manifest['run_id'], manifest['controller_instance_id'],
+                                     {action, sibling_action}, [], writer_active=False)
+    sibling = host.publish(sibling_action, prompt='Keep the failed slot fenced.', timeout_seconds=60)
+    now = time.time()
+    with monkeypatch.context() as expired:
+        expired.setattr(host.time, 'time', lambda: now + 2)
+        assert host.await_result(request)['status'] == 'failed'
+        expired.setattr(host.time, 'time', lambda: now + 3)
+        with pytest.raises(ValueError, match='stale_source'):
+            host.release_failed_slot(request, owner=owner, source=parent, source_line=stale)
+        dispatch = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(sibling)}, 'fenced-slot', {})
+        with pytest.raises(ValueError, match='slot_busy'):
+            host.assign(sibling, slot=0, owner=owner, source=parent, source_line=dispatch)
+    with monkeypatch.context() as elapsed:
+        elapsed.setattr(host.time, 'time', lambda: now + 4)
+        from datetime import datetime, timezone
+        line = native_call(parent, 'list_agents', {}, 'current-idle', {'agents': [{'agent_name': '/root/reviewer_0', 'agent_status': 'idle'}]})
+        rows = parent.read_text().splitlines()
+        call = json.loads(rows[line - 1]); call['timestamp'] = datetime.fromtimestamp(now + 3, timezone.utc).isoformat()
+        rows[line - 1] = json.dumps(call); parent.write_text('\n'.join(rows) + '\n')
+        assert host.release_failed_slot(request, owner=owner, source=parent, source_line=line)['state'] == 'failed_sealed'
+        action_b = sibling_action
+        host.approval_lifecycle.heartbeat(manifest['run_id'], manifest['controller_instance_id'], {action_b}, [], writer_active=False)
+    line = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(sibling)}, 'after-idle', {})
+    assert host.assign(sibling, slot=0, owner=owner, source=parent, source_line=line)['slot'] == 0
+
+
+def test_normal_close_accepts_trusted_expired_request_and_preserves_failure_proof(exchange, monkeypatch):
+    action, _, owner, child, _, manifest, _ = exchange
+    parent = child.with_name('parent.jsonl')
+    request = host.publish(action, prompt='A', timeout_seconds=1)
+    now = time.time()
+    with monkeypatch.context() as elapsed:
+        elapsed.setattr(host.time, 'time', lambda: now + 2)
+        failed = host.await_result(request)
+    controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
+    seal_execution(owner, manifest)
+    line = native_call(parent, 'list_agents', {}, 'close-after-failure', {'agents': [
+        {'agent_name': f'/root/reviewer_{slot}', 'agent_status': 'idle'} for slot in range(3)]})
+    from datetime import datetime, timezone
+    rows = parent.read_text().splitlines()
+    call = json.loads(rows[line - 1]); call['timestamp'] = datetime.fromtimestamp(now + 3, timezone.utc).isoformat()
+    rows[line - 1] = json.dumps(call); parent.write_text('\n'.join(rows) + '\n')
+    with monkeypatch.context() as elapsed:
+        elapsed.setattr(host.time, 'time', lambda: now + 4)
+        assert host.close(owner=owner, source=parent, source_line=line)['state'] == 'closed'
+    assert host.verified_failure(action, failed) == failed['host_failure']
+    material = json.loads(action.with_name('material.json').read_text())
+    material['warnings'] = ['Changed input']
+    host.guard.write(action.with_name('material.json'), material)
+    assert host.verified_failure(action, failed) is None

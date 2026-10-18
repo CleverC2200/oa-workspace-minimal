@@ -51,7 +51,7 @@ def test_public_dispatcher_uses_same_app_budget_for_request_and_watchdog(exchang
 
 
 @pytest.mark.parametrize('damage,code', [('expired', 'host_review_request_expired'), ('frozen_and_expired', 'host_review_request_untrusted')])
-def test_exchange_preserves_bound_first_failure_without_extending_old_request(exchange, monkeypatch, damage, code):
+def test_exchange_preserves_bound_failure_without_extending_old_request(exchange, monkeypatch, damage, code):
     action, _, owner, *_ = exchange
     request = host.publish(action, prompt='Current frozen review.', timeout_seconds=60)
     raw = request.read_bytes()
@@ -64,12 +64,29 @@ def test_exchange_preserves_bound_first_failure_without_extending_old_request(ex
     result = host.await_result(request)
     assert result['status'] == 'failed' and result['error_code'] == 'host_review_exchange_failed'
     assert result['failure_detail_code'] == code and result['failure_recorded'] is True
-    failure = json.loads(host.registry_file(owner).read_text())['first_failure']
-    assert failure['failure_detail_code'] == code and failure['operation'] == 'await_result'
-    assert failure['request_file'] == str(request) and failure['exception_type'] == 'ValueError'
+    registry = json.loads(host.registry_file(owner).read_text())
+    if damage == 'expired':
+        request_id = json.loads(raw)['request_id']
+        failure = registry['request_failures'][request_id]
+        reference = host.failure_reference(action, result)
+        assert reference is not None and host.verified_failure_reference(action, reference) == failure
+        assert failure['failure_detail_code'] == code and failure['request_file'] == str(request)
+        assert 'first_failure' not in registry and registry['state'] == 'open'
+        assert host.runtime_control.stop_requested() is False
+    else:
+        failure = registry['first_failure']
+        assert failure['failure_detail_code'] == code and failure['operation'] == 'await_result'
+        assert failure['request_file'] == str(request) and failure['exception_type'] == 'ValueError'
+        assert not registry.get('request_failures')
+        assert host.runtime_control.stop_requested() is True
     assert request.read_bytes() == raw
     host.await_result(request)
-    assert json.loads(host.registry_file(owner).read_text())['first_failure'] == failure
+    retained = json.loads(host.registry_file(owner).read_text())
+    if damage == 'expired':
+        assert retained['request_failures'][request_id] == failure and 'first_failure' not in retained
+    else:
+        assert retained['first_failure'] == failure
+    assert request.read_bytes() == raw
     assert not host._submission_file(request).exists()
 
 

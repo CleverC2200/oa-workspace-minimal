@@ -44,8 +44,8 @@ def test_every_material_value_and_order_survives_readable_view():
     assert "unknown relationship" in text
 
 
-def files(tmp_path: Path) -> Path:
-    material = {
+def files(tmp_path: Path, material=None) -> Path:
+    material = material if material is not None else {
         "workflow_key": "tpm_small_marketing_fee",
         "prepared": {"images": []},
         "declared_fields": [],
@@ -91,3 +91,30 @@ def test_reader_rejects_different_action_packet(tmp_path):
 
 def test_empty_prepared_mapping_remains_visible():
     assert "[material.prepared]\n{}" in read_material.render({"prepared": {}})
+
+
+def test_reader_labels_source_rows_per_table_without_using_array_position(tmp_path):
+    material = {
+        "workflow_key": "business_entertainment",
+        "declared_fields": [
+            {"path": "main.field[0]", "name": "金额", "value": "120"},
+            {"path": "detail[1].row[2].field[4]", "name": "金额", "value": None},
+            {"path": "detail[1].row[2].field[7]", "name": "金额", "read_status": "unresolved"},
+            {"path": "detail[0].row[0].field[4]", "name": "金额", "value": "120"},
+            {"path": "unknown[7]", "value": "unlocated"},
+        ],
+        "prepared": {"images": [{"path": "page.png", "spreadsheet_cell": "附件!C2"}]},
+    }
+    action = files(tmp_path, material)
+    before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+    view = read_material.read(action)
+    assert view.count("明细表2第3行：detail[1].row[2]") == 1
+    assert "明细表1第1行：detail[0].row[0]" in view
+    assert "零基数组索引，不是明细行号" in view
+    assert "完整字段路径" in view and "标签不证明业务事实" in view
+    assert "引用表单字段时" in view and "其他证据引用按原合同" in view
+    assert view.index("main.field[0]") < view.index("detail[1].row[2].field[4]")
+    assert view.index("detail[1].row[2].field[7]") < view.index("detail[0].row[0].field[4]")
+    assert 'absent=["value"]' in view and "null" in view
+    assert "附件!C2" in view and "unlocated" in view
+    assert before == {p.name: p.read_bytes() for p in tmp_path.iterdir()}

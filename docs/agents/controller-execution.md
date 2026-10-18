@@ -55,6 +55,12 @@ python -B -m apps.oa_finance_preaudit.host_chat_review --operation pending --own
 python -B -m apps.oa_finance_preaudit.host_chat_review --operation assign --owner-task-id <主会话UUID> --request-file <本轮request.json> --slot <0或1或2> --source-session-file <父原生会话jsonl> --source-line <本次followup行>
 ```
 
+财务请求过期时，控制器只在原请求、冻结输入和未写入证据可信后撤销该项授权并隔离；其他槽位按原 FIFO 继续，失败项不在本轮重领。失败槽位仍占用，主线程先中断该原 Agent，再取得失败发生后的原生 `list_agents` 空闲、完成或已中断状态，调用 `release-failed-slot` 验证并释放。只有释放成功才给该槽位下一单。来源、共享身份或未知写入不可信时仍停止整轮。
+
+```bash
+python -B -m apps.oa_finance_preaudit.host_chat_review --operation release-failed-slot --owner-task-id <主会话UUID> --run-id <本轮run_id> --request-file <失败请求绝对路径> --source-session-file <父原生会话jsonl> --source-line <失败后list_agents行>
+```
+
 4. 子 Agent 读取当前请求提示词、规则和冻结材料，形成本单决定或包装草稿。保存只使用专用 `write-draft`，目标必须是尚不存在的私有文件。先在本轮有效控制环境中调用 `host_chat_review.draft_command(Path(request_file), Path(decision_file), payload, owner=owner)`，取得固定发布命令。命令在 `uv run --quiet python -B -m ... --operation write-draft` 前携带 `/usr/bin/env` 及本轮 controller lock、stop file 的绝对路径，使独立原生 exec 使用相同控制目录；仅传这两项路径，核验时须与本轮完全一致。已有原生记录中的规范 bare uv 命令仍可核验。此仓库无 pyproject.toml，不使用会产生项目警告的 no-sync；发布只返回一个 JSON 回执。payload 是审核者形成的原 JSON；不手工拼接 shell 参数，不使用通用写文件脚本，不覆盖已有文件。
 
 将该完整命令用 JSON 字符串字面量填入下方 cmd，再执行一个独立原生 exec。整个调用只含这一条表达式，不附加变量、注释、分支或其他工具。此示例中的占位文字必须替换为 draft_command 返回值，不能照字面执行：

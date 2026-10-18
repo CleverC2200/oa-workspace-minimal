@@ -36,6 +36,7 @@ from apps.oa_finance_preaudit import (
     concurrency_control,
     controller_handoff,
     flow_engine,
+    host_chat_review,
     item_failure,
     observability,
     prepare_failure,
@@ -44,6 +45,7 @@ from apps.oa_finance_preaudit import (
     production_config,
     production_pending,
     reconciliation,
+    review_failure_evidence,
     runtime_maintenance,
     session_alert,
 )
@@ -62,7 +64,7 @@ LiveStatus = Callable[[], dict]
 PipelineRunner = Callable[[int, int], process_pool.PoolResult[dict]]
 ReviewWorker = Callable[[dict], dict]
 ReviewCompleter = Callable[[Path, dict], dict]
-ReviewQuarantine = Callable[[Path, str], dict]
+ReviewQuarantine = Callable[..., dict]
 FailureRoundRecorder = Callable[[Path, str], dict]
 ExecutorFactory = Callable[[int], object]
 
@@ -90,6 +92,7 @@ ITEM_LOCAL_QUARANTINE_REASONS = {
     "codex_review_failed",
     "codex_process_failed",
     "codex_process_incomplete",
+    "host_review_request_expired",
     "material_collection_failed",
 }
 ITEM_LOCAL_REVIEW_FAILURE_REASONS = frozenset(
@@ -652,6 +655,8 @@ def _quarantined_action_matches_selection(
             return False
         return (
             trusted
+            and ((review_failure_evidence.read_receipt(receipt_path) or {}).get("schema_version") != 3
+                 or item_failure.isolated(action_path.parent, state))
             and not receipt_path.is_symlink()
             and action.get("review_failure_fingerprint")
             == state.get("review_failure_fingerprint")
@@ -797,8 +802,8 @@ def _local_quarantined_identities() -> frozenset[tuple[str, str]]:
             state.get("execution_state") == "needs_admin"
             and state.get("write_state") == "not_requested"
             and (
-                reason in {"write_authorization_invalid", *QUARANTINED_REASONS}
-                or (reason == "codex_review_interrupted" and reconciliation._trusted_quarantine(
+                reason in {"write_authorization_invalid", *(QUARANTINED_REASONS - {"codex_review_failed"})}
+                or (reason in {"codex_review_interrupted", "codex_review_failed"} and reconciliation._trusted_quarantine(
                     PROJECT_ROOT / "runtime" / "finance_preaudit_flows", state,
                 ))
             )
@@ -2037,7 +2042,6 @@ def run_adaptive_read_only_probe(
 
 
 def _review_only(task: dict) -> dict:
-    from apps.oa_finance_preaudit import host_chat_review
     if host_chat_review.selected():
         return host_chat_review.review(task)
     return codex_review_worker.review(task)
@@ -2742,44 +2746,46 @@ def _run_dispatched_tasks(
             selection["admission_cutoff"] = admission_deadline.isoformat()
         return selection
 
-    def finish_bounded_review_failure(action_file: Path, value: dict, error_code: str) -> dict:
+    def finish_bounded_review_failure(action_file: Path, value: dict, error_code: str, *, host_reference: dict | None = None) -> dict:
         nonlocal retry_pending_now
-        failure_round = None
-        recorder = record_failure_round or (
-            codex_review_worker.record_production_failure_round
-            if strict_global_fifo and continuous_discovery
-            else None
-        )
-        if recorder is None:
-            review_retry_diagnostics["recorder_missing"] += 1
-        else:
-            try:
-                failure_round = recorder(action_file, error_code).get("production_failure_round")
-            except Exception as error:
-                review_retry_diagnostics["recorder_error"] += 1
-                review_retry_diagnostics[_RECORDER_ERROR_CODES.get(type(error).__name__, "recorder_error_other")] += 1
-            if type(failure_round) is not int or failure_round < 1:
-                if failure_round is not None:
-                    review_retry_diagnostics["recorder_invalid"] += 1
-                failure_round = None
-        if defer_review_failures and failure_round is not None:
-            review_retry_diagnostics["retry_pending"] += 1
-            retry_pending_now = True
-            return {
-                **value, "status": "retry_pending", "execution_state": "review_required",
-                "business_state": "not_available", "write_state": "authorized",
-                "error_code": "codex_review_retry_pending", "production_failure_round": failure_round,
-            }
+        if host_reference is None:
+            failure_round = None
+            recorder = record_failure_round or (
+                codex_review_worker.record_production_failure_round
+                if strict_global_fifo and continuous_discovery
+                else None
+            )
+            if recorder is None:
+                review_retry_diagnostics["recorder_missing"] += 1
+            else:
+                try:
+                    failure_round = recorder(action_file, error_code).get("production_failure_round")
+                except Exception as error:
+                    review_retry_diagnostics["recorder_error"] += 1
+                    review_retry_diagnostics[_RECORDER_ERROR_CODES.get(type(error).__name__, "recorder_error_other")] += 1
+                if type(failure_round) is not int or failure_round < 1:
+                    if failure_round is not None:
+                        review_retry_diagnostics["recorder_invalid"] += 1
+                    failure_round = None
+            if defer_review_failures and failure_round is not None:
+                review_retry_diagnostics["retry_pending"] += 1
+                retry_pending_now = True
+                return {
+                    **value, "status": "retry_pending", "execution_state": "review_required",
+                    "business_state": "not_available", "write_state": "authorized",
+                    "error_code": "codex_review_retry_pending", "production_failure_round": failure_round,
+                }
         try:
-            quarantine = quarantine_review(action_file, error_code)
+            quarantine = (quarantine_review(action_file, error_code, host_failure_reference=host_reference)
+                          if host_reference is not None else quarantine_review(action_file, error_code))
         except Exception:
             quarantine = {}
-        review_retry_diagnostics["isolated"] += 1
         expected_reason = "codex_decision_invalid" if error_code == "codex_decision_invalid" else "codex_review_failed"
         if all(quarantine.get(field) == expected for field, expected in {
             "action": "needs_admin", "execution_state": "needs_admin", "business_state": "not_available",
             "write_state": "not_requested", "reason": expected_reason,
         }.items()):
+            review_retry_diagnostics["isolated"] += 1
             return {
                 **value, "status": "quarantined", "execution_state": "needs_admin",
                 "business_state": "not_available", "write_state": "not_requested", "error_code": error_code,
@@ -3287,16 +3293,17 @@ def _run_dispatched_tasks(
                         failed_now = True
                         first_review_error_code = first_review_error_code or "stop_requested"
                         continue
-                    error_code = str(
-                        value.get("error_code") or "worker_process_failed"
-                    )
-                    bounded_review_failure = (
+                    host_reference = (host_chat_review.failure_reference(action_file, value)
+                                      if value.get("kind") == "preaudit_host_review_result" else None)
+                    error_code = str(value["failure_detail_code"] if host_reference is not None
+                                     else value.get("error_code") or "worker_process_failed")
+                    bounded_review_failure = host_reference is not None or (
                         codex_review_worker.is_bounded_invalid_decision(value)
                         if error_code == "codex_decision_invalid"
                         else codex_review_worker.is_bounded_prewrite_failure(value)
                     )
                     if (
-                        error_code in ITEM_LOCAL_REVIEW_FAILURE_REASONS
+                        host_reference is not None or error_code in ITEM_LOCAL_REVIEW_FAILURE_REASONS
                         or error_code == "codex_process_timeout"
                     ):
                         review_retry_diagnostics["item_local_failure"] += 1
@@ -3304,11 +3311,11 @@ def _run_dispatched_tasks(
                             "bounded" if bounded_review_failure else "unbounded"
                         ] += 1
                     if (
-                        (error_code in ITEM_LOCAL_REVIEW_FAILURE_REASONS
+                        (host_reference is not None or error_code in ITEM_LOCAL_REVIEW_FAILURE_REASONS
                          or error_code == "codex_process_timeout")
                         and bounded_review_failure
                     ):
-                        value = finish_bounded_review_failure(action_file, value, error_code)
+                        value = finish_bounded_review_failure(action_file, value, error_code, host_reference=host_reference)
                         if value.get("status") in {"retry_pending", "quarantined"}:
                             outcomes[index] = process_pool.TaskOutcome(
                                 index=index, status="completed",
