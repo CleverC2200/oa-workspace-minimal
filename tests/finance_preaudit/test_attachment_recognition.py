@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError
 
@@ -72,6 +73,71 @@ def test_direct_api_custom_question_and_duplicate_source_mapping(tmp_path, monke
     assert 'base64' not in json.dumps(report)
     assert 'offline-secret' not in json.dumps(report)
     assert Path(report['report_file']).stat().st_mode & 0o777 == 0o600
+
+
+def test_default_output_records_lifecycle_in_managed_root(tmp_path, monkeypatch):
+    from apps.oa_finance_preaudit import retention
+    fake_api(monkeypatch)
+    root = tmp_path / 'flows'
+    monkeypatch.setenv('OA_FINANCE_PREAUDIT_FLOW_ROOT', str(root))
+    before = datetime.now(timezone.utc)
+
+    report = recognition.recognize(files=[image(tmp_path)])
+
+    assert report['status'] == 'complete'
+    assert Path(report['report_file']).parent.parent == root / '.attachment-recognitions'
+    assert (root / retention.MARKER_NAME).is_file()
+    assert before <= datetime.fromisoformat(report['created_at']) <= datetime.fromisoformat(report['completed_at'])
+    assert report['retention'] == {'scope': 'standalone', 'owner_attempts': []}
+    assert Path(report['report_file']).parent.stat().st_mode & 0o777 == 0o700
+    lifecycle_file = Path(report['report_file']).with_name('retention.json')
+    lifecycle = json.loads(lifecycle_file.read_text())
+    assert lifecycle == {key: report[key] for key in (
+        'schema_version', 'kind', 'report_file', 'created_at', 'completed_at', 'status', 'retention')}
+    assert lifecycle_file.stat().st_size < 64 * 1024
+    assert lifecycle_file.stat().st_mode & 0o777 == 0o600
+    assert 'offline-secret' not in lifecycle_file.read_text()
+
+
+@pytest.mark.parametrize('location', ['custom', 'control/attachment-recognitions/legacy-output'])
+def test_custom_output_is_not_added_to_managed_root(tmp_path, monkeypatch, location):
+    from apps.oa_finance_preaudit import retention, runtime_maintenance
+    fake_api(monkeypatch)
+    root = tmp_path / 'flows'
+    monkeypatch.setenv('OA_FINANCE_PREAUDIT_FLOW_ROOT', str(root))
+    output = tmp_path / location
+    report = recognition.recognize(files=[image(tmp_path)], output_dir=output)
+    assert report['status'] == 'complete'
+    assert not root.exists()
+    assert not (output / 'retention.json').exists()
+    root.mkdir()
+    retention.initialize_root(root)
+    runtime_maintenance.prune(root, now=datetime.fromisoformat(report['completed_at']) + timedelta(days=31))
+    assert (output / 'recognition.json').is_file()
+
+
+@pytest.mark.parametrize('alias', ['direct', 'parent_component', 'symlink'])
+def test_custom_output_refuses_reserved_recognition_namespace(tmp_path, monkeypatch, alias):
+    calls = fake_api(monkeypatch)
+    root = tmp_path / 'flows'
+    reserved = root / '.attachment-recognitions'
+    monkeypatch.setenv('OA_FINANCE_PREAUDIT_FLOW_ROOT', str(root))
+    if alias == 'direct':
+        output = reserved / ('a' * 32)
+    elif alias == 'parent_component':
+        output = root / 'unused' / '..' / '.attachment-recognitions' / ('a' * 32)
+    else:
+        reserved.mkdir(parents=True)
+        link = tmp_path / 'alias'
+        link.symlink_to(reserved, target_is_directory=True)
+        output = link / ('a' * 32)
+
+    with pytest.raises(ValueError, match='^attachment_output_reserved$'):
+        recognition.recognize(files=[image(tmp_path)], output_dir=output)
+
+    assert calls == []
+    assert not output.resolve().exists()
+    assert not list(reserved.glob('*/recognition.json'))
 
 
 def test_pdf_all_pages_are_separate_requests(tmp_path, monkeypatch):
@@ -187,6 +253,7 @@ def test_frozen_action_preserves_page_identity_and_inputs(tmp_path, monkeypatch)
     result = recognition.recognize(action_file=action, prompt='只读里程', output_dir=tmp_path.parent / (tmp_path.name + '-output'))
     assert result['parts'][0]['evidence_ref'] == 'material:prepared.images.trip.1'
     assert result['parts'][0]['owner_detail_id'] == 'row-2'
+    assert result['retention'] == {'scope': 'unmanaged', 'owner_attempts': []}
     assert len(calls) == 1
     assert all(p.read_bytes() == data for p, data in before.items())
 

@@ -1748,3 +1748,301 @@ def test_cli_status_and_prune_share_runtime_contract(tmp_path: Path) -> None:
 
     assert prune_exit == 0
     assert json.loads(prune_stdout.getvalue())["kind"] == "preaudit_prune_receipt"
+
+
+def _recognition_output(root, name, *, age_days=31, status="complete", owners=(), sidecar=True):
+    directory = root / ".attachment-recognitions" / name
+    directory.mkdir(parents=True)
+    created_at = (NOW - timedelta(days=age_days)).isoformat()
+    report = {
+        "schema_version": 1,
+        "kind": "deepseek_attachment_recognition",
+        "report_file": str(directory / "recognition.json"),
+        "created_at": created_at,
+        "completed_at": created_at if status != "running" else None,
+        "status": status,
+        "retention": {
+            "scope": "attempt" if owners else "standalone",
+            "owner_attempts": list(owners),
+        },
+        "parts": [{"answer": "synthetic private transcription"}],
+    }
+    (directory / "recognition.json").write_text(json.dumps(report))
+    if sidecar:
+        (directory / "retention.json").write_text(json.dumps({key: value for key, value in report.items() if key != "parts"}))
+    (directory / "prepared").mkdir()
+    (directory / "prepared" / "page.txt").write_text("synthetic prepared page")
+    return directory
+
+
+def test_prune_recognition_outputs_respects_lifecycle_and_preserves_sources(tmp_path):
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    source = tmp_path / "source.txt"
+    source.write_text("synthetic source must remain")
+    expired = _recognition_output(root, "a" * 32)
+    failed = _recognition_output(root, "b" * 32, status="failed")
+    recent = _recognition_output(root, "c" * 32, age_days=1)
+    running = _recognition_output(root, "d" * 32, status="running")
+    legacy = _recognition_output(root, "e" * 32, sidecar=False)
+    (legacy / "recognition.json").write_text('{"status":"complete"}')
+
+    plan = runtime_maintenance.build_prune_plan(root, now=NOW)
+    assert expired.is_dir(), "planning must remain read-only"
+    receipt = runtime_maintenance.apply_prune_plan(root, plan, now=NOW)
+
+    assert receipt["deleted"] == 2
+    assert not expired.exists() and not failed.exists()
+    assert recent.is_dir() and running.is_dir() and legacy.is_dir()
+    assert source.read_text() == "synthetic source must remain"
+    assert "synthetic private transcription" not in json.dumps(plan)
+
+
+@pytest.mark.parametrize("archived", [False, True])
+def test_prune_recognition_retains_active_unknown_and_missing_owners(tmp_path, archived):
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    expired = _attempt(root, case_key="old", attempt=1, age_days=90, archived=archived)
+    active = _attempt(root, case_key="active", attempt=1, age_days=90,
+                      execution_state="review_required", business_state="not_available")
+    unknown = _attempt(root, case_key="unknown", attempt=1, age_days=90,
+                       write_state="unknown")
+    latest = _attempt(root, case_key="latest", attempt=1, age_days=1)
+    def owner(path):
+        return str(path.relative_to(root)).removeprefix(".archive/")
+    outputs = [
+        _recognition_output(root, str(index) * 32, owners=[owner(path)])
+        for index, path in enumerate((expired, active, unknown, latest), 1)
+    ]
+    missing = _recognition_output(root, "5" * 32,
+        owners=["travel_expense/cases/" + "f" * 64 + "/attempt-1"])
+
+    receipt = runtime_maintenance.prune(root, now=NOW)
+
+    assert receipt["status"] == "ok"
+    assert not expired.exists() and not outputs[0].exists()
+    assert all(path.is_dir() for path in (*outputs[1:], missing, active, unknown, latest))
+
+
+@pytest.mark.parametrize("status,age_days", [("running", 90), ("complete", 1)])
+def test_recent_or_running_recognition_pins_owner_and_related_reports(tmp_path, status, age_days):
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    owner = _attempt(root, case_key="old", attempt=1, age_days=90)
+    _attempt(root, case_key="latest", attempt=1, age_days=1)
+    relative = str(owner.relative_to(root))
+    pending = _recognition_output(root, "1" * 32, owners=[relative],
+                                  status=status, age_days=age_days)
+    old = _recognition_output(root, "2" * 32, owners=[relative])
+
+    runtime_maintenance.prune(root, now=NOW)
+
+    assert owner.is_dir() and pending.is_dir() and old.is_dir()
+
+
+@pytest.mark.parametrize("damage", ["metadata", "future", "owner_path", "report_symlink", "page_symlink", "fifo"])
+def test_prune_preserves_untrusted_recognition_output(tmp_path, damage):
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    directory = _recognition_output(root, "a" * 32)
+    report_file = directory / ("recognition.json" if damage in {"report_symlink", "fifo"} else "retention.json")
+    report = json.loads(report_file.read_text())
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps(report))
+    if damage == "metadata":
+        report.pop("retention")
+    elif damage == "future":
+        report["completed_at"] = (NOW + timedelta(days=1)).isoformat()
+    elif damage == "owner_path":
+        report["retention"] = {"scope": "attempt", "owner_attempts": ["../outside"]}
+    elif damage == "report_symlink":
+        report_file.unlink()
+        report_file.symlink_to(outside)
+    elif damage == "page_symlink":
+        (directory / "prepared" / "external").symlink_to(outside)
+    elif damage == "fifo":
+        report_file.unlink()
+        os.mkfifo(report_file)
+    if damage not in {"report_symlink", "fifo"}:
+        report_file.write_text(json.dumps(report))
+
+    receipt = runtime_maintenance.prune(root, now=NOW)
+
+    assert receipt["deleted"] == 0
+    assert directory.is_dir() and outside.is_file()
+
+
+def test_prune_rejects_recognition_that_becomes_active_after_planning(tmp_path):
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    directory = _recognition_output(root, "a" * 32)
+    plan = runtime_maintenance.build_prune_plan(root, now=NOW)
+    report_file = directory / "retention.json"
+    report = json.loads(report_file.read_text())
+    report.update(status="running", completed_at=None)
+    report_file.write_text(json.dumps(report))
+
+    with pytest.raises(ValueError, match="retention_plan_invalid"):
+        runtime_maintenance.apply_prune_plan(root, plan, now=NOW)
+
+    assert directory.is_dir()
+
+
+@pytest.mark.parametrize("damage", ["missing", "malformed", "oversized", "unmanaged"])
+def test_unreadable_recognition_sidecar_pins_active_and_archived_attempts(tmp_path, damage):
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    active = _attempt(root, case_key="old", attempt=1, age_days=90)
+    archived = _attempt(root, case_key="archived", attempt=1, age_days=90, archived=True)
+    latest = _attempt(root, case_key="latest", attempt=1, age_days=1)
+    directory = _recognition_output(root, "a" * 32, owners=[str(active.relative_to(root))])
+    sidecar = directory / "retention.json"
+    if damage == "missing":
+        sidecar.unlink()
+    elif damage == "unmanaged":
+        lifecycle = json.loads(sidecar.read_text())
+        lifecycle["retention"]["scope"] = "unmanaged"
+        sidecar.write_text(json.dumps(lifecycle))
+    else:
+        sidecar.write_bytes(b"{" if damage == "malformed" else b" " * (64 * 1024 + 1))
+
+    plan = runtime_maintenance.build_prune_plan(root, now=NOW)
+    receipt = runtime_maintenance.apply_prune_plan(root, plan, now=NOW)
+
+    assert receipt["deleted"] == receipt["archived"] == 0
+    assert all(path.is_dir() for path in (active, archived, latest, directory))
+    by_path = {row["relative_path"]: row for row in plan["actions"]}
+    assert all(by_path[str(path.relative_to(root))]["reason"] == "recognition_evidence_retained"
+               for path in (active, archived))
+
+
+@pytest.mark.parametrize("status", ["running", "complete"])
+def test_large_recognition_body_uses_bounded_sidecar_for_source_retention(tmp_path, monkeypatch, status):
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    owner = _attempt(root, case_key="old", attempt=1, age_days=90)
+    _attempt(root, case_key="latest", attempt=1, age_days=1)
+    directory = _recognition_output(root, "a" * 32, status=status, owners=[str(owner.relative_to(root))])
+    report_file = directory / "recognition.json"
+    with report_file.open("wb") as output:
+        output.write(b'{"status":"complete","parts":[{"answer":"')
+        for _ in range(33):
+            output.write(b"x" * (1024 * 1024))
+        output.write(b'"}]}')
+    assert report_file.stat().st_size > 32 * 1024 * 1024
+    read = runtime_maintenance.runtime_control.read_control_bytes
+    limits = []
+
+    def bounded_read(path, **kwargs):
+        assert Path(path).name != "recognition.json", "prune must not parse the unbounded transcription body"
+        if Path(path).name == "retention.json":
+            limits.append(kwargs["max_bytes"])
+        return read(path, **kwargs)
+
+    monkeypatch.setattr(runtime_maintenance.runtime_control, "read_control_bytes", bounded_read)
+
+    receipt = runtime_maintenance.prune(root, now=NOW)
+
+    assert receipt["status"] == "ok"
+    assert limits and set(limits) == {64 * 1024}
+    assert owner.exists() == directory.exists() == (status == "running")
+
+
+@pytest.mark.parametrize("stage", ["initial", "terminal"])
+def test_recognition_interrupted_before_sidecar_write_preserves_evidence(tmp_path, monkeypatch, stage):
+    from apps.oa_approval import attachment_recognition
+
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    owner = _attempt(root, case_key="old", attempt=1, age_days=90)
+    archived = _attempt(root, case_key="archived", attempt=1, age_days=90, archived=True)
+    _attempt(root, case_key="latest", attempt=1, age_days=1)
+    source = owner / "source.txt"
+    source.write_text("synthetic source must remain")
+    monkeypatch.setenv("OA_FINANCE_PREAUDIT_FLOW_ROOT", str(root))
+    monkeypatch.setattr(attachment_recognition, "_api_key", lambda: "offline-secret")
+    calls = []
+
+    def post(body, **_kwargs):
+        calls.append(body)
+        return {"choices": [{"finish_reason": "stop", "message": {"content": "synthetic answer"}}]}
+
+    monkeypatch.setattr(attachment_recognition, "_post", post)
+    write = attachment_recognition.runtime_control.write_control_bytes_atomic
+
+    def crash_before_sidecar(path, payload):
+        if Path(path).name == "retention.json":
+            lifecycle = json.loads(payload)
+            if stage == "initial" or lifecycle["status"] == "complete":
+                raise SystemExit("sidecar_not_persisted")
+        return write(path, payload)
+
+    monkeypatch.setattr(attachment_recognition.runtime_control, "write_control_bytes_atomic", crash_before_sidecar)
+    with pytest.raises(SystemExit, match="sidecar_not_persisted"):
+        attachment_recognition.recognize(files=[source])
+    reports = list((root / ".attachment-recognitions").glob("*/recognition.json"))
+    assert len(reports) == 1
+    report_file = reports[0]
+    report = json.loads(report_file.read_text())
+    assert report["status"] == ("running" if stage == "initial" else "complete")
+    sidecar = report_file.with_name("retention.json")
+    if stage == "initial":
+        assert not sidecar.exists()
+    else:
+        assert json.loads(sidecar.read_text())["status"] == "running"
+
+    receipt = runtime_maintenance.prune(root, now=datetime.now(timezone.utc) + timedelta(days=31))
+
+    assert receipt["status"] == "ok"
+    assert source.read_text() == "synthetic source must remain"
+    assert report_file.is_file()
+    assert archived.exists() == (stage == "initial")
+    assert len(calls) == (0 if stage == "initial" else 1)
+
+
+def test_recognition_registers_owner_before_request_and_expires_with_it(tmp_path, monkeypatch):
+    import fitz
+    from apps.oa_approval import attachment_recognition
+
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    owner = _attempt(root, case_key="old", attempt=1, age_days=90)
+    _attempt(root, case_key="latest", attempt=1, age_days=1)
+    source = owner / "page.png"
+    pixmap = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 8, 8), False)
+    pixmap.clear_with(255)
+    pixmap.save(source)
+    monkeypatch.setenv("OA_FINANCE_PREAUDIT_FLOW_ROOT", str(root))
+    monkeypatch.setattr(attachment_recognition, "_api_key", lambda: "offline-secret")
+    calls = []
+
+    def post(body, **_kwargs):
+        reports = list((root / ".attachment-recognitions").glob("*/recognition.json"))
+        assert len(reports) == 1
+        running = json.loads(reports[0].with_name("retention.json").read_text())
+        assert running["status"] == "running"
+        assert running["retention"]["owner_attempts"] == [str(owner.relative_to(root))]
+        runtime_maintenance.prune(root)
+        assert source.is_file()
+        calls.append(body)
+        return {"choices": [{"finish_reason": "stop", "message": {"content": "synthetic answer"}}]}
+
+    monkeypatch.setattr(attachment_recognition, "_post", post)
+    report = attachment_recognition.recognize(files=[source])
+    output = Path(report["report_file"]).parent
+
+    assert report["status"] == "complete" and len(calls) == 1
+    assert source.is_file() and output.is_dir()
+    after_retention = datetime.fromisoformat(report["completed_at"]) + timedelta(days=31)
+    receipt = runtime_maintenance.prune(root, now=after_retention)
+    assert receipt["status"] == "ok"
+    assert not output.exists() and not owner.exists()

@@ -10,9 +10,10 @@ import os
 from pathlib import Path
 import re
 import secrets
+import stat
 from zoneinfo import ZoneInfo
 
-from apps.oa_approval import writer_outcomes
+from apps.oa_approval import runtime_control, writer_outcomes
 
 from . import item_failure, observability, retention, review_failure_evidence
 
@@ -50,7 +51,8 @@ _MANAGED_PATH = re.compile(
     r"business_support_fee|small_marketing_fee|tpm_small_marketing_fee|general_expense|"
     r"packaging_layout_approval)/"
     r"cases/[0-9a-f]{64}/attempt-[1-9][0-9]*|"
-    r"\.metrics/daily/[0-9]{4}-[0-9]{2}-[0-9]{2}\.json)$"
+    r"\.metrics/daily/[0-9]{4}-[0-9]{2}-[0-9]{2}\.json|"
+    r"\.attachment-recognitions/[0-9a-f]{32})$"
 )
 _PLAN_MAX_AGE = timedelta(minutes=5)
 _DAILY_RETENTION_DAYS = 180
@@ -1207,6 +1209,102 @@ def _plan_fingerprint(plan: dict) -> str:
     return f"sha256:{hashlib.sha256(raw).hexdigest()}"
 
 
+def _recognition_actions(root: Path, attempt_actions: list[dict], *,
+                         now: datetime, cutoff: datetime) -> list[dict]:
+    base = root / ".attachment-recognitions"
+    if base.is_symlink():
+        raise ValueError("runtime_path_symlink")
+    if not base.is_dir():
+        return []
+    owners_by_path: dict[str, list[dict]] = {}
+    for action in attempt_actions:
+        key = action["relative_path"].removeprefix(".archive/")
+        owners_by_path.setdefault(key, []).append(action)
+    records = []
+    pinned = set()
+    for directory in sorted(base.iterdir()):
+        if not re.fullmatch(r"[0-9a-f]{32}", directory.name):
+            continue
+        if directory.is_symlink():
+            raise ValueError("runtime_path_symlink")
+        if not directory.is_dir():
+            continue
+        owner_paths = []
+        binding_valid = False
+        reason = "state_invalid"
+        try:
+            report_file = directory / "recognition.json"
+            lifecycle_file = directory / "retention.json"
+            if any(not stat.S_ISREG(path.lstat().st_mode) for path in (report_file, lifecycle_file)):
+                raise ValueError("recognition_file_invalid")
+            raw = runtime_control.read_control_bytes(lifecycle_file, max_bytes=64 * 1024)
+            report = json.loads(raw) if raw is not None else None
+            if (not isinstance(report, dict) or report.get("schema_version") != 1
+                    or set(report) != {"schema_version", "kind", "report_file", "created_at",
+                                       "completed_at", "status", "retention"}
+                    or report.get("kind") != "deepseek_attachment_recognition"
+                    or report.get("report_file") != str(report_file)):
+                raise ValueError("recognition_state_invalid")
+            binding = report.get("retention")
+            if (not isinstance(binding, dict) or set(binding) != {"scope", "owner_attempts"}
+                    or binding["scope"] not in {"standalone", "attempt", "unmanaged"}
+                    or not isinstance(binding["owner_attempts"], list)):
+                raise ValueError("recognition_state_invalid")
+            for owner in binding["owner_attempts"]:
+                if (not isinstance(owner, str) or not _MANAGED_PATH.fullmatch(owner)
+                        or owner.startswith(".") or owner in owner_paths):
+                    raise ValueError("recognition_owner_invalid")
+                owner_paths.append(owner)
+            scope = binding["scope"]
+            if ((scope == "standalone" and owner_paths)
+                    or (scope == "attempt" and not owner_paths)):
+                raise ValueError("recognition_owner_invalid")
+            binding_valid = scope != "unmanaged"
+            if any(path.is_symlink() for path in directory.rglob("*")):
+                raise ValueError("recognition_path_symlink")
+            created_at = _timestamp(report.get("created_at"))
+            if created_at > now:
+                raise ValueError("recognition_time_invalid")
+            if scope == "unmanaged":
+                reason = "owner_unverified"
+            elif report.get("status") == "running":
+                reason = "not_closed"
+            elif report.get("status") in {"complete", "failed"}:
+                completed_at = _timestamp(report.get("completed_at"))
+                if not created_at <= completed_at <= now:
+                    raise ValueError("recognition_time_invalid")
+                reason = "expired" if completed_at < cutoff else "within_retention"
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError):
+            reason = "state_invalid"
+        if not binding_valid:
+            # Unknown ownership must not silently unpin a source attempt.
+            pinned.update(owners_by_path)
+        if reason != "expired":
+            pinned.update(owner_paths)
+        relative_path = str(directory.relative_to(root))
+        records.append((relative_path, owner_paths, reason))
+
+    # A new or unfinished recognition must not lose its source attempt first.
+    for owner in pinned:
+        for action in owners_by_path.get(owner, []):
+            if action["action"] in {"archive_path", "delete_path"}:
+                action.update(action="keep", reason="recognition_evidence_retained")
+    actions = []
+    for relative_path, owner_paths, reason in records:
+        if reason == "expired" and owner_paths:
+            owner_actions = [owners_by_path.get(owner, []) for owner in owner_paths]
+            if any(len(matches) != 1 or matches[0]["action"] != "delete_path"
+                   for matches in owner_actions):
+                reason = "owner_retained"
+        actions.append({
+            "key": hashlib.sha256(relative_path.encode("utf-8")).hexdigest(),
+            "action": "delete_path" if reason == "expired" else "keep",
+            "reason": reason,
+            "relative_path": relative_path,
+        })
+    return actions
+
+
 def build_prune_plan(
     root: Path,
     *,
@@ -1315,6 +1413,8 @@ def build_prune_plan(
             }
         )
 
+    actions.extend(_recognition_actions(runtime_root, actions, now=current_time, cutoff=cutoff))
+
     daily_cutoff = current_time.astimezone(_LOCAL_TIMEZONE).date() - timedelta(
         days=_DAILY_RETENTION_DAYS
     )
@@ -1389,7 +1489,7 @@ def _validated_plan(plan: object) -> list[retention.RetentionAction]:
             or not _MANAGED_PATH.fullmatch(item["relative_path"])
             or (
                 item.get("action") == "archive_path"
-                and item["relative_path"].startswith((".archive/", ".metrics/"))
+                and item["relative_path"].startswith((".archive/", ".metrics/", ".attachment-recognitions/"))
             )
             or item["key"] in keys
             or item["relative_path"] in paths

@@ -2010,6 +2010,7 @@ def _validate_review_decision(action: dict, packet: dict, quality_material: dict
     if decision["overall"] != expected_overall:
         raise decision_validation.InvalidDecision("overall_mismatch")
 
+    decision["items"] = normalized_items
     return _ValidatedReviewDecision(
         decision, normalized_items, needs_human, covered_page_count, total_page_count,
         routed_resource_refs, packaging_excel_notice, packaging_visual_outcome,
@@ -2341,6 +2342,12 @@ class FlowEngine:
             "material_fingerprint": state.get("material_fingerprint"),
             "evidence_fingerprint": state.get("evidence_fingerprint"),
         }
+        try:
+            review_binding = submission.review_decision_binding(state)
+        except ValueError as error:
+            raise ValueError("execution_receipt_invalid") from error
+        expected_fields.update(review_binding)
+        identity.update(review_binding)
         if (
             state.get("mode") == "preview"
             and receipt.get("no_write_evidence") != "confirmed_no_write"
@@ -2375,6 +2382,15 @@ class FlowEngine:
             attempt_root / "review-decision.json",
             code="execution_receipt_invalid",
         )
+        envelope = _read_object(attempt_root / "submission-envelope.json", code="execution_receipt_invalid")
+        try:
+            if submission.review_decision_binding(envelope) != review_binding or (
+                review_binding and submission.fingerprint(decision)
+                != review_binding[submission.REVIEW_BINDING]["normalized_fingerprint"]
+            ):
+                raise ValueError("execution_receipt_invalid")
+        except ValueError as error:
+            raise ValueError("execution_receipt_invalid") from error
         expected_business_state = {
             "pass": "pass",
             "needs_human": "needs_human",
@@ -2495,6 +2511,7 @@ class FlowEngine:
                 "envelope_fingerprint": receipt["envelope_fingerprint"],
                 "receipt_fingerprint": _file_fingerprint(receipt_file),
                 "submission_token_sha256": receipt["submission_token_sha256"],
+                **submission.review_decision_binding(state),
                 **({"company_comparison_contract_version": state["company_comparison_contract_version"]}
                    if "company_comparison_contract_version" in state else {}),
             },
@@ -2578,10 +2595,15 @@ class FlowEngine:
         return self._persist_receipt_completion(action_path, state, receipt)
 
     @staticmethod
-    def _require_same_decision(decision_file: Path, stored_file: Path) -> None:
-        incoming = _read_object(decision_file, code="review_decision_unreadable")
+    def _require_same_decision(incoming: dict, stored_file: Path, state: dict, *, recovered: bool = False) -> None:
         stored = _read_object(stored_file, code="review_decision_conflict")
-        if incoming != stored:
+        binding = submission.review_decision_binding(state).get(submission.REVIEW_BINDING)
+        if binding is not None:
+            expected_input = binding["normalized_fingerprint" if recovered else "input_fingerprint"]
+            if (submission.fingerprint(incoming) != expected_input
+                    or submission.fingerprint(stored) != binding["normalized_fingerprint"]):
+                raise ValueError("review_decision_conflict")
+        elif incoming != stored:
             raise ValueError("review_decision_conflict")
 
     def _recover_before_discovery(
@@ -4390,8 +4412,9 @@ class FlowEngine:
             recovered = self._recover_completion(action_path.parent, persisted_state)
             if recovered.get("action") == "closed":
                 self._require_same_decision(
-                    decision_file,
+                    _read_object(decision_file, code="review_decision_unreadable"),
                     action_path.with_name("review-decision.json"),
+                    persisted_state,
                 )
             return recovered
         try:
@@ -4504,6 +4527,18 @@ class FlowEngine:
                 "observability_incomplete",
             )
         decision = _read_object(decision_file, code="review_decision_unreadable")
+        input_fingerprint = submission.fingerprint(decision)
+        review_binding = submission.review_decision_binding(state)
+        stored_decision = action_path.with_name("review-decision.json")
+        if stored_decision.exists():
+            self._require_same_decision(
+                decision, stored_decision, state, recovered=recovered_submission_result is not None,
+            )
+        elif review_binding and (
+            input_fingerprint != review_binding[submission.REVIEW_BINDING]["input_fingerprint"]
+            or recovered_submission_result is not None
+        ):
+            raise ValueError("review_decision_conflict")
         is_handoff = decision.get("kind") == manual_handoff.KIND
         packaging_supplementary_line: str | None = None
         if is_handoff:
@@ -4540,9 +4575,20 @@ class FlowEngine:
             packaging_visual_outcome = validated.packaging_visual_outcome
             packaging_supplementary_line = validated.packaging_supplementary_line
 
-        stored_decision = action_path.with_name("review-decision.json")
+        normalized_fingerprint = submission.fingerprint(decision)
+        if review_binding:
+            if normalized_fingerprint != review_binding[submission.REVIEW_BINDING]["normalized_fingerprint"]:
+                raise ValueError("review_decision_conflict")
+        elif not stored_decision.exists():
+            review_binding = {submission.REVIEW_BINDING: {
+                "version": 1, "input_fingerprint": input_fingerprint,
+                "normalized_fingerprint": normalized_fingerprint,
+            }}
+            state = {**state, **review_binding}
+            json_artifact.write_json_atomic(Path(action["state_file"]), state, indent=2)
         if stored_decision.exists():
-            self._require_same_decision(decision_file, stored_decision)
+            if _read_object(stored_decision, code="review_decision_conflict") != decision:
+                raise ValueError("review_decision_conflict")
         else:
             json_artifact.write_json_atomic(stored_decision, decision, indent=2)
 
@@ -4780,6 +4826,7 @@ class FlowEngine:
                 "receipt_fingerprint": _file_fingerprint(receipt_file),
                 "no_write_evidence": receipt["no_write_evidence"],
                 "submission_token_sha256": receipt["submission_token_sha256"],
+                **review_binding,
                 **({"company_comparison_contract_version": state["company_comparison_contract_version"]}
                    if "company_comparison_contract_version" in state else {}),
             },
