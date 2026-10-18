@@ -2999,6 +2999,8 @@ class FlowEngine:
         if path.parent not in reader._latest_case_attempts(reader._root / workflow):
             raise ValueError("production_target_action_stale")
         state = _read_object(path.with_name("state.json"), code="production_target_action_invalid")
+        if not reader._attempt_identity_matches(path.parent, state, require_material=False):
+            raise ValueError("production_target_action_invalid")
         if recovery:
             if not cls.recoverable_no_write(reader._root, path):
                 raise ValueError("production_target_recovery_invalid")

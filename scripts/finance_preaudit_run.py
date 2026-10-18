@@ -149,17 +149,90 @@ def _skip_verification(payload: dict, receipt: dict) -> dict:
             "run_id": payload.get("run_id"), "blocked_until": payload.get("blocked_until")}
 
 
-def _target_outcome(payload: object, *, terminal: bool, completed: bool) -> dict:
+def _target_arguments(command: Sequence[str]):
+    if list(command[1:3]) != ["-m", "scripts.finance_preaudit_concurrency_probe"]:
+        return None
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--targets-only", action="store_true")
+    parser.add_argument("--resume-action-file", action="append", type=Path, default=[])
+    parser.add_argument("--recover-action-file", action="append", type=Path, default=[])
+    parser.add_argument("--workflow", action="append", default=[])
     try:
-        if (not terminal or not isinstance(payload, dict) or payload.get("kind") not in {
+        args, _rest = parser.parse_known_args(command[3:])
+    except SystemExit as error:
+        raise ValueError("controller_execution_target_binding_invalid") from error
+    return args if args.targets_only else None
+
+
+def _bind_target_execution(command: Sequence[str], receipt: dict) -> dict | None:
+    args = _target_arguments(command)
+    if args is None:
+        return None
+    root = Path(os.environ.get("OA_FINANCE_PREAUDIT_FLOW_ROOT") or PROJECT_ROOT / "runtime/finance_preaudit_flows")
+    targets = target_scope.TargetScope.bind(root, resume=args.resume_action_file, recover=args.recover_action_file,
+                                          workflows=frozenset(args.workflow or production_config.FINANCE_WORKFLOWS))
+    revision, _dirty = controller_handoff._code_state()
+    return {"owner_task_id": receipt["owner_task_id"], "invocation_id": receipt["invocation_id"],
+            "command": list(command), "flow_root": str(targets.root),
+            "source": {"module": "scripts.finance_preaudit_concurrency_probe", "code_revision": revision,
+                       "sha256": hashlib.sha256((PROJECT_ROOT / "scripts/finance_preaudit_concurrency_probe.py").read_bytes()).hexdigest()},
+            "outcome": targets.outcome({}, controller_completed=False)}
+
+
+def _bound_target_outcome(receipt: dict) -> dict | None:
+    binding = receipt.get("target_binding")
+    if binding is None:
+        return None
+    try:
+        if (not isinstance(binding, dict)
+                or set(binding) != {"owner_task_id", "invocation_id", "command", "flow_root", "source", "outcome"}
+                or any(binding[key] != receipt[key] for key in ("owner_task_id", "invocation_id"))
+                or not isinstance(binding["command"], list)
+                or any(not isinstance(arg, str) for arg in binding["command"])
+                or not isinstance(binding["source"], dict)
+                or binding["source"].get("module") != "scripts.finance_preaudit_concurrency_probe"
+                or controller_handoff._REVISION.fullmatch(str(binding["source"].get("code_revision", ""))) is None
+                or re.fullmatch(r"[0-9a-f]{64}", str(binding["source"].get("sha256", ""))) is None):
+            raise ValueError("controller_execution_target_binding_invalid")
+        args = _target_arguments(binding["command"])
+        root = Path(binding["flow_root"])
+        if args is None or not root.is_absolute():
+            raise ValueError("controller_execution_target_binding_invalid")
+        expected = set()
+        for operation, paths in (("resume", args.resume_action_file), ("recover", args.recover_action_file)):
+            for raw in paths:
+                path = raw.expanduser()
+                parts = path.relative_to(root).parts
+                if (not path.is_absolute() or len(parts) != 5 or parts[1] != "cases" or parts[4] != "action.json"
+                        or re.fullmatch(r"attempt-[1-9][0-9]*", parts[3]) is None):
+                    raise ValueError("controller_execution_target_binding_invalid")
+                expected.add((parts[0], parts[2], int(parts[3][8:]), operation))
+        outcome = target_scope.validate_outcome(binding["outcome"])
+        actual = {(row["workflow_key"], row["item_key"], row["source_attempt"], row["operation"]) for row in outcome["items"]}
+        if (not expected or expected != actual or outcome["status"] != "blocked" or outcome["completed"] != 0
+                or any(row["outcome"] != "unresolved" for row in outcome["items"])):
+            raise ValueError("controller_execution_target_binding_invalid")
+        return outcome
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("controller_execution_target_binding_invalid") from error
+
+
+def _target_outcome(payload: object, *, terminal: bool, completed: bool, bound: dict | None = None) -> dict:
+    try:
+        if (bound is None or not terminal or not isinstance(payload, dict) or payload.get("kind") not in {
                 "preaudit_production_rolling_drain", "preaudit_production_concurrency_probe_failed"}):
             raise ValueError("production_target_outcome_unverified")
         outcome = target_scope.validate_outcome(payload.get("target_outcome"))
+        if bound is not None:
+            actual = {(row["workflow_key"], row["item_key"], row["source_attempt"], row["operation"]) for row in outcome["items"]}
+            expected = {(row["workflow_key"], row["item_key"], row["source_attempt"], row["operation"]) for row in bound["items"]}
+            if actual != expected:
+                raise ValueError("production_target_outcome_unverified")
         if not completed:
             outcome["status"] = "blocked"
         return outcome
     except (TypeError, ValueError):
-        return {"status": "blocked", "reason": "production_target_outcome_unverified"}
+        return bound if bound is not None else {"status": "blocked", "reason": "production_target_outcome_unverified"}
 
 
 def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str,
@@ -177,6 +250,7 @@ def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str
                 or receipt.get("owner_task_id") != owner_task_id or receipt.get("invocation_id") != invocation_id
                 or receipt.get("state") not in {"starting", "waiting", "exited", "start_failed"}):
             raise ValueError("controller_execution_identity_mismatch")
+        bound_targets = _bound_target_outcome(receipt)
         started = _timestamp(receipt["started_at"])
         if (started > datetime.now(timezone.utc)
                 or (receipt.get("children_reaped") != "unknown" and type(receipt.get("children_reaped")) is not bool)
@@ -308,12 +382,14 @@ def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str
                     verified = _verified_skip(payload)
                 if verified:
                     report.update(status="skipped", terminal=True)
+                    if bound_targets is not None and controller_handoff._RUN_ID.fullmatch(str(payload.get("run_id", ""))):
+                        report["blocking_run_id"] = payload["run_id"]
             try:
                 payload = json.loads(logs["stdout.log"] or b"null")
             except (TypeError, ValueError):
                 payload = None
             if "target_outcome" in receipt or isinstance(payload, dict) and "target_outcome" in payload:
-                target = _target_outcome(payload, terminal=report["terminal"], completed=report["status"] == "completed")
+                target = _target_outcome(payload, terminal=report["terminal"], completed=report["status"] == "completed", bound=bound_targets)
                 if receipt.get("target_outcome") != target:
                     raise ValueError("controller_execution_target_outcome_mismatch")
                 report["target_outcome"] = target
@@ -477,6 +553,9 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str,
         "review_configuration": host_chat_review.settings(),
         "tool_session_file": str(directory / "tool-session.json"),
     }
+    target_binding = _bind_target_execution(command, receipt)
+    if target_binding is not None:
+        receipt["target_binding"] = target_binding
     old_umask = os.umask(0o077)
     process = None
     handlers = {}
@@ -639,10 +718,10 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str,
             payload = json.loads(runtime_control.read_control_bytes(directory / "stdout.log") or b"null")
         except (OSError, RuntimeError, TypeError, ValueError):
             payload = None
-        if "--targets-only" in command or isinstance(payload, dict) and "target_outcome" in payload:
+        if target_binding is not None or "--targets-only" in command or isinstance(payload, dict) and "target_outcome" in payload:
             receipt["target_outcome"] = _target_outcome(
                 payload, terminal=bool(matched and receipt["state"] == "exited" and receipt["children_reaped"] is True),
-                completed=receipt["result"] == "completed",
+                completed=receipt["result"] == "completed", bound=_bound_target_outcome(receipt),
             )
         persist()
         return {**receipt, "receipt_file": str(receipt_file)}
@@ -731,10 +810,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 original=maintenance_runtime.OriginalExecution(args.original_receipt_file,
                     str(args.original_owner_task_id), args.original_tool_session_id))
         with scope:
-            if configuration.get("transport") == "host_chat":
+            targeted = _target_arguments([sys.executable, "-m", "scripts.finance_preaudit_concurrency_probe", *arguments]) is not None
+            gate = approval_lifecycle.startup(PROJECT_ROOT) if targeted else None
+            if configuration.get("transport") == "host_chat" and (gate is None or gate["status"] == "ready"):
                 host_chat_review.assert_previous_rounds_closed(owner=str(args.owner_task_id))
-            gate = approval_lifecycle.startup(PROJECT_ROOT)
-            if gate["status"] != "ready":
+            gate = gate or approval_lifecycle.startup(PROJECT_ROOT)
+            if gate["status"] != "ready" and not targeted:
                 print(json.dumps({"schema_version": 1, "kind": "approval_startup_gate", **gate}, sort_keys=True))
                 return 0 if gate["status"] == "skipped" else 1
             directory = invocation_directory

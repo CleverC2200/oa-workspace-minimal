@@ -144,7 +144,9 @@ class TargetScope:
                         blocked = True
                 elif category == "handled_not_pending":
                     no_write_state = (state["execution_state"], state["write_state"], state["business_state"]) in _NO_WRITE_STATES
-                    if (no_write_state and (FlowEngine.resumable_review(self.root, state)
+                    if matches[0].get("handled_version_verified") is not True:
+                        item["reason"] = "target_handled_version_unverified"
+                    elif (no_write_state and (FlowEngine.resumable_review(self.root, state)
                             or FlowEngine.recoverable_no_write(self.root, attempt / "action.json"))):
                         item.update(outcome="confirmed_no_resubmit", reason="handled_not_pending", evidence_verified=True)
                     else:
@@ -180,7 +182,7 @@ def validate_outcome(value: object) -> dict:
                    "execution_state", "business_state", "write_state", "outcome", "reason", "evidence_verified"}
     reasons = {"target_evidence_unavailable", "production_target_action_changed", "target_write_state_unresolved",
                "target_submission_unverified", "target_no_write_unverified", "handled_not_pending", "target_not_visible",
-               "review_retry_pending", "target_not_closed", "target_identity_conflict"}
+               "review_retry_pending", "target_not_closed", "target_identity_conflict", "target_handled_version_unverified"}
     keys = set()
     completed = 0
     for row in value["items"]:

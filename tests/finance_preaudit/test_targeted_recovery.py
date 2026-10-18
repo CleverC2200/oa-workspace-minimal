@@ -158,11 +158,14 @@ def test_targeted_run_recovers_isolation_and_resumes_open_attempt(tmp_path, monk
 
 
 
-def test_supervisor_keeps_partial_delivery_separate_from_process_completion(tmp_path):
+def test_supervisor_keeps_partial_delivery_separate_from_process_completion(tmp_path, monkeypatch):
     import sys
     from uuid import uuid4
     from scripts.finance_preaudit_run import supervise
 
+    from scripts import finance_preaudit_run as supervisor
+    env = RepairEnvironment(tmp_path, monkeypatch)
+    selected = [env.seed("selected-a", 8), env.seed("selected-b", 9)]
     code = f'''import json
 from pathlib import Path
 import pytest
@@ -181,7 +184,17 @@ patch.setattr(runtime_doctor.attachments, "rpa_web_session_status", lambda: {{
 raise SystemExit(controller.main(["--rolling", "--capacity", "2", "--confirm-write", "YES", "--targets-only",
     "--resume-action-file", str(a), "--resume-action-file", str(b)]))
 '''
-    receipt = supervise([sys.executable, "-c", code], directory=tmp_path / "control/executions" / uuid4().hex, owner_task_id=str(uuid4()))
+    original_popen = supervisor.subprocess.Popen
+    def recorded_controller(command, **kwargs):
+        if list(command[1:3]) == ["-m", "scripts.finance_preaudit_concurrency_probe"]:
+            command = [sys.executable, "-c", code]
+        return original_popen(command, **kwargs)
+    monkeypatch.setattr(supervisor.subprocess, "Popen", recorded_controller)
+    monkeypatch.setattr(supervisor.approval_guard, "observe_project_errors", lambda _: None)
+    command = [sys.executable, "-m", "scripts.finance_preaudit_concurrency_probe", "--rolling",
+               "--capacity", "2", "--confirm-write", "YES", "--targets-only",
+               "--resume-action-file", str(selected[0]), "--resume-action-file", str(selected[1])]
+    receipt = supervise(command, directory=tmp_path / "control/executions" / uuid4().hex, owner_task_id=str(uuid4()))
     assert receipt["result"] == "completed"
     assert receipt["exit_code"] == 0 and receipt["children_reaped"] is True
     assert receipt["target_outcome"]["status"] == "partial"
@@ -476,7 +489,7 @@ def test_existing_global_start_gates_still_block_targets(tmp_path, monkeypatch, 
 
 
 
-@pytest.mark.parametrize("damage", ["counter", "extra", "identity", "state", "attempt", "external_state"])
+@pytest.mark.parametrize("damage", ["counter", "extra", "identity", "state", "attempt", "external_state", "unbound_valid"])
 def test_supervisor_refuses_malformed_target_delivery(tmp_path, damage):
     import sys
     from uuid import uuid4
@@ -498,7 +511,7 @@ def test_supervisor_refuses_malformed_target_delivery(tmp_path, damage):
         outcome["items"][0].update(write_state="authorized", execution_state="unknown", business_state="not_available", attempt=None)
     elif damage == "attempt":
         outcome["items"][0].update(operation="recover", attempt=4)
-    else:
+    elif damage == "external_state":
         outcome["items"][0].update(outcome="confirmed_no_resubmit", execution_state="unknown", business_state="pass", write_state="authorized")
     code = '''import os,json,datetime
 from pathlib import Path
@@ -552,3 +565,138 @@ def test_target_resume_preserves_an_active_completion(tmp_path, monkeypatch):
             engine.resume_target_review(action)
     assert action.with_name("state.json").read_bytes() == before
     assert env.submitted == []
+
+
+@pytest.mark.parametrize("handled_time", ["2026-08-21T08:00:00+08:00", ""])
+def test_older_or_unknown_handled_version_cannot_complete_new_target(tmp_path, monkeypatch, handled_time):
+    env = RepairEnvironment(tmp_path, monkeypatch)
+    action = env.seed("selected-a", 8)
+    row = env.pending.pop()
+    env.handled.append({**row, "received_at": handled_time})
+    before = {path: path.read_bytes() for path in action.parent.iterdir() if path.is_file()}
+
+    result = controller.run_rolling_drain(
+        capacity=2, targets_only=True, resume_action_files=(action,), live_status=env.live_status,
+    )
+
+    outcome = result["target_outcome"]
+    assert outcome["status"] in {"partial", "blocked"} and outcome["completed"] == 0
+    assert outcome["items"][0]["outcome"] == "unresolved"
+    assert outcome["items"][0]["evidence_verified"] is False
+    assert env.submitted == []
+    assert all(path.read_bytes() == raw for path, raw in before.items())
+
+
+def test_target_inspection_rejects_another_valid_attempt_state(tmp_path, monkeypatch):
+    from apps.oa_finance_preaudit import FlowEngine
+
+    env = RepairEnvironment(tmp_path, monkeypatch)
+    selected = env.seed("selected-a", 8)
+    outside = env.seed("outside-b", 9)
+    selected.with_name("state.json").write_bytes(outside.with_name("state.json").read_bytes())
+
+    with pytest.raises(ValueError, match="production_target_action_invalid"):
+        FlowEngine.inspect_target_action(env.root, selected)
+    assert env.submitted == []
+
+
+@pytest.mark.parametrize("gate", ["manual_stop", "writer", "active_controller"])
+def test_supervised_early_stop_keeps_bound_target_results(tmp_path, monkeypatch, capsys, gate):
+    from contextlib import ExitStack
+    import sys
+    from uuid import uuid4
+    from apps.oa_approval import runtime_control
+    from apps.oa_finance_preaudit import controller_handoff
+    from scripts import finance_preaudit_run as supervisor
+
+    env = RepairEnvironment(tmp_path, monkeypatch)
+    actions = [env.seed("selected-a", 8), env.seed("selected-b", 9)]
+    rows = list(env.pending)
+    code = f'''import sys
+from pathlib import Path
+import pytest
+from tests.finance_preaudit.test_targeted_recovery import RepairEnvironment
+from scripts import finance_preaudit_concurrency_probe as controller
+patch = pytest.MonkeyPatch()
+env = RepairEnvironment(Path({str(tmp_path)!r}), patch)
+env.pending = {rows!r}
+raise SystemExit(controller.main(sys.argv[1:]))
+'''
+    original_popen = supervisor.subprocess.Popen
+    def recorded_controller(command, **kwargs):
+        if list(command[1:3]) == ["-m", "scripts.finance_preaudit_concurrency_probe"]:
+            command = [sys.executable, "-c", code, *command[3:]]
+        return original_popen(command, **kwargs)
+    monkeypatch.setattr(supervisor.subprocess, "Popen", recorded_controller)
+    monkeypatch.setattr(supervisor.approval_guard, "observe_project_errors", lambda _: None)
+    command = [sys.executable, "-m", "scripts.finance_preaudit_concurrency_probe",
+               "--rolling", "--capacity", "2", "--confirm-write", "YES", "--targets-only",
+               "--resume-action-file", str(actions[0]), "--resume-action-file", str(actions[1])]
+    with ExitStack() as stack:
+        manifest = None
+        if gate == "manual_stop":
+            runtime_control.request_stop()
+        elif gate == "writer":
+            stack.enter_context(runtime_control.global_writer_lease())
+        else:
+            stack.enter_context(runtime_control.global_controller_lease())
+            manifest = controller_handoff.begin({"capacity": 2})
+            stack.enter_context(controller.approval_lifecycle.run_scope(manifest, env.project))
+        if gate == "manual_stop":
+            monkeypatch.setattr(supervisor, "_supervise_detached", lambda command, **kwargs: supervisor.supervise(command, **kwargs))
+            assert supervisor.main(["--owner-task-id", str(uuid4()), "--review-provider", "deepseek", "--", *command[3:]]) == 1
+            receipt = json.loads(capsys.readouterr().out.splitlines()[-1])
+        else:
+            receipt = supervisor.supervise(command, directory=tmp_path / "control/executions" / uuid4().hex,
+                                           owner_task_id=str(uuid4()))
+        path = Path(receipt["receipt_file"])
+        outcome = receipt["target_outcome"]
+        assert receipt["state"] == "exited" and receipt["result"] != "completed"
+        assert outcome["status"] == "blocked" and outcome["target_count"] == 2
+        assert outcome["completed"] == 0 and outcome["unresolved"] == 2
+        assert receipt["run_id"] is None and receipt["children_reaped"] == "unknown"
+        assert receipt["exit_code"] == (0 if gate == "active_controller" else 1)
+        report = supervisor.read_execution(path, owner_task_id=receipt["owner_task_id"],
+                                           invocation_id=receipt["invocation_id"])
+        assert report["target_outcome"] == outcome and report["status"] != "completed"
+        assert report["owner_task_id"] == receipt["owner_task_id"] and report["invocation_id"] == receipt["invocation_id"]
+        assert report["exit_code"] == receipt["exit_code"] and report["children_reaped"] == "unknown"
+        original = path.read_bytes()
+        for damage in ("owner", "invocation", "target"):
+            changed = json.loads(original)
+            if damage == "target":
+                changed["target_binding"]["outcome"]["items"][0]["item_key"] = "f" * 64
+            else:
+                changed["target_binding"]["owner_task_id" if damage == "owner" else "invocation_id"] = uuid4().hex
+            path.write_text(json.dumps(changed))
+            with pytest.raises(ValueError, match="target_binding"):
+                supervisor.read_execution(path, owner_task_id=receipt["owner_task_id"], invocation_id=receipt["invocation_id"])
+        path.write_bytes(original)
+        output = path.with_name("stdout.log")
+        raw_output = output.read_bytes()
+        output.write_bytes(b"{}")
+        with pytest.raises(ValueError, match="output_mismatch"):
+            supervisor.read_execution(path, owner_task_id=receipt["owner_task_id"], invocation_id=receipt["invocation_id"])
+        output.write_bytes(raw_output)
+        if manifest is not None:
+            assert receipt["skip_verification"]["run_id"] == manifest["run_id"]
+            assert report["blocking_run_id"] == manifest["run_id"] and "run_id" not in report
+            controller_handoff.finish(manifest, status="completed", children_reaped=True, health="healthy")
+    assert env.submitted == []
+
+
+def test_unbound_child_cannot_supply_early_target_results(tmp_path, monkeypatch):
+    import sys
+    from uuid import uuid4
+    from apps.oa_finance_preaudit import target_scope
+    from scripts import finance_preaudit_run as supervisor
+
+    env = RepairEnvironment(tmp_path, monkeypatch)
+    action = env.seed("selected-a", 8)
+    scope = target_scope.TargetScope.bind(env.root, resume=(action,), recover=(), workflows=controller.ROLLING_WORKFLOW_KEYS)
+    payload = {"kind": "approval_startup_gate", "status": "blocked", "reason": "existing_stop_preserved",
+               "target_outcome": scope.outcome({}, controller_completed=False)}
+    receipt = supervisor.supervise([sys.executable, "-c", "print(" + repr(json.dumps(payload)) + ")"],
+                                   directory=tmp_path / "control/executions" / uuid4().hex, owner_task_id=str(uuid4()))
+    assert receipt["target_outcome"] == {"status": "blocked", "reason": "production_target_outcome_unverified"}
+    assert "target_binding" not in receipt
