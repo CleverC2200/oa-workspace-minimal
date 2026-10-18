@@ -80,7 +80,7 @@ def resources(request_id: str, workflow: dict, workflow_key: str, evidence: dict
     return result
 
 
-def _download_context(request_id: str, native_file_id: str):
+def _download_contexts(request_id: str):
     from apps.oa_approval import api, flow, invoice_buyers
 
     client = api.build_api({})
@@ -89,24 +89,53 @@ def _download_context(request_id: str, native_file_id: str):
     flow.ensure_workflow_matches(request_id, workflow, config)
     workflow_key = config['flow_key']
     if workflow_key not in _FINANCE_FLOWS or str(workflow.get('requestId')) != request_id:
-        return client, {}, ''
+        return client, {}
     result = invoice_buyers.read_invoice_buyers(
         client, workflow, linked_detail_only=workflow_key == 'tpm_small_marketing_fee',
         include_evidence=True,
     )
     evidence = result.get('invoice_evidence') or {}
     trusted = resources(request_id, workflow, workflow_key, evidence)
-    if not any(item['id'] == native_file_id for item in trusted):
-        return client, {}, ''
-    sources = [(file['original_source'], _positive_id(invoice.get('data_id'))) for invoice in evidence['invoices']
-               for file in invoice['files'] if file.get('original_source', {}).get('native_file_id') == native_file_id]
-    if sources and all(source == sources[0][0] and data_id for source, data_id in sources):
-        return client, sources[0][0], sources[0][1]
-    return client, {}, ''
+    candidates = {item['id']: [] for item in trusted}
+    for invoice in evidence.get('invoices', []):
+        for file in invoice['files']:
+            source = file.get('original_source') or {}
+            native_file_id = source.get('native_file_id')
+            if native_file_id in candidates:
+                candidates[native_file_id].append((source, _positive_id(invoice.get('data_id'))))
+    return client, {
+        native_file_id: sources[0]
+        for native_file_id, sources in candidates.items()
+        if sources and all(source == sources[0][0] and data_id for source, data_id in sources)
+    }
 
 
-def source_for_download(request_id: str, native_file_id: str) -> dict:
-    return _download_context(request_id, native_file_id)[1]
+class DownloadBatch:
+    def __init__(self, request_id: str):
+        self.request_id = request_id
+        self.client, self._sources = _download_contexts(request_id)
+
+    def context(self, request_id: str, native_file_id: str):
+        source, data_id = ({}, '')
+        if request_id == self.request_id:
+            source, data_id = self._sources.get(native_file_id, ({}, ''))
+        return self.client, source, data_id
+
+    def recheck(self) -> bool:
+        _, current = _download_contexts(self.request_id)
+        return bool(self._sources) and current == self._sources
+
+
+def _download_context(request_id: str, native_file_id: str, batch: DownloadBatch | None = None):
+    if batch is not None:
+        return batch.context(request_id, native_file_id)
+    client, sources = _download_contexts(request_id)
+    source, data_id = sources.get(native_file_id, ({}, ''))
+    return client, source, data_id
+
+
+def source_for_download(request_id: str, native_file_id: str, *, batch: DownloadBatch | None = None) -> dict:
+    return _download_context(request_id, native_file_id, batch)[1]
 
 
 class _NoCloudRedirect(urllib.request.HTTPRedirectHandler):
@@ -114,7 +143,8 @@ class _NoCloudRedirect(urllib.request.HTTPRedirectHandler):
         raise ValueError('attachment_download_failed')
 
 
-def download_original(resource: dict, *, dest_dir: Path, timeout_sec: int) -> tuple[Path | None, str]:
+def download_original(resource: dict, *, dest_dir: Path, timeout_sec: int,
+                      batch: DownloadBatch | None = None) -> tuple[Path | None, str]:
     from apps.oa_approval import attachments, invoice_buyers, runtime_control
 
     request_id = str(resource.get('_workflow_request_id') or '')
@@ -122,7 +152,7 @@ def download_original(resource: dict, *, dest_dir: Path, timeout_sec: int) -> tu
     dest = dest_dir / attachments.deterministic_filename(resource)
     temporary = None
     try:
-        client, source, data_id = _download_context(request_id, native_file_id)
+        client, source, data_id = _download_context(request_id, native_file_id, batch)
         if not source or source != resource.get('_invoice_original'):
             return None, 'resource_ownership_untrusted'
         token_response = client.get(invoice_buyers.TOKEN_PATH)
@@ -146,12 +176,13 @@ def download_original(resource: dict, *, dest_dir: Path, timeout_sec: int) -> tu
             if (len(body) > _MAX_ORIGINAL_BYTES or not body.startswith(b'%PDF-')
                     or length is not None and len(body) != int(length)):
                 return None, 'attachment_content_incomplete'
-        _, current_source, current_data_id = _download_context(request_id, native_file_id)
-        if current_source != source or current_data_id != data_id:
-            return None, 'resource_ownership_untrusted'
+        if batch is None:
+            _, current_source, current_data_id = _download_context(request_id, native_file_id)
+            if current_source != source or current_data_id != data_id:
+                return None, 'resource_ownership_untrusted'
         url, error = attachments._normalized_download_url(resource)
         if error or not attachments._initialize_workflow_document_context(
-                resource, url, timeout_sec=timeout_sec, initialize=False):
+                resource, url, timeout_sec=timeout_sec, initialize=False, original_batch=batch):
             return None, 'resource_ownership_untrusted'
         if runtime_control.stop_requested():
             return None, runtime_control.STOP_CODE
