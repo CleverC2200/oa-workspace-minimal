@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import shutil
+from unittest.mock import Mock
 
 import pytest
 
 from apps import json_artifact
-from apps.oa_finance_preaudit import cli, flow_engine
+from apps.oa_finance_preaudit import cli, flow_engine, observability
 from apps.oa_finance_preaudit import review_failure_evidence
 
 
@@ -1616,6 +1618,9 @@ def test_preview_receipt_recovers_closed_without_repeating_review(
     monkeypatch: pytest.MonkeyPatch,
     boundary: str,
 ) -> None:
+    clock = Mock(wraps=datetime)
+    clock.now.return_value = datetime(2026, 8, 22, tzinfo=timezone.utc)
+    monkeypatch.setattr(observability, "datetime", clock)
     engine = _engine(tmp_path)
     action = engine.next_action("travel_expense")
     decision_file = tmp_path / "decision.json"
@@ -1644,12 +1649,23 @@ def test_preview_receipt_recovers_closed_without_repeating_review(
     with pytest.raises(SystemExit, match=boundary):
         engine.complete_review(Path(action["action_file"]), decision_file)
 
-    recovered = _engine(tmp_path).complete_review(Path(action["action_file"]), decision_file)
+    action_path = Path(action["action_file"])
+    preserved = [action_path, action_path.with_name("execution-receipt.json"), Path(action["events_file"])]
+    if boundary == "closed_state_persisted":
+        preserved.append(Path(action["state_file"]))
+    before = {path: path.read_bytes() for path in preserved}
+    events = json.loads(before[Path(action["events_file"])])["events"]
+    assert len([event for event in events if event["event_id"] == "03-review"]) == 1
+    clock.now.return_value += timedelta(seconds=1)
+    restarted = _engine(tmp_path)
+    recovered = (restarted.next_action("travel_expense") if boundary == "receipt_persisted"
+                 else restarted.complete_review(action_path, decision_file))
 
     assert recovered["action"] == "closed"
     assert recovered["write_state"] == "not_requested"
     assert recovered["no_write_evidence"] == "confirmed_no_write"
     assert len(list(Path(action["action_file"]).parent.parent.glob("attempt-*"))) == 1
+    assert {path: path.read_bytes() for path in preserved} == before
 
 
 def test_unknown_recovery_does_not_depend_on_candidate_discovery(
