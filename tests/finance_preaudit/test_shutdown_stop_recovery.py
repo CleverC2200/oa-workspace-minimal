@@ -19,7 +19,7 @@ def candidate_git(_root, *args):
 
 
 @pytest.fixture
-def sealed_target(restart_target, tmp_path, monkeypatch):
+def sealed_target(restart_target, tmp_path, monkeypatch, request):
     root, original, action, cron, args, live = restart_target
     home = Path(__import__('os').environ['CODEX_HOME'])
     owner, parent, reviewers = native_sessions(tmp_path / 'native', monkeypatch)
@@ -64,6 +64,7 @@ def stop():
  plan.update(status='pending',reason='reviewer_failed',started_at=time.time(),
   interrupt_targets=[r['agent_path'] for r in value['reviewers']],original_tool_session_id='original-session')
  marker=Path.cwd()/'runtime/stop-preaudit.flag';marker.write_bytes(b'stop_requested:controller_cycle_stop\n');marker.chmod(0o600)
+ stamp=time.time_ns();__import__('os').utime(marker,ns=(stamp,stamp))
  value['shutdown']=dict(plan);h.guard.write(h.registry_file(owner),value)
  return {'exit_code':0,'output':json.dumps(plan)}
 cmd='.venv/bin/python -B -m apps.oa_finance_preaudit.host_chat_review --operation begin-shutdown --owner-task-id '+owner+' --reason reviewer_failed'
@@ -74,6 +75,8 @@ wait=call('functions.exec','text(await tools.write_stdin('+json.dumps({'session_
 s.finish(owner=owner,source=parent,interrupt_lines=interrupts,status_line=status,wait_line=wait)
 print(begin)
 '''
+    if getattr(request, 'param', None) == 'coarse_stop_clock':
+        program = program.replace("marker.chmod(0o600)", "marker.chmod(0o600); stamp=time.time_ns()-10_000_000; __import__('os').utime(marker,ns=(stamp,stamp))")
     result = subprocess.run([str(root / '.venv/bin/python'), '-B', '-c', program,
         original.owner_task_id, str(parent), str(spec), str(original.file)], cwd=root,
         text=True, capture_output=True, check=True)
@@ -81,7 +84,16 @@ print(begin)
     return root, original, action, cron, live, begin, parent
 
 
-def test_target_owned_bound_reader_revalidates_original_native_shutdown(sealed_target):
+@pytest.mark.parametrize('sealed_target', [None, 'coarse_stop_clock'], indirect=True)
+def test_target_owned_bound_reader_revalidates_original_native_shutdown(sealed_target, monkeypatch):
+    original_reader = maintenance_runtime._run_readonly
+
+    def checked_reader(*args, **kwargs):
+        result = original_reader(*args, **kwargs)
+        assert result.returncode == 0, result.stderr
+        return result
+
+    monkeypatch.setattr(maintenance_runtime, '_run_readonly', checked_reader)
     root, original, _, _, _, begin, parent = sealed_target
     protected = {p:p.read_bytes() for p in [parent,original.file,root/'runtime/control/rolling-controller-manifest.json']}
     bound = recovery._bound(root, original, begin)
@@ -192,6 +204,62 @@ def test_recovery_uses_live_gates_and_preserves_originals(sealed_target,monkeypa
     assert {p:p.read_bytes() for p in protected}==protected
     if confirmed:
         assert json.loads(Path(result['receipt_file']).read_text())==result
+
+
+def test_recovery_passes_exact_material_failure_source_only_proof(sealed_target, monkeypatch):
+    root, original, action, cron, _live, begin, _ = sealed_target
+    monkeypatch.setattr(recovery.production_release, '_git', candidate_git)
+    monkeypatch.setattr(recovery.production_release, '_source', lambda *_args, **_kwargs: 'c' * 40)
+    monkeypatch.setattr(recovery, '_bound', lambda *_args, **_kwargs: {
+        'execution': {'code_revision': 'c' * 40},
+    })
+    monkeypatch.setattr(recovery.maintenance_runtime, 'assert_original_execution_safe', lambda *_args, **_kwargs: None)
+    snapshot = {'maintenance_status_file': {'path': str(root / 'status.json')},
+                'maintenance_current_inputs': {'verified_material_failure_actions': [str(action)]}}
+    seen = []
+
+    def read_live(_target, **kwargs):
+        seen.append(('live', kwargs.get('source_only_proof')))
+        return snapshot
+
+    def read_current(_target, _receipt, **kwargs):
+        seen.append(('inputs', kwargs.get('source_only_proof')))
+        return snapshot['maintenance_current_inputs']
+
+    def assert_safe(_payload, **kwargs):
+        seen.append(('assert', kwargs.get('source_only_proof')))
+
+    monkeypatch.setattr(recovery.maintenance_runtime, 'read_live_status', read_live)
+    monkeypatch.setattr(recovery.maintenance_runtime, 'read_current_inputs', read_current)
+    monkeypatch.setattr(recovery.maintenance_runtime, 'assert_live_safe', assert_safe)
+    result = recovery.recover(
+        target_root=root, expected_revision='f' * 40,
+        original=original,
+        automation=production_release.ProductionAutomation(cron, 'production', 'preserved'),
+        begin_line=begin, material_failure_actions=(action,),
+    )
+    proof = {'kind': 'preaudit_material_failure_source_only', 'target_root': str(root),
+             'actions': [str(action)]}
+    assert result['status'] == 'ready'
+    assert result['material_failure_source_only'] is True
+    assert all(value == proof for _name, value in seen)
+
+
+def test_recovery_rejects_duplicate_material_failure_actions_before_live_read(sealed_target, monkeypatch):
+    root, original, action, cron, _live, begin, _ = sealed_target
+    monkeypatch.setattr(recovery.production_release, '_git', candidate_git)
+    monkeypatch.setattr(recovery.production_release, '_source', lambda *_args, **_kwargs: 'c' * 40)
+    monkeypatch.setattr(recovery, '_bound', lambda *_args, **_kwargs: {'execution': {'code_revision': 'c' * 40}})
+    monkeypatch.setattr(recovery.maintenance_runtime, 'read_live_status',
+                        lambda *_args, **_kwargs: pytest.fail('live read must not run'))
+    result = recovery.recover(
+        target_root=root, expected_revision='f' * 40,
+        original=original,
+        automation=production_release.ProductionAutomation(cron, 'production', 'preserved'),
+        begin_line=begin, material_failure_actions=(action, action),
+    )
+    assert result['status'] == 'blocked'
+    assert result['stop_cleared'] is False
 
 
 @pytest.mark.parametrize('damage',['plain_stop','cron_active','auth','continuation','stop_replaced','inputs_changed','bound_changed'])

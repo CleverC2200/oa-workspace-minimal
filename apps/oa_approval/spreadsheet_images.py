@@ -48,18 +48,24 @@ def extract(path: Path, out_dir: Path, prefix: str, *, compact: bool = False) ->
             if relfile not in names:
                 return {}
             result = {}
+            identifiers = set()
             for rel in xml(relfile):
+                key = rel.get("Id", "")
+                if key in identifiers:
+                    raise ValueError("spreadsheet_relationship_ambiguous")
+                identifiers.add(key)
                 if rel.get("TargetMode") == "External":
                     continue
                 target = rel.get("Target", "")
                 target = posixpath.normpath(target.lstrip('/') if target.startswith('/') else posixpath.join(base, target))
-                if not target.startswith('xl/') or '\\' in target:
-                    raise ValueError("spreadsheet_relationship_untrusted")
-                key = rel.get("Id", "")
-                if key in result:
-                    raise ValueError("spreadsheet_relationship_ambiguous")
                 result[key] = target
             return result
+
+        def referenced(relationships: dict[str, str], key: str) -> str:
+            target = relationships[key]
+            if not target.startswith('xl/') or '\\' in target:
+                raise ValueError("spreadsheet_relationship_untrusted")
+            return target
 
         def emit(member: str, cell: str) -> None:
             if len(output) >= 1000:
@@ -93,10 +99,10 @@ def extract(path: Path, out_dir: Path, prefix: str, *, compact: bool = False) ->
                 key = prop.get('name')
                 if key in cell_images:
                     raise ValueError("spreadsheet_cell_image_ambiguous")
-                cell_images[key] = image_rels[blip.get(f'{{{_NS["r"]}}}embed')]
+                cell_images[key] = referenced(image_rels, blip.get(f'{{{_NS["r"]}}}embed'))
         workbook_rels = relations('xl/workbook.xml')
         for sheet in xml('xl/workbook.xml').findall('s:sheets/s:sheet', _NS):
-            sheet_path = workbook_rels[sheet.get(f'{{{_NS["r"]}}}id')]
+            sheet_path = referenced(workbook_rels, sheet.get(f'{{{_NS["r"]}}}id'))
             document = xml(sheet_path)
             shared = {
                 f.get('si'): f.text for f in document.findall('.//s:f', _NS)
@@ -117,11 +123,11 @@ def extract(path: Path, out_dir: Path, prefix: str, *, compact: bool = False) ->
                 emit(cell_images[match[1]], f'{sheet.get("name")}!{cell.get("r")}')
             sheet_rels = relations(sheet_path)
             for drawing in document.findall('s:drawing', _NS):
-                drawing_path = sheet_rels[drawing.get(f'{{{_NS["r"]}}}id')]
+                drawing_path = referenced(sheet_rels, drawing.get(f'{{{_NS["r"]}}}id'))
                 drawing_rels = relations(drawing_path)
                 for anchor in xml(drawing_path):
                     for blip in anchor.findall('.//a:blip', _NS):
-                        member = drawing_rels[blip.get(f'{{{_NS["r"]}}}embed')]
+                        member = referenced(drawing_rels, blip.get(f'{{{_NS["r"]}}}embed'))
                         origin = anchor.find('xdr:from', _NS)
                         location = 'absolute-anchor'
                         if origin is not None:

@@ -46,7 +46,7 @@ def fingerprint(value: dict) -> str:
 def review_decision_binding(state: dict) -> dict:
     """Keep input identity separate from the normalized, submitted decision."""
     if REVIEW_BINDING not in state:
-        return {}  # Historical decisions have no recoverable candidate identity.
+        return {}
     binding = state[REVIEW_BINDING]
     if (
         not isinstance(binding, dict)

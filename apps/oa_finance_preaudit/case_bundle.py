@@ -13,6 +13,7 @@ from apps.oa_approval import (
     evidence_packet,
     flow,
     invoice_buyers,
+    invoice_originals,
     official_sql,
     travel_orders,
 )
@@ -49,7 +50,7 @@ class CollectionFailure(RuntimeError):
         }
 
 
-def _field_rows(workflow: dict[str, Any]) -> list[dict[str, str]]:
+def _field_rows(workflow: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         {
             "path": str(item.get("path") or ""),
@@ -489,7 +490,16 @@ def collect_case(
         attachment_timeout_sec=attachment_timeout_sec,
     )
     authority_facts.extend(travel_facts)
-    logical_resources = _merge_resources(form_resources, discovered_resources)
+    original_resources = invoice_originals.resources(
+        str(request_id), workflow, str(config.get("flow_key") or ""), invoice_evidence,
+    )
+    logical_resources = _merge_resources(form_resources, discovered_resources + original_resources)
+    original_sources = {item["id"]: item["_invoice_original"] for item in original_resources}
+    logical_resources = [
+        {**item, "_invoice_original": original_sources[str(item["id"])]}
+        if str(item.get("id") or "") in original_sources else item
+        for item in logical_resources
+    ]
     attachment_deduplication: list[dict[str, str]] = []
     if str(config.get("flow_key") or "") == _PACKAGING_FLOW:
         logical_resources, attachment_deduplication = _prepare_packaging_resources(
@@ -582,6 +592,7 @@ def collect_case(
             "manifest": manifest,
         }
 
+    invoice_originals.bind_prepared_bodies(invoice_evidence, descriptors, prepared)
     warnings = [
         {
             "code": "invoice_document_reference_unresolved",
@@ -592,10 +603,21 @@ def collect_case(
         if str(config.get("flow_key") or "") != _PACKAGING_FLOW
         and field["field_name"] == "fpfj"
         and re.search(r"\btoDocument\s*\(", field["attachment_html"])
+        and not invoice_originals.field_body_read(field, invoice_evidence)
         and not any(
             item["source_field_path"] == field["path"] for item in descriptors
         )
     ]
+
+    declared_fields = _field_rows(workflow)
+    if (config.get("flow_key") in {"general_expense", "tpm_small_marketing_fee"} and not logical_resources
+            and not authority_facts and not invoice_evidence.get("invoices")):
+        empty_fields = official_sql.confirmed_empty_attachment_fields(
+            workflow, request_id=str(request_id), workflow_key=str(config["flow_key"]))
+        for field in declared_fields:
+            if field["path"] in empty_fields:
+                field["read_status"] = "empty"
+                field["empty_source"] = empty_fields[field["path"]]
 
     public_resources = [
         {key: value for key, value in descriptor.items() if key != "raw_resource_id"}
@@ -608,7 +630,7 @@ def collect_case(
         "request_id": str(request_id),
         "workflow_key": str(config.get("flow_key") or ""),
         "workflow_name": identity["workflow_name"],
-        "declared_fields": _field_rows(workflow),
+        "declared_fields": declared_fields,
         "resources": public_resources,
         "attachment_deduplication": attachment_deduplication,
         "prepared": prepared,

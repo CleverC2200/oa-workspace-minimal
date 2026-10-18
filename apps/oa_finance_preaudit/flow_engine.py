@@ -19,7 +19,7 @@ import fitz
 from apps import json_artifact
 from apps.oa_approval import runtime_control, writer_outcomes
 
-from . import company_comparison, fuel_trip_observation, decision_validation, item_failure, manual_handoff, observability, packaging_contract, review_failure_evidence, submission, tpm_price_reference
+from . import company_comparison, fuel_trip_observation, decision_validation, item_failure, manual_handoff, observability, packaging_contract, prepare_failure, review_failure_evidence, submission, tpm_price_reference
 
 
 SCHEMA_VERSION = 1
@@ -224,6 +224,14 @@ _SAFE_COLLECTION_COUNT_KEYS = {
     "form_resource_count",
     "travel_resource_count",
     "trusted_source_sighting_count",
+}
+_ATTACHMENT_DIAGNOSTIC_FRAMES = {
+    "_prepare_one_attachment": "attachment_prepare",
+    "_prepare_attachments": "attachment_prepare",
+    "_validate_prepared": "prepared_manifest_validation",
+    "prepared_body": "invoice_original_body",
+    "bind_prepared_bodies": "invoice_original_body",
+    "_frozen": "recognition_frozen_material",
 }
 _HARD_COLLECTION_FAILURE_CODES = {
     "oa_run_stopped",
@@ -643,10 +651,20 @@ def _material_gap(error: Exception) -> dict:
 def _material_failure_details(error: Exception) -> dict:
     raw_code = _stable_error_code(error, _SAFE_MATERIAL_FAILURE_DETAIL_CODES)
     gap = _material_gap(error)
-    return {
+    details = {
         "failure_detail_code": raw_code or "material_collection_failed",
         **({"failure_counts": gap["counts"]} if "counts" in gap else {}),
     }
+    if raw_code == "attachment_content_incomplete":
+        frame = prepare_failure.last_frame(error)
+        details["failure_diagnostic"] = {
+            "kind": "preaudit_material_failure_diagnostic",
+            "code": raw_code,
+            "stage": _ATTACHMENT_DIAGNOSTIC_FRAMES.get(frame, "material_collection"),
+            "error_class": prepare_failure.error_class(error),
+            "last_frame": frame,
+        }
+    return details
 
 
 def _require_reviewable_material(workflow_key: str, material: dict) -> None:
@@ -4567,12 +4585,9 @@ class FlowEngine:
                 "normalized_fingerprint": normalized_fingerprint,
             }}
             state = {**state, **review_binding}
-            # Pin both identities before publishing the normalized result. A crash
-            # between these writes can only resume the same candidate/result pair.
             json_artifact.write_json_atomic(Path(action["state_file"]), state, indent=2)
         if stored_decision.exists():
             if _read_object(stored_decision, code="review_decision_conflict") != decision:
-                # Do not reinterpret or rewrite already persisted legacy evidence.
                 raise ValueError("review_decision_conflict")
         else:
             json_artifact.write_json_atomic(stored_decision, decision, indent=2)

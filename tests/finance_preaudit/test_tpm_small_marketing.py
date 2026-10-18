@@ -239,7 +239,6 @@ def test_tpm_attachment_pass_without_image_evidence_is_downgraded(
         in remark
     )
     assert "AI审核结论：需人工判断 ⚠️" in remark
-    # 候选输入保留原样；冻结结果、意见及回执共同记录确定性证据降级。
     frozen_file = Path(closed["decision_file"])
     frozen = json.loads(frozen_file.read_text())
     receipt = json.loads(Path(closed["receipt_file"]).read_text())
@@ -416,6 +415,34 @@ def test_tpm_read_failure_never_enters_reviewer_prompt(
     assert action["failure_detail_code"] == "attachment_content_incomplete"
     with pytest.raises(ValueError, match="frozen_packet_changed"):
         codex_review_worker._prompt(Path(action["action_file"]))
+
+
+def test_tpm_content_incomplete_failure_keeps_redacted_stage_diagnostic(tmp_path):
+    def _prepare_one_attachment(_request_id, _attempt_root):
+        raise RuntimeError("attachment_content_incomplete: account=private token=secret")
+
+    engine = flow_engine.FlowEngine(
+        root=tmp_path / "runtime" / "finance_preaudit_flows",
+        discover_candidates=lambda workflow_key: [{
+            "request_id": "diagnostic-request",
+            "received_at": "2026-09-16T09:00:00+08:00",
+            "workflow_key": workflow_key,
+        }],
+        collect_material=_prepare_one_attachment,
+    )
+    action = engine.next_action(WORKFLOW_KEY)
+
+    diagnostic = action["failure_diagnostic"]
+    assert diagnostic == {
+        "kind": "preaudit_material_failure_diagnostic",
+        "code": "attachment_content_incomplete",
+        "stage": "attachment_prepare",
+        "error_class": "RuntimeError",
+        "last_frame": "_prepare_one_attachment",
+    }
+    serialized = json.dumps(diagnostic, ensure_ascii=False)
+    assert "account=private" not in serialized
+    assert "secret" not in serialized
 
 
 @pytest.mark.parametrize("all_pass", [True, False])

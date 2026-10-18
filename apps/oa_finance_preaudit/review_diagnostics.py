@@ -207,7 +207,8 @@ def inspect_material(material_file: Path) -> dict:
         return {**result, "status": "blocked", "reason": str(error)}
     coverage = {"status": "recorded", "entries": 0, "source_consistent_entries": 0,
                 "source_inconsistent_entries": 0, "read_failed_entries": 0, "unknown_entries": 0,
-                "file_records": 0, "body_read_entries": 0, "body_not_read_entries": 0, "body_unknown_entries": 0,
+                "file_records": 0, "body_read_entries": 0, "body_partial_read_entries": 0,
+                "body_not_read_entries": 0, "body_unknown_entries": 0,
                 "field_coverage": {name: {"present": 0, "not_provided": 0, "unknown": 0} for name in _INVOICE_FIELDS}}
     declared = material.get("declared_fields")
     linked_fields = {
@@ -272,8 +273,13 @@ def inspect_material(material_file: Path) -> dict:
                         and file.get("read_status") == "record_present"
                         for file in files
                     )
-                coverage["body_not_read_entries"] += invoice.get("body_read_status") == "not_read"
-                coverage["body_unknown_entries"] += invoice.get("body_read_status") != "not_read"
+                from apps.oa_approval.invoice_originals import body_coverage
+
+                body_state = body_coverage(invoice, material.get("resources") or [], material.get("prepared") or {})
+                coverage["body_read_entries"] += body_state == "content_read"
+                coverage["body_partial_read_entries"] += body_state == "partial_read"
+                coverage["body_not_read_entries"] += body_state == "not_read"
+                coverage["body_unknown_entries"] += body_state == "unknown"
     gaps = material.get("collection_gaps")
     result["collection_gap_count"] = len(gaps) if isinstance(gaps, list) else 0
     result.update(status="inspected", material_sha256=hashlib.sha256(raw).hexdigest(), material_bytes=len(raw),

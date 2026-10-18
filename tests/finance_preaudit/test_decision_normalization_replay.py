@@ -377,8 +377,6 @@ def test_legacy_closed_normalization_is_verified_without_rewriting_or_guessing_i
     closed = engine.complete_review(Path(action["action_file"]), candidate)
     directory = Path(action["action_file"]).parent
     decision = json.loads((directory / "review-decision.json").read_text())
-    # Reproduce the pre-fix persisted form: normalized overall, original item
-    # status/conclusion, and the shared missing-evidence list. No input identity.
     decision["items"][1]["status"] = original["items"][1]["status"]
     decision["items"][1]["conclusion"] = original["items"][1]["conclusion"]
     json_artifact.write_json_atomic(directory / "review-decision.json", decision, indent=2)
