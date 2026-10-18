@@ -19,8 +19,6 @@ import threading
 import time
 from typing import Callable, TextIO
 
-from jsonschema import Draft202012Validator
-
 from apps import json_artifact
 from apps.oa_approval import runtime_control, writer_outcomes
 
@@ -1584,6 +1582,7 @@ def _execute_codex_raw(
                 try:
                     from .review_decision import bind_frozen_fields
                     bound = candidate if read_only else bind_frozen_fields(action_file, candidate)
+                    from jsonschema import Draft202012Validator
                     if Draft202012Validator(schema).is_valid(bound):
                         decision = bound if read_only else _normalize_decision(action_file, bound)
                         decision_state = "valid_object"
