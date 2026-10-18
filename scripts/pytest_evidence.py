@@ -16,6 +16,7 @@ from xml.etree import ElementTree
 import pytest
 
 
+SHARDS = (0, 1, 2)
 _MANUAL_STOP = 'tests/finance_preaudit/test_manual_stop_recovery.py::'
 _LINUX_SKIPS = {
     _MANUAL_STOP + name for name in (
@@ -34,13 +35,13 @@ def pytest_addoption(parser):
     group.addoption('--ci-evidence-file', type=Path)
     group.addoption('--ci-expected-file', type=Path)
     group.addoption('--ci-budget-seconds', type=float, default=170)
-    group.addoption('--ci-shard', type=int, choices=(0, 1))
+    group.addoption('--ci-shard', type=int, choices=SHARDS)
 
 
 def shard_nodes(nodes, shard):
     if shard is None:
         return nodes
-    return [node for node in nodes if hashlib.sha256(node.encode()).digest()[0] % 2 == shard]
+    return [node for node in nodes if hashlib.sha256(node.encode()).digest()[0] % len(SHARDS) == shard]
 
 
 def collection_digest(nodes):
@@ -191,20 +192,21 @@ def _job_evidence(directory):
         raise ValueError('ci_required_jobs_invalid')
     errors = [] if all(job.get('result') == 'success' for job in required.values()) else ['required_job_failed']
     selected, artifacts, paths = {}, {}, {}
-    for role, job, suffix in (('0', 'quality', '_0'), ('1', 'quality', '_1'), ('macos', 'macos-stop-recovery', '')):
+    roles = [(str(shard), 'quality', f'_{shard}') for shard in SHARDS]
+    for role, job, suffix in [*roles, ('macos', 'macos-stop-recovery', '')]:
         outputs = required[job]['outputs']
         selected[role] = _positive_integer(outputs['attempt' + suffix])
         artifacts[role] = _positive_integer(outputs['artifact' + suffix])
         if selected[role] > attempt:
             raise ValueError('ci_job_attempt_invalid')
         paths[role] = directory / f'offline-test-evidence-{role}-attempt-{selected[role]}'
-    if len(set(artifacts.values())) != 3:
+    if len(set(artifacts.values())) != len(selected):
         raise ValueError('ci_duplicate_artifact')
     for path in directory.glob('offline-test-evidence-*'):
-        if path.name in {'offline-test-evidence-0', 'offline-test-evidence-1'}:
+        if path.name in {f'offline-test-evidence-{shard}' for shard in SHARDS}:
             continue
-        match = re.fullmatch(r'offline-test-evidence-(0|1|macos)-attempt-([1-9][0-9]*)', path.name)
-        if not match or int(match[2]) > selected[match[1]]:
+        match = re.fullmatch(r'offline-test-evidence-([0-9]+|macos)-attempt-([1-9][0-9]*)', path.name)
+        if not match or match[1] not in selected or int(match[2]) > selected[match[1]]:
             raise ValueError('ci_unexpected_artifact')
     return attempt, selected, artifacts, paths, errors
 
@@ -231,11 +233,11 @@ def macos_evidence(path, budget):
 
 
 def matrix_timing(jobs, identity, selected):
-    names = {'quality (0)', 'quality (1)', 'macos-stop-recovery', 'quality-complete'}
+    names = {*(f'quality ({shard})' for shard in SHARDS), 'macos-stop-recovery', 'quality-complete'}
     head = os.environ.get('OA_CI_HEAD_SHA')
     if (not head or not identity['run_id'] or not identity['run_attempt']
             or jobs['total_count'] != len(jobs['jobs'])
-            or len(jobs['jobs']) != 4 or {job['name'] for job in jobs['jobs']} != names):
+            or len(jobs['jobs']) != len(names) or {job['name'] for job in jobs['jobs']} != names):
         raise ValueError('job_timing_set_untrusted')
     observed = time.time()
     intervals, timings = {}, {}
@@ -262,7 +264,7 @@ def matrix_timing(jobs, identity, selected):
     aggregation_start = intervals['quality-complete'][0]
     if any(end > aggregation_start for name, (_, end) in intervals.items() if name != 'quality-complete'):
         raise ValueError('job_timing_clock_untrusted')
-    attempts = {'quality (0)': selected['0'], 'quality (1)': selected['1'],
+    attempts = {**{f'quality ({shard})': selected[str(shard)] for shard in SHARDS},
                 'macos-stop-recovery': selected['macos']}
     current_names = {name for name, attempt in attempts.items() if attempt == identity['run_attempt']}
     reused = {name: end - start for name, (start, end) in intervals.items()
@@ -283,9 +285,9 @@ def merge_evidence(directory, budget, jobs):
     """Join exact job-attempt evidence, retaining successful jobs not selected for rerun."""
     attempt, selected, artifacts, paths, errors = _job_evidence(directory)
     references = [json.loads((paths[str(shard)] / 'collection.json').read_text())
-                  for shard in (0, 1)]
+                  for shard in SHARDS]
     reports = [json.loads((paths[str(shard)] / 'execution.json').read_text())
-               for shard in (0, 1)]
+               for shard in SHARDS]
     nodes = references[0]['nodeids']
     digest = collection_digest(nodes)
     outcomes = defaultdict(list)
@@ -346,7 +348,7 @@ def merge_evidence(directory, budget, jobs):
             and (not 0 <= timing['elapsed_seconds'] <= budget
                  or any(seconds > budget for seconds in timing['reused_job_seconds'].values()))):
         errors.append('ci_time_budget_exceeded')
-    roles = {'0': 'quality-0', '1': 'quality-1', 'macos': 'macos-stop-recovery'}
+    roles = {**{str(shard): f'quality-{shard}' for shard in SHARDS}, 'macos': 'macos-stop-recovery'}
     return {'schema_version': 2, 'kind': 'offline_pytest_matrix_evidence',
             'status': 'failed' if errors else 'verified', **identity,
             'run_attempt': attempt, 'evidence_attempts': {roles[role]: value for role, value in selected.items()},
@@ -361,7 +363,7 @@ def merge_evidence(directory, budget, jobs):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Verify complete two-runner offline CI evidence')
+    parser = argparse.ArgumentParser(description='Verify complete offline CI evidence')
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument('--merge-directory', type=Path)
     mode.add_argument('--macos-report', type=Path)

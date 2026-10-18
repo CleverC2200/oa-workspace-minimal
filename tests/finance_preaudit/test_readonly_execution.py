@@ -27,6 +27,7 @@ from tests.finance_preaudit.process_helpers import (
     _slotted_worker,
     _interval_peak,
     _assert_fake_codex_tree_reaped,
+    _readonly_reap_diagnostics,
 )
 
 
@@ -110,7 +111,7 @@ def test_readonly_timeout_reaps_registered_real_model_tree(tmp_path, monkeypatch
                 capacity=1, sample_size=1, project_root=Path(task["project_root"]),
                 run_reviews=partial(probe._run_read_only_reviews, **options),
             )
-        assert approval_lifecycle.readonly_reaped(manifest)
+        assert approval_lifecycle.readonly_reaped(manifest), _readonly_reap_diagnostics(manifest, result)
     assert result["stopped" if mode == "stop" else "timed_out"] == 1
     assert result["error_counts"] == {expected: 1}
     assert result["processes_reaped"] is True
