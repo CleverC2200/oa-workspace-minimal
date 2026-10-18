@@ -15,6 +15,7 @@ from uuid import uuid4
 from jsonschema import Draft202012Validator
 
 from apps.oa_approval import auth, runtime_control
+from . import attempt_state
 from . import codex_review_worker as worker, decision_validation, flow_engine, packaging_contract, review_decision, host_chat_review, review_context
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -430,7 +431,7 @@ def complete_host(receipt_file: Path, *, project_root: Path = PROJECT_ROOT, conf
         if result.get('action') == 'closed' and result.get('write_state') in {'not_requested', 'submitted'}:
             try:
                 action_file = Path(receipt['action_file'])
-                closed = json.loads(review_context.read_input(action_file))
+                closed = attempt_state.read_action(action_file)
                 if closed.get('action') != 'closed' or closed.get('execution_state') != 'closed':
                     raise ValueError('packaging_completion_untrusted')
                 files = [receipt_file, confirmation_file, Path(receipt['decision_file']), action_file,

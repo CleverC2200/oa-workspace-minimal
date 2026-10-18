@@ -7,6 +7,7 @@ import os
 
 from apps import json_artifact
 from apps.oa_approval import writer_outcomes
+from . import attempt_state
 from . import review_failure_evidence as evidence
 
 NAME = "recovery-receipt.json"
@@ -31,7 +32,7 @@ def _write(target: Path, receipt: dict) -> None:
     if state is None:
         raise ValueError("recovery_receipt_invalid")
     state["recovery_receipt_fingerprint"] = evidence.file_fingerprint(target / NAME)
-    json_artifact.write_json_atomic(target / "state.json", state, indent=2)
+    attempt_state.write(target / "state.json", state, indent=2)
     if state.get("execution_state") == "needs_admin":
         from . import item_failure
         item_failure.persist(target, state)

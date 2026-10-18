@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 
+from . import attempt_state
 from apps import json_artifact
 
 
@@ -38,7 +39,7 @@ def record_rejection(action_file: Path, decision: dict, error: ValueError, *, co
     if action_path.is_symlink() or state_path.is_symlink():
         raise ValueError("decision_diagnostic_invalid")
     if action_token_sha256 is None:
-        action = json.loads(action_path.read_text(encoding="utf-8"))
+        action = attempt_state.read_action(action_path)
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if not isinstance(action, dict) or not isinstance(state, dict):
             raise ValueError("decision_diagnostic_invalid")

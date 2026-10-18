@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 
+from . import attempt_state
 from .production_config import MODEL, REASONING_EFFORT, MODEL_PROVIDER, SERVICE_TIER, HOST_REVIEW_IDENTITY
 # Frozen historical evidence keeps the model and effort used by that invocation.
 LEGACY_MODELS = frozenset({"gpt-5.6-terra"})
@@ -149,7 +150,7 @@ def read_receipt(path: Path) -> dict | None:
         return None
     try:
         value = json.loads(receipt_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return None
     return value if isinstance(value, dict) else None
 
@@ -184,8 +185,8 @@ def trusted_quarantine(attempt_root: Path, state: dict) -> bool:
     if action_path.is_symlink() or not action_path.is_file():
         return False
     try:
-        action = json.loads(action_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        action = attempt_state.read_action(action_path)
+    except (OSError, ValueError):
         return False
     if not isinstance(action, dict):
         return False

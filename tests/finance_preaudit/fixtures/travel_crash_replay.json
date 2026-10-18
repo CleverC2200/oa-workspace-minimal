@@ -28,7 +28,7 @@
       }
     },
     {
-      "boundary": "closed_action_persisted",
+      "boundary": "closed_state_persisted",
       "expected": {
         "action": "closed",
         "write_state": "submitted",

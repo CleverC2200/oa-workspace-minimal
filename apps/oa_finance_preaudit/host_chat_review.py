@@ -14,6 +14,7 @@ import time
 from uuid import UUID, uuid4
 
 from apps.oa_approval import runtime_control
+from . import attempt_state
 from . import approval_guard as guard, approval_lifecycle, production_config, review_context
 
 TRANSPORT_ENV = 'OA_REVIEW_TRANSPORT'
@@ -503,7 +504,7 @@ def _package_completion(request: dict, assigned: dict) -> None:
                 or any(hashlib.sha256(review_context.read_input(Path(file))).hexdigest() != digest
                        for file, digest in marker['file_sha256'].items())):
             raise ValueError('invalid_completion')
-        closed = json.loads(review_context.read_input(action))
+        closed = attempt_state.read_action(action)
         if closed.get('action') != 'closed' or closed.get('execution_state') != 'closed' or closed.get('write_state') != marker['write_state']:
             raise ValueError('incomplete_action')
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
@@ -818,8 +819,8 @@ def _fingerprints(action: Path) -> dict:
         raise ValueError('host_review_frozen_untrusted')
     # State is mutable authorization bookkeeping; frozen inputs and action remain bound.
     frozen = {key: value for key, value in context['input_fingerprints'].items()
-              if key in {'review-packet.json', 'material.json'}}
-    value = json.loads(review_context.read_input(action))
+              if key in {'action.json', 'review-packet.json', 'material.json'}}
+    value = attempt_state.read_action(action)
     frozen['action_token_sha256'] = hashlib.sha256(value['action_token'].encode()).hexdigest()
     return frozen
 
@@ -1052,7 +1053,7 @@ def _failed_result(proof: dict) -> dict:
 
 
 def _unwritten_action(action: Path) -> dict:
-    current = json.loads(review_context.read_input(action))
+    current = attempt_state.read_action(action)
     state = json.loads(review_context.read_input(action.with_name('state.json')))
     if (any(current.get(key) != state.get(key) for key in ('workflow_key', 'write_state', 'action'))
             or current.get('write_state') not in {'not_requested', 'authorized'}

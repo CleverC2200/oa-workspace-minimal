@@ -284,7 +284,8 @@ def verify(args):
         if expectations.get('schema_version') != 1 or len(cases) != 1:
             raise ValueError('expectations_schema_invalid')
         allowed = cases[0]['allowed_statuses']
-        action = read(manifest['action_file'])
+        from apps.oa_finance_preaudit import attempt_state
+        action = attempt_state.read_action(Path(manifest['action_file']))
         packet = read(action['review_packet_file'])
         keys = {i['item_key'] for i in packet['items']}
         if not isinstance(allowed, dict) or set(allowed) != keys or not all(

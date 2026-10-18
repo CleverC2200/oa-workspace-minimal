@@ -19,7 +19,7 @@ import fitz
 from apps import json_artifact
 from apps.oa_approval import runtime_control, writer_outcomes
 
-from . import company_comparison, fuel_trip_observation, decision_validation, item_failure, manual_handoff, observability, packaging_contract, prepare_failure, review_failure_evidence, submission, tpm_price_reference
+from . import attempt_state, company_comparison, fuel_trip_observation, decision_validation, item_failure, manual_handoff, observability, packaging_contract, prepare_failure, review_failure_evidence, submission, tpm_price_reference
 
 
 SCHEMA_VERSION = 1
@@ -478,8 +478,10 @@ def _validate_small_marketing_conclusions(
 
 def _read_object(path: Path, *, code: str) -> dict:
     try:
+        if Path(path).name == "action.json":
+            return attempt_state.read_action(path)
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, ValueError) as error:
         raise ValueError(code) from error
     if not isinstance(payload, dict):
         raise ValueError(code)
@@ -1334,7 +1336,7 @@ def _accepted_packaging_packets(
 ) -> list[dict]:
     frozen_version = state.get("rule_version")
     if frozen_version is None:
-        if action is not None and action.get("rule_version") is not None:
+        if not attempt_state.legacy_contract(state) or action is not None and action.get("rule_version") is not None:
             raise ValueError("frozen_packet_changed")
         return [_legacy_packaging_packet(expected_packet)]
     if frozen_version == _PACKAGING_RULE_VERSION and (
@@ -1368,7 +1370,7 @@ def _accepted_small_marketing_packets(
 ) -> list[dict]:
     frozen_version = state.get("rule_version")
     if frozen_version is None:
-        if action is not None and action.get("rule_version") is not None:
+        if not attempt_state.legacy_contract(state) or action is not None and action.get("rule_version") is not None:
             raise ValueError("frozen_packet_changed")
         return [_legacy_small_marketing_packet(expected_packet)]
     if frozen_version == _SMALL_MARKETING_RULE_VERSION and (
@@ -1395,6 +1397,8 @@ def _accepted_tpm_small_marketing_packets(
         if state.get("company_comparison_contract_version") is not None:
             raise ValueError("frozen_packet_changed")
         return [expected_packet]
+    if not attempt_state.legacy_contract(state):
+        raise ValueError("frozen_packet_changed")
     expected_packet = dict(expected_packet)
     expected_packet.pop("company_comparison_contract", None)
     if action is None and version == "tpm_small_marketing_fee:3":
@@ -2034,7 +2038,6 @@ class FlowEngine:
         authorization_refresh_needed: AuthorizationRefreshNeeded | None = None,
         submit_frozen: SubmitFrozen | None = None,
         recover_frozen: RecoverFrozen | None = None,
-        projection_scope: frozenset[str] | None = None,
     ) -> None:
         self._root = Path(root).expanduser().resolve()
         self._discover_candidates = discover_candidates
@@ -2046,38 +2049,6 @@ class FlowEngine:
         self._authorization_refresh_needed = authorization_refresh_needed
         self._submit_frozen = submit_frozen
         self._recover_frozen = recover_frozen
-        self._projection_scope = projection_scope
-
-    def _persist_current_action(
-        self,
-        workflow_root: Path,
-        action: dict,
-        *,
-        expected_action_file: str | None = None,
-    ) -> dict:
-        current_file = workflow_root / "current-action.json"
-        lock_file = workflow_root / "current-action.lock"
-        if current_file.is_symlink() or lock_file.is_symlink():
-            raise ValueError("persistent_state_invalid")
-        if "action_file" not in action:
-            action = {**action, "action_file": str(current_file)}
-        with _exclusive_lock(lock_file):
-            if self._projection_scope is not None and current_file.exists():
-                current = _read_object(current_file, code="persistent_state_invalid")
-                if current.get("case_key") not in self._projection_scope:
-                    return action
-            if expected_action_file is not None and current_file.exists():
-                try:
-                    current = _read_object(
-                        current_file,
-                        code="persistent_state_invalid",
-                    )
-                except ValueError:
-                    current = {}
-                if current.get("action_file") != expected_action_file:
-                    return action
-            json_artifact.write_json_atomic(current_file, action, indent=2)
-        return action
 
     def _record_phase(
         self,
@@ -2226,10 +2197,7 @@ class FlowEngine:
         workflow_root = self._root / workflow_key
         state_path = attempt_root / "state.json"
         if action_path.is_symlink() or state_path.is_symlink():
-            return self._persist_current_action(
-                workflow_root,
-                _needs_admin(workflow_key, "persistent_state_invalid"),
-            )
+            return _needs_admin(workflow_key, "persistent_state_invalid")
         try:
             state = _read_object(state_path, code="persistent_state_invalid")
         except ValueError:
@@ -2252,21 +2220,15 @@ class FlowEngine:
             attempt=_attempt_number(attempt_root),
             **(failure_details or {}),
         )
-        json_artifact.write_json_atomic(action_path, action, indent=2)
         failed_state = {**state, **action, "failed_at": state.get("failed_at") or datetime.now(timezone.utc).isoformat()}
-        json_artifact.write_json_atomic(
-            state_path,
-            failed_state,
-            indent=2,
-        )
+        try:
+            attempt_state.write(state_path, failed_state, indent=2)
+        except ValueError:
+            return {**action, "reason": "persistent_state_invalid"}
         item_failure.persist(
-            attempt_root, failed_state, confirmed_rejection=confirmed_rejection,
+            attempt_root, _read_object(state_path, code="persistent_state_invalid"), confirmed_rejection=confirmed_rejection,
         )
-        return self._persist_current_action(
-            workflow_root,
-            action,
-            expected_action_file=str(action_path),
-        )
+        return action
 
     def _attempt_identity_matches(
         self,
@@ -2511,11 +2473,12 @@ class FlowEngine:
             **fuel_trip_observation.binding(state),
             **self._recovery_completion_metadata(state),
         )
-        json_artifact.write_json_atomic(action_path, closed, indent=2)
-        json_artifact.write_json_atomic(
+        attempt_state.write(
             attempt_root / "state.json",
             {
                 **closed,
+                **attempt_state.binding(state),
+                **({"rule_version": state["rule_version"]} if "rule_version" in state else {}),
                 "created_at": state["created_at"],
                 "request_id": state["request_id"],
                 "received_at": state["received_at"],
@@ -2533,11 +2496,7 @@ class FlowEngine:
             },
             indent=2,
         )
-        return self._persist_current_action(
-            self._root / workflow_key,
-            closed,
-            expected_action_file=str(action_path),
-        )
+        return closed
 
     def _recover_frozen_submission(
         self,
@@ -2597,7 +2556,7 @@ class FlowEngine:
                 except ValueError:
                     reason = "writer_result_unknown"
                 else:
-                    json_artifact.write_json_atomic(
+                    attempt_state.write(
                         attempt_root / "state.json",
                         {**state, "write_state": "authorized"},
                         indent=2,
@@ -2725,16 +2684,13 @@ class FlowEngine:
                     action_path,
                     str(error),
                 )
-            return self._persist_current_action(workflow_root, action)
+            return action
         return None
 
     def _persist_tree_invalid(self, workflow_root: Path) -> dict:
         if workflow_root.is_symlink():
             raise ValueError("persistent_state_invalid")
-        return self._persist_current_action(
-            workflow_root,
-            _needs_admin(workflow_root.name, "persistent_state_invalid"),
-        )
+        return _needs_admin(workflow_root.name, "persistent_state_invalid")
 
     def _renew_expired_authorization(
         self,
@@ -2802,12 +2758,11 @@ class FlowEngine:
             "submission_token": authorization["submission_token"],
             "action_token": refreshed_action["action_token"],
         }
-        json_artifact.write_json_atomic(
+        attempt_state.write(
             action_path.with_name("state.json"),
             refreshed_state,
             indent=2,
         )
-        json_artifact.write_json_atomic(action_path, refreshed_action, indent=2)
         return refreshed_action
 
     def _resume_active_action(
@@ -2878,7 +2833,7 @@ class FlowEngine:
                     action_path,
                     "persistent_state_invalid",
                 )
-            return self._persist_current_action(workflow_root, action)
+            return action
         try:
             action, state, _packet = self._open_attempt(action_path)
             action = self._renew_expired_authorization(
@@ -2892,7 +2847,7 @@ class FlowEngine:
                 failure_details=_material_failure_details(error)
                 if str(error) == "material_collection_failed" else None,
             )
-        return self._persist_current_action(workflow_root, action)
+        return action
 
     @classmethod
     def confirmed_submission(cls, root: Path, state: dict) -> bool:
@@ -2925,7 +2880,7 @@ class FlowEngine:
             with os.fdopen(descriptor, "rb") as lock:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 persisted = review_failure_evidence.read_receipt(attempt_root / "state.json")
-                action = review_failure_evidence.read_receipt(action_path)
+                action = attempt_state.read_action(action_path)
                 if persisted != state or not action or any(state.get(k) != v for k, v in action.items()):
                     return False
                 if not {
@@ -3031,7 +2986,7 @@ class FlowEngine:
                 raise ValueError("completion_in_progress")
             action, persisted, _packet = self._open_attempt(path)
             action = self._renew_expired_authorization(path, action, persisted)
-            return self._persist_current_action(self._root / state["workflow_key"], action)
+            return action
 
     def _open_attempt(self, action_path: Path, *, require_reviewable: bool = True) -> tuple[dict, dict, dict]:
         action_path = action_path.expanduser().resolve()
@@ -3187,7 +3142,7 @@ class FlowEngine:
                         failure_details=_material_failure_details(error)
                         if str(error) == "material_collection_failed" else None,
                     )
-                return self._persist_current_action(workflow_root, action)
+                return action
             if execution_state == "needs_admin":
                 return self._resume_active_action(
                     workflow_root,
@@ -3294,7 +3249,7 @@ class FlowEngine:
                     "evidence_fingerprint": evidence_fingerprint,
                     **fuel_trip_observation.binding(packet),
                 }
-                json_artifact.write_json_atomic(state_path, claim, indent=2)
+                attempt_state.write(state_path, claim, indent=2)
             except Exception as error:
                 return self._persist_attempt_needs_admin(
                     attempt_root / "action.json",
@@ -3371,6 +3326,7 @@ class FlowEngine:
             )
             state = {
                 **action,
+                **attempt_state.binding(claim),
                 "created_at": claim["created_at"],
                 "request_id": claim["request_id"],
                 "received_at": claim["received_at"],
@@ -3395,8 +3351,7 @@ class FlowEngine:
                     else {}
                 ),
             }
-            json_artifact.write_json_atomic(action_file, action, indent=2)
-            json_artifact.write_json_atomic(state_path, state, indent=2)
+            attempt_state.write(state_path, state, indent=2)
             try:
                 self._record_phase(
                     state,
@@ -3413,7 +3368,7 @@ class FlowEngine:
                     action_file,
                     "observability_write_failed",
                 )
-            return self._persist_current_action(workflow_root, action)
+            return action
 
     def _validate_skipped_write_authorization_failures(
         self,
@@ -3893,7 +3848,7 @@ class FlowEngine:
                             first_terminal / "action.json",
                             "persistent_state_invalid",
                         )
-                    return self._persist_current_action(workflow_root, closed)
+                    return closed
                 elif not candidates:
                     active_action = self._resume_active_action(
                         workflow_root,
@@ -3906,9 +3861,7 @@ class FlowEngine:
                         | skipped_unknown_failures
                     ):
                         return active_action
-                    return self._persist_current_action(
-                        workflow_root,
-                        _action_payload(
+                    return _action_payload(
                             action="closed",
                             execution_state="closed",
                             business_state="not_available",
@@ -3916,8 +3869,7 @@ class FlowEngine:
                             workflow_key=workflow_key,
                             mode=mode,
                             write_authorized=False,
-                        ),
-                    )
+                        )
 
             if prepare_root is None and selected is not None:
                 case_key = _case_key(
@@ -3948,8 +3900,8 @@ class FlowEngine:
                     discovery_seconds=discovery_seconds,
                 )
                 prepare_root.mkdir(parents=True, exist_ok=True)
-                json_artifact.write_json_atomic(action_file, claim, indent=2)
-                json_artifact.write_json_atomic(state_file, claim, indent=2)
+                claim = attempt_state.create(action_file, claim)
+                attempt_state.write(state_file, claim, indent=2)
 
         if prepare_root is None:
             raise ValueError("persistent_state_invalid")
@@ -4195,8 +4147,8 @@ class FlowEngine:
                 ),
             )
             prepare_root.mkdir(parents=True)
-            json_artifact.write_json_atomic(action_file_next, claim, indent=2)
-            json_artifact.write_json_atomic(state_file_next, claim, indent=2)
+            claim = attempt_state.create(action_file_next, claim)
+            attempt_state.write(state_file_next, claim, indent=2)
             from . import recovery_receipt
             recovery_receipt.begin(prepare_root, attempt_root, state, human_confirmed=human_confirmed_unknown)
         try:
@@ -4248,8 +4200,8 @@ class FlowEngine:
                 created_at=datetime.now(timezone.utc).isoformat(), recovered_from_attempt=state["attempt"],
                 recovery_reason="user_confirmed_withdrawal")
             target.mkdir()
-            json_artifact.write_json_atomic(target / "action.json", claim, indent=2)
-            json_artifact.write_json_atomic(target / "state.json", claim, indent=2)
+            claim = attempt_state.create(target / "action.json", claim)
+            attempt_state.write(target / "state.json", claim, indent=2)
             recovery_receipt.begin_withdrawal(target, path.parent, state, observation)
         try:
             result = self._prepare_attempt(target)
@@ -4415,8 +4367,7 @@ class FlowEngine:
                 "production_failure_round": current,
                 "production_failure_code": failure_code,
             }
-            json_artifact.write_json_atomic(state_path, updated_state, indent=2)
-            json_artifact.write_json_atomic(action_path, updated, indent=2)
+            attempt_state.write(state_path, updated_state, indent=2)
             return updated
 
     def quarantine_invalid_review(self, action_file: Path) -> dict:
@@ -4539,10 +4490,7 @@ class FlowEngine:
                 and _is_attempt_action_path(action_path, self._root)
             ):
                 workflow_key = _attempt_workflow_key(action_path.parent, self._root)
-                return self._persist_current_action(
-                    self._root / workflow_key,
-                    _needs_admin(workflow_key, reason),
-                )
+                return _needs_admin(workflow_key, reason)
             return _needs_admin("unknown", reason)
         if recovered_submission_result is None:
             try:
@@ -4653,7 +4601,7 @@ class FlowEngine:
                 "normalized_fingerprint": normalized_fingerprint,
             }}
             state = {**state, **review_binding}
-            json_artifact.write_json_atomic(Path(action["state_file"]), state, indent=2)
+            attempt_state.write(Path(action["state_file"]), state, indent=2)
         if stored_decision.exists():
             if _read_object(stored_decision, code="review_decision_conflict") != decision:
                 raise ValueError("review_decision_conflict")
@@ -4729,7 +4677,7 @@ class FlowEngine:
                 submission_result = recovered_submission_result
             else:
                 submitting_state = {**state, "write_state": "submitting"}
-                json_artifact.write_json_atomic(
+                attempt_state.write(
                     Path(action["state_file"]),
                     submitting_state,
                     indent=2,
@@ -4878,11 +4826,12 @@ class FlowEngine:
             **fuel_trip_observation.binding(state),
             **self._recovery_completion_metadata(state),
         )
-        json_artifact.write_json_atomic(action_path, closed, indent=2)
-        json_artifact.write_json_atomic(
+        attempt_state.write(
             Path(action["state_file"]),
             {
                 **closed,
+                **attempt_state.binding(state),
+                **({"rule_version": state["rule_version"]} if "rule_version" in state else {}),
                 "created_at": state["created_at"],
                 "request_id": state["request_id"],
                 "received_at": state["received_at"],
@@ -4901,8 +4850,4 @@ class FlowEngine:
             },
             indent=2,
         )
-        return self._persist_current_action(
-            self._root / action["workflow_key"],
-            closed,
-            expected_action_file=str(action_path),
-        )
+        return closed

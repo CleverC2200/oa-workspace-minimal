@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from apps.oa_finance_preaudit import cli, codex_review_worker, decision_validation, runtime_doctor
+from apps.oa_finance_preaudit import attempt_state, cli, codex_review_worker, decision_validation, runtime_doctor
 from scripts import finance_preaudit_concurrency_probe as controller
 from tests.finance_preaudit.review_profiles import retained_deepseek_cli  # noqa: F401
 from tests.finance_preaudit.test_flow_engine_submission import (
@@ -95,7 +95,7 @@ class RepairEnvironment:
         return Path(action["action_file"])
 
     def execute(self, _project, action_file, _timeout):
-        action = json.loads(action_file.read_text())
+        action = attempt_state.read_action(action_file)
         state = json.loads(action_file.with_name("state.json").read_text())
         if state["request_id"] in self.fail_review_for:
             decision_validation.record_rejection(action_file, {}, decision_validation.InvalidDecision("decision_json"))
@@ -237,6 +237,7 @@ def test_targeted_run_preserves_unselected_open_projection(tmp_path, monkeypatch
     a = env.seed("selected-a", 8)
     outside = env.seed("outside-b", 7)
     projection = outside.parents[3] / "current-action.json"
+    projection.write_bytes(b'{"historical": "preserve old projection"}\n ')
     before = projection.read_bytes()
     original = {p: p.read_bytes() for p in outside.parent.rglob("*") if p.is_file()}
     result = controller.run_rolling_drain(
@@ -373,7 +374,7 @@ def test_already_submitted_target_is_confirmed_without_resubmit(tmp_path, monkey
     env = RepairEnvironment(tmp_path, monkeypatch)
     a = env.seed("selected-a", 8)
     decision = tmp_path / "decision.json"
-    decision.write_text(json.dumps(_needs_human_decision(json.loads(a.read_text()))))
+    decision.write_text(json.dumps(_needs_human_decision(attempt_state.read_action(a))))
     cli._live_flow_engine(controlled=True).complete_review(a, decision)
     env.submitted.clear()
     env.add("outside-b", 9)
@@ -454,7 +455,7 @@ def test_missing_submission_receipt_cannot_be_counted_complete(tmp_path, monkeyp
     env = RepairEnvironment(tmp_path, monkeypatch)
     a = env.seed("selected-a", 8)
     decision = tmp_path / "decision.json"
-    decision.write_text(json.dumps(_needs_human_decision(json.loads(a.read_text()))))
+    decision.write_text(json.dumps(_needs_human_decision(attempt_state.read_action(a))))
     cli._live_flow_engine(controlled=True).complete_review(a, decision)
     a.with_name("execution-receipt.json").unlink()
     with pytest.raises(ValueError, match="production_target_resume_invalid"):

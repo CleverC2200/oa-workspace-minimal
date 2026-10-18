@@ -679,6 +679,7 @@ def validate_collecting(flows, attempt, state):
                 'review-decision.json', 'remark.txt', 'submission-envelope.json'))):
         raise ValueError()
     claim_state = dict(state)
+    claim_state.pop('action_reference_sha256', None)
     if (state.get('recovered_from_attempt') is not None or state.get('recovery_receipt_fingerprint') is not None
             or os.path.lexists(attempt / recovery_receipt.NAME)):
         if recovery_receipt.projection(attempt, state).get('receipt_status') != 'verified':
@@ -689,34 +690,35 @@ def validate_collecting(flows, attempt, state):
     fields = ('material_file', 'review_packet_file', 'material_fingerprint', 'evidence_fingerprint')
     frozen = {key: state.get(key) for key in fields}
     has_frozen = any(value is not None for value in frozen.values())
-    if action.get('execution_state') == 'collecting':
-        # Preparation enriches only state with the four frozen fields; the original
-        # claim, including any recovery provenance, remains unchanged in action.
-        if claim_state != action and (not has_frozen or claim_state != {**action, **frozen}):
+    if 'action_reference_sha256' not in state:
+        if action.get('execution_state') == 'collecting':
+            # Preparation enriches only state with the four frozen fields; the original
+            # claim, including any recovery provenance, remains unchanged in action.
+            if claim_state != action and (not has_frozen or claim_state != {**action, **frozen}):
+                raise ValueError()
+        elif action.get('execution_state') == 'review_required':
+            # action is written immediately before state. The saved collecting state
+            # remains unwritten; validate this exact public action contract, not a grant.
+            mode = action.get('mode')
+            fingerprint = action.get('authorization_fingerprint')
+            token = action.get('action_token')
+            if (not has_frozen or mode not in {'preview', 'controlled_write'}
+                    or not isinstance(fingerprint, str) or not fingerprint.startswith('sha256:')
+                    or not isinstance(token, str) or not token):
+                raise ValueError()
+            expected = flow_engine._action_payload(action='review_required', execution_state='review_required',
+                business_state='not_available', write_state='authorized' if mode == 'controlled_write' else 'not_requested',
+                workflow_key=state['workflow_key'], mode=mode, write_authorized=mode == 'controlled_write',
+                authorization_fingerprint=fingerprint, action_token=token, action_file=str(attempt / 'action.json'),
+                state_file=str(attempt / 'state.json'), review_packet_file=str(attempt / 'review-packet.json'),
+                events_file=str(attempt / 'observability.json'), case_key=state['case_key'], attempt=state['attempt'],
+                **({'rule_version':flow_engine._FLOW_SPECS[state['workflow_key']]['rule_version']}
+                    if state['workflow_key'] in flow_engine._EXPLICIT_RULE_VERSION_WORKFLOWS else {}),
+                **{key:state[key] for key in ('recovered_from_attempt', 'recovery_reason', 'recovery_no_write_evidence') if key in state})
+            if action != expected:
+                raise ValueError()
+        else:
             raise ValueError()
-    elif action.get('execution_state') == 'review_required':
-        # action is written immediately before state. The saved collecting state
-        # remains unwritten; validate this exact public action contract, not a grant.
-        mode = action.get('mode')
-        fingerprint = action.get('authorization_fingerprint')
-        token = action.get('action_token')
-        if (not has_frozen or mode not in {'preview', 'controlled_write'}
-                or not isinstance(fingerprint, str) or not fingerprint.startswith('sha256:')
-                or not isinstance(token, str) or not token):
-            raise ValueError()
-        expected = flow_engine._action_payload(action='review_required', execution_state='review_required',
-            business_state='not_available', write_state='authorized' if mode == 'controlled_write' else 'not_requested',
-            workflow_key=state['workflow_key'], mode=mode, write_authorized=mode == 'controlled_write',
-            authorization_fingerprint=fingerprint, action_token=token, action_file=str(attempt / 'action.json'),
-            state_file=str(attempt / 'state.json'), review_packet_file=str(attempt / 'review-packet.json'),
-            events_file=str(attempt / 'observability.json'), case_key=state['case_key'], attempt=state['attempt'],
-            **({'rule_version':flow_engine._FLOW_SPECS[state['workflow_key']]['rule_version']}
-                if state['workflow_key'] in flow_engine._EXPLICIT_RULE_VERSION_WORKFLOWS else {}),
-            **{key:state[key] for key in ('recovered_from_attempt', 'recovery_reason', 'recovery_no_write_evidence') if key in state})
-        if action != expected:
-            raise ValueError()
-    else:
-        raise ValueError()
     validation_state = state
     if state['workflow_key'] in flow_engine._EXPLICIT_RULE_VERSION_WORKFLOWS:
         version = flow_engine._FLOW_SPECS[state['workflow_key']]['rule_version']

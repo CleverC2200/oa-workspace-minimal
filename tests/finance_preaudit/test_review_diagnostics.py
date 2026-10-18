@@ -7,7 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from apps.oa_finance_preaudit import decision_validation, flow_engine
+from apps.oa_finance_preaudit import attempt_state, decision_validation, flow_engine
 from tests.finance_preaudit.test_flow_engine_submission import _material
 
 
@@ -57,7 +57,7 @@ def test_saved_context_verifies_original_schema_and_binding(tmp_path):
 
     action = frozen_attempt(tmp_path)
     context = review_context.capture(action, codex_review_worker._decision_schema(action))
-    value = _needs_human_decision(json.loads(action.read_text()))
+    value = _needs_human_decision(attempt_state.read_action(action))
     raw = json.dumps(value).encode()
     digest = hashlib.sha256(raw).hexdigest()
     path = action.with_name(f"review-output-{digest}.txt")
@@ -144,7 +144,7 @@ def test_historical_context_gaps_are_not_filled(tmp_path, damage):
     from apps.oa_finance_preaudit import review_diagnostics
     from tests.finance_preaudit.test_flow_engine_submission import _needs_human_decision
     a = frozen_attempt(tmp_path)
-    p = with_context(a, json.dumps(_needs_human_decision(json.loads(a.read_text()))).encode())
+    p = with_context(a, json.dumps(_needs_human_decision(attempt_state.read_action(a))).encode())
     ctx = next(a.parent.glob('review-context-*'))
     if damage == "context":
         ctx.write_bytes(ctx.read_bytes() + b' ')
@@ -195,7 +195,7 @@ def test_replay_never_calls_business_ports(tmp_path, monkeypatch):
     from apps.oa_approval import auth, runtime_control
     from tests.finance_preaudit.test_flow_engine_submission import _needs_human_decision
     a = frozen_attempt(tmp_path)
-    p = with_context(a, json.dumps(_needs_human_decision(json.loads(a.read_text()))).encode())
+    p = with_context(a, json.dumps(_needs_human_decision(attempt_state.read_action(a))).encode())
     def forbidden(*args, **kwargs):
         raise AssertionError("business or model port must not run")
     monkeypatch.setattr(auth, "load_local_env", forbidden)
@@ -227,7 +227,7 @@ def test_unsafe_frozen_input_blocks_replay(tmp_path, damage, parsed):
     from apps.oa_finance_preaudit import review_diagnostics
     from tests.finance_preaudit.test_flow_engine_submission import _needs_human_decision
     a = frozen_attempt(tmp_path)
-    raw = with_context(a, json.dumps(_needs_human_decision(json.loads(a.read_text()))).encode() if parsed else b'not-json')
+    raw = with_context(a, json.dumps(_needs_human_decision(attempt_state.read_action(a))).encode() if parsed else b'not-json')
     material = a.with_name('material.json')
     if damage == 'permissions':
         material.chmod(0o666)
@@ -256,7 +256,7 @@ def test_schema_pass_does_not_claim_flow_engine_decision_contract(tmp_path):
     from apps.oa_finance_preaudit import review_diagnostics
     from tests.finance_preaudit.test_flow_engine_submission import _needs_human_decision
     a = frozen_attempt(tmp_path)
-    value = _needs_human_decision(json.loads(a.read_text()))
+    value = _needs_human_decision(attempt_state.read_action(a))
     value['items'] = []
     raw = with_context(a, json.dumps(value).encode())
     result = review_diagnostics.replay(raw, a)

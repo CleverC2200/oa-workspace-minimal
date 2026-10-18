@@ -296,6 +296,15 @@ def test_target_owned_current_validators_check_policy_and_pending_frozen_preview
                     ('collecting_files' in scenario and payload.get('execution_state') == 'collecting' and payload.get('material_file'))
                     or ('collecting_review_action' in scenario and payload.get('execution_state') == 'review_required')
                 ):
+                    if 'collecting_review_action' in scenario:
+                        from apps.oa_finance_preaudit import attempt_state
+                        reference_path = Path(target).with_name('action.json')
+                        raw = reference_path.read_bytes()
+                        legacy = attempt_state.view(reference_path, json.loads(raw), raw=raw, state=payload)
+                        saved = json.loads(Path(target).read_bytes())
+                        saved.pop('action_reference_sha256')
+                        real_write(reference_path, legacy)
+                        real_write(target, saved)
                     raise KeyboardInterrupt('pause-between-files')
                 return real_write(target, payload, **kwargs)
             with monkeypatch.context() as interrupt:

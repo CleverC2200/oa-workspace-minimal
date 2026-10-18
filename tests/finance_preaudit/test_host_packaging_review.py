@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from apps.oa_finance_preaudit import attempt_state
+
 import hashlib
 import json
 import time
@@ -438,7 +440,7 @@ def test_public_completion_reports_confirmed_write_when_local_marker_seal_fails(
     output = json.loads(capsys.readouterr().out)
     assert code == 1 and output['action'] == 'closed' and output['write_state'] == 'submitted'
     assert output['completion_seal'] == {'status': 'failed', 'error_code': 'packaging_completion_seal_failed', 'stop_requested': True}
-    assert len(calls) == 1 and json.loads(action.read_text())['write_state'] == 'submitted'
+    assert len(calls) == 1 and attempt_state.read_action(action)['write_state'] == 'submitted'
     assert host.runtime_control.stop_requested()
     parent = child.with_name('parent.jsonl')
     line = native_call(parent, 'list_agents', {}, 'native-after-seal-failure', {'agents': [
@@ -447,7 +449,7 @@ def test_public_completion_reports_confirmed_write_when_local_marker_seal_fails(
         host.close(owner=owner, source=parent, source_line=line)
     if seal_failure != 'registry':
         assert host.close(owner=owner, reason='cancelled')['state'] == 'cancelled'
-    assert len(calls) == 1 and json.loads(action.read_text())['write_state'] == 'submitted'
+    assert len(calls) == 1 and attempt_state.read_action(action)['write_state'] == 'submitted'
 
 
 def test_app_completion_seals_request_round_without_inherited_controller_environment(package_round, monkeypatch):

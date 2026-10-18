@@ -14,6 +14,7 @@ from typing import Callable
 from apps import json_artifact
 from apps.oa_approval import auth, runtime_control, writer_api, writer_outcomes
 
+from . import attempt_state
 from . import concurrency_control, flow_engine, manual_handoff, submission
 
 
@@ -584,6 +585,7 @@ def _verify_submit_gate(
         or state.get("submission_token") != job["submission_token"]
     ):
         raise ValueError("submission_job_invalid")
+    attempt_state.read_action(attempt_root / "action.json", state=state)
     submission.verify_persisted_authorization(
         state,
         verifier=authorization_verifier,
