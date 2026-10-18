@@ -29,7 +29,8 @@ def original_transport(monkeypatch, tmp_path):
     page.insert_text((40, 40), 'Original invoice ' + NUMBER)
     state = SimpleNamespace(
         client=client, workflow=workflow, initialized=False, requests=[], actor='77',
-        main_file='202', still_denied=False, pdf=document.tobytes(),
+        main_file='202', still_denied=False, pdf=document.tobytes(), cloud_pdf=None,
+        after_cloud_download=None, cloud_failure=None, cloud_headers={},
         detail={'id': '9001', 'fid': '9001', 'number': NUMBER,
                 'flist': [{'id': '8001', 'type': 'pdf', 'size': 0, 'del': 0}],
                 'modify_info': {'pdf': '8001', 'furl': '8001'},
@@ -49,6 +50,7 @@ def original_transport(monkeypatch, tmp_path):
         def __init__(self, body, url):
             super().__init__(body)
             self.url = url
+            self.headers = {'Content-Type': 'application/pdf', 'Content-Length': str(len(body))}
 
         def geturl(self):
             return self.url
@@ -59,6 +61,22 @@ def original_transport(monkeypatch, tmp_path):
         state.requests.append((path, params, request.get_header('Cookie')))
         if request.full_url == invoice_buyers.DETAIL_URL:
             body = {'actionMsg': {'code': '0'}, 'data': state.detail}
+        elif path == '/invoiceApi/file/download':
+            assert urlsplit(request.full_url).hostname == 'api.mypiaojia.com'
+            assert params == {'id': ['8001'], 'fid': ['9001'], 'dataId': ['101'],
+                              'token': ['synthetic-token']}
+            assert request.get_header('Cookie') is None
+            if state.cloud_failure == 'http':
+                from urllib.error import HTTPError
+                raise HTTPError(request.full_url, 403, 'forbidden', {}, None)
+            if state.cloud_failure == 'redirect':
+                from apps.oa_approval.invoice_originals import _NoCloudRedirect
+                return _NoCloudRedirect().redirect_request(request, None, 302, '', {}, 'https://other.invalid/collect')
+            if state.after_cloud_download:
+                state.after_cloud_download()
+            response = Response(state.cloud_pdf or b'{"actionMsg":{"code":"denied"}}', request.full_url)
+            response.headers.update(state.cloud_headers)
+            return response
         elif path == '/api/hrm/login/getAccountList':
             body = {'data': {'userid': state.actor}}
         elif path == '/api/doc/detail/basicInfo':
@@ -101,6 +119,52 @@ def test_collect_reads_linked_original_body_via_native_context(original_transpor
     downloads = [r for r in state.requests if r[0] == '/weaver/weaver.file.FileDownload']
     assert len(downloads) == 2 and downloads[0] == downloads[1]
     assert 'session=fixed' not in json.dumps(material, default=str)
+
+
+def test_collect_reads_cloud_original_when_native_document_remains_denied(original_transport, tmp_path):
+    state = original_transport
+    state.still_denied = True
+    state.cloud_pdf = state.pdf
+    material = collect_original(state, tmp_path)
+    invoice = material['invoice_evidence']['invoices'][0]
+    assert invoice['body_read_status'] == 'content_read'
+    assert invoice['files'][0]['original_source']['cloud_file_id'] == '8001'
+    assert material['prepared']['manifest'][0]['page_count'] == 1
+    assert NUMBER in material['prepared']['structured_contents'][0]['key_text'][0]
+    assert sum(r[0] == '/invoiceApi/file/download' for r in state.requests) == 1
+    assert 'synthetic-token' not in json.dumps(material, default=str)
+    assert not any('synthetic-token' in p.read_text(errors='ignore')
+                   for p in (tmp_path / 'attachments').rglob('*.json'))
+
+
+def test_cloud_body_is_not_prepared_after_linked_file_changes(original_transport, tmp_path):
+    state = original_transport
+    state.still_denied = True
+    state.cloud_pdf = state.pdf
+    state.after_cloud_download = lambda: state.detail['modify_info'].update(furl='8002')
+    with pytest.raises(RuntimeError, match='^resource_ownership_untrusted$'):
+        collect_original(state, tmp_path)
+    assert not list((tmp_path / 'attachments').rglob('*.cloud.part'))
+    assert not list((tmp_path / 'prepared').rglob('*.png'))
+
+
+@pytest.mark.parametrize('failure', ['json', 'truncated', 'oversized', 'http', 'redirect'])
+def test_cloud_failure_keeps_collection_unavailable(original_transport, tmp_path, monkeypatch, failure):
+    from apps.oa_approval import invoice_originals
+    state = original_transport
+    state.still_denied = True
+    state.cloud_pdf = b'{}' if failure == 'json' else state.pdf
+    if failure == 'truncated':
+        state.cloud_headers['Content-Length'] = str(len(state.pdf) + 1)
+    if failure == 'oversized':
+        monkeypatch.setattr(invoice_originals, '_MAX_ORIGINAL_BYTES', 16)
+    state.cloud_failure = failure
+    expected = {'http': 'attachment_access_denied', 'redirect': 'attachment_download_failed'}.get(
+        failure, 'attachment_content_incomplete')
+    with pytest.raises(RuntimeError, match='^' + expected + '$'):
+        collect_original(state, tmp_path)
+    assert sum(r[0] == '/invoiceApi/file/download' for r in state.requests) == 1
+    assert not list((tmp_path / 'attachments').rglob('*.cloud.part'))
 
 
 @pytest.mark.parametrize('change', ['request', 'record', 'number', 'cloud_file', 'doc', 'main_file', 'actor'])
@@ -229,10 +293,13 @@ def test_original_body_uses_shared_finance_collection(workflow_key, original_tra
     assert material['prepared']['images']
 
 
-def test_original_body_enters_frozen_review_input_and_tampering_is_rejected(original_transport, tmp_path):
+@pytest.mark.parametrize('cloud_fallback', [False, True])
+def test_original_body_enters_frozen_review_input_and_tampering_is_rejected(original_transport, tmp_path, cloud_fallback):
     from pathlib import Path
     from apps.oa_finance_preaudit import flow_engine, read_material
     state = original_transport
+    state.still_denied = cloud_fallback
+    state.cloud_pdf = state.pdf if cloud_fallback else None
     engine = flow_engine.FlowEngine(
         root=tmp_path / 'runtime' / 'finance_preaudit_flows',
         discover_candidates=lambda key: [{'request_id': '101', 'workflow_key': key,
