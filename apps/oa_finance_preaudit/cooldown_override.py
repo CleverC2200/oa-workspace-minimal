@@ -10,7 +10,7 @@ import time
 from uuid import UUID
 
 from apps.oa_approval import runtime_control
-from . import approval_guard as guard, maintenance_runtime, production_config, production_release
+from . import approval_guard as guard, maintenance_runtime, production_config, production_release, controller_handoff
 
 MANIFEST_ENV = "OA_CONTROLLER_EXECUTION_MANIFEST_FILE"
 
@@ -174,7 +174,7 @@ def one_round(project_root: Path, *, owner_task_id: str, invocation_id: str,
                 or runtime_control.stop_reason() != guard.STOP_REASON):
             raise ValueError("approval_cooldown_override_stop_invalid")
         value = guard.cooldown()
-        manifest = runtime_control.read_control_bytes(root / "runtime/control/rolling-controller-manifest.json")
+        manifest = controller_handoff.manifest_snapshot(root / "runtime/control/rolling-controller-manifest.json")
         report = maintenance_runtime.read_original_execution(root, original, official_stop_source_only=True)
         maintenance_runtime.assert_original_execution_safe(root, original, report, manifest, official_stop_source_only=True)
         snapshot = maintenance_runtime.read_live_status(root, require_reaped=True)

@@ -74,6 +74,11 @@ if not Path(finance_preaudit_run.__file__).resolve().is_relative_to(root):
 path, owner, session = sys.argv[1:4]
 report = finance_preaudit_run.read_execution(Path(path), owner_task_id=owner,
     invocation_id=Path(path).parent.name, tool_session_id=session)
+def active_manifest(file):
+    value = json.loads(finance_preaudit_run._read_evidence(file))
+    if value.get('kind') == 'preaudit_controller_execution_pointer':
+        return finance_preaudit_run.controller_handoff._read_manifest(file)
+    return value
 '''
 
 
@@ -121,7 +126,7 @@ if (saved.get('state') != 'waiting' or saved.get('exit_code') is not None
         or saved.get('completed_at') is not None or saved.get('result') is not None
         or type(saved.get('supervisor_pid')) is not int or saved['supervisor_pid'] < 1
         or guard.process_identity(saved['supervisor_pid']) is not None
-        or mirror != json.loads(finance_preaudit_run._read_evidence(rolling))
+        or mirror != active_manifest(rolling)
         or mirror.get('state') != 'failed' or mirror.get('children_reaped') is not True):
     raise ValueError('maintenance_original_execution_untrusted')
 progress = lifecycle._progress(mirror)
@@ -166,7 +171,7 @@ if (any(fingerprints[str(file)] is None for file in required)
         or fingerprints != {str(file):fingerprint(file) for file in files}
         or saved != json.loads(finance_preaudit_run._read_evidence(path))
         or mirror != json.loads(finance_preaudit_run._read_evidence(path.with_name('controller-manifest.json')))
-        or mirror != json.loads(finance_preaudit_run._read_evidence(rolling))
+        or mirror != active_manifest(rolling)
         or progress != lifecycle._progress(mirror)
         or historical != historical_actions()
         or report != finance_preaudit_run.read_execution(path, owner_task_id=owner,
@@ -193,7 +198,7 @@ rolling = root / 'runtime/control/rolling-controller-manifest.json'
 mirror = json.loads(finance_preaudit_run._read_evidence(path.with_name('controller-manifest.json')))
 if (report.get('state') != 'exited' or report.get('terminal') is not True
         or type(report.get('exit_code')) is not int or report['exit_code'] == 0
-        or mirror != json.loads(finance_preaudit_run._read_evidence(rolling))
+        or mirror != active_manifest(rolling)
         or mirror.get('state') != 'failed' or mirror.get('children_reaped') is not True
         or type(saved.get('supervisor_pid')) is not int
         or guard.process_identity(saved['supervisor_pid']) is not None):
@@ -325,11 +330,18 @@ def read_original_execution(target_root: Path, original: OriginalExecution, *,
 
 
 def assert_original_execution_safe(target_root: Path, original: OriginalExecution,
-                                   report: dict, manifest: bytes, *, supervisor_loss_source_only: bool = False,
+                                   report: dict, manifest: bytes | tuple, *, supervisor_loss_source_only: bool = False,
                                    official_stop_source_only: bool = False) -> None:
     """Bind terminal readback to the unchanged controller and require its group idle."""
     try:
-        saved = json.loads(manifest)
+        saved = json.loads(controller_handoff.manifest_payload(manifest))
+        if isinstance(manifest, tuple):
+            active = json.loads(manifest[0])
+            if (controller_handoff.manifest_snapshot(target_root / "runtime/control/rolling-controller-manifest.json") != manifest
+                    or (active.get("kind") == "preaudit_controller_execution_pointer"
+                        and (active["invocation_id"] != original.file.parent.name
+                             or active["owner_task_id"] != original.owner_task_id))):
+                raise RuntimeError("maintenance_original_execution_untrusted")
         if (not isinstance(saved, dict) or not isinstance(report, dict)
                 or original.file.name != 'execution.json'
                 or original.file.parent.parent != target_root / 'runtime/control/executions'

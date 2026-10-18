@@ -15,7 +15,7 @@ import tomllib
 from typing import Callable
 
 from apps.oa_approval import runtime_control
-from . import maintenance_runtime
+from . import maintenance_runtime, controller_handoff
 
 ORIGIN = 'https://github.com/CleverC2200/oa-workspace-minimal.git'
 _REVISION = re.compile(r'^[0-9a-f]{40}$')
@@ -345,8 +345,8 @@ def release_source(
         source_only_proof=material_proof or withdrawal_proof or loss_proof, official_stop_proof=official_proof,
         allow_admission_blocked=allow_admission_blocked))
     manifest_file = root / 'runtime/control/rolling-controller-manifest.json'
-    manifest = runtime_control.read_control_bytes(manifest_file)
-    if manifest is None:
+    manifest = controller_handoff.manifest_snapshot(manifest_file)
+    if controller_handoff.manifest_payload(manifest) is None:
         raise RuntimeError('production_release_manifest_missing')
     sync_started = False
     pre_sync_evidence = {}
@@ -397,7 +397,7 @@ def release_source(
             if pre_sync_inputs and pre_sync_inputs.get('admission_blocked_actions'):
                 pre_sync_evidence = {'pre_sync_status_file': pre_sync_status,
                     'pre_sync_current_input_proof': pre_sync_inputs}
-            if runtime_control.read_control_bytes(manifest_file) != manifest:
+            if controller_handoff.manifest_snapshot(manifest_file) != manifest:
                 raise RuntimeError('production_release_manifest_changed')
             if _source(root, expected_revision, expected_origin) != before:
                 raise RuntimeError('production_release_source_changed')
@@ -427,7 +427,7 @@ def release_source(
             findings = configuration(root, expected_revision)
             if findings:
                 raise RuntimeError('production_release_configuration_invalid:' + ','.join(findings))
-            if runtime_control.read_control_bytes(manifest_file) != manifest:
+            if controller_handoff.manifest_snapshot(manifest_file) != manifest:
                 raise RuntimeError('production_release_manifest_changed')
             if stopped_maintenance:
                 report = original_readback()

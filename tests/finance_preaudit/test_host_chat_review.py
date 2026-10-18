@@ -573,14 +573,14 @@ def test_submission_rejects_untrusted_exchange_without_publishing(exchange, monk
     elif damage == 'run':
         original_manifest = dict(manifest)
         changed = {**manifest, 'run_id': uuid4().hex}
-        host.guard.write(controller_handoff.manifest_file(), changed)
+        host.guard.write(controller_handoff.manifest_file().parent / 'executions' / manifest['invocation_id'] / 'controller-manifest.json', changed)
     else:
         value = json.loads(request.read_text()); value['expires_at'] = 0
         json_artifact.write_json_atomic(request, value)
     with pytest.raises((ValueError, KeyError)):
         host.submit(request, draft, owner=owner, source=source, source_line=2)
     if damage == 'run':
-        host.guard.write(controller_handoff.manifest_file(), original_manifest)
+        host.guard.write(controller_handoff.manifest_file().parent / 'executions' / manifest['invocation_id'] / 'controller-manifest.json', original_manifest)
     assert not request.with_name(request.name.replace(host.REQUEST, host.SUBMISSION)).exists()
     monkeypatch.setattr(runtime_control, 'stop_requested', lambda: True)
     thread.join(3)
@@ -943,13 +943,13 @@ def test_bootstrap_observation_grace_is_bounded_by_the_original_manifest_clock(e
     assert not runtime_control.stop_requested()
     original = dict(manifest)
     expired = {**manifest, 'started_at': (datetime.now(timezone.utc) - timedelta(seconds=901)).isoformat()}
-    host.guard.write(controller_handoff.manifest_file(), expired)
+    host.guard.write(controller_handoff.manifest_file().parent / 'executions' / manifest['invocation_id'] / 'controller-manifest.json', expired)
     try:
         with pytest.raises(ValueError, match='parent_lost'):
             host.assert_round_alive(owner=owner, manifest=expired)
         assert runtime_control.stop_requested()
     finally:
-        host.guard.write(controller_handoff.manifest_file(), original)
+        host.guard.write(controller_handoff.manifest_file().parent / 'executions' / manifest['invocation_id'] / 'controller-manifest.json', original)
 
 
 def test_round_observer_cannot_accept_a_different_controller_instance(exchange):

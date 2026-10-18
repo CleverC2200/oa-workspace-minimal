@@ -9,7 +9,7 @@ from pathlib import Path
 import secrets
 
 from apps.oa_approval import runtime_control
-from . import maintenance_runtime, production_release
+from . import maintenance_runtime, production_release, controller_handoff
 
 BLOCKED = 'shutdown_stop_recovery_blocked'
 
@@ -221,7 +221,7 @@ def recover(*, target_root: Path, expected_revision: str, original: maintenance_
             bound = _bound(target, original, begin_line)
             if revision != bound['execution']['code_revision']:
                 raise ValueError(BLOCKED)
-            manifest = runtime_control.read_control_bytes(target / 'runtime/control/rolling-controller-manifest.json')
+            manifest = controller_handoff.manifest_snapshot(target / 'runtime/control/rolling-controller-manifest.json')
             maintenance_runtime.assert_original_execution_safe(target, original, bound['execution'], manifest)
             snapshot = maintenance_runtime.read_live_status(
                 target, require_reaped=True, source_only_proof=source_only_proof,

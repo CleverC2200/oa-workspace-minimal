@@ -11,6 +11,8 @@ import re
 
 import pytest
 
+from tests.finance_preaudit.controller_helpers import _write_failed_unreaped_manifest
+
 from apps import json_artifact
 from apps.oa_approval import runtime_control
 from apps.oa_finance_preaudit import approval_guard, cli, controller_handoff
@@ -234,37 +236,6 @@ def test_unreaped_pipeline_blocks_terminal_handoff(
 
     assert runtime_control.stop_requested() is True
 
-
-def _write_failed_unreaped_manifest(
-    path: Path,
-    *,
-    controller_pid: int = 999999,
-) -> None:
-    path.parent.mkdir(parents=True)
-    json_artifact.write_json_atomic(
-        path,
-        {
-            "schema_version": 1,
-            "kind": "preaudit_controller_run_manifest",
-            "state": "failed",
-            "run_id": "0" * 32,
-            "started_at": "2026-08-25T00:00:00+00:00",
-            "completed_at": "2026-08-25T00:10:00+00:00",
-            "controller_pid": controller_pid,
-            "controller_instance_id": "1" * 32,
-            "previous_run_id": None,
-            "previous_controller_instance_id": None,
-            "code_revision": "0" * 40,
-            "code_dirty": False,
-            "config_fingerprint": "sha256:" + "0" * 64,
-            "restart_mode": "fresh_process",
-            "controller_lock_verified": True,
-            "writer_inactive_at_start": True,
-            "children_reaped": False,
-            "restart_verified": True,
-            "health": "degraded",
-        },
-    )
 
 
 def test_confirmed_legacy_handoff_without_ownership_remains_blocked(
@@ -542,7 +513,7 @@ def test_orphan_recovery_preserves_original_and_requires_locked_live_gates(monke
     )
     assert result["status"] == "recovered"
     assert json.loads(Path(result["evidence_file"]).read_text()) == original
-    manifest = json.loads(controller_handoff.manifest_file().read_text())
+    manifest = controller_handoff._read_manifest()
     assert manifest["state"] == "failed"
     assert manifest["children_reaped"] is True
     assert manifest["health"] == "degraded"
@@ -742,20 +713,47 @@ def test_failed_recovery_preserves_retry_after_finalization_failure(monkeypatch,
     def failed_clear(**kwargs):
         if failure == "clear_refused": return False
         raise OSError("simulated clear failure")
-    def replacing_write(manifest):
-        write(manifest)
+    def replacing_write(manifest, **options):
+        result = write(manifest, **options)
         if manifest["children_reaped"]:
             runtime_control.stop_file().unlink()
             runtime_control.request_cycle_stop()
+        return result
     if failure == "replaced_stop": monkeypatch.setattr(controller_handoff, "_write_manifest", replacing_write)
     else: monkeypatch.setattr(runtime_control, "clear_cycle_stop", failed_clear)
     check = lambda: {"live_check": _live_status(), "reconciliation": _clear_reconciliation()}
     with pytest.raises((OSError, ValueError), match="failure|blocked"):
         controller_handoff.recover_orphaned_run(confirmed_children_reaped=True, mode="failed", check_live=check)
     assert runtime_control.stop_reason() == "controller_cycle_stop"
-    assert json.loads(controller_handoff.manifest_file().read_bytes()) == value
+    current = controller_handoff._read_manifest()
+    assert {key: current[key] for key in value} == value
+    archive = controller_handoff.manifest_file().with_name(
+        f"legacy-controller-manifest-{value['run_id']}-{value['controller_instance_id']}.json")
+    assert json.loads(archive.read_bytes()) == value
     monkeypatch.setattr(controller_handoff, "_write_manifest", write)
     monkeypatch.setattr(runtime_control, "clear_cycle_stop", clear)
     assert controller_handoff.recover_orphaned_run(
         confirmed_children_reaped=True, mode="failed", check_live=check,
     )["status"] == "recovered"
+
+
+@pytest.mark.parametrize("pointer", [False, True])
+def test_orphan_recovery_keeps_manifest_source_pinned_across_live_check(monkeypatch, pointer):
+    manifest = _orphan(monkeypatch)
+    path = controller_handoff.manifest_file()
+    if pointer:
+        manifest.update(owner_task_id=None, invocation_id="2" * 32)
+        authority = path.parent / "executions" / manifest["invocation_id"] / "controller-manifest.json"
+        authority.parent.mkdir(parents=True)
+        json_artifact.write_json_atomic(authority, manifest)
+        json_artifact.write_json_atomic(path, {"schema_version": 1, "kind": "preaudit_controller_execution_pointer",
+            **{key: manifest[key] for key in ("owner_task_id", "invocation_id", "run_id", "controller_instance_id")}})
+    else:
+        authority = path
+    original = path.read_bytes(), authority.read_bytes()
+    def live():
+        runtime_control.write_control_bytes_atomic(authority, authority.read_bytes())
+        return {"live_check": _live_status(), "reconciliation": _clear_reconciliation()}
+    with pytest.raises(ValueError, match="controller_handoff_recovery_blocked"):
+        controller_handoff.recover_orphaned_run(confirmed_children_reaped=True, check_live=live)
+    assert (path.read_bytes(), authority.read_bytes()) == original
