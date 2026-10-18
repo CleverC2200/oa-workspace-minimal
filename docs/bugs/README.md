@@ -16,6 +16,7 @@
 
 | 领域 | 症状 / 搜索词 | 主记录或历史组件 | 回归 / 经验入口 |
 |---|---|---|---|
+| CI 重跑证据 | 同名旧失败 artifact、failed-only rerun、run_attempt、汇总旧时钟超时 | [#540](https://github.com/CleverC2200/oa-workspace-minimal/issues/540) | [CI 证据回归](../../tests/finance_preaudit/test_ci_evidence.py)、[质量检查](../agents/quality-checks.md)；按 job 输出的 artifact ID 和 attempt 选择，正确性复用与本次计时分别核验 |
 | 发票云原件正文 | body_read_status、原件未读、云文件与 OA 文档映射 | [#556](https://github.com/CleverC2200/oa-workspace-minimal/issues/556) | [真实采集入口回归](../../tests/finance_preaudit/test_invoice_original_bodies.py)、[来源合同](../agents/oa-api.md)；字段、文件记录、正文准备与业务审核分别验收 |
 | 发票原件下载拒绝 | attachment_access_denied、原生详情可下载、发票云文件读取 | [#569](https://github.com/CleverC2200/oa-workspace-minimal/issues/569) | [正常采集及失败反例](../../tests/finance_preaudit/test_invoice_original_bodies.py)、[原件读取合同](../agents/oa-api.md#关联发票原件读取)；OA 文档初始化成功不证明原件可下载 |
 | DeepSeek 附件转写 | attachment_response_incomplete、默认思考、8192 Token、length、空回答 | [#529](https://github.com/CleverC2200/oa-workspace-minimal/issues/529) | [HTTP 识别回归](../../tests/finance_preaudit/test_attachment_recognition.py)、[附件读取合同](../agents/attachment-recognition.md)；历史报告未保存终止原因，根因归属与新版本验证分别记录 |
