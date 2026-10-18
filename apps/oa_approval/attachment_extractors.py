@@ -44,6 +44,7 @@ SUCCESSFUL_PREPARATION_STATUSES = {
     "ofd_invoice_read",
     "pdf_rendered",
     "spreadsheet_read",
+    "video_rendered",
     "xml_invoice_read",
 }
 
@@ -753,6 +754,25 @@ def _prepare_one_attachment(
                 "image_count": 1,
             }
         )
+    elif suffix == ".mp4":
+        from apps.oa_approval import silent_video
+
+        pages, video = silent_video.render(
+            path, out_dir=out_dir, prefix=safe_name(resource_id, path.stem),
+            source_sha256=source_content_sha256,
+        )
+        images.extend({**base, **page} for page in pages)
+        manifest.append({"resource_id": resource_id, "name": name,
+                         "status": "video_rendered", "image_count": len(pages), **video})
+        structured_contents.append({
+            "resource_id": resource_id, "name": name,
+            "source_content_sha256": source_content_sha256,
+            "document_type": "video", **video,
+            "summary": f"完整解码 {video['frame_count']} 帧，按时间顺序每图最多两帧，保持原始像素。",
+            "key_text": [f"audio_state={video['audio_state']}",
+                         f"duration_seconds={video['duration_seconds']}",
+                         f"frame_count={video['frame_count']}"],
+        })
     elif suffix in PDF_EXTS or suffix in {".doc", ".pptx"}:
         renderer = render_office_document if suffix in {".doc", ".pptx"} else render_pdf
         try:
