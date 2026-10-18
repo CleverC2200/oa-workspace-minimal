@@ -394,9 +394,10 @@ def test_app_completion_seals_request_round_without_inherited_controller_environ
     from tests.finance_preaudit.test_flow_engine_packaging import _engine
     receipt = ready_draft(package_round)
     semantic_accept(receipt, package_round)
-    monkeypatch.delenv(host.guard.RUN_ENV, raising=False)
-    monkeypatch.delenv(host.guard.INSTANCE_ENV, raising=False)
-    result = packaging.complete_host(receipt, project_root=package_round[1], confirm_write=True,
-        engine=_engine(package_round[1] / 'runtime/finance_preaudit_flows'))
+    with monkeypatch.context() as context:
+        context.delenv(host.guard.RUN_ENV, raising=False)
+        context.delenv(host.guard.INSTANCE_ENV, raising=False)
+        result = packaging.complete_host(receipt, project_root=package_round[1], confirm_write=True,
+            engine=_engine(package_round[1] / 'runtime/finance_preaudit_flows'))
     assert result['action'] == 'closed'
     assert result.get('completion_seal', {}).get('status') != 'failed'
