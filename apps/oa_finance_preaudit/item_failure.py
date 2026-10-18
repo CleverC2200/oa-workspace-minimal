@@ -146,4 +146,10 @@ def verified_receipt(root: Path, state: dict) -> dict | None:
 
 def isolated(root: Path, state: dict) -> bool:
     receipt = verified_receipt(root, state)
-    return receipt is not None and receipt["scope"] == "item"
+    if receipt is not None:
+        return receipt["scope"] == "item"
+    failure = evidence.read_receipt(root / "review-failure.json")
+    return (not os.path.lexists(root / RECEIPT_FILE)
+            and isinstance(failure, dict) and failure.get("schema_version") == 1
+            and state.get("reason") == "codex_review_failed"
+            and evidence.trusted_quarantine(root, state))

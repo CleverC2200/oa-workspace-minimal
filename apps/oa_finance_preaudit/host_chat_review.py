@@ -523,6 +523,25 @@ def request_abort_stop(value: dict) -> None:
     runtime_control.request_cycle_stop()
 
 
+def _requests_terminal(value: dict) -> bool:
+    from . import item_failure
+
+    for request_id, published in value.get('requests', {}).items():
+        proof = value.get('request_failures', {}).get(request_id)
+        if proof is not None:
+            action = Path(proof['action_file'])
+            current = _unwritten_action(action)
+            if (proof['request_file'] != published['request_file']
+                    or verified_failure(action, _failed_result(proof)) is None
+                    or current.get('mode') == 'controlled_write'
+                    or current.get('action') == 'needs_admin' and not item_failure.isolated(
+                        action.parent, _read(action.with_name('state.json'))[1])):
+                return False
+        elif value['assignments'].get(request_id, {}).get('state') != 'submitted':
+            return False
+    return True
+
+
 def close(*, owner: str, reason: str = 'completed', source: Path | None = None, source_line: int | None = None, run_id: str | None = None) -> dict:
     """Close the exchange; cancellation never signals the Writer process."""
     if reason not in {'completed', 'cancelled', 'parent_lost', 'reviewer_failed'}:
@@ -536,7 +555,7 @@ def close(*, owner: str, reason: str = 'completed', source: Path | None = None, 
             report = finance_preaudit_run.read_execution(**value['original_execution'])
             if (report.get('terminal') is not True or report.get('status') != 'completed'
                     or report.get('run_id') != value['run_id'] or report.get('controller_instance_id') != value['controller_instance_id']
-                    or any(value['assignments'].get(request_id, {}).get('state') != 'submitted' for request_id in value.get('requests', {}))
+                    or not _requests_terminal(value)
                     or runtime_control.writer_active() or runtime_control.active_request_writers()):
                 raise ValueError('host_review_close_incomplete')
             for request_id, published in value.get('requests', {}).items():
@@ -550,7 +569,7 @@ def close(*, owner: str, reason: str = 'completed', source: Path | None = None, 
             agents = proof['output'].get('agents')
             from datetime import datetime
             timestamp = native['anchor'].get('timestamp')
-            last_result = max([value['heartbeat_at'], *(max(item.get('submitted_at', 0), item.get('completed_at', 0)) for item in value['assignments'].values())])
+            last_result = max([value['heartbeat_at'], *(item['observed_at'] for item in value.get('request_failures', {}).values()), *(max(item.get('submitted_at', 0), item.get('completed_at', 0)) for item in value['assignments'].values())])
             if not isinstance(timestamp, str) or not last_result <= datetime.fromisoformat(timestamp.replace('Z', '+00:00')).timestamp() <= time.time():
                 raise ValueError('host_review_stale_source')
             if not isinstance(agents, list) or any(not isinstance(agent, dict) for agent in agents):
@@ -569,6 +588,9 @@ def close(*, owner: str, reason: str = 'completed', source: Path | None = None, 
             proof.pop('output')
             proof['reviewers'] = statuses
             value['children_idle_source'] = proof
+            for assigned in value['assignments'].values():
+                if assigned['state'] == 'failed_fenced':
+                    assigned.update(state='failed_sealed', idle_source=proof)
         value.update(state='closed' if reason == 'completed' else 'cancelled', close_reason=reason, closed_at=time.time())
         guard.write(path, value)
     if reason != 'completed':
@@ -599,7 +621,7 @@ def enter_packaging(*, owner: str, receipt_file: Path | None = None, invocation_
                 or report.get('children_reaped') is not True or manifest is None or manifest['state'] != 'completed'
                 or manifest['run_id'] != value['run_id'] or manifest['controller_instance_id'] != value['controller_instance_id']
                 or report.get('run_id') != value['run_id'] or report.get('controller_instance_id') != value['controller_instance_id']
-                or any(item['state'] == 'assigned' for item in value['assignments'].values())
+                or not _requests_terminal(value)
                 or runtime_control.writer_active() or runtime_control.active_request_writers()):
             raise ValueError('host_review_finance_incomplete')
         value.update(phase='packaging', execution_owners=[], finance_receipt_sha256=hashlib.sha256(_read(Path(binding['receipt_file']))[0]).hexdigest())
@@ -700,7 +722,7 @@ def assign(request_file: Path, *, slot: int, owner: str, source: Path, source_li
                or (item['dispatch_source']['session_file'] == str(source.absolute()) and item['dispatch_source']['line'] == source_line)
                for item in registered['assignments'].values()):
             raise ValueError('host_review_dispatch_reused')
-        if any(item['slot'] == slot and item['state'] == 'assigned' for item in registered['assignments'].values()):
+        if any(item['slot'] == slot and item['state'] in {'assigned', 'failed_fenced'} for item in registered['assignments'].values()):
             raise ValueError('host_review_slot_busy')
         from datetime import datetime
         timestamp = native['anchor'].get('timestamp')
@@ -716,6 +738,39 @@ def assign(request_file: Path, *, slot: int, owner: str, source: Path, source_li
         registered['assignments'][request['request_id']] = value
         guard.write(path, registered)
     return value
+
+
+def release_failed_slot(request_file: Path, *, owner: str, source: Path, source_line: int, run_id: str | None = None) -> dict:
+    _, request = _read(request_file)
+    if run_id is not None and run_id != request['run_id']:
+        raise ValueError('host_review_run_untrusted')
+    with _round_lease(owner, request['run_id']) as path:
+        registered = _registry(owner, run_id=request['run_id'])
+        proof = registered.get('request_failures', {}).get(request['request_id'])
+        assigned = registered['assignments'].get(request['request_id'])
+        if (proof is None or verified_failure(Path(request['action_file']), _failed_result(proof)) is None
+                or assigned is None or assigned['state'] not in {'failed_fenced', 'failed_sealed'}):
+            raise ValueError('host_review_assignment_untrusted')
+        if str(source.absolute()) != registered['reviewers'][0]['spawn_source']['session_file']:
+            raise ValueError('host_review_source_untrusted')
+        native, idle = _native_source(source, owner, source_line, output=True)
+        _tool(native['anchor'], 'list_agents')
+        from datetime import datetime
+        timestamp = native['anchor'].get('timestamp')
+        if not isinstance(timestamp, str) or not proof['observed_at'] <= datetime.fromisoformat(timestamp.replace('Z', '+00:00')).timestamp() <= time.time():
+            raise ValueError('host_review_stale_source')
+        agents = idle['output'].get('agents')
+        if not isinstance(agents, list) or any(not isinstance(item, dict) for item in agents):
+            raise ValueError('host_review_children_status_untrusted')
+        reviewer = registered['reviewers'][assigned['slot']]
+        matching = [agent for agent in agents if agent.get('agent_name') == reviewer['agent_path']]
+        if len(matching) != 1 or _native_agent_status(matching[0].get('agent_status')) not in {'idle', 'completed', 'interrupted'}:
+            raise ValueError('host_review_children_not_idle')
+        idle.pop('output')
+        assigned.update(state='failed_sealed', idle_source=idle)
+        guard.write(path, registered)
+        return assigned
+
 
 def _fingerprints(action: Path) -> dict:
     context = review_context.capture(action, {})
@@ -735,12 +790,14 @@ def _live(request: dict, action: Path, *, owner: str | None = None) -> None:
     UUID(request['owner_task_id']); UUID(hex=request['run_id']); UUID(hex=request['controller_instance_id'])
     if owner is not None and owner != request['owner_task_id']:
         raise ValueError('host_review_owner_mismatch')
+    registered = _registry(request['owner_task_id'], run_id=request['run_id'])
+    if request['request_id'] in registered.get('request_failures', {}):
+        raise ValueError('host_review_request_expired')
     if (request.get('kind') != 'preaudit_host_review_request' or request.get('schema_version') != 1
             or request.get('review_configuration') != IDENTITY or request.get('action_file') != str(action)
             or request.get('input_fingerprints') != _fingerprints(action)
             or not guard._timestamp(request.get('expires_at'))):
         raise ValueError('host_review_request_untrusted')
-    registered = _registry(request['owner_task_id'], run_id=request['run_id'])
     if (registered['run_id'] != request['run_id'] or registered['controller_instance_id'] != request['controller_instance_id']):
         raise ValueError('host_review_registry_untrusted')
     if registered['phase'] == 'packaging':
@@ -938,6 +995,11 @@ def await_result(request_file: Path) -> dict:
             return read_result(request_file)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
         detail = _failure_detail(error)
+        if detail['failure_detail_code'] == 'host_review_request_expired' and request.get('review_kind') == 'finance':
+            try:
+                return _fail_request(request_file, request, 'host_review_request_expired')
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                pass
         recorded = _record_exchange_failure(request_file, detail)
         # Leave in-flight write classification to the original Writer. No signals here.
         try:
@@ -949,6 +1011,133 @@ def await_result(request_file: Path) -> dict:
         runtime_control.request_cycle_stop()
         return {**_base(), 'status': 'failed', 'error_code': 'host_review_exchange_failed',
                 **detail, 'failure_recorded': recorded}
+
+
+def _failed_result(proof: dict) -> dict:
+    return {**_base(), 'status': 'failed', 'error_code': 'host_review_exchange_failed',
+            'failure_detail_code': proof['failure_detail_code'], 'exception_type': 'ValueError',
+            'failure_recorded': True, 'host_failure': proof}
+
+
+def _unwritten_action(action: Path) -> dict:
+    current = json.loads(review_context.read_input(action))
+    state = json.loads(review_context.read_input(action.with_name('state.json')))
+    if (any(current.get(key) != state.get(key) for key in ('workflow_key', 'write_state', 'action'))
+            or current.get('write_state') not in {'not_requested', 'authorized'}
+            or current.get('action') not in {'review_required', 'needs_admin'}
+            or current.get('receipt_file') or state.get('receipt_file')
+            or any(os.path.lexists(action.with_name(name)) for name in (
+                'writer-boundary.json', 'execution-receipt.json', 'review-decision.json',
+                'remark.txt', 'submission-envelope.json'))):
+        raise ValueError('host_review_request_untrusted')
+    if current['action'] == 'review_required':
+        if current.get('action_token') != state.get('action_token'):
+            raise ValueError('host_review_request_untrusted')
+    elif any(current.get(key) != expected or state.get(key) != expected for key, expected in {
+            'reason': 'codex_review_failed', 'mode': 'preview',
+            'write_authorized': False, 'write_state': 'not_requested'}.items()):
+        raise ValueError('host_review_request_untrusted')
+    return {**current, 'action_token': state.get('action_token')}
+
+
+def verified_failure(action_file: Path, reviewed: dict) -> dict | None:
+    try:
+        action = action_file.absolute()
+        proof = reviewed['host_failure']
+        if reviewed != _failed_result(proof):
+            return None
+        raw, request = _read(Path(proof['request_file']))
+        registered = _registry(request['owner_task_id'], live=False, run_id=request['run_id'])
+        if (registered.get('request_failures', {}).get(request['request_id']) != proof
+                or registered.get('requests', {}).get(request['request_id']) != {
+                    'request_file': proof['request_file'], 'request_sha256': proof['request_sha256']}
+                or hashlib.sha256(raw).hexdigest() != proof['request_sha256']
+                or Path(proof['request_file']) != _request_file(action, 'finance', owner=request['owner_task_id'], run_id=request['run_id'])
+                or request['action_file'] != str(action) or proof['action_file'] != str(action)
+                or proof['run_id'] != request['run_id'] or proof['run_id'] != registered['run_id']
+                or proof['controller_instance_id'] != request['controller_instance_id']
+                or proof['controller_instance_id'] != registered['controller_instance_id']
+                or proof['input_fingerprints'] != request['input_fingerprints']
+                or proof['observed_at'] < request['expires_at']
+                or proof['failure_detail_code'] != 'host_review_request_expired'
+                or request['review_kind'] != 'finance'
+                or proof['action_token_sha256'] != hashlib.sha256(proof['action_token'].encode()).hexdigest()
+                or proof['action_token_sha256'] != request['input_fingerprints']['action_token_sha256']):
+            return None
+        current = _unwritten_action(action)
+        if current.get('workflow_key') != proof['workflow_key'] or current.get('action_token') != proof['action_token']:
+            return None
+        for name, digest in request['input_fingerprints'].items():
+            if name != 'action_token_sha256' and hashlib.sha256(review_context.read_input(action.with_name(name))).hexdigest() != digest:
+                return None
+        return proof
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _failure_reference(proof: dict) -> dict:
+    return {**{key: proof[key] for key in ('request_file', 'request_id', 'request_sha256')},
+            'outcome_sha256': hashlib.sha256(json.dumps(proof, sort_keys=True).encode()).hexdigest()}
+
+
+def failure_reference(action_file: Path, reviewed: dict) -> dict | None:
+    proof = verified_failure(action_file, reviewed)
+    return _failure_reference(proof) if proof is not None else None
+
+
+def verified_failure_reference(action_file: Path, reference: object) -> dict | None:
+    if not isinstance(reference, dict):
+        return None
+    try:
+        _, request = _read(Path(reference['request_file']))
+        registered = _registry(request['owner_task_id'], live=False, run_id=request['run_id'])
+        proof = registered['request_failures'][request['request_id']]
+        if reference != _failure_reference(proof):
+            return None
+        return verified_failure(action_file, _failed_result(proof))
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _fail_request(request_file: Path, request: dict, failure_code: str) -> dict:
+    owner, run_id = request['owner_task_id'], request['run_id']
+    with _round_lease(owner, run_id) as path:
+        registered = _registry(owner, run_id=run_id)
+        action = Path(request['action_file'])
+        raw, actual = _read(request_file)
+        binding = {'request_file': str(request_file.absolute()), 'request_sha256': hashlib.sha256(raw).hexdigest()}
+        if (request != actual or registered.get('requests', {}).get(request['request_id']) != binding
+                or request_file.absolute() != _request_file(action, 'finance', owner=owner, run_id=run_id)
+                or request['review_kind'] != 'finance' or failure_code != 'host_review_request_expired'):
+            raise ValueError('host_review_request_untrusted')
+        try:
+            _live(request, action)
+        except ValueError as error:
+            if str(error) != failure_code:
+                raise
+        else:
+            raise ValueError('host_review_request_untrusted')
+        failures = registered.setdefault('request_failures', {})
+        if request['request_id'] not in failures:
+            state = _unwritten_action(action)
+            if state.get('action') != 'review_required':
+                raise ValueError('host_review_request_untrusted')
+            proof = {'schema_version': 1, 'kind': 'preaudit_host_request_failure', **binding,
+                     'request_id': request['request_id'], 'action_file': str(action),
+                     'action_token': state['action_token'], 'workflow_key': state['workflow_key'],
+                     'action_token_sha256': request['input_fingerprints']['action_token_sha256'],
+                     'run_id': run_id, 'controller_instance_id': request['controller_instance_id'],
+                     'input_fingerprints': request['input_fingerprints'], 'observed_at': time.time(),
+                     'failure_detail_code': failure_code}
+            failures[request['request_id']] = proof
+            assigned = registered['assignments'].get(request['request_id'])
+            if assigned is not None:
+                assigned.update(state='failed_fenced', failed_at=proof['observed_at'])
+            guard.write(path, registered)
+        result = _failed_result(failures[request['request_id']])
+        if verified_failure(action, result) is None:
+            raise ValueError('host_review_request_untrusted')
+        return result
 
 
 def review(task: dict) -> dict:
@@ -1206,7 +1395,7 @@ def source_anchor(*, owner: str, operation: str = 'heartbeat', run_id: str | Non
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--operation', choices=['register', 'pending', 'assign', 'submit', 'heartbeat', 'enter-packaging', 'close', 'begin-shutdown', 'finish-shutdown', 'write-draft'], default='submit')
+    parser.add_argument('--operation', choices=['register', 'pending', 'assign', 'submit', 'heartbeat', 'enter-packaging', 'close', 'begin-shutdown', 'finish-shutdown', 'write-draft', 'release-failed-slot'], default='submit')
     parser.add_argument('--owner-task-id', required=True)
     parser.add_argument('--run-id')
     parser.add_argument('--request-file', type=Path)
@@ -1227,7 +1416,7 @@ def main(argv=None) -> int:
     UUID(args.owner_task_id)
     owner = args.owner_task_id
     if args.operation in {'pending', 'heartbeat', 'enter-packaging', 'begin-shutdown',
-                          'finish-shutdown', 'close', 'assign', 'submit'} and args.run_id is None:
+                          'finish-shutdown', 'close', 'assign', 'submit', 'release-failed-slot'} and args.run_id is None:
         parser.error('run-id required to select one independent round')
     if args.run_id is not None:
         from . import controller_handoff
@@ -1247,6 +1436,11 @@ def main(argv=None) -> int:
                           invocation_id=args.invocation_id, tool_session_id=args.tool_session_id, run_id=args.run_id)
     elif args.operation == 'pending':
         result = {'requests': pending(owner=owner, run_id=args.run_id)}
+    elif args.operation == 'release-failed-slot':
+        if args.request_file is None or args.source_session_file is None or args.source_line is None:
+            parser.error('release-failed-slot requires request and fresh native idle source')
+        result = release_failed_slot(args.request_file, owner=owner, source=args.source_session_file,
+                                     source_line=args.source_line, run_id=args.run_id)
     elif args.operation == 'heartbeat':
         if args.source_session_file is None or args.source_line is None:
             parser.error('heartbeat requires the current parent native source call')

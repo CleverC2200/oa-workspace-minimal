@@ -678,6 +678,28 @@ def test_parent_lease_loss_cancels_exchange_and_rejects_late_decision(exchange, 
     assert not request.with_name(request.name.replace(host.REQUEST, host.SUBMISSION)).exists()
 
 
+def test_expired_finance_request_fences_only_its_assignment(exchange, monkeypatch):
+    action, draft, owner, child, *_ = exchange
+    request = host.publish(action, prompt='Review current frozen facts.', timeout_seconds=60)
+    parent = child.with_name('parent.jsonl')
+    line = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(request)}, 'expiry-dispatch', {})
+    host.assign(request, slot=0, owner=owner, source=parent, source_line=line)
+    now = time.time()
+    monkeypatch.setattr(host.time, 'time', lambda: now + 61)
+
+    failed = host.await_result(request)
+
+    assert failed['failure_detail_code'] == 'host_review_request_expired'
+    assert failed['failure_recorded'] is True
+    assert runtime_control.stop_requested() is False
+    registered = json.loads(host.registry_file(owner).read_text())
+    assert registered['state'] == 'open'
+    assert next(iter(registered['assignments'].values()))['state'] == 'failed_fenced'
+    assert host.failure_reference(action, failed) is not None
+    with pytest.raises(ValueError, match='request_expired'):
+        host.submit(request, draft, owner=owner, source=child, source_line=2)
+
+
 def test_cancel_closes_registered_round_and_never_terminates_writer(exchange, monkeypatch):
     action, draft, owner, source, *_ = exchange
     thread, results, request = start(exchange)
@@ -1165,3 +1187,63 @@ def test_new_controller_cannot_start_before_same_parent_shutdown_is_verified(exc
     monkeypatch.setattr(finance_preaudit_run.approval_lifecycle, 'startup', lambda _: pytest.fail('Unsealed prior round admitted'))
     assert finance_preaudit_run.main(['--owner-task-id', owner, '--review-transport', 'host_chat', '--', '--rolling']) == 1
     assert json.loads(capsys.readouterr().out)['error_code'] == 'controller_execution_evidence_failed'
+
+def test_failed_slot_reuse_requires_fresh_native_idle_proof(exchange, monkeypatch):
+    action, _, owner, child, _, manifest, engine = exchange
+    parent = child.with_name('parent.jsonl')
+    request = host.publish(action, prompt='A', timeout_seconds=1)
+    line = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(request)}, 'expiry-dispatch', {})
+    host.assign(request, slot=0, owner=owner, source=parent, source_line=line)
+    stale = native_call(parent, 'list_agents', {}, 'old-idle', {'agents': [{'agent_name': '/root/reviewer_0', 'agent_status': 'idle'}]})
+    sibling_action = Path(engine.next_action('general_expense')['action_file'])
+    host.approval_lifecycle.heartbeat(manifest['run_id'], manifest['controller_instance_id'],
+                                     {action, sibling_action}, [], writer_active=False)
+    sibling = host.publish(sibling_action, prompt='Keep the failed slot fenced.', timeout_seconds=60)
+    now = time.time()
+    with monkeypatch.context() as expired:
+        expired.setattr(host.time, 'time', lambda: now + 2)
+        assert host.await_result(request)['status'] == 'failed'
+        expired.setattr(host.time, 'time', lambda: now + 3)
+        with pytest.raises(ValueError, match='stale_source'):
+            host.release_failed_slot(request, owner=owner, source=parent, source_line=stale)
+        dispatch = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(sibling)}, 'fenced-slot', {})
+        with pytest.raises(ValueError, match='slot_busy'):
+            host.assign(sibling, slot=0, owner=owner, source=parent, source_line=dispatch)
+    with monkeypatch.context() as elapsed:
+        elapsed.setattr(host.time, 'time', lambda: now + 4)
+        from datetime import datetime, timezone
+        line = native_call(parent, 'list_agents', {}, 'current-idle', {'agents': [{'agent_name': '/root/reviewer_0', 'agent_status': 'idle'}]})
+        rows = parent.read_text().splitlines()
+        call = json.loads(rows[line - 1]); call['timestamp'] = datetime.fromtimestamp(now + 3, timezone.utc).isoformat()
+        rows[line - 1] = json.dumps(call); parent.write_text('\n'.join(rows) + '\n')
+        assert host.release_failed_slot(request, owner=owner, source=parent, source_line=line)['state'] == 'failed_sealed'
+        action_b = sibling_action
+        host.approval_lifecycle.heartbeat(manifest['run_id'], manifest['controller_instance_id'], {action_b}, [], writer_active=False)
+    line = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(sibling)}, 'after-idle', {})
+    assert host.assign(sibling, slot=0, owner=owner, source=parent, source_line=line)['slot'] == 0
+
+
+def test_normal_close_accepts_trusted_expired_request_and_preserves_failure_proof(exchange, monkeypatch):
+    action, _, owner, child, _, manifest, _ = exchange
+    parent = child.with_name('parent.jsonl')
+    request = host.publish(action, prompt='A', timeout_seconds=1)
+    now = time.time()
+    with monkeypatch.context() as elapsed:
+        elapsed.setattr(host.time, 'time', lambda: now + 2)
+        failed = host.await_result(request)
+    controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
+    seal_execution(owner, manifest)
+    line = native_call(parent, 'list_agents', {}, 'close-after-failure', {'agents': [
+        {'agent_name': f'/root/reviewer_{slot}', 'agent_status': 'idle'} for slot in range(3)]})
+    from datetime import datetime, timezone
+    rows = parent.read_text().splitlines()
+    call = json.loads(rows[line - 1]); call['timestamp'] = datetime.fromtimestamp(now + 3, timezone.utc).isoformat()
+    rows[line - 1] = json.dumps(call); parent.write_text('\n'.join(rows) + '\n')
+    with monkeypatch.context() as elapsed:
+        elapsed.setattr(host.time, 'time', lambda: now + 4)
+        assert host.close(owner=owner, source=parent, source_line=line)['state'] == 'closed'
+    assert host.verified_failure(action, failed) == failed['host_failure']
+    material = json.loads(action.with_name('material.json').read_text())
+    material['warnings'] = ['Changed input']
+    host.guard.write(action.with_name('material.json'), material)
+    assert host.verified_failure(action, failed) is None

@@ -90,9 +90,18 @@ def receipt_matches(
     workflow_key: str,
     failure_code: str | None = None,
     attempt_error_codes: list[str] | None = None,
+    action_file: Path | None = None,
 ) -> bool:
     if not isinstance(value, dict):
         return False
+    if value.get("schema_version") == 3:
+        if action_file is None or attempt_error_codes is not None:
+            return False
+        expected = host_receipt_payload(action_file, value.get("host_failure_reference"), value.get("failure_code"))
+        return (expected is not None and value == expected
+                and value.get("action_token") == action_token
+                and value.get("workflow_key") == workflow_key
+                and (failure_code is None or value.get("failure_code") == failure_code))
     actual_attempt_codes = value.get("attempt_error_codes")
     actual_failure_code = value.get("failure_code")
     if (
@@ -119,6 +128,19 @@ def receipt_matches(
         reasoning_effort=identity["reasoning_effort"],
     )
     return value == expected
+
+
+def host_receipt_payload(action_file: Path, reference: object, failure_code: str) -> dict | None:
+    from . import host_chat_review
+
+    proof = host_chat_review.verified_failure_reference(action_file, reference)
+    if proof is None or proof['failure_detail_code'] != failure_code:
+        return None
+    return {
+        'schema_version': 3, 'kind': 'preaudit_review_failure', 'transport': 'host_chat',
+        'action_token': proof['action_token'], 'workflow_key': proof['workflow_key'],
+        'failure_code': failure_code, 'host_failure_reference': reference,
+    }
 
 
 def read_receipt(path: Path) -> dict | None:
@@ -219,5 +241,6 @@ def trusted_quarantine(attempt_root: Path, state: dict) -> bool:
             receipt,
             action_token=action_token,
             workflow_key=str(state.get("workflow_key") or ""),
+            action_file=action_path,
         )
     )
