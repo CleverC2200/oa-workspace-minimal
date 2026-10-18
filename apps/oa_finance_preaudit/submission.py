@@ -7,6 +7,7 @@ from typing import Callable
 
 
 SCHEMA_VERSION = 1
+REVIEW_BINDING = "review_decision_binding"
 
 AuthorizationSource = Callable[[dict], dict]
 AuthorizationVerifier = Callable[[dict, dict], bool]
@@ -40,6 +41,28 @@ def fingerprint(value: dict) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return f"sha256:{hashlib.sha256(raw).hexdigest()}"
+
+
+def review_decision_binding(state: dict) -> dict:
+    """Keep input identity separate from the normalized, submitted decision."""
+    if REVIEW_BINDING not in state:
+        return {}
+    binding = state[REVIEW_BINDING]
+    if (
+        not isinstance(binding, dict)
+        or set(binding) != {"version", "input_fingerprint", "normalized_fingerprint"}
+        or type(binding.get("version")) is not int
+        or binding["version"] != 1
+        or any(
+            not isinstance(value, str)
+            or len(value) != 71
+            or not value.startswith("sha256:")
+            or any(character not in "0123456789abcdef" for character in value[7:])
+            for value in (binding.get("input_fingerprint"), binding.get("normalized_fingerprint"))
+        )
+    ):
+        raise ValueError("review_decision_conflict")
+    return {REVIEW_BINDING: dict(binding)}
 
 
 def authorization_context(
@@ -217,6 +240,7 @@ def build_envelope(
         "decision_fingerprint": decision_fingerprint,
         "remark_fingerprint": remark_fingerprint,
         "submission_token_sha256": submission_token_sha256,
+        **review_decision_binding(state),
     }
 
 
@@ -295,5 +319,6 @@ def build_receipt(
             "confirmed_no_write" if write_state == "not_requested" else None
         ),
         "quality": quality,
+        **review_decision_binding(state),
         **submission_result,
     }
