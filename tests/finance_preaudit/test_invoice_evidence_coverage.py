@@ -78,7 +78,7 @@ def cloud_http(monkeypatch):
         data_id = json.loads(request.data)['dataId']
         return Response(payloads[data_id])
 
-    monkeypatch.setattr(invoice_buyers.urllib.request, 'urlopen', urlopen)
+    monkeypatch.setattr(invoice_buyers.safe_http, 'urlopen', urlopen)
     return payloads
 
 
@@ -268,7 +268,7 @@ def test_service_failure_stops_before_review_and_retains_detail(tmp_path, monkey
     from pathlib import Path
     from apps.oa_finance_preaudit import flow_engine
 
-    monkeypatch.setattr(invoice_buyers.urllib.request, 'urlopen',
+    monkeypatch.setattr(invoice_buyers.safe_http, 'urlopen',
                         lambda *_a, **_k: (_ for _ in ()).throw(OSError('synthetic-read-failure')))
     with pytest.raises(RuntimeError, match='^invoice_buyer_read_failed$'):
         collect()

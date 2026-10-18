@@ -842,7 +842,7 @@ def _parse_token_usage(stream: TextIO) -> dict:
         if not isinstance(usage, dict):
             continue
         values = {
-            field: usage.get(field, 0)
+            field: usage.get(field)
             for field in ("input_tokens", "cached_input_tokens", "output_tokens")
         }
         if any(
@@ -850,11 +850,13 @@ def _parse_token_usage(stream: TextIO) -> dict:
             for value in values.values()
         ):
             continue
-        return {
+        recorded = {
             "status": "recorded",
             **values,
             "total_tokens": values["input_tokens"] + values["output_tokens"],
         }
+        if _valid_token_usage(recorded):
+            return recorded
     return _unknown_usage()
 
 
