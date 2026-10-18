@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from apps.oa_finance_preaudit import attempt_state
+
 # Select the retained supplier explicitly for recorded CLI/slot behavior.
 from tests.finance_preaudit.review_profiles import retained_deepseek_cli  # noqa: F401
 
@@ -60,7 +62,7 @@ def test_prepare_freezes_complete_recorded_material_without_exposing_answers(rec
     arguments, material_file, material = recorded_case
     assert finance_preaudit_native_replay.main(arguments) == 0
     summary = json.loads(capsys.readouterr().out)
-    action = json.loads(Path(summary['action_file']).read_text())
+    action = attempt_state.read_action(Path(summary['action_file']))
     assert action['mode'] == 'preview'
     assert action['write_authorized'] is False
     state = json.loads(Path(action['state_file']).read_text())
@@ -89,7 +91,7 @@ def test_prepare_routes_frozen_travel_material_to_its_eight_review_items(recorde
 
     assert finance_preaudit_native_replay.main(arguments) == 0
     summary = json.loads(capsys.readouterr().out)
-    action = json.loads(Path(summary['action_file']).read_text())
+    action = attempt_state.read_action(Path(summary['action_file']))
     packet = json.loads(Path(action['review_packet_file']).read_text())
     assert action['workflow_key'] == packet['workflow_key'] == 'travel_expense'
     assert [item['item_key'] for item in packet['items']] == [
@@ -108,7 +110,7 @@ def test_run_uses_worker_then_closes_preview_with_real_anomalies_preserved(recor
     calls = []
     def recorded_native(project, action_file, timeout):
         calls.append((project, action_file, timeout))
-        action = json.loads(action_file.read_text())
+        action = attempt_state.read_action(action_file)
         packet = json.loads(Path(action['review_packet_file']).read_text())
         decision = {'schema_version': 1, 'kind': 'preaudit_review_decision',
                     'action_token': action['action_token'], 'workflow_key': 'general_expense',
@@ -158,7 +160,7 @@ def acceptance_records(recorded_case, capsys):
     finance_preaudit_native_replay.main(arguments)
     prepared = json.loads(capsys.readouterr().out)
     action_file = Path(prepared['action_file'])
-    action = json.loads(action_file.read_text())
+    action = attempt_state.read_action(action_file)
     packet = json.loads(Path(action['review_packet_file']).read_text())
     def recorded_native(*_args):
         return CodexExecution(None, {'status': 'unknown'}, {
@@ -250,7 +252,7 @@ def test_verify_rejects_unqualified_results(acceptance_records, capsys, mistake,
     elif mistake == 'changed_material':
         Path(manifest['original_material']).write_text('{}')
     elif mistake in {'changed_fresh_material', 'deleted_fresh_material', 'changed_packet', 'deleted_packet'}:
-        action = finance_preaudit_native_replay.read(manifest['action_file'])
+        action = attempt_state.read_action(Path(manifest['action_file']))
         state = finance_preaudit_native_replay.read(action['state_file'])
         p = Path(state['material_file'] if mistake.endswith('material') else action['review_packet_file'])
         if mistake.startswith('deleted'):

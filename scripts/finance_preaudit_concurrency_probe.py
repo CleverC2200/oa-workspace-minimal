@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from apps.oa_finance_preaudit import attempt_state
+
 import argparse
 from collections import Counter
 from contextlib import ExitStack
@@ -212,8 +214,10 @@ def _pending_identity_key(request_id: str, received_at: str) -> str:
 
 def _read_object(path: Path) -> dict:
     try:
+        if Path(path).name == "action.json":
+            return attempt_state.read_action(path)
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, ValueError) as error:
         raise ValueError("production_probe_state_invalid") from error
     if not isinstance(value, dict):
         raise ValueError("production_probe_state_invalid")

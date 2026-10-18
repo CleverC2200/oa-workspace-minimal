@@ -8,6 +8,8 @@ import re
 from pathlib import Path
 import sys
 
+from . import attempt_state
+
 
 def _json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
@@ -68,7 +70,7 @@ def read(action_file: Path) -> str:
     paths = (action_file, packet_file, material_file)
     if any(path.is_symlink() or not path.is_file() for path in paths):
         raise ValueError('frozen_material_changed')
-    action = json.loads(action_file.read_text())
+    action = attempt_state.read_action(action_file)
     packet = json.loads(packet_file.read_text())
     raw = material_file.read_bytes()
     material = json.loads(raw)

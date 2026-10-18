@@ -592,15 +592,12 @@ def test_expired_tampered_authorization_is_not_renewed(tmp_path: Path) -> None:
         **ports,
     )
     action = engine.next_action("travel_expense", mode="controlled_write")
-    action_path = Path(action["action_file"])
     state_path = Path(action["state_file"])
     state = json.loads(state_path.read_text(encoding="utf-8"))
     state["authorization_grant"]["proof"] = "tampered"
     forged_fingerprint = submission.fingerprint(state["authorization_grant"])
     state["authorization_fingerprint"] = forged_fingerprint
-    action["authorization_fingerprint"] = forged_fingerprint
     json_artifact.write_json_atomic(state_path, state)
-    json_artifact.write_json_atomic(action_path, action)
 
     current_time[0] = NOW + timedelta(minutes=61)
     blocked = engine.next_action("travel_expense", mode="controlled_write")
@@ -909,9 +906,6 @@ def test_cycle_stop_receipt_only_isolates_signed_unwritten_stop(tmp_path: Path, 
         (attempt / "prepared" / "page-1.txt").write_text("changed page")
     elif mutation == "state_detail":
         state["failure_detail_code"] = "authorization_invalid"
-        changed_action = json.loads((attempt / "action.json").read_text())
-        changed_action["failure_detail_code"] = state["failure_detail_code"]
-        json_artifact.write_json_atomic(attempt / "action.json", changed_action)
         json_artifact.write_json_atomic(attempt / "state.json", state)
     item_failure.persist(attempt, state)
     assert item_failure.isolated(attempt, state) is (mutation is None)

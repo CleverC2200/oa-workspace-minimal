@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
 
-from . import approval_guard as guard, approval_lifecycle, controller_handoff, review_failure_evidence as evidence
+from . import attempt_state, approval_guard as guard, approval_lifecycle, controller_handoff, review_failure_evidence as evidence
 
 REASON = "codex_review_interrupted"
 FORBIDDEN_WRITES = ("writer-boundary.json", "execution-receipt.json", "review-decision.json", "remark.txt", "submission-envelope.json")
@@ -46,7 +47,7 @@ def record(action_file: Path, state: dict, *, run_id: str) -> str:
         archived = action_file.with_name("interrupted-" + name)
         raw = original.read_bytes()
         previous = guard.read(archived)
-        if previous is not None and previous != evidence.read_receipt(original):
+        if previous is not None and previous != json.loads(raw):
             raise ValueError("review_interruption_untrusted")
         if previous is None:
             from apps.oa_approval import runtime_control
@@ -69,7 +70,7 @@ def record(action_file: Path, state: dict, *, run_id: str) -> str:
 
 def trusted(attempt_root: Path, state: dict) -> bool:
     try:
-        action = evidence.read_receipt(attempt_root / "action.json")
+        action = attempt_state.read_action(attempt_root / "action.json", state=state)
         receipt = guard.read(attempt_root / "review-interruption.json")
         if not isinstance(action, dict) or receipt is None:
             return False
@@ -88,9 +89,12 @@ def trusted(attempt_root: Path, state: dict) -> bool:
                 or action.get("review_interruption_fingerprint") != state["review_interruption_fingerprint"]
                 or receipt.get("closed_run_fingerprint") != evidence.file_fingerprint(approval_lifecycle.run_directory(receipt["run_id"]) / "closed-readonly.json")):
             return False
+        original_state = guard.read(attempt_root / "interrupted-state.json")
         for name in ("action", "state"):
             path = attempt_root / f"interrupted-{name}.json"
             old = guard.read(path)
+            if name == "action" and old is not None:
+                old = attempt_state.view(attempt_root / "action.json", old, raw=path.read_bytes(), state=original_state)
             if (receipt[f"original_{name}_fingerprint"] != evidence.file_fingerprint(path) or old is None
                     or old.get("action") != "review_required" or old.get("write_state") not in {"authorized", "not_requested"}
                     or old.get("action_token") != state["action_token"]):

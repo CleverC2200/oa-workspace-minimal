@@ -54,6 +54,88 @@ def fake_http(monkeypatch, respond):
     return calls
 
 
+@pytest.fixture
+def frozen_finance_action(tmp_path, monkeypatch):
+    from apps.oa_finance_preaudit import FlowEngine
+    from tests.finance_preaudit.test_flow_engine import _travel_material_with_attachment
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail('Recognition test must not use live credentials or prepare new material')
+
+    monkeypatch.setattr(recognition, '_api_key', lambda: 'offline-key')
+    monkeypatch.setattr(recognition.auth, 'env', forbidden)
+    monkeypatch.setattr(recognition.auth, 'load_local_env', forbidden)
+    monkeypatch.setattr(recognition.attachment_extractors, 'prepare_materials', forbidden)
+
+    def collect(request, root):
+        material = _travel_material_with_attachment(request, root)
+        page = image(root / 'prepared', 'evidence.png')
+        material['prepared']['images'][0].update(
+            content_sha256=hashlib.sha256(page.read_bytes()).hexdigest(), owner_detail_id='row-2')
+        material['prepared']['manifest'][0]['status'] = 'image'
+        return material
+
+    engine = FlowEngine(root=tmp_path / 'flows', discover_candidates=lambda workflow: [{
+        'request_id': 'offline-recognition', 'received_at': '2026-10-18T09:00:00+08:00',
+        'workflow_key': workflow}], collect_material=collect)
+    action = engine.next_action('travel_expense')
+    assert action['action'] == 'review_required'
+    return action
+
+
+@pytest.mark.parametrize('storage', ['canonical', 'legacy'])
+def test_action_file_cli_reads_frozen_finance_pages(
+        tmp_path, monkeypatch, capsys, frozen_finance_action, storage):
+    from apps import json_artifact
+
+    action = frozen_finance_action
+    path = Path(action['action_file'])
+    if storage == 'legacy':
+        state_path = Path(action['state_file'])
+        state = json.loads(state_path.read_bytes())
+        state.pop('action_reference_sha256')
+        json_artifact.write_json_atomic(path, action)
+        json_artifact.write_json_atomic(state_path, state)
+    before = {p: p.read_bytes() for p in path.parent.rglob('*') if p.is_file()}
+    calls = fake_http(monkeypatch, lambda _: {'choices': [{'finish_reason': 'stop',
+        'message': {'content': '读数 12345；右下角日期无法确认。'}}]})
+
+    result = recognition.main(['--action-file', str(path), '--output-dir', str(tmp_path / 'out')])
+    assert (result, len(calls)) == (0, 1)
+
+    summary = json.loads(capsys.readouterr().out)
+    report = json.loads(Path(summary['report_file']).read_bytes())
+    assert summary['status'] == 'complete' and summary['parts'] == 1
+    assert len(calls) == 1
+    assert report['parts'][0]['owner_detail_id'] == 'row-2'
+    assert report['parts'][0]['evidence_ref'] == 'material:prepared.images.evidence-1.1'
+    assert report['frozen_binding']['action_file'] == str(path)
+    assert all(p.read_bytes() == raw for p, raw in before.items())
+
+
+@pytest.mark.parametrize('damage', ['reference', 'packet', 'material', 'page'])
+def test_action_file_cli_rejects_changed_frozen_finance_input(
+        tmp_path, monkeypatch, capsys, frozen_finance_action, damage):
+    action = frozen_finance_action
+    path = Path(action['action_file'])
+    changed = {'reference': path, 'packet': path.with_name('review-packet.json'),
+               'material': path.with_name('material.json'),
+               'page': path.parent / 'prepared/evidence.png'}[damage]
+    if damage == 'packet':
+        packet = json.loads(changed.read_bytes())
+        packet['workflow_key'] = 'other-workflow'
+        changed.write_text(json.dumps(packet))
+    else:
+        changed.write_bytes(changed.read_bytes() + b' ')
+    calls = fake_http(monkeypatch, lambda _: pytest.fail('Changed input must not reach HTTP'))
+
+    assert recognition.main(['--action-file', str(path), '--output-dir', str(tmp_path / 'out')]) == 1
+
+    summary = json.loads(capsys.readouterr().out)
+    assert summary['status'] == 'failed'
+    assert calls == []
+
+
 def test_direct_api_custom_question_and_duplicate_source_mapping(tmp_path, monkeypatch):
     calls = fake_api(monkeypatch)
     one = image(tmp_path)

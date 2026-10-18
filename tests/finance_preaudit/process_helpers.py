@@ -37,6 +37,8 @@ def _codex_task(tmp_path: Path) -> tuple[dict, Path]:
     json_artifact.write_json_atomic(
         action_file,
         {
+            "schema_version": 1,
+            "kind": "preaudit_action",
             "action": "review_required",
             "workflow_key": "travel_expense",
             "action_token": "test-action-token",
@@ -128,6 +130,55 @@ def _assert_fake_codex_tree_reaped(
         if ownership_verified:
             os.killpg(pids[0], signal.SIGKILL)
     assert remaining == []
+
+
+def _readonly_reap_diagnostics(manifest: dict, result: dict) -> dict:
+    from apps.oa_finance_preaudit import approval_guard as guard, approval_lifecycle
+
+    snapshot = {"phase": "after_failure", "non_atomic": True}
+    stage = "result"
+    try:
+        snapshot["result"] = {key: result[key] for key in (
+            "stopped", "timed_out", "failed", "processes_reaped",
+        ) if type(result.get(key)) in (int, bool)}
+        snapshot["result"]["error_counts"] = {
+            code: count for code, count in result.get("error_counts", {}).items()
+            if code in {"stop_requested", "worker_timeout", "worker_task_timeout",
+                        "worker_cleanup_failed", "worker_start_failed", "worker_failed",
+                        "worker_process_failed"} and type(count) is int
+        }
+
+        def process(identity, pid=None):
+            pid = identity["pid"] if identity is not None else pid
+            if pid is None:
+                return {"pid": None, "pgid": None, "identity_matches": None}
+            pgid = identity["pgid"] if identity is not None else pid
+            actual = guard.process_identity(pid)
+            return {"pid": pid, "pgid": pgid, "pid_present": actual is not None,
+                    "identity_matches": actual == identity if identity is not None else None,
+                    "group_alive": guard.group_alive(pgid)}
+
+        stage = "pools"
+        progress = approval_lifecycle._progress(manifest)
+        snapshot["pools"] = [process(identity) for identity in
+                             approval_lifecycle._pool_processes(manifest, progress)]
+        stage = "workers"
+        snapshot["workers"] = [{"role": record["role"], **process(record["process"])}
+                               for record in approval_lifecycle._workers(manifest, progress)]
+        stage = "models"
+        snapshot["models"] = []
+        for index in range(guard.MAX_MODEL_WORKERS):
+            slot = guard._slot(index)
+            if slot is not None and slot["run_id"] == manifest["run_id"]:
+                snapshot["models"].append({
+                    "slot": index, "state": slot["state"],
+                    "closed_at_present": "closed_at" in slot,
+                    "worker": process(slot["worker"]),
+                    "model": process(slot["process"], slot["pid"]),
+                })
+    except Exception:
+        snapshot["diagnostic_error"] = stage + "_unavailable"
+    return snapshot
 
 
 def _flow_action_worker(root: str) -> dict:

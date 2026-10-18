@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from apps.oa_finance_preaudit import attempt_state
+
 # Select the retained supplier explicitly for recorded CLI/slot behavior.
 from tests.finance_preaudit.review_profiles import retained_deepseek_cli  # noqa: F401
 
@@ -133,7 +135,8 @@ def test_submitted_marketing_is_a_confirmed_previous_round(tmp_path: Path, versi
     if version == 1:
         for name in ("action_file", "state_file"):
             path = Path(action[name])
-            legacy = json.loads(path.read_text())
+            legacy = dict(action) if name == "action_file" else json.loads(path.read_text())
+            legacy.pop("action_reference_sha256", None)
             legacy.pop("rule_version")
             json_artifact.write_json_atomic(path, legacy)
         packet_file = Path(action["review_packet_file"])
@@ -144,13 +147,13 @@ def test_submitted_marketing_is_a_confirmed_previous_round(tmp_path: Path, versi
             key for key in packet["required_uncertain_items"] if key != "payment_company_consistency"
         ]
         json_artifact.write_json_atomic(packet_file, packet)
-        action = json.loads(Path(action["action_file"]).read_text())
+        action = attempt_state.read_action(Path(action["action_file"]))
         reviewed = reviewed[:-1]
     decision = tmp_path / "decision.json"
     json_artifact.write_json_atomic(decision, _decision(action, reviewed))
     closed = engine.complete_review(Path(action["action_file"]), decision)
     state = json.loads(Path(closed["state_file"]).read_text())
-    assert "rule_version" not in state
+    assert ("rule_version" not in state) if version == 1 else state["rule_version"] == "small_marketing_fee:2"
     assert closed["write_state"] == "submitted"
     received = datetime.fromisoformat(state["created_at"]) + timedelta(seconds=1)
     report = reconciliation.reconcile(tmp_path, pending_rows=[{
@@ -284,11 +287,12 @@ def test_marketing_legacy_v1_packet_can_finish_original_five_items(
     action_file = Path(action["action_file"])
     state_file = Path(action["state_file"])
     packet_file = Path(action["review_packet_file"])
-    legacy_action = json.loads(action_file.read_text(encoding="utf-8"))
+    legacy_action = dict(action)
     legacy_state = json.loads(state_file.read_text(encoding="utf-8"))
     legacy_packet = json.loads(packet_file.read_text(encoding="utf-8"))
     legacy_action.pop("rule_version")
     legacy_state.pop("rule_version")
+    legacy_state.pop("action_reference_sha256")
     legacy_packet["rule_version"] = "small_marketing_fee:1"
     legacy_packet["items"] = legacy_packet["items"][:-1]
     legacy_packet["required_uncertain_items"] = [

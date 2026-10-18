@@ -22,6 +22,7 @@ from typing import Callable, TextIO
 from apps import json_artifact
 from apps.oa_approval import runtime_control, writer_outcomes
 
+from . import attempt_state
 from . import approval_guard, concurrency_control, decision_validation, fuel_trip_observation, manual_handoff, process_diagnostics, production_config, review_failure_evidence, review_output, review_context
 from .review_output import parse_json as _parse_decision_json
 
@@ -350,8 +351,8 @@ def _page_routing_instruction(action_file: Path) -> str:
 
 def _action_workflow(action_file: Path) -> str | None:
     try:
-        action = json.loads(action_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        action = attempt_state.read_action(action_file)
+    except (OSError, ValueError):
         return None
     workflow_key = action.get("workflow_key") if isinstance(action, dict) else None
     return str(workflow_key) if workflow_key in _FINANCE_RULES else None
@@ -426,7 +427,7 @@ def _small_marketing_attachment_terms_required(action_file: Path) -> bool:
 
 def _fuel_trip_contract(action_file: Path) -> dict | None:
     try:
-        action = json.loads(action_file.read_text(encoding="utf-8"))
+        action = attempt_state.read_action(action_file)
         state = json.loads(action_file.with_name("state.json").read_text(encoding="utf-8"))
     except (OSError, ValueError, AttributeError):
         raise ValueError("frozen_packet_changed") from None
@@ -682,11 +683,9 @@ def _decision_schema(action_file: Path | None = None, *, read_only: bool = False
         try:
             if action_file.is_symlink() or state_file.is_symlink():
                 raise ValueError("codex_review_task_invalid")
-            action = json.loads(action_file.read_text(encoding="utf-8"))
-            state = json.loads(state_file.read_text(encoding="utf-8"))
+            action = attempt_state.read_action(action_file)
             action_token = action.get("action_token") if isinstance(action, dict) else None
-            if (not isinstance(action_token, str) or not action_token
-                    or not isinstance(state, dict) or state.get("action_token") != action_token):
+            if not isinstance(action_token, str) or not action_token:
                 raise ValueError("codex_review_task_invalid")
         except (OSError, ValueError):
             raise ValueError("codex_review_task_invalid") from None
@@ -1135,7 +1134,7 @@ def _execute_codex_raw(
     try:
         if type(allow_visual_aux) is not bool or (allow_visual_aux and (
                 not read_only or audit_directory is None
-                or json.loads(action_file.read_text()).get('workflow_key') != 'packaging_layout_approval')):
+                or attempt_state.read_action(action_file).get('workflow_key') != 'packaging_layout_approval')):
             raise ValueError('codex_review_task_invalid')
         schema = schema_builder(action_file) if schema_builder else _decision_schema(action_file, read_only=read_only)
         prompt = prompt_builder(action_file)
@@ -1866,11 +1865,11 @@ def _write_review_failure_receipt(
     if not _safe_to_retry(action_file):
         return False
     try:
-        action = json.loads(action_file.read_text(encoding="utf-8"))
+        action = attempt_state.read_action(action_file)
         state = json.loads(
             action_file.with_name("state.json").read_text(encoding="utf-8")
         )
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return False
     action_token = action.get("action_token")
     if (
@@ -1934,8 +1933,8 @@ def _write_agent_timing(
     if timing_file.is_symlink():
         return False
     try:
-        action = json.loads(action_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        action = attempt_state.read_action(action_file)
+    except (OSError, ValueError):
         return False
     action_token = action.get("action_token") if isinstance(action, dict) else None
     if (
@@ -2006,10 +2005,10 @@ def _validated_task(task: dict) -> tuple[Path, Path, int]:
 
 def _read_completed(action_file: Path) -> str | None:
     try:
-        action = json.loads(action_file.read_text(encoding="utf-8"))
+        action = attempt_state.read_action(action_file)
         receipt_file = Path(str(action["receipt_file"])).resolve(strict=True)
         receipt = json.loads(receipt_file.read_text(encoding="utf-8"))
-    except (KeyError, OSError, json.JSONDecodeError):
+    except (KeyError, OSError, ValueError):
         return None
     if (
         action.get("action") == "closed"
@@ -2028,9 +2027,9 @@ def _read_completed(action_file: Path) -> str | None:
 
 def _safe_to_retry(action_file: Path) -> bool:
     try:
-        action = json.loads(action_file.read_text(encoding="utf-8"))
+        action = attempt_state.read_action(action_file)
         state = json.loads(action_file.with_name("state.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return False
     required = {
         "action": "review_required",

@@ -37,9 +37,9 @@ FlowEngine 的隔离和恢复仍须在完成锁内复核失败凭据、动作、
 
 人工明确授权后，滚动入口可通过精确的 `--recover-action-file` 恢复 `codex_decision_invalid` 或 `codex_review_failed`。恢复前必须核对 action/state 均为 `needs_admin / not_requested`、冻结身份与材料完整、最新 attempt、实时待办身份一致且无已办命中，并确认不存在 Writer 边界、执行回执、审核决定、意见或提交信封；进程失败还必须通过原始失败凭据与指纹校验。只创建新的冻结 attempt，保留原隔离证据，不直接写 OA；不带显式恢复参数时仍跳过历史隔离，不自动重试，未知写入规则不变。
 
-每个 attempt 只有一个当前动作；同一候选重复调用时返回原动作和 token，不重复取数。积压中还存在未打开候选时，后续 `next-action` 可以打开另一单据，供独立审核调用处理。`current-action.json` 只是最近一次返回动作的投影，不是全局锁或事实源。
+每个 attempt 的当前动作由 `state.json` 派生；新 `action.json` 是绑定身份、路径与原始字节摘要的不可变引用。同一候选重复调用时返回原动作和 token，不重复取数。积压中还存在未打开候选时，后续 `next-action` 可以打开另一单据，供独立审核调用处理。存储与历史兼容边界见 [ADR 0012](../../../../docs/adr/0012-canonical-attempt-state.md)。
 
-同一 attempt 的完成转换使用 attempt 锁单飞，后到的重复决定不能覆盖已闭合结果；不同 case 不共享提交锁。完成旧动作时，若投影已指向另一单据，不得回写覆盖该投影。
+同一 attempt 的完成转换使用 attempt 锁单飞，后到的重复决定不能覆盖已闭合结果；不同 case 不共享提交锁。当前入口停止写入 `current-action.json`，已有文件保留原字节。
 
 审核者不得修改 `action_file`、审核包或材料，不得读取其他 attempt，不得自行组织路径、计算指纹、选择 requestId 或调用 OA 写入。
 

@@ -13,6 +13,7 @@ from typing import Callable, TextIO
 
 from apps import json_artifact
 from apps.oa_approval import runtime_control
+from . import attempt_state
 from . import approval_guard
 
 STAGES = frozenset({"thread.started", "turn.started", "item.started", "item.completed", "turn.completed"})
@@ -338,7 +339,7 @@ def record(action_file: Path, *, execution, elapsed_seconds: float, stderr: dict
     if path.is_symlink() or state_path.is_symlink():
         raise ValueError("process_diagnostic_invalid")
     if action_token_sha256 is None:
-        action = json.loads(path.read_text())
+        action = attempt_state.read_action(path)
         state = json.loads(state_path.read_text())
         token = action.get("action_token") if isinstance(action, dict) else None
         if not isinstance(token, str) or not token or not isinstance(state, dict) or state.get("action_token") != token:

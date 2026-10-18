@@ -10,7 +10,7 @@ import threading
 import pytest
 
 from apps import json_artifact
-from apps.oa_finance_preaudit import cli, flow_engine, flow_evals
+from apps.oa_finance_preaudit import attempt_state, cli, flow_engine, flow_evals
 
 
 def _travel_material(request_id: str) -> dict:
@@ -412,7 +412,8 @@ def test_legacy_travel_packet_without_page_routing_uses_full_fallback(
     assert resumed["review_packet_file"] == str(packet_file)
 
 
-def test_travel_preview_closes_through_two_action_interface(tmp_path: Path) -> None:
+@pytest.mark.parametrize("storage", ["canonical", "legacy"])
+def test_travel_preview_closes_through_two_action_interface(tmp_path: Path, storage: str) -> None:
     engine = flow_engine.FlowEngine(
         root=tmp_path,
         discover_candidates=lambda workflow_key: [
@@ -462,11 +463,20 @@ def test_travel_preview_closes_through_two_action_interface(tmp_path: Path) -> N
         _passing_decision(review_action, packet),
     )
 
+    if storage == "legacy":
+        json_artifact.write_json_atomic(Path(review_action["action_file"]), review_action)
+        legacy_state = json.loads(Path(review_action["state_file"]).read_bytes())
+        legacy_state.pop("action_reference_sha256")
+        json_artifact.write_json_atomic(Path(review_action["state_file"]), legacy_state)
+    immutable_action = Path(review_action["action_file"]).read_bytes()
+
     closed = engine.complete_review(
         Path(review_action["action_file"]),
         decision_path,
     )
 
+    assert Path(review_action["action_file"]).read_bytes() == immutable_action
+    assert attempt_state.read_action(Path(review_action["action_file"]))["action"] == "closed"
     assert closed["action"] == "closed"
     assert closed["execution_state"] == "closed"
     assert closed["business_state"] == "pass"
@@ -553,9 +563,8 @@ def test_empty_travel_queue_closes_without_collecting_material(tmp_path: Path) -
     assert closed["write_state"] == "not_requested"
     assert closed["mode"] == "preview"
     assert closed["write_authorized"] is False
-    assert json.loads(
-        Path(closed["action_file"]).read_text(encoding="utf-8")
-    ) == closed
+    assert "action_file" not in closed
+    assert not (tmp_path / "travel_expense" / "current-action.json").exists()
     assert collected == []
 
 
@@ -704,9 +713,7 @@ def test_changed_frozen_material_returns_needs_admin_without_closing(
     assert result["write_authorized"] is False
     state = json.loads(Path(action["state_file"]).read_text(encoding="utf-8"))
     assert state["execution_state"] == "needs_admin"
-    assert json.loads(
-        Path(action["action_file"]).read_text(encoding="utf-8")
-    )["execution_state"] == "needs_admin"
+    assert attempt_state.read_action(Path(action["action_file"]))["execution_state"] == "needs_admin"
 
 
 @pytest.mark.parametrize("changed_file", ["source", "prepared"])
@@ -937,11 +944,7 @@ def test_new_candidate_can_open_while_another_case_waits_for_review(
     assert second != first
     assert second["case_key"] != first["case_key"]
     assert collected == ["request-a", "request-b"]
-    assert json.loads(
-        (tmp_path / "travel_expense" / "current-action.json").read_text(
-            encoding="utf-8"
-        )
-    ) == second
+    assert attempt_state.read_action(Path(second["action_file"])) == second
 
 
 def test_concurrent_review_completion_cannot_overwrite_the_first_result(
@@ -1030,11 +1033,7 @@ def test_concurrent_review_completion_cannot_overwrite_the_first_result(
     assert Path(first["remark_file"]).read_text(encoding="utf-8").startswith(
         "AI审核结论：可提交 ✅\n"
     )
-    assert json.loads(
-        (tmp_path / "travel_expense" / "current-action.json").read_text(
-            encoding="utf-8"
-        )
-    ) == first
+    assert attempt_state.read_action(Path(first["action_file"])) == first
 
 
 def test_stale_closed_attempt_cannot_replace_a_new_current_attempt(
@@ -1076,8 +1075,30 @@ def test_stale_closed_attempt_cannot_replace_a_new_current_attempt(
     assert first_closed["attempt"] == 1
     assert second_action["attempt"] == 2
     assert stale_result == first_closed
-    assert json.loads(
-        (tmp_path / "travel_expense" / "current-action.json").read_text(
-            encoding="utf-8"
-        )
-    ) == second_action
+    assert attempt_state.read_action(Path(second_action["action_file"])) == second_action
+
+
+@pytest.mark.parametrize("replacement", [None, b"[]"])
+def test_changed_attempt_reference_blocks_without_rebinding(tmp_path: Path, replacement: bytes | None) -> None:
+    engine = flow_engine.FlowEngine(
+        root=tmp_path,
+        discover_candidates=lambda workflow_key: [{
+            "request_id": "reference-request", "received_at": "2026-08-22T09:00:00+08:00",
+            "workflow_key": workflow_key,
+        }],
+        collect_material=lambda request_id, _root: _travel_material(request_id),
+    )
+    action = engine.next_action("travel_expense", mode="preview")
+    path = Path(action["action_file"])
+    if replacement is not None:
+        legacy_state = json.loads(Path(action["state_file"]).read_bytes())
+        legacy_state.pop("action_reference_sha256")
+        json_artifact.write_json_atomic(path, action)
+        json_artifact.write_json_atomic(Path(action["state_file"]), legacy_state)
+    original_state = Path(action["state_file"]).read_bytes()
+    path.write_bytes(path.read_bytes() + b" " if replacement is None else replacement)
+    blocked = engine.next_action("travel_expense", mode="preview")
+    assert blocked["action"] == "needs_admin"
+    assert blocked["reason"] == "persistent_state_invalid"
+    assert Path(action["state_file"]).read_bytes() == original_state
+    assert not path.with_name("execution-receipt.json").exists()

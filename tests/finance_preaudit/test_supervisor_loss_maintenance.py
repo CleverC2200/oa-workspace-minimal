@@ -16,17 +16,16 @@ from apps.oa_approval import runtime_control
 from apps.oa_finance_preaudit import maintenance_runtime, production_config, production_release, reconciliation
 from scripts.finance_preaudit_run import bind_tool_session, supervise
 from tests.finance_preaudit.test_flow_engine_submission import _engine
-from tests.finance_preaudit.test_maintenance_runtime import clean_control_environment, live_snapshot
+from tests.finance_preaudit.test_maintenance_runtime import clean_control_environment, compiled_maintenance_source, live_snapshot
 from tests.finance_preaudit.test_production_release import git
 
 
 @pytest.fixture
-def lost_execution(tmp_path, monkeypatch):
+def lost_execution(tmp_path, monkeypatch, compiled_maintenance_source):
     tmp_path = tmp_path / 'oa-workspace-minimal'
     tmp_path.mkdir()
-    source = Path(maintenance_runtime.__file__).resolve().parents[2]
     for name in ('apps', 'scripts'):
-        shutil.copytree(source / name, tmp_path / name, ignore=shutil.ignore_patterns('__pycache__'))
+        shutil.copytree(compiled_maintenance_source / name, tmp_path / name)
     interpreter = tmp_path / '.venv/bin/python'
     interpreter.parent.mkdir(parents=True)
     interpreter.write_text('#!/bin/sh\nexec "' + sys.executable + '" "$@"\n')
@@ -139,7 +138,7 @@ def test_source_only_retains_trusted_same_run_cancelled_collection_and_blocked_c
 @pytest.fixture
 def source_only_production(lost_execution, monkeypatch):
     root, original, action = lost_execution
-    (root / '.gitignore').write_text('runtime/\n.venv/\nstatus.json\n')
+    (root / '.gitignore').write_text('runtime/\n.venv/\nstatus.json\n__pycache__/\n')
     (root / 'source.txt').write_text('first')
     git(root, 'init', '-q', '-b', 'main')
     git(root, 'add', '.')

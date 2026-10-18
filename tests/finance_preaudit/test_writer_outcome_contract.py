@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from apps.oa_finance_preaudit import attempt_state
+
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -514,7 +516,7 @@ def test_mixed_batch_continues_after_verified_rejection(tmp_path: Path, monkeypa
     monkeypatch.setattr(probe, "_preparation_executor", lambda: ThreadPoolExecutor(max_workers=1))
 
     def review(task):
-        action = json.loads(Path(task["action_file"]).read_text())
+        action = attempt_state.read_action(Path(task["action_file"]))
         return {
             "status": "reviewed", "decision": _decision(action),
             "model": "gpt-6.1-sol", "reasoning_effort": "medium",
