@@ -18,7 +18,7 @@ from typing import Sequence
 from uuid import UUID, uuid4
 
 from apps.oa_approval import auth, runtime_control
-from apps.oa_finance_preaudit import controller_handoff, approval_guard, approval_lifecycle, production_config
+from apps.oa_finance_preaudit import controller_handoff, target_scope, approval_guard, approval_lifecycle, production_config
 from apps.oa_finance_preaudit import host_chat_review
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -147,6 +147,19 @@ def _skip_verification(payload: dict, receipt: dict) -> dict:
             "invocation_id": receipt["invocation_id"], "verified_at": receipt["completed_at"],
             "stdout_sha256": receipt["output_sha256"]["stdout.log"], "reason": payload.get("reason"),
             "run_id": payload.get("run_id"), "blocked_until": payload.get("blocked_until")}
+
+
+def _target_outcome(payload: object, *, terminal: bool, completed: bool) -> dict:
+    try:
+        if (not terminal or not isinstance(payload, dict) or payload.get("kind") not in {
+                "preaudit_production_rolling_drain", "preaudit_production_concurrency_probe_failed"}):
+            raise ValueError("production_target_outcome_unverified")
+        outcome = target_scope.validate_outcome(payload.get("target_outcome"))
+        if not completed:
+            outcome["status"] = "blocked"
+        return outcome
+    except (TypeError, ValueError):
+        return {"status": "blocked", "reason": "production_target_outcome_unverified"}
 
 
 def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str,
@@ -295,6 +308,15 @@ def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str
                     verified = _verified_skip(payload)
                 if verified:
                     report.update(status="skipped", terminal=True)
+            try:
+                payload = json.loads(logs["stdout.log"] or b"null")
+            except (TypeError, ValueError):
+                payload = None
+            if "target_outcome" in receipt or isinstance(payload, dict) and "target_outcome" in payload:
+                target = _target_outcome(payload, terminal=report["terminal"], completed=report["status"] == "completed")
+                if receipt.get("target_outcome") != target:
+                    raise ValueError("controller_execution_target_outcome_mismatch")
+                report["target_outcome"] = target
             if retrieve and report["terminal"]:
                 if logs["stdout.log"] is None:
                     report.update(output_omitted="size_limit", controller_stdout_file=str(path.with_name("stdout.log")))
@@ -613,6 +635,15 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str,
                 receipt["result"] = "skipped"
                 if payload.get("kind") == "approval_startup_gate":
                     receipt["skip_verification"] = _skip_verification(payload, receipt)
+        try:
+            payload = json.loads(runtime_control.read_control_bytes(directory / "stdout.log") or b"null")
+        except (OSError, RuntimeError, TypeError, ValueError):
+            payload = None
+        if "--targets-only" in command or isinstance(payload, dict) and "target_outcome" in payload:
+            receipt["target_outcome"] = _target_outcome(
+                payload, terminal=bool(matched and receipt["state"] == "exited" and receipt["children_reaped"] is True),
+                completed=receipt["result"] == "completed",
+            )
         persist()
         return {**receipt, "receipt_file": str(receipt_file)}
     finally:

@@ -180,6 +180,7 @@ def _live_flow_engine(
     *,
     controlled: bool = False,
     selected_identity: tuple[str, str] | None = None,
+    target_case_keys: frozenset[str] | None = None,
 ) -> flow_engine.FlowEngine:
     configs = legacy_flow.load_all_configs()
     oa_api = legacy_api.build_api(configs[0])
@@ -221,6 +222,7 @@ def _live_flow_engine(
     ports = production_write.build_ports(root=root) if controlled else {}
     return flow_engine.FlowEngine(
         root=root,
+        projection_scope=target_case_keys,
         discover_candidates=discover,
         discover_handled=lambda: oa_api.handled_rows(page_size=200, max_pages=100),
         collect_material=collect,

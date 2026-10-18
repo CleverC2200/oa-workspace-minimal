@@ -94,6 +94,14 @@ python -B -m apps.oa_finance_preaudit.host_chat_review --operation submit --owne
 
 财务原工具 session 和原回执均确认 completed、children_reaped=true，且新鲜结束门禁可信、Writer 空闲后，执行 `host_chat_review --operation enter-packaging --owner-task-id <主会话UUID>`。该操作只推进同轮阶段，不重启控制器，不增加 Agent；包装请求继续使用上方 pending、followup、assign、submit。包装业务确认和完成动作见[包装审核](packaging-review.md)。包装主审请求还必须由 App 完成入口产生可信 app-completion.json，绑定语义确认、决定、闭合 action/state、执行回执和文件指纹；独立复核请求只是只读结果，不代替 OA 完成。仅主审 submitted 或 draft_ready 时 normal close 拒绝，不能直接把本轮报完成。包装及结束对账完成后，执行下面的统一收尾。
 
+### 定向恢复与逐目标验收
+
+在已获单据级授权的下一轮，监督入口的 `--` 后传入 `--targets-only`，并重复使用 `--recover-action-file <隔离动作绝对路径>` 或 `--resume-action-file <已打开动作绝对路径>`。恢复沿原校验创建一次新 attempt，续审复用原 attempt。必须提供非空目标；等价输入去重，方式冲突、旧 attempt、坏路径及冻结不可信拒绝。此模式不能与自动选择恢复或暂缓参数混用，未开启时保持原全队列行为。
+
+选择固定到精确单据版本，范围内按操作时间 FIFO；新增待办和范围外历史状态不取材、不恢复、不提交。全量身份、停止、unknown、Writer 与进程回收门仍先检查，目标范围不授予写入资格。
+
+控制器输出及监督回读的 `target_outcome` 为每个目标保留脱敏单据键、来源/实际 attempt、执行/业务/写入状态与证据分类。`complete` 要求全部目标可信提交并后查，或已办且有可信无需重提证据；`partial` 表示门禁可信但仍有未解决目标；安全阻断为 `blocked`。提交的 `needs_human` 可以完成，preview、模型结束或不可见不能当提交成功。进程退出码和原 `result` 含义不变，进程 completed 仍可能目标 partial；原历史回执不改写。真实生产逐目标验收仍需独立授权，见 [#350](https://github.com/CleverC2200/oa-workspace-minimal/issues/350)。
+
 ### 本轮精确暂缓未提交单据
 
 用户允许先跳过拿不准的单据时，在下一轮滚动入口重复传入 `--defer-action-file /absolute/path/to/action.json`。参数只缩小本次选择范围，不改变原单状态，不重采材料；不提供参数的后续轮次会重新选择该单。运行中不修改本轮选择，已有控制器先按下节完成收尾。
