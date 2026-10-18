@@ -148,6 +148,26 @@ def test_cloud_body_is_not_prepared_after_linked_file_changes(original_transport
     assert not list((tmp_path / 'prepared').rglob('*.png'))
 
 
+@pytest.mark.parametrize('change,expected', [
+    ('main_file', 'resource_ownership_untrusted'),
+    ('actor', 'rpa_session_invalid'),
+    ('data_id', 'resource_ownership_untrusted'),
+])
+def test_cloud_download_rechecks_live_identity_before_preparation(original_transport, tmp_path, change, expected):
+    state = original_transport
+    state.still_denied = True
+    state.cloud_pdf = state.pdf
+    if change == 'data_id':
+        field = state.workflow['workflowDetailTableInfos'][0]['workflowRequestTableRecords'][0]['workflowRequestTableFields'][0]
+        state.after_cloud_download = lambda: field.update(fieldValue='102')
+    else:
+        state.after_cloud_download = lambda: setattr(state, change, '999')
+    with pytest.raises(RuntimeError, match='^' + expected + '$'):
+        collect_original(state, tmp_path)
+    assert not list((tmp_path / 'attachments').rglob('*.cloud.part'))
+    assert not list((tmp_path / 'prepared').rglob('*.png'))
+
+
 @pytest.mark.parametrize('failure', ['json', 'truncated', 'oversized', 'http', 'redirect'])
 def test_cloud_failure_keeps_collection_unavailable(original_transport, tmp_path, monkeypatch, failure):
     from apps.oa_approval import invoice_originals

@@ -146,7 +146,12 @@ def download_original(resource: dict, *, dest_dir: Path, timeout_sec: int) -> tu
             if (len(body) > _MAX_ORIGINAL_BYTES or not body.startswith(b'%PDF-')
                     or length is not None and len(body) != int(length)):
                 return None, 'attachment_content_incomplete'
-        if source_for_download(request_id, native_file_id) != source:
+        _, current_source, current_data_id = _download_context(request_id, native_file_id)
+        if current_source != source or current_data_id != data_id:
+            return None, 'resource_ownership_untrusted'
+        url, error = attachments._normalized_download_url(resource)
+        if error or not attachments._initialize_workflow_document_context(
+                resource, url, timeout_sec=timeout_sec, initialize=False):
             return None, 'resource_ownership_untrusted'
         if runtime_control.stop_requested():
             return None, runtime_control.STOP_CODE
@@ -157,6 +162,8 @@ def download_original(resource: dict, *, dest_dir: Path, timeout_sec: int) -> tu
         return dest, ''
     except urllib.error.HTTPError as error:
         return None, 'attachment_access_denied' if error.code in (401, 403) else 'attachment_download_failed'
+    except attachments.rpa_session.RpaSessionError as error:
+        return None, error.code
     except Exception:
         return None, 'attachment_download_failed'
     finally:
