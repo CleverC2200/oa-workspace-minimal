@@ -144,6 +144,73 @@ def test_public_restart_recovery_preserves_real_failed_wait_and_all_business_evi
         assert Path(result['receipt_file']).stat().st_mode & 0o077 == 0
 
 
+def test_prepare_failure_recovery_preflight_preserves_exact_stop_and_material_proof(
+    restart_target, capsys, monkeypatch,
+):
+    root, original, action, cron, args, live = restart_target
+    stop = root / 'runtime/stop-preaudit.flag'
+    cron_before = cron.read_bytes()
+    runtime_control.write_control_bytes_atomic(
+        stop, b'stop_requested:production_probe_prepare_failed\n'
+    )
+    current_inputs = {
+        'kind': 'preaudit_maintenance_current_inputs',
+        'status': 'verified',
+        'read_only': True,
+        'target_root': str(root),
+        'write_state': 'not_requested',
+        'verified_material_failure_actions': [str(action)],
+        'material_failure_recovery_ready': True,
+        'material_failure_fingerprints': {},
+    }
+    snapshot = live(root)
+    snapshot['maintenance_current_inputs'] = current_inputs
+    snapshot['reconciliation'] = {
+        'continuation': {
+            'status': 'blocked', 'scope': 'controller', 'isolated_pending': 0,
+            'blocking_reasons': {'pending_failure_not_isolated': 1},
+        },
+        'quarantine': {'pending_quarantined': 1},
+    }
+    report = {
+        'kind': 'preaudit_controller_execution_readback',
+        'read_only': True,
+        'state': 'exited',
+        'terminal': True,
+        'children_reaped': True,
+        'controller_state': 'failed',
+        'exit_code': 1,
+        'run_id': 'a' * 32,
+        'controller_instance_id': 'b' * 32,
+        'code_revision': args[args.index('--expected-revision') + 1],
+        'receipt_file': str(original.file),
+        'owner_task_id': original.owner_task_id,
+        'invocation_id': original.file.parent.name,
+        'tool_session_id': original.tool_session_id,
+        'owner_restart_proof': {'kind': 'preaudit_owner_restart_proof', 'read_only': True},
+    }
+    monkeypatch.setattr(owner_restart_recovery, '_read_prepare_failure_original', lambda *_, **__: {
+        **report,
+        'prepare_failure_recovery_proof': report['owner_restart_proof'],
+    })
+    monkeypatch.setattr(maintenance_runtime, 'assert_live_safe', lambda *_, **__: None)
+    monkeypatch.setattr(maintenance_runtime, 'read_current_inputs', lambda *_, **__: current_inputs)
+    code = owner_restart_recovery.main(
+        [*args, '--prepare-failure-recovery', 'YES', '--recover-action-file', str(action)],
+        check_live=lambda _target: snapshot,
+    )
+    result = json.loads(capsys.readouterr().out)
+    assert code == 0, result
+    assert result['status'] == 'ready'
+    assert result['prepare_failure_recovery'] is True
+    assert result['selected_recovery_action'] == str(action)
+    assert result['stop_cleared'] is False
+    assert result['approval_started'] is False
+    assert result['automation_state'] == 'PAUSED'
+    assert stop.read_bytes() == b'stop_requested:production_probe_prepare_failed\n'
+    assert cron.read_bytes() == cron_before
+
+
 @pytest.mark.parametrize('mutation', ['missing_owner_loss','missing_supervisor_stop','received_signal',
     'unknown_wait','manual_stop','cooldown','active_controller','progress_writer','original_changed','stop_replaced','auth','unknown_write','frozen_changed','attachment_replaced','prepared_replaced'])
 def test_public_restart_recovery_refuses_other_causes_and_changing_evidence(restart_target, capsys, mutation):

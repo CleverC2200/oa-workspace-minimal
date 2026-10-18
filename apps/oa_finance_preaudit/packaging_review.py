@@ -221,39 +221,41 @@ def _observations(action: Path, source: dict, refs: list[str] | None = None, *, 
     required = set(paths if refs is None else refs)
     if not required or not required.issubset(paths):
         raise ValueError('packaging_page_coverage')
-    raw = review_context.read_input(Path(source['session_file']))
     observed = {}
-    for number, line in enumerate(raw.splitlines(), 1):
-        if number >= source['line']:
-            break
-        row = json.loads(line)
-        payload = row.get('payload', {})
-        if row.get('type') != 'response_item' or payload.get('type') not in {'function_call', 'custom_tool_call'}:
-            continue
-        args = payload.get('arguments', payload.get('input', ''))
-        image_path = None
-        if payload.get('name') in {'view_image', 'functions.view_image'}:
-            try:
-                image_path = (json.loads(args) if isinstance(args, str) else args).get('path')
-            except (ValueError, AttributeError):
+    with host_chat_review._native_path(Path(source['session_file'])).open('rb') as stream:
+        for number, raw in host_chat_review._native_lines(stream):
+            if number >= source['line']:
+                break
+            if raw is None:
                 continue
-        elif payload.get('name') in {'functions.exec', 'exec'} and isinstance(args, str):
-            image_path = _single_image_path(args)
-        if image_path not in paths.values():
-            continue
-        stamp = row.get('timestamp')
-        if not isinstance(stamp, str) or datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp() < source['dispatched_at']:
-            continue
-        _, proof = host_chat_review._native_source(Path(source['session_file']), source['session_id'], number, output=True)
-        output = proof.pop('output')
-        failed = _tool_failed(output)
-        read = not failed and _image_output(output)
-        if proof['output_line'] >= source['line'] or not (read or allow_failed and failed):
-            continue
-        proof['observation_state'] = 'read' if read else 'failed'
-        for ref, path in paths.items():
-            if path == image_path and ref in required:
-                observed[ref] = {**proof, 'page_ref': ref, 'path_sha256': hashlib.sha256(review_context.read_input(Path(path))).hexdigest()}
+            row = json.loads(raw)
+            payload = row.get('payload', {})
+            if row.get('type') != 'response_item' or payload.get('type') not in {'function_call', 'custom_tool_call'}:
+                continue
+            args = payload.get('arguments', payload.get('input', ''))
+            image_path = None
+            if payload.get('name') in {'view_image', 'functions.view_image'}:
+                try:
+                    image_path = (json.loads(args) if isinstance(args, str) else args).get('path')
+                except (ValueError, AttributeError):
+                    continue
+            elif payload.get('name') in {'functions.exec', 'exec'} and isinstance(args, str):
+                image_path = _single_image_path(args)
+            if image_path not in paths.values():
+                continue
+            stamp = row.get('timestamp')
+            if not isinstance(stamp, str) or datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp() < source['dispatched_at']:
+                continue
+            _, proof = host_chat_review._native_source(Path(source['session_file']), source['session_id'], number, output=True)
+            output = proof.pop('output')
+            failed = _tool_failed(output)
+            read = not failed and _image_output(output)
+            if proof['output_line'] >= source['line'] or not (read or allow_failed and failed):
+                continue
+            proof['observation_state'] = 'read' if read else 'failed'
+            for ref, path in paths.items():
+                if path == image_path and ref in required:
+                    observed[ref] = {**proof, 'page_ref': ref, 'path_sha256': review_context.input_sha256(Path(path))}
     if set(observed) != required:
         raise ValueError('packaging_observation_missing')
     return [observed[ref] for ref in paths if ref in required]
@@ -422,7 +424,7 @@ def complete_host(receipt_file: Path, *, project_root: Path = PROJECT_ROOT, conf
     if engine is None:
         from . import cli
         engine = cli._live_flow_engine(controlled=True)
-    with host_chat_review._round_lease(confirmed['owner_task_id']):
+    with host_chat_review._round_lease(confirmed['owner_task_id'], request['run_id']):
         _trusted_host_receipt(receipt_file)
         result = engine.complete_review(Path(receipt['action_file']), Path(receipt['decision_file']))
         if result.get('action') == 'closed' and result.get('write_state') in {'not_requested', 'submitted'}:
@@ -444,12 +446,12 @@ def complete_host(receipt_file: Path, *, project_root: Path = PROJECT_ROOT, conf
                 host_chat_review._write_new(marker_file, marker)
                 # Seal an already-completed Writer even if the parent lease expired
                 # during its in-flight operation; this admits no new write.
-                registered = host_chat_review._registry(confirmed['owner_task_id'], live=False)
+                registered = host_chat_review._registry(confirmed['owner_task_id'], live=False, run_id=request['run_id'])
                 registered['assignments'][request['request_id']].update(
                     completion_file=str(marker_file), completion_sha256=hashlib.sha256(review_context.read_input(marker_file, private=True)).hexdigest(),
                     completed_at=time.time())
                 from . import approval_guard
-                approval_guard.write(host_chat_review.registry_file(confirmed['owner_task_id']), registered)
+                approval_guard.write(host_chat_review.registry_file(confirmed['owner_task_id'], request['run_id']), registered)
             except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                 # The original consumer has already sealed the business outcome.
                 # A local App evidence failure cannot erase or replay that write.

@@ -408,6 +408,34 @@ def test_tpm_read_failure_never_enters_reviewer_prompt(
         codex_review_worker._prompt(Path(action["action_file"]))
 
 
+def test_tpm_content_incomplete_failure_keeps_redacted_stage_diagnostic(tmp_path):
+    def _prepare_one_attachment(_request_id, _attempt_root):
+        raise RuntimeError("attachment_content_incomplete: account=private token=secret")
+
+    engine = flow_engine.FlowEngine(
+        root=tmp_path / "runtime" / "finance_preaudit_flows",
+        discover_candidates=lambda workflow_key: [{
+            "request_id": "diagnostic-request",
+            "received_at": "2026-09-16T09:00:00+08:00",
+            "workflow_key": workflow_key,
+        }],
+        collect_material=_prepare_one_attachment,
+    )
+    action = engine.next_action(WORKFLOW_KEY)
+
+    diagnostic = action["failure_diagnostic"]
+    assert diagnostic == {
+        "kind": "preaudit_material_failure_diagnostic",
+        "code": "attachment_content_incomplete",
+        "stage": "attachment_prepare",
+        "error_class": "RuntimeError",
+        "last_frame": "_prepare_one_attachment",
+    }
+    serialized = json.dumps(diagnostic, ensure_ascii=False)
+    assert "account=private" not in serialized
+    assert "secret" not in serialized
+
+
 @pytest.mark.parametrize("all_pass", [True, False])
 def test_tpm_public_remark_keeps_all_four_checks(tmp_path: Path, all_pass: bool) -> None:
     engine = _engine(tmp_path)

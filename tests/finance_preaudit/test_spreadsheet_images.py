@@ -2,6 +2,7 @@ import io
 import hashlib
 import random
 import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 import openpyxl
 import fitz
@@ -62,6 +63,37 @@ def rewrite_part(path, member, transform):
             z.writestr(name, content)
 
 
+@pytest.mark.parametrize('compact', [False, True])
+def test_preparation_ignores_unreferenced_workbook_custom_xml(tmp_path, compact):
+    path = book(tmp_path)
+    namespace = 'http://schemas.openxmlformats.org/package/2006/relationships'
+
+    def add_metadata(content):
+        root = ET.fromstring(content)
+        ET.SubElement(root, f'{{{namespace}}}Relationship', {
+            'Id': 'metadata',
+            'Type': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml',
+            'Target': '../customXml/item1.xml',
+        })
+        return ET.tostring(root)
+
+    rewrite_part(path, 'xl/_rels/workbook.xml.rels', add_metadata)
+    with zipfile.ZipFile(path, 'a') as archive:
+        archive.writestr('customXml/item1.xml', '<metadata/>')
+    original = path.read_bytes()
+
+    images, manifest, facts = attachment_extractors.prepare_materials(
+        [{'resource_id': 'book', 'path': str(path)}],
+        out_dir=tmp_path/'prepared', compact_spreadsheet=compact,
+    )
+
+    assert path.read_bytes() == original
+    assert {image['spreadsheet_cell'] for image in images} == {'现场!B2', '现场!C3'}
+    assert manifest[0]['status'] == 'spreadsheet_read'
+    assert manifest[0]['image_count'] == 2
+    assert facts[0]['resource_id'] == 'book'
+
+
 def test_shared_formula_preserves_each_cell_anchor(tmp_path):
     path = book(tmp_path)
     rewrite_part(path, 'xl/worksheets/sheet1.xml', lambda b: b.replace(b'<f>DISPIMG', b'<f t="shared" si="0" ref="B2:C2">DISPIMG').replace(b'</row></sheetData>', b'<c r="C2"><f t="shared" si="0"/></c></row></sheetData>'))
@@ -81,6 +113,35 @@ def test_image_relationship_cannot_escape_workbook(tmp_path):
     rewrite_part(path, 'xl/_rels/cellimages.xml.rels', lambda b: b.replace(b'media/cell.png', b'../../outside.png'))
     with pytest.raises(RuntimeError, match='attachment_content_incomplete'):
         attachment_extractors.prepare_materials([{'resource_id':'book', 'path':str(path)}], out_dir=tmp_path/'prepared')
+
+
+@pytest.mark.parametrize('member', [
+    'xl/_rels/workbook.xml.rels',
+    'xl/worksheets/_rels/sheet1.xml.rels',
+    'xl/drawings/_rels/drawing1.xml.rels',
+])
+@pytest.mark.parametrize('mutation', ['external', 'outside', 'missing', 'duplicate'])
+def test_preparation_rejects_untrusted_referenced_relationship(tmp_path, member, mutation):
+    path = book(tmp_path)
+
+    def mutate(content):
+        root = ET.fromstring(content)
+        relation = root[0]
+        if mutation == 'external':
+            relation.set('TargetMode', 'External')
+        elif mutation == 'outside':
+            relation.set('Target', '../../outside.png')
+        elif mutation == 'missing':
+            relation.set('Target', 'missing.xml')
+        else:
+            root.append(ET.fromstring(ET.tostring(relation)))
+        return ET.tostring(root)
+
+    rewrite_part(path, member, mutate)
+    with pytest.raises(RuntimeError, match='^attachment_content_incomplete$'):
+        attachment_extractors.prepare_materials(
+            [{'resource_id': 'book', 'path': str(path)}], out_dir=tmp_path/'prepared',
+        )
 
 
 def test_compact_spreadsheet_keeps_pixels_anchors_and_original_source(tmp_path):

@@ -88,6 +88,96 @@ def test_source_repair_preserves_real_controller_failure_and_all_original_files(
     assert automation.file.read_bytes() == cron
 
 
+def test_source_repair_preserves_prepare_failure_stop_and_paused_cron(failed_install):
+    root, remote, revision, automation, original, report, action, live = failed_install
+    stop = root / 'runtime/stop-preaudit.flag'
+    stop.write_bytes(b'stop_requested:production_probe_prepare_failed\n')
+    stop.chmod(0o600)
+    stop_before = stop.read_bytes()
+    cron_before = automation.file.read_bytes()
+    expected = advance_source(root, remote)
+    result = production_release.release_source(
+        root, expected_revision=expected, expected_origin=str(remote), confirmed_sync=True,
+        automation=automation, original_execution=original, failed_material_actions=(action,),
+        check_original=lambda *_: report, check_live=live, check_configuration=lambda *_: [],
+    )
+    assert result['status'] == 'synced'
+    assert result['material_failure_source_only'] is True
+    assert result['next_process_ready'] is False
+    assert result['approval_recovery_allowed'] is False
+    assert result['material_stop_preserved'] is True
+    assert stop.read_bytes() == stop_before
+    assert automation.file.read_bytes() == cron_before
+
+
+def test_prepare_failure_recovery_preflight_is_read_only_and_requires_exact_stop(
+    failed_install,
+):
+    root, remote, revision, automation, original, report, action, live = failed_install
+    stop = root / 'runtime/stop-preaudit.flag'
+    stop.write_bytes(b'stop_requested:production_probe_prepare_failed\n')
+    stop.chmod(0o600)
+    stop_before = stop.read_bytes()
+    cron_before = automation.file.read_bytes()
+    result = production_release.release_source(
+        root,
+        expected_revision=revision,
+        expected_origin=str(remote),
+        confirmed_sync=False,
+        automation=automation,
+        original_execution=original,
+        failed_material_actions=(action,),
+        prepare_failure_recovery_preflight=True,
+        check_original=lambda *_: report,
+        check_live=live,
+        check_configuration=lambda *_: [],
+    )
+    assert result['status'] == 'ready'
+    assert result['prepare_failure_recovery_preflight'] is True
+    assert result['source_sync_requested'] is False
+    assert result['source_sync_state'] == 'not_updated'
+    assert result['next_process_ready'] is False
+    assert result['approval_recovery_allowed'] is False
+    assert result['material_stop_preserved'] is True
+    assert stop.read_bytes() == stop_before
+    assert automation.file.read_bytes() == cron_before
+
+
+def test_prepare_failure_recovery_preflight_rejects_missing_or_other_stop(
+    failed_install,
+):
+    root, remote, revision, automation, original, report, action, live = failed_install
+    with pytest.raises(RuntimeError, match='production_release_prepare_failure_stop_required'):
+        production_release.release_source(
+            root,
+            expected_revision=revision,
+            expected_origin=str(remote),
+            automation=automation,
+            original_execution=original,
+            failed_material_actions=(action,),
+            prepare_failure_recovery_preflight=True,
+            check_original=lambda *_: report,
+            check_live=live,
+            check_configuration=lambda *_: [],
+        )
+    other_stop = root / 'runtime/stop-preaudit.flag'
+    other_stop.write_bytes(b'stop_requested:codex_review_technical_failure\n')
+    other_stop.chmod(0o600)
+    with pytest.raises(RuntimeError, match='production_release_stop_not_repairable'):
+        production_release.release_source(
+            root,
+            expected_revision=revision,
+            expected_origin=str(remote),
+            automation=automation,
+            original_execution=original,
+            failed_material_actions=(action,),
+            prepare_failure_recovery_preflight=True,
+            check_original=lambda *_: report,
+            check_live=live,
+            check_configuration=lambda *_: [],
+        )
+
+
 @pytest.mark.parametrize('damage', ['writer-boundary.json', 'execution-receipt.json', 'review-decision.json',
     'remark.txt', 'submission-envelope.json', 'bad_receipt', 'state_identity', 'additional_block'])
 def test_source_repair_rejects_untrusted_or_unexplained_failure(failed_install, damage):

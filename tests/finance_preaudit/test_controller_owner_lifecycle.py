@@ -227,9 +227,11 @@ def test_detached_snapshot_race_does_not_cancel_healthy_controller(tmp_path, mon
     monkeypatch.setenv('OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE', str(tmp_path / 'rolling.lock'))
     read = runner._read_evidence
     interrupted = []
+    started = tmp_path / 'controller-started'
 
     def raced_read(path):
         if path.name == 'execution.json' and not interrupted:
+            wait_until(started.exists)
             interrupted.append(True)
             raise ValueError(error_code)
         return read(path)
@@ -237,7 +239,7 @@ def test_detached_snapshot_race_does_not_cancel_healthy_controller(tmp_path, mon
     monkeypatch.setattr(runner, '_read_evidence', raced_read)
     directory = tmp_path / 'executions' / uuid4().hex
     options = dict(directory=directory, owner_task_id=str(uuid4()), detached=True)
-    command = [sys.executable, '-c', 'import time;time.sleep(.4)']
+    command = [sys.executable, '-c', f"import time\nfrom pathlib import Path\nPath({str(started)!r}).touch()\ntime.sleep(.4)"]
     if error_code == 'controller_execution_snapshot_changed':
         receipt = runner.supervise(command, **options)
         assert receipt['exit_code'] == 0 and not receipt['received_signals']

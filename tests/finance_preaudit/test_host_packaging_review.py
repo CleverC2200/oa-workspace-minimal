@@ -22,7 +22,16 @@ def envelope(path):
 
 
 @pytest.fixture
-def package_round(exchange, monkeypatch):
+def package_round(exchange, monkeypatch, request):
+    if getattr(request, 'param', None) == 'large-image':
+        from tests.finance_preaudit import test_flow_engine_packaging as fixtures
+        collect = fixtures._material
+        def large_material(*args, **kwargs):
+            material = collect(*args, **kwargs)
+            with Path(material['prepared']['images'][0]['path']).open('ab') as stream:
+                stream.write(b'\0' * (17 * 1024 * 1024))
+            return material
+        monkeypatch.setattr(fixtures, '_material', large_material)
     finance, _, owner, child, _, manifest, _ = exchange
     root = Path(finance).parents[6]
     package = action(root)
@@ -103,6 +112,52 @@ def test_current_observed_app_draft_preserves_business_fields_without_cli(packag
     assert receipt['host_result']['assignment'] == reviewed['assignment']
     bound = json.loads(Path(receipt['decision_file']).read_text())
     assert {key: bound[key] for key in envelope(path)['draft']} == envelope(path)['draft']
+
+
+@pytest.mark.parametrize('package_round,prefix_bytes', [
+    ('large-image', 0), (None, 17 * 1024 * 1024), (None, 33 * 1024 * 1024),
+], indirect=['package_round'])
+def test_public_submission_verifies_large_images_and_native_media(package_round, prefix_bytes):
+    path, _, owner, _ = package_round
+    request, child = assigned_package(package_round)
+    if prefix_bytes:
+        with child.open('a') as stream:
+            stream.write(json.dumps({'type': 'event_msg', 'payload': {'type': 'unrelated_media',
+                'data': 'x' * prefix_bytes}}) + '\n')
+    observe_pages(path, child)
+    reviewed = publish_payload(request, child, envelope(path), owner)
+    assert reviewed['status'] == 'reviewed'
+    image = Path(next(iter(packaging._page_paths(path).values())))
+    observations = packaging._observations(path, reviewed['source'])
+    assert observations[0]['path_sha256'] == hashlib.sha256(image.read_bytes()).hexdigest()
+
+
+def test_large_page_hash_keeps_diagnostic_size_and_file_safety_limits(tmp_path):
+    from apps.oa_finance_preaudit import review_context
+    image = tmp_path / 'original.png'
+    image.write_bytes(b'x' * (17 * 1024 * 1024))
+    assert review_context.input_sha256(image) == hashlib.sha256(image.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match='diagnostic_input_too_large'):
+        review_context.read_input(image)
+    linked = tmp_path / 'linked.png'
+    linked.symlink_to(image)
+    with pytest.raises(ValueError, match='diagnostic_input_unsafe'):
+        review_context.input_sha256(linked)
+    image.chmod(0o666)
+    with pytest.raises(ValueError, match='diagnostic_input_permissions_invalid'):
+        review_context.input_sha256(image)
+    with pytest.raises(ValueError, match='diagnostic_input_unreadable'):
+        review_context.input_sha256(tmp_path)
+
+
+def test_public_submission_still_rejects_oversized_required_image_output(package_round):
+    path, _, owner, _ = package_round
+    request, child = assigned_package(package_round)
+    original = next(iter(packaging._page_paths(path).values()))
+    native_exec(child, 'const r=await tools.view_image({path:' + json.dumps(original) + '});image(r.image_url);',
+        'oversized-required-image', [{'type': 'input_image', 'image_url': 'data:image/png;base64,' + 'x' * (33 * 1024 * 1024)}])
+    with pytest.raises(ValueError, match='host_review_source_untrusted'):
+        publish_payload(request, child, envelope(path), owner)
 
 
 def ready_draft(package_round, *, recheck=False, uncertain=False):
@@ -388,3 +443,16 @@ def test_public_completion_reports_confirmed_write_when_local_marker_seal_fails(
     if seal_failure != 'registry':
         assert host.close(owner=owner, reason='cancelled')['state'] == 'cancelled'
     assert len(calls) == 1 and json.loads(action.read_text())['write_state'] == 'submitted'
+
+
+def test_app_completion_seals_request_round_without_inherited_controller_environment(package_round, monkeypatch):
+    from tests.finance_preaudit.test_flow_engine_packaging import _engine
+    receipt = ready_draft(package_round)
+    semantic_accept(receipt, package_round)
+    with monkeypatch.context() as context:
+        context.delenv(host.guard.RUN_ENV, raising=False)
+        context.delenv(host.guard.INSTANCE_ENV, raising=False)
+        result = packaging.complete_host(receipt, project_root=package_round[1], confirm_write=True,
+            engine=_engine(package_round[1] / 'runtime/finance_preaudit_flows'))
+    assert result['action'] == 'closed'
+    assert result.get('completion_seal', {}).get('status') != 'failed'
