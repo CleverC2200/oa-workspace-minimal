@@ -610,9 +610,10 @@ def collect_case(
     ]
 
     declared_fields = _field_rows(workflow)
-    if (config.get("flow_key") == "general_expense" and not logical_resources
+    if (config.get("flow_key") in {"general_expense", "tpm_small_marketing_fee"} and not logical_resources
             and not authority_facts and not invoice_evidence.get("invoices")):
-        empty_fields = official_sql.general_expense_empty_attachment_fields(workflow, request_id=str(request_id))
+        empty_fields = official_sql.confirmed_empty_attachment_fields(
+            workflow, request_id=str(request_id), workflow_key=str(config["flow_key"]))
         for field in declared_fields:
             if field["path"] in empty_fields:
                 field["read_status"] = "empty"
