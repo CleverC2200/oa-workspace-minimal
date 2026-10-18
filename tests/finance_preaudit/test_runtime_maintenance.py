@@ -1775,14 +1775,15 @@ def _recognition_output(root, name, *, age_days=31, status="complete", owners=()
     return directory
 
 
-def test_prune_recognition_outputs_respects_lifecycle_and_preserves_sources(tmp_path):
+@pytest.mark.parametrize("terminal_status", ["failed", "skipped"])
+def test_prune_recognition_outputs_respects_lifecycle_and_preserves_sources(tmp_path, terminal_status):
     root = tmp_path / "runtime"
     root.mkdir()
     retention.initialize_root(root)
     source = tmp_path / "source.txt"
     source.write_text("synthetic source must remain")
     expired = _recognition_output(root, "a" * 32)
-    failed = _recognition_output(root, "b" * 32, status="failed")
+    failed = _recognition_output(root, "b" * 32, status=terminal_status)
     recent = _recognition_output(root, "c" * 32, age_days=1)
     running = _recognition_output(root, "d" * 32, status="running")
     legacy = _recognition_output(root, "e" * 32, sidecar=False)
