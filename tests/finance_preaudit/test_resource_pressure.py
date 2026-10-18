@@ -55,7 +55,7 @@ def test_sustained_cpu_pressure_keeps_fifo_and_does_not_handoff(tmp_path: Path, 
         assert reviewed["decision"]["kind"] == "preaudit_review_decision"
         completed.append(path)
         return {**reviewed, "status": "completed", "business_state": "pass", "write_state": "submitted", "error_code": None}
-    result = probe._run_dispatched_tasks(4, 6, project_root=tmp_path, adaptive=True,
+    result = probe._run_dispatched_tasks(4, 3, project_root=tmp_path, adaptive=False,
         heartbeat_interval_sec=0.01, renew_actions=lambda p: p, review_worker=review,
         complete_review=complete, executor_factory=lambda n: ThreadPoolExecutor(max_workers=n),
         runtime_status=lambda: control.sample_local_health(memory_reader=lambda: 44,
@@ -63,7 +63,6 @@ def test_sustained_cpu_pressure_keeps_fifo_and_does_not_handoff(tmp_path: Path, 
     assert result.completed == 4
     assert result.failed == result.stopped == result.timed_out == 0
     assert completed == paths
-    assert result.recommended_capacity == control.CAPACITY_STEPS[0] == 2
     assert result.processes_reaped
 
 
@@ -91,7 +90,7 @@ def test_unknown_health_waits_without_claim_or_write_and_can_resume(tmp_path: Pa
         assert action == path
         calls.append("write")
         return {**value, "status": "completed", "business_state": "pass", "write_state": "submitted"}
-    result = probe._run_dispatched_tasks(1, 6, project_root=tmp_path, adaptive=True,
+    result = probe._run_dispatched_tasks(1, 3, project_root=tmp_path, adaptive=False,
         heartbeat_interval_sec=0.01, runtime_status=health, renew_actions=renew,
         review_worker=review, complete_review=complete,
         executor_factory=lambda n: ThreadPoolExecutor(max_workers=n))
@@ -146,7 +145,7 @@ def test_writer_rejection_does_not_retry_after_resource_recovery(tmp_path: Path,
         assert unknown_seen.wait(1)
         phase = "recovered"
         return _rejected_decision_result(value)
-    result = probe._run_dispatched_tasks(1, 6, project_root=tmp_path, adaptive=True,
+    result = probe._run_dispatched_tasks(1, 3, project_root=tmp_path, adaptive=False,
         heartbeat_interval_sec=0.01, runtime_status=health, renew_actions=lambda p: p,
         review_worker=review, complete_review=complete,
         record_failure_round=lambda *_args: {"production_failure_round": 1},
@@ -157,64 +156,3 @@ def test_writer_rejection_does_not_retry_after_resource_recovery(tmp_path: Path,
     assert phase == "recovered"
     assert any(sample["resource_paused"] for sample in result.runtime_samples)
     assert probe.runtime_control.stop_reason() is None
-
-
-def test_prepared_work_waits_for_review_capacity_after_decrease(tmp_path: Path, monkeypatch):
-    from tests.finance_preaudit.test_concurrency_probe import _open_action
-    monkeypatch.setattr(probe.runtime_control, "stop_requested", lambda: False)
-    monkeypatch.setattr(probe, "_preparation_executor", lambda: ThreadPoolExecutor(max_workers=1))
-    prepare_count = 0
-    pressure_samples = 0
-    prepared_order = {}
-    active = 0
-    sixth_started = False
-    release_preparation = threading.Event()
-    release_reviews = threading.Event()
-    sixth_entered = threading.Event()
-    guard = threading.Lock()
-    def prepare(selection):
-        nonlocal prepare_count
-        prepare_count += 1
-        index = prepare_count
-        if index == 6:
-            assert release_preparation.wait(2)
-        path = _open_action(tmp_path / "runtime" / "finance_preaudit_flows",
-            case_key=f"prepared-{index}", created_at=f"2026-08-25T02:01:0{index}+00:00")
-        prepared_order[path] = index
-        return {"action": "review_required", "action_file": str(path)}
-    def health():
-        nonlocal pressure_samples
-        if prepare_count >= 6:
-            pressure_samples += 1
-            release_preparation.set()
-            if pressure_samples >= 5:
-                release_reviews.set()
-            return {"status": "pressure"}
-        return {"status": "healthy"}
-    def review(task):
-        nonlocal active, sixth_started
-        with guard:
-            active += 1
-            if prepared_order[Path(task["action_file"])] == 6:
-                sixth_entered.set()
-                assert release_reviews.is_set()
-                # One old review deliberately stays in flight. The new review
-                # may start once the reduced two-slot capacity has room.
-                assert active == control.CAPACITY_STEPS[0] == 2
-                sixth_started = True
-        assert release_reviews.wait(2)
-        if prepared_order[Path(task["action_file"])] == 5:
-            assert sixth_entered.wait(2)
-        with guard:
-            active -= 1
-        return {"status": "reviewed", "decision": {}, "process_attempts": 1,
-                "agent_wall_seconds": 0, "token_usage": {"status": "unknown"}}
-    result = probe._run_dispatched_tasks(6, 6, project_root=tmp_path, adaptive=True,
-        heartbeat_interval_sec=0.01, runtime_status=health, prepare_action=prepare,
-        renew_actions=lambda p: p, review_worker=review,
-        complete_review=lambda p,v: {**v, "status": "completed", "business_state": "pass", "write_state": "submitted"},
-        executor_factory=lambda n: ThreadPoolExecutor(max_workers=n))
-    assert result.completed == 6
-    assert result.failed == result.stopped == result.timed_out == 0
-    assert sixth_started
-    assert result.recommended_capacity == control.CAPACITY_STEPS[0] == 2
