@@ -196,10 +196,10 @@ def _validate_prepared(prepared: dict, *, frozen: bool) -> None:
                                            for key in ('images', 'manifest', 'structured_contents')):
         raise ValueError('attachment_content_incomplete')
     images = prepared.get('images', [])
-    if not images and not prepared.get('structured_contents'):
+    if not images and not prepared.get('structured_contents') and not attachment_extractors.skipped_video_sources(prepared.get('manifest', [])):
         raise ValueError('attachment_content_empty')
     for entry in prepared.get('manifest', []):
-        if entry.get('status') not in attachment_extractors.SUCCESSFUL_PREPARATION_STATUSES:
+        if entry.get('status') not in attachment_extractors.SUCCESSFUL_PREPARATION_STATUSES | attachment_extractors.SKIPPED_PREPARATION_STATUSES:
             raise ValueError('attachment_content_incomplete')
         if 'image_count' in entry:
             expected = entry['image_count']
@@ -315,6 +315,8 @@ def recognize(*, files: list[Path] | None = None, action_file: Path | None = Non
                                        'text': _read(Path(item['path'])).decode('utf-8')})
             prepared = {'images': images, 'manifest': manifest, 'structured_contents': structured}
         _validate_prepared(prepared, frozen=action_file is not None)
+        report['skipped_sources'] = attachment_extractors.skipped_video_sources(prepared.get('manifest', []))
+        report['coverage'] = 'non_video_only' if report['skipped_sources'] else 'all_prepared_content'
         save()
         for current, source in _parts(prepared):
             if time.monotonic() >= deadline:
@@ -360,7 +362,7 @@ def recognize(*, files: list[Path] | None = None, action_file: Path | None = Non
         for source in report['sources']:
             if _source_digest(Path(source['path'])) != source['sha256']:
                 raise ValueError('attachment_source_changed')
-        report['status'] = 'complete'
+        report['status'] = 'complete' if report['parts'] else 'skipped'
     except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
         code = str(error)
         report.update(status='failed', error_code=code if code.startswith(('attachment_', 'frozen_')) else 'attachment_recognition_failed')
@@ -384,8 +386,9 @@ def main(argv=None) -> int:
     try:
         report = recognize(**vars(args))
         print(json.dumps({key: report[key] for key in ('status', 'report_file', 'model', 'transport')}
-                         | {'parts': len(report['parts']), 'error_code': report.get('error_code')}, ensure_ascii=False))
-        return 0 if report['status'] == 'complete' else 1
+                         | {'parts': len(report['parts']), 'skipped_sources': len(report.get('skipped_sources', [])),
+                            'coverage': report.get('coverage'), 'error_code': report.get('error_code')}, ensure_ascii=False))
+        return 0 if report['status'] in {'complete', 'skipped'} else 1
     except (OSError, ValueError) as error:
         code = str(error) if str(error) in {'attachment_api_key_missing', 'attachment_recognition_input_invalid', 'attachment_recognition_timeout_invalid', 'attachment_output_inside_frozen_attempt'} else 'attachment_recognition_start_failed'
         print(json.dumps({'status': 'failed', 'error_code': code}))
