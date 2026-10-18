@@ -339,7 +339,7 @@ def test_rolling_controller_runs_cache_maintenance_at_startup_and_each_wave(
         }
 
     def pipeline_runner(count: int, capacity: int):
-        return finance_preaudit_concurrency_probe.process_pool.PoolResult(
+        return finance_preaudit_concurrency_probe.PoolResult(
             requested=count,
             started=count,
             completed=count,
@@ -349,7 +349,7 @@ def test_rolling_controller_runs_cache_maintenance_at_startup_and_each_wave(
             peak_active=capacity,
             elapsed_seconds=0,
             outcomes=tuple(
-                finance_preaudit_concurrency_probe.process_pool.TaskOutcome(
+                finance_preaudit_concurrency_probe.TaskOutcome(
                     index=index,
                     status="completed",
                     value={

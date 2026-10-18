@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from scripts.finance_preaudit_concurrency_probe import PoolResult, TaskOutcome
+
 # Select the retained supplier explicitly for recorded CLI/slot behavior.
 from tests.finance_preaudit.review_profiles import retained_deepseek_cli  # noqa: F401
 
@@ -23,7 +25,6 @@ from apps.oa_finance_preaudit import (
     codex_review_worker,
     concurrency_control,
     observability,
-    process_pool,
 )
 from scripts import finance_preaudit_concurrency_probe
 
@@ -356,122 +357,6 @@ def test_read_only_probe_excludes_older_closed_attempt_when_latest_is_active(
     assert finance_preaudit_concurrency_probe._reviewable_action_files(tmp_path) == []
 
 
-def test_probe_renews_oldest_open_actions_and_returns_only_sanitized_counts(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        finance_preaudit_concurrency_probe.runtime_control,
-        "stop_requested",
-        lambda: False,
-    )
-    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
-    newer = _open_action(
-        flow_root,
-        case_key="b" * 64,
-        created_at="2026-08-23T12:00:00+00:00",
-    )
-    older = _open_action(
-        flow_root,
-        case_key="a" * 64,
-        created_at="2026-08-23T11:00:00+00:00",
-    )
-    renewed: list[Path] = []
-
-    def renew(paths: list[Path]) -> list[Path]:
-        renewed.extend(paths)
-        return paths
-
-    def review(tasks: list[dict], capacity: int) -> process_pool.PoolResult[dict]:
-        assert capacity == 1
-        assert [Path(task["action_file"]) for task in tasks] == [older]
-        outcome = process_pool.TaskOutcome(
-            index=0,
-            status="completed",
-            value={
-                "status": "completed",
-                "business_state": "needs_human",
-                "process_attempts": 1,
-                "process_retries": 0,
-                "token_usage": {
-                    "status": "recorded",
-                    "input_tokens": 100,
-                    "cached_input_tokens": 10,
-                    "output_tokens": 20,
-                    "total_tokens": 120,
-                },
-            },
-        )
-        return process_pool.PoolResult(
-            requested=1,
-            started=1,
-            completed=1,
-            failed=0,
-            timed_out=0,
-            stopped=0,
-            peak_active=1,
-            elapsed_seconds=1.25,
-            outcomes=(outcome,),
-        )
-
-    result = finance_preaudit_concurrency_probe._legacy_run_existing_batch(
-        capacity=1,
-        project_root=tmp_path,
-        renew_actions=renew,
-        run_reviews=review,
-    )
-
-    assert renewed == [older]
-    assert result == {
-        "schema_version": 1,
-        "kind": "preaudit_production_concurrency_probe",
-        "capacity": 1,
-        "selected": 1,
-        "prepared_new": 0,
-        "prepare_peak_active": 0,
-        "prepare_elapsed_seconds": 0.0,
-        "completed": 1,
-        "failed": 0,
-        "timed_out": 0,
-        "stopped": 0,
-        "peak_active": 1,
-        "elapsed_seconds": 1.25,
-        "business_results": {"needs_human": 1},
-        "error_counts": {},
-        "model": codex_review_worker.MODEL,
-        "reasoning_effort": codex_review_worker.REASONING_EFFORT,
-        "process_attempts": 1,
-        "process_retries": 0,
-        "runtime_health": {
-            "status": "unknown",
-                "sample_count": 0,
-            "minimum_memory_free_percent": None,
-                "maximum_load_per_cpu": None,
-                "maximum_active_threads": None,
-                "maximum_active_workers": 0,
-                "maximum_oldest_task_seconds": 0.0,
-            },
-        "watchdog": {
-            "runtime_samples": 0,
-            "maximum_task_seconds": 0.0,
-            "task_timeout_seconds": 960,
-        },
-        "token_usage": {
-            "status": "recorded",
-            "recorded_workers": 1,
-            "partial_workers": 0,
-            "unknown_workers": 0,
-            "input_tokens": 100,
-            "cached_input_tokens": 10,
-            "output_tokens": 20,
-            "total_tokens": 120,
-        },
-    }
-    encoded = json.dumps(result)
-    assert str(older) not in encoded
-    assert str(newer) not in encoded
-
-
 def test_renew_failure_requests_only_cycle_stop(tmp_path: Path, monkeypatch) -> None:
     flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
     action_file = _open_action(
@@ -508,76 +393,6 @@ def test_renew_failure_requests_only_cycle_stop(tmp_path: Path, monkeypatch) -> 
 
     assert cycle_stop_requests == [True]
     assert persistent_stop_requests == []
-
-
-def test_probe_prepares_missing_actions_before_review(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        finance_preaudit_concurrency_probe.runtime_control,
-        "stop_requested",
-        lambda: False,
-    )
-    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
-    prepared_file = flow_root / "travel_expense" / "pending-action.json"
-
-    def prepare(count: int) -> process_pool.PoolResult[dict]:
-        assert count == 1
-        action_file = _open_action(
-            flow_root,
-            case_key="c" * 64,
-            created_at="2026-08-23T13:00:00+00:00",
-        )
-        outcome = process_pool.TaskOutcome(
-            index=0,
-            status="completed",
-            value={"action": "review_required", "action_file": str(action_file)},
-        )
-        return process_pool.PoolResult(
-            requested=1,
-            started=1,
-            completed=1,
-            failed=0,
-            timed_out=0,
-            stopped=0,
-            peak_active=1,
-            elapsed_seconds=2.5,
-            outcomes=(outcome,),
-        )
-
-    def review(tasks: list[dict], capacity: int) -> process_pool.PoolResult[dict]:
-        del tasks, capacity
-        outcome = process_pool.TaskOutcome(
-            index=0,
-            status="completed",
-            value={"status": "completed", "business_state": "pass"},
-        )
-        return process_pool.PoolResult(
-            requested=1,
-            started=1,
-            completed=1,
-            failed=0,
-            timed_out=0,
-            stopped=0,
-            peak_active=1,
-            elapsed_seconds=3.0,
-            outcomes=(outcome,),
-        )
-
-    result = finance_preaudit_concurrency_probe._legacy_run_existing_batch(
-        capacity=1,
-        project_root=tmp_path,
-        prepare_actions=prepare,
-        renew_actions=lambda paths: paths,
-        run_reviews=review,
-    )
-
-    assert result["prepared_new"] == 1
-    assert result["prepare_peak_active"] == 1
-    assert result["prepare_elapsed_seconds"] == 2.5
-    assert result["completed"] == 1
-    assert not prepared_file.exists()
 
 
 def test_prepare_skips_quarantined_item_without_global_stop(
@@ -2271,7 +2086,6 @@ def test_prepare_global_fifo_returns_trusted_zero_write_quarantine(
     assert stop_requests == []
 
 
-
 @pytest.mark.parametrize('mutation', [None, 'missing_receipt', 'receipt_changed', 'identity', 'writer', 'decision'])
 def test_prepare_preserves_trusted_controller_material_failure(tmp_path, monkeypatch, mutation):
     probe = finance_preaudit_concurrency_probe
@@ -2966,104 +2780,6 @@ def test_prepare_stops_before_collecting_another_item_after_stop(
     assert calls == 1
 
 
-def test_probe_accepts_partial_final_capacity(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(
-        finance_preaudit_concurrency_probe.runtime_control,
-        "stop_requested",
-        lambda: False,
-    )
-    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
-    for index in range(3):
-        _open_action(
-            flow_root,
-            case_key=str(index) * 64,
-            created_at=f"2026-08-23T15:00:0{index}+00:00",
-        )
-
-    result = finance_preaudit_concurrency_probe._legacy_run_existing_batch(
-        capacity=3,
-        project_root=tmp_path,
-        renew_actions=lambda paths: paths,
-        run_reviews=lambda tasks, capacity: process_pool.PoolResult(
-            requested=3,
-            started=3,
-            completed=3,
-            failed=0,
-            timed_out=0,
-            stopped=0,
-            peak_active=capacity,
-            elapsed_seconds=4.0,
-            outcomes=tuple(
-                process_pool.TaskOutcome(
-                    index=index,
-                    status="completed",
-                    value={"status": "completed", "business_state": "pass"},
-                )
-                for index, _task in enumerate(tasks)
-            ),
-        ),
-    )
-
-    assert result["capacity"] == 3
-    assert result["completed"] == 3
-
-
-def test_drain_uses_six_then_partial_capacity_and_aggregates() -> None:
-    pending = iter([8, 2, 0])
-    capacities: list[int] = []
-
-    def live_status() -> dict:
-        count = next(pending)
-        return {
-            "credentials": {"status": "ok"},
-            "oa": {
-                "execution_identity": "verified",
-                "by_workflow": {"travel_expense": count},
-            },
-        }
-
-    def batch_runner(*, capacity: int) -> dict:
-        capacities.append(capacity)
-        return {
-            "capacity": capacity,
-            "selected": capacity,
-            "prepared_new": capacity,
-            "completed": capacity,
-            "failed": 0,
-            "timed_out": 0,
-            "stopped": 0,
-            "elapsed_seconds": 10.0,
-            "business_results": {"needs_human": capacity},
-            "error_counts": {},
-            "process_attempts": capacity,
-            "process_retries": 0,
-            "token_usage": {
-                "status": "recorded",
-                "recorded_workers": capacity,
-                "partial_workers": 0,
-                "unknown_workers": 0,
-                "input_tokens": capacity * 100,
-                "cached_input_tokens": 0,
-                "output_tokens": capacity * 10,
-                "total_tokens": capacity * 110,
-            },
-        }
-
-    result = finance_preaudit_concurrency_probe._legacy_run_drain(
-        max_capacity=6,
-        live_status=live_status,
-        batch_runner=batch_runner,
-    )
-
-    assert capacities == [6, 2]
-    assert result["status"] == "completed"
-    assert result["initial_pending"] == 8
-    assert result["final_pending"] == 0
-    assert result["batches"] == 2
-    assert result["completed"] == 8
-    assert result["token_usage"]["total_tokens"] == 880
-
-
 def test_rolling_drain_runs_full_pipeline_without_batch_barriers() -> None:
     pending = iter([8, 0, 0])
     current_pending = [0]
@@ -3084,9 +2800,9 @@ def test_rolling_drain_runs_full_pipeline_without_batch_barriers() -> None:
             },
         }
 
-    def pipeline_runner(count: int, capacity: int) -> process_pool.PoolResult[dict]:
+    def pipeline_runner(count: int, capacity: int) -> PoolResult[dict]:
         calls.append((count, capacity))
-        return process_pool.PoolResult(
+        return PoolResult(
             requested=count,
             started=count,
             completed=count,
@@ -3096,7 +2812,7 @@ def test_rolling_drain_runs_full_pipeline_without_batch_barriers() -> None:
             peak_active=capacity,
             elapsed_seconds=20.0,
             outcomes=tuple(
-                process_pool.TaskOutcome(
+                TaskOutcome(
                     index=index,
                     status="completed",
                     value={
@@ -3165,7 +2881,7 @@ def test_rolling_drain_routes_recoveries_through_the_isolated_prepare_stage(
         count: int,
         capacity: int,
         **kwargs: object,
-    ) -> process_pool.PoolResult[dict]:
+    ) -> PoolResult[dict]:
         calls.append(
             (
                 count,
@@ -3173,7 +2889,7 @@ def test_rolling_drain_routes_recoveries_through_the_isolated_prepare_stage(
                 tuple(kwargs.get("recovery_action_files", ())),
             )
         )
-        return process_pool.PoolResult(
+        return PoolResult(
             requested=count,
             started=count,
             completed=count,
@@ -3183,7 +2899,7 @@ def test_rolling_drain_routes_recoveries_through_the_isolated_prepare_stage(
             peak_active=1,
             elapsed_seconds=1.0,
             outcomes=(
-                process_pool.TaskOutcome(
+                TaskOutcome(
                     index=0,
                     status="completed",
                     value={
@@ -3232,14 +2948,14 @@ def test_hourly_recovery_option_keeps_new_failures_deferred(tmp_path, monkeypatc
     def pipeline(count, capacity, *, defer_review_failures=True, **kwargs):
         calls.append((count, capacity, defer_review_failures))
         pending[0] = 1
-        return process_pool.PoolResult(
+        return PoolResult(
             requested=2, started=2, completed=2, failed=0, timed_out=0, stopped=0,
             peak_active=1, elapsed_seconds=1,
             outcomes=(
-                process_pool.TaskOutcome(index=0, status="completed", value={
+                TaskOutcome(index=0, status="completed", value={
                     "status": "retry_pending", "error_code": "codex_review_retry_pending",
                     "write_state": "authorized", "token_usage": {"status": "unknown"}}),
-                process_pool.TaskOutcome(index=1, status="completed", value={
+                TaskOutcome(index=1, status="completed", value={
                     "status": "completed", "write_state": "submitted", "token_usage": {"status": "unknown"}}),
             ),
         )
@@ -3257,91 +2973,6 @@ def test_hourly_recovery_option_keeps_new_failures_deferred(tmp_path, monkeypatc
     assert result["stop_reason"] == "review_retry_pending"
 
 
-def test_elastic_health_window_does_not_cap_claims() -> None:
-    pending = iter([36, 0, 0])
-    current_pending = [0]
-    calls: list[tuple[int, int]] = []
-
-    def live_status() -> dict:
-        current_pending[0] = next(pending)
-        return {
-            "credentials": {"status": "ok"},
-            "oa": {
-                "execution_identity": "verified",
-                "by_workflow": {"travel_expense": current_pending[0]},
-            },
-        }
-
-    def pipeline(count: int, capacity: int) -> process_pool.PoolResult[dict]:
-        calls.append((count, capacity))
-        return process_pool.PoolResult(
-            requested=count,
-            started=count,
-            completed=count,
-            failed=0,
-            timed_out=0,
-            stopped=0,
-            peak_active=capacity,
-            elapsed_seconds=10.0,
-            outcomes=tuple(
-                process_pool.TaskOutcome(
-                    index=index,
-                    status="completed",
-                    value={
-                        "status": "completed",
-                        "business_state": "needs_human",
-                        "process_attempts": 1,
-                        "process_retries": 0,
-                        "token_usage": {"status": "unknown"},
-                        "codex_events": {
-                            "status": "recorded",
-                            "attempts": 1,
-                            "recorded_attempts": 1,
-                            "unknown_attempts": 0,
-                            "counts": {"turn.completed": 1},
-                        },
-                    },
-                )
-                for index in range(count)
-            ),
-            runtime_samples=(
-                {
-                    "active_workers": capacity,
-                    "oldest_task_seconds": 9.0,
-                    "host": {
-                        "status": "healthy",
-                        "memory_free_percent": 40,
-                        "load_per_cpu": 0.5,
-                        "active_threads": 3,
-                        "cpu_count": 10,
-                    },
-                },
-            ),
-            max_task_elapsed_seconds=9.0,
-        )
-
-    result = finance_preaudit_concurrency_probe.run_rolling_drain(
-        capacity=6,
-        adaptive=True,
-        live_status=live_status,
-        pipeline_runner=pipeline,
-        reconcile_status=lambda: _reconciliation_snapshot(current_pending[0]),
-    )
-
-    assert calls == [(36, 6)]
-    assert result["elastic"] is True
-    assert result["recommended_capacity"] == 6
-    assert result["last_capacity_decision"]["reason"] == (
-        "healthy_window_accumulating"
-    )
-    assert result["status"] == "completed"
-    assert [health["status"] for health in result["wave_runtime_health"]] == [
-        "healthy"
-    ]
-
-
-
-
 @pytest.mark.parametrize(
     ("host_status", "expected_reason"),
     (("critical", "host_critical"), ("healthy", "technical_failure")),
@@ -3352,7 +2983,7 @@ def test_rolling_failure_retains_health_and_stable_reason(
 ) -> None:
     result = finance_preaudit_concurrency_probe.run_rolling_drain(
         capacity=6,
-        adaptive=True,
+        adaptive=False,
         live_status=lambda: {
             "credentials": {"status": "ok"},
             "oa": {
@@ -3361,7 +2992,7 @@ def test_rolling_failure_retains_health_and_stable_reason(
             },
         },
         reconcile_status=lambda: _reconciliation_snapshot(12),
-        pipeline_runner=lambda count, capacity: process_pool.PoolResult(
+        pipeline_runner=lambda count, capacity: PoolResult(
             requested=count,
             started=1,
             completed=0,
@@ -3371,7 +3002,7 @@ def test_rolling_failure_retains_health_and_stable_reason(
             peak_active=capacity,
             elapsed_seconds=10,
             outcomes=tuple(
-                process_pool.TaskOutcome(
+                TaskOutcome(
                     index=index,
                     status="stopped",
                     value=None,
@@ -3496,9 +3127,9 @@ def test_rolling_controller_holds_unique_runtime_lease(tmp_path, monkeypatch) ->
             },
         }
 
-    def pipeline(count: int, capacity: int) -> process_pool.PoolResult[dict]:
+    def pipeline(count: int, capacity: int) -> PoolResult[dict]:
         assert finance_preaudit_concurrency_probe.runtime_control.controller_active()
-        return process_pool.PoolResult(
+        return PoolResult(
             requested=count,
             started=count,
             completed=count,
@@ -3508,7 +3139,7 @@ def test_rolling_controller_holds_unique_runtime_lease(tmp_path, monkeypatch) ->
             peak_active=capacity,
             elapsed_seconds=1.0,
             outcomes=tuple(
-                process_pool.TaskOutcome(
+                TaskOutcome(
                     index=index,
                     status="completed",
                     value={
@@ -3536,81 +3167,9 @@ def test_rolling_controller_holds_unique_runtime_lease(tmp_path, monkeypatch) ->
         assert result["status"] == "blocked" and result["reason"] == "previous_run_ownership_unknown"
 
 
-def test_rolling_failure_retains_internal_host_critical_decision() -> None:
-    result = finance_preaudit_concurrency_probe.run_rolling_drain(
-        capacity=6,
-        adaptive=True,
-        live_status=lambda: {
-            "credentials": {"status": "ok"},
-            "oa": {
-                "execution_identity": "verified",
-                "by_workflow": {"travel_expense": 12},
-            },
-        },
-        reconcile_status=lambda: _reconciliation_snapshot(12),
-        pipeline_runner=lambda count, capacity: process_pool.PoolResult(
-            requested=count,
-            started=1,
-            completed=0,
-            failed=0,
-            timed_out=0,
-            stopped=count,
-            peak_active=capacity,
-            elapsed_seconds=10,
-            outcomes=tuple(
-                process_pool.TaskOutcome(
-                    index=index,
-                    status="stopped",
-                    value=None,
-                    error_code="stop_requested",
-                )
-                for index in range(count)
-            ),
-            runtime_samples=(
-                {
-                    "active_workers": 6,
-                    "oldest_task_seconds": 8,
-                    "host": {
-                        "status": "healthy",
-                        "memory_free_percent": 40,
-                        "load_per_cpu": 0.5,
-                        "active_threads": 1,
-                        "cpu_count": 10,
-                    },
-                },
-            ),
-            max_task_elapsed_seconds=8,
-            recommended_capacity=6,
-            capacity_decisions=(
-                {
-                    "action": "stop",
-                    "next_capacity": 6,
-                    "healthy_windows": 0,
-                    "reason": "host_critical",
-                },
-            ),
-        ),
-    )
-
-    assert result["status"] == "failed"
-    assert result["stop_reason"] == "host_critical"
-    assert result["last_capacity_decision"]["reason"] == "host_critical"
-    assert result["wave_runtime_health"] == [
-        {
-            "status": "healthy",
-            "sample_count": 1,
-            "minimum_memory_free_percent": 40,
-            "maximum_load_per_cpu": 0.5,
-            "maximum_active_threads": 1,
-            "maximum_active_workers": 6,
-            "maximum_oldest_task_seconds": 8.0,
-        }
-    ]
-
-
 def test_rolling_wave_preserves_transient_codex_error_counts() -> None:
     metrics = finance_preaudit_concurrency_probe._rolling_wave_metrics(
-        process_pool.PoolResult(
+        PoolResult(
             requested=1,
             started=1,
             completed=1,
@@ -3620,7 +3179,7 @@ def test_rolling_wave_preserves_transient_codex_error_counts() -> None:
             peak_active=1,
             elapsed_seconds=1.0,
             outcomes=(
-                process_pool.TaskOutcome(
+                TaskOutcome(
                     index=0,
                     status="completed",
                     value={
@@ -3655,7 +3214,7 @@ def test_rolling_wave_preserves_transient_codex_error_counts() -> None:
 
 def test_rolling_wave_preserves_first_non_cancellation_error() -> None:
     metrics = finance_preaudit_concurrency_probe._rolling_wave_metrics(
-        process_pool.PoolResult(
+        PoolResult(
             requested=3,
             started=3,
             completed=1,
@@ -3665,13 +3224,13 @@ def test_rolling_wave_preserves_first_non_cancellation_error() -> None:
             peak_active=3,
             elapsed_seconds=1.0,
             outcomes=(
-                process_pool.TaskOutcome(
+                TaskOutcome(
                     index=0,
                     status="stopped",
                     value=None,
                     error_code="stop_requested",
                 ),
-                process_pool.TaskOutcome(
+                TaskOutcome(
                     index=1,
                     status="completed",
                     value={
@@ -3680,7 +3239,7 @@ def test_rolling_wave_preserves_first_non_cancellation_error() -> None:
                         "token_usage": {"status": "unknown"},
                     },
                 ),
-                process_pool.TaskOutcome(
+                TaskOutcome(
                     index=2,
                     status="failed",
                     value=None,
@@ -3749,7 +3308,7 @@ def test_rolling_drain_accounts_for_new_item_local_quarantine() -> None:
             },
         },
         reconcile_status=lambda: next(reconciliations),
-        pipeline_runner=lambda count, capacity: process_pool.PoolResult(
+        pipeline_runner=lambda count, capacity: PoolResult(
             requested=count,
             started=count,
             completed=count,
@@ -3759,7 +3318,7 @@ def test_rolling_drain_accounts_for_new_item_local_quarantine() -> None:
             peak_active=capacity,
             elapsed_seconds=1.0,
             outcomes=(
-                process_pool.TaskOutcome(
+                TaskOutcome(
                     index=0,
                     status="completed",
                     value={
@@ -3770,7 +3329,7 @@ def test_rolling_drain_accounts_for_new_item_local_quarantine() -> None:
                         "token_usage": {"status": "unknown"},
                     },
                 ),
-                process_pool.TaskOutcome(
+                TaskOutcome(
                     index=1,
                     status="completed",
                     value={
@@ -3808,9 +3367,9 @@ def test_rolling_drain_requires_consecutive_empty_snapshots_and_accepts_arrival(
             },
         }
 
-    def pipeline(count: int, capacity: int) -> process_pool.PoolResult[dict]:
+    def pipeline(count: int, capacity: int) -> PoolResult[dict]:
         pipeline_calls.append(count)
-        return process_pool.PoolResult(
+        return PoolResult(
             requested=count,
             started=count,
             completed=count,
@@ -3820,7 +3379,7 @@ def test_rolling_drain_requires_consecutive_empty_snapshots_and_accepts_arrival(
             peak_active=capacity,
             elapsed_seconds=0.1,
             outcomes=tuple(
-                process_pool.TaskOutcome(
+                TaskOutcome(
                     index=index,
                     status="completed",
                     value={
@@ -3871,10 +3430,10 @@ def test_rolling_drain_uses_continuous_dispatcher_completion_boundary(
             },
         }
 
-    def pipeline(count: int, capacity: int) -> process_pool.PoolResult[dict]:
+    def pipeline(count: int, capacity: int) -> PoolResult[dict]:
         nonlocal pipeline_calls
         pipeline_calls += 1
-        return process_pool.PoolResult(
+        return PoolResult(
             requested=count,
             started=count,
             completed=count,
@@ -3884,7 +3443,7 @@ def test_rolling_drain_uses_continuous_dispatcher_completion_boundary(
             peak_active=capacity,
             elapsed_seconds=0.1,
             outcomes=(
-                process_pool.TaskOutcome(
+                TaskOutcome(
                     index=0,
                     status="completed",
                     value={
@@ -3932,7 +3491,7 @@ def test_rolling_drain_stops_at_admission_cutoff_boundary(admission_reason) -> N
         capacity=6,
         live_status=live,
         reconcile_status=lambda: _reconciliation_snapshot(current[0]),
-        pipeline_runner=lambda count, capacity: process_pool.PoolResult(
+        pipeline_runner=lambda count, capacity: PoolResult(
             requested=count,
             started=count,
             completed=count,
@@ -3942,7 +3501,7 @@ def test_rolling_drain_stops_at_admission_cutoff_boundary(admission_reason) -> N
             peak_active=capacity,
             elapsed_seconds=0.1,
             outcomes=(
-                process_pool.TaskOutcome(
+                TaskOutcome(
                     index=0,
                     status="completed",
                     value={
@@ -4168,6 +3727,16 @@ def test_production_cli_passes_three_fixed_slots(monkeypatch, capsys) -> None:
     assert calls[0]["max_capacity"] == 3
     assert calls[0]["adaptive"] is False
     capsys.readouterr()
+
+
+def test_rolling_rejects_retired_adaptive_before_dependencies():
+    def reject(*_args, **_kwargs):
+        pytest.fail("retired_adaptive_dependency_called")
+    with pytest.raises(ValueError, match="^approval_global_capacity_invalid$"):
+        finance_preaudit_concurrency_probe.run_rolling_drain(
+            capacity=3, adaptive=True, pipeline_runner=reject,
+            live_status=reject, reconcile_status=reject,
+        )
 
 
 @pytest.mark.parametrize("capacity,maximum", [(3, 1), (3, 5), (6, 4), (3, 14)])
@@ -4549,6 +4118,110 @@ def test_dispatcher_assigns_each_open_action_once_with_rolling_capacity(
     assert result.peak_active == 2
     assert len(assigned) == 3
     assert len(set(assigned)) == 3
+
+
+@pytest.mark.parametrize("health", ["healthy", "critical", "sampling_failure"])
+def test_rolling_fixed_health_gate_and_heartbeat_interval(tmp_path, monkeypatch, health):
+    probe = finance_preaudit_concurrency_probe
+    clock = [0.0]
+    pending = [3]
+    submitted = []
+    shutdowns = []
+    health_times = []
+    writes = []
+    active = []
+    ticks = []
+    real_wait = probe.wait
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    _open_action(flow_root, case_key="initial", created_at="2026-08-23T16:00:00+00:00")
+
+    class RecordedExecutor:
+        _processes = {}
+
+        def __init__(self, role):
+            self.role = role
+            self.futures = []
+
+        def submit(self, function, *args):
+            future = Future()
+            self.futures.append(future)
+            submitted.append((self.role, clock[0]))
+            delay = 1 if self.role == "review" else 2
+            active.append((clock[0] + delay, future, function, args))
+            return future
+
+        def shutdown(self, *, wait, cancel_futures=False):
+            shutdowns.append((self.role, wait))
+            if cancel_futures:
+                for future in self.futures:
+                    future.cancel()
+
+    def advance(seconds):
+        ticks.append(clock[0])
+        assert len(ticks) < 100, "recorded_controller_did_not_finish"
+        clock[0] += seconds
+        for ready_at, future, function, args in active:
+            if not future.done() and clock[0] >= ready_at:
+                future.set_result(function(*args))
+
+    def wait(futures, **_options):
+        advance(.25)
+        return real_wait(futures, timeout=.001)
+
+    def prepare(_selection):
+        action = _open_action(flow_root, case_key=f"prepared-{len(submitted)}",
+                              created_at="2026-08-23T16:01:00+00:00")
+        return {"action": "review_required", "action_file": str(action)}
+
+    def complete(action, _reviewed):
+        writes.append(action)
+        pending[0] -= 1
+        return {"status": "completed", "business_state": "pass", "write_state": "submitted"}
+
+    def runtime_status():
+        health_times.append(clock[0])
+        if health == "sampling_failure":
+            if clock[0] < 1:
+                raise RuntimeError("private_sampler_detail")
+            return {"status": "healthy"}
+        return {"status": health if clock[0] >= 1 else "healthy"}
+
+    monkeypatch.setattr(probe, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time, sleep=advance))
+    monkeypatch.setattr(probe, "wait", wait)
+    monkeypatch.setattr(probe, "_preparation_executor", lambda: RecordedExecutor("prepare"))
+    def pipeline(count, capacity):
+        return probe._run_dispatched_tasks(
+            count, capacity, project_root=tmp_path, renew_actions=lambda paths: paths,
+            prepare_action=prepare, review_worker=lambda _task: {"status": "reviewed", "decision": {"overall": "pass"}},
+            complete_review=complete, executor_factory=lambda _capacity: RecordedExecutor("review"),
+            task_timeout_sec=30, prepare_timeout_sec=30, heartbeat_interval_sec=1,
+            runtime_status=runtime_status,
+        )
+    result = probe.run_rolling_drain(
+        capacity=2, max_capacity=2, pipeline_runner=pipeline,
+        live_status=lambda: {"credentials": {"status": "ok"}, "oa": {
+            "execution_identity": "verified", "by_workflow": {"travel_expense": pending[0]}}},
+        reconcile_status=lambda: _reconciliation_snapshot(pending[0]),
+    )
+    assert result["processes_reaped"] is True
+    assert result["controller_handoff"]["children_reaped"] is True
+    if health == "critical":
+        assert result["status"] == "failed"
+        assert result["stop_reason"] == "host_critical"
+        assert all(submitted_at < 1 for _role, submitted_at in submitted)
+        assert writes == []
+        assert ("review", False) in shutdowns
+    else:
+        assert result["status"] == "completed"
+        assert len(writes) == 3
+        assert result["token_usage"]["status"] == "unknown"
+        assert len(ticks) >= 8
+        assert len(health_times) >= 2
+        assert all(later - earlier >= 1 for earlier, later in zip(health_times, health_times[1:]))
+        if health == "sampling_failure":
+            assert all(submitted_at >= 1 for _role, submitted_at in submitted)
+            assert result["wave_runtime_health"][0]["status"] == "unknown"
+            assert "private_sampler_detail" not in str(result)
 
 
 def test_dispatcher_times_out_stuck_task_and_stops_new_work(
@@ -5847,14 +5520,14 @@ def test_isolated_timeout_does_not_stop_next_item(tmp_path: Path, monkeypatch) -
 
 def test_rolling_timeout_keeps_token_usage_unknown() -> None:
     result = finance_preaudit_concurrency_probe.run_rolling_drain(
-        capacity=6, adaptive=True,
+        capacity=6, adaptive=False,
         live_status=lambda: {"credentials": {"status": "ok"}, "oa": {
             "execution_identity": "verified", "by_workflow": {"travel_expense": 1}}},
         reconcile_status=lambda: _reconciliation_snapshot(1),
-        pipeline_runner=lambda count, capacity: process_pool.PoolResult(
+        pipeline_runner=lambda count, capacity: PoolResult(
             requested=1, started=1, completed=1, failed=0, timed_out=0, stopped=0,
             peak_active=1, elapsed_seconds=1,
-            outcomes=(process_pool.TaskOutcome(index=0, status="completed", value={
+            outcomes=(TaskOutcome(index=0, status="completed", value={
                 "status": "failed", "error_code": "codex_process_timeout",
                 "business_state": "not_available", "write_state": "not_requested",
                 "process_attempts": 1, "process_retries": 0,
@@ -7363,221 +7036,6 @@ def test_pipeline_evidence_suffix_advances_across_controller_runs(
     }
 
 
-@pytest.mark.parametrize("start,maximum", [(6, 10), (3, 6)])
-def test_dispatcher_adaptive_capacity_increases_inside_continuous_fifo(
-    tmp_path: Path,
-    monkeypatch,
-    start,
-    maximum,
-) -> None:
-    monkeypatch.setattr(
-        finance_preaudit_concurrency_probe.runtime_control,
-        "stop_requested",
-        lambda: False,
-    )
-    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
-    action_files = [
-        _open_action(
-            flow_root,
-            case_key=f"adaptive-{index}",
-            created_at=(
-                f"2026-08-25T{2 + index // 60:02d}:"
-                f"{index % 60:02d}:00+00:00"
-            ),
-            received_at=(
-                f"2026-08-25T{10 + index // 60:02d}:"
-                f"{index % 60:02d}:00+08:00"
-            ),
-        )
-        for index in range(100)
-    ]
-    writes: list[Path] = []
-    writer_lock = threading.Lock()
-    active_writers = 0
-    maximum_writers = 0
-    active_reviews = 0
-    maximum_reviews = 0
-    review_entries = 0
-    first_cohort = threading.Barrier(start)
-
-    def review(_task: dict) -> dict:
-        nonlocal active_reviews, maximum_reviews, review_entries
-        with writer_lock:
-            review_entries += 1
-            entry = review_entries
-            active_reviews += 1
-            maximum_reviews = max(maximum_reviews, active_reviews)
-        if entry <= start:
-            first_cohort.wait(timeout=10)
-        with writer_lock:
-            active_reviews -= 1
-        return {
-            "status": "reviewed",
-            "business_state": "not_available",
-            "write_state": "not_requested",
-            "process_attempts": 1,
-            "process_retries": 0,
-            "token_usage": {"status": "unknown"},
-            "codex_events": {
-                "status": "recorded",
-                "attempts": 1,
-                "recorded_attempts": 1,
-                "unknown_attempts": 0,
-                "counts": {"turn.completed": 1},
-            },
-            "agent_wall_seconds": 1,
-            "decision": {"overall": "needs_human"},
-        }
-
-    def complete(action: Path, reviewed: dict) -> dict:
-        nonlocal active_writers, maximum_writers
-        with writer_lock:
-            active_writers += 1
-            maximum_writers = max(maximum_writers, active_writers)
-        time.sleep(0.001)
-        writes.append(action)
-        with writer_lock:
-            active_writers -= 1
-        return {
-            **reviewed,
-            "status": "completed",
-            "business_state": "needs_human",
-            "write_state": "submitted",
-            "error_code": None,
-        }
-
-    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
-        100,
-        start,
-        project_root=tmp_path,
-        renew_actions=lambda paths: paths,
-        review_worker=review,
-        complete_review=complete,
-        executor_factory=lambda capacity: ThreadPoolExecutor(
-            max_workers=capacity
-        ),
-        runtime_status=lambda: {
-            "status": "healthy",
-            "memory_free_percent": 40,
-            "load_per_cpu": 0.5,
-            "active_threads": 3,
-            "cpu_count": 10,
-        },
-        adaptive=True,
-        max_capacity=maximum,
-    )
-
-    assert result.completed == 100
-    assert result.recommended_capacity == maximum
-    assert result.capacity_decisions[0]["next_capacity"] == start
-    assert [item["next_capacity"] for item in result.capacity_decisions
-            if item["action"] == "increase"] == ([8, 10] if start == 6 else [4, 6])
-    assert all(item["next_capacity"] <= maximum for item in result.capacity_decisions)
-    assert max(item["active_workers"] for item in result.runtime_samples) <= maximum
-    assert result.capacity_decisions[-1] == {
-        "action": "hold",
-        "next_capacity": maximum,
-        "healthy_windows": 1,
-        "reason": "configured_maximum",
-    }
-    assert writes == action_files
-    assert maximum_writers == 1
-    assert start <= maximum_reviews <= maximum
-
-
-def test_dispatcher_adaptive_window_keeps_worst_heartbeat_health(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        finance_preaudit_concurrency_probe.runtime_control,
-        "stop_requested",
-        lambda: False,
-    )
-    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
-    for index in range(12):
-        _open_action(
-            flow_root,
-            case_key=f"pressure-{index}",
-            created_at=f"2026-08-25T03:{index:02d}:00+00:00",
-            received_at=f"2026-08-25T11:{index:02d}:00+08:00",
-        )
-    health_reads = 0
-
-    def runtime_status() -> dict:
-        nonlocal health_reads
-        health_reads += 1
-        status = (
-            "pressure"
-            if health_reads != 2
-            else "unknown"
-        )
-        return {
-            "status": status,
-            "memory_free_percent": 25 if health_reads == 1 else 40,
-            "load_per_cpu": 0.5,
-            "active_threads": 3,
-            "cpu_count": 10,
-        }
-
-    def review(_task: dict) -> dict:
-        return {
-            "status": "reviewed",
-            "business_state": "not_available",
-            "write_state": "not_requested",
-            "process_attempts": 1,
-            "process_retries": 0,
-            "token_usage": {"status": "unknown"},
-            "codex_events": {
-                "status": "recorded",
-                "attempts": 1,
-                "recorded_attempts": 1,
-                "unknown_attempts": 0,
-                "counts": {"turn.completed": 1},
-            },
-            "agent_wall_seconds": 1,
-            "decision": {"overall": "needs_human"},
-        }
-
-    def complete(_action: Path, reviewed: dict) -> dict:
-        time.sleep(0.002)
-        return {
-            **reviewed,
-            "status": "completed",
-            "business_state": "needs_human",
-            "write_state": "submitted",
-            "error_code": None,
-        }
-
-    result = finance_preaudit_concurrency_probe._run_dispatched_tasks(
-        12,
-        8,
-        project_root=tmp_path,
-        renew_actions=lambda paths: paths,
-        review_worker=review,
-        complete_review=complete,
-        executor_factory=lambda capacity: ThreadPoolExecutor(
-            max_workers=capacity
-        ),
-        heartbeat_interval_sec=0.001,
-        runtime_status=runtime_status,
-        adaptive=True,
-        max_capacity=10,
-    )
-
-    assert result.completed == 12
-    assert result.capacity_decisions[0]["action"] == "decrease"
-    assert result.capacity_decisions[0]["next_capacity"] == 6
-    assert result.capacity_decisions[0]["reason"] == "host_pressure"
-    assert [
-        decision["next_capacity"]
-        for decision in result.capacity_decisions
-        if decision["reason"] == "host_pressure"
-    ] == [6, 4, 2]
-    assert result.capacity_decisions[-1]["reason"] == "host_pressure_active"
-    assert result.recommended_capacity == 2
-
-
 def test_strict_global_fifo_merges_recovered_open_and_live_claim_order(
     tmp_path: Path,
     monkeypatch,
@@ -7887,65 +7345,6 @@ def test_dispatcher_unknown_writer_stops_queue_without_second_write(
     )
 
 
-def test_probe_counts_returned_worker_failure_as_batch_failure(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
-    _open_action(
-        flow_root,
-        case_key="d" * 64,
-        created_at="2026-08-23T14:00:00+00:00",
-    )
-    stop_requests: list[bool] = []
-    monkeypatch.setattr(
-        finance_preaudit_concurrency_probe.runtime_control,
-        "request_stop",
-        lambda: stop_requests.append(True),
-    )
-    monkeypatch.setattr(
-        finance_preaudit_concurrency_probe.runtime_control,
-        "stop_requested",
-        lambda: False,
-    )
-
-    def review(tasks: list[dict], capacity: int) -> process_pool.PoolResult[dict]:
-        del tasks, capacity
-        outcome = process_pool.TaskOutcome(
-            index=0,
-            status="completed",
-            value={
-                "status": "failed",
-                "business_state": "not_available",
-                "error_code": "codex_process_incomplete",
-            },
-        )
-        return process_pool.PoolResult(
-            requested=1,
-            started=1,
-            completed=1,
-            failed=0,
-            timed_out=0,
-            stopped=0,
-            peak_active=1,
-            elapsed_seconds=2.0,
-            outcomes=(outcome,),
-        )
-
-    result = finance_preaudit_concurrency_probe._legacy_run_existing_batch(
-        capacity=1,
-        project_root=tmp_path,
-        renew_actions=lambda paths: paths,
-        run_reviews=review,
-    )
-
-    assert result["completed"] == 0
-    assert result["failed"] == 1
-    assert result["business_results"] == {}
-    assert result["error_counts"] == {"codex_process_incomplete": 1}
-    assert stop_requests == [True]
-
-
 def test_read_only_probe_allows_twelve_slots_and_returns_sanitized_summary(
     tmp_path: Path,
 ) -> None:
@@ -7953,10 +7352,10 @@ def test_read_only_probe_allows_twelve_slots_and_returns_sanitized_summary(
     for index in range(12):
         _reviewable_action(flow_root, case_key=f"{index:064x}")
 
-    def review(tasks: list[dict], capacity: int) -> process_pool.PoolResult[dict]:
+    def review(tasks: list[dict], capacity: int) -> PoolResult[dict]:
         assert len(tasks) == 12
         assert capacity == 12
-        return process_pool.PoolResult(
+        return PoolResult(
             requested=12,
             started=12,
             completed=12,
@@ -7966,7 +7365,7 @@ def test_read_only_probe_allows_twelve_slots_and_returns_sanitized_summary(
             peak_active=12,
             elapsed_seconds=5.0,
             outcomes=tuple(
-                process_pool.TaskOutcome(
+                TaskOutcome(
                     index=index,
                     status="completed",
                     value={
@@ -8167,10 +7566,10 @@ def test_rolling_recovers_cycle_stop_with_trusted_review_isolation() -> None:
     def pipeline(count, capacity):
         calls.append((count, capacity))
         pending[0] = 1
-        return process_pool.PoolResult(
+        return PoolResult(
             requested=1, started=1, completed=1, failed=0, timed_out=0,
             stopped=0, peak_active=1, elapsed_seconds=1,
-            outcomes=(process_pool.TaskOutcome(
+            outcomes=(TaskOutcome(
                 index=0, status="completed",
                 value={"status": "completed", "business_state": "needs_human",
                        "token_usage": {"status": "unknown"}},
@@ -8638,11 +8037,11 @@ def test_retry_pending_does_not_hide_prepare_timeout(monkeypatch):
     probe = finance_preaudit_concurrency_probe
     monkeypatch.setattr(probe.runtime_control, "stop_requested", lambda: False)
     monkeypatch.setattr(probe.runtime_control, "request_cycle_stop", lambda: None)
-    result = process_pool.PoolResult(requested=2, started=2, completed=1, failed=0, timed_out=1,
+    result = PoolResult(requested=2, started=2, completed=1, failed=0, timed_out=1,
         stopped=0, peak_active=1, elapsed_seconds=1.0, outcomes=(
-            process_pool.TaskOutcome(index=0, status="completed", value={"status": "retry_pending",
+            TaskOutcome(index=0, status="completed", value={"status": "retry_pending",
                 "error_code": "codex_review_retry_pending", "token_usage": {"status": "unknown"}}),
-            process_pool.TaskOutcome(index=1, status="timed_out", value=None,
+            TaskOutcome(index=1, status="timed_out", value=None,
                 error_code="production_probe_prepare_timeout"),
         ))
     payload = probe._run_rolling_drain_locked(
@@ -8664,11 +8063,11 @@ def test_official_first_stop_survives_secondary_prepare_failure(tmp_path, monkey
     def pipeline(count, capacity, **kwargs):
         if notice_code is not None:
             guard.record_notice(notice_code, "cli:offline-first")
-        return process_pool.PoolResult(
+        return PoolResult(
             requested=count, started=1, completed=0, failed=1, timed_out=0,
             stopped=count - 1, peak_active=1, elapsed_seconds=1,
             primary_error_code="production_probe_prepare_failed",
-            outcomes=(process_pool.TaskOutcome(index=0, status="failed", value={
+            outcomes=(TaskOutcome(index=0, status="failed", value={
                 "status": "failed", "error_code": "production_probe_prepare_failed",
                 "token_usage": {"status": "unknown"},
             }),),
@@ -8716,7 +8115,7 @@ def test_official_stop_does_not_invent_classification_from_unbound_evidence(tmp_
             probe.runtime_control.request_stop(guard.STOP_REASON)
             if evidence == "invalid":
                 guard.write(guard.directory() / "cooldown.json", {"notice_code": "usage_limit"})
-        return process_pool.PoolResult(requested=count, started=0, completed=0, failed=0,
+        return PoolResult(requested=count, started=0, completed=0, failed=0,
             timed_out=0, stopped=count, peak_active=0, elapsed_seconds=1, outcomes=())
 
     monkeypatch.setattr(probe, "_run_global_dispatched_tasks", pipeline)

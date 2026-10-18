@@ -10,6 +10,8 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     wait,
 )
+from concurrent.futures.process import BrokenProcessPool
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -23,7 +25,7 @@ import secrets
 import sys
 import threading
 import time
-from typing import Callable, Sequence
+from typing import Callable, Generic, Sequence, TypeVar
 from zoneinfo import ZoneInfo
 
 from apps import json_artifact
@@ -41,7 +43,6 @@ from apps.oa_finance_preaudit import (
     observability,
     prepare_failure,
     prepare_trace,
-    process_pool,
     production_config,
     production_pending,
     reconciliation,
@@ -54,14 +55,52 @@ from apps.oa_finance_preaudit import runtime_doctor
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEVELOPMENT_PROJECT_SUFFIX = "-dev"
+Output = TypeVar("Output")
+
+
+@dataclass(frozen=True)
+class TaskOutcome(Generic[Output]):
+    index: int
+    status: str
+    value: Output | None
+    error_code: str | None = None
+
+
+@dataclass(frozen=True)
+class PoolResult(Generic[Output]):
+    requested: int
+    started: int
+    completed: int
+    failed: int
+    timed_out: int
+    stopped: int
+    peak_active: int
+    elapsed_seconds: float
+    outcomes: tuple[TaskOutcome[Output], ...]
+    runtime_samples: tuple[dict, ...] = ()
+    max_task_elapsed_seconds: float = 0.0
+    processes_reaped: bool = True
+    primary_error_code: str | None = None
+    recommended_capacity: int | None = None
+    capacity_decisions: tuple[dict, ...] = ()
+    discovery_refreshes: int = 0
+    late_visible_count: int = 0
+    late_visible_keys: tuple[str, ...] = ()
+    committed_received_at: str | None = None
+    committed_request_id: str | None = None
+    late_visible_pending_count: int = 0
+    discovery_exhausted: bool = False
+    admission_closed: bool = False
+    admission_reason: str | None = None
+    deferred_count: int = 0
+
+
 RenewActions = Callable[[list[Path]], list[Path]]
-ReviewRunner = Callable[[list[dict], int], process_pool.PoolResult[dict]]
-PrepareRunner = Callable[[int], process_pool.PoolResult[dict]]
+ReviewRunner = Callable[[list[dict], int], PoolResult[dict]]
 PrepareSelection = str | dict[str, object]
 PrepareAction = Callable[[PrepareSelection], dict]
-BatchRunner = Callable[..., dict]
 LiveStatus = Callable[[], dict]
-PipelineRunner = Callable[[int, int], process_pool.PoolResult[dict]]
+PipelineRunner = Callable[[int, int], PoolResult[dict]]
 ReviewWorker = Callable[[dict], dict]
 ReviewCompleter = Callable[[Path, dict], dict]
 ReviewQuarantine = Callable[..., dict]
@@ -1589,33 +1628,6 @@ def _prepare_one(selection: PrepareSelection) -> dict:
     }
 
 
-def _prepare_actions(count: int) -> process_pool.PoolResult[dict]:
-    return process_pool.run(
-        ["travel_expense"] * count,
-        _prepare_one,
-        max_workers=count,
-        batch_timeout_sec=600,
-        task_timeout_sec=300,
-        heartbeat_interval_sec=10,
-        runtime_status=concurrency_control.sample_local_health,
-    )
-
-
-def _run_reviews(
-    tasks: list[dict],
-    capacity: int,
-) -> process_pool.PoolResult[dict]:
-    return process_pool.run(
-        tasks,
-        codex_review_worker.review,
-        max_workers=capacity,
-        batch_timeout_sec=1200,
-        task_timeout_sec=960,
-        heartbeat_interval_sec=15,
-        runtime_status=concurrency_control.sample_local_health,
-    )
-
-
 def _reviewable_action_files(project_root: Path) -> list[Path]:
     flow_root = (
         project_root
@@ -1675,15 +1687,144 @@ def _reviewable_action_files(project_root: Path) -> list[Path]:
 def _run_read_only_reviews(
     tasks: list[dict],
     capacity: int,
-) -> process_pool.PoolResult[dict]:
-    return process_pool.run(
-        tasks,
-        codex_review_worker.run_read_only,
-        max_workers=capacity,
-        batch_timeout_sec=1800,
-        task_timeout_sec=960,
-        heartbeat_interval_sec=15,
-        runtime_status=concurrency_control.sample_local_health,
+    *,
+    batch_timeout_sec: float = 1800,
+    task_timeout_sec: float = 960,
+    heartbeat_interval_sec: float = 15,
+    stop_requested: Callable[[], bool] = runtime_control.stop_requested,
+) -> PoolResult[dict]:
+    if (type(capacity) is not int or not 1 <= capacity <= 12
+            or min(batch_timeout_sec, task_timeout_sec, heartbeat_interval_sec) <= 0):
+        raise ValueError("read_only_probe_settings_invalid")
+    started_at = time.monotonic()
+    outcomes: dict[int, TaskOutcome[dict]] = {}
+    active: dict[Future, tuple[int, float, object, tuple[dict, ...]]] = {}
+    next_index = 0
+    peak_active = 0
+    samples: list[dict] = []
+    next_heartbeat = started_at
+    max_elapsed = 0.0
+    reaped = True
+
+    def finish_executor(executor, identities, *, terminate=False):
+        processes = list((getattr(executor, "_processes", None) or {}).values())
+        complete = len(identities) == len(processes)
+        if terminate:
+            complete = _terminate_executor(executor, owned_process_groups=True) and complete
+        else:
+            executor.shutdown(wait=True, cancel_futures=True)
+            complete = _processes_reaped(processes, timeout_seconds=5) and complete
+        for identity in identities:
+            try:
+                complete = approval_guard.reap_models(worker=identity, orphaned=True) and complete
+            except (OSError, ValueError):
+                complete = False
+        return complete
+
+    try:
+        while active or next_index < len(tasks):
+            now = time.monotonic()
+            batch_expired = now - started_at >= batch_timeout_sec
+            stopped = stop_requested()
+            if stopped or batch_expired:
+                status = "stopped" if stopped else "timed_out"
+                code = "stop_requested" if stopped else "worker_timeout"
+                for future, (index, submitted, executor, identities) in list(active.items()):
+                    max_elapsed = max(max_elapsed, now - submitted)
+                    cleaned = finish_executor(executor, identities, terminate=True)
+                    reaped = cleaned and reaped
+                    outcomes[index] = TaskOutcome(index, status, None, code) if cleaned else TaskOutcome(
+                        index, "failed", None, "worker_cleanup_failed",
+                    )
+                    del active[future]
+                for index in range(next_index, len(tasks)):
+                    outcomes[index] = TaskOutcome(index, status, None, code)
+                break
+            if now >= next_heartbeat:
+                try:
+                    host = concurrency_control.sample_local_health()
+                except Exception:
+                    host = {"status": "unknown"}
+                samples.append({"elapsed_seconds": now - started_at,
+                                "pending_tasks": len(tasks) - next_index,
+                                "active_workers": len(active),
+                                "completed_tasks": len(outcomes),
+                                "oldest_task_seconds": max((now - submitted for _, submitted, _, _ in active.values()), default=0),
+                                "host": host})
+                next_heartbeat = now + heartbeat_interval_sec
+            for future, (index, submitted, executor, identities) in list(active.items()):
+                elapsed = now - submitted
+                if future.done():
+                    failed = False
+                    try:
+                        value = future.result()
+                        outcomes[index] = TaskOutcome(index, "completed", value)
+                    except Exception as error:
+                        failed = True
+                        code = "worker_process_failed" if isinstance(error, BrokenProcessPool) else "worker_failed"
+                        outcomes[index] = TaskOutcome(index, "failed", None, code)
+                    cleaned = finish_executor(executor, identities, terminate=failed)
+                elif elapsed >= task_timeout_sec:
+                    cleaned = finish_executor(executor, identities, terminate=True)
+                    outcomes[index] = TaskOutcome(index, "timed_out", None, "worker_task_timeout")
+                else:
+                    continue
+                reaped = cleaned and reaped
+                if not cleaned:
+                    outcomes[index] = TaskOutcome(index, "failed", None, "worker_cleanup_failed")
+                max_elapsed = max(max_elapsed, elapsed)
+                del active[future]
+            if not reaped:
+                break
+            while next_index < len(tasks) and len(active) < capacity:
+                executor = None
+                identities = ()
+                try:
+                    executor = _process_executor(1)
+                    future = approval_lifecycle.submit_readonly(
+                        executor, codex_review_worker.run_read_only, tasks[next_index], role="review",
+                    )
+                    processes = tuple((getattr(executor, "_processes", None) or {}).values())
+                    identities = tuple(
+                        {**identity, "pgid": identity["pid"]}
+                        for process in processes
+                        if (identity := approval_guard.process_identity(process.pid)) is not None
+                    )
+                    if not identities or len(identities) != len(processes):
+                        raise ValueError("approval_worker_untrusted")
+                except Exception:
+                    if executor is not None:
+                        reaped = finish_executor(executor, identities, terminate=True) and reaped
+                    outcomes[next_index] = TaskOutcome(next_index, "failed", None, "worker_start_failed")
+                    next_index += 1
+                    if not reaped:
+                        break
+                    continue
+                active[future] = (next_index, time.monotonic(), executor, identities)
+                next_index += 1
+                peak_active = max(peak_active, len(active))
+            if active:
+                wait(active, timeout=min(.05, heartbeat_interval_sec), return_when=FIRST_COMPLETED)
+    finally:
+        for index, submitted, executor, identities in active.values():
+            cleaned = finish_executor(executor, identities, terminate=True)
+            reaped = cleaned and reaped
+            max_elapsed = max(max_elapsed, time.monotonic() - submitted)
+            outcomes[index] = TaskOutcome(index, "stopped", None, "stop_requested") if cleaned else TaskOutcome(
+                index, "failed", None, "worker_cleanup_failed",
+            )
+    for index in range(len(tasks)):
+        outcomes.setdefault(index, TaskOutcome(index, "stopped", None, "stop_requested"))
+    ordered = tuple(outcomes[index] for index in range(len(tasks)))
+    return PoolResult(
+        requested=len(tasks), started=next_index,
+        completed=sum(item.status == "completed" for item in ordered),
+        failed=sum(item.status == "failed" for item in ordered),
+        timed_out=sum(item.status == "timed_out" for item in ordered),
+        stopped=sum(item.status == "stopped" for item in ordered),
+        peak_active=peak_active, elapsed_seconds=time.monotonic() - started_at,
+        outcomes=ordered, runtime_samples=tuple(samples),
+        max_task_elapsed_seconds=max_elapsed, processes_reaped=reaped,
     )
 
 
@@ -1906,6 +2047,7 @@ def run_read_only_probe(
         "reasoning_effort": codex_review_worker.REASONING_EFFORT,
         "production_write": False,
         "production_stop_preserved": runtime_control.stop_requested(),
+        "processes_reaped": result.processes_reaped,
         "runtime_health": concurrency_control.summarize_runtime(
             result.runtime_samples
         ),
@@ -2274,7 +2416,7 @@ def _run_dispatched_tasks(
     allowed_workflows: frozenset[str] = ROLLING_WORKFLOW_KEYS,
     run_id: str | None = None,
     controller_instance_id: str | None = None,
-) -> process_pool.PoolResult[dict]:
+) -> PoolResult[dict]:
     native_review = host_chat_review.selected()
     native_bootstrapped = False
     native_ready = not native_review
@@ -2288,8 +2430,8 @@ def _run_dispatched_tasks(
         Path(path).expanduser().resolve() for path in recovery_action_files
     )
     if (
-        not 1 <= capacity <= process_pool.MAX_PROCESS_POOL_CAPACITY
-        or not capacity <= maximum_capacity <= process_pool.MAX_PROCESS_POOL_CAPACITY
+        not 1 <= capacity <= 12
+        or not capacity <= maximum_capacity <= 12
         or task_timeout_sec <= 0
         or prepare_timeout_sec <= 0
         or heartbeat_interval_sec <= 0
@@ -2300,11 +2442,8 @@ def _run_dispatched_tasks(
         or not allowed_workflows.issubset(ROLLING_WORKFLOW_KEYS)
     ):
         raise ValueError("production_dispatcher_watchdog_invalid")
-    if adaptive and (
-        capacity not in concurrency_control.CAPACITY_STEPS
-        or maximum_capacity not in concurrency_control.CAPACITY_STEPS
-    ):
-        raise ValueError("production_dispatcher_watchdog_invalid")
+    if adaptive:
+        raise ValueError("approval_global_capacity_invalid")
     try:
         if (committed_received_at is None) != (committed_request_id is None):
             raise ValueError
@@ -2329,7 +2468,7 @@ def _run_dispatched_tasks(
         raise ValueError("production_dispatcher_watchdog_invalid")
     started_at = time.monotonic()
     root = Path(project_root).expanduser().resolve()
-    outcomes: list[process_pool.TaskOutcome[dict] | None] = [None] * count
+    outcomes: list[TaskOutcome[dict] | None] = [None] * count
     assigned: set[Path] = set()
     assigned_identities: dict[Path, tuple[str, str]] = {}
     assigned_order_keys: dict[int, tuple[datetime, str]] = {}
@@ -2363,12 +2502,6 @@ def _run_dispatched_tasks(
     next_index = 0
     next_write_index = 0
     current_review_capacity = capacity
-    adaptive_healthy_windows = 0
-    adaptive_window_target = capacity * 2
-    adaptive_window_values: list[dict] = []
-    adaptive_window_hosts: list[dict] = []
-    capacity_decisions: list[dict] = []
-    adaptive_pressure_active = False
     resource_paused = False
     started = 0
     peak_active = 0
@@ -2406,7 +2539,7 @@ def _run_dispatched_tasks(
     preparation_stop_deadline: float | None = None
     preparation_deferred = False
     unblocked_duplicate_retries = 0
-    write_queue_capacity = max(2, maximum_capacity * 2)
+    write_queue_capacity = max(2, capacity * 2)
     max_write_queue_depth = 0
     prepare_action = prepare_action or _prepare_one
     trace_id = secrets.token_hex(16)
@@ -2415,7 +2548,7 @@ def _run_dispatched_tasks(
     timed_out_prepare_context: dict | None = None
     prepare_executor = _preparation_executor()
     prepare_executor_terminated = False
-    executor = None if native_review else executor_factory(maximum_capacity)
+    executor = None if native_review else executor_factory(capacity)
     writer_executor = ThreadPoolExecutor(
         max_workers=1,
         thread_name_prefix="oa-global-writer",
@@ -2436,7 +2569,7 @@ def _run_dispatched_tasks(
         prepare_elapsed: float,
         value: dict | None,
     ) -> None:
-        outcomes[index] = process_pool.TaskOutcome(
+        outcomes[index] = TaskOutcome(
             index=index,
             status="stopped",
             value=(
@@ -2468,7 +2601,7 @@ def _run_dispatched_tasks(
             try:
                 value = future.result()
             except Exception:
-                outcomes[index] = process_pool.TaskOutcome(
+                outcomes[index] = TaskOutcome(
                     index=index,
                     status="failed",
                     value=None,
@@ -2478,7 +2611,7 @@ def _run_dispatched_tasks(
             if value.get("status") == "reviewed" or value.get("error_code") == "stop_requested":
                 stopped_review(index, prepare_elapsed, value)
             else:
-                outcomes[index] = process_pool.TaskOutcome(
+                outcomes[index] = TaskOutcome(
                     index=index,
                     status="completed",
                     value={
@@ -2555,107 +2688,6 @@ def _run_dispatched_tasks(
             )
         return next_write_index
 
-    def observe_adaptive_window(value: dict) -> None:
-        nonlocal adaptive_healthy_windows
-        nonlocal adaptive_window_target
-        nonlocal current_review_capacity
-        nonlocal adaptive_pressure_active
-        if not adaptive:
-            return
-        adaptive_window_values.append(value)
-        if len(adaptive_window_values) < adaptive_window_target:
-            return
-        codex_events = _aggregate_codex_events(adaptive_window_values)
-        transient_errors = codex_events["counts"].get("error")
-        if transient_errors is None and codex_events["status"] == "recorded":
-            transient_errors = 0
-        try:
-            host = runtime_status()
-        except Exception:
-            host = {"status": "unknown"}
-        adaptive_window_hosts.append(host)
-        window_host = concurrency_control.summarize_runtime(
-            tuple({"host": item} for item in adaptive_window_hosts)
-        )
-        if (
-            adaptive_pressure_active
-            and window_host.get("status") == "pressure"
-        ):
-            decision = {
-                "action": "hold",
-                "next_capacity": current_review_capacity,
-                "healthy_windows": 0,
-                "reason": "host_pressure_active",
-            }
-        else:
-            decision = concurrency_control.decide_capacity(
-                current_capacity=current_review_capacity,
-                healthy_windows=adaptive_healthy_windows,
-                wave={
-                    "requested": len(adaptive_window_values),
-                    "completed": len(adaptive_window_values),
-                    "failed": 0,
-                    "timed_out": 0,
-                    "stopped": 0,
-                    "codex_event_status": codex_events["status"],
-                    "transient_error_events": transient_errors,
-                    "rate_limit_events": (
-                        codex_events["counts"].get("rate_limit_signal", 0)
-                        if codex_events["status"] == "recorded"
-                        else None
-                    ),
-                },
-                host=window_host,
-            )
-        if int(decision["next_capacity"]) > maximum_capacity:
-            decision = {
-                "action": "hold",
-                "next_capacity": maximum_capacity,
-                "healthy_windows": 1,
-                "reason": "configured_maximum",
-            }
-        capacity_decisions.append(decision)
-        if decision["reason"] == "host_pressure":
-            adaptive_pressure_active = True
-        elif window_host.get("status") == "healthy":
-            adaptive_pressure_active = False
-        adaptive_healthy_windows = int(decision["healthy_windows"])
-        current_review_capacity = min(
-            maximum_capacity,
-            int(decision["next_capacity"]),
-        )
-        adaptive_window_values.clear()
-        adaptive_window_hosts.clear()
-        adaptive_window_target = current_review_capacity * 2
-        if decision["action"] == "stop":
-            request_pipeline_stop(str(decision["reason"]))
-
-    def apply_immediate_host_pressure(host: dict) -> None:
-        nonlocal adaptive_healthy_windows
-        nonlocal adaptive_pressure_active
-        nonlocal adaptive_window_target
-        nonlocal current_review_capacity
-        if not adaptive or (adaptive_pressure_active and current_review_capacity == concurrency_control.CAPACITY_STEPS[0]):
-            return
-        decision = concurrency_control.decide_capacity(
-            current_capacity=current_review_capacity,
-            healthy_windows=adaptive_healthy_windows,
-            wave={
-                "requested": 0,
-                "completed": 0,
-                "failed": 0,
-                "timed_out": 0,
-                "stopped": 0,
-            },
-            host=host,
-        )
-        capacity_decisions.append(decision)
-        current_review_capacity = int(decision["next_capacity"])
-        adaptive_healthy_windows = 0
-        adaptive_pressure_active = True
-        adaptive_window_values.clear()
-        adaptive_window_hosts.clear()
-        adaptive_window_target = current_review_capacity * 2
 
     def submit_review(
         index: int,
@@ -2671,7 +2703,7 @@ def _run_dispatched_tasks(
                     timeout_seconds=review_timeout_seconds, run_id=run_id,
                 )
             except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-                outcomes[index] = process_pool.TaskOutcome(
+                outcomes[index] = TaskOutcome(
                     index=index, status="failed", value=None, error_code="host_review_publish_failed",
                 )
                 request_pipeline_stop("host_review_publish_failed")
@@ -2892,7 +2924,7 @@ def _run_dispatched_tasks(
                     value = finish_bounded_review_failure(action_file, value, "codex_decision_invalid")
                 if value.get("status") == "retry_required":
                     value = {**value, "status": "failed"}
-                outcomes[index] = process_pool.TaskOutcome(index=index, status="completed", value=value)
+                outcomes[index] = TaskOutcome(index=index, status="completed", value=value)
                 if value.get("status") not in {"completed", "quarantined", "retry_pending"}:
                     request_pipeline_stop(value.get("error_code"))
                 else:
@@ -2901,7 +2933,6 @@ def _run_dispatched_tasks(
                     else:
                         next_write_index += 1
                     advance_write_head()
-                    observe_adaptive_window(value)
 
             review_ages = {
                 index: max(0.0, now - task_started)
@@ -2945,7 +2976,7 @@ def _run_dispatched_tasks(
                 for index, _prepare_elapsed, _started_at, _action_file in (
                     *futures.values(), *host_requests.values(),
                 ):
-                    outcomes[index] = process_pool.TaskOutcome(
+                    outcomes[index] = TaskOutcome(
                         index=index,
                         status="timed_out",
                         value=None,
@@ -2959,7 +2990,7 @@ def _run_dispatched_tasks(
                 host_requests.clear()
                 if preparation is not None:
                     _prepare_future, prepare_index, _started_at = preparation
-                    outcomes[prepare_index] = process_pool.TaskOutcome(
+                    outcomes[prepare_index] = TaskOutcome(
                         index=prepare_index,
                         status="timed_out",
                         value=None,
@@ -3016,16 +3047,9 @@ def _run_dispatched_tasks(
                         "host": host,
                     }
                 )
-                if adaptive and host.get("status") == "pressure":
-                    apply_immediate_host_pressure(host)
-                elif adaptive:
-                    if host.get("status") == "healthy":
-                        adaptive_pressure_active = False
-                    adaptive_window_hosts.append(host)
                 next_heartbeat = now + heartbeat_interval_sec
                 if host.get("status") == "critical" and not halted:
                     request_pipeline_stop("host_critical")
-
             if (
                 halted
                 and preparation is not None
@@ -3038,7 +3062,7 @@ def _run_dispatched_tasks(
                     )
                 if time.monotonic() >= preparation_stop_deadline:
                     _future, prepare_index, _started_at = preparation
-                    outcomes[prepare_index] = process_pool.TaskOutcome(
+                    outcomes[prepare_index] = TaskOutcome(
                         index=prepare_index,
                         status="stopped",
                         value=None,
@@ -3101,7 +3125,7 @@ def _run_dispatched_tasks(
                     late_visible_keys.update(raw_late_keys)
                     late_visible_pending_count = raw_late_pending_count
                 if prepared.get("action") == "late_visible":
-                    outcomes[index] = process_pool.TaskOutcome(
+                    outcomes[index] = TaskOutcome(
                         index=index,
                         status="completed",
                         value={
@@ -3118,7 +3142,7 @@ def _run_dispatched_tasks(
                     empty_discovery_snapshots = 0
                     advance_write_head()
                 elif prepared.get("action") in {"no_action", "admission_closed"}:
-                    outcomes[index] = process_pool.TaskOutcome(
+                    outcomes[index] = TaskOutcome(
                         index=index,
                         status="completed",
                         value={
@@ -3153,7 +3177,7 @@ def _run_dispatched_tasks(
                         path for path in recovery_queue
                         if str(path) != prepared.get("recovery_action_file")
                     )
-                    outcomes[index] = process_pool.TaskOutcome(
+                    outcomes[index] = TaskOutcome(
                         index=index,
                         status="completed",
                         value={
@@ -3177,7 +3201,7 @@ def _run_dispatched_tasks(
                         run_id=run_id,
                         controller_instance_id=controller_instance_id,
                     )
-                    outcomes[index] = process_pool.TaskOutcome(
+                    outcomes[index] = TaskOutcome(
                         index=index,
                         status="completed",
                         value={
@@ -3215,7 +3239,7 @@ def _run_dispatched_tasks(
                         else:
                             unblocked_duplicate_retries += 1
                             if unblocked_duplicate_retries > 1:
-                                outcomes[index] = process_pool.TaskOutcome(
+                                outcomes[index] = TaskOutcome(
                                     index=index,
                                     status="completed",
                                     value={
@@ -3272,7 +3296,7 @@ def _run_dispatched_tasks(
                                         controller_instance_id
                                     ),
                                 )
-                                outcomes[index] = process_pool.TaskOutcome(
+                                outcomes[index] = TaskOutcome(
                                     index=index,
                                     status="completed",
                                     value={
@@ -3310,7 +3334,7 @@ def _run_dispatched_tasks(
                 try:
                     value = future.result()
                 except Exception:
-                    outcomes[index] = process_pool.TaskOutcome(
+                    outcomes[index] = TaskOutcome(
                         index=index,
                         status="failed",
                         value=None,
@@ -3331,7 +3355,7 @@ def _run_dispatched_tasks(
             for index, prepare_elapsed, action_file, value in sorted(completed_reviews, key=lambda item: item[0]):
                 if value.get("status") != "reviewed":
                     if runtime_control.stop_reason() == approval_guard.STOP_REASON:
-                        outcomes[index] = process_pool.TaskOutcome(index=index, status="stopped", value=value, error_code="stop_requested")
+                        outcomes[index] = TaskOutcome(index=index, status="stopped", value=value, error_code="stop_requested")
                         failed_now = True
                         first_review_error_code = first_review_error_code or "stop_requested"
                         continue
@@ -3359,7 +3383,7 @@ def _run_dispatched_tasks(
                     ):
                         value = finish_bounded_review_failure(action_file, value, error_code, host_reference=host_reference)
                         if value.get("status") in {"retry_pending", "quarantined"}:
-                            outcomes[index] = process_pool.TaskOutcome(
+                            outcomes[index] = TaskOutcome(
                                 index=index, status="completed",
                                 value={**value, "prepare_elapsed_seconds": prepare_elapsed},
                             )
@@ -3368,9 +3392,8 @@ def _run_dispatched_tasks(
                             else:
                                 skipped_write_indices.add(index)
                             advance_write_head()
-                            observe_adaptive_window(value)
                             continue
-                    outcomes[index] = process_pool.TaskOutcome(
+                    outcomes[index] = TaskOutcome(
                         index=index,
                         status="completed",
                         value={
@@ -3420,13 +3443,13 @@ def _run_dispatched_tasks(
                     if native_bootstrapped and not native_ready:
                         raise ValueError("host_review_run_untrusted")
                     native_bootstrapped = native_bootstrapped or native_ready
-                    current_review_capacity = min(maximum_capacity, native_status["capacity"])
+                    current_review_capacity = min(capacity, native_status["capacity"])
                     if native_ready and current_review_capacity == 0:
                         admission_was_closed = True
                         admission_reason = "host_review_slots_fenced"
                         discovery_closed = True
                         for index, (prepare_elapsed, _action_file) in tuple(pending_reviews.items()):
-                            outcomes[index] = process_pool.TaskOutcome(index=index, status="completed", value={
+                            outcomes[index] = TaskOutcome(index=index, status="completed", value={
                                 "status": "admission_closed", "write_state": "not_requested",
                                 "business_state": "not_available", "error_code": admission_reason,
                                 "prepare_elapsed_seconds": prepare_elapsed,
@@ -3478,7 +3501,7 @@ def _run_dispatched_tasks(
                     attribution=write_wait,
                     event_suffix=1,
                 ):
-                    outcomes[index] = process_pool.TaskOutcome(
+                    outcomes[index] = TaskOutcome(
                         index=index,
                         status="completed",
                         value={
@@ -3498,7 +3521,7 @@ def _run_dispatched_tasks(
                         committed_order_key is not None
                         and order_key < committed_order_key
                     ):
-                        outcomes[index] = process_pool.TaskOutcome(
+                        outcomes[index] = TaskOutcome(
                             index=index,
                             status="completed",
                             value={
@@ -3570,7 +3593,7 @@ def _run_dispatched_tasks(
                             else "*"
                         )
                     except ValueError:
-                        outcomes[next_index] = process_pool.TaskOutcome(
+                        outcomes[next_index] = TaskOutcome(
                             index=next_index,
                             status="completed",
                             value={
@@ -3612,7 +3635,7 @@ def _run_dispatched_tasks(
                 renewed = renew_actions([available[0]])
                 prepare_elapsed = time.monotonic() - prepare_started
                 if renewed != [available[0]]:
-                    outcomes[next_index] = process_pool.TaskOutcome(
+                    outcomes[next_index] = TaskOutcome(
                         index=next_index,
                         status="completed",
                         value={
@@ -3703,7 +3726,7 @@ def _run_dispatched_tasks(
         del outcomes[next_index:]
     for index, outcome in enumerate(outcomes):
         if outcome is None:
-            outcomes[index] = process_pool.TaskOutcome(
+            outcomes[index] = TaskOutcome(
                 index=index,
                 status="stopped",
                 value=None,
@@ -3738,7 +3761,7 @@ def _run_dispatched_tasks(
         )
     except (OSError, TypeError, ValueError):
         pass
-    return process_pool.PoolResult(
+    return PoolResult(
         requested=len(completed_outcomes),
         started=started,
         completed=sum(
@@ -3759,7 +3782,6 @@ def _run_dispatched_tasks(
         processes_reaped=processes_reaped,
         primary_error_code=primary_error_code,
         recommended_capacity=current_review_capacity,
-        capacity_decisions=tuple(capacity_decisions),
         discovery_refreshes=(next_index if strict_global_fifo else 0),
         late_visible_count=len(late_visible_keys - initial_late_visible_keys),
         late_visible_keys=tuple(sorted(late_visible_keys)),
@@ -3801,7 +3823,9 @@ def _run_global_dispatched_tasks(
     run_id: str | None = None,
     controller_instance_id: str | None = None,
     defer_review_failures: bool = True,
-) -> process_pool.PoolResult[dict]:
+) -> PoolResult[dict]:
+    if adaptive:
+        raise ValueError("approval_global_capacity_invalid")
     codex_review_worker._reviewer_environment()
     frozen_unknown = (
         _local_unknown_quarantined_identities()
@@ -3830,172 +3854,6 @@ def _run_global_dispatched_tasks(
     if not defer_review_failures:
         dispatcher_args["defer_review_failures"] = False
     return _run_dispatched_tasks(count, capacity, **dispatcher_args)
-
-
-def _legacy_run_existing_batch(
-    *,
-    capacity: int,
-    project_root: Path = PROJECT_ROOT,
-    prepare_actions: PrepareRunner = _prepare_actions,
-    renew_actions: RenewActions = _renew_actions,
-    run_reviews: ReviewRunner = _run_reviews,
-) -> dict:
-    if not isinstance(capacity, int) or isinstance(capacity, bool) or not 1 <= capacity <= 8:
-        raise ValueError("production_probe_capacity_invalid")
-    root = Path(project_root).expanduser().resolve()
-    if runtime_control.stop_requested():
-        raise ValueError("production_probe_stopped")
-    selected = _open_action_files(root)[:capacity]
-    prepared_new = 0
-    prepare_peak_active = 0
-    prepare_elapsed_seconds = 0.0
-    missing = capacity - len(selected)
-    if missing:
-        preparation = prepare_actions(missing)
-        prepared_new = preparation.completed
-        prepare_peak_active = preparation.peak_active
-        prepare_elapsed_seconds = preparation.elapsed_seconds
-        if (
-            preparation.completed != missing
-            or preparation.failed
-            or preparation.timed_out
-            or preparation.stopped
-            or any(
-                not isinstance(outcome.value, dict)
-                or outcome.value.get("action") != "review_required"
-                for outcome in preparation.outcomes
-            )
-        ):
-            runtime_control.request_cycle_stop()
-            raise ValueError("production_probe_prepare_failed")
-        selected = _open_action_files(root)[:capacity]
-    if len(selected) != capacity:
-        raise ValueError("production_probe_insufficient_open_actions")
-    renewed = renew_actions(selected)
-    if renewed != selected:
-        raise ValueError("production_probe_renew_failed")
-    tasks = [
-        {
-            "project_root": str(root),
-            "action_file": str(action_file),
-            "timeout_seconds": 900,
-        }
-        for action_file in renewed
-    ]
-    result = run_reviews(tasks, capacity)
-    business_results: Counter[str] = Counter()
-    error_counts: Counter[str] = Counter()
-    completed = 0
-    failed = 0
-    process_attempts = 0
-    process_retries = 0
-    usage_statuses: Counter[str] = Counter()
-    token_totals: Counter[str] = Counter()
-    for outcome in result.outcomes:
-        value = outcome.value if isinstance(outcome.value, dict) else {}
-        business_state = value.get("business_state")
-        worker_status = value.get("status")
-        if outcome.status == "completed" and worker_status == "completed":
-            completed += 1
-        elif outcome.status not in {"timed_out", "stopped"}:
-            failed += 1
-        if worker_status == "completed" and isinstance(business_state, str):
-            business_results[business_state] += 1
-        error_code = value.get("error_code") or outcome.error_code
-        if isinstance(error_code, str):
-            error_counts[error_code] += 1
-        process_attempts += int(value.get("process_attempts") or 0)
-        process_retries += int(value.get("process_retries") or 0)
-        token_usage = value.get("token_usage")
-        if not isinstance(token_usage, dict):
-            usage_statuses["unknown"] += 1
-            continue
-        usage_status = str(token_usage.get("status") or "unknown")
-        if usage_status not in {"recorded", "partial"}:
-            usage_status = "unknown"
-        usage_statuses[usage_status] += 1
-        for field in (
-            "input_tokens",
-            "cached_input_tokens",
-            "output_tokens",
-            "total_tokens",
-        ):
-            value_count = token_usage.get(field)
-            if isinstance(value_count, int) and not isinstance(value_count, bool):
-                token_totals[field] += value_count
-    if failed or result.timed_out or result.stopped:
-        runtime_control.request_cycle_stop()
-    return {
-        "schema_version": 1,
-        "kind": "preaudit_production_concurrency_probe",
-        "capacity": capacity,
-        "selected": len(selected),
-        "prepared_new": prepared_new,
-        "prepare_peak_active": prepare_peak_active,
-        "prepare_elapsed_seconds": prepare_elapsed_seconds,
-        "completed": completed,
-        "failed": failed,
-        "timed_out": result.timed_out,
-        "stopped": result.stopped,
-        "peak_active": result.peak_active,
-        "elapsed_seconds": result.elapsed_seconds,
-        "business_results": dict(sorted(business_results.items())),
-        "error_counts": dict(sorted(error_counts.items())),
-        "model": codex_review_worker.MODEL,
-        "reasoning_effort": codex_review_worker.REASONING_EFFORT,
-        "process_attempts": process_attempts,
-        "process_retries": process_retries,
-        "runtime_health": concurrency_control.summarize_runtime(
-            result.runtime_samples
-        ),
-        "watchdog": {
-            "runtime_samples": len(result.runtime_samples),
-            "maximum_task_seconds": result.max_task_elapsed_seconds,
-            "task_timeout_seconds": 960,
-        },
-        "token_usage": {
-            "status": (
-                "recorded"
-                if usage_statuses["recorded"] == len(result.outcomes)
-                else "partial"
-                if usage_statuses["recorded"] or usage_statuses["partial"]
-                else "unknown"
-            ),
-            "recorded_workers": usage_statuses["recorded"],
-            "partial_workers": usage_statuses["partial"],
-            "unknown_workers": usage_statuses["unknown"],
-            **{
-                field: token_totals[field]
-                for field in (
-                    "input_tokens",
-                    "cached_input_tokens",
-                    "output_tokens",
-                    "total_tokens",
-                )
-            },
-        },
-    }
-
-
-def _travel_pending(live: dict) -> int:
-    credentials = live.get("credentials")
-    oa = live.get("oa")
-    if (
-        not isinstance(credentials, dict)
-        or credentials.get("status") != "ok"
-        or not isinstance(oa, dict)
-        or oa.get("execution_identity") not in {"verified", "unknown"}
-    ):
-        raise ValueError("production_drain_live_status_invalid")
-    by_workflow = oa.get("by_workflow")
-    if not isinstance(by_workflow, dict):
-        raise ValueError("production_drain_live_status_invalid")
-    pending = by_workflow.get("travel_expense", 0)
-    if not isinstance(pending, int) or isinstance(pending, bool) or pending < 0:
-        raise ValueError("production_drain_live_status_invalid")
-    if pending and oa.get("execution_identity") != "verified":
-        raise ValueError("production_drain_live_status_invalid")
-    return pending
 
 
 def _production_reconciliation(
@@ -4103,90 +3961,6 @@ def _local_quarantine_count() -> int:
     )["local_quarantined"]
 
 
-def _legacy_run_drain(
-    *,
-    max_capacity: int,
-    live_status: LiveStatus = runtime_doctor.status,
-    batch_runner: BatchRunner = _legacy_run_existing_batch,
-    on_batch: Callable[[dict], None] | None = None,
-    max_batches: int = 100,
-) -> dict:
-    if not 1 <= max_capacity <= 6:
-        raise ValueError("production_drain_capacity_invalid")
-    started_at = time.monotonic()
-    initial_pending = _travel_pending(live_status())
-    pending = initial_pending
-    batches: list[dict] = []
-    while pending:
-        if len(batches) >= max_batches:
-            runtime_control.request_cycle_stop()
-            raise ValueError("production_drain_batch_limit_reached")
-        batch = batch_runner(capacity=min(max_capacity, pending))
-        batches.append(batch)
-        if on_batch is not None:
-            on_batch(batch)
-        if (
-            batch.get("failed")
-            or batch.get("timed_out")
-            or batch.get("stopped")
-            or batch.get("completed") != batch.get("selected")
-        ):
-            runtime_control.request_cycle_stop()
-            raise ValueError("production_drain_batch_failed")
-        pending = _travel_pending(live_status())
-
-    business_results: Counter[str] = Counter()
-    error_counts: Counter[str] = Counter()
-    token_totals: Counter[str] = Counter()
-    usage_workers: Counter[str] = Counter()
-    for batch in batches:
-        business_results.update(batch.get("business_results") or {})
-        error_counts.update(batch.get("error_counts") or {})
-        usage = batch.get("token_usage") or {}
-        for field in ("recorded_workers", "partial_workers", "unknown_workers"):
-            usage_workers[field] += int(usage.get(field) or 0)
-        for field in (
-            "input_tokens",
-            "cached_input_tokens",
-            "output_tokens",
-            "total_tokens",
-        ):
-            token_totals[field] += int(usage.get(field) or 0)
-    return {
-        "schema_version": 1,
-        "kind": "preaudit_production_drain",
-        "status": "completed",
-        "model": codex_review_worker.MODEL,
-        "reasoning_effort": codex_review_worker.REASONING_EFFORT,
-        "max_capacity": max_capacity,
-        "initial_pending": initial_pending,
-        "final_pending": pending,
-        "batches": len(batches),
-        "selected": sum(int(batch.get("selected") or 0) for batch in batches),
-        "prepared_new": sum(int(batch.get("prepared_new") or 0) for batch in batches),
-        "completed": sum(int(batch.get("completed") or 0) for batch in batches),
-        "process_attempts": sum(int(batch.get("process_attempts") or 0) for batch in batches),
-        "process_retries": sum(int(batch.get("process_retries") or 0) for batch in batches),
-        "batch_elapsed_seconds": sum(float(batch.get("elapsed_seconds") or 0) for batch in batches),
-        "elapsed_seconds": time.monotonic() - started_at,
-        "business_results": dict(sorted(business_results.items())),
-        "error_counts": dict(sorted(error_counts.items())),
-        "token_usage": {
-            "status": (
-                "recorded"
-                if usage_workers["recorded_workers"] == sum(
-                    int(batch.get("selected") or 0) for batch in batches
-                )
-                else "partial"
-                if usage_workers["recorded_workers"] or usage_workers["partial_workers"]
-                else "unknown"
-            ),
-            **usage_workers,
-            **token_totals,
-        },
-    }
-
-
 def run_existing_batch(*, capacity: int, **_legacy_options: object) -> dict:
     del capacity, _legacy_options
     raise ValueError("production_legacy_scheduler_removed")
@@ -4263,7 +4037,7 @@ def _write_wait_attribution(
     }
 
 
-def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
+def _rolling_wave_metrics(result: PoolResult[dict]) -> dict:
     business_results: Counter[str] = Counter()
     error_counts: Counter[str] = Counter()
     usage_workers: Counter[str] = Counter()
@@ -4541,11 +4315,12 @@ def run_rolling_drain(
     authorized_recovery_once: bool = False,
 ) -> dict:
     native_pipeline = pipeline_runner is _run_global_dispatched_tasks
-    # Recorded runners retain the diagnostic algorithm; native admission is fixed.
     max_capacity = (3 if native_pipeline else 12) if max_capacity is None else max_capacity
     _validate_rolling_capacity(capacity, max_capacity)
+    if adaptive:
+        raise ValueError("approval_global_capacity_invalid")
     if native_pipeline:
-        if adaptive or capacity > approval_guard.MAX_MODEL_WORKERS or max_capacity > approval_guard.MAX_MODEL_WORKERS:
+        if capacity > approval_guard.MAX_MODEL_WORKERS or max_capacity > approval_guard.MAX_MODEL_WORKERS:
             raise ValueError("approval_global_capacity_invalid")
         gate = approval_lifecycle.startup(PROJECT_ROOT, observe_errors=not bool(os.environ.get(approval_guard.OWNER_ENV)))
         if gate["status"] != "ready":
@@ -4638,7 +4413,7 @@ def run_rolling_drain(
             def tracked_pipeline_runner(
                 count: int,
                 review_capacity: int,
-            ) -> process_pool.PoolResult[dict]:
+            ) -> PoolResult[dict]:
                 nonlocal children_reaped, pending_recoveries
                 nonlocal committed_received_at, committed_request_id
                 nonlocal known_late_visible_keys
@@ -4933,6 +4708,8 @@ def _run_rolling_drain_locked(
     ):
         raise ValueError("production_rolling_capacity_invalid")
     _validate_rolling_capacity(capacity, max_capacity)
+    if adaptive:
+        raise ValueError("approval_global_capacity_invalid")
     if runtime_control.stop_requested():
         raise ValueError("production_probe_stopped")
     started_at = time.monotonic()
@@ -4961,7 +4738,6 @@ def _run_rolling_drain_locked(
     cache_maintenance_waves: list[dict] = []
     status = "completed"
     stop_reason: str | None = None
-    healthy_windows = 0
     current_capacity = capacity
     last_decision = {
         "action": "hold",
@@ -5054,36 +4830,17 @@ def _run_rolling_drain_locked(
                     "healthy_windows": 0, "reason": stop_reason,
                 }
                 break
-            if adaptive and int(wave.get("rate_limit_events") or 0) > 0:
-                current_capacity = concurrency_control.CAPACITY_STEPS[0]
-                last_decision = {
-                    "action": "decrease",
-                    "next_capacity": concurrency_control.CAPACITY_STEPS[0],
-                    "healthy_windows": 0,
-                    "reason": "rate_limit_pressure",
-                }
-                stop_reason = "rate_limit_pressure"
-                break
-            internal_stops = [
-                decision
-                for decision in wave.get("capacity_decisions", [])
-                if decision.get("action") == "stop"
-            ]
-            if internal_stops:
-                last_decision = internal_stops[-1]
-                stop_reason = str(last_decision["reason"])
-            else:
-                stop_reason = (
-                    "host_critical"
-                    if wave["runtime_health"].get("status") == "critical"
-                    else "technical_failure"
-                )
-                last_decision = {
-                    "action": "stop",
-                    "next_capacity": current_capacity,
-                    "healthy_windows": 0,
-                    "reason": stop_reason,
-                }
+            stop_reason = (
+                "host_critical"
+                if wave["runtime_health"].get("status") == "critical"
+                else "technical_failure"
+            )
+            last_decision = {
+                "action": "stop",
+                "next_capacity": current_capacity,
+                "healthy_windows": 0,
+                "reason": stop_reason,
+            }
             break
         quarantined_before_wave = quarantined_pending
         try:
@@ -5133,42 +4890,6 @@ def _run_rolling_drain_locked(
             empty_snapshots = required_empty_snapshots
             break
         empty_snapshots = 0 if actionable else 1
-        if adaptive:
-            internal_decisions = wave.get("capacity_decisions") or []
-            if internal_decisions:
-                last_decision = internal_decisions[-1]
-                current_capacity = int(
-                    wave.get("recommended_capacity") or current_capacity
-                )
-            else:
-                last_decision = concurrency_control.decide_capacity(
-                    current_capacity=current_capacity,
-                    healthy_windows=healthy_windows,
-                    wave={
-                        "requested": wave["requested"],
-                        "completed": wave["completed"],
-                        "failed": wave["failed"],
-                        "timed_out": wave["timed_out"],
-                        "stopped": wave["stopped"],
-                        "transient_error_events": wave[
-                            "transient_error_events"
-                        ],
-                        "rate_limit_events": wave.get("rate_limit_events"),
-                        "codex_event_status": wave["codex_events"]["status"],
-                    },
-                    host=wave["runtime_health"],
-                )
-            healthy_windows = int(last_decision["healthy_windows"])
-            if last_decision["action"] == "stop":
-                runtime_control.request_cycle_stop()
-                status = "failed"
-                stop_reason = str(last_decision["reason"])
-                break
-            if not internal_decisions:
-                current_capacity = min(
-                    int(last_decision["next_capacity"]),
-                    max_capacity,
-                )
 
     if status == "completed" and quarantined_pending:
         status = "completed_with_quarantine"
@@ -5328,7 +5049,7 @@ def _run_rolling_drain_locked(
         "kind": "preaudit_production_rolling_drain",
         "status": status,
         "scheduler": "rolling",
-        "elastic": adaptive,
+        "elastic": False,
         "capacity": capacity,
         "model": codex_review_worker.MODEL,
         "reasoning_effort": codex_review_worker.REASONING_EFFORT,

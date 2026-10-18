@@ -19,7 +19,7 @@ status_dir=$(mktemp -d /tmp/oa-status.XXXXXX) &&
 
 继续须凭据、OA 接口与专用浏览器会话正常、执行身份 verified、授权与冻结可信、所有控制器和 Writer 空闲、上一轮终态及子进程回收可信。continuation 须 status=ready、blocking_reasons={}、isolated_pending为非负整数且等于pending_quarantined、scope与计数一致。code_matches_current=false 若只表示已终态旧版本清单，且当前 Git干净同步、ready_for_start=true、children_reaped=true、restart_verified=true，其余门禁可信，可由 fresh process加载新版；不复用旧进程。不因笼统 degraded 或可信隔离数量停止其他待办。
 
-生产审核固定 3 槽，OpenAI 每轮只创建 3 个 App 子 Agent 并复用对话，DeepSeek 沿用独立 API key 的 CLI 工具承载；不能弹性扩容；材料准备和全局 Writer 均为 1。每次启动产生独立 `run_id`，后续 pending、heartbeat、派单、包装和收尾命令都必须显式带同一 `--run-id`；旧轮证据只按 legacy 只读路径核验，不能回退到旧轮。门禁通过后只调用一次：
+生产审核固定 3 槽，OpenAI 每轮只创建 3 个 App 子 Agent 并复用对话，控制器直接发布并轮询请求；DeepSeek 沿用独立 API key 的 CLI 工具承载。生产弹性和旧批次执行已退场；材料准备和全局 Writer 均为 1。每次启动产生独立 `run_id`，后续 pending、heartbeat、派单、包装和收尾命令都必须显式带同一 `--run-id`；旧轮证据只按 legacy 只读路径核验，不能回退到旧轮。门禁通过后只调用一次：
 
 ```bash
 .venv/bin/python -m scripts.finance_preaudit_run --owner-task-id <当前任务真实UUID> --review-provider openai --review-transport host_chat -- --rolling --fixed-capacity --capacity 3 --max-capacity 3 --confirm-write YES --confirm-alerts YES --recover-confirmed-no-write-once YES --workflow travel_expense --workflow business_entertainment --workflow business_support_fee --workflow small_marketing_fee --workflow tpm_small_marketing_fee --workflow general_expense

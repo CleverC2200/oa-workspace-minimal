@@ -1966,24 +1966,6 @@ def _write_agent_timing(
     return True
 
 
-def _failure(
-    code: str,
-    request_stop: StopRequester,
-    *,
-    attempts: int = 0,
-    usages: list[dict] | None = None,
-) -> dict:
-    request_stop()
-    return {
-        **_base_result(attempts=attempts, usages=usages or []),
-        "status": "failed",
-        "execution_state": "failed",
-        "business_state": "not_available",
-        "write_state": "not_requested",
-        "error_code": code,
-    }
-
-
 def _validated_task(task: dict) -> tuple[Path, Path, int]:
     if not isinstance(task, dict) or set(task) != {
         "project_root",
@@ -2070,70 +2052,6 @@ def _safe_to_retry(action_file: Path) -> bool:
     if action.get("receipt_file") or state.get("receipt_file"):
         return False
     return not action_file.with_name("execution-receipt.json").exists()
-
-
-def _legacy_run_with_completion(
-    task: dict,
-    *,
-    executor: Executor = _execute_codex,
-    completer: Completer = _complete_decision,
-    request_stop: StopRequester = runtime_control.request_cycle_stop,
-) -> dict:
-    run_started = time.monotonic()
-    try:
-        project_root, action_file, timeout_seconds = _validated_task(task)
-    except ValueError:
-        return _failure("codex_review_task_invalid", request_stop)
-    usages: list[dict] = []
-    for attempt in (1, 2):
-        execution = executor(project_root, action_file, timeout_seconds)
-        usages.append(execution.token_usage)
-        business_state = _read_completed(action_file)
-        completion_error: str | None = None
-        if (
-            business_state is None
-            and execution.error_code is None
-            and execution.decision is not None
-        ):
-            usage = _merge_usage(usages)
-            if not _write_agent_timing(
-                action_file,
-                wall_seconds=time.monotonic() - run_started,
-                attempts=attempt,
-                token_usage=usage,
-            ):
-                completion_error = "agent_timing_write_failed"
-            else:
-                completion_error = completer(action_file, execution.decision)
-            business_state = _read_completed(action_file)
-        if business_state is not None:
-            return {
-                **_base_result(attempts=attempt, usages=usages),
-                "status": "completed",
-                "execution_state": "closed",
-                "business_state": business_state,
-                "write_state": "submitted",
-                "error_code": None,
-            }
-        error_code = (
-            execution.error_code
-            or completion_error
-            or "codex_process_incomplete"
-        )
-        retryable = error_code in {
-            "codex_process_failed",
-            "codex_process_incomplete",
-            "codex_decision_invalid",
-        }
-        if attempt == 1 and retryable and _safe_to_retry(action_file):
-            continue
-        return _failure(
-            error_code,
-            request_stop,
-            attempts=attempt,
-            usages=usages,
-        )
-    raise AssertionError("unreachable")
 
 
 def review(
