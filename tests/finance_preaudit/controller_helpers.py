@@ -33,4 +33,3 @@ def _write_failed_unreaped_manifest(
             "health": "degraded",
         },
     )
-
