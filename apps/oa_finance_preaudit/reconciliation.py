@@ -353,9 +353,10 @@ def reconcile(
     pending = {_identity(row) for row in pending_input}
     pending = {identity for identity in pending if identity[0]}
     pending_ids = {request_id for request_id, _received_at in pending}
+    handled_input = [row for row in handled_rows if isinstance(row, dict)]
     handled_ids = {
         request_id
-        for row in handled_rows
+        for row in handled_input
         if isinstance(row, dict)
         and (request_id := _identity(row)[0])
     }
@@ -506,6 +507,14 @@ def reconcile(
                 "local_write_state": state.get("write_state"),
                 "category": category,
                 "recommendation": recommendation,
+                **({"handled_version_verified": any(
+                    _identity(row) == (request_id, received_at)
+                    and bool(received_at)
+                    and not (row.get("request_id") and row.get("requestId")
+                             and row["request_id"] != row["requestId"])
+                    and row.get("workflow_key", state["workflow_key"]) == state["workflow_key"]
+                    for row in handled_input
+                )} if category == "handled_not_pending" else {}),
                 **({"current_item_key": _item_key(*_identity(current_rows[0]))}
                    if category in {"prior_round_submitted", "prior_round_unsubmitted"}
                    else {}),

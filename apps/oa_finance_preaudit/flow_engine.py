@@ -2034,6 +2034,7 @@ class FlowEngine:
         authorization_refresh_needed: AuthorizationRefreshNeeded | None = None,
         submit_frozen: SubmitFrozen | None = None,
         recover_frozen: RecoverFrozen | None = None,
+        projection_scope: frozenset[str] | None = None,
     ) -> None:
         self._root = Path(root).expanduser().resolve()
         self._discover_candidates = discover_candidates
@@ -2045,6 +2046,7 @@ class FlowEngine:
         self._authorization_refresh_needed = authorization_refresh_needed
         self._submit_frozen = submit_frozen
         self._recover_frozen = recover_frozen
+        self._projection_scope = projection_scope
 
     def _persist_current_action(
         self,
@@ -2060,6 +2062,10 @@ class FlowEngine:
         if "action_file" not in action:
             action = {**action, "action_file": str(current_file)}
         with _exclusive_lock(lock_file):
+            if self._projection_scope is not None and current_file.exists():
+                current = _read_object(current_file, code="persistent_state_invalid")
+                if current.get("case_key") not in self._projection_scope:
+                    return action
             if expected_action_file is not None and current_file.exists():
                 try:
                     current = _read_object(
@@ -2465,6 +2471,13 @@ class FlowEngine:
                 raise ValueError("execution_receipt_invalid")
         return receipt
 
+    @staticmethod
+    def _recovery_completion_metadata(state: dict) -> dict:
+        return {key: state[key] for key in (
+            "recovered_from_attempt", "recovery_reason", "recovery_no_write_evidence",
+            "recovery_receipt_fingerprint",
+        ) if key in state}
+
     def _persist_receipt_completion(
         self,
         action_path: Path,
@@ -2496,6 +2509,7 @@ class FlowEngine:
             case_key=attempt_root.parent.name,
             attempt=_attempt_number(attempt_root),
             **fuel_trip_observation.binding(state),
+            **self._recovery_completion_metadata(state),
         )
         json_artifact.write_json_atomic(action_path, closed, indent=2)
         json_artifact.write_json_atomic(
@@ -2970,6 +2984,54 @@ class FlowEngine:
         except (OSError, ValueError):
             return False
         return persisted == state
+
+    @classmethod
+    def inspect_target_action(cls, root: Path, action_file: Path, *, recovery: bool = False) -> dict:
+        def unavailable(*_args, **_kwargs):
+            raise ValueError("read_only_port_unavailable")
+
+        reader = cls(root=root, discover_candidates=unavailable, collect_material=unavailable)
+        path = Path(action_file).expanduser()
+        if (not path.is_absolute() or not _managed_existing_path(path, reader._root)
+                or path != path.resolve() or not _is_attempt_action_path(path, reader._root)):
+            raise ValueError("production_target_action_invalid")
+        workflow = _attempt_workflow_key(path.parent, reader._root)
+        if path.parent not in reader._latest_case_attempts(reader._root / workflow):
+            raise ValueError("production_target_action_stale")
+        state = _read_object(path.with_name("state.json"), code="production_target_action_invalid")
+        if not reader._attempt_identity_matches(path.parent, state, require_material=False):
+            raise ValueError("production_target_action_invalid")
+        if recovery:
+            if not cls.recoverable_no_write(reader._root, path):
+                raise ValueError("production_target_recovery_invalid")
+        elif not cls.confirmed_submission(reader._root, state):
+            if (state.get("mode") != "controlled_write"
+                    or state.get("write_state") != "authorized"
+                    or not cls.resumable_review(reader._root, state)):
+                raise ValueError("production_target_resume_invalid")
+        return state
+
+    def resume_target_review(self, action_file: Path) -> dict:
+        if (self._authorization_source is None or self._authorization_verifier is None
+                or self._submit_frozen is None or self._discover_handled is None):
+            raise ValueError("run_mode_unauthorized")
+        state = self.inspect_target_action(self._root, action_file)
+        identity = state["request_id"], state["received_at"]
+        candidates = list(self._discover_candidates(state["workflow_key"]))
+        handled = list(self._discover_handled())
+        if (sum((row.get("request_id"), row.get("received_at")) == identity
+                and row.get("workflow_key") == state["workflow_key"] for row in candidates) != 1
+                or any(str(row.get("request_id") or row.get("requestId") or "") == identity[0]
+                       for row in handled)):
+            raise ValueError("production_target_live_state_conflict")
+        path = Path(state["action_file"])
+        with _exclusive_lock(self._root / state["workflow_key"] / "flow.lock"):
+            self.inspect_target_action(self._root, path)
+            if _exclusive_lock_active(path.with_name("complete.lock")):
+                raise ValueError("completion_in_progress")
+            action, persisted, _packet = self._open_attempt(path)
+            action = self._renew_expired_authorization(path, action, persisted)
+            return self._persist_current_action(self._root / state["workflow_key"], action)
 
     def _open_attempt(self, action_path: Path, *, require_reviewable: bool = True) -> tuple[dict, dict, dict]:
         action_path = action_path.expanduser().resolve()
@@ -4814,6 +4876,7 @@ class FlowEngine:
             case_key=action["case_key"],
             attempt=action["attempt"],
             **fuel_trip_observation.binding(state),
+            **self._recovery_completion_metadata(state),
         )
         json_artifact.write_json_atomic(action_path, closed, indent=2)
         json_artifact.write_json_atomic(

@@ -317,7 +317,13 @@ def test_native_dispatch_polls_original_three_requests_without_review_executor(
         if failure_kind == 'shared_source_observed':
             assert writes == [] and oa_calls == []
             assert runtime_control.stop_requested()
-            assert all(item.value['status'] != 'completed' for item in results[0].outcomes)
+            assert all(
+                (item.status == 'stopped' and item.value is None)
+                or (item.status in {'completed', 'stopped'} and isinstance(item.value, dict)
+                    and item.value.get('status') in {'failed', 'stopped'})
+                for item in results[0].outcomes
+            )
+            assert results[0].processes_reaped is True
             assert not json.loads(host.registry_file(owner).read_text()).get('request_failures')
             return
         if failure_kind == 'all_fenced_observed':
