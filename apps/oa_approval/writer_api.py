@@ -6,7 +6,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-from apps.oa_approval import auth
+from apps.oa_approval import auth, safe_http
 from apps.oa_approval.api import OaApi, TIMEOUT, _decode_json
 from apps.oa_approval import writer_outcomes
 
@@ -41,7 +41,7 @@ class FrozenWriterApi(OaApi):
             },
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        with safe_http.urlopen(request, timeout=TIMEOUT) as response:
             return _decode_json(response.read().decode("utf-8", errors="ignore"))
 
     def submit_and_verify(self, request_id: str, remark: str) -> dict[str, Any]:

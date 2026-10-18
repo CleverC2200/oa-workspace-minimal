@@ -7,7 +7,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-from apps.oa_approval import auth, flow
+from apps.oa_approval import auth, flow, safe_http
 
 
 TIMEOUT = 30
@@ -151,7 +151,7 @@ class OaApi:
         """Retry one transport failure only for the existing read-only callers."""
         for attempt in range(2):
             try:
-                with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+                with safe_http.urlopen(request, timeout=TIMEOUT) as response:
                     return _decode_json(response.read().decode("utf-8", errors="ignore"))
             except urllib.error.HTTPError as error:
                 return {"http_status": error.code, "error": str(error),

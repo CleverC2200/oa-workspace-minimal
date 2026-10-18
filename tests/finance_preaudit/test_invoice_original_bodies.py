@@ -93,7 +93,7 @@ def original_transport(monkeypatch, tmp_path):
             return Response(state.pdf, request.full_url)
         return Response(json.dumps(body).encode(), request.full_url)
 
-    monkeypatch.setattr(attachments.urllib.request, 'urlopen', open_request)
+    monkeypatch.setattr(attachments.safe_http, 'urlopen', open_request)
     monkeypatch.setattr(attachments.urllib.request, 'build_opener', lambda *_a: SimpleNamespace(open=open_request))
     monkeypatch.setattr(attachments, '_download_resource_with_browser', lambda *_a, **_kw: pytest.fail('classified denial must stop'))
     return state

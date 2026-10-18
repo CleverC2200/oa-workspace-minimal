@@ -89,7 +89,7 @@ def recorded_invoice_http(monkeypatch):
         assert body["id"] == "cloud-101"
         return Response()
 
-    monkeypatch.setattr(invoice_buyers.urllib.request, "urlopen", open_invoice)
+    monkeypatch.setattr(invoice_buyers.safe_http, "urlopen", open_invoice)
     return parties
 
 
