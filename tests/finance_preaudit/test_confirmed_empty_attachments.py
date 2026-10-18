@@ -25,7 +25,7 @@ def empty_source(monkeypatch, tmp_path):
                     {"fieldName": "cwzfje", "fieldShowName": "财务审核金额", "fieldValue": "100", "fieldShowValue": "100"}]}]},
                 "workflowDetailTableInfos": [{"tableDBName": "formtable_main_569_dt1", "workflowRequestTableRecords": [
                     {"recordOrder": 202, "workflowRequestTableFields": fields}]}]}
-    state = SimpleNamespace(workflow=workflow, rows=[{"requestid": 101, "detail_id": 202, "scfj": None, "fj": None, "glfp": None}], queries=[], error=None, rows_by_detail={})
+    state = SimpleNamespace(config=config, workflow=workflow, rows=[{"requestid": 101, "detail_id": 202, "scfj": None, "fj": None, "glfp": None}], queries=[], error=None, rows_by_detail={})
 
     def query(name, params, **kwargs):
         state.queries.append((name, params, kwargs))
@@ -46,6 +46,45 @@ def empty_source(monkeypatch, tmp_path):
 
     state.collect = collect
     return state
+
+
+@pytest.fixture
+def tpm_empty_source(empty_source):
+    state = empty_source
+    state.config.update(flow_key='tpm_small_marketing_fee', workflow_id='195039', workflow_name='TPM小额市场费用报销申请流程')
+    state.workflow['workflowBaseInfo'].update(workflowId=state.config['workflow_id'], workflowName=state.config['workflow_name'])
+    state.workflow['workflowMainTableInfo']['tableDBName'] = 'formtable_main_912'
+    table = state.workflow['workflowDetailTableInfos'][0]
+    table['tableDBName'] = 'formtable_main_912_dt1'
+    fields = table['workflowRequestTableRecords'][0]['workflowRequestTableFields']
+    fields[:] = [f for f in fields if f['fieldName'] != 'scfj']
+    next(f for f in fields if f['fieldName'] == 'fj')['fieldValue'] = '[]'
+    state.rows = [{'requestid': 101, 'detail_id': 202, 'fj': '[]', 'glfp': None}]
+    return state
+
+
+@pytest.mark.parametrize('attachment_value', [None, '[]'])
+def test_tpm_confirmed_empty_source_reaches_review_and_preview_close(tpm_empty_source, tmp_path, attachment_value):
+    state = tpm_empty_source
+    state.rows[0]['fj'] = attachment_value
+    material = state.collect()
+    fields = attachment_fields(material)
+    assert len(fields) == 2 and all(f['read_status'] == 'empty' for f in fields)
+    assert all(f['empty_source']['table'] == 'formtable_main_912_dt1' for f in fields)
+    assert state.queries == [('tpm_small_marketing_fee_attachment_fields', {'request_id': 101, 'detail_id': 202}, {'require_connection': True})]
+    engine = _engine(tmp_path / 'engine', 'tpm_small_marketing_fee', RuntimeError('unused'))
+    engine._discover_candidates = lambda key: [{'request_id': '101', 'workflow_key': key, 'received_at': '2026-08-23T09:00:00+08:00'}]
+    engine._collect_material = state.collect
+    action = engine.next_action('tpm_small_marketing_fee')
+    assert action['action'] == 'review_required'
+    packet = json.loads(Path(action['review_packet_file']).read_text())
+    decision = _uncertain_decision(action, packet)
+    decision['items'][0]['conclusion'] = '当前科目所需附件未提供，请财务核对。'
+    path = tmp_path / 'tpm-decision.json'
+    json_artifact.write_json_atomic(path, decision, indent=2)
+    result = engine.complete_review(action['action_file'], path)
+    assert result['action'] == 'closed' and result['business_state'] == 'needs_human'
+    assert result['write_state'] == 'not_requested'
 
 
 def attachment_fields(material):
@@ -80,7 +119,10 @@ def test_confirmed_empty_source_can_complete_business_preview(empty_source, tmp_
 
 
 @pytest.mark.parametrize("variant", ["database_error", "unavailable", "missing", "duplicate", "wrong_request", "wrong_detail", "nonnull", "missing_column"])
-def test_unconfirmed_source_still_isolates(empty_source, tmp_path, variant):
+@pytest.mark.parametrize('source_fixture', ['empty_source', 'tpm_empty_source'])
+def test_unconfirmed_source_still_isolates(request, source_fixture, tmp_path, variant):
+    empty_source = request.getfixturevalue(source_fixture)
+    workflow_key = empty_source.config['flow_key']
     if variant in {"database_error", "unavailable"}:
         empty_source.error = RuntimeError("official_sql_unavailable" if variant == "unavailable" else "official_sql_read_failed")
     elif variant == "missing":
@@ -95,17 +137,19 @@ def test_unconfirmed_source_still_isolates(empty_source, tmp_path, variant):
         empty_source.rows[0].pop("glfp")
     else:
         empty_source.rows[0].update(scfj="91", fj="92", glfp="93")
-    engine = _engine(tmp_path / "engine", "general_expense", RuntimeError("unused"))
+    engine = _engine(tmp_path / "engine", workflow_key, RuntimeError("unused"))
     engine._discover_candidates = lambda key: [{"request_id": "101", "workflow_key": key, "received_at": "2026-08-23T09:00:00+08:00"}]
     engine._collect_material = empty_source.collect
-    action = engine.next_action("general_expense")
+    action = engine.next_action(workflow_key)
     assert action["action"] == "needs_admin"
-    assert action["failure_detail_code"] == "general_evidence_references_unresolved"
+    assert action["failure_detail_code"] == ('general_evidence_references_unresolved' if workflow_key == 'general_expense' else 'tpm_evidence_references_unresolved')
     assert action["write_state"] == "not_requested"
 
 
 @pytest.mark.parametrize("variant", ["wrong_main", "wrong_table", "missing_record", "duplicate_record", "wrong_workflow_request", "api_nonempty", "api_html", "duplicate_table"])
-def test_unbound_or_conflicting_fields_are_not_reclassified(empty_source, variant):
+@pytest.mark.parametrize('source_fixture', ['empty_source', 'tpm_empty_source'])
+def test_unbound_or_conflicting_fields_are_not_reclassified(request, source_fixture, variant):
+    empty_source = request.getfixturevalue(source_fixture)
     workflow = empty_source.workflow
     table = workflow["workflowDetailTableInfos"][0]
     if variant == "wrong_main": workflow["workflowMainTableInfo"]["tableDBName"] = "formtable_main_999"
@@ -141,8 +185,9 @@ def test_nonempty_source_field_does_not_become_empty(empty_source):
     assert all(f["read_status"] == "unresolved" for f in fields.values())
 
 
-def test_empty_source_query_binds_both_workflow_and_detail():
-    query = sql_templates.render_query("general_expense_attachment_fields", {"request_id": 101, "detail_id": 202})
+@pytest.mark.parametrize('workflow_key', ['general_expense', 'tpm_small_marketing_fee'])
+def test_empty_source_query_binds_both_workflow_and_detail(workflow_key):
+    query = sql_templates.render_query(workflow_key + "_attachment_fields", {"request_id": 101, "detail_id": 202})
     assert query.params == {"request_id": 101, "detail_id": 202}
     assert "d.mainid = m.id" in query.sql
     assert "m.requestid = :request_id" in query.sql
@@ -166,7 +211,10 @@ def test_source_confirmation_does_not_mutate_api_response(empty_source):
 
 
 @pytest.mark.parametrize("variant", ["nonnull", "later_row_failure"])
-def test_partial_confirmation_cannot_open_business_preview(empty_source, tmp_path, variant):
+@pytest.mark.parametrize('source_fixture', ['empty_source', 'tpm_empty_source'])
+def test_partial_confirmation_cannot_open_business_preview(request, source_fixture, tmp_path, variant):
+    empty_source = request.getfixturevalue(source_fixture)
+    workflow_key = empty_source.config['flow_key']
     for field in empty_source.workflow["workflowDetailTableInfos"][0]["workflowRequestTableRecords"][0]["workflowRequestTableFields"]:
         field["filedHtmlShow"] = ""
     if variant == "nonnull":
@@ -176,12 +224,12 @@ def test_partial_confirmation_cannot_open_business_preview(empty_source, tmp_pat
         later = deepcopy(table["workflowRequestTableRecords"][0]);later["recordOrder"] = 303
         table["workflowRequestTableRecords"].append(later)
         empty_source.rows_by_detail[303] = RuntimeError("official_sql_read_failed")
-    engine = _engine(tmp_path / "engine", "general_expense", RuntimeError("unused"))
+    engine = _engine(tmp_path / "engine", workflow_key, RuntimeError("unused"))
     engine._discover_candidates = lambda key: [{"request_id": "101", "workflow_key": key, "received_at": "2026-08-23T09:00:00+08:00"}]
     engine._collect_material = empty_source.collect
-    action = engine.next_action("general_expense")
+    action = engine.next_action(workflow_key)
     assert action["action"] == "needs_admin"
-    assert action["failure_detail_code"] == "general_evidence_references_unresolved"
+    assert action["failure_detail_code"] == ('general_evidence_references_unresolved' if workflow_key == 'general_expense' else 'tpm_evidence_references_unresolved')
     assert action["write_state"] == "not_requested"
 
 

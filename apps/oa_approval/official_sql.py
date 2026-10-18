@@ -169,19 +169,26 @@ def _attachment_placeholder_html(value: str) -> bool:
     return content in {"", "[该字段暂不支持]", "[该字段仅支持显示]"}
 
 
-def general_expense_empty_attachment_fields(data: dict, *, request_id: str) -> dict[str, dict[str, str]]:
+def confirmed_empty_attachment_fields(data: dict, *, request_id: str, workflow_key: str) -> dict[str, dict[str, str]]:
+    sources = {
+        "general_expense": ("formtable_main_569", {"scfj", "fj", "glfp"}),
+        "tpm_small_marketing_fee": ("formtable_main_912", {"fj", "glfp"}),
+    }
+    if workflow_key not in sources:
+        return {}
+    main_table, codes = sources[workflow_key]
+    detail_table = main_table + "_dt1"
     if (not re.fullmatch(r"[1-9][0-9]*", request_id)
             or str(data.get("requestId") or "") != request_id
-            or (data.get("workflowMainTableInfo") or {}).get("tableDBName") != "formtable_main_569"):
+            or (data.get("workflowMainTableInfo") or {}).get("tableDBName") != main_table):
         return {}
-    if sum(table.get("tableDBName") == "formtable_main_569_dt1"
+    if sum(table.get("tableDBName") == detail_table
            for table in data.get("workflowDetailTableInfos") or []) != 1:
         return {}
     extracted = {field["path"]: field for field in evidence_packet.extract_fields(data)}
     confirmed = {}
-    codes = {"scfj", "fj", "glfp"}
     for table_index, table in enumerate(data.get("workflowDetailTableInfos") or []):
-        if table.get("tableDBName") != "formtable_main_569_dt1":
+        if table.get("tableDBName") != detail_table:
             continue
         records = table.get("workflowRequestTableRecords") or []
         identities = [str(record.get("recordOrder") or "") for record in records]
@@ -194,11 +201,12 @@ def general_expense_empty_attachment_fields(data: dict, *, request_id: str) -> d
                       for index, field in enumerate(record.get("workflowRequestTableFields") or [])
                       if field.get("fieldName") in codes]
             if ({field["field_name"] for field in fields} != codes or len(fields) != len(codes)
-                    or any(field["read_status"] != "unresolved" or field["raw_value"].strip()
+                    or any(field["read_status"] != "unresolved" or field["raw_value"].strip() not in (
+                               {"", "[]"} if workflow_key == "tpm_small_marketing_fee" and field["field_name"] == "fj" else {""})
                            or not _attachment_placeholder_html(field["attachment_html"]) for field in fields)):
                 return {}
             try:
-                rows = _query_rows("general_expense_attachment_fields",
+                rows = _query_rows(workflow_key + "_attachment_fields",
                                    {"request_id": int(request_id), "detail_id": int(detail_id)},
                                    require_connection=True)
             except RuntimeError:
@@ -206,12 +214,13 @@ def general_expense_empty_attachment_fields(data: dict, *, request_id: str) -> d
             if (len(rows) != 1 or not codes.issubset(rows[0])
                     or str(rows[0].get("requestid")) != request_id
                     or str(rows[0].get("detail_id")) != detail_id
-                    or any(rows[0][code] is not None for code in codes)):
+                    or any(rows[0][code] is not None and not (
+                        workflow_key == "tpm_small_marketing_fee" and code == "fj" and rows[0][code] == "[]") for code in codes)):
                 return {}
             for field in fields:
                 code = field["field_name"]
                 confirmed[field["path"]] = {"source": "official_sql", "request_id": request_id,
-                    "detail_id": detail_id, "table": "formtable_main_569_dt1", "field_name": code}
+                    "detail_id": detail_id, "table": detail_table, "field_name": code}
     return confirmed
 
 
