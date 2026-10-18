@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from apps.oa_finance_preaudit import attempt_state
+
 import json
 import io
 import hashlib
@@ -77,7 +79,7 @@ def _task(
     )
     json_artifact.write_json_atomic(
         action_file.with_name("state.json"),
-        json.loads(action_file.read_text(encoding="utf-8")),
+        attempt_state.read_action(action_file),
     )
     json_artifact.write_json_atomic(
         action_file.with_name("review-packet.json"),
@@ -190,8 +192,9 @@ def test_host_request_reads_complete_material_view_for_every_finance_workflow(
         "material_file": str(material_file),
         "material_fingerprint": flow_engine._file_fingerprint(material_file),
     })
-    action = json.loads(action_file.read_text())
+    action = attempt_state.read_action(action_file)
     json_artifact.write_json_atomic(action_file, {**action, "review_packet_file": str(packet_file)})
+    json_artifact.write_json_atomic(action_file.with_name("state.json"), {**action, "review_packet_file": str(packet_file)})
     prompts = []
 
     def publish(action, *, prompt, timeout_seconds):
@@ -269,7 +272,7 @@ def test_cli_consumer_rejects_invalid_final_contract_from_real_child(tmp_path, m
     from tests.finance_preaudit.test_flow_engine_submission import _needs_human_decision
 
     action_file = frozen_attempt(tmp_path)
-    decision = _needs_human_decision(json.loads(action_file.read_text()))
+    decision = _needs_human_decision(attempt_state.read_action(action_file))
     if case == "tool_arguments":
         decision = {"command": "read material"}
     elif case == "missing_overall":
@@ -308,7 +311,7 @@ def test_cli_consumer_assembles_protocol_and_closes_needs_human_preview(tmp_path
     from tests.finance_preaudit.test_flow_engine_submission import _needs_human_decision
 
     action_file = frozen_attempt(tmp_path)
-    expected = _needs_human_decision(json.loads(action_file.read_text()))
+    expected = _needs_human_decision(attempt_state.read_action(action_file))
     business = {key: expected[key] for key in ("overall", "items")}
     _real_final_output(monkeypatch, wrapper.format(json.dumps(business)))
     task = {"project_root": str(tmp_path / "project"), "action_file": str(action_file), "timeout_seconds": 60}
@@ -333,7 +336,8 @@ def test_cli_consumer_retains_original_binding_when_inputs_change(tmp_path, monk
     from tests.finance_preaudit.test_flow_engine_submission import _needs_human_decision
 
     action_file = frozen_attempt(tmp_path)
-    original = json.loads(action_file.read_text())
+    original = attempt_state.read_action(action_file)
+    reference = action_file.read_bytes()
     raw = json.dumps(_needs_human_decision(original)).encode()
     if change == "material":
         mutation = f"p=Path({str(action_file.with_name('material.json'))!r}); p.write_bytes(p.read_bytes()+b' '); "
@@ -342,7 +346,7 @@ def test_cli_consumer_retains_original_binding_when_inputs_change(tmp_path, monk
     else:
         mutation = "\n".join(
             f"p=Path({str(path)!r}); value=json.loads(p.read_text()); value['action_token']='different-token'; p.write_text(json.dumps(value))"
-            for path in (action_file, action_file.with_name("state.json"))
+            for path in (action_file.with_name("state.json"),)
         ) + "\n"
     _real_final_output(monkeypatch, raw, mutation=mutation,
                        usage={"input_tokens": 12, "cached_input_tokens": 2, "output_tokens": 4})
@@ -364,6 +368,10 @@ def test_cli_consumer_retains_original_binding_when_inputs_change(tmp_path, monk
     assert retained.read_bytes() == raw and retained.stat().st_mode & 0o777 == 0o600
     context = json.loads(next(action_file.parent.glob("review-context-*.json")).read_text())
     assert context["schema"]["properties"]["action_token"]["const"] == original["action_token"]
+    assert action_file.read_bytes() == reference
+    assert context["input_fingerprints"]["action.json"] == hashlib.sha256(reference).hexdigest()
+    if change != "material":
+        assert context["input_fingerprints"]["state.json"] != hashlib.sha256(action_file.with_name("state.json").read_bytes()).hexdigest()
     assert not action_file.with_name("execution-receipt.json").exists()
 
 
@@ -1249,11 +1257,14 @@ def test_small_marketing_v2_reuses_full_frozen_attempt_validation(
             packet["unexpected"] = "changed"
         json_artifact.write_json_atomic(packet_file, packet)
     elif tamper == "action_packet_path":
-        action = json.loads(action_file.read_text(encoding="utf-8"))
+        action = attempt_state.read_action(action_file)
         action["review_packet_file"] = str(action_file.with_name("other.json"))
         json_artifact.write_json_atomic(action_file, action)
     else:
+        legacy = attempt_state.read_action(action_file)
+        json_artifact.write_json_atomic(action_file, legacy)
         state = json.loads(state_file.read_text(encoding="utf-8"))
+        state.pop("action_reference_sha256")
         state["action_token"] = "changed"
         json_artifact.write_json_atomic(state_file, state)
 
@@ -1357,7 +1368,7 @@ def test_cli_consumer_normalizes_small_marketing_transport_schema(tmp_path, monk
 
     assert result["status"] == "reviewed"
     assert [item["item_key"] for item in result["decision"]["items"]] == _SMALL_MARKETING_V2_ITEM_KEYS
-    assert result["decision"]["action_token"] == json.loads(action_file.read_text())["action_token"]
+    assert result["decision"]["action_token"] == attempt_state.read_action(action_file)["action_token"]
     decision_file = tmp_path / "consumer-decision.json"
     json_artifact.write_json_atomic(decision_file, result["decision"])
     engine = flow_engine.FlowEngine(root=action_file.parents[4],
@@ -1586,7 +1597,7 @@ def test_production_review_phase_returns_decision_without_completing_action(
         "unknown_attempts": 1,
         "counts": {},
     }
-    assert json.loads(action_file.read_text(encoding="utf-8"))["action"] == (
+    assert attempt_state.read_action(action_file)["action"] == (
         "review_required"
     )
     assert not action_file.with_name("agent-timing.json").exists()
@@ -1793,7 +1804,7 @@ def test_parent_completion_persists_timing_and_bound_receipt(
                 "postcheck_done_hit": True,
             },
         )
-        action = json.loads(current_action.read_text(encoding="utf-8"))
+        action = attempt_state.read_action(current_action)
         json_artifact.write_json_atomic(
             current_action,
             {
@@ -2454,7 +2465,7 @@ def test_output_schema_binds_current_action_token(tmp_path: Path, workflow: str)
 
 def test_v2_output_schema_binds_real_frozen_token(tmp_path: Path) -> None:
     _, action_file = _small_marketing_v2_task(tmp_path, budget_account="市场费用")
-    token = json.loads(action_file.read_text())["action_token"]
+    token = attempt_state.read_action(action_file)["action_token"]
     schema = codex_review_worker._decision_schema(action_file)
     assert schema["properties"]["action_token"] == {"type": "string", "const": token}
     wrong = {"action_token": "wrong-token"}
@@ -2464,7 +2475,7 @@ def test_v2_output_schema_binds_real_frozen_token(tmp_path: Path) -> None:
 @pytest.mark.parametrize("token", [None, "", 123, "different-token"])
 def test_output_schema_rejects_invalid_or_unbound_token(tmp_path: Path, token) -> None:
     _, action_file = _task(tmp_path)
-    action = json.loads(action_file.read_text())
+    action = attempt_state.read_action(action_file)
     action["action_token"] = token
     json_artifact.write_json_atomic(action_file, action)
     with pytest.raises(ValueError, match="codex_review_task_invalid"):

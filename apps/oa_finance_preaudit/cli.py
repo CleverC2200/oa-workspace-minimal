@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from apps.oa_approval import api as legacy_api
 from apps.oa_approval import flow as legacy_flow
 from apps.oa_approval import attachment_cache, runtime_control
+from . import attempt_state
 from .case_bundle import collect_case
 from . import (
     controller_handoff,
@@ -266,16 +267,16 @@ def _live_reconciliation(
 
 def _persisted_mode(action_file: Path) -> str | None:
     try:
-        payload = json.loads(action_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        payload = attempt_state.read_action(action_file)
+    except (OSError, ValueError):
         return None
     return str(payload.get("mode") or "") if isinstance(payload, dict) else None
 
 
 def _persisted_workflow(action_file: Path) -> str | None:
     try:
-        payload = json.loads(action_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        payload = attempt_state.read_action(action_file)
+    except (OSError, ValueError):
         return None
     if not isinstance(payload, dict):
         return None
@@ -290,11 +291,11 @@ def _matches_confirmed_unknown_recovery(
     if not confirmed_request_id:
         return False
     try:
-        action = json.loads(action_file.read_text(encoding="utf-8"))
+        action = attempt_state.read_action(action_file)
         state = json.loads(
             action_file.with_name("state.json").read_text(encoding="utf-8")
         )
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return False
     if not isinstance(action, dict) or not isinstance(state, dict):
         return False

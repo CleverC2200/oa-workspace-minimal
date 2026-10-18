@@ -14,7 +14,7 @@ from apps.oa_finance_preaudit import codex_review_worker as worker, process_diag
 
 def _action(tmp_path: Path) -> Path:
     path = tmp_path / "action.json"
-    payload = {"action_token": "private-token", "workflow_key": "travel_expense"}
+    payload = {"schema_version": 1, "kind": "preaudit_action", "action_token": "private-token", "workflow_key": "travel_expense"}
     json_artifact.write_json_atomic(path, payload)
     json_artifact.write_json_atomic(path.with_name("state.json"), payload)
     return path

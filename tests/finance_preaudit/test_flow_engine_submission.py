@@ -524,7 +524,7 @@ def test_tampered_preview_state_cannot_forge_a_controlled_write(tmp_path: Path) 
     )
     forged_grant["proof"] = "forged"
     forged_fingerprint = submission.fingerprint(forged_grant)
-    for path in (action_path, state_path):
+    for path in (state_path,):
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload.update(
             {

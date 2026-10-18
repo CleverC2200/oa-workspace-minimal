@@ -8,7 +8,7 @@ from pathlib import Path
 from apps import json_artifact
 from apps.oa_approval import writer_outcomes
 
-from . import review_failure_evidence as evidence
+from . import attempt_state, review_failure_evidence as evidence
 
 RECEIPT_FILE = "manual-review-receipt.json"
 ITEM_LOCAL_MATERIAL_FAILURE_DETAILS = frozenset({
@@ -43,7 +43,10 @@ def _bound_state(root: Path, state: dict) -> bool:
     if not isinstance(request_id, str) or not request_id or not isinstance(received_at, str) or not received_at:
         return False
     key = hashlib.sha256(f"{request_id}\x1f{received_at}".encode()).hexdigest()
-    action = evidence.read_receipt(root / "action.json")
+    try:
+        attempt_state.read_action(root / "action.json", state=state)
+    except (OSError, ValueError):
+        return False
     required = {
         "schema_version": 1, "kind": "preaudit_action", "action": "needs_admin",
         "execution_state": "needs_admin", "business_state": "not_available",
@@ -55,12 +58,9 @@ def _bound_state(root: Path, state: dict) -> bool:
         and root.name == f"attempt-{attempt}" and root.parent.name == key
         and root.parent.parent.name == "cases"
         and root.parent.parent.parent.name == state.get("workflow_key")
-        and state.get("case_key") == key and isinstance(action, dict)
+        and state.get("case_key") == key
         and not any(path.is_symlink() for path in (root, *root.parents))
-        and all(action.get(k) == v == state.get(k) for k, v in required.items())
-        and all(action.get(k) == state.get(k) for k in (
-            "reason", "write_state", "workflow_key", "case_key", "attempt", "failure_detail_code",
-        ))
+        and all(state.get(k) == v for k, v in required.items())
     )
 
 

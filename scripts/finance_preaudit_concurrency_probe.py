@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from apps.oa_finance_preaudit import attempt_state
+
 import argparse
 from collections import Counter
 from contextlib import ExitStack
@@ -769,7 +771,7 @@ def _renew_actions(action_files: list[Path]) -> list[Path]:
     flow_root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
     renewed: list[Path] = []
     for action_file in action_files:
-        action = _read_object(action_file)
+        action = attempt_state.read_action(action_file)
         case_key = str(action.get("case_key") or "")
         workflow_key = str(action.get("workflow_key") or "")
         if workflow_key not in flow_engine.WORKFLOW_KEYS:
@@ -1413,7 +1415,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                         and raw_action_path == action_path
                         and not state_path.is_symlink()
                     ):
-                        persisted_action = _read_object(action_path)
+                        persisted_action = attempt_state.read_action(action_path)
                         persisted = _read_object(state_path)
                 except (KeyError, ValueError):
                     pass
@@ -1469,7 +1471,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                         and raw_action_path == action_path
                         and not state_path.is_symlink()
                     ):
-                        persisted_action = _read_object(action_path)
+                        persisted_action = attempt_state.read_action(action_path)
                         persisted = _read_object(state_path)
                 except (KeyError, OSError, ValueError):
                     pass
@@ -1654,7 +1656,7 @@ def _reviewable_action_files(project_root: Path) -> list[Path]:
             / "action.json"
         )
         try:
-            action = _read_object(action_file)
+            action = attempt_state.read_action(action_file)
             review_packet_file = Path(
                 str(action["review_packet_file"])
             ).resolve(strict=True)
@@ -2750,7 +2752,7 @@ def _run_dispatched_tasks(
             or state_path.is_symlink()
         ):
             raise ValueError("production_probe_state_invalid")
-        action = _read_object(action_path)
+        action = attempt_state.read_action(action_path)
         state = _read_object(state_path)
         request_id = str(state.get("request_id") or "").strip()
         received_at = str(state.get("received_at") or "").strip()
@@ -4648,7 +4650,7 @@ def _continuation_is_ready(
         for candidate in candidates:
             path = Path(candidate["recovery_action_file"])
             state = latest.get(str(path))
-            action = _read_object(path)
+            action = attempt_state.read_action(path)
             if not isinstance(state, dict) or any(action.get(key) != state.get(key) for key in (
                 "action_file", "state_file", "workflow_key", "case_key", "attempt",
                 "execution_state", "write_state", "reason",

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from apps.oa_finance_preaudit import attempt_state
+
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -70,7 +72,8 @@ def controlled_exchange(exchange):
 
 def test_verified_host_expiry_becomes_an_item_local_quarantine(exchange, controlled_exchange, monkeypatch):
     engine, action, calls = controlled_exchange
-    original = json.loads(action.read_text())
+    original = attempt_state.read_action(action)
+    reference_bytes = action.read_bytes()
     packet = json.loads(action.with_name('review-packet.json').read_text())
     late_decision = {
         'schema_version': 1, 'kind': 'preaudit_review_decision',
@@ -97,6 +100,7 @@ def test_verified_host_expiry_becomes_an_item_local_quarantine(exchange, control
     assert quarantined['reason'] == 'codex_review_failed'
     assert quarantined['write_state'] == 'not_requested'
     assert quarantined['write_authorized'] is False
+    assert action.read_bytes() == reference_bytes
     state = json.loads(action.with_name('state.json').read_text())
     assert evidence.trusted_quarantine(action.parent, state)
     assert item_failure.isolated(action.parent, state)

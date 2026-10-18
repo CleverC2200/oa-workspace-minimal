@@ -74,7 +74,7 @@ def _candidates(request_ids: tuple[str, ...] = ("recorded-request",)) -> list[di
 
 
 def _mark_unknown(action: dict) -> None:
-    for path in (Path(action["action_file"]), Path(action["state_file"])):
+    for path in (Path(action["state_file"]),):
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload.update(
             {
@@ -360,7 +360,7 @@ def test_unknown_writer_result_blocks_later_review_required(
     later = _engine(tmp_path, candidates=[candidates[1]]).next_action(
         "travel_expense"
     )
-    for path in (Path(first["action_file"]), Path(first["state_file"])):
+    for path in (Path(first["state_file"]),):
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload.update(
             {
@@ -613,7 +613,7 @@ def test_historical_unknown_skip_rejects_confirmed_no_write_reason(
     first = _engine(tmp_path).next_action("travel_expense")
     _mark_unknown(first)
     action_path = Path(first["action_file"])
-    for path in (action_path, Path(first["state_file"])):
+    for path in (Path(first["state_file"]),):
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload["reason"] = "writer_preflight_failed"
         json_artifact.write_json_atomic(path, payload)
@@ -806,7 +806,7 @@ def test_human_confirmed_unknown_creates_fresh_controlled_attempt(
     failed = engine.next_action("travel_expense")
     action_path = Path(failed["action_file"])
     state_path = Path(failed["state_file"])
-    for path in (action_path, state_path):
+    for path in (state_path,):
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload.update(
             {
@@ -853,7 +853,7 @@ def test_human_confirmed_unknown_requires_controlled_needs_admin_state(
     )
     failed = engine.next_action("travel_expense")
     action_path = Path(failed["action_file"])
-    for path in (action_path, Path(failed["state_file"])):
+    for path in (Path(failed["state_file"]),):
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload.update(
             {
@@ -863,7 +863,7 @@ def test_human_confirmed_unknown_requires_controlled_needs_admin_state(
                 "reason": "writer_result_unknown",
             }
         )
-        if invalid_boundary == "action_state" and path == action_path:
+        if invalid_boundary == "action_state":
             payload["action"] = "review_required"
         path.write_text(json.dumps(payload), encoding="utf-8")
 
@@ -898,7 +898,7 @@ def test_human_confirmed_unknown_keeps_live_and_receipt_gates(
     )
     failed = engine.next_action("travel_expense")
     action_path = Path(failed["action_file"])
-    for path in (action_path, Path(failed["state_file"])):
+    for path in (Path(failed["state_file"]),):
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload.update(
             {
@@ -946,7 +946,7 @@ def test_writer_failure_label_without_signed_boundary_cannot_be_recovered(
     first = engine.next_action("travel_expense")
     action_path = Path(first["action_file"])
     state_path = Path(first["state_file"])
-    for path in (action_path, state_path):
+    for path in (state_path,):
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload.update(
             {
@@ -1210,8 +1210,8 @@ def test_travel_crash_golden_replay_has_no_duplicate_submission(
             boundary in {"submit_return", "receipt_persisted"}
             and target.name == "execution-receipt.json"
         ) or (
-            boundary == "closed_action_persisted"
-            and target.name == "action.json"
+            boundary == "closed_state_persisted"
+            and target.name == "state.json"
             and data.get("action") == "closed"
         )
         if matches and not tripped:
@@ -1246,7 +1246,7 @@ def test_travel_crash_golden_suite_has_complete_write_boundary_gate() -> None:
         "submit_begin",
         "submit_return",
         "receipt_persisted",
-        "closed_action_persisted",
+        "closed_state_persisted",
     }
 
 
@@ -1610,7 +1610,7 @@ def test_crash_after_postcheck_or_close_without_receipt_never_retries_write(
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("boundary", ["receipt_persisted", "closed_action_persisted"])
+@pytest.mark.parametrize("boundary", ["receipt_persisted", "closed_state_persisted"])
 def test_preview_receipt_recovers_closed_without_repeating_review(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1631,8 +1631,8 @@ def test_preview_receipt_recovers_closed_without_repeating_review(
             boundary == "receipt_persisted"
             and target.name == "execution-receipt.json"
         ) or (
-            boundary == "closed_action_persisted"
-            and target.name == "action.json"
+            boundary == "closed_state_persisted"
+            and target.name == "state.json"
             and data.get("action") == "closed"
         )
         original_write(path, payload, *args, **kwargs)
@@ -1644,7 +1644,7 @@ def test_preview_receipt_recovers_closed_without_repeating_review(
     with pytest.raises(SystemExit, match=boundary):
         engine.complete_review(Path(action["action_file"]), decision_file)
 
-    recovered = _engine(tmp_path).next_action("travel_expense")
+    recovered = _engine(tmp_path).complete_review(Path(action["action_file"]), decision_file)
 
     assert recovered["action"] == "closed"
     assert recovered["write_state"] == "not_requested"

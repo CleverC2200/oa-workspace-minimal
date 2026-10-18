@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from apps.oa_finance_preaudit import attempt_state
+
 import json
 from pathlib import Path
 import shutil
@@ -879,9 +881,10 @@ def test_packaging_v1_frozen_packet_remains_compatible(tmp_path: Path) -> None:
     state_file = Path(action["state_file"])
     state = json.loads(state_file.read_text(encoding="utf-8"))
     state.pop("rule_version")
+    state.pop("action_reference_sha256")
     json_artifact.write_json_atomic(state_file, state)
     action_file = Path(action["action_file"])
-    legacy_action = json.loads(action_file.read_text(encoding="utf-8"))
+    legacy_action = dict(action)
     legacy_action.pop("rule_version")
     json_artifact.write_json_atomic(action_file, legacy_action)
     decision = _decision(action, _passing_items())
@@ -961,7 +964,8 @@ def test_submitted_packaging_is_a_confirmed_previous_round(tmp_path: Path, versi
     if version == 1:
         for name in ("action_file", "state_file"):
             path = Path(action[name])
-            legacy = json.loads(path.read_text())
+            legacy = dict(action) if name == "action_file" else json.loads(path.read_text())
+            legacy.pop("action_reference_sha256", None)
             legacy.pop("rule_version")
             json_artifact.write_json_atomic(path, legacy)
         packet_file = Path(action["review_packet_file"])
@@ -975,7 +979,7 @@ def test_submitted_packaging_is_a_confirmed_previous_round(tmp_path: Path, versi
     json_artifact.write_json_atomic(decision, payload)
     closed = engine.complete_review(Path(action["action_file"]), decision)
     state = json.loads(Path(closed["state_file"]).read_text())
-    assert "rule_version" not in state
+    assert ("rule_version" not in state) if version == 1 else state["rule_version"] == "packaging_layout_approval:2"
     assert closed["write_state"] == "submitted"
     received = datetime.fromisoformat(state["created_at"]) + timedelta(seconds=1)
     report = reconciliation.reconcile(tmp_path, pending_rows=[{
