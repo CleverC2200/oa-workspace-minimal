@@ -24,9 +24,11 @@
 
 ## 固定 App 审核槽的原生派单
 
-新财务 App 请求的审核预算为 1800 秒，进程 watchdog 使用同一预算加 60 秒回收余量；保留的 CLI 审核仍为 900 秒。注册 bootstrap 900 秒、父心跳 300 秒、准备 300 秒及领取窗口不变。预算只作用于新请求，不延长已经发布的 `expires_at`。期限到期仍停止交换，不能接收迟到决定。
+财务控制器直接发布并轮询 App 请求，不创建 Python 审核等待池；取材仍使用隔离准备进程，完成结果进入唯一 Writer。每轮先收齐当前可见结果并分类共享失败，再按 FIFO 启动新写入。包装沿同一发布和轮询入口，保留实际请求的 Schema。
 
-App 等待异常保留主码 `host_review_exchange_failed`，并返回安全的 `failure_detail_code`、异常类型及 `failure_recorded`。可信已登记请求的首错保存在本轮私有 registry 的 `first_failure`，绑定请求路径和 SHA-256；后续关闭或停止错误不覆盖它。未发布或无法安全留证时明确 `failure_recorded=false`，不保存任意异常正文。历史无细码的轮次保持未知，不追溯补造。
+新财务 App 请求的审核预算为 1800 秒，控制器 watchdog 使用同一预算加 60 秒收尾余量；保留的 CLI 审核仍为 900 秒。注册 bootstrap 900 秒、父心跳 300 秒、准备 300 秒及领取窗口不变。预算只作用于新请求，不延长已经发布的 `expires_at`。可信未写请求到期沿单据隔离入口处理，迟到决定拒收；共享身份或来源失信仍停止整轮。
+
+App 等待异常保留主码 `host_review_exchange_failed`，并返回安全的 `failure_detail_code`、异常类型及 `failure_recorded`。共享交换失败的首错保存在本轮私有 registry 的 `first_failure`，绑定请求路径和 SHA-256；后续关闭或停止错误不覆盖它。未发布或无法安全留证时明确 `failure_recorded=false`，不保存任意异常正文。历史无细码的轮次保持未知，不追溯补造。
 
 本节只适用于 OpenAI `host_chat`。唯一滚动控制器启动一次后，主对话创建恰好 3 个原生 `collaboration.spawn_agent`，保留其真实 Agent 路径、子会话 UUID 和成功工具回执。每个 Agent 一次只审核一单，返回结果后空闲；下一单调用同一 Agent 的 `followup_task`，本轮不替换身份、不递归创建审核者。DeepSeek 不执行本节。
 
@@ -38,14 +40,17 @@ App 等待异常保留主码 `host_review_exchange_failed`，并返回安全的 
 python -B -m apps.oa_finance_preaudit.host_chat_review --operation register --owner-task-id <主会话UUID> --source-session-file <父原生会话jsonl> --reviewer-session-file <槽0子会话jsonl> --spawn-line <槽0spawn行> --reviewer-session-file <槽1子会话jsonl> --spawn-line <槽1spawn行> --reviewer-session-file <槽2子会话jsonl> --spawn-line <槽2spawn行> --receipt-file <原execution.json> --invocation-id <原调用ID> --tool-session-id <原session_id>
 ```
 
-2. 注册回执成功后，在下一次独立原生 `functions.exec` 中续首次父任务心跳，再读取 pending。注册与首次心跳不得合并在同一次原生调用中；其来源时间早于注册时，心跳拒绝且不会续租。请求发布会等待可信首次心跳，仍受原单据截止时间和父链门约束，等待期间 pending 为空不代表队列已完成。随后每次取得可信进度后读取当前请求，并在 60 秒以内续一次父任务心跳。App 父租约独立为 300 秒，用于容忍原生派单和工具调度超过 45 秒；控制器自身的 45 秒进程心跳门保持原值。父租约到期阈值为 5 分钟，到期后的下一次既有检查拒绝派单和结果，控制器观察器再请求停止。原进程身份丢失、显式停止及单据截止时间仍在原检查点生效。心跳必须来自主会话本次已落盘的原生调用，父会话 UUID 和实际调用时间均需可信。可在当前原生 exec 内调用 `source_anchor(owner=owner, operation="heartbeat")` 取得当前来源，再调用 `heartbeat(owner=owner, **anchor)`；重复旧来源不延长租约。维持原工具 session 的等待；不得等待直到控制器退出才派单。心跳到期后，新增派单和结果接收在下一次检查时拒绝，不把等待超时当审批重试授权。
+2. 注册回执成功后，在下一次独立原生 `functions.exec` 中续首次父任务心跳，再读取 pending。注册与首次心跳不得合并在同一次原生调用中；其来源时间早于注册时，心跳拒绝且不会续租。控制器在可信首次心跳前保持自身心跳，不取材或发布请求；注册与首次心跳共用原清单开始时间的 900 秒宽限，轮询不重新计时。等待期间 pending 为空不代表队列已完成。随后每次取得可信进度后读取当前请求，并在 60 秒以内续一次父任务心跳。App 父租约独立为 300 秒，用于容忍原生派单和工具调度超过 45 秒；控制器自身的 45 秒进程心跳门保持原值。父租约到期阈值为 5 分钟，到期后的下一次既有检查拒绝派单和结果，控制器观察器再请求停止。原进程身份丢失、显式停止及单据截止时间仍在原检查点生效。心跳必须来自主会话本次已落盘的原生调用，父会话 UUID 和实际调用时间均需可信。可在当前原生 exec 内调用 `source_anchor(owner=owner, operation="heartbeat")` 取得当前来源，再调用 `heartbeat(owner=owner, **anchor)`；重复旧来源不延长租约。维持原工具 session 的等待；不得等待直到控制器退出才派单。心跳到期后，新增派单和结果接收在下一次检查时拒绝，不把等待超时当审批重试授权。
 
 ```bash
 python -B -m apps.oa_finance_preaudit.host_chat_review --operation heartbeat --owner-task-id <主会话UUID> --source-session-file <父原生会话jsonl> --source-line <本次heartbeat工具行>
 python -B -m apps.oa_finance_preaudit.host_chat_review --operation pending --owner-task-id <主会话UUID>
+python -B -m apps.oa_finance_preaudit.host_chat_review --operation status --owner-task-id <主会话UUID> --run-id <本轮run_id>
 ```
 
 3. 请求文件名绑定本轮 owner，保留旧轮同 attempt 的请求、决定和提交证据。pending 只发现本轮注册表登记且属于当前 progress 的请求；派单使用返回的绝对路径，不拼接固定文件名。对 pending 返回的本轮请求，调用空闲原 Agent 的 `followup_task`，只传请求绝对路径和当前单据边界。保留该次真实工具调用来源；它完成后执行 assign，把请求绑定到原槽位。一个槽位有未交回请求时不能再派单。dispatch 的原生时间、请求指纹、子会话和来源必须匹配。
+
+pending 的 round 及独立 status 返回本轮原 3 槽、可用容量和失败请求。失败槽在新鲜原生空闲证明前保持封存；全部封存时控制器停止领取，保留未处理单据并等待统一收尾，不替换 Agent。
 
 主线程使用原执行回执、pending 和原生工具进度监督审核，向用户汇报并持续父心跳。审核槽完成当前取证、必要验算和决定发布；仅在发生阻断或需要澄清时交回中间消息，避免为纯进度回复增加一次携带累计图片的模型请求。
 

@@ -1,4 +1,3 @@
-from concurrent.futures import ThreadPoolExecutor
 import json
 import time
 from uuid import uuid4
@@ -6,9 +5,7 @@ from uuid import uuid4
 import pytest
 
 from apps.oa_finance_preaudit import host_chat_review as host, production_config
-from scripts import finance_preaudit_concurrency_probe as controller
 from tests.finance_preaudit.test_host_chat_review import exchange  # noqa: F401
-from tests.finance_preaudit.test_concurrency_probe import _open_action
 
 
 @pytest.mark.parametrize('provider,transport,seconds', [('openai', 'host_chat', 1800), ('deepseek', 'cli', 900)])
@@ -19,35 +16,6 @@ def test_new_round_review_budget_is_selected_without_changing_identity(monkeypat
     assert production_config.review_timeout_seconds() == seconds
     assert production_config.review_settings() == identity
 
-
-def test_public_dispatcher_uses_same_app_budget_for_request_and_watchdog(exchange, monkeypatch):
-    action, draft, _, _, _, manifest, _ = exchange
-    _open_action(action.parents[4], case_key='synthetic-budget', created_at='2026-10-14T00:00:00+00:00')
-    tasks, deadlines = [], []
-    original = host.approval_lifecycle.heartbeat
-
-    def heartbeat(*args, **kwargs):
-        deadlines.extend(deadline - time.time() for deadline in args[3])
-        return original(*args, **kwargs)
-
-    def review(task):
-        tasks.append(task)
-        time.sleep(.05)
-        return {'status': 'reviewed', 'decision': json.loads(draft.read_text()), 'write_state': 'not_requested'}
-
-    monkeypatch.setattr(host.approval_lifecycle, 'heartbeat', heartbeat)
-    # Explicit in-process fake transport; native pool ownership has separate coverage.
-    monkeypatch.setattr(host.approval_lifecycle, 'submit_readonly',
-        lambda executor, function, task, **kwargs: executor.submit(function, task))
-    result = controller._run_dispatched_tasks(1, 1, project_root=action.parents[6],
-        renew_actions=lambda paths: paths, review_worker=review,
-        prepare_action=lambda _: {'action': 'no_action'},
-        complete_review=lambda *_: {'status': 'completed', 'write_state': 'submitted', 'business_state': 'needs_human'},
-        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
-        runtime_status=lambda: {'status': 'healthy'}, heartbeat_interval_sec=.01,
-        run_id=manifest['run_id'], controller_instance_id=manifest['controller_instance_id'])
-    assert result.completed == 1 and tasks[0]['timeout_seconds'] == 1800
-    assert any(1850 < delta <= 1860 for delta in deadlines)
 
 
 @pytest.mark.parametrize('damage,code', [('expired', 'host_review_request_expired'), ('frozen_and_expired', 'host_review_request_untrusted')])

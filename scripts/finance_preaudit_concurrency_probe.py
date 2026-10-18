@@ -2043,7 +2043,7 @@ def run_adaptive_read_only_probe(
 
 def _review_only(task: dict) -> dict:
     if host_chat_review.selected():
-        return host_chat_review.review(task)
+        raise ValueError("host_review_direct_dispatch_required")
     return codex_review_worker.review(task)
 
 
@@ -2275,6 +2275,11 @@ def _run_dispatched_tasks(
     run_id: str | None = None,
     controller_instance_id: str | None = None,
 ) -> process_pool.PoolResult[dict]:
+    native_review = host_chat_review.selected()
+    native_bootstrapped = False
+    native_ready = not native_review
+    native_status = None
+    next_native_poll = 0.0
     review_timeout_seconds = production_config.review_timeout_seconds()
     if task_timeout_sec is None:
         task_timeout_sec = review_timeout_seconds + 60
@@ -2330,6 +2335,7 @@ def _run_dispatched_tasks(
     assigned_order_keys: dict[int, tuple[datetime, str]] = {}
     pending_write_indices: set[int] = set()
     futures: dict[object, tuple[int, float, float, Path]] = {}
+    host_requests: dict[Path, tuple[int, float, float, Path]] = {}
     pending_reviews: dict[int, tuple[float, Path]] = {}
     write_ready: dict[
         int,
@@ -2392,6 +2398,8 @@ def _run_dispatched_tasks(
     next_heartbeat = time.monotonic()
     discovery_closed = not continuous_discovery
     admission_was_closed = False
+    admission_reason = None
+    deferred_count = 0
     empty_discovery_snapshots = 0
     next_discovery_at = time.monotonic()
     preparation: tuple[Future[dict], int, float] | None = None
@@ -2407,7 +2415,7 @@ def _run_dispatched_tasks(
     timed_out_prepare_context: dict | None = None
     prepare_executor = _preparation_executor()
     prepare_executor_terminated = False
-    executor = executor_factory(maximum_capacity)
+    executor = None if native_review else executor_factory(maximum_capacity)
     writer_executor = ThreadPoolExecutor(
         max_workers=1,
         thread_name_prefix="oa-global-writer",
@@ -2498,7 +2506,11 @@ def _run_dispatched_tasks(
         ) in futures.items():
             stopped_review(index, prepare_elapsed, None)
         futures.clear()
-        terminate_executor(executor)
+        for index, prepare_elapsed, _task_started, _action_file in host_requests.values():
+            stopped_review(index, prepare_elapsed, None)
+        host_requests.clear()
+        if executor is not None:
+            terminate_executor(executor)
         force_terminated = True
 
     def stop_write_queue() -> None:
@@ -2652,6 +2664,22 @@ def _run_dispatched_tasks(
     ) -> None:
         nonlocal started, peak_active
         publish_progress()
+        if native_review:
+            try:
+                request_file = host_chat_review.publish(
+                    action_file, prompt=codex_review_worker._prompt(action_file),
+                    timeout_seconds=review_timeout_seconds, run_id=run_id,
+                )
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                outcomes[index] = process_pool.TaskOutcome(
+                    index=index, status="failed", value=None, error_code="host_review_publish_failed",
+                )
+                request_pipeline_stop("host_review_publish_failed")
+                return
+            host_requests[request_file] = (index, prepare_elapsed, time.monotonic(), action_file)
+            started += 1
+            peak_active = max(peak_active, len(host_requests))
+            return
         future = approval_lifecycle.submit_readonly(
             executor,
             review_worker,
@@ -2675,7 +2703,7 @@ def _run_dispatched_tasks(
         if approval_lifecycle.context() is None:
             return
         now, wall = time.monotonic(), time.time()
-        deadlines = [wall + task_timeout_sec - (now - task[2]) for task in futures.values()]
+        deadlines = [wall + task_timeout_sec - (now - task[2]) for task in (*futures.values(), *host_requests.values())]
         if preparation is not None:
             deadlines.append(wall + prepare_timeout_sec - (now - preparation[2]))
         approval_lifecycle.heartbeat(run_id, controller_instance_id, assigned, deadlines, writer_active=writer is not None)
@@ -2795,6 +2823,7 @@ def _run_dispatched_tasks(
     try:
         while (
             futures
+            or host_requests
             or preparation is not None
             or writer is not None
             or write_ready
@@ -2805,6 +2834,7 @@ def _run_dispatched_tasks(
                     or (continuous_discovery and not discovery_closed)
                 )
                 and not halted
+                and not admission_was_closed
             )
         ):
             if runtime_control.stop_requested() and not halted:
@@ -2880,7 +2910,7 @@ def _run_dispatched_tasks(
                     _prepare_elapsed,
                     task_started,
                     _action_file,
-                ) in futures.values()
+                ) in (*futures.values(), *host_requests.values())
             }
             active_ages = dict(review_ages)
             prepare_age = 0.0
@@ -2902,6 +2932,9 @@ def _run_dispatched_tasks(
                 ) in futures.items()
                 if not future.done()
                 and review_ages[index] >= task_timeout_sec
+            } | {
+                index for index, _elapsed, _started, _action in host_requests.values()
+                if review_ages[index] >= task_timeout_sec
             }
             prepare_timed_out = (
                 preparation is not None
@@ -2909,12 +2942,9 @@ def _run_dispatched_tasks(
                 and prepare_age >= prepare_timeout_sec
             )
             if timed_out_indices or prepare_timed_out:
-                for _future, (
-                    index,
-                    _prepare_elapsed,
-                    _started_at,
-                    _action_file,
-                ) in futures.items():
+                for index, _prepare_elapsed, _started_at, _action_file in (
+                    *futures.values(), *host_requests.values(),
+                ):
                     outcomes[index] = process_pool.TaskOutcome(
                         index=index,
                         status="timed_out",
@@ -2926,6 +2956,7 @@ def _run_dispatched_tasks(
                         ),
                     )
                 futures.clear()
+                host_requests.clear()
                 if preparation is not None:
                     _prepare_future, prepare_index, _started_at = preparation
                     outcomes[prepare_index] = process_pool.TaskOutcome(
@@ -2966,7 +2997,8 @@ def _run_dispatched_tasks(
                         "pending_tasks": max(0, count - next_index),
                         "active_workers": len(futures)
                         + int(preparation is not None),
-                        "active_reviews": len(futures),
+                        "active_reviews": len(futures) + len(host_requests),
+                        "native_review_requests": len(host_requests),
                         "review_capacity": current_review_capacity,
                         "resource_paused": resource_paused,
                         "pending_reviews": len(pending_reviews),
@@ -3105,7 +3137,7 @@ def _run_dispatched_tasks(
                         discovery_closed = True
                         admission_was_closed = True
                     elif continuous_discovery:
-                        if futures or write_ready or writer is not None:
+                        if futures or host_requests or write_ready or writer is not None:
                             empty_discovery_snapshots = 0
                         else:
                             empty_discovery_snapshots += 1
@@ -3178,7 +3210,7 @@ def _run_dispatched_tasks(
                     action_file = Path(str(prepared["action_file"])).resolve()
                     if action_file in assigned:
                         next_index -= 1
-                        if futures or write_ready or writer is not None:
+                        if futures or host_requests or write_ready or writer is not None:
                             preparation_deferred = True
                         else:
                             unblocked_duplicate_retries += 1
@@ -3270,6 +3302,7 @@ def _run_dispatched_tasks(
             reviewed_now: list[tuple[int, float, Path, dict]] = []
             failed_now = False
             first_review_error_code: str | None = None
+            completed_reviews = []
             for future in sorted(done, key=lambda item: futures[item][0]):
                 index, prepare_elapsed, _started_at, action_file = futures.pop(
                     future
@@ -3287,6 +3320,15 @@ def _run_dispatched_tasks(
                     if first_review_error_code is None:
                         first_review_error_code = "worker_process_failed"
                     continue
+                completed_reviews.append((index, prepare_elapsed, action_file, value))
+            native_poll_due = time.monotonic() >= next_native_poll
+            if native_poll_due:
+                for request_file, (index, prepare_elapsed, _started_at, action_file) in tuple(host_requests.items()):
+                    value = host_chat_review.poll_result(request_file)
+                    if value is not None:
+                        host_requests.pop(request_file)
+                        completed_reviews.append((index, prepare_elapsed, action_file, value))
+            for index, prepare_elapsed, action_file, value in sorted(completed_reviews, key=lambda item: item[0]):
                 if value.get("status") != "reviewed":
                     if runtime_control.stop_reason() == approval_guard.STOP_REASON:
                         outcomes[index] = process_pool.TaskOutcome(index=index, status="stopped", value=value, error_code="stop_requested")
@@ -3369,7 +3411,35 @@ def _run_dispatched_tasks(
                     )
                 advance_write_head()
 
-            while pending_reviews and not halted and not resource_paused and len(futures) < current_review_capacity:
+            if native_review and not halted:
+                try:
+                    if native_status is None or native_poll_due:
+                        native_status = host_chat_review.round_status(run_id=run_id)
+                        next_native_poll = time.monotonic() + .2
+                    native_ready = native_status["ready"]
+                    if native_bootstrapped and not native_ready:
+                        raise ValueError("host_review_run_untrusted")
+                    native_bootstrapped = native_bootstrapped or native_ready
+                    current_review_capacity = min(maximum_capacity, native_status["capacity"])
+                    if native_ready and current_review_capacity == 0:
+                        admission_was_closed = True
+                        admission_reason = "host_review_slots_fenced"
+                        discovery_closed = True
+                        for index, (prepare_elapsed, _action_file) in tuple(pending_reviews.items()):
+                            outcomes[index] = process_pool.TaskOutcome(index=index, status="completed", value={
+                                "status": "admission_closed", "write_state": "not_requested",
+                                "business_state": "not_available", "error_code": admission_reason,
+                                "prepare_elapsed_seconds": prepare_elapsed,
+                            })
+                            deferred_count += 1
+                            pending_reviews.pop(index)
+                            pending_write_indices.discard(index)
+                            skipped_write_indices.add(index)
+                        advance_write_head()
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                    request_pipeline_stop("host_review_parent_lost_or_closed")
+                    native_ready = False
+            while pending_reviews and not halted and not resource_paused and native_ready and len(futures) + len(host_requests) < current_review_capacity:
                 index = min(pending_reviews)
                 prepare_elapsed, action_file = pending_reviews.pop(index)
                 submit_review(index, prepare_elapsed, action_file)
@@ -3461,15 +3531,18 @@ def _run_dispatched_tasks(
             while (
                 not halted
                 and not resource_paused
+                and native_ready
+                and not admission_was_closed
                 and preparation is None
                 and (
                     next_index < len(outcomes)
                     or (continuous_discovery and not discovery_closed)
                 )
                 and time.monotonic() >= next_discovery_at
-                and len(futures) + len(pending_reviews) < current_review_capacity
+                and len(futures) + len(host_requests) + len(pending_reviews) < current_review_capacity
                 and (
                     len(futures)
+                    + len(host_requests)
                     + len(pending_reviews)
                     + len(write_ready)
                     + int(preparation is not None)
@@ -3567,6 +3640,7 @@ def _run_dispatched_tasks(
 
             if (
                 not futures
+                and not host_requests
                 and preparation is None
                 and writer is None
                 and not write_ready
@@ -3574,7 +3648,7 @@ def _run_dispatched_tasks(
                 and (
                     halted
                     or (
-                        next_index >= len(outcomes)
+                        (next_index >= len(outcomes) or admission_was_closed)
                         and (not continuous_discovery or discovery_closed)
                     )
                 )
@@ -3612,7 +3686,7 @@ def _run_dispatched_tasks(
                 )
             else:
                 prepare_executor.shutdown(wait=True)
-        if not force_terminated:
+        if not force_terminated and executor is not None:
             executor.shutdown(wait=True)
         writer_executor.shutdown(wait=True)
     processes_reaped = _processes_reaped(
@@ -3625,6 +3699,8 @@ def _run_dispatched_tasks(
     if timed_out_prepare_context is not None:
         prepare_trace.record_timeout(trace_directory, timed_out_prepare_context)
 
+    if admission_was_closed:
+        del outcomes[next_index:]
     for index, outcome in enumerate(outcomes):
         if outcome is None:
             outcomes[index] = process_pool.TaskOutcome(
@@ -3639,7 +3715,7 @@ def _run_dispatched_tasks(
         if outcome is not None
         and not (
             isinstance(outcome.value, dict)
-            and outcome.value.get("status") in {"late_visible", "no_action"}
+            and outcome.value.get("status") in {"late_visible", "no_action", "admission_closed"}
         )
     )
     if (
@@ -3703,6 +3779,8 @@ def _run_dispatched_tasks(
             and not halted
         ),
         admission_closed=admission_was_closed,
+        admission_reason=admission_reason,
+        deferred_count=deferred_count,
     )
 
 
@@ -4416,6 +4494,8 @@ def _rolling_wave_metrics(result: process_pool.PoolResult[dict]) -> dict:
         "late_visible_pending": result.late_visible_pending_count,
         "discovery_exhausted": result.discovery_exhausted,
         "admission_closed": result.admission_closed,
+        "admission_reason": result.admission_reason,
+        "deferred_count": result.deferred_count,
         "recommended_capacity": result.recommended_capacity,
         "capacity_decisions": list(result.capacity_decisions),
         "_pipeline_review_wait_samples": review_to_write,
@@ -4893,6 +4973,8 @@ def _run_rolling_drain_locked(
     late_visible_pending = 0
     post_boundary_actionable = 0
     admission_closed = False
+    admission_reason = None
+    deferred_count = 0
     empty_snapshots = 0 if actionable else 1
     required_empty_snapshots = 2
     while actionable or empty_snapshots < required_empty_snapshots:
@@ -5031,7 +5113,13 @@ def _run_rolling_drain_locked(
             break
         if wave.get("admission_closed") is True:
             admission_closed = True
-            unauthorized_pending += actionable
+            admission_reason = wave.get("admission_reason")
+            deferred_count += int(wave.get("deferred_count") or 0)
+            if admission_reason:
+                stop_reason = admission_reason
+                post_boundary_actionable = actionable
+            else:
+                unauthorized_pending += actionable
             actionable = 0
             empty_snapshots = required_empty_snapshots
             break
@@ -5269,6 +5357,8 @@ def _run_rolling_drain_locked(
             int(wave.get("late_visible") or 0) for wave in waves
         ),
         "admission_closed": admission_closed,
+        "admission_reason": admission_reason,
+        "deferred_count": deferred_count,
         "post_boundary_actionable": post_boundary_actionable,
         "waves": len(waves),
         "cache_maintenance_waves": cache_maintenance_waves,

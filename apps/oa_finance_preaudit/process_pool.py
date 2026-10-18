@@ -47,6 +47,8 @@ class PoolResult(Generic[Output]):
     late_visible_pending_count: int = 0
     discovery_exhausted: bool = False
     admission_closed: bool = False
+    admission_reason: str | None = None
+    deferred_count: int = 0
 
 
 @dataclass

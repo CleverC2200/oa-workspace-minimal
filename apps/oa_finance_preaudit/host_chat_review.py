@@ -403,9 +403,11 @@ def _registry(owner: str, *, live: bool = True, run_id: str | None = None, legac
                 or not started <= registered_at < started + 900 or registered_at > time.time()):
             raise ValueError('host_review_heartbeat_untrusted')
     if live:
+        heartbeat_current = (0 <= time.time() - value['heartbeat_at'] < PARENT_HEARTBEAT_MAX_AGE
+                             if heartbeat_proof is not None else started <= time.time() < started + 900)
         if (value.get('state') != 'open' or value.get('shutdown') is not None or runtime_control.stop_requested()
                 or not guard._timestamp(value.get('heartbeat_at'))
-                or not 0 <= time.time() - value['heartbeat_at'] < PARENT_HEARTBEAT_MAX_AGE
+                or not heartbeat_current
                 or not all(guard.process_identity(item['pid']) == item for item in value['execution_owners'])):
             raise ValueError('host_review_parent_lost_or_closed')
     return value
@@ -639,6 +641,44 @@ def _request_file(action: Path, kind: str, *, owner: str, run_id: str | None = N
 def _submission_file(request_file: Path) -> Path:
     return request_file.with_name(request_file.name.replace(REQUEST, SUBMISSION))
 
+
+def round_status(*, owner: str | None = None, run_id: str | None = None) -> dict:
+    from . import controller_handoff
+
+    owner = owner or os.environ.get(guard.OWNER_ENV)
+    manifest = controller_handoff._read_manifest()
+    if (owner is None or manifest is None or manifest.get('review_configuration') != IDENTITY
+            or run_id is not None and manifest['run_id'] != run_id):
+        raise ValueError('host_review_run_untrusted')
+    run_id = manifest['run_id']
+    if not os.path.lexists(registry_file(owner, run_id)):
+        assert_round_alive(owner=owner, manifest=manifest)
+        return {'ready': False, 'phase': 'finance', 'run_id': run_id,
+                'controller_instance_id': manifest['controller_instance_id'], 'capacity': 0, 'slots': []}
+    value = _registry(owner, run_id=run_id)
+    if (value['controller_instance_id'] != manifest['controller_instance_id']
+            or manifest['state'] != ('running' if value['phase'] == 'finance' else 'completed')):
+        raise ValueError('host_review_run_untrusted')
+    ready = value.get('heartbeat_source') is not None
+    slots = []
+    for reviewer in value['reviewers']:
+        failures = []
+        for request_id, assigned in value['assignments'].items():
+            if assigned['state'] not in {'assigned', 'submitted', 'failed_fenced', 'failed_sealed'}:
+                raise ValueError('host_review_assignment_untrusted')
+            if assigned['slot'] != reviewer['slot'] or assigned['state'] != 'failed_fenced':
+                continue
+            proof = value.get('request_failures', {}).get(request_id)
+            if proof is None or verified_failure(Path(proof['action_file']), _failed_result(proof)) is None:
+                raise ValueError('host_review_request_untrusted')
+            failures.append({key: proof[key] for key in ('request_id', 'request_file', 'failure_detail_code')})
+        slots.append({**{key: reviewer[key] for key in ('slot', 'agent_path', 'reviewer_task_id')},
+                      'fenced': bool(failures), 'failed_requests': failures})
+    return {'ready': ready, 'phase': value['phase'], 'run_id': run_id,
+            'controller_instance_id': value['controller_instance_id'],
+            'capacity': sum(not slot['fenced'] for slot in slots) if ready else 0, 'slots': slots}
+
+
 def pending(*, owner: str | None = None, manifest: dict | None = None, run_id: str | None = None) -> list[dict]:
     """Observe only requests listed in the current controller's bound progress."""
     owner = owner or os.environ.get(guard.OWNER_ENV)
@@ -843,34 +883,15 @@ def publish(action: Path, *, prompt: str, timeout_seconds: int, kind: str = 'fin
     if owner is None or kind not in {'finance', 'packaging_draft', 'packaging_confirmation'}:
         raise ValueError('host_review_run_untrusted')
     from . import controller_handoff
-    if run_id is None:
-        try:
-            registered = _registry(owner, live=False)
-            run_id = registered['run_id']
-        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-            manifest = controller_handoff._read_manifest()
-            run_id = manifest.get('run_id') if manifest is not None else None
-    started_at = time.time()
-    while not os.path.lexists(registry_file(owner, run_id)):
-        candidates = sorted(registry_file(owner, legacy=True).parent.glob('*/registry.json'))
-        if len(candidates) == 1:
-            run_id = candidates[0].parent.name
-            break
-        manifest = controller_handoff._read_manifest()
-        if (manifest is None or manifest['state'] != 'running' or manifest.get('review_configuration') != IDENTITY
-                or runtime_control.stop_requested() or not guard.execution_owners_alive()
-                or time.time() >= started_at + timeout_seconds):
-            raise ValueError('host_review_bootstrap_failed')
-        time.sleep(.2)
+    status = round_status(owner=owner, run_id=run_id)
+    if not status['ready']:
+        raise ValueError('host_review_not_ready')
+    run_id = status['run_id']
     registered = _registry(owner, run_id=run_id)
-    while registered.get('heartbeat_source') is None:
-        if time.time() >= started_at + timeout_seconds:
-            raise ValueError('host_review_bootstrap_failed')
-        time.sleep(.2)
-        registered = _registry(owner, run_id=run_id)
     manifest = controller_handoff._read_manifest()
     if manifest is None:
         raise ValueError('host_review_run_untrusted')
+    started_at = time.time()
     request = {'schema_version': 1, 'kind': 'preaudit_host_review_request', 'review_kind': kind,
                'request_id': uuid4().hex, 'owner_task_id': owner, 'run_id': registered['run_id'],
                'controller_instance_id': registered['controller_instance_id'],
@@ -943,7 +964,7 @@ def _failure_detail(error: Exception) -> dict:
         'host_review_parent_lost_or_closed', 'host_review_registry_untrusted', 'host_review_frozen_untrusted',
         'host_review_submission_untrusted', 'host_review_assignment_untrusted', 'host_review_source_untrusted',
         'host_review_heartbeat_untrusted', 'host_review_phase_untrusted', 'host_review_finance_incomplete',
-        'host_review_bootstrap_failed', 'host_review_transport_invalid', 'codex_review_task_invalid', 'stop_requested',
+        'host_review_bootstrap_failed', 'host_review_not_ready', 'host_review_transport_invalid', 'codex_review_task_invalid', 'stop_requested',
     }
     classes = (ValueError, RuntimeError, OSError, KeyError, TypeError, FileNotFoundError, PermissionError, TimeoutError)
     return {'failure_detail_code': str(error) if str(error) in codes else 'host_review_exception',
@@ -980,18 +1001,21 @@ def _record_exchange_failure(request_file: Path, detail: dict) -> bool:
         return False
 
 
-def await_result(request_file: Path) -> dict:
+def poll_result(request_file: Path) -> dict | None:
     request = {}
     try:
-        _, request = _read(request_file)
+        raw, request = _read(request_file)
         action = Path(request['action_file'])
         submission = _submission_file(request_file)
-        while not os.path.lexists(submission):
-            _live(request, action)
-            time.sleep(.2)
-        # submit publishes the file before committing its registry fingerprint.
-        # Wait for that same transaction before consuming either side.
+        submission_exists = os.path.lexists(submission)
         with _round_lease(request['owner_task_id'], request['run_id']):
+            registered = _registry(request['owner_task_id'], run_id=request['run_id'])
+            if registered.get('requests', {}).get(request['request_id']) != {
+                    'request_file': str(request_file.absolute()), 'request_sha256': hashlib.sha256(raw).hexdigest()}:
+                raise ValueError('host_review_request_untrusted')
+            _live(request, action)
+            if not submission_exists and not os.path.lexists(submission):
+                return None
             return read_result(request_file)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
         detail = _failure_detail(error)
@@ -1011,6 +1035,14 @@ def await_result(request_file: Path) -> dict:
         runtime_control.request_cycle_stop()
         return {**_base(), 'status': 'failed', 'error_code': 'host_review_exchange_failed',
                 **detail, 'failure_recorded': recorded}
+
+
+def await_result(request_file: Path) -> dict:
+    while True:
+        result = poll_result(request_file)
+        if result is not None:
+            return result
+        time.sleep(.2)
 
 
 def _failed_result(proof: dict) -> dict:
@@ -1395,7 +1427,7 @@ def source_anchor(*, owner: str, operation: str = 'heartbeat', run_id: str | Non
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--operation', choices=['register', 'pending', 'assign', 'submit', 'heartbeat', 'enter-packaging', 'close', 'begin-shutdown', 'finish-shutdown', 'write-draft', 'release-failed-slot'], default='submit')
+    parser.add_argument('--operation', choices=['register', 'pending', 'assign', 'submit', 'heartbeat', 'enter-packaging', 'close', 'begin-shutdown', 'finish-shutdown', 'write-draft', 'release-failed-slot', 'status'], default='submit')
     parser.add_argument('--owner-task-id', required=True)
     parser.add_argument('--run-id')
     parser.add_argument('--request-file', type=Path)
@@ -1415,7 +1447,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     UUID(args.owner_task_id)
     owner = args.owner_task_id
-    if args.operation in {'pending', 'heartbeat', 'enter-packaging', 'begin-shutdown',
+    if args.operation in {'pending', 'status', 'heartbeat', 'enter-packaging', 'begin-shutdown',
                           'finish-shutdown', 'close', 'assign', 'submit', 'release-failed-slot'} and args.run_id is None:
         parser.error('run-id required to select one independent round')
     if args.run_id is not None:
@@ -1435,7 +1467,9 @@ def main(argv=None) -> int:
                           owner=owner, source=args.source_session_file, receipt_file=args.receipt_file,
                           invocation_id=args.invocation_id, tool_session_id=args.tool_session_id, run_id=args.run_id)
     elif args.operation == 'pending':
-        result = {'requests': pending(owner=owner, run_id=args.run_id)}
+        result = {'requests': pending(owner=owner, run_id=args.run_id), 'round': round_status(owner=owner, run_id=args.run_id)}
+    elif args.operation == 'status':
+        result = round_status(owner=owner, run_id=args.run_id)
     elif args.operation == 'release-failed-slot':
         if args.request_file is None or args.source_session_file is None or args.source_line is None:
             parser.error('release-failed-slot requires request and fresh native idle source')

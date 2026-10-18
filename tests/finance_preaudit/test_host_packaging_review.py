@@ -73,7 +73,7 @@ def publish_payload(request, child, payload, owner, *, filename='draft.json'):
     target = request.parent / filename
     source_line = draft_source(child, request, target, owner, payload=payload, call_id='write-' + filename)
     host.submit(request, target, owner=owner, source=child, source_line=source_line)
-    return host.await_result(request)
+    return host.poll_result(request)
 
 
 def test_app_packaging_submission_requires_current_real_image_observation(package_round):
@@ -93,11 +93,16 @@ def test_current_observed_app_draft_preserves_business_fields_without_cli(packag
     import threading
     path, root, owner, child = package_round
     monkeypatch.setattr(packaging.worker.subprocess, 'Popen', lambda *_a, **_k: pytest.fail('OpenAI CLI launched'))
+    monkeypatch.setattr(host, 'await_result', lambda *_: pytest.fail('Packaging used the retired wait consumer'))
     results = []
     thread = threading.Thread(target=lambda: results.append(packaging.review(path, project_root=root, timeout_seconds=60)))
     thread.start()
     request = wait_request(path, owner, kind='packaging_draft')
     assert request.exists()
+    prompt = json.loads(request.read_text())['prompt']
+    schema, _ = json.JSONDecoder().raw_decode(prompt.split('draft 必须逐字段符合此 JSON Schema：', 1)[1])
+    packet = json.loads(path.with_name('review-packet.json').read_text())
+    assert schema == packaging.draft_schema(packet)
     parent = child.with_name('parent.jsonl')
     line = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(request)}, 'dispatch-package', {})
     host.assign(request, slot=0, owner=owner, source=parent, source_line=line)

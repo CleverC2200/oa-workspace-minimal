@@ -12,7 +12,7 @@ import pytest
 from apps import json_artifact
 from apps.oa_approval import runtime_control
 from apps.oa_finance_preaudit import host_chat_review as host, codex_review_worker as worker, flow_engine, controller_handoff
-from scripts import finance_preaudit_concurrency_probe as controller, finance_preaudit_run
+from scripts import finance_preaudit_run
 
 
 @pytest.fixture
@@ -110,7 +110,7 @@ def test_cancelled_round_reuses_frozen_attempt_without_overwriting_old_request(e
         host.heartbeat(owner=new_owner, source=parent, source_line=line)
         host.approval_lifecycle.heartbeat(current['run_id'], current['controller_instance_id'], {action}, [], writer_active=False)
         results = []
-        thread = threading.Thread(target=lambda: results.append(controller._review_only(task)))
+        thread = threading.Thread(target=lambda: results.append(host.review(task)))
         thread.start()
         try:
             request = wait_request(action, new_owner)
@@ -255,7 +255,7 @@ def test_result_read_waits_for_submission_registry_commit(exchange, monkeypatch)
     def read():
         reading.set()
         try:
-            reads.append(host.await_result(request))
+            reads.append(host.poll_result(request))
         except Exception as error:
             reads.append(error)
         finally:
@@ -419,7 +419,7 @@ def test_opaque_dispatch_requires_registered_parent_and_actual_child_request_rec
     import shutil
     action, draft, owner, child, task, _, engine = exchange
     results = []
-    thread = threading.Thread(target=lambda: results.append(controller._review_only(task)))
+    thread = threading.Thread(target=lambda: results.append(host.review(task)))
     thread.start()
     request = wait_request(action, owner)
     assert request.exists()
@@ -460,7 +460,7 @@ def test_opaque_dispatch_requires_registered_parent_and_actual_child_request_rec
 def test_one_native_dispatch_cannot_be_consumed_by_two_requests(exchange, opaque):
     action, draft, owner, child, task, _, engine = exchange
     results = []
-    thread = threading.Thread(target=lambda: results.append(controller._review_only(task)))
+    thread = threading.Thread(target=lambda: results.append(host.review(task)))
     thread.start()
     request = wait_request(action, owner)
     another = Path(engine.next_action('general_expense')['action_file'])
@@ -492,7 +492,7 @@ def test_app_small_marketing_object_uses_existing_normalizer_and_keeps_raw_sourc
               'evidence_refs': [], 'missing_evidence': ['缺少审核材料']} for key in keys}}
     task = {'project_root': str(runtime_control.PROJECT_ROOT), 'action_file': str(action), 'timeout_seconds': 60}
     results = []
-    thread = threading.Thread(target=lambda: results.append(controller._review_only(task)))
+    thread = threading.Thread(target=lambda: results.append(host.review(task)))
     thread.start()
     request = wait_request(action, owner)
     parent = child.with_name('parent.jsonl')
@@ -519,7 +519,7 @@ def test_app_small_marketing_object_uses_existing_normalizer_and_keeps_raw_sourc
 def start(exchange):
     action, draft, owner, source, task, _, _ = exchange
     result = []
-    thread = threading.Thread(target=lambda: result.append(controller._review_only(task)))
+    thread = threading.Thread(target=lambda: result.append(host.review(task)))
     thread.start()
     request = wait_request(action, owner)
     assert request.exists()
@@ -531,7 +531,7 @@ def start(exchange):
     return thread, result, request
 
 
-def test_public_controller_host_exchange_never_launches_cli_and_preserves_unknown_identity(exchange, monkeypatch):
+def test_public_host_exchange_never_launches_cli_and_preserves_unknown_identity(exchange, monkeypatch):
     action, draft, owner, source, _, _, engine = exchange
     monkeypatch.setattr(worker, '_execute_codex', lambda *_: pytest.fail('CLI invoked'))
     monkeypatch.setattr(worker, '_codex_command', lambda *_a, **_k: pytest.fail('CLI command built'))
@@ -899,38 +899,27 @@ def test_public_heartbeat_command_can_discover_its_already_logged_parent_anchor(
 
 
 @pytest.mark.parametrize('exchange', [False], indirect=True)
-def test_first_review_waits_for_independent_parent_heartbeat_after_registration(exchange, request):
-    action, draft, owner, child, task, *_ = exchange
-    results = []
-    thread = threading.Thread(target=lambda: results.append(host.review(task)))
+def test_publication_requires_independent_parent_heartbeat_after_registration(exchange, request):
+    action, draft, owner, child, *_ = exchange
     parent = child.with_name('parent.jsonl')
-    thread.start()
-    try:
-        time.sleep(.05)
-        assert thread.is_alive() and not results and not action.with_name(host.REQUEST).exists()
-        same_call = native_call(parent, 'functions.exec', 'register then heartbeat ' + owner, 'combined-call', {})
-        host.register(request.node.native_reviewers, owner=owner, source=parent, **request.node.original_binding)
-        with pytest.raises(ValueError, match='host_review_stale_source'):
-            host.heartbeat(owner=owner, source=parent, source_line=same_call)
-        with pytest.raises(AssertionError, match='Current round did not publish'):
-            wait_request(action, owner, timeout=.5)
-        assert thread.is_alive() and not results
-        independent = native_call(parent, 'functions.exec', 'heartbeat ' + owner, 'independent-first-heartbeat', {})
-        host.heartbeat(owner=owner, source=parent, source_line=independent)
-        published = wait_request(action, owner)
-        dispatch = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(published)}, 'boot-dispatch', {})
-        host.assign(published, slot=0, owner=owner, source=parent, source_line=dispatch)
-        source_line = draft_source(child, published, draft, owner, call_id='boot-review')
-        host.submit(published, draft, owner=owner, source=child, source_line=source_line)
-        thread.join(3)
-        assert not thread.is_alive() and results[0]['status'] == 'reviewed'
-    finally:
-        try:
-            host.close(owner=owner, reason='cancelled')
-        finally:
-            runtime_control.request_cycle_stop()
-            thread.join(3)
-            assert not thread.is_alive()
+    assert host.round_status(owner=owner)['ready'] is False
+    with pytest.raises(ValueError, match='host_review_not_ready'):
+        host.publish(action, prompt='Read only frozen material.', timeout_seconds=60)
+    same_call = native_call(parent, 'functions.exec', 'register then heartbeat ' + owner, 'combined-call', {})
+    host.register(request.node.native_reviewers, owner=owner, source=parent, **request.node.original_binding)
+    with pytest.raises(ValueError, match='host_review_stale_source'):
+        host.heartbeat(owner=owner, source=parent, source_line=same_call)
+    assert host.round_status(owner=owner)['ready'] is False and host.pending(owner=owner) == []
+    with pytest.raises(ValueError, match='host_review_not_ready'):
+        host.publish(action, prompt='Still requires an independent heartbeat.', timeout_seconds=60)
+    independent = native_call(parent, 'functions.exec', 'heartbeat ' + owner, 'independent-first-heartbeat', {})
+    host.heartbeat(owner=owner, source=parent, source_line=independent)
+    published = host.publish(action, prompt='Read only frozen material.', timeout_seconds=60)
+    dispatch = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(published)}, 'boot-dispatch', {})
+    host.assign(published, slot=0, owner=owner, source=parent, source_line=dispatch)
+    source_line = draft_source(child, published, draft, owner, call_id='boot-review')
+    host.submit(published, draft, owner=owner, source=child, source_line=source_line)
+    assert host.poll_result(published)['status'] == 'reviewed'
 
 
 def test_parent_lease_observation_stops_admission_during_prepare_without_review_waiter(exchange, monkeypatch):
