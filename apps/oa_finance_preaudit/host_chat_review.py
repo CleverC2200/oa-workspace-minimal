@@ -87,19 +87,30 @@ def _native_lines(stream):
         yield number, b''.join(chunks) if size <= 32 * 1024 * 1024 else None
 
 
-def _native_source(source: Path, session: str, line: int = 1, *, output: bool = False) -> tuple[dict, dict]:
-    """Read native session ancestry and one immutable tool-call anchor."""
+def _native_path(source: Path) -> Path:
     source = source.absolute()
     home = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex').absolute()
-    if (not source.is_relative_to(home / 'sessions') or type(line) is not int or line < 1
+    if (not source.is_relative_to(home / 'sessions') or '..' in source.parts
             or any(path.is_symlink() for path in (source, *source.parents))):
         raise ValueError('host_review_source_untrusted')
+    if not os.path.lexists(source):
+        source = home / 'archived_sessions' / source.name
+        if any(path.is_symlink() for path in (source, *source.parents)):
+            raise ValueError('host_review_source_untrusted')
     import stat
     metadata = source.stat()
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
         raise ValueError('host_review_source_untrusted')
+    return source
+
+
+def _native_source(source: Path, session: str, line: int = 1, *, output: bool = False) -> tuple[dict, dict]:
+    """Read native session ancestry and one immutable tool-call anchor."""
+    source = source.absolute()
+    if type(line) is not int or line < 1:
+        raise ValueError('host_review_source_untrusted')
     header = anchor = result = None
-    with source.open('rb') as stream:
+    with _native_path(source).open('rb') as stream:
         for number, raw in _native_lines(stream):
             if raw is None:
                 if number in {1, line} or anchor is not None:
@@ -250,10 +261,7 @@ def _reviewers(reviewers: list[dict], owner: str, source: Path) -> list[dict]:
     for slot, entry in enumerate(reviewers):
         child = Path(entry['session_file']).absolute()
         # Read the header through the same native-source checks below.
-        home = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex').absolute()
-        if not child.is_relative_to(home / 'sessions') or any(path.is_symlink() for path in (child, *child.parents)):
-            raise ValueError('host_review_source_untrusted')
-        descriptor = os.open(child, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        descriptor = os.open(_native_path(child), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(descriptor, 'rb') as stream:
             import stat
             if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
@@ -1038,7 +1046,11 @@ def _draft_publication(input_text, output, decision_file: Path) -> dict:
         canonical = draft_command(request_file, target, payload, owner=owner)
         # Historical native sources used the exact bare command and inherited
         # their controls. New publications carry only the two fixed routes.
-        expected_command = shlex.join(shlex.split(canonical)[3:]) if len(command_tokens) == 17 else canonical
+        expected_tokens = shlex.split(canonical)
+        expected_tokens[-1] = tokens[16]
+        if len(command_tokens) == 17:
+            expected_tokens = expected_tokens[3:]
+        expected_command = shlex.join(expected_tokens)
         if target != decision_file or args['cmd'] != expected_command:
             raise ValueError('invalid_command')
         result = _shell_result(output)
