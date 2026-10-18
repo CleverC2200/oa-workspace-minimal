@@ -18,13 +18,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1]
+        shard: [0, 1, 2]
     timeout-minutes: 20
     outputs:
       attempt_0: ${{ matrix.shard == 0 && github.run_attempt || '' }}
       artifact_0: ${{ matrix.shard == 0 && steps.evidence.outputs.artifact-id || '' }}
       attempt_1: ${{ matrix.shard == 1 && github.run_attempt || '' }}
       artifact_1: ${{ matrix.shard == 1 && steps.evidence.outputs.artifact-id || '' }}
+      attempt_2: ${{ matrix.shard == 2 && github.run_attempt || '' }}
+      artifact_2: ${{ matrix.shard == 2 && steps.evidence.outputs.artifact-id || '' }}
     steps:
       - name: Record CI step start
         run: echo "OA_CI_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
@@ -146,7 +148,7 @@ jobs:
       - run: python -m pip install pytest==9.1.1
       - uses: actions/download-artifact@v4
         with:
-          artifact-ids: ${{ needs.quality.outputs.artifact_0 }},${{ needs.quality.outputs.artifact_1 }},${{ needs.macos-stop-recovery.outputs.artifact }}
+          artifact-ids: ${{ needs.quality.outputs.artifact_0 }},${{ needs.quality.outputs.artifact_1 }},${{ needs.quality.outputs.artifact_2 }},${{ needs.macos-stop-recovery.outputs.artifact }}
           path: ${{ runner.temp }}/evidence
       - name: Verify complete coverage and total CI budget
         if: always()

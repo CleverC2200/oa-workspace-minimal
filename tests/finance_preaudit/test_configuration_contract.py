@@ -77,7 +77,10 @@ class TestConfigurationContract:
             encoding="utf-8"
         )
         jobs = yaml.safe_load(workflow)['jobs']
-        assert jobs['quality']['strategy']['matrix']['shard'] == [0, 1]
+        assert jobs['quality']['strategy']['matrix']['shard'] == [0, 1, 2]
+        assert set(jobs['quality']['outputs']) == {
+            f'{field}_{shard}' for field in ('attempt', 'artifact') for shard in (0, 1, 2)
+        }
         assert jobs['quality']['strategy']['fail-fast'] is False
         assert set(jobs['quality-complete']['needs']) == {'quality', 'macos-stop-recovery'}
         commands = [shlex.split(step['run']) for step in jobs['quality']['steps']
@@ -86,7 +89,11 @@ class TestConfigurationContract:
         assert '--collect-only' in collection
         assert any(arg.startswith('--ci-expected-file=') for arg in execution)
         assert '--dist' in execution and execution[execution.index('--dist') + 1] == 'worksteal'
-        assert int(execution[execution.index('-n') + 1]) >= 2
+        assert int(execution[execution.index('-n') + 1]) == 4
+        download = next(step for step in jobs['quality-complete']['steps']
+                        if step.get('uses') == 'actions/download-artifact@v4')
+        assert all(f'needs.quality.outputs.artifact_{shard}' in download['with']['artifact-ids']
+                   for shard in (0, 1, 2))
         for command in commands:
             assert not any(arg.startswith('tests/') or arg in {'-k', '-m', '--ignore', '--lf', '--ff'}
                            for arg in command[3:])
