@@ -5,9 +5,10 @@ import json
 import secrets
 from typing import Callable
 
+from apps.attempt_action import REVIEW_BINDING
+
 
 SCHEMA_VERSION = 1
-REVIEW_BINDING = "review_decision_binding"
 
 AuthorizationSource = Callable[[dict], dict]
 AuthorizationVerifier = Callable[[dict, dict], bool]

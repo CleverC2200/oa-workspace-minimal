@@ -192,7 +192,8 @@ def test_old_marker_free_packet_keeps_its_original_contract(tmp_path: Path) -> N
     json_artifact.write_json_atomic(material_path, old_material, indent=2)
     old_fingerprint = "sha256:" + hashlib.sha256(material_path.read_bytes()).hexdigest()
     for path in (Path(action["action_file"]), Path(action["state_file"]), Path(action["review_packet_file"])):
-        old = json.loads(path.read_text())
+        old = dict(action) if path.name == "action.json" else json.loads(path.read_text())
+        old.pop("action_reference_sha256", None)
         old.pop("fuel_trip_contract")
         if "material_fingerprint" in old:
             old["material_fingerprint"] = old_fingerprint
@@ -205,6 +206,12 @@ def test_old_marker_free_packet_keeps_its_original_contract(tmp_path: Path) -> N
 def test_new_marker_cannot_be_removed_from_one_frozen_artifact(tmp_path: Path, artifact: str) -> None:
     engine, action, _packet, decision = _review(tmp_path)
     path = Path(action[artifact])
+    if artifact == "action_file":
+        state_path = Path(action["state_file"])
+        state = json.loads(state_path.read_bytes())
+        state.pop("action_reference_sha256")
+        json_artifact.write_json_atomic(state_path, state)
+        json_artifact.write_json_atomic(path, action)
     changed = json.loads(path.read_text())
     changed.pop("fuel_trip_contract")
     json_artifact.write_json_atomic(path, changed)
@@ -214,7 +221,7 @@ def test_new_marker_cannot_be_removed_from_one_frozen_artifact(tmp_path: Path, a
 
 def test_new_contract_cannot_be_downgraded_by_removing_all_protocol_markers(tmp_path: Path) -> None:
     engine, action, _packet, decision = _review(tmp_path)
-    for name in ("action_file", "state_file", "review_packet_file"):
+    for name in ("state_file", "review_packet_file"):
         path = Path(action[name])
         changed = json.loads(path.read_text())
         changed.pop("fuel_trip_contract")

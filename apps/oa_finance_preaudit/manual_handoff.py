@@ -80,7 +80,10 @@ def build(action_file: Path, failure_code: str) -> dict:
     if failure_code not in REASONS:
         raise ValueError("manual_handoff_invalid")
     root = action_file.parent
-    action = attempt_state.read_action(action_file)
+    try:
+        action = attempt_state.read_action(action_file)
+    except (OSError, ValueError) as error:
+        raise ValueError("manual_handoff_invalid") from error
     state = _read(root / "state.json")
     if not action.get("action_token") or state.get("action_token") != action.get("action_token"):
         raise ValueError("manual_handoff_invalid")

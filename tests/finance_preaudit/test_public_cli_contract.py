@@ -462,24 +462,11 @@ def test_recovery_requires_explicit_confirmation_and_uses_engine_gate(
                 "workflow_key": "travel_expense",
             }
 
-    action = tmp_path / "action.json"
-    action.write_text(
-        json.dumps(
-            {
-                "workflow_key": "travel_expense",
-                "action": "needs_admin",
-                "execution_state": "needs_admin",
-                "write_state": "unknown",
-                "reason": "writer_result_unknown",
-                "request_id": "recorded-request",
-            }
-        ),
-        encoding="utf-8",
-    )
-    action.with_name("state.json").write_text(
-        action.read_text(encoding="utf-8"),
-        encoding="utf-8",
-    )
+    from tests.finance_preaudit.test_flow_engine_replay import _engine, _mark_unknown
+
+    frozen = _engine(tmp_path / "flows").next_action("travel_expense")
+    _mark_unknown(frozen)
+    action = Path(frozen["action_file"])
     denied = io.StringIO()
     with redirect_stdout(denied):
         assert cli.main(

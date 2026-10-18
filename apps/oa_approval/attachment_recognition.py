@@ -153,8 +153,8 @@ def _image_block(raw: bytes) -> dict:
 
 
 def _frozen(action: Path) -> tuple[dict, dict]:
-    from apps.oa_finance_preaudit import attempt_state
-    action_data = attempt_state.read_action(action)
+    from apps import attempt_action
+    action_data = attempt_action.read_action(action)
     packet_path = action.with_name('review-packet.json')
     material_path = action.with_name('material.json')
     packet_raw, material_raw = _read(packet_path), _read(material_path)

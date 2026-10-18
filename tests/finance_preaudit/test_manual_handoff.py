@@ -12,7 +12,8 @@ from apps.oa_finance_preaudit import decision_validation, manual_handoff, review
 
 def test_handoff_requires_bound_failure_and_contains_no_business_items(tmp_path: Path) -> None:
     code = "codex_process_timeout"
-    action = {"workflow_key": "small_marketing_fee", "action_token": "test-token"}
+    action = {"schema_version": 1, "kind": "preaudit_action",
+              "workflow_key": "small_marketing_fee", "action_token": "test-token"}
     path = tmp_path / "action.json"
     json_artifact.write_json_atomic(path, action)
     json_artifact.write_json_atomic(tmp_path / "state.json", action)
@@ -37,7 +38,8 @@ def test_handoff_requires_bound_failure_and_contains_no_business_items(tmp_path:
 
 
 def test_invalid_decision_cannot_build_manual_handoff(tmp_path: Path) -> None:
-    action = {"workflow_key": "small_marketing_fee", "action_token": "test-token"}
+    action = {"schema_version": 1, "kind": "preaudit_action",
+              "workflow_key": "small_marketing_fee", "action_token": "test-token"}
     path = tmp_path / "action.json"
     json_artifact.write_json_atomic(path, action)
     json_artifact.write_json_atomic(tmp_path / "state.json", action)
@@ -53,6 +55,19 @@ def test_invalid_decision_cannot_build_manual_handoff(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="manual_handoff_invalid"):
         manual_handoff.build(path, "codex_decision_invalid")
+
+
+@pytest.mark.parametrize("damage", ["missing", "mismatched_state"])
+def test_unreadable_action_keeps_public_handoff_rejection(tmp_path, damage):
+    path = tmp_path / "action.json"
+    if damage == "mismatched_state":
+        action = {"schema_version": 1, "kind": "preaudit_action",
+                  "workflow_key": "small_marketing_fee", "action_token": "test-token"}
+        json_artifact.write_json_atomic(path, action)
+        json_artifact.write_json_atomic(path.with_name("state.json"), {
+            **action, "workflow_key": "travel_expense"})
+    with pytest.raises(ValueError, match="^manual_handoff_invalid$"):
+        manual_handoff.build(path, "codex_process_timeout")
 
 
 @pytest.mark.parametrize("code", ["host_critical", "oa_session_expired", "writer_result_unknown", "codex_process_failed"])
