@@ -144,6 +144,10 @@ def draft_source(source, request_file, target, owner, *, call_id='actual-host-ca
 
 
 def test_host_entertainment_rule_and_preview_keep_payment_distinct_from_attribution(exchange, tmp_path):
+    import re
+    import shlex
+
+    from apps.oa_finance_preaudit import read_material
     from tests.finance_preaudit.test_flow_engine_entertainment import _material, _decision
 
     _, draft, owner, child, task, manifest, _ = exchange
@@ -189,6 +193,10 @@ def test_host_entertainment_rule_and_preview_keep_payment_distinct_from_attribut
         prompt = json.loads(request.read_text())['prompt']
         assert 'references/flows/business-entertainment.md' in prompt
         assert '## 支付事实与费用归属' in rule.read_text()
+        command = re.search(r'`(python3 -m apps.oa_finance_preaudit.read_material [^`]+)`', prompt)
+        assert command
+        view = read_material.read(Path(shlex.split(command.group(1))[-1]))
+        assert '付款65元成功' in view and '付款40元成功' in view
         parent = child.with_name('parent.jsonl')
         dispatch = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(request)}, 'attribution-dispatch', {})
         host.assign(request, slot=0, owner=owner, source=parent, source_line=dispatch)
