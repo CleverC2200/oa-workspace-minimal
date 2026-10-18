@@ -1056,6 +1056,7 @@ def _execute_codex(
         process_diagnostics.record(
             action_file, execution=execution,
             elapsed_seconds=time.monotonic() - started, stderr=stderr,
+            action_token_sha256=stderr.get("action_token_sha256"),
         )
     except (OSError, ValueError, TypeError):
         return CodexExecution(
@@ -1144,6 +1145,9 @@ def _execute_codex_raw(
             process_state="not_started", decision_state="not_attempted",
         )
     retained_context = review_context.capture(action_file, schema)
+    token = schema.get("properties", {}).get("action_token", {}).get("const")
+    if not read_only and isinstance(token, str) and token:
+        stderr_summary["action_token_sha256"] = hashlib.sha256(token.encode()).hexdigest()
     output = ((audit_directory / "events.jsonl").open("x+", encoding="utf-8")
               if audit_directory else tempfile.TemporaryFile(mode="w+", encoding="utf-8"))
     workspace = nullcontext(str(audit_directory)) if audit_directory else tempfile.TemporaryDirectory(prefix="oa-preaudit-codex-")
@@ -1561,6 +1565,7 @@ def _execute_codex_raw(
         output_error = (None if event_status == "recorded" and event_counts.get("turn.completed") == 1
                         and _event_terminal_count(event_counts) == 1 else "codex_process_incomplete")
         if process.returncode == 0 and not live_failure and not interrupted and output_error is None:
+            raw_bytes = None
             try:
                 raw_bytes = decision_file.read_bytes()
                 parsed = review_output.consume(raw_bytes, parser=decision_parser)
@@ -1571,14 +1576,27 @@ def _execute_codex_raw(
             except ValueError:
                 candidate = None
                 decision_state = "unreadable"
-            if isinstance(candidate, dict):
-                decision = candidate if read_only else _normalize_decision(action_file, candidate)
-                decision_state = "valid_object"
+            if retained_context is not None and review_context.capture(action_file, schema) != retained_context:
+                decision_state = "binding_invalid"
+            elif isinstance(candidate, dict):
+                try:
+                    from .review_decision import bind_frozen_fields
+                    bound = candidate if read_only else bind_frozen_fields(action_file, candidate)
+                    from jsonschema import Draft202012Validator
+                    if Draft202012Validator(schema).is_valid(bound):
+                        decision = bound if read_only else _normalize_decision(action_file, bound)
+                        decision_state = "valid_object"
+                    else:
+                        decision_state = "contract_invalid"
+                except (OSError, ValueError, TypeError):
+                    decision_state = "binding_invalid"
             elif candidate is not None:
                 decision_state = "not_object"
-            if decision_state in {"unreadable", "not_object"}:
+            if decision_state == "binding_invalid":
+                output_error = "codex_decision_binding_invalid"
+            if raw_bytes is not None and decision_state in {"unreadable", "not_object", "contract_invalid", "binding_invalid"}:
                 if audit_directory and read_only:
-                    output_error = "codex_decision_invalid"
+                    output_error = output_error or "codex_decision_invalid"
                     output.close()
                     return CodexExecution(output_error, usage, process_state="exited",
                                           decision_state=decision_state, event_counts=event_counts,
@@ -1597,10 +1615,14 @@ def _execute_codex_raw(
                     decision_validation.record_rejection(
                         action_file,
                         {"raw_output_sha256": raw_hash},
-                        decision_validation.InvalidDecision("decision_json" if decision_state == "unreadable" else "decision_object"),
+                        decision_validation.InvalidDecision({
+                            "unreadable": "decision_json", "not_object": "decision_object",
+                            "contract_invalid": "decision_contract", "binding_invalid": "decision_binding",
+                        }[decision_state]),
+                        action_token_sha256=stderr_summary.get("action_token_sha256"),
                         **({"context_fingerprint": context_hash} if context_hash else {}),
                     )
-                    output_error = "codex_decision_invalid"
+                    output_error = "codex_decision_binding_invalid" if decision_state == "binding_invalid" else "codex_decision_invalid"
                 except (OSError, RuntimeError, ValueError, TypeError):
                     output_error = "codex_decision_diagnostic_failed"
         if decision is None and output_error is None:
