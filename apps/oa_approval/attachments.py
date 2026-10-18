@@ -453,25 +453,43 @@ def _cached_attachment_entry(
     request_id: str,
     flow_key: str,
     legacy_resources: Dict[str, Any],
+    migrate_legacy: bool = True,
 ) -> Dict[str, Any] | None:
     key = resource_key(resource)
     cached_entry = attachment_cache.latest_attachment_file(request_id, flow_key, key)
-    if cached_entry:
-        return cached_entry
     legacy_entry = (
         legacy_resources.get(key)
         if isinstance(legacy_resources.get(key), dict)
         else None
     )
+    if resource.get('_invoice_original'):
+        entry = cached_entry or legacy_entry
+        if (entry and entry.get('invoice_original_source') == resource['_invoice_original']
+                and entry.get('content_sha256')
+                and entry['content_sha256'] == _attachment_content_sha256(
+                    _resolve_stored_path(dest_dir, entry.get('path')))):
+            return entry
+        return None
+    if cached_entry:
+        return cached_entry
     if legacy_entry:
-        attachment_cache.record_attachment_file(
-            request_id=request_id,
-            flow_key=flow_key,
-            resource_key=key,
-            entry_json=legacy_entry,
-        )
+        if migrate_legacy:
+            attachment_cache.record_attachment_file(
+                request_id=request_id,
+                flow_key=flow_key,
+                resource_key=key,
+                entry_json=legacy_entry,
+            )
         return legacy_entry
     return None
+
+
+def _attachment_content_sha256(path: Path) -> str:
+    try:
+        with path.open('rb') as source:
+            return hashlib.file_digest(source, 'sha256').hexdigest()
+    except OSError:
+        return ''
 
 
 def _record_attachment_entry(
@@ -482,11 +500,17 @@ def _record_attachment_entry(
     request_id: str,
     flow_key: str,
 ) -> None:
+    entry = _item_to_manifest_entry(dest_dir, item)
+    if resource.get('_invoice_original'):
+        digest = _attachment_content_sha256(Path(item['path']))
+        if not digest:
+            return
+        entry.update(invoice_original_source=dict(resource['_invoice_original']), content_sha256=digest)
     attachment_cache.record_attachment_file(
         request_id=request_id,
         flow_key=flow_key,
         resource_key=resource_key(resource),
-        entry_json=_item_to_manifest_entry(dest_dir, item),
+        entry_json=entry,
     )
 
 
@@ -994,7 +1018,8 @@ class _DocumentContextRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def _initialize_workflow_document_context(
-    resource: Dict[str, Any], url: str, *, timeout_sec: int, initialize: bool = True
+    resource: Dict[str, Any], url: str, *, timeout_sec: int, initialize: bool = True,
+    original_batch=None,
 ) -> bool:
     from apps.oa_approval import official_sql
 
@@ -1031,7 +1056,7 @@ def _initialize_workflow_document_context(
         if not doc_id:
             from apps.oa_approval.invoice_originals import source_for_download
 
-            original = source_for_download(request_id, file_id)
+            original = source_for_download(request_id, file_id, batch=original_batch)
             if original_hint and original_hint != original:
                 return False
             doc_id = original.get("document_id", "")
@@ -1063,7 +1088,7 @@ def _initialize_workflow_document_context(
 
 
 def _download_resource_direct_uncoordinated(
-    resource: Dict[str, Any], *, dest_dir: Path, timeout_sec: int
+    resource: Dict[str, Any], *, dest_dir: Path, timeout_sec: int, original_batch=None,
 ) -> Tuple[Path | None, str]:
     url, error = _normalized_download_url(resource)
     if error:
@@ -1085,7 +1110,8 @@ def _download_resource_direct_uncoordinated(
     )
     if direct_path is None and download_error_code(direct_err) == ATTACHMENT_ACCESS_DENIED_CODE:
         try:
-            initialized = _initialize_workflow_document_context(resource, url, timeout_sec=timeout_sec)
+            initialized = _initialize_workflow_document_context(
+                resource, url, timeout_sec=timeout_sec, original_batch=original_batch)
         except rpa_session.RpaSessionError as error:
             return None, f"{error.code}: {resource_name(resource)}: {error}"
         if initialized:
@@ -1098,7 +1124,8 @@ def _download_resource_direct_uncoordinated(
                     and download_error_code(retry_error) == ATTACHMENT_ACCESS_DENIED_CODE):
                 from apps.oa_approval import invoice_originals
 
-                cloud_path, cloud_error = invoice_originals.download_original(resource, dest_dir=dest_dir, timeout_sec=timeout_sec)
+                cloud_path, cloud_error = invoice_originals.download_original(
+                    resource, dest_dir=dest_dir, timeout_sec=timeout_sec, batch=original_batch)
                 return cloud_path, f"{cloud_error}: 关联发票原件读取失败" if cloud_error else ""
             return retry_path, retry_error or (direct_err if retry_path is None else "")
     if direct_path is not None or direct_err:
@@ -1107,7 +1134,7 @@ def _download_resource_direct_uncoordinated(
 
 
 def _download_resource_direct(
-    resource: Dict[str, Any], *, dest_dir: Path, timeout_sec: int
+    resource: Dict[str, Any], *, dest_dir: Path, timeout_sec: int, original_batch=None,
 ) -> Tuple[Path | None, str]:
     name = resource_name(resource) or "attachment.bin"
     try:
@@ -1120,6 +1147,7 @@ def _download_resource_direct(
                 resource,
                 dest_dir=dest_dir,
                 timeout_sec=timeout_sec,
+                original_batch=original_batch,
             )
     except resource_slots.ResourceSlotTimeout:
         return None, (
@@ -1574,6 +1602,16 @@ def download_resources(
 
     outcomes: List[Dict[str, Any]] = [{} for _item in targets]
     pending: List[tuple[int, Dict[str, Any]]] = []
+    original_batch = None
+    if any(resource.get('_invoice_original') for resource in targets):
+        from apps.oa_approval.invoice_originals import DownloadBatch
+
+        try:
+            original_batch = DownloadBatch(str(request_id).strip())
+        except rpa_session.RpaSessionError as error:
+            return [], [{'code': error.code, 'message': '发票原件会话核验失败'}]
+        except Exception:
+            return [], [{'code': 'resource_ownership_untrusted', 'message': '发票原件归属核验失败'}]
     for index, resource in enumerate(targets):
         if resource.get("_invoice_original"):
             checked = dict(resource)
@@ -1582,6 +1620,7 @@ def download_resources(
                 url, error = _normalized_download_url(checked)
                 valid = not error and _initialize_workflow_document_context(
                     checked, url, timeout_sec=timeout_sec, initialize=False,
+                    original_batch=original_batch,
                 )
             except rpa_session.RpaSessionError as error:
                 return [], [{"code": error.code, "message": "发票原件会话核验失败"}]
@@ -1593,6 +1632,7 @@ def download_resources(
             request_id=cache_request_id,
             flow_key=cache_flow_key,
             legacy_resources=legacy_resources,
+            migrate_legacy=original_batch is None,
         ) if reuse_cache else None
         if cached_entry:
             cached_item = _manifest_entry_to_item(dest_dir, resource, cached_entry)
@@ -1615,6 +1655,7 @@ def download_resources(
                         resource,
                         dest_dir=dest_dir,
                         timeout_sec=timeout_sec,
+                        original_batch=original_batch,
                     ),
                 )
                 for index, resource in pending
@@ -1629,6 +1670,7 @@ def download_resources(
                     )
                 outcomes[index] = {"path": path, "error": err}
 
+    cache_entries = []
     for index, resource in enumerate(targets):
         outcome = outcomes[index]
         cached_item = outcome.get("item")
@@ -1682,12 +1724,24 @@ def download_resources(
                 continue
         if item is not None:
             downloaded.append(item)
-            _record_attachment_entry(
-                dest_dir,
-                resource,
-                item,
-                request_id=cache_request_id,
-                flow_key=cache_flow_key,
-            )
+            cache_entries.append((resource, item))
+    if original_batch is not None:
+        if runtime_control.stop_requested():
+            return [], [runtime_control.stop_error('已请求停止财务预审，停止本单附件下载')]
+        try:
+            valid = original_batch.recheck()
+        except rpa_session.RpaSessionError as error:
+            return [], [{'code': error.code, 'message': '发票原件会话核验失败'}]
+        except Exception:
+            valid = False
+        if runtime_control.stop_requested():
+            return [], [runtime_control.stop_error('已请求停止财务预审，停止本单附件下载')]
+        if not valid:
+            return [], [{'code': 'resource_ownership_untrusted', 'message': '发票原件批量下载归属已变化'}]
+    for resource, item in cache_entries:
+        _record_attachment_entry(
+            dest_dir, resource, item,
+            request_id=cache_request_id, flow_key=cache_flow_key,
+        )
     _remove_legacy_manifest(dest_dir)
     return downloaded, errors

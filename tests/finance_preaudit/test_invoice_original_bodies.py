@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+from copy import deepcopy
 import json
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
@@ -63,7 +64,7 @@ def original_transport(monkeypatch, tmp_path):
             body = {'actionMsg': {'code': '0'}, 'data': state.detail}
         elif path == '/invoiceApi/file/download':
             assert urlsplit(request.full_url).hostname == 'api.mypiaojia.com'
-            assert params == {'id': ['8001'], 'fid': ['9001'], 'dataId': ['101'],
+            assert params == {'id': [state.detail['modify_info']['pdf']], 'fid': ['9001'], 'dataId': ['101'],
                               'token': ['synthetic-token']}
             assert request.get_header('Cookie') is None
             if state.cloud_failure == 'http':
@@ -414,3 +415,190 @@ def test_material_diagnostic_counts_verified_body_and_rejects_unbound_claim(orig
     result = review_diagnostics.inspect_material(source)
     assert result['invoice_evidence']['body_unknown_entries'] == 1
     assert result['invoice_evidence']['body_read_entries'] == 0
+
+
+@pytest.fixture
+def many_originals(original_transport, monkeypatch):
+    state = original_transport
+    state.details = {}
+    state.detail_reads = []
+    state.cloud_reads = []
+    state.after_body = None
+    rows = []
+    for index in range(27):
+        data_id = str(1000 + index)
+        number = str(1000 + index).zfill(20)
+        detail = deepcopy(state.detail)
+        detail.update(id=str(9000 + index), fid=str(9000 + index), number=number)
+        detail['flist'][0]['id'] = str(8000 + index)
+        detail['modify_info'] = {'pdf': str(8000 + index), 'furl': str(8000 + index)}
+        detail['oa'] = {'doc_id': str(3000 + index), 'img_id': str(2000 + index)}
+        state.details[data_id] = detail
+        rows.append({'workflowRequestTableFields': [{
+            'fieldName': 'glfp', 'fieldShowName': '关联发票',
+            'fieldValue': data_id, 'fieldShowValue': number,
+        }]})
+    state.workflow['workflowDetailTableInfos'][0]['workflowRequestTableRecords'] = rows
+    original_get = state.client.get
+    state.client.get = lambda path, params=None: (
+        {'status': '1', 'targetIds': state.details[params['ids']]['id']}
+        if path == invoice_buyers.MAPPING_PATH else original_get(path, params)
+    )
+    original_open = attachments.safe_http.urlopen
+
+    class Response(BytesIO):
+        def __init__(self, body, url):
+            super().__init__(body)
+            self.url = url
+            self.headers = {'Content-Length': str(len(body))}
+
+        def geturl(self):
+            return self.url
+
+    def open_request(request, **kwargs):
+        path = urlsplit(request.full_url).path
+        params = parse_qs(urlsplit(request.full_url).query)
+        if request.full_url == invoice_buyers.DETAIL_URL:
+            data_id = json.loads(request.data)['dataId']
+            state.detail_reads.append(data_id)
+            body = json.dumps({'actionMsg': {'code': '0'}, 'data': state.details[data_id]}).encode()
+        elif path == '/invoiceApi/file/download':
+            state.cloud_reads.append(params['dataId'][0])
+            if state.after_body:
+                state.after_body()
+            body = state.pdf
+        elif path == '/api/doc/detail/basicInfo':
+            index = int(params['docid'][0]) - 3000
+            body = json.dumps({'status': 1, 'mainimagefile': str(2000 + index)}).encode()
+        elif path == '/weaver/weaver.file.FileDownload':
+            return Response(b'<html>permission denied</html>', 'https://oa.example.test/notice/noright.jsp')
+        else:
+            return original_open(request, **kwargs)
+        return Response(body, request.full_url)
+
+    monkeypatch.setattr(attachments.safe_http, 'urlopen', open_request)
+    monkeypatch.setattr(attachments.urllib.request, 'build_opener', lambda *_a: SimpleNamespace(open=open_request))
+    return state
+
+
+def test_many_originals_keep_full_body_coverage_with_bounded_context_reads(many_originals, tmp_path):
+    material = collect_original(many_originals, tmp_path)
+    assert len(material['resources']) == len(material['prepared']['images']) == 27
+    assert all(entry['body_read_status'] == 'content_read'
+               for entry in material['invoice_evidence']['invoices'])
+    assert len(many_originals.cloud_reads) == 27
+    assert len(many_originals.detail_reads) <= 27 * 3
+
+
+def test_many_originals_reject_binding_change_before_preparing_any_body(many_originals, tmp_path):
+    many_originals.after_body = lambda: many_originals.details['1000']['oa'].update(doc_id='999')
+    with pytest.raises(RuntimeError, match='^resource_ownership_untrusted$'):
+        collect_original(many_originals, tmp_path)
+    assert not list((tmp_path / 'prepared').rglob('*.png'))
+    many_originals.after_body = None
+    many_originals.details['1000']['oa']['doc_id'] = '3000'
+    material = collect_original(many_originals, tmp_path)
+    assert len(material['prepared']['images']) == 27
+    assert len(many_originals.cloud_reads) == 54
+
+
+def test_original_batch_stop_keeps_downloaded_files_unprepared(many_originals, monkeypatch, tmp_path):
+    stopped = []
+    monkeypatch.setattr(attachments.runtime_control, 'stop_requested', lambda: bool(stopped))
+    many_originals.after_body = lambda: stopped.append(True)
+    with pytest.raises(RuntimeError, match='^oa_run_stopped$'):
+        collect_original(many_originals, tmp_path)
+    assert not list((tmp_path / 'prepared').rglob('*.png'))
+
+
+@pytest.mark.parametrize('change', ['binding', 'body'])
+def test_original_cache_reuse_requires_current_binding_and_bytes(original_transport, tmp_path, change):
+    state = original_transport
+    state.still_denied = True
+    state.cloud_pdf = state.pdf
+    material = collect_original(state, tmp_path)
+    if change == 'binding':
+        state.detail['flist'][0]['id'] = '8002'
+        state.detail['modify_info'] = {'pdf': '8002', 'furl': '8002'}
+        with fitz.open(stream=state.pdf, filetype='pdf') as document:
+            document.new_page().insert_text((40, 40), 'Replacement original')
+            state.cloud_pdf = document.tobytes()
+    else:
+        from pathlib import Path
+        Path(material['resources'][0]['local_readonly_path']).write_bytes(b'%PDF changed')
+    material = collect_original(state, tmp_path)
+    assert sum(r[0] == '/invoiceApi/file/download' for r in state.requests) == 2
+    assert len(material['prepared']['images']) == (2 if change == 'binding' else 1)
+    assert material['invoice_evidence']['invoices'][0]['body_read_status'] == 'content_read'
+
+
+@pytest.mark.parametrize('failure_point', [2, 3])
+def test_original_context_transport_failure_preserves_download_error_contract(
+    original_transport, tmp_path, failure_point,
+):
+    state = original_transport
+    context = state.client.request_context
+    calls = []
+
+    def failing_context(request_id):
+        calls.append(request_id)
+        if len(calls) == failure_point:
+            raise RuntimeError('synthetic_transport_failed')
+        return context(request_id)
+
+    state.client.request_context = failing_context
+    with pytest.raises(RuntimeError, match='^resource_ownership_untrusted$'):
+        collect_original(state, tmp_path)
+    assert not list((tmp_path / 'prepared').rglob('*.png'))
+
+
+def test_original_stop_during_final_context_read_prevents_preparation(original_transport, tmp_path, monkeypatch):
+    state = original_transport
+    context = state.client.request_context
+    calls = []
+    stopped = []
+    monkeypatch.setattr(attachments.runtime_control, 'stop_requested', lambda: bool(stopped))
+
+    def stopping_context(request_id):
+        calls.append(request_id)
+        if len(calls) == 3:
+            stopped.append(True)
+        return context(request_id)
+
+    state.client.request_context = stopping_context
+    with pytest.raises(RuntimeError, match='^oa_run_stopped$'):
+        collect_original(state, tmp_path)
+    assert not list((tmp_path / 'prepared').rglob('*.png'))
+
+
+def test_original_cache_reuses_unchanged_bound_body(original_transport, tmp_path):
+    state = original_transport
+    state.still_denied = True
+    state.cloud_pdf = state.pdf
+    collect_original(state, tmp_path)
+    material = collect_original(state, tmp_path)
+    assert sum(r[0] == '/invoiceApi/file/download' for r in state.requests) == 1
+    assert material['invoice_evidence']['invoices'][0]['body_read_status'] == 'content_read'
+
+
+def test_original_legacy_cache_waits_for_final_binding_check(original_transport, tmp_path, monkeypatch):
+    state = original_transport
+    collect_original(state, tmp_path)
+    entry = attachments.attachment_cache.latest_attachment_file('101', CONFIG['flow_key'], '202')
+    writes = []
+    monkeypatch.setattr(attachments, '_load_manifest', lambda _root: {'resources': {'202': entry}})
+    monkeypatch.setattr(attachments.attachment_cache, 'latest_attachment_file', lambda *_a: None)
+    monkeypatch.setattr(attachments.attachment_cache, 'record_attachment_file', lambda **kwargs: writes.append(kwargs))
+    context = state.client.request_context
+    calls = []
+
+    def changing_context(request_id):
+        calls.append(request_id)
+        if len(calls) == 3:
+            state.detail['oa']['doc_id'] = '404'
+        return context(request_id)
+
+    state.client.request_context = changing_context
+    with pytest.raises(RuntimeError, match='^resource_ownership_untrusted$'):
+        collect_original(state, tmp_path)
+    assert not writes
