@@ -332,15 +332,19 @@ def event_error_signals(stream: TextIO) -> list[str]:
     return sorted(flags)
 
 
-def record(action_file: Path, *, execution, elapsed_seconds: float, stderr: dict) -> None:
+def record(action_file: Path, *, execution, elapsed_seconds: float, stderr: dict, action_token_sha256: str | None = None) -> None:
     path = Path(action_file)
     state_path = path.with_name("state.json")
     if path.is_symlink() or state_path.is_symlink():
         raise ValueError("process_diagnostic_invalid")
-    action = json.loads(path.read_text())
-    state = json.loads(state_path.read_text())
-    token = action.get("action_token") if isinstance(action, dict) else None
-    if not isinstance(token, str) or not token or not isinstance(state, dict) or state.get("action_token") != token:
+    if action_token_sha256 is None:
+        action = json.loads(path.read_text())
+        state = json.loads(state_path.read_text())
+        token = action.get("action_token") if isinstance(action, dict) else None
+        if not isinstance(token, str) or not token or not isinstance(state, dict) or state.get("action_token") != token:
+            raise ValueError("process_diagnostic_invalid")
+        action_token_sha256 = hashlib.sha256(token.encode()).hexdigest()
+    elif not isinstance(action_token_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", action_token_sha256):
         raise ValueError("process_diagnostic_invalid")
     events = {key: value for key, value in execution.event_counts.items()
               if key in {"thread.started", "turn.started", "item.started", "item.completed", "turn.completed", "error", "other"}
@@ -350,7 +354,7 @@ def record(action_file: Path, *, execution, elapsed_seconds: float, stderr: dict
         stage = "no_event"
     payload = {
         "schema_version": 1, "kind": "preaudit_process_diagnostic",
-        "action_token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+        "action_token_sha256": action_token_sha256,
         "last_observed_stage": stage, "event_counts": events,
         "elapsed_seconds": max(0, int(elapsed_seconds)),
         "process_state": execution.process_state if execution.process_state in {"exited", "timed_out", "start_failed"} else "unknown",

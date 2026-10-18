@@ -14,7 +14,7 @@ from apps.oa_approval import runtime_control
 from apps.oa_finance_preaudit import codex_review_worker as worker
 from apps.oa_finance_preaudit import approval_guard as guard
 from scripts import finance_preaudit_run, finance_preaudit_concurrency_probe as probe
-from tests.finance_preaudit.test_codex_review_worker import _task, _small_marketing_v2_task
+from tests.finance_preaudit.test_codex_review_worker import _task, _small_marketing_v2_task, _small_marketing_v2_decision
 from tests.finance_preaudit.test_concurrency_probe import _open_action
 from tests.finance_preaudit.test_execution_readback import recorded_execution
 from tests.finance_preaudit.review_profiles import retained_deepseek_cli  # noqa: F401
@@ -116,7 +116,7 @@ def test_item_technical_failure_allows_next_native_review(tmp_path, monkeypatch,
             }[mode]
             return [sys.executable, '-c', 'import sys,json,time; sys.stdin.read(); ' + script]
         return [sys.executable, '-c', 'import sys,json; from pathlib import Path; sys.stdin.read(); '
-                f'Path({str(decision)!r}).write_text(json.dumps({{"overall":"pass"}})); '
+                f'Path({str(decision)!r}).write_text({json.dumps(_small_marketing_v2_decision())!r}); '
                 'print(json.dumps({"type":"turn.completed"}),flush=True)']
 
     monkeypatch.setattr(worker, '_codex_command', command)
@@ -574,7 +574,7 @@ def test_normal_progress_is_not_mistaken_for_model_failure(tmp_path, monkeypatch
                 'print(json.dumps({"type":"turn.started"}), flush=True); '
                 'print(json.dumps({"type":"item.completed","item":{"type":"command_execution",'
                 '"aggregated_output":"usage limit exceeded model unavailable"}}), flush=True); time.sleep(.2); '
-                f'Path({str(decision)!r}).write_text(json.dumps({{"overall":"pass"}})); '
+                f'Path({str(decision)!r}).write_text({json.dumps(_small_marketing_v2_decision())!r}); '
                 'print(json.dumps({"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}), flush=True)']
 
     monkeypatch.setattr(worker, '_codex_command', command)
@@ -600,7 +600,7 @@ def test_explicit_reconnect_warning_can_finish_same_review(tmp_path, monkeypatch
             f'sys.stderr.write({text[40:]!r}); sys.stderr.flush(); ')
         return [sys.executable, '-c',
                 'import sys,json,time; from pathlib import Path; sys.stdin.read(); ' + emit +
-                f'Path({str(decision)!r}).write_text(json.dumps({{"overall":"pass"}})); '
+                f'Path({str(decision)!r}).write_text({json.dumps(_small_marketing_v2_decision())!r}); '
                 'print(json.dumps({"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}), flush=True)']
 
     monkeypatch.setattr(worker, '_codex_command', command)
@@ -639,7 +639,7 @@ def test_native_transport_fallback_can_finish_same_review(tmp_path, monkeypatch,
             emit = f'print({warning!r}, file=sys.{stream}, flush=True); '
         return [sys.executable, '-c',
                 'import sys,json,time; from pathlib import Path; sys.stdin.read(); ' + emit +
-                f'Path({str(decision)!r}).write_text(json.dumps({{"overall":"pass"}})); '
+                f'Path({str(decision)!r}).write_text({json.dumps(_small_marketing_v2_decision())!r}); '
                 'print(json.dumps({"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}), flush=True)']
 
     monkeypatch.setattr(worker, '_codex_command', command)
@@ -1117,7 +1117,7 @@ def test_original_notice_readback_preserves_earlier_launches(tmp_path, monkeypat
         return [sys.executable, '-c',
                 'import sys,json; from pathlib import Path; sys.stdin.read(); '
                 'print(json.dumps({"type":"error","message":"Reconnecting stream disconnected"}), flush=True); '
-                f'Path({str(decision)!r}).write_text(json.dumps({{"overall":"pass"}})); '
+                f'Path({str(decision)!r}).write_text({json.dumps(_small_marketing_v2_decision())!r}); '
                 'print(\'{"type":"turn.completed"}\', flush=True)']
 
     monkeypatch.setattr(worker, '_codex_command', command)

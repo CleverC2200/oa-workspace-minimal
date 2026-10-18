@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 
 from apps import json_artifact
 
@@ -12,7 +13,7 @@ CODES = frozenset({
     "decision_contract", "item_count", "item_fields", "item_values",
     "decision_fields", "decision_schema_version", "decision_kind",
     "decision_action_token", "decision_workflow", "decision_rule_version",
-    "decision_overall", "decision_items_type", "decision_json", "decision_object",
+    "decision_overall", "decision_items_type", "decision_json", "decision_object", "decision_binding",
     "required_uncertain", "payment_company_conclusion", "payment_attachment_terms",
     "budget_conclusion", "deferred_payment_conclusion",
     "overall_mismatch", "fuel_trip_observation", "company_comparison_binding", "company_comparison_observations",
@@ -30,17 +31,22 @@ class InvalidDecision(ValueError):
         self.validation_code = validation_code if validation_code in CODES else "unspecified"
 
 
-def record_rejection(action_file: Path, decision: dict, error: ValueError, *, context_fingerprint: str | None = None) -> None:
+def record_rejection(action_file: Path, decision: dict, error: ValueError, *, context_fingerprint: str | None = None,
+                     action_token_sha256: str | None = None) -> None:
     action_path = Path(action_file)
     state_path = action_path.with_name("state.json")
     if action_path.is_symlink() or state_path.is_symlink():
         raise ValueError("decision_diagnostic_invalid")
-    action = json.loads(action_path.read_text(encoding="utf-8"))
-    state = json.loads(state_path.read_text(encoding="utf-8"))
-    if not isinstance(action, dict) or not isinstance(state, dict):
-        raise ValueError("decision_diagnostic_invalid")
-    token = action.get("action_token")
-    if not isinstance(token, str) or not token or state.get("action_token") != token:
+    if action_token_sha256 is None:
+        action = json.loads(action_path.read_text(encoding="utf-8"))
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if not isinstance(action, dict) or not isinstance(state, dict):
+            raise ValueError("decision_diagnostic_invalid")
+        token = action.get("action_token")
+        if not isinstance(token, str) or not token or state.get("action_token") != token:
+            raise ValueError("decision_diagnostic_invalid")
+        action_token_sha256 = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    elif not isinstance(action_token_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", action_token_sha256):
         raise ValueError("decision_diagnostic_invalid")
     decision_hash = hashlib.sha256(json.dumps(
         decision, sort_keys=True, ensure_ascii=True, separators=(",", ":"),
@@ -49,7 +55,7 @@ def record_rejection(action_file: Path, decision: dict, error: ValueError, *, co
     payload = {
         "schema_version": 1,
         "kind": "preaudit_decision_rejection",
-        "action_token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+        "action_token_sha256": action_token_sha256,
         "decision_sha256": decision_hash,
         "validation_code": code if isinstance(code, str) and code in CODES else "unspecified",
     }

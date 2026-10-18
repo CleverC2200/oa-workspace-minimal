@@ -165,6 +165,8 @@ def test_review_launch_requires_shared_payment_rule(tmp_path, monkeypatch, flow_
 
     from apps.oa_finance_preaudit import codex_review_worker
     from apps.oa_finance_preaudit import FlowEngine
+    from tests.finance_preaudit.test_codex_review_worker import _small_marketing_v2_decision
+    from tests.finance_preaudit.test_flow_engine_material_gaps import _uncertain_decision
 
     project = tmp_path / "project"
     engine = FlowEngine(
@@ -183,6 +185,10 @@ def test_review_launch_requires_shared_payment_rule(tmp_path, monkeypatch, flow_
     )
     action = engine.next_action(flow_key)
     action_file = Path(action["action_file"])
+    packet = json.loads(Path(action["review_packet_file"]).read_text())
+    decision = _uncertain_decision(action, packet)
+    if packet["rule_version"] == "small_marketing_fee:2":
+        decision["items"] = _small_marketing_v2_decision()["items"]
     task = {"project_root": str(project), "action_file": str(action_file), "timeout_seconds": 60}
     prompts = []
 
@@ -197,7 +203,7 @@ def test_review_launch_requires_shared_payment_rule(tmp_path, monkeypatch, flow_
 
         def communicate(self, *, input, timeout):
             prompts.append(input)
-            self.decision_file.write_text('{}')
+            self.decision_file.write_text(json.dumps(decision))
             self.output.write('{"type":"turn.completed"}\n')
             self.output.flush()
 

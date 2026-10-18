@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import io
+import hashlib
 from pathlib import Path
 import signal
 import subprocess
@@ -32,6 +33,14 @@ _SMALL_MARKETING_V2_ITEM_KEYS = [
     "reimbursable_minimum",
     "payment_company_consistency",
 ]
+
+
+def _small_marketing_v2_decision():
+    return {"overall": "needs_human", "items": {
+        key: {"status": "uncertain", "conclusion": "支付截图和发票待核实。",
+              "evidence_refs": [], "missing_evidence": ["待核实当前材料"]}
+        for key in reversed(_SMALL_MARKETING_V2_ITEM_KEYS)
+    }}
 
 
 def _task(
@@ -234,6 +243,128 @@ def _mock_final_output(monkeypatch, raw):
     monkeypatch.setattr(codex_review_worker.subprocess, "Popen", popen)
     monkeypatch.setattr(codex_review_worker.runtime_control, "stop_requested", lambda: False)
     return prompts
+
+
+def _real_final_output(monkeypatch, raw, *, mutation="", usage=None):
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
+    payload = raw if isinstance(raw, bytes) else raw.encode()
+    event = {"type": "turn.completed"}
+    if usage is not None:
+        event["usage"] = usage
+    script = (
+        "import json,sys; from pathlib import Path; "
+        f"Path(sys.argv[1]).write_bytes({payload!r}); "
+        + mutation
+        + f"print({json.dumps(event)!r}, flush=True)"
+    )
+    monkeypatch.setattr(
+        codex_review_worker, "_codex_command",
+        lambda project, schema, decision, visual_aux=None: [sys.executable, "-c", script, str(decision), str(schema)],
+    )
+
+
+@pytest.mark.parametrize("case", ["tool_arguments", "missing_overall", "missing_items", "status", "item_type", "binding_conflict"])
+def test_cli_consumer_rejects_invalid_final_contract_from_real_child(tmp_path, monkeypatch, case):
+    from tests.finance_preaudit.test_review_diagnostics import frozen_attempt
+    from tests.finance_preaudit.test_flow_engine_submission import _needs_human_decision
+
+    action_file = frozen_attempt(tmp_path)
+    decision = _needs_human_decision(json.loads(action_file.read_text()))
+    if case == "tool_arguments":
+        decision = {"command": "read material"}
+    elif case == "missing_overall":
+        decision.pop("overall")
+    elif case == "missing_items":
+        decision.pop("items")
+    elif case == "status":
+        decision["items"][0]["status"] = "approved"
+    elif case == "item_type":
+        decision["items"][0] = "not an item"
+    else:
+        decision["action_token"] = "conflicting-token"
+    raw = (json.dumps(decision) + "\r\n").encode()
+    _real_final_output(monkeypatch, raw)
+    task = {"project_root": str(tmp_path / "project"), "action_file": str(action_file), "timeout_seconds": 60}
+
+    result = codex_review_worker.review(task)
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "codex_decision_invalid"
+    assert result["token_usage"] == {"status": "unknown"}
+    assert "decision" not in result
+    retained = action_file.with_name(f"review-output-{hashlib.sha256(raw).hexdigest()}.txt")
+    assert retained.read_bytes() == raw
+    assert retained.stat().st_mode & 0o777 == 0o600
+    rejection = json.loads(next(action_file.parent.glob("review-rejection-*.json")).read_text())
+    assert rejection["validation_code"] == "decision_contract"
+    process = json.loads(next(action_file.parent.glob("review-process-*.json")).read_text())
+    assert process["process_state"] == "exited" and process["exit_code"] == 0
+    assert not action_file.with_name("execution-receipt.json").exists()
+
+
+@pytest.mark.parametrize("wrapper", ["{}", "```json\n{}\n```"])
+def test_cli_consumer_assembles_protocol_and_closes_needs_human_preview(tmp_path, monkeypatch, wrapper):
+    from tests.finance_preaudit.test_review_diagnostics import frozen_attempt
+    from tests.finance_preaudit.test_flow_engine_submission import _needs_human_decision
+
+    action_file = frozen_attempt(tmp_path)
+    expected = _needs_human_decision(json.loads(action_file.read_text()))
+    business = {key: expected[key] for key in ("overall", "items")}
+    _real_final_output(monkeypatch, wrapper.format(json.dumps(business)))
+    task = {"project_root": str(tmp_path / "project"), "action_file": str(action_file), "timeout_seconds": 60}
+
+    result = codex_review_worker.review(task)
+
+    assert result["status"] == "reviewed" and result["decision"] == expected
+    decision_file = tmp_path / "consumer-decision.json"
+    json_artifact.write_json_atomic(decision_file, result["decision"])
+    engine = flow_engine.FlowEngine(root=action_file.parents[4],
+                                   discover_candidates=lambda _: pytest.fail("preview must use frozen inputs"),
+                                   collect_material=lambda *_: pytest.fail("preview must use frozen inputs"))
+    closed = engine.complete_review(action_file, decision_file)
+    assert closed["action"] == "closed" and closed["business_state"] == "needs_human"
+    assert closed["write_state"] == "not_requested"
+    assert not list(action_file.parent.glob("review-rejection-*.json"))
+
+
+@pytest.mark.parametrize("change", ["material", "new_identity", "corrupt_state"])
+def test_cli_consumer_retains_original_binding_when_inputs_change(tmp_path, monkeypatch, change):
+    from tests.finance_preaudit.test_review_diagnostics import frozen_attempt
+    from tests.finance_preaudit.test_flow_engine_submission import _needs_human_decision
+
+    action_file = frozen_attempt(tmp_path)
+    original = json.loads(action_file.read_text())
+    raw = json.dumps(_needs_human_decision(original)).encode()
+    if change == "material":
+        mutation = f"p=Path({str(action_file.with_name('material.json'))!r}); p.write_bytes(p.read_bytes()+b' '); "
+    elif change == "corrupt_state":
+        mutation = f"Path({str(action_file.with_name('state.json'))!r}).write_text('broken'); "
+    else:
+        mutation = "\n".join(
+            f"p=Path({str(path)!r}); value=json.loads(p.read_text()); value['action_token']='different-token'; p.write_text(json.dumps(value))"
+            for path in (action_file, action_file.with_name("state.json"))
+        ) + "\n"
+    _real_final_output(monkeypatch, raw, mutation=mutation,
+                       usage={"input_tokens": 12, "cached_input_tokens": 2, "output_tokens": 4})
+    task = {"project_root": str(tmp_path / "project"), "action_file": str(action_file), "timeout_seconds": 60}
+
+    result = codex_review_worker.review(task)
+
+    assert result["error_code"] == "codex_decision_binding_invalid"
+    assert result["status"] == "failed" and "decision" not in result
+    assert result["token_usage"]["input_tokens"] == 12
+    expected_binding = hashlib.sha256(original["action_token"].encode()).hexdigest()
+    process = json.loads(next(action_file.parent.glob("review-process-*.json")).read_text())
+    assert process["process_state"] == "exited" and process["exit_code"] == 0
+    assert process["action_token_sha256"] == expected_binding
+    rejection = json.loads(next(action_file.parent.glob("review-rejection-*.json")).read_text())
+    assert rejection["action_token_sha256"] == expected_binding
+    assert rejection["validation_code"] == "decision_binding"
+    retained = action_file.with_name(f"review-output-{hashlib.sha256(raw).hexdigest()}.txt")
+    assert retained.read_bytes() == raw and retained.stat().st_mode & 0o777 == 0o600
+    context = json.loads(next(action_file.parent.glob("review-context-*.json")).read_text())
+    assert context["schema"]["properties"]["action_token"]["const"] == original["action_token"]
+    assert not action_file.with_name("execution-receipt.json").exists()
 
 
 @pytest.mark.parametrize("wrapper", ["{}", "```json\n{}\n```", " \n```json\r\n{}\r\n```\n"])
@@ -1410,69 +1541,22 @@ def test_codex_command_pins_deepseek_high_and_json_output(tmp_path: Path) -> Non
     assert 'approval_policy="never"' in command
 
 
-def test_execute_codex_normalizes_small_marketing_transport_schema(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
-    task, action_file = _small_marketing_v2_task(
-        tmp_path,
-        budget_account="市场活动费",
-    )
-    item_keys = _SMALL_MARKETING_V2_ITEM_KEYS
+def test_cli_consumer_normalizes_small_marketing_transport_schema(tmp_path, monkeypatch):
+    task, action_file = _small_marketing_v2_task(tmp_path, budget_account="市场活动费")
+    _real_final_output(monkeypatch, json.dumps(_small_marketing_v2_decision()))
 
-    class Process:
-        pid = 12345
-        returncode = 0
-        stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+    result = codex_review_worker.review(task)
 
-        def __init__(self, command: list[str]) -> None:
-            self.decision_file = Path(
-                command[command.index("--output-last-message") + 1]
-            )
-
-        def communicate(self, *, input: str, timeout: int) -> None:
-            del input, timeout
-            json_artifact.write_json_atomic(
-                self.decision_file,
-                {
-                    "schema_version": 1,
-                    "kind": "preaudit_review_decision",
-                    "action_token": "test-action-token",
-                    "workflow_key": "small_marketing_fee",
-                    "rule_version": "small_marketing_fee:2",
-                    "overall": "needs_human",
-                    "items": {
-                        item_key: {
-                            "status": "uncertain",
-                            "conclusion": item_key,
-                            "evidence_refs": [],
-                            "missing_evidence": ["待确认"],
-                        }
-                        for item_key in reversed(item_keys)
-                    },
-                },
-            )
-
-        def poll(self) -> int:
-            return self.returncode
-
-    def popen(command, **kwargs):
-        kwargs["stdout"].write('{"type":"turn.completed"}\n')
-        kwargs["stdout"].flush()
-        return Process(command)
-
-    monkeypatch.setattr(codex_review_worker.subprocess, "Popen", popen)
-
-    result = codex_review_worker._execute_codex(
-        Path(task["project_root"]),
-        action_file,
-        60,
-    )
-
-    assert result.error_code is None
-    assert result.decision is not None
-    assert [item["item_key"] for item in result.decision["items"]] == item_keys
+    assert result["status"] == "reviewed"
+    assert [item["item_key"] for item in result["decision"]["items"]] == _SMALL_MARKETING_V2_ITEM_KEYS
+    assert result["decision"]["action_token"] == json.loads(action_file.read_text())["action_token"]
+    decision_file = tmp_path / "consumer-decision.json"
+    json_artifact.write_json_atomic(decision_file, result["decision"])
+    engine = flow_engine.FlowEngine(root=action_file.parents[4],
+                                   discover_candidates=lambda _: pytest.fail("preview must use frozen inputs"),
+                                   collect_material=lambda *_: pytest.fail("preview must use frozen inputs"))
+    closed = engine.complete_review(action_file, decision_file)
+    assert closed["business_state"] == "needs_human" and closed["write_state"] == "not_requested"
 
 
 def test_prompt_exposes_flow_engine_fallback_routing_for_legacy_packet(
