@@ -10,6 +10,8 @@ import pytest
 
 from apps.oa_approval import attachment_extractors as extractor
 from apps.oa_approval import attachment_recognition as recognition
+from apps.oa_finance_preaudit import case_bundle
+from tests.finance_preaudit.test_collect_case_contract import FLOW_CONFIGS, RecordedOaApi
 
 
 @pytest.fixture
@@ -18,12 +20,14 @@ def recorded_video(tmp_path, monkeypatch):
     source.write_bytes(b'recorded-video-source')
     frames = [bytes([value, 0, 0]) * 6 for value in (20, 40, 60)]
     settings = {'audio': True, 'nonzero_audio': False, 'missing_frame': False,
-                'duration': '1.0', 'source_changed': False}
+                'duration': '1.0', 'source_changed': False, 'dimensions_changed': False}
     monkeypatch.setattr(extractor.shutil, 'which', lambda name: '/recorded/' + name)
     def run(command, **kwargs):
         if command[0].endswith('ffprobe'):
             if '-show_frames' in command:
-                result = {'frames': [{'best_effort_timestamp_time': str(i / 3)} for i in range(3)]}
+                result = {'frames': [{'best_effort_timestamp_time': str(i / 3), 'height': 2,
+                                      'width': 4 if settings['dimensions_changed'] and i == 2 else 3}
+                                     for i in range(3)]}
             else:
                 result = {'format': {'duration': settings['duration']}, 'streams': [
                     {'codec_type': 'video', 'width': 3, 'height': 2},
@@ -69,7 +73,8 @@ def test_public_preparation_keeps_every_silent_video_frame_and_original_pixels(r
     assert contents[0]['frame_count'] == 3
 
 
-@pytest.mark.parametrize('damage', ['nonzero_audio', 'missing_frame', 'duration', 'source_changed'])
+@pytest.mark.parametrize('damage', ['nonzero_audio', 'missing_frame', 'duration', 'source_changed',
+                                   'dimensions_changed'])
 def test_public_video_preparation_rejects_unread_audio_or_incomplete_source(recorded_video, tmp_path, damage):
     source, _, settings = recorded_video
     settings[damage] = '31.0' if damage == 'duration' else True
@@ -84,7 +89,27 @@ def test_public_video_preparation_rejects_missing_decoder(recorded_video, tmp_pa
         extractor.prepare_materials([{'path': source, 'resource_id': 'video-1'}], out_dir=tmp_path / 'prepared')
 
 
-def test_public_reader_preserves_video_frame_coverage(recorded_video, tmp_path, monkeypatch):
+def test_public_collection_keeps_complete_video_material(recorded_video, tmp_path, monkeypatch):
+    source, _, _ = recorded_video
+    monkeypatch.setattr(case_bundle, '_travel_resources', lambda *_a, **_k: ([], []))
+    monkeypatch.setattr(case_bundle.evidence_packet, 'logical_attachment_resources',
+                        lambda *_: [{'id': 'video-1', 'name': source.name}])
+    monkeypatch.setattr(case_bundle.attachments, 'download_resources', lambda *_a, **_k: (
+        [{'path': str(source), 'resource_id': 'video-1', 'name': source.name}], []))
+    monkeypatch.setattr(case_bundle.invoice_buyers, 'read_invoice_buyers', lambda *_a, **_k: {
+        'read_status': 'not_applicable', 'invoices': []})
+    material = case_bundle.collect_case('recorded-request',
+        oa_api=RecordedOaApi('195021', '通用费用报销申请流程'), configs=FLOW_CONFIGS,
+        allow_browser_download=False, attachment_root=tmp_path / 'attachments',
+        prepared_root=tmp_path / 'prepared')
+    assert material['prepared']['manifest'][0]['status'] == 'video_rendered'
+    assert [f['frame_index'] for p in material['prepared']['images']
+            for f in p['video_frames']] == [0, 1, 2]
+    assert material['prepared']['structured_contents'][0]['audio_state'] == 'digital_silence'
+
+
+@pytest.mark.parametrize('frozen', [False, True])
+def test_public_reader_preserves_video_frame_coverage(recorded_video, tmp_path, monkeypatch, frozen):
     source, _, _ = recorded_video
     monkeypatch.setenv('OA_REVIEW_API_KEY', 'offline-secret')
     calls = []
@@ -92,8 +117,26 @@ def test_public_reader_preserves_video_frame_coverage(recorded_video, tmp_path, 
         calls.append(body)
         return {'choices': [{'finish_reason': 'stop', 'message': {'content': 'Frame transcription'}}]}
     monkeypatch.setattr(recognition, '_post', post)
-    result = recognition.recognize(files=[source], prompt='Read every frame in temporal order',
-                                   output_dir=tmp_path / 'recognition')
+    if frozen:
+        images, manifest, contents = extractor.prepare_materials(
+            [{'path': source, 'resource_id': 'file-1'}], out_dir=tmp_path / 'prepared')
+        material = {'workflow_key': 'general_expense', 'prepared': {
+            'images': [{**page, 'path': str(page['path'])} for page in images],
+            'manifest': manifest, 'structured_contents': contents}}
+        material_file = tmp_path / 'material.json'
+        material_file.write_text(json.dumps(material))
+        packet = tmp_path / 'review-packet.json'
+        packet.write_text(json.dumps({'workflow_key': 'general_expense',
+            'material_file': str(material_file),
+            'material_fingerprint': 'sha256:' + hashlib.sha256(material_file.read_bytes()).hexdigest()}))
+        action = tmp_path / 'action.json'
+        action.write_text(json.dumps({'workflow_key': 'general_expense', 'review_packet_file': str(packet)}))
+        result = recognition.recognize(action_file=action, prompt='Read every frame in temporal order',
+            output_dir=tmp_path.parent / (tmp_path.name + '-recognition'))
+        assert result['frozen_binding']['material_sha256'] == hashlib.sha256(material_file.read_bytes()).hexdigest()
+    else:
+        result = recognition.recognize(files=[source], prompt='Read every frame in temporal order',
+                                       output_dir=tmp_path / 'recognition')
     assert result['status'] == 'complete'
     assert len(calls) == len(result['parts']) == 3
     assert [f['frame_index'] for p in result['parts'] if p['kind'] == 'image'

@@ -61,10 +61,13 @@ def _render(
         raise ValueError('rotation_unsupported')
     timeline = json.loads(_run([
         probe, *probe_input, '-select_streams', 'v:0', '-read_intervals', '%+#901',
-        '-show_frames', '-show_entries', 'frame=best_effort_timestamp_time',
+        '-show_frames', '-show_entries', 'frame=best_effort_timestamp_time,width,height',
         '-of', 'json', str(path),
     ]))
     timestamps = [float(frame['best_effort_timestamp_time']) for frame in timeline['frames']]
+    if any((int(frame['width']), int(frame['height'])) != (width, height)
+           for frame in timeline['frames']):
+        raise ValueError('frame_dimensions_changed')
     count = len(timestamps)
     if (not 0 < count <= 900 or width * height * count > 350_000_000
             or any(not math.isfinite(t) or not 0 <= t <= duration + .1 for t in timestamps)
@@ -82,7 +85,7 @@ def _render(
     with TemporaryDirectory(prefix='video-', dir=out_dir) as temporary:
         raw = Path(temporary) / 'frames.rgb'
         _run([*decode_input, '-map', '0:v:0', '-an', '-pix_fmt', 'rgb24',
-              '-fps_mode', 'passthrough', '-frames:v', '901', '-fs',
+              '-noautoscale', '-fps_mode', 'passthrough', '-frames:v', '901', '-fs',
               str(frame_size * count + 1), '-f', 'rawvideo', str(raw)])
         if raw.stat().st_size != frame_size * count:
             raise ValueError('decoded_frame_count_mismatch')
