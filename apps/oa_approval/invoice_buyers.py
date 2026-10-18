@@ -213,6 +213,13 @@ def _invoice_evidence(ref: dict, detail: dict) -> dict:
         if isinstance(size, int) and not isinstance(size, bool) and size >= 0:
             record["size_bytes"] = size
         files.append(record)
+    from apps.oa_approval.invoice_originals import original_source
+
+    original = original_source(data, ref["invoice_no"])
+    if original:
+        for record in files:
+            if record["file_id"] == original["cloud_file_id"]:
+                record["original_source"] = original
     return {
         **ref, "read_status": "content_read", "fields": fields, "files": files,
         "file_records_status": "present" if files else "not_provided",

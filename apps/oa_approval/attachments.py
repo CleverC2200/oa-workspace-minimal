@@ -317,6 +317,9 @@ def detect_oa_download_fail_code(value: Any) -> str:
 
 def download_error_code(message: str) -> str:
     text = str(message or "").strip()
+    for code in ("resource_ownership_untrusted", "attachment_content_incomplete"):
+        if text.startswith(f"{code}:"):
+            return code
     if text.startswith(f"{ATTACHMENT_ACCESS_DENIED_CODE}:"):
         return ATTACHMENT_ACCESS_DENIED_CODE
     for code in rpa_session.FATAL_SESSION_CODES:
@@ -991,7 +994,7 @@ class _DocumentContextRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def _initialize_workflow_document_context(
-    resource: Dict[str, Any], url: str, *, timeout_sec: int
+    resource: Dict[str, Any], url: str, *, timeout_sec: int, initialize: bool = True
 ) -> bool:
     from apps.oa_approval import official_sql
 
@@ -1023,9 +1026,17 @@ def _initialize_workflow_document_context(
         return payload if isinstance(payload, dict) else {}
 
     try:
-        doc_id = official_sql.workflow_attachment_document(request_id, file_id)
+        original_hint = resource.get("_invoice_original")
+        doc_id = "" if original_hint else official_sql.workflow_attachment_document(request_id, file_id)
         if not doc_id:
-            return False
+            from apps.oa_approval.invoice_originals import source_for_download
+
+            original = source_for_download(request_id, file_id)
+            if original_hint and original_hint != original:
+                return False
+            doc_id = original.get("document_id", "")
+            if not doc_id:
+                return False
         account = read("/api/hrm/login/getAccountList")
         actual_user = str((account.get("data") or {}).get("userid") or "")
         expected_user = auth.env("OA_UID")
@@ -1036,6 +1047,8 @@ def _initialize_workflow_document_context(
         preview = read("/api/doc/detail/basicInfo", {"docid": doc_id})
         if str(preview.get("status")) != "1" or str(preview.get("mainimagefile")) != file_id:
             return False
+        if not initialize:
+            return True
         if runtime_control.stop_requested():
             raise rpa_session.RpaSessionError(runtime_control.STOP_CODE, "已请求停止")
         info = read(
@@ -1081,6 +1094,12 @@ def _download_resource_direct_uncoordinated(
             retry_path, retry_error = _direct_session_cookie_download(
                 resource, url, dest_dir=dest_dir, timeout_sec=timeout_sec
             )
+            if (retry_path is None and resource.get('_invoice_original')
+                    and download_error_code(retry_error) == ATTACHMENT_ACCESS_DENIED_CODE):
+                from apps.oa_approval import invoice_originals
+
+                cloud_path, cloud_error = invoice_originals.download_original(resource, dest_dir=dest_dir, timeout_sec=timeout_sec)
+                return cloud_path, f"{cloud_error}: 关联发票原件读取失败" if cloud_error else ""
             return retry_path, retry_error or (direct_err if retry_path is None else "")
     if direct_path is not None or direct_err:
         return direct_path, direct_err
@@ -1556,6 +1575,18 @@ def download_resources(
     outcomes: List[Dict[str, Any]] = [{} for _item in targets]
     pending: List[tuple[int, Dict[str, Any]]] = []
     for index, resource in enumerate(targets):
+        if resource.get("_invoice_original"):
+            checked = dict(resource)
+            checked["_ephemeral_cookie_header"] = _rpa_cookie_header(urllib.parse.urlsplit(OA_HOST).hostname or "")
+            try:
+                url, error = _normalized_download_url(checked)
+                valid = not error and _initialize_workflow_document_context(
+                    checked, url, timeout_sec=timeout_sec, initialize=False,
+                )
+            except rpa_session.RpaSessionError as error:
+                return [], [{"code": error.code, "message": "发票原件会话核验失败"}]
+            if not valid:
+                return [], [{"code": "resource_ownership_untrusted", "message": "发票原件归属核验失败"}]
         cached_entry = _cached_attachment_entry(
             dest_dir,
             resource,

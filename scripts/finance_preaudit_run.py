@@ -700,6 +700,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 original=maintenance_runtime.OriginalExecution(args.original_receipt_file,
                     str(args.original_owner_task_id), args.original_tool_session_id))
         with scope:
+            if configuration.get("transport") == "host_chat":
+                host_chat_review.assert_previous_rounds_closed(owner=str(args.owner_task_id))
             gate = approval_lifecycle.startup(PROJECT_ROOT)
             if gate["status"] != "ready":
                 print(json.dumps({"schema_version": 1, "kind": "approval_startup_gate", **gate}, sort_keys=True))
