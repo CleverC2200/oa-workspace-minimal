@@ -10,10 +10,13 @@
 | 数据库地址、服务名、账号 | `.env` | 已忽略 |
 | 数据库密码 | `.env`，或由 `OA_DB_KEYCHAIN_SERVICE` 指向 macOS Keychain | 已忽略或不在项目目录 |
 | 已获授权的生产流程清单 | `runtime/control/write-policy.json` | 已忽略 |
+| DeepSeek 图片识别 API 密钥 `OA_REVIEW_API_KEY` | 进程环境或现有 OA 私有配置 | 不提交 |
 | 下载附件、冻结材料、队列状态、SQLite 状态和脱敏指标 | `runtime/` | 已忽略 |
 | 临时分析和发布审计材料 | `.scratch/` | 已忽略 |
 
-`.env.example` 只列出当前代码实际读取的变量名、空值和无效示例域名，不得填入可用凭据后提交。附件观察与模型路由由 Skill 和 Agent 运行时负责，项目代码不接收或保存模型服务密钥。
+`.env.example` 只列出当前代码实际读取的变量名、空值和无效示例域名，不得填入可用凭据后提交。附件工具从私有环境读取 `OA_REVIEW_API_KEY`，直接向固定 HTTPS DeepSeek 接口发送选定图片页、文本片段和本次问题。密钥只用于认证请求头，不写入识别报告或标准输出；业务判断仍由当前 Codex Reviewer 完成。
+
+识别报告包含转写全文、问题和来源路径，属于私有业务材料。新默认输出位于财务 flow 根的 `.attachment-recognitions/`，记录创建、完成时间和可识别的所属 attempt，沿用现有 30 天保留期。小型 `retention.json` 是清理依据，不含转写正文；元数据损坏且无法确认归属时暂停该 flow 根内 attempt 的归档和删除。活跃、写入未知、归属不明或仍需保留的原 attempt 会保留对应识别结果；新近或运行中的识别也会保护其原材料。旧 `runtime/control/attachment-recognitions/`、缺少生命周期元数据的报告和自定义输出目录保持人工管理，不能推断时间或归属后批量删除。详见[附件识别与保留](docs/agents/attachment-recognition.md)。
 
 OA 配置文件必须是权限不超过 `600` 的普通文件；符号链接、组可读或其他用户可读文件会在认证前被拒绝。稳定配置优先于工作树回退，可通过进程环境变量 `OA_AUTH_ENV_FILE` 指定其他工作树外位置。删除工作树不会删除稳定配置，但磁盘损坏或用户主目录清理仍需要独立备份策略。
 
