@@ -4120,6 +4120,110 @@ def test_dispatcher_assigns_each_open_action_once_with_rolling_capacity(
     assert len(set(assigned)) == 3
 
 
+@pytest.mark.parametrize("health", ["healthy", "critical", "sampling_failure"])
+def test_rolling_fixed_health_gate_and_heartbeat_interval(tmp_path, monkeypatch, health):
+    probe = finance_preaudit_concurrency_probe
+    clock = [0.0]
+    pending = [3]
+    submitted = []
+    shutdowns = []
+    health_times = []
+    writes = []
+    active = []
+    ticks = []
+    real_wait = probe.wait
+    flow_root = tmp_path / "runtime" / "finance_preaudit_flows"
+    _open_action(flow_root, case_key="initial", created_at="2026-08-23T16:00:00+00:00")
+
+    class RecordedExecutor:
+        _processes = {}
+
+        def __init__(self, role):
+            self.role = role
+            self.futures = []
+
+        def submit(self, function, *args):
+            future = Future()
+            self.futures.append(future)
+            submitted.append((self.role, clock[0]))
+            delay = 1 if self.role == "review" else 2
+            active.append((clock[0] + delay, future, function, args))
+            return future
+
+        def shutdown(self, *, wait, cancel_futures=False):
+            shutdowns.append((self.role, wait))
+            if cancel_futures:
+                for future in self.futures:
+                    future.cancel()
+
+    def advance(seconds):
+        ticks.append(clock[0])
+        assert len(ticks) < 100, "recorded_controller_did_not_finish"
+        clock[0] += seconds
+        for ready_at, future, function, args in active:
+            if not future.done() and clock[0] >= ready_at:
+                future.set_result(function(*args))
+
+    def wait(futures, **_options):
+        advance(.25)
+        return real_wait(futures, timeout=.001)
+
+    def prepare(_selection):
+        action = _open_action(flow_root, case_key=f"prepared-{len(submitted)}",
+                              created_at="2026-08-23T16:01:00+00:00")
+        return {"action": "review_required", "action_file": str(action)}
+
+    def complete(action, _reviewed):
+        writes.append(action)
+        pending[0] -= 1
+        return {"status": "completed", "business_state": "pass", "write_state": "submitted"}
+
+    def runtime_status():
+        health_times.append(clock[0])
+        if health == "sampling_failure":
+            if clock[0] < 1:
+                raise RuntimeError("private_sampler_detail")
+            return {"status": "healthy"}
+        return {"status": health if clock[0] >= 1 else "healthy"}
+
+    monkeypatch.setattr(probe, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time, sleep=advance))
+    monkeypatch.setattr(probe, "wait", wait)
+    monkeypatch.setattr(probe, "_preparation_executor", lambda: RecordedExecutor("prepare"))
+    def pipeline(count, capacity):
+        return probe._run_dispatched_tasks(
+            count, capacity, project_root=tmp_path, renew_actions=lambda paths: paths,
+            prepare_action=prepare, review_worker=lambda _task: {"status": "reviewed", "decision": {"overall": "pass"}},
+            complete_review=complete, executor_factory=lambda _capacity: RecordedExecutor("review"),
+            task_timeout_sec=30, prepare_timeout_sec=30, heartbeat_interval_sec=1,
+            runtime_status=runtime_status,
+        )
+    result = probe.run_rolling_drain(
+        capacity=2, max_capacity=2, pipeline_runner=pipeline,
+        live_status=lambda: {"credentials": {"status": "ok"}, "oa": {
+            "execution_identity": "verified", "by_workflow": {"travel_expense": pending[0]}}},
+        reconcile_status=lambda: _reconciliation_snapshot(pending[0]),
+    )
+    assert result["processes_reaped"] is True
+    assert result["controller_handoff"]["children_reaped"] is True
+    if health == "critical":
+        assert result["status"] == "failed"
+        assert result["stop_reason"] == "host_critical"
+        assert all(submitted_at < 1 for _role, submitted_at in submitted)
+        assert writes == []
+        assert ("review", False) in shutdowns
+    else:
+        assert result["status"] == "completed"
+        assert len(writes) == 3
+        assert result["token_usage"]["status"] == "unknown"
+        assert len(ticks) >= 8
+        assert len(health_times) >= 2
+        assert all(later - earlier >= 1 for earlier, later in zip(health_times, health_times[1:]))
+        if health == "sampling_failure":
+            assert all(submitted_at >= 1 for _role, submitted_at in submitted)
+            assert result["wave_runtime_health"][0]["status"] == "unknown"
+            assert "private_sampler_detail" not in str(result)
+
+
 def test_dispatcher_times_out_stuck_task_and_stops_new_work(
     tmp_path: Path,
     monkeypatch,

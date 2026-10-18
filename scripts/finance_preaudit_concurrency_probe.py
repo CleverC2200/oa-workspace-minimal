@@ -3047,6 +3047,9 @@ def _run_dispatched_tasks(
                         "host": host,
                     }
                 )
+                next_heartbeat = now + heartbeat_interval_sec
+                if host.get("status") == "critical" and not halted:
+                    request_pipeline_stop("host_critical")
             if (
                 halted
                 and preparation is not None
