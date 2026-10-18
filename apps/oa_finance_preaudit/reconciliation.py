@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 from apps.oa_approval import writer_outcomes
 
-from . import case_recovery, item_failure, review_failure_evidence, recovery_receipt
+from . import case_recovery, item_failure, recovery_receipt
 
 
 _WORKFLOW_KEYS = {
@@ -225,7 +225,7 @@ def _trusted_quarantine(root: Path, state: dict) -> bool:
         )
     if state.get("reason") != "codex_review_failed":
         return True
-    return review_failure_evidence.trusted_quarantine(
+    return item_failure.isolated(
         Path(root)
         / str(state["workflow_key"])
         / "cases"

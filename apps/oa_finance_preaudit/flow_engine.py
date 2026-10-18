@@ -274,6 +274,7 @@ _REVIEW_QUARANTINE_REASONS = {
     "codex_process_failed": "codex_review_failed",
     "codex_process_incomplete": "codex_review_failed",
     "codex_process_timeout": "codex_review_failed",
+    "host_review_request_expired": "codex_review_failed",
 }
 
 
@@ -527,6 +528,7 @@ def _review_failure_fingerprint(
         action_token=str(action.get("action_token") or ""),
         workflow_key=str(action.get("workflow_key") or ""),
         failure_code=failure_code,
+        action_file=action_path,
     ):
         raise ValueError("review_quarantine_invalid")
     return _file_fingerprint(receipt_path)
@@ -3945,7 +3947,7 @@ class FlowEngine:
                 )
                 or (
                     reason == "codex_review_failed"
-                    and not review_failure_evidence.trusted_quarantine(
+                    and not item_failure.isolated(
                         attempt_root, state
                     )
                 )
@@ -4207,6 +4209,8 @@ class FlowEngine:
         self,
         action_file: Path,
         failure_code: str,
+        *,
+        host_failure_reference: dict | None = None,
     ) -> dict:
         reason = _REVIEW_QUARANTINE_REASONS.get(failure_code)
         if reason is None:
@@ -4239,18 +4243,6 @@ class FlowEngine:
                 for field, value in required.items()
             ):
                 raise ValueError("review_quarantine_invalid")
-            review_failure_fingerprint: str | None = None
-            if reason == "codex_review_failed":
-                review_failure_fingerprint = _review_failure_fingerprint(
-                    action_path,
-                    action,
-                    failure_code,
-                )
-            elif os.path.lexists(action_path.with_name("review-failure.json")):
-                # 该 attempt 之前以进程级失败进入过重试，盘上回执描述的是已被取代的旧失败。
-                # 决定无效的隔离与后续恢复都要求该文件不存在：原样保留会让隔离永久失败，
-                # 而隔离失败会把整轮生产中止。这里只改名归档，不删除任何证据。
-                _supersede_stale_review_failure(action_path)
             forbidden = (
                 "writer-boundary.json",
                 "execution-receipt.json",
@@ -4264,6 +4256,20 @@ class FlowEngine:
                 for name in forbidden
             ):
                 raise ValueError("review_quarantine_invalid")
+            review_failure_fingerprint: str | None = None
+            if host_failure_reference is not None:
+                receipt = review_failure_evidence.host_receipt_payload(action_path, host_failure_reference, failure_code)
+                receipt_path = action_path.with_name("review-failure.json")
+                if receipt is None or (os.path.lexists(receipt_path)
+                        and review_failure_evidence.read_receipt(receipt_path) != receipt):
+                    raise ValueError("review_quarantine_invalid")
+                if not os.path.lexists(receipt_path):
+                    json_artifact.write_json_atomic(receipt_path, receipt, indent=2)
+                review_failure_fingerprint = _file_fingerprint(receipt_path)
+            elif reason == "codex_review_failed":
+                review_failure_fingerprint = _review_failure_fingerprint(action_path, action, failure_code)
+            elif os.path.lexists(action_path.with_name("review-failure.json")):
+                _supersede_stale_review_failure(action_path)
             return self._persist_attempt_needs_admin(
                 action_path,
                 reason,
