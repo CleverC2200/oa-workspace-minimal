@@ -16,6 +16,8 @@ from apps.oa_finance_preaudit import (
     codex_review_worker,
     flow_engine,
     review_failure_evidence,
+    read_material,
+    host_chat_review,
 )
 from apps.oa_approval import runtime_control
 
@@ -151,6 +153,56 @@ def test_non_travel_schema_and_timing_follow_bound_action(tmp_path: Path) -> Non
     assert "业务招待费生产预审" in prompt
     assert "business-entertainment.md" in prompt
     assert "page_routing" not in prompt
+
+
+@pytest.mark.parametrize("workflow_key", codex_review_worker._FINANCE_RULES)
+def test_host_request_reads_complete_material_view_for_every_finance_workflow(
+    tmp_path, monkeypatch, workflow_key,
+):
+    task, action_file = _task(tmp_path, workflow_key=workflow_key)
+    material = {
+        "workflow_key": workflow_key,
+        "declared_fields": [
+            {"path": "details[0].amount", "value": "123.45", "read_status": "present"},
+            {"path": "details[1].amount", "value": None, "read_status": "unresolved"},
+            {"path": "details[2].amount", "read_status": "empty"},
+        ],
+        "prepared": {"images": [{"path": "first.png"}, {"path": "second.png"}]},
+        "invoice_evidence": {"invoices": [{"data_id": "invoice-record", "body_read_status": "not_read"}]},
+    }
+    material_file = action_file.with_name("material.json")
+    json_artifact.write_json_atomic(material_file, material)
+    packet_file = action_file.with_name("review-packet.json")
+    json_artifact.write_json_atomic(packet_file, {
+        "workflow_key": workflow_key,
+        "rule_version": "tpm_small_marketing_fee:4" if workflow_key == "tpm_small_marketing_fee" else f"{workflow_key}:1",
+        "material_file": str(material_file),
+        "material_fingerprint": flow_engine._file_fingerprint(material_file),
+    })
+    action = json.loads(action_file.read_text())
+    json_artifact.write_json_atomic(action_file, {**action, "review_packet_file": str(packet_file)})
+    prompts = []
+
+    def publish(action, *, prompt, timeout_seconds):
+        assert action == action_file
+        assert timeout_seconds == task["timeout_seconds"]
+        prompts.append(prompt)
+        return action_file.with_name("host-review-request.json")
+
+    monkeypatch.setattr(host_chat_review, "selected", lambda: True)
+    monkeypatch.setattr(host_chat_review, "publish", publish)
+    monkeypatch.setattr(host_chat_review, "await_result", lambda _: {"status": "recorded"})
+    assert host_chat_review.review(task) == {"status": "recorded"}
+    prompt, = prompts
+    assert f"python3 -m apps.oa_finance_preaudit.read_material {action_file}" in prompt
+    assert "完整读完视图即完成材料文本读取，无需再重复展开同一 material.json" in prompt
+    assert "审核包、流程规则和必要附件内容仍须完整读取" in prompt
+    assert "DeepSeek HTTP API" in prompt
+    assert "不通过看图工具或附件上传把原文件传入本审核会话" in prompt
+    assert "完整读取 `references/payment-screenshot-exemption.md`" in prompt
+    assert "body_read_status=not_read 表示正文未读取" in prompt
+    assert "prepared.images" in prompt
+    assert read_material.read(action_file) == read_material.render(json.loads(material_file.read_text()))
 
 
 def _mock_final_output(monkeypatch, raw):
