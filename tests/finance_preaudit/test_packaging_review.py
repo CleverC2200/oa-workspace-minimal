@@ -160,9 +160,14 @@ def test_draft_shapes_reach_existing_completion_consumer(tmp_path, classificatio
 def test_packaging_receipt_records_current_deepseek_identity(tmp_path, monkeypatch):
     path = action(tmp_path)
     packet = json.loads(path.with_name('review-packet.json').read_text())
-    fake_process(monkeypatch, json.dumps(draft(packet)), native_home=tmp_path / 'native-auth')
+    sent = []
+    def inspect_start(command, _directory):
+        sent.append(json.loads(Path(command[command.index('--output-schema') + 1]).read_text()))
+    fake_process(monkeypatch, json.dumps(draft(packet)), native_home=tmp_path / 'native-auth', inspect_start=inspect_start)
     result = reviewer.review(path, project_root=tmp_path, timeout_seconds=60)
     assert result['status'] == 'draft_ready'
+    assert sent == [reviewer.draft_schema(packet)]
+    assert 'action_token' not in sent[0]['properties']
     assert result['model'] == 'deepseek-flash' and result['reasoning_effort'] == 'high'
     assert result['model_provider'] == 'oa_deepseek' and result['requested_service_tier'] == 'default'
     assert not Path(result['evidence_directory']).joinpath('auth.json').exists()
