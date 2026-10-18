@@ -1,6 +1,7 @@
 """Exercise CI completeness through actual serial collection and xdist execution."""
 import json
 import hashlib
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import subprocess
@@ -12,6 +13,24 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+CI_IDENTITY = {'GITHUB_SHA': 'a' * 40, 'GITHUB_RUN_ID': '1234', 'GITHUB_RUN_ATTEMPT': '1',
+               'OA_CI_HEAD_SHA': 'b' * 40}
+
+
+def job_timings():
+    now = time.time()
+    jobs = []
+    for name, start_age, end_age in [('quality (0)', 600, 480), ('quality (1)', 300, 170),
+                                     ('macos-stop-recovery', 400, 375), ('quality-complete', 5, None)]:
+        jobs.append({'name': name, 'head_sha': CI_IDENTITY['OA_CI_HEAD_SHA'], 'run_id': 1234, 'run_attempt': 1,
+                     'status': 'in_progress' if end_age is None else 'completed',
+                     'conclusion': None if end_age is None else 'success',
+                     'started_at': datetime.fromtimestamp(now - start_age, timezone.utc).isoformat(),
+                     'completed_at': None if end_age is None else
+                     datetime.fromtimestamp(now - end_age, timezone.utc).isoformat()})
+    return {'total_count': len(jobs), 'jobs': jobs}
+
+
 
 
 def run_pytest(tmp_path, source, *, selection=(), budget='170', shard=None):
@@ -84,18 +103,19 @@ def matrix_evidence(tmp_path_factory):
         'schema_version': 2, 'job': 'macos-stop-recovery', 'platform': 'darwin',
         'code_revision': 'a' * 40, 'run_id': '1234', 'run_attempt': 1,
         'status': 'verified', 'errors': [], 'started_at': time.time(), 'elapsed_seconds': 0}))
+    (tmp_path / 'job-timings.json').write_text(json.dumps(job_timings()))
     return tmp_path
 
 
 def merge_matrix(directory, output, budget='170', required_results=None, environment_updates=None):
     environment = dict(os.environ)
-    environment.update(GITHUB_SHA='a' * 40, GITHUB_RUN_ID='1234', GITHUB_RUN_ATTEMPT='1',
-                       OA_CI_STARTED_AT=str(time.time()))
+    environment.update(CI_IDENTITY)
     environment.update(environment_updates or {})
     environment['OA_CI_REQUIRED_RESULTS'] = json.dumps(
         required_results if required_results is not None else attempt_needs((1, 1, 1)))
     return subprocess.run([sys.executable, '-m', 'scripts.pytest_evidence',
-        '--merge-directory', str(directory), '--output', str(output), '--budget-seconds', budget],
+        '--merge-directory', str(directory), '--output', str(output), '--budget-seconds', budget,
+        '--jobs-file', str(directory / 'job-timings.json')],
         cwd=ROOT, env=environment, capture_output=True, text=True, timeout=30)
 
 
@@ -129,7 +149,7 @@ def test_matrix_ci_rejects_incomplete_reports(matrix_evidence, tmp_path, defect)
     elif defect == 'macos_clock':
         path = directory / 'offline-test-evidence-macos-attempt-1/macos.json'
         macos = json.loads(path.read_text())
-        macos['started_at'] = 0
+        macos['started_at'] = float('nan')
         path.write_text(json.dumps(macos))
     elif defect == 'extra_shard':
         (directory / 'offline-test-evidence-2-attempt-1').mkdir()
@@ -197,9 +217,13 @@ def attempt_needs(attempts):
 
 
 def merge_attempt(directory, output, attempt, attempts, *, required=None):
+    timings = job_timings()
+    for job in timings['jobs']:
+        job['run_attempt'] = attempt
+    (directory / 'job-timings.json').write_text(json.dumps(timings))
     return merge_matrix(directory, output, required_results=required or attempt_needs(attempts),
         environment_updates={'GITHUB_SHA': 'a' * 40, 'GITHUB_RUN_ID': '1234',
-            'GITHUB_RUN_ATTEMPT': str(attempt), 'OA_CI_STARTED_AT': str(time.time() - 1)})
+            'GITHUB_RUN_ATTEMPT': str(attempt)})
 
 
 def test_partial_rerun_replaces_legacy_failed_artifact_instead_of_reusing_it(tmp_path):
@@ -220,7 +244,6 @@ def test_partial_rerun_replaces_legacy_failed_artifact_instead_of_reusing_it(tmp
 
 @pytest.mark.parametrize('attempt,selected', [(1, (1, 1, 1)), (2, (2, 2, 2)), (2, (2, 1, 1)), (2, (1, 1, 1))])
 def test_matrix_uses_job_attempts_for_first_full_partial_and_aggregate_reruns(tmp_path, attempt, selected):
-    # A prior failure plus an arbitrarily old clock must not contaminate a repaired shard.
     attempt_artifacts(tmp_path, 1, started_at=time.time() - (600 if attempt > 1 else 2),
                       failed_shard=0 if 2 in selected else None)
     if 2 in selected:
@@ -237,7 +260,11 @@ def test_matrix_uses_job_attempts_for_first_full_partial_and_aggregate_reruns(tm
     assert report['counts'] == {'passed': 8, 'skipped': 1}
     assert report['run_attempt'] == attempt
     assert report['evidence_attempts'] == dict(zip(('quality-0', 'quality-1', 'macos-stop-recovery'), selected))
-    assert 0 <= report['elapsed_seconds'] < 15
+    assert 0 <= report['elapsed_seconds'] < 170
+    assert report['timing_scope'] == 'active_critical_path'
+    durations = dict(zip(('0', '1', 'macos'), (120, 130, 25)))
+    current = [durations[role] for role, actual in zip(('0', '1', 'macos'), selected) if actual == attempt]
+    assert report['upstream_seconds'] == max(current, default=0)
 
 
 @pytest.mark.parametrize('defect', ['new_failure', 'missing_new', 'sha', 'run', 'attempt', 'shard',
@@ -306,7 +333,107 @@ def test_rerun_keeps_original_job_budgets_and_current_attempt_budget(tmp_path):
     result = merge_attempt(tmp_path, tmp_path / 'invalid-job.json', 2, (1, 1, 1))
     assert result.returncode != 0
     execution.write_text(json.dumps(original))
+    timing = job_timings()
+    timing['jobs'][-1]['started_at'] = datetime.fromtimestamp(time.time() - 171, timezone.utc).isoformat()
+    timing['jobs'][1]['completed_at'] = datetime.fromtimestamp(time.time() - 200, timezone.utc).isoformat()
+    for job in timing['jobs']:
+        job['run_attempt'] = 2
+    (tmp_path / 'job-timings.json').write_text(json.dumps(timing))
     result = merge_matrix(tmp_path, tmp_path / 'invalid-attempt.json', required_results=attempt_needs((1, 1, 1)),
-        environment_updates={'GITHUB_RUN_ATTEMPT': '2', 'OA_CI_STARTED_AT': str(time.time() - 171)})
+        environment_updates={'GITHUB_RUN_ATTEMPT': '2'})
     assert result.returncode != 0
     assert 'ci_time_budget_exceeded' in json.loads((tmp_path / 'invalid-attempt.json').read_text())['errors']
+
+
+def test_matrix_ci_excludes_delayed_shards_and_aggregation_queue(matrix_evidence, tmp_path):
+    directory = tmp_path / 'evidence'
+    shutil.copytree(matrix_evidence, directory)
+    for shard, age in ((0, 600), (1, 300)):
+        path = directory / f'offline-test-evidence-{shard}-attempt-1/collection.json'
+        reference = json.loads(path.read_text())
+        reference['started_at'] = time.time() - age
+        path.write_text(json.dumps(reference))
+        path.with_name('execution.json').write_text(json.dumps({
+            **json.loads(path.with_name('execution.json').read_text()), 'started_at': reference['started_at']}))
+    output = tmp_path / 'merged.json'
+    result = merge_matrix(directory, output)
+    report = json.loads(output.read_text())
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert report['status'] == 'verified'
+    assert report['elapsed_seconds'] < 170
+    assert report['timing_scope'] == 'active_critical_path'
+    assert report['upstream_seconds'] == 130
+    assert report['aggregation_seconds'] >= 5
+    assert report['matrix_wall_seconds'] >= 600
+    assert report['excluded_scheduling_seconds'] >= 400
+    assert report['elapsed_seconds'] == pytest.approx(report['upstream_seconds'] + report['aggregation_seconds'])
+
+
+
+@pytest.mark.parametrize('defect', ['missing', 'duplicate', 'truncated', 'failed', 'running',
+                                   'run', 'attempt', 'head', 'clock', 'timezone', 'future',
+                                   'upstream_budget', 'aggregation_budget'])
+def test_matrix_ci_requires_bound_job_execution_timing(matrix_evidence, tmp_path, defect):
+    directory = tmp_path / 'evidence'
+    shutil.copytree(matrix_evidence, directory)
+    timing = job_timings()
+    job = timing['jobs'][1]
+    if defect == 'missing':
+        timing['jobs'].pop()
+        timing['total_count'] -= 1
+    elif defect == 'duplicate':
+        timing['jobs'][0] = job
+    elif defect == 'truncated':
+        timing['total_count'] += 1
+    elif defect == 'failed':
+        job['conclusion'] = 'failure'
+    elif defect == 'running':
+        job['status'] = 'in_progress'
+    elif defect == 'run':
+        job['run_id'] = 124
+    elif defect == 'attempt':
+        job['run_attempt'] = 2
+    elif defect == 'head':
+        job['head_sha'] = CI_IDENTITY['GITHUB_SHA']
+    elif defect == 'clock':
+        job['completed_at'] = job['started_at']
+        job['started_at'] = timing['jobs'][-1]['started_at']
+    elif defect == 'timezone':
+        job['started_at'] = '2026-10-17T00:00:00'
+    elif defect == 'future':
+        timing['jobs'][-1]['started_at'] = '9999-01-01T00:00:00Z'
+    elif defect == 'upstream_budget':
+        job['started_at'] = datetime.fromtimestamp(time.time() - 600, timezone.utc).isoformat()
+        job['completed_at'] = datetime.fromtimestamp(time.time() - 400, timezone.utc).isoformat()
+    elif defect == 'aggregation_budget':
+        timing['jobs'][-1]['started_at'] = datetime.fromtimestamp(time.time() - 50, timezone.utc).isoformat()
+    (directory / 'job-timings.json').write_text(json.dumps(timing))
+    output = tmp_path / 'merged.json'
+    result = merge_matrix(directory, output)
+    assert result.returncode != 0, result.stdout + result.stderr
+    report = json.loads(output.read_text())
+    if defect.endswith('_budget'):
+        assert report['errors'] == ['ci_time_budget_exceeded']
+    else:
+        assert any(error.startswith('job_timing_') for error in report['errors'])
+
+
+
+@pytest.mark.parametrize('role', ['quality (1)', 'macos-stop-recovery'])
+def test_reused_job_metadata_still_enforces_original_execution_budget(tmp_path, role):
+    attempt_artifacts(tmp_path, 1, started_at=time.time() - 600)
+    timing = job_timings()
+    for job in timing['jobs']:
+        job['run_attempt'] = 2
+        if job['name'] == role:
+            job['started_at'] = datetime.fromtimestamp(time.time() - 600, timezone.utc).isoformat()
+            job['completed_at'] = datetime.fromtimestamp(time.time() - 429, timezone.utc).isoformat()
+    (tmp_path / 'job-timings.json').write_text(json.dumps(timing))
+    output = tmp_path / 'merged.json'
+    result = merge_matrix(tmp_path, output, required_results=attempt_needs((1, 1, 1)),
+                          environment_updates={'GITHUB_RUN_ATTEMPT': '2'})
+    report = json.loads(output.read_text())
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert report['errors'] == ['ci_time_budget_exceeded']
+    assert report['upstream_seconds'] == 0
+    assert report['reused_job_seconds'][role] == pytest.approx(171, abs=0.01)

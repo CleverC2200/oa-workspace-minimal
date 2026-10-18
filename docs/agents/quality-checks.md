@@ -22,11 +22,13 @@
 
 `quality-complete` 等待两个分片和 macOS 专项，按这些 job 在 `needs` 输出的 artifact ID 精确下载原始证据，不按同名列表或宽泛通配符选择，也不把上次汇总产物当作输入。原始 artifact 名含逻辑分片及 `run_attempt`；JSON 同时绑定源码、run、attempt 和 job。汇总要求所有必需任务成功，再核对两份完整收集、各 job 实际 attempt、分片归属、逐项并集恰好一次，以及 macOS JUnit 无跳过、无失败。输出缺失、产物身份不符或重跑失败时停止，不回退到旧成功。
 
-仅重跑失败任务时，未重跑的成功 job 可明确复用原 artifact ID 和 attempt；汇总记录 `evidence_attempts`、`artifact_ids` 与 `reused_jobs`。170 秒预算从本 attempt 实际执行的必需 job 及汇总 job 的最早首步计时，仍包含准备、执行、上传及汇总启动；旧成功 job 的原耗时继续核验，但等待重跑的间隔不计入本 attempt。只重跑汇总时从汇总首步计时。JSON 和 JUnit 按 attempt 留存，不自动重跑失败 worker；实际全工作流的 180 秒验收仍按 GitHub 完成记录核对，不以本地回归代替。
+170 秒运行预算按并行上游任务中最长的实际执行时间，加汇总任务从开始执行到完成验证的时间计算。上游起止来自[GitHub 当前 workflow attempt 的任务元数据](https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-workflow-run-attempt)，包含检出、依赖安装、静态门、测试、证据上传和收尾；汇总包含检出、安装、下载和元数据查询。任务集合、成功状态、源码分支 SHA、run 和 attempt 必须匹配；PR 测试源码的合并候选 SHA 仍由原 artifact 校验独立绑定。缺少、重复、错轮或无效时间证据均拒绝。汇总完成后最终回执的上传和收尾按 GitHub 完成记录另报。
+
+完整回执分别记录运行关键路径、从最早上游开始到汇总验证的墙钟跨度，以及调度等待对关键路径的影响。分片启动错开和汇总等待执行器不计入运行预算；完整覆盖、必需任务状态和 170 秒阈值保持。真实主机的执行超限仍失败，不用本地通过或单个任务通过代替完整 hosted CI 验收。历史墙钟计时报告保持原判定，修复与验收见 [#554](https://github.com/CleverC2200/oa-workspace-minimal/issues/554)。
+
+仅重跑失败任务时，未重跑的成功 job 可明确复用原 artifact ID 和 attempt；汇总记录 `evidence_attempts`、`artifact_ids` 与 `reused_jobs`。本 attempt 的关键路径只计本轮实际执行的最长上游任务和汇总开销；复用 job 的原始证据和 GitHub 元数据执行时长仍各自核验 170 秒预算，历史等待不计入本轮。只重跑汇总时，本轮关键路径只计汇总实际执行时间。JSON 和 JUnit 按 attempt 留存，不自动重跑失败 worker。
 
 录制 CLI 的分类与回执用例通过共享 fixture 缩短观察间隔，仍启动真实子进程；超时用例在既有 executor 接口缩短测试期限，仍走真实超时和进程回收。`real_observation_interval` 用例保留生产 5 秒周期，核对首次错误在重试前停止。生产默认、停止门与历史证据不受这些测试参数影响。
-
-耗时验收以真实 GitHub workflow 的全部必需任务完成时间为准，排队时间另列。工作流从首个 step 计时并留出收尾预算；本地测试耗时及 step 预算通过不能代替完整 CI 在 180 秒内完成的验收。尚未推送或实际运行未达标时，[#478](https://github.com/CleverC2200/oa-workspace-minimal/issues/478) 保持打开。
 
 证据覆盖沿用已接线的公开入口检查，不增加第二套结论规则。`test_invoice_linkage_preview.py` 核验上传附件不能代替可信 OA 关联；`test_invoice_evidence_coverage.py` 核验关联票面资料进入 collect_case、真实 Worker 冻结输入及 preview；`test_invoice_material_diagnostics.py` 核验文件记录与正文读取分别计数。这些检查不证明模型业务判断总是正确。
 

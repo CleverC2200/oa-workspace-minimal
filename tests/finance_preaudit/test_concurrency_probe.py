@@ -2272,6 +2272,66 @@ def test_prepare_global_fifo_returns_trusted_zero_write_quarantine(
 
 
 
+@pytest.mark.parametrize('mutation', [None, 'missing_receipt', 'receipt_changed', 'identity', 'writer', 'decision'])
+def test_prepare_preserves_trusted_controller_material_failure(tmp_path, monkeypatch, mutation):
+    probe = finance_preaudit_concurrency_probe
+    request_id = 'failed-material'
+    received_at = '2026-08-25T08:00:00+08:00'
+    stop_requests = []
+    calls = []
+
+    class Engine:
+        def next_action(self, *_args, **_kwargs):
+            calls.append(request_id)
+            action_file = _quarantined_action(
+                tmp_path/'runtime'/'finance_preaudit_flows', request_id=request_id,
+                received_at=received_at, failure_detail_code='attachment_content_incomplete',
+            )
+            action = json.loads(action_file.read_text())
+            action.update(mode='preview', write_authorized=False)
+            for name in ('action.json', 'state.json'):
+                json_artifact.write_json_atomic(action_file.with_name(name), action)
+            probe.item_failure.persist(action_file.parent, action)
+            receipt_file = action_file.with_name('manual-review-receipt.json')
+            if mutation == 'missing_receipt':
+                receipt_file.unlink()
+            elif mutation == 'receipt_changed':
+                receipt_file.write_text('{}')
+            elif mutation == 'identity':
+                state = {**action, 'request_id': 'another-request'}
+                json_artifact.write_json_atomic(action_file.with_name('state.json'), state)
+            elif mutation in {'writer', 'decision'}:
+                name = 'writer-boundary.json' if mutation == 'writer' else 'review-decision.json'
+                action_file.with_name(name).write_text('{}')
+            return action
+
+    monkeypatch.setattr(probe, 'PROJECT_ROOT', tmp_path)
+    monkeypatch.setattr(probe.cli, '_live_pending_identities', lambda: [{
+        'requestId': request_id, 'received_at': received_at, 'flow_key': 'travel_expense',
+        'support_status': 'supported', 'can_submit': True,
+    }])
+    monkeypatch.setattr(probe.cli, '_live_flow_engine', lambda **_kwargs: Engine())
+    monkeypatch.setattr(probe.runtime_control, 'stop_requested', lambda: False)
+    monkeypatch.setattr(probe.runtime_control, 'request_stop', lambda reason=None: stop_requests.append(reason))
+    monkeypatch.setattr(probe, '_historical_write_authorization_failures', frozenset)
+    monkeypatch.setattr(probe, '_local_quarantine_count', lambda: 0)
+    monkeypatch.setattr(probe, '_local_quarantined_identities', frozenset)
+
+    result = probe._prepare_one({
+        'workflow_key': '*', 'assigned_identities': [], 'historical_unknown_identities': [],
+    })
+
+    assert calls == [request_id]
+    assert stop_requests == ['production_probe_prepare_failed']
+    assert result['action'] == 'failed'
+    if mutation is not None:
+        assert result['error_code'] == 'production_probe_fifo_mismatch'
+    else:
+        assert result['error_code'] == 'material_collection_failed'
+        assert result['failure_detail_code'] == 'attachment_content_incomplete'
+        assert result['prepare_failure']['reason_code'] == 'attachment_content_incomplete'
+
+
 def test_dispatcher_consumes_isolated_exact_recovery_before_ordinary_work(tmp_path, monkeypatch):
     probe = finance_preaudit_concurrency_probe
     root = tmp_path / "runtime" / "finance_preaudit_flows"

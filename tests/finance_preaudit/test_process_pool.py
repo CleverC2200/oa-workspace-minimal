@@ -3,6 +3,7 @@ from __future__ import annotations
 # Select the retained supplier explicitly for recorded CLI/slot behavior.
 from tests.finance_preaudit.review_profiles import retained_deepseek_cli  # noqa: F401
 
+from functools import partial
 import json
 import os
 from pathlib import Path
@@ -161,7 +162,9 @@ def _must_not_run(_value: str) -> str:
     raise AssertionError("worker must not start")
 
 
-def _crashing_worker(name: str) -> str:
+def _crashing_worker(name: str, *, startup_delay: float = 0) -> str:
+    if startup_delay:
+        time.sleep(startup_delay)
     if name == "crash":
         os._exit(17)
     return name
@@ -441,12 +444,13 @@ def test_inner_codex_timeout_reaps_process_group_and_grandchild(
     _assert_fake_codex_tree_reaped(pid_file, fake_codex, marker)
 
 
-def test_crashed_process_is_classified_and_other_tasks_continue() -> None:
+@pytest.mark.parametrize("startup_delay", [0, 1.1])
+def test_crashed_process_is_classified_and_other_tasks_continue(startup_delay) -> None:
     result = process_pool.run(
         ["first", "crash", "third"],
-        _crashing_worker,
+        partial(_crashing_worker, startup_delay=startup_delay),
         max_workers=2,
-        batch_timeout_sec=1,
+        batch_timeout_sec=5,
     )
 
     assert result.completed == 2

@@ -316,6 +316,9 @@ def detect_oa_download_fail_code(value: Any) -> str:
 
 def download_error_code(message: str) -> str:
     text = str(message or "").strip()
+    for code in ("resource_ownership_untrusted", "attachment_content_incomplete"):
+        if text.startswith(f"{code}:"):
+            return code
     if text.startswith(f"{ATTACHMENT_ACCESS_DENIED_CODE}:"):
         return ATTACHMENT_ACCESS_DENIED_CODE
     for code in rpa_session.FATAL_SESSION_CODES:
@@ -978,6 +981,81 @@ def _normalized_download_url(resource: Dict[str, Any]) -> Tuple[str, str]:
         return "", f"{name}: 下载链接不合法: {err}"
 
 
+class _DocumentContextRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        failure = detect_oa_download_fail_code(newurl) or rpa_session.RPA_SESSION_INVALID_CODE
+        raise rpa_session.RpaSessionError(failure, "原生文档接口发生重定向")
+
+
+def _initialize_workflow_document_context(
+    resource: Dict[str, Any], url: str, *, timeout_sec: int, initialize: bool = True
+) -> bool:
+    from apps.oa_approval import official_sql
+
+    parsed = urllib.parse.urlsplit(url)
+    origin = urllib.parse.urlsplit(OA_HOST)
+    request_id = str(resource.get("_workflow_request_id") or "")
+    file_id = str(resource.get("id") or "")
+    cookie = str(resource.get("_ephemeral_cookie_header") or "")
+    url_ids = urllib.parse.parse_qs(parsed.query, keep_blank_values=True).get("fileid", [])
+    if (
+        (parsed.scheme, parsed.netloc) != (origin.scheme, origin.netloc)
+        or parsed.path not in {"/weaver/weaver.file.FileDownload", "/news/download.do"}
+        or len(url_ids) != 1 or not url_ids[0].strip()
+        or (re.fullmatch(r"[0-9]+", url_ids[0]) and url_ids[0] != file_id)
+        or not re.fullmatch(r"[1-9][0-9]*", request_id)
+        or not cookie
+    ):
+        return False
+
+    def read(path: str, params: Dict[str, str] | None = None) -> dict:
+        query = "?" + urllib.parse.urlencode(params) if params else ""
+        request = urllib.request.Request(
+            OA_HOST + path + query,
+            headers={"User-Agent": "Mozilla/5.0", "Cookie": cookie},
+        )
+        opener = urllib.request.build_opener(_DocumentContextRedirect())
+        with opener.open(request, timeout=max(1, timeout_sec)) as response:
+            payload = json.loads(response.read())
+        return payload if isinstance(payload, dict) else {}
+
+    try:
+        original_hint = resource.get("_invoice_original")
+        doc_id = "" if original_hint else official_sql.workflow_attachment_document(request_id, file_id)
+        if not doc_id:
+            from apps.oa_approval.invoice_originals import source_for_download
+
+            original = source_for_download(request_id, file_id)
+            if original_hint and original_hint != original:
+                return False
+            doc_id = original.get("document_id", "")
+            if not doc_id:
+                return False
+        account = read("/api/hrm/login/getAccountList")
+        actual_user = str((account.get("data") or {}).get("userid") or "")
+        expected_user = auth.env("OA_UID")
+        if not expected_user or actual_user != expected_user:
+            raise rpa_session.RpaSessionError(
+                rpa_session.RPA_SESSION_INVALID_CODE, "RPA 文档读取账号与配置不一致"
+            )
+        preview = read("/api/doc/detail/basicInfo", {"docid": doc_id})
+        if str(preview.get("status")) != "1" or str(preview.get("mainimagefile")) != file_id:
+            return False
+        if not initialize:
+            return True
+        if runtime_control.stop_requested():
+            raise rpa_session.RpaSessionError(runtime_control.STOP_CODE, "已请求停止")
+        info = read(
+            "/api/doc/detail/basicInfo",
+            {"docid": doc_id, "isrequest": "1", "requestid": request_id},
+        )
+        return str(info.get("status")) == "1" and str(info.get("mainimagefile")) == file_id
+    except rpa_session.RpaSessionError:
+        raise
+    except Exception:
+        return False
+
+
 def _download_resource_direct_uncoordinated(
     resource: Dict[str, Any], *, dest_dir: Path, timeout_sec: int
 ) -> Tuple[Path | None, str]:
@@ -990,9 +1068,33 @@ def _download_resource_direct_uncoordinated(
     )
     if direct_path is not None:
         return direct_path, ""
+    resource = dict(resource)
+    host = urllib.parse.urlsplit(url).hostname or ""
+    if host in {urllib.parse.urlsplit(OA_HOST).hostname, *EXTRA_DOWNLOAD_HOSTS}:
+        resource["_ephemeral_cookie_header"] = (
+            resource.get("_ephemeral_cookie_header") or _rpa_cookie_header(host)
+        )
     direct_path, direct_err = _direct_session_cookie_download(
         resource, url, dest_dir=dest_dir, timeout_sec=timeout_sec
     )
+    if direct_path is None and download_error_code(direct_err) == ATTACHMENT_ACCESS_DENIED_CODE:
+        try:
+            initialized = _initialize_workflow_document_context(resource, url, timeout_sec=timeout_sec)
+        except rpa_session.RpaSessionError as error:
+            return None, f"{error.code}: {resource_name(resource)}: {error}"
+        if initialized:
+            if runtime_control.stop_requested():
+                return None, _download_block_message(runtime_control.STOP_CODE, resource_name(resource))
+            retry_path, retry_error = _direct_session_cookie_download(
+                resource, url, dest_dir=dest_dir, timeout_sec=timeout_sec
+            )
+            if (retry_path is None and resource.get('_invoice_original')
+                    and download_error_code(retry_error) == ATTACHMENT_ACCESS_DENIED_CODE):
+                from apps.oa_approval import invoice_originals
+
+                cloud_path, cloud_error = invoice_originals.download_original(resource, dest_dir=dest_dir, timeout_sec=timeout_sec)
+                return cloud_path, f"{cloud_error}: 关联发票原件读取失败" if cloud_error else ""
+            return retry_path, retry_error or (direct_err if retry_path is None else "")
     if direct_path is not None or direct_err:
         return direct_path, direct_err
     return None, ""
@@ -1438,6 +1540,7 @@ def download_resources(
     targets, identity_errors = _unique_attachment_resources(resources)
     if identity_errors:
         return [], identity_errors
+    targets = [dict(resource, _workflow_request_id=str(request_id).strip()) for resource in targets]
     if not targets:
         return [], []
     if not allow_browser_download and not is_enabled(
@@ -1466,6 +1569,18 @@ def download_resources(
     outcomes: List[Dict[str, Any]] = [{} for _item in targets]
     pending: List[tuple[int, Dict[str, Any]]] = []
     for index, resource in enumerate(targets):
+        if resource.get("_invoice_original"):
+            checked = dict(resource)
+            checked["_ephemeral_cookie_header"] = _rpa_cookie_header(urllib.parse.urlsplit(OA_HOST).hostname or "")
+            try:
+                url, error = _normalized_download_url(checked)
+                valid = not error and _initialize_workflow_document_context(
+                    checked, url, timeout_sec=timeout_sec, initialize=False,
+                )
+            except rpa_session.RpaSessionError as error:
+                return [], [{"code": error.code, "message": "发票原件会话核验失败"}]
+            if not valid:
+                return [], [{"code": "resource_ownership_untrusted", "message": "发票原件归属核验失败"}]
         cached_entry = _cached_attachment_entry(
             dest_dir,
             resource,

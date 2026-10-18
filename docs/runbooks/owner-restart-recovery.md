@@ -16,6 +16,8 @@
   --original-tool-session-id "$original_tool_session_id"
 ```
 
+准备阶段技术停止 `production_probe_prepare_failed` 使用同一恢复合同的显式材料分支，并绑定唯一的可信未写入材料失败 action：`--prepare-failure-recovery YES --recover-action-file "$material_failure_action"`。该分支要求停止门内容精确匹配 `stop_requested:production_probe_prepare_failed`，预检仍只返回 `status=ready`，确认调用才清除该停止门；它不创建 attempt、不调用审批模型、不提交 OA，cron 继续保持 `PAUSED`。
+
 `exit_code=0`、`status=ready` 只证明本次预检通过，停止门仍在。已有本次明确恢复授权时，追加 `--confirm-recovery YES`。确认调用独立重复全部核验，不以此前预检放行。
 
 恢复在 controller/global Writer 租约内等待完整只读 OA 状态，核对当前身份、授权、冻结输入、continuation、原监督者和 controller/独立进程组、登记只读进程及全部模型槽。关闭槽仍核对实际进程消失，运行中、未登记完、回收未知或新官方冷却均拒绝。保留过期冷却，不进行模型可用性探测。原 cron 必须 PAUSED，其他停止原因和环境停止拒绝。

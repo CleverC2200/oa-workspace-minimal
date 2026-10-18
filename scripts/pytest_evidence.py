@@ -1,6 +1,7 @@
 """Opt-in pytest evidence: independent collection, exact execution and time budget."""
 from collections import Counter, defaultdict
 import argparse
+from datetime import datetime
 import hashlib
 import json
 import math
@@ -200,7 +201,6 @@ def _job_evidence(directory):
     if len(set(artifacts.values())) != 3:
         raise ValueError('ci_duplicate_artifact')
     for path in directory.glob('offline-test-evidence-*'):
-        # Legacy names cannot be selected, even if an old download left them behind.
         if path.name in {'offline-test-evidence-0', 'offline-test-evidence-1'}:
             continue
         match = re.fullmatch(r'offline-test-evidence-(0|1|macos)-attempt-([1-9][0-9]*)', path.name)
@@ -230,7 +230,56 @@ def macos_evidence(path, budget):
             'elapsed_seconds': elapsed, 'budget_seconds': budget, 'test_count': len(cases), 'errors': errors}
 
 
-def merge_evidence(directory, budget):
+def matrix_timing(jobs, identity, selected):
+    names = {'quality (0)', 'quality (1)', 'macos-stop-recovery', 'quality-complete'}
+    head = os.environ.get('OA_CI_HEAD_SHA')
+    if (not head or not identity['run_id'] or not identity['run_attempt']
+            or jobs['total_count'] != len(jobs['jobs'])
+            or len(jobs['jobs']) != 4 or {job['name'] for job in jobs['jobs']} != names):
+        raise ValueError('job_timing_set_untrusted')
+    observed = time.time()
+    intervals, timings = {}, {}
+    for job in jobs['jobs']:
+        name = job['name']
+        if (str(job['run_id']) != identity['run_id']
+                or str(job['run_attempt']) != str(identity['run_attempt']) or job['head_sha'] != head):
+            raise ValueError('job_timing_identity_mismatch')
+        current = name == 'quality-complete'
+        if (job['status'] != ('in_progress' if current else 'completed')
+                or job['conclusion'] != (None if current else 'success')):
+            raise ValueError('job_timing_status_untrusted')
+        start = datetime.fromisoformat(job['started_at'])
+        end = None if current else datetime.fromisoformat(job['completed_at'])
+        if start.tzinfo is None or (end is not None and end.tzinfo is None):
+            raise ValueError('job_timing_clock_untrusted')
+        started = start.timestamp()
+        finished = observed if current else end.timestamp()
+        if not 0 <= started <= finished <= observed:
+            raise ValueError('job_timing_clock_untrusted')
+        intervals[name] = (started, finished)
+        timings[name] = {'started_at': job['started_at'], 'completed_at': job['completed_at'],
+                         'elapsed_seconds': finished - started}
+    aggregation_start = intervals['quality-complete'][0]
+    if any(end > aggregation_start for name, (_, end) in intervals.items() if name != 'quality-complete'):
+        raise ValueError('job_timing_clock_untrusted')
+    attempts = {'quality (0)': selected['0'], 'quality (1)': selected['1'],
+                'macos-stop-recovery': selected['macos']}
+    current_names = {name for name, attempt in attempts.items() if attempt == identity['run_attempt']}
+    reused = {name: end - start for name, (start, end) in intervals.items()
+              if name in attempts and name not in current_names}
+    upstream = max((end - start for name, (start, end) in intervals.items() if name in current_names), default=0)
+    aggregation = observed - aggregation_start
+    elapsed = upstream + aggregation
+    wall = observed - min(start for name, (start, _) in intervals.items()
+                          if name in current_names or name == 'quality-complete')
+    return {'elapsed_seconds': elapsed, 'timing_scope': 'active_critical_path',
+            'upstream_seconds': upstream, 'aggregation_seconds': aggregation,
+            'reused_job_seconds': reused,
+            'matrix_wall_seconds': wall, 'excluded_scheduling_seconds': wall - elapsed,
+            'timing_head_sha': head, 'timing_observed_at': observed, 'job_timings': timings}
+
+
+def merge_evidence(directory, budget, jobs):
     """Join exact job-attempt evidence, retaining successful jobs not selected for rerun."""
     attempt, selected, artifacts, paths, errors = _job_evidence(directory)
     references = [json.loads((paths[str(shard)] / 'collection.json').read_text())
@@ -240,7 +289,6 @@ def merge_evidence(directory, budget):
     nodes = references[0]['nodeids']
     digest = collection_digest(nodes)
     outcomes = defaultdict(list)
-    starts = [float(os.environ['OA_CI_STARTED_AT'])]
     identity = {key: references[0].get(key) for key in ('root', 'platform', 'code_revision', 'run_id')}
     for shard, (reference, report) in enumerate(zip(references, reports)):
         if (reference.get('status') != 'collected' or reference.get('nodeids') != nodes
@@ -258,8 +306,6 @@ def merge_evidence(directory, budget):
         if (not _valid_time(reference.get('started_at')) or reference['started_at'] != report.get('started_at')
                 or not _valid_time(report.get('elapsed_seconds')) or report['elapsed_seconds'] > budget):
             errors.append('evidence_timing_invalid')
-        elif selected[str(shard)] == attempt:
-            starts.append(reference['started_at'])
         expected = shard_nodes(nodes, shard)
         if (report.get('shard') != shard or report.get('status') != 'verified' or report.get('errors')
                 or report.get('nodeids') != expected
@@ -291,10 +337,14 @@ def merge_evidence(directory, budget):
     if (not _valid_time(macos.get('started_at')) or not _valid_time(macos.get('elapsed_seconds'))
             or macos['elapsed_seconds'] > budget):
         errors.append('evidence_timing_invalid')
-    elif selected['macos'] == attempt:
-        starts.append(macos['started_at'])
-    elapsed = time.time() - min(starts)
-    if not 0 <= elapsed <= budget:
+    timing = {'elapsed_seconds': None, 'timing_scope': 'active_critical_path'}
+    try:
+        timing = matrix_timing(jobs, {**identity, 'run_attempt': attempt}, selected)
+    except (KeyError, TypeError, ValueError) as error:
+        errors.append(str(error) if str(error).startswith('job_timing_') else 'job_timing_untrusted')
+    if (timing['elapsed_seconds'] is not None
+            and (not 0 <= timing['elapsed_seconds'] <= budget
+                 or any(seconds > budget for seconds in timing['reused_job_seconds'].values()))):
         errors.append('ci_time_budget_exceeded')
     roles = {'0': 'quality-0', '1': 'quality-1', 'macos': 'macos-stop-recovery'}
     return {'schema_version': 2, 'kind': 'offline_pytest_matrix_evidence',
@@ -306,7 +356,7 @@ def merge_evidence(directory, budget):
             'executed_count': sum(len(values) for values in outcomes.values()),
             'counts': dict(Counter(value for values in outcomes.values() for value in values)),
             'macos_stop_recovery_count': len(manual_nodes), 'shards': reports,
-            'elapsed_seconds': elapsed, 'timing_scope': 'attempt_matrix_and_aggregation',
+            **timing,
             'budget_seconds': budget, 'errors': errors}
 
 
@@ -316,10 +366,14 @@ def main():
     mode.add_argument('--merge-directory', type=Path)
     mode.add_argument('--macos-report', type=Path)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--jobs-file', type=Path)
     parser.add_argument('--budget-seconds', type=float, default=170)
     args = parser.parse_args()
+    if args.merge_directory and args.jobs_file is None:
+        parser.error('--merge-directory requires --jobs-file')
     try:
-        report = (merge_evidence(args.merge_directory, args.budget_seconds) if args.merge_directory
+        report = (merge_evidence(args.merge_directory, args.budget_seconds, json.loads(args.jobs_file.read_text()))
+                  if args.merge_directory
                   else macos_evidence(args.macos_report, args.budget_seconds))
     except (OSError, ValueError, KeyError, TypeError, ElementTree.ParseError) as error:
         report = {'status': 'failed', 'counts': {}, 'elapsed_seconds': None,

@@ -1460,6 +1460,41 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                         "action": "failed",
                         "error_code": session_failure_code,
                     }
+                if (
+                    action.get("reason") == "material_collection_failed"
+                    and session_failure_code not in ITEM_LOCAL_MATERIAL_FAILURE_DETAILS
+                    and prepare_failure.is_code(session_failure_code)
+                    and _material_failure_action_matches_selection(
+                        action_path,
+                        persisted_action,
+                        persisted,
+                        selected,
+                        selected_workflow,
+                        allowed_failure_details=frozenset({session_failure_code}),
+                        forbidden_names=(
+                            "material.json",
+                            "review-packet.json",
+                            "review-decision.json",
+                            "remark.txt",
+                            "submission-envelope.json",
+                        ),
+                        project_root=PROJECT_ROOT,
+                    )
+                ):
+                    receipt = item_failure.verified_receipt(action_path.parent, persisted)
+                    if receipt is not None and receipt["scope"] == "controller":
+                        runtime_control.request_stop("production_probe_prepare_failed")
+                        return {
+                            **failed(
+                                "next_action",
+                                error_code="material_collection_failed",
+                                reason_code=session_failure_code,
+                                stop_action="stop",
+                                workflow_key=selected_workflow,
+                                action_file=action_path,
+                            ),
+                            "failure_detail_code": session_failure_code,
+                        }
                 if not _quarantined_action_matches_selection(
                     action_path,
                     persisted_action,
