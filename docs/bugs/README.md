@@ -16,6 +16,7 @@
 
 | 领域 | 症状 / 搜索词 | 主记录或历史组件 | 回归 / 经验入口 |
 |---|---|---|---|
+| CI 重跑证据 | 同名旧失败 artifact、failed-only rerun、run_attempt、汇总旧时钟超时 | [#540](https://github.com/CleverC2200/oa-workspace-minimal/issues/540) | [CI 证据回归](../../tests/finance_preaudit/test_ci_evidence.py)、[质量检查](../agents/quality-checks.md)；按 job 输出的 artifact ID 和 attempt 选择，正确性复用与本次计时分别核验 |
 | 发票云原件正文 | body_read_status、原件未读、云文件与 OA 文档映射 | [#556](https://github.com/CleverC2200/oa-workspace-minimal/issues/556) | [真实采集入口回归](../../tests/finance_preaudit/test_invoice_original_bodies.py)、[来源合同](../agents/oa-api.md)；字段、文件记录、正文准备与业务审核分别验收 |
 | 发票原件下载拒绝 | attachment_access_denied、原生详情可下载、发票云文件读取 | [#569](https://github.com/CleverC2200/oa-workspace-minimal/issues/569) | [正常采集及失败反例](../../tests/finance_preaudit/test_invoice_original_bodies.py)、[原件读取合同](../agents/oa-api.md#关联发票原件读取)；OA 文档初始化成功不证明原件可下载 |
 | DeepSeek 附件转写 | attachment_response_incomplete、默认思考、8192 Token、length、空回答 | [#529](https://github.com/CleverC2200/oa-workspace-minimal/issues/529) | [HTTP 识别回归](../../tests/finance_preaudit/test_attachment_recognition.py)、[附件读取合同](../agents/attachment-recognition.md)；历史报告未保存终止原因，根因归属与新版本验证分别记录 |
@@ -47,6 +48,7 @@
 | 发票对应关系 | invoice_buyer_read_failed、读取成功但票号误报、ID 与显示号码不同序、位置配对 | [#484](https://github.com/CleverC2200/oa-workspace-minimal/issues/484) | [记录身份与字段组回归](../../tests/finance_preaudit/test_invoice_reference_binding.py)；按明确引用和返回记录身份核验同字段号码及次数，不按位置猜测关联 |
 | 报销公司取数 | 原表单有公司、bxgs 原值为全文、browser.19001、冻结却 unresolved | [#493](https://github.com/CleverC2200/oa-workspace-minimal/issues/493) | [公开采集字段回归](../../tests/finance_preaudit/test_collect_case_contract.py)；只读取已确认字段的原始业务文本，不用开票公司或公司代码补猜 |
 | 读取失败提交空意见 | invoice_buyer_read_failed、空骨架、degraded、全部未完成核对 | [#275](https://github.com/CleverC2200/oa-workspace-minimal/issues/275) | [新采集/旧冻结/完成回归](../../tests/finance_preaudit/test_flow_engine_material_gaps.py)、[当前提交门](../../.agents/skills/oa-finance-preaudit/references/flow-engine-contract.md)；历史已提交意见保留，不重放 |
+| 决定规范化与重放 | overall/item 不一致、降级意见、review_decision_conflict、保存后中断、同输入重放 | [#539](https://github.com/CleverC2200/oa-workspace-minimal/issues/539) | [公开完成入口回归](../../tests/finance_preaudit/test_decision_normalization_replay.py)；候选身份与最终结果分别绑定，历史证据和未知写入不自动改写或重试 |
 | 一般费用空材料误隔离 | 源字段 NULL、接口显示占位、确认缺件、empty_source | [#550](https://github.com/CleverC2200/oa-workspace-minimal/issues/550) | [正常采集与业务预览回归](../../tests/finance_preaudit/test_confirmed_empty_attachments.py)、[空值读取合同](../agents/oa-api.md#一般费用空材料的来源确认)；源表确认空值与真实读取失败分开，原隔离保持 |
 | TPM 空材料误隔离 | fj 空列表、glfp NULL、接口显示占位、tpm_evidence_references_unresolved | [#571](https://github.com/CleverC2200/oa-workspace-minimal/issues/571) | [精确来源及失败反例](../../tests/finance_preaudit/test_confirmed_empty_attachments.py)、[空值读取合同](../agents/oa-api.md#一般费用空材料的来源确认)；确认缺件后仍按原规则审核，旧 attempt 保留 |
 | CI 排队误计入运行预算 | ci_time_budget_exceeded、runner 排队、分片启动错开、汇总等待 | [#554](https://github.com/CleverC2200/oa-workspace-minimal/issues/554) | [完整覆盖与计时回归](../../tests/finance_preaudit/test_ci_evidence.py)、[运行预算合同](../agents/quality-checks.md)；实际关键路径与调度墙钟分列，原失败报告保留 |
