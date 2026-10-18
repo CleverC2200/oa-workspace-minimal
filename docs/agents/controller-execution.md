@@ -137,6 +137,14 @@ python -B -m apps.oa_finance_preaudit.host_chat_review --operation finish-shutdo
 
 CLI 的旧 `close` 操作也走相同收尾核验，不能省略证明参数。Python 内部 `close()` 只负责 exchange 止损，供父链失效观察器等使用，不构成主回合退出许可。突然失去整个父会话时仍由原父链门和300秒租约止损；没有活着的 App 主对话就无法补发原生中断。机器断电、App崩溃或所有保护进程同时被强杀不保证完整收尾，结果缺失保持 unknown。
 
+## 控制器清单与历史证据
+
+每次 execution 目录中的 `controller-manifest.json` 是该轮唯一完整可变清单。全局 `rolling-controller-manifest.json` 只保存版本与 owner、invocation、run、controller instance 的定位绑定，读取时同时核对指针和执行清单的原字节、文件身份与路径。owner 是原生父会话，invocation 是监督执行目录，run 是控制器轮次，controller instance 是进程身份；四者分别核验。指针或目标损坏、丢失、冲突及符号链接均阻断，不能当作未运行。
+
+旧完整全局清单保持只读兼容。显式新启动通过原门禁后，先保留原字节再激活新指针；显式旧轮恢复也先归档原件，只更新该轮执行权威。有原 execution 原件时须核身份与内容兼容，冲突拒绝。归档不改写原 execution receipt、退出码、日志或原工具 wait，历史取回仍按原 invocation 与原回执指纹读取。恢复后的当前清单不替原回执补造 terminal、children_reaped 或原生等待证据。
+
+progress、execution receipt 和原生工具收尾各自保留原合同；指针不代替阶段心跳、实际进程回收、Writer 空闲或业务完成证明。
+
 ## 只读进度、等待与终态取回
 
 小时调度的运行中监视使用本节原回执入口，并继续等待原工具会话；完整 `status --check-live --reconcile` 用于启动前和原控制器真实退出后。待办、已办及本地状态分次读取，不是活动 Writer 的原子快照。不得把运行中混合快照的 pending_write_state_unresolved 当作已确认故障去停止原控制器，也不能放宽 raw continuation 或给 submitting/submitted 自动豁免。原控制器内部身份、冻结、授权、Writer 未知结果及轮次后对账保护保持有效。

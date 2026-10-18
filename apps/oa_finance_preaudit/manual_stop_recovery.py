@@ -260,7 +260,9 @@ def _verify_original_exit(terminal: dict, manifest: dict, binding: dict, observe
         or receipt.get("controller_instance_id") != manifest.get("controller_instance_id")
         or receipt.get("controller_pid") != manifest.get("controller_pid")
         or receipt.get("code_revision") != manifest.get("code_revision")
-        or receipt.get("controller_state") != manifest.get("state")):
+        or receipt.get("controller_state") != manifest.get("state")
+        or ("invocation_id" in manifest and (manifest["invocation_id"] != receipt.get("invocation_id")
+            or manifest.get("owner_task_id") != receipt.get("owner_task_id")))):
         raise ValueError(BLOCKED)
     if not (_aware_time(manifest.get("completed_at")) <= _aware_time(receipt.get("completed_at"))
             <= _aware_time(event.get("timestamp")) <= observed):
@@ -372,8 +374,16 @@ def _original_evidence(target: Path, binding: dict) -> tuple[dict, dict]:
         or not isinstance(binding.get("manifest"), dict)
         or binding["manifest"].get("path") != str(target / "runtime/control/rolling-controller-manifest.json")):
         raise ValueError(BLOCKED)
-    manifest = _object(_bound_bytes(binding["manifest"]))
-    if _object(_bound_bytes(binding["original_manifest"])) != manifest:
+    active = _object(_bound_bytes(binding["manifest"]))
+    manifest = _object(_bound_bytes(binding["original_manifest"]))
+    if active.get("kind") == "preaudit_controller_execution_pointer":
+        from . import controller_handoff
+        if (controller_handoff._pointer_path(Path(binding["manifest"]["path"]), active)
+                != Path(binding["original_manifest"]["path"])
+                or any(active[key] != manifest.get(key) for key in
+                       ("owner_task_id", "invocation_id", "run_id", "controller_instance_id"))):
+            raise ValueError(BLOCKED)
+    elif active != manifest:
         raise ValueError(BLOCKED)
     original = _object(_bound_bytes(binding["original_status"]))
     conflict = _object(_bound_bytes(binding["original_conflict_status"]))
@@ -470,6 +480,7 @@ def recover_manual_stop(
 ) -> dict:
     """Audit original terminal evidence, recheck live gates, then clear its marker."""
     from .maintenance_runtime import assert_live_safe, read_live_status, target_runtime_leases
+    from . import controller_handoff
 
     if confirmed is not True:
         raise ValueError(BLOCKED)
@@ -482,6 +493,7 @@ def recover_manual_stop(
         with target_runtime_leases(target):
             identity = _original_stop(target, binding)
             manifest, terminal = _original_evidence(target, binding)
+            manifest_source = controller_handoff.manifest_snapshot(Path(binding["manifest"]["path"]))
             current = check_live() if check_live is not None else read_live_status(target)
             assert_live_safe(current, maintenance_leases_held=True)
             if binding['schema_version'] == 2:
@@ -490,7 +502,8 @@ def recover_manual_stop(
                 _require_submission_closure(current, _resolved_submission_evidence(target, binding, conflict, original))
             if (_private_bytes(evidence_file) != raw_binding
                 or _original_stop(target, binding) != identity
-                or _original_evidence(target, binding) != (manifest, terminal)):
+                or _original_evidence(target, binding) != (manifest, terminal)
+                or controller_handoff.manifest_snapshot(Path(binding["manifest"]["path"])) != manifest_source):
                 raise ValueError(BLOCKED)
             receipt_file = target / "runtime/control" / f"manual-stop-recovery-{secrets.token_hex(16)}.json"
             receipt = {"schema_version": 1, "kind": "preaudit_manual_stop_recovery_receipt",
@@ -509,7 +522,8 @@ def recover_manual_stop(
             record()
             if (_private_bytes(evidence_file) != raw_binding
                 or _original_stop(target, binding) != identity
-                or _original_evidence(target, binding) != (manifest, terminal)):
+                or _original_evidence(target, binding) != (manifest, terminal)
+                or controller_handoff.manifest_snapshot(Path(binding["manifest"]["path"])) != manifest_source):
                 raise ValueError(BLOCKED)
             writer = target / "runtime/control/frozen-writer.lock"
             if runtime_control.writer_active(writer) or runtime_control.active_request_writers(writer) != 1:

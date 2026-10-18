@@ -318,13 +318,20 @@ def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str
                           status="blocked", error_code="controller_supervisor_lost")
         elif state in {"starting", "waiting"} and receipt.get("stop_wait_error"):
             report.update(status="blocked", error_code=receipt["stop_wait_error"])
-        manifest_raw = _read_evidence(path.with_name("controller-manifest.json"))
+        manifest_path = path.with_name("controller-manifest.json")
+        legacy_path = path.with_name("legacy-controller-manifest.json")
+        legacy_raw = _read_evidence(legacy_path)
+        if legacy_raw is not None:
+            manifest_path = legacy_path
+        manifest_raw = legacy_raw if legacy_raw is not None else _read_evidence(manifest_path)
         manifest = None
         if manifest_raw is not None:
             manifest = _object(manifest_raw)
             if "review_configuration" in manifest and manifest["review_configuration"] != configuration:
                 raise ValueError("controller_execution_review_configuration_mismatch")
             if (manifest.get("kind") != "preaudit_controller_run_manifest"
+                    or ("invocation_id" in manifest and (manifest["invocation_id"] != invocation_id
+                        or manifest.get("owner_task_id") != owner_task_id))
                     or ("schema_version" in manifest and (type(manifest["schema_version"]) is not int or manifest["schema_version"] != 1))
                     or type(receipt.get("controller_pid")) is not int or receipt["controller_pid"] <= 0
                     or type(manifest.get("controller_pid")) is not int
@@ -405,7 +412,8 @@ def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str
             report["review_requests"] = host_chat_review.pending(owner=owner_task_id, manifest=manifest)
         # Atomic receipt replacement while the child exits requires a fresh snapshot, never mixed proof.
         if (_read_evidence(path) != raw
-                or _read_evidence(path.with_name("controller-manifest.json")) != manifest_raw
+                or _read_evidence(manifest_path) != manifest_raw
+                or _read_evidence(legacy_path) != legacy_raw
                 or _read_evidence(path.with_name("tool-session.json")) != binding_raw):
             raise ValueError("controller_execution_snapshot_changed")
     return report
@@ -681,6 +689,8 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str,
             started = datetime.fromisoformat(manifest["started_at"])
             matched = (
                 manifest.get("kind") == "preaudit_controller_run_manifest"
+                and ("invocation_id" not in manifest or (manifest["invocation_id"] == directory.name
+                    and manifest.get("owner_task_id") == owner_task_id))
                 and manifest.get("controller_pid") == receipt["controller_pid"]
                 and started.tzinfo is not None
                 and started >= datetime.fromisoformat(receipt["started_at"])

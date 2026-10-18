@@ -11,7 +11,7 @@ from typing import Callable
 from uuid import uuid4
 
 from apps.oa_approval import runtime_control
-from . import maintenance_runtime, production_release
+from . import maintenance_runtime, production_release, controller_handoff
 
 
 # Run only in the target interpreter, using its installed receipt/process readers.
@@ -35,7 +35,7 @@ if (report.get('state')!='exited' or report.get('terminal') is not True
         or saved.get('stop_requested_by_supervisor') is not True
         or saved.get('received_signals')!=[] or saved.get('stop_request_error') is not None
         or saved.get('stop_wait_error') is not None
-        or mirror!=json.loads(finance_preaudit_run._read_evidence(rolling))):
+        or mirror!=active_manifest(rolling)):
     raise ValueError('owner_restart_original_untrusted')
 stop=production_release._pinned_control(root/'runtime/stop-preaudit.flag')
 started=datetime.fromisoformat(saved['started_at']).timestamp()
@@ -109,7 +109,7 @@ print(json.dumps(report))
 '''
 
 
-def _read_original(root: Path, original: maintenance_runtime.OriginalExecution, manifest: bytes,
+def _read_original(root: Path, original: maintenance_runtime.OriginalExecution, manifest: bytes | tuple,
                    *, user_stop: bool = False, source_only: bool = False,
                    prepare_failure: bool = False) -> dict:
     maintenance_runtime.assert_target_environment(root)
@@ -134,7 +134,7 @@ def _read_original(root: Path, original: maintenance_runtime.OriginalExecution, 
 def _read_prepare_failure_original(
     root: Path,
     original: maintenance_runtime.OriginalExecution,
-    manifest: bytes,
+    manifest: bytes | tuple,
     stop_controls: tuple,
 ) -> dict:
     before = production_release._pinned_control(original.file, private=False, max_bytes=64 * 1024 * 1024)
@@ -209,7 +209,7 @@ def recover(
             production_release._source(root, expected_revision, expected_origin, synchronized=True)
             if production_release.candidate_configuration_findings(root, expected_revision):
                 raise RuntimeError('production_release_configuration_invalid')
-            manifest = runtime_control.read_control_bytes(root / 'runtime/control/rolling-controller-manifest.json')
+            manifest = controller_handoff.manifest_snapshot(root / 'runtime/control/rolling-controller-manifest.json')
             report = (_read_prepare_failure_original(root, original, manifest, controls)
                       if prepare_failure else
                       _read_original(root, original, manifest, user_stop=user_stop))

@@ -712,3 +712,29 @@ def test_recovery_rejects_system_tmp_alias_replaced_during_read(tmp_path, monkey
     assert read_completed
     assert (target / 'runtime/stop-preaudit.flag').read_bytes() == b'stop_requested\n'
     assert not list((target / 'runtime/control').glob('manual-stop-recovery-*.json'))
+
+
+def test_pointer_recovery_rejects_same_bytes_authority_replacement_during_live_check(tmp_path):
+    from apps.oa_approval import runtime_control
+    from apps.oa_finance_preaudit import manual_stop_recovery
+    from tests.finance_preaudit.controller_helpers import _write_failed_unreaped_manifest
+
+    target, evidence, snapshot = _environment(tmp_path)
+    binding = json.loads(evidence.read_bytes())
+    authority = Path(binding["original_manifest"]["path"])
+    original = json.loads(authority.read_bytes())
+    _write_failed_unreaped_manifest(authority)
+    manifest = json.loads(authority.read_bytes())
+    manifest.update(original, owner_task_id="00000000-0000-0000-0000-000000000001", invocation_id="d" * 32)
+    binding["original_manifest"] = _write(authority, manifest)
+    pointer = {"schema_version": 1, "kind": "preaudit_controller_execution_pointer",
+               **{key: manifest[key] for key in ("owner_task_id", "invocation_id", "run_id", "controller_instance_id")}}
+    binding["manifest"] = _write(Path(binding["manifest"]["path"]), pointer)
+    _write(evidence, binding)
+    def live():
+        runtime_control.write_control_bytes_atomic(authority, authority.read_bytes())
+        return snapshot
+    with pytest.raises(ValueError, match=manual_stop_recovery.BLOCKED):
+        manual_stop_recovery.recover_manual_stop(target_root=target, evidence_file=evidence,
+            confirmed=True, check_live=live)
+    assert (target / "runtime/stop-preaudit.flag").read_bytes() == b"stop_requested\n"

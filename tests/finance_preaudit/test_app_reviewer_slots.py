@@ -14,6 +14,7 @@ def native_sessions(tmp_path, monkeypatch, *, owner_depth=0):
     sessions.mkdir(parents=True)
     monkeypatch.setenv('CODEX_HOME', str(home))
     owner = str(uuid4())
+    monkeypatch.setenv(host.guard.OWNER_ENV, owner)
     parent = sessions / 'parent.jsonl'
     owner_path = '/root' + ''.join(f'/supervisor_{level}' for level in range(owner_depth))
     metadata = {'id': owner}
@@ -59,7 +60,7 @@ def original_execution(owner, manifest):
     import os
     from apps.oa_finance_preaudit import approval_guard, controller_handoff
     from scripts import finance_preaudit_run
-    invocation = uuid4().hex
+    invocation = manifest["invocation_id"]
     receipt_file = controller_handoff.manifest_file().parent / 'executions' / invocation / 'execution.json'
     receipt = {'schema_version': 1, 'kind': 'preaudit_controller_execution', 'owner_task_id': owner,
         'invocation_id': invocation, 'state': 'waiting', 'controller_pid': os.getpid(), 'process_group_id': os.getpid(),
@@ -68,7 +69,6 @@ def original_execution(owner, manifest):
         'started_at': (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), 'completed_at': None,
         'review_configuration': host.IDENTITY, 'exit_code': None}
     approval_guard.write(receipt_file, receipt)
-    approval_guard.write(receipt_file.with_name('controller-manifest.json'), manifest)
     finance_preaudit_run.bind_tool_session(receipt_file, owner_task_id=owner, session_id='original-session')
     return {'receipt_file': receipt_file, 'invocation_id': invocation, 'tool_session_id': 'original-session'}
 

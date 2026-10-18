@@ -4614,7 +4614,10 @@ def _recover_stale_cycle_stop(
         return False
     if runtime_control.stop_reason() != "controller_cycle_stop":
         raise ValueError("production_probe_stopped")
-    handoff = controller_handoff.status()
+    try:
+        handoff = controller_handoff._cycle_stop_recovery_status()
+    except ValueError as error:
+        raise ValueError("production_cycle_stop_recovery_blocked") from error
     if (
         confirm_stale_children_reaped
         and handoff.get("ready_for_start") is True
@@ -4653,9 +4656,9 @@ def _recover_stale_cycle_stop(
             controller_handoff.recover_confirmed_children_reaped(
                 confirmed=True
             )
+            handoff = controller_handoff._cycle_stop_recovery_status()
         except ValueError as error:
             raise ValueError("production_cycle_stop_recovery_blocked") from error
-        handoff = controller_handoff.status()
         if handoff.get("ready_for_start") is not True:
             raise ValueError("production_cycle_stop_recovery_blocked")
     try:

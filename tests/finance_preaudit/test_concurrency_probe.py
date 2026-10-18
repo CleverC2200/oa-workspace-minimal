@@ -3050,6 +3050,7 @@ def test_rolling_failure_retains_health_and_stable_reason(
 
 def test_rolling_recovers_reaped_cycle_stop_after_live_gates_pass() -> None:
     finance_preaudit_concurrency_probe.runtime_control.request_cycle_stop()
+    assert finance_preaudit_concurrency_probe.controller_handoff.status()["ready_for_start"] is False
 
     result = finance_preaudit_concurrency_probe.run_rolling_drain(
         capacity=6,

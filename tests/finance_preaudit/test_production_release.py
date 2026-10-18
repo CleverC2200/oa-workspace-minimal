@@ -715,3 +715,27 @@ def test_withdrawal_source_only_requires_the_registered_paused_native_cron(stopp
         production_release.release_source(root, expected_revision=revision, expected_origin=str(remote),
             automation=automation, original_execution=original, withdrawn_action=root / 'unopened-action.json',
             confirmed_withdrawal=True)
+
+
+def test_release_pins_execution_authority_even_when_pointer_bytes_are_unchanged(production):
+    from apps.oa_finance_preaudit import controller_handoff
+    from tests.finance_preaudit.controller_helpers import _write_failed_unreaped_manifest
+    root, remote, expected = production
+    path = root / "runtime/control/rolling-controller-manifest.json"
+    authority = path.parent / "executions" / ("2" * 32) / "controller-manifest.json"
+    _write_failed_unreaped_manifest(authority)
+    manifest = json.loads(authority.read_bytes())
+    manifest.update(invocation_id=authority.parent.name, owner_task_id=None, children_reaped=True)
+    runtime_control.write_control_bytes_atomic(authority, json.dumps(manifest).encode())
+    pointer = {"schema_version": 1, "kind": "preaudit_controller_execution_pointer",
+               **{key: manifest[key] for key in ("owner_task_id", "invocation_id", "run_id", "controller_instance_id")}}
+    runtime_control.write_control_bytes_atomic(path, json.dumps(pointer).encode())
+    original = path.read_bytes()
+    def live(target):
+        runtime_control.write_control_bytes_atomic(authority, authority.read_bytes())
+        return live_snapshot()
+    with pytest.raises(RuntimeError, match="production_release_manifest_changed"):
+        production_release.release_source(root, expected_revision=expected, expected_origin=str(remote),
+            confirmed_sync=True, check_live=live, check_configuration=lambda *_: [])
+    assert path.read_bytes() == original
+    assert controller_handoff.manifest_payload(controller_handoff.manifest_snapshot(path)) == authority.read_bytes()

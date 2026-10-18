@@ -235,7 +235,8 @@ def test_pool_launch_registration_gap_cannot_certify_closed(tmp_path):
             assert not (lifecycle.run_directory(manifest["run_id"]) / "closed-readonly.json").exists()
 
 
-def test_startup_reclaims_only_proven_orphan_and_closes_original_manifest(tmp_path):
+@pytest.mark.parametrize("layout", ["current", "legacy", "legacy_conflict"])
+def test_startup_reclaims_only_proven_orphan_and_closes_original_manifest(tmp_path, layout):
     old = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)"], start_new_session=True)
     identity = guard.process_identity(old.pid)
     try:
@@ -245,13 +246,38 @@ def test_startup_reclaims_only_proven_orphan_and_closes_original_manifest(tmp_pa
                 progress_path = lifecycle.run_directory(manifest["run_id"]) / "progress.json"
                 guard.write(progress_path, {**guard.read(progress_path), "controller": identity})
                 manifest = {**manifest, "controller_pid": old.pid}
-                guard.write(controller_handoff.manifest_file(), manifest)
+                pointer = controller_handoff.manifest_file()
+                authority = pointer.parent / "executions" / manifest["invocation_id"] / "controller-manifest.json"
+                if layout == "current":
+                    guard.write(authority, manifest)
+                else:
+                    manifest = {key: value for key, value in manifest.items() if key not in {"invocation_id", "owner_task_id"}}
+                    guard.write(pointer, manifest)
+                    if layout == "legacy_conflict":
+                        guard.write(authority, {**manifest, "health": "degraded"})
+                    else:
+                        authority.unlink()
+                original = pointer.read_bytes()
+                authority_original = authority.read_bytes() if authority.exists() else None
         old.kill()
         old.wait()
+        if layout == "legacy_conflict":
+            with pytest.raises(ValueError, match="controller_handoff_untrusted"):
+                lifecycle.startup(tmp_path, observe_errors=False)
+            assert pointer.read_bytes() == original
+            assert authority.read_bytes() == authority_original
+            return
         result = lifecycle.startup(tmp_path, observe_errors=False)
         assert result == {"status": "ready", "cleanup": True}
         closed = controller_handoff._read_manifest()
         assert closed["state"] == "failed" and closed["children_reaped"] is True
+        if layout == "current":
+            assert pointer.read_bytes() == original
+            assert closed["invocation_id"] == manifest["invocation_id"]
+        else:
+            archive = pointer.with_name(f"legacy-controller-manifest-{manifest['run_id']}-{manifest['controller_instance_id']}.json")
+            assert archive.read_bytes() == original
+        assert not list((pointer.parent / "executions").glob("*/execution.json"))
     finally:
         if old.poll() is None:
             old.kill()

@@ -11,7 +11,7 @@ from pathlib import Path
 import secrets
 
 from apps.oa_approval import runtime_control
-from . import maintenance_runtime, production_release, stop_recovery
+from . import maintenance_runtime, production_release, controller_handoff, stop_recovery
 
 BLOCKED = "writer_stop_maintenance_blocked"
 _REASON = "writer_result_unknown"
@@ -145,7 +145,7 @@ def recover(
         with maintenance_runtime.target_runtime_leases(target):
             controls = _controls(target, automation)
             manifest_path = target / "runtime/control/rolling-controller-manifest.json"
-            manifest = runtime_control.read_control_bytes(manifest_path)
+            manifest = controller_handoff.manifest_snapshot(manifest_path)
             report = maintenance_runtime.read_original_execution(target, original)
             maintenance_runtime.assert_original_execution_safe(
                 target, original, report, manifest
@@ -188,7 +188,7 @@ def recover(
             if (
                 _controls(target, automation) != controls
                 or _read_bound(target, action_file) != bound
-                or runtime_control.read_control_bytes(manifest_path) != manifest
+                or controller_handoff.manifest_snapshot(manifest_path) != manifest
             ):
                 raise ValueError(BLOCKED)
             production_release._source(

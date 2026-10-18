@@ -11,7 +11,7 @@ from typing import Callable
 from uuid import uuid4
 
 from apps.oa_approval import runtime_control
-from . import maintenance_runtime, production_release
+from . import maintenance_runtime, production_release, controller_handoff
 
 
 # The target's installed recovery contract independently selects exactly one
@@ -125,7 +125,7 @@ def recover(
             findings = production_release.candidate_configuration_findings(root, expected_revision)
             if findings:
                 raise RuntimeError('production_release_configuration_invalid')
-            manifest = runtime_control.read_control_bytes(root / 'runtime/control/rolling-controller-manifest.json')
+            manifest = controller_handoff.manifest_snapshot(root / 'runtime/control/rolling-controller-manifest.json')
             original_report = maintenance_runtime.read_original_execution(root, original, supervisor_loss_source_only=True)
             maintenance_runtime.assert_original_execution_safe(root, original, original_report, manifest,
                 supervisor_loss_source_only=True)

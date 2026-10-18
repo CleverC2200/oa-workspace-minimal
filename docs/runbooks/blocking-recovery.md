@@ -111,7 +111,7 @@ Writer 被停止门拦在提交之前时，仅精确签名边界为 `writer_pref
 
 - `target_root`、`target_revision` 绑定唯一、干净、可核实的生产 main。
 - `stop` 包含原标记的 `device`、`inode`、`mtime_ns` 和原始字节 `sha256`。不能用维护时重新读取的标记身份替代原记录。
-- `manifest` 和 `original_manifest` 均包含绝对 `path`、原始字节 `sha256`，分别指向当前 rolling-controller-manifest 和原执行目录 controller-manifest。两份内容必须同轮终态且 children_reaped=true。
+- `manifest` 和 `original_manifest` 均包含绝对 `path`、原始字节 `sha256`，分别指向当前 rolling-controller-manifest 和原执行目录 controller-manifest。全局入口为定位指针时，须绑定原 execution 的 owner、invocation、run 和 controller instance；旧完整全局清单仍与原 execution 内容一致。权威清单必须同轮终态且 children_reaped=true。
 - `original_conflict_status` 绑定原 blocked、存在 pending_handled_conflict 的完整状态文件；`original_status` 绑定原控制器终态后的完整收尾状态文件。两者均使用 `path`、`sha256`，不能用当前新快照替代。
 - `original_exit` 使用 `path`、`sha256` 绑定 `preaudit_original_controller_exit` 记录。该记录必须包含实际 `exit_code`、`process_session_id`、`run_id`、`terminal=true`、`children_reaped=true`，以及原会话 `source_file` 的 `path/sha256`、`source_line`、`source_call_id`。
 - `stop_source` 包含原停止调用的 `line`、`call_id`，引用同一原会话文件。维护核对原 `request_stop()` 调用、实际退出 0 的停止结果、无原因码和对应冲突文件；再核对原会话 cwd、任务 id，以及实际 write_stdin 进程退出与嵌套执行回执的轮次、实例、PID、修订和终态。保留各阶段原时间，严格核对带时区的 manifest.completed_at ≤ supervisor.completed_at ≤ 原工具输出 timestamp ≤ 原收尾 status.generated_at；这些阶段无须同时结束。`Script completed` 不作为进程退出证据。原会话只读源允许当前用户所有且组和其他用户不可写，私有维护证据仍须 0600。

@@ -7,8 +7,10 @@ import os
 from pathlib import Path
 import re
 import secrets
+import stat
 import subprocess
 from typing import Callable, Mapping
+from uuid import UUID
 
 from apps.oa_approval import runtime_control
 
@@ -17,6 +19,7 @@ SCHEMA_VERSION = 1
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _FINGERPRINT = re.compile(r"^sha256:[0-9a-f]{64}$")
 _RUN_ID = re.compile(r"^[0-9a-f]{32}$")
+_EXECUTION_IDENTITY = ("owner_task_id", "invocation_id", "run_id", "controller_instance_id")
 _STATES = {"running", "completed", "failed"}
 _HEALTH = {"healthy", "degraded", "unknown"}
 _RECOVERY_MIN_AGE_SECONDS = 30
@@ -94,18 +97,69 @@ def _config_fingerprint(config: Mapping[str, object]) -> str:
     return f"sha256:{hashlib.sha256(raw).hexdigest()}"
 
 
-def _read_manifest() -> dict | None:
-    path = manifest_file()
+def _pointer_path(path: Path, value: dict) -> Path:
+    if (set(value) != {'schema_version', 'kind', 'owner_task_id', 'invocation_id', 'run_id', 'controller_instance_id'}
+            or type(value['schema_version']) is not int or value['schema_version'] != 1
+            or value['kind'] != 'preaudit_controller_execution_pointer'
+            or any(_RUN_ID.fullmatch(str(value[key])) is None
+                   for key in ('invocation_id', 'run_id', 'controller_instance_id'))):
+        raise ValueError('controller_handoff_untrusted')
+    if value['owner_task_id'] is not None:
+        if not isinstance(value['owner_task_id'], str):
+            raise ValueError('controller_handoff_untrusted')
+        UUID(value['owner_task_id'])
+    return path.parent / 'executions' / value['invocation_id'] / 'controller-manifest.json'
+
+
+def _manifest_identity(path: Path) -> tuple:
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        raise ValueError('controller_handoff_untrusted')
+    return tuple(getattr(info, name) for name in
+                 ('st_dev', 'st_ino', 'st_mtime_ns', 'st_ctime_ns', 'st_mode', 'st_uid', 'st_size'))
+
+
+def manifest_snapshot(path: Path | None = None) -> tuple:
+    path = path or manifest_file()
     try:
+        try:
+            identity = _manifest_identity(path)
+        except FileNotFoundError:
+            if runtime_control.read_control_bytes(path) is None:
+                return None, None, ()
+            raise ValueError("controller_handoff_untrusted")
         raw = runtime_control.read_control_bytes(path)
-    except RuntimeError as error:
-        raise ValueError("controller_handoff_untrusted") from error
-    if raw is None:
-        return None
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise ValueError('controller_handoff_untrusted')
+        target = _pointer_path(path, value) if value.get('kind') == 'preaudit_controller_execution_pointer' else path
+        target_identity = _manifest_identity(target) if target != path else identity
+        authority = runtime_control.read_control_bytes(target) if target != path else raw
+        manifest = _validate_manifest(json.loads(authority)) if target != path else value
+        if (target != path and any(manifest.get(key) != value[key] for key in
+                                   _EXECUTION_IDENTITY)
+                or runtime_control.read_control_bytes(path) != raw or _manifest_identity(path) != identity
+                or runtime_control.read_control_bytes(target) != authority or _manifest_identity(target) != target_identity):
+            raise ValueError('controller_handoff_untrusted')
+        identities = ((str(path), identity),) if target == path else ((str(path), identity), (str(target), target_identity))
+        return raw, authority, identities
+    except (OSError, RuntimeError, ValueError, TypeError, UnicodeError, KeyError) as error:
+        raise ValueError('controller_handoff_untrusted') from error
+
+
+def manifest_payload(snapshot: bytes | tuple) -> bytes | None:
+    return snapshot[1] if isinstance(snapshot, tuple) else snapshot
+
+
+def _read_manifest(path: Path | None = None) -> dict | None:
     try:
-        value = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raw = manifest_payload(manifest_snapshot(path))
+        return _validate_manifest(json.loads(raw)) if raw is not None else None
+    except (TypeError, KeyError, AttributeError) as error:
         raise ValueError("controller_handoff_untrusted") from error
+
+
+def _validate_manifest(value) -> dict:
     expected_fields = {
         "schema_version",
         "kind",
@@ -127,6 +181,15 @@ def _read_manifest() -> dict | None:
         "restart_verified",
         "health",
     }
+    if isinstance(value, dict) and 'invocation_id' in value:
+        if (_RUN_ID.fullmatch(str(value['invocation_id'])) is None
+                or 'owner_task_id' not in value):
+            raise ValueError('controller_handoff_untrusted')
+        if value['owner_task_id'] is not None:
+            if not isinstance(value['owner_task_id'], str):
+                raise ValueError('controller_handoff_untrusted')
+            UUID(value['owner_task_id'])
+        expected_fields.update({'invocation_id', 'owner_task_id'})
     if isinstance(value, dict) and "review_configuration" in value:
         from . import production_config
         configuration = value["review_configuration"]
@@ -136,6 +199,7 @@ def _read_manifest() -> dict | None:
     if (
         not isinstance(value, dict)
         or set(value) != expected_fields
+        or type(value.get("schema_version")) is not int
         or value.get("schema_version") != SCHEMA_VERSION
         or value.get("kind") != "preaudit_controller_run_manifest"
         or value.get("state") not in _STATES
@@ -231,8 +295,21 @@ def _process_alive(pid: int) -> bool:
 
 
 def recover_confirmed_children_reaped(*, confirmed: bool) -> dict:
+    try:
+        with runtime_control.global_controller_lease():
+            with runtime_control.request_writer_lease(
+                runtime_control.GLOBAL_WRITER_KEY, runtime_control.writer_lock_file(), blocking=False,
+            ):
+                return _recover_confirmed_children_reaped(confirmed=confirmed)
+    except (OSError, RuntimeError) as error:
+        raise ValueError("controller_handoff_recovery_blocked") from error
+
+
+def _recover_confirmed_children_reaped(*, confirmed: bool) -> dict:
     """Repair one stale terminal handoff after an operator verified reaping."""
-    manifest = _read_manifest()
+    snapshot = manifest_snapshot()
+    raw = manifest_payload(snapshot)
+    manifest = _validate_manifest(json.loads(raw)) if raw is not None else None
     revision, dirty = _code_state()
     now = datetime.now(timezone.utc)
     try:
@@ -251,15 +328,15 @@ def recover_confirmed_children_reaped(*, confirmed: bool) -> dict:
         or completed_at.tzinfo is None
         or (now - completed_at).total_seconds() < _RECOVERY_MIN_AGE_SECONDS
         or _process_alive(manifest["controller_pid"])
-        or runtime_control.controller_active()
+        or runtime_control.controller_owner_pid() != os.getpid()
         or runtime_control.writer_active()
-        or runtime_control.active_request_writers() != 0
+        or runtime_control.active_request_writers() != 1
         or revision == "unknown"
         or dirty is not False
     ):
         raise ValueError("controller_handoff_recovery_blocked")
     recovered = {**manifest, "children_reaped": True}
-    _write_manifest(recovered)
+    _write_manifest(recovered, previous=manifest, snapshot=snapshot)
     return {
         "status": "recovered",
         "manifest_state": recovered["state"],
@@ -304,7 +381,9 @@ def recover_orphaned_run(
                 runtime_control.GLOBAL_WRITER_KEY,
                 runtime_control.writer_lock_file(), blocking=False,
             ):
-                manifest = _read_manifest()
+                manifest_source = manifest_snapshot()
+                raw_manifest = manifest_payload(manifest_source)
+                manifest = _validate_manifest(json.loads(raw_manifest)) if raw_manifest is not None else None
                 revision, dirty = _code_state()
                 original_stop = stop_snapshot()
                 if (manifest is None or manifest["state"] != expected_state
@@ -327,7 +406,7 @@ def recover_orphaned_run(
                 if (live.get("credentials", {}).get("status") != "ok"
                     or live.get("oa", {}).get("execution_identity") != "verified"
                     or not _recovery_reconciliation_is_trusted(reconciled)
-                    or _read_manifest() != manifest
+                    or manifest_snapshot() != manifest_source
                     or stop_snapshot() != original_stop
                     or _code_state() != (revision, False)
                     or _process_alive(manifest["controller_pid"])
@@ -339,9 +418,13 @@ def recover_orphaned_run(
                 )
                 raw = (json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
                 existing = runtime_control.read_control_bytes(evidence)
-                if existing is not None and existing != raw:
-                    raise ValueError(blocked)
-                runtime_control.write_control_bytes_atomic(evidence, raw)
+                if existing is not None:
+                    saved = _validate_manifest(json.loads(existing))
+                    if (not set(manifest).difference(saved).issubset({"owner_task_id", "invocation_id"})
+                            or any(manifest.get(key) != value for key, value in saved.items())):
+                        raise ValueError(blocked)
+                else:
+                    runtime_control.write_control_bytes_atomic(evidence, raw)
                 stop_evidence = evidence.with_suffix(".stop.flag")
                 if original_stop is not None:
                     existing_stop = runtime_control.read_control_bytes(stop_evidence)
@@ -351,18 +434,21 @@ def recover_orphaned_run(
                 if stop_snapshot() != original_stop:
                     raise ValueError(blocked)
                 if original_stop is None:
-                    result = finish(manifest, status="failed", children_reaped=True, health="degraded")
+                    result = finish(manifest, status="failed", children_reaped=True, health="degraded", expected_snapshot=manifest_source)
                 else:
                     recovered = {**manifest, "children_reaped": True}
+                    written_source = None
                     try:
-                        _write_manifest(recovered)
+                        recovered = _write_manifest(recovered, previous=manifest, snapshot=manifest_source)
+                        written_source = manifest_snapshot()
                         if not runtime_control.clear_cycle_stop(expected_identity=original_stop[:3]):
                             raise ValueError(blocked)
                     except BaseException:
                         # Keep a failed maintenance attempt retryable, without
                         # overwriting a concurrently replaced manifest or stop.
-                        if _read_manifest() == recovered:
-                            _write_manifest(manifest)
+                        if written_source is not None and manifest_snapshot() == written_source:
+                            _write_manifest({**manifest, **{key: recovered[key] for key in ("invocation_id", "owner_task_id")}},
+                                            previous=recovered, snapshot=written_source)
                         runtime_control.request_cycle_stop()
                         raise
                     result = {"manifest_state": "failed", "children_reaped": True,
@@ -374,36 +460,120 @@ def recover_orphaned_run(
         raise ValueError(blocked) from error
 
 
-def _write_manifest(manifest: Mapping[str, object]) -> None:
-    payload = (
-        json.dumps(
-            dict(manifest),
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n"
-    ).encode("utf-8")
+def _manifest_bytes(manifest: Mapping[str, object]) -> bytes:
+    return (json.dumps(dict(manifest), ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _archive(path: Path, raw: bytes) -> None:
+    existing = runtime_control.read_control_bytes(path)
+    if existing is not None and existing != raw:
+        raise ValueError("controller_handoff_untrusted")
+    if existing is None:
+        runtime_control.write_control_bytes_atomic(path, raw)
+    if runtime_control.read_control_bytes(path) != raw:
+        raise ValueError("controller_handoff_untrusted")
+    _manifest_identity(path)
+
+
+def _activate_manifest(manifest: Mapping[str, object], snapshot: tuple) -> None:
+    path = manifest_file()
     try:
-        runtime_control.write_control_bytes_atomic(manifest_file(), payload)
-    except RuntimeError as error:
+        if manifest_snapshot() != snapshot:
+            raise ValueError("controller_handoff_untrusted")
+        if snapshot[0] is not None and json.loads(snapshot[0]).get("kind") == "preaudit_controller_run_manifest":
+            previous = json.loads(snapshot[0])
+            _archive(path.with_name(
+                f"legacy-controller-manifest-{previous['run_id']}-{previous['controller_instance_id']}.json"
+            ), snapshot[0])
+        _record_execution_manifest(manifest)
+        if manifest_snapshot() != snapshot:
+            raise ValueError("controller_handoff_untrusted")
+        pointer = {"schema_version": 1, "kind": "preaudit_controller_execution_pointer",
+                   **{key: manifest[key] for key in _EXECUTION_IDENTITY}}
+        runtime_control.write_control_bytes_atomic(path, _manifest_bytes(pointer))
+        if _read_manifest() != dict(manifest):
+            raise ValueError("controller_handoff_untrusted")
+    except (OSError, RuntimeError, ValueError):
+        runtime_control.request_stop("codex_review_technical_failure")
+        raise
+
+
+def _legacy_execution(manifest: dict) -> tuple[str, str | None, tuple | None]:
+    executions = manifest_file().parent / "executions"
+    found = None
+    if executions.exists():
+        with runtime_control.pinned_directory(executions):
+            for directory in executions.iterdir():
+                if _RUN_ID.fullmatch(directory.name) is None:
+                    continue
+                path = directory / "controller-manifest.json"
+                raw = runtime_control.read_control_bytes(path)
+                if raw is None:
+                    continue
+                value = json.loads(raw)
+                if not isinstance(value, dict) or not any(value.get(key) == manifest[key] for key in
+                                                         ("run_id", "controller_instance_id")):
+                    continue
+                if _validate_manifest(value) != manifest or found is not None:
+                    raise ValueError("controller_handoff_untrusted")
+                owner = None
+                receipt_raw = runtime_control.read_control_bytes(directory / "execution.json")
+                if receipt_raw is not None:
+                    from scripts import finance_preaudit_run
+                    receipt = json.loads(receipt_raw)
+                    owner = receipt["owner_task_id"]
+                    UUID(owner)
+                    report = finance_preaudit_run.read_execution(directory / "execution.json",
+                        owner_task_id=owner, invocation_id=directory.name)
+                    if any(report.get(key) != manifest[key] for key in ("run_id", "controller_instance_id")):
+                        raise ValueError("controller_handoff_untrusted")
+                found = directory.name, owner, (path, raw, _manifest_identity(path))
+    return found or (secrets.token_hex(16), None, None)
+
+
+def _write_manifest(manifest: Mapping[str, object], *, previous: Mapping[str, object], snapshot: tuple) -> dict:
+    if manifest_snapshot() != snapshot:
+        raise ValueError("controller_handoff_untrusted")
+    current = _validate_manifest(json.loads(manifest_payload(snapshot)))
+    if current != dict(previous):
+        raise ValueError("controller_handoff_untrusted")
+    result = dict(manifest)
+    _validate_manifest(result)
+    try:
+        if "invocation_id" not in current:
+            invocation, owner, original = _legacy_execution(current)
+            result.update(invocation_id=invocation, owner_task_id=owner)
+            if original is not None:
+                path, raw, identity = original
+                _archive(path.with_name("legacy-controller-manifest.json"), raw)
+                if runtime_control.read_control_bytes(path) != raw or _manifest_identity(path) != identity:
+                    raise ValueError("controller_handoff_untrusted")
+            _activate_manifest(result, snapshot)
+        else:
+            if any(result.get(key) != current[key] for key in
+                   _EXECUTION_IDENTITY):
+                raise ValueError("controller_handoff_untrusted")
+            if manifest_snapshot() != snapshot:
+                raise ValueError("controller_handoff_untrusted")
+            try:
+                _record_execution_manifest(result)
+                readback = manifest_snapshot()
+                if (readback[0] != snapshot[0] or readback[2][0] != snapshot[2][0]
+                        or _validate_manifest(json.loads(manifest_payload(readback))) != result):
+                    raise ValueError("controller_handoff_untrusted")
+            except (OSError, RuntimeError, ValueError):
+                runtime_control.request_stop("codex_review_technical_failure")
+                raise
+    except (OSError, RuntimeError) as error:
         raise ValueError("controller_handoff_untrusted") from error
+    return result
 
 
 def _record_execution_manifest(manifest: Mapping[str, object]) -> None:
-    """Copy this run's handoff into its supervisor-owned evidence directory."""
-    raw = os.environ.get("OA_CONTROLLER_EXECUTION_MANIFEST_FILE")
-    if not raw:
-        return
-    path = Path(raw)
-    base = manifest_file().parent / "executions"
-    if (not path.is_absolute() or path.parent.parent != base
-            or _RUN_ID.fullmatch(path.parent.name) is None
-            or path.name != "controller-manifest.json"):
+    path = manifest_file().parent / "executions" / manifest["invocation_id"] / "controller-manifest.json"
+    runtime_control.write_control_bytes_atomic(path, _manifest_bytes(manifest))
+    if runtime_control.read_control_bytes(path) != _manifest_bytes(manifest):
         raise ValueError("controller_execution_evidence_failed")
-    runtime_control.write_control_bytes_atomic(
-        path, (json.dumps(dict(manifest), sort_keys=True) + "\n").encode(),
-    )
 
 
 def begin(config: Mapping[str, object]) -> dict:
@@ -416,9 +586,11 @@ def begin(config: Mapping[str, object]) -> dict:
         not runtime_control.controller_active()
         or owner_pid != os.getpid()
         or not writer_inactive
+        or runtime_control.stop_requested()
     ):
         raise ValueError("controller_handoff_untrusted")
-    previous = _read_manifest()
+    snapshot = manifest_snapshot()
+    previous = _validate_manifest(json.loads(manifest_payload(snapshot))) if snapshot[0] is not None else None
     if previous is not None and (
         previous["state"] not in {"completed", "failed"}
         or previous["children_reaped"] is not True
@@ -426,11 +598,22 @@ def begin(config: Mapping[str, object]) -> dict:
     ):
         raise ValueError("controller_handoff_untrusted")
     revision, dirty = _code_state()
+    raw_path = os.environ.get('OA_CONTROLLER_EXECUTION_MANIFEST_FILE')
+    path = Path(raw_path) if raw_path else manifest_file().parent / 'executions' / secrets.token_hex(16) / 'controller-manifest.json'
+    if (not path.is_absolute() or path.parent.parent != manifest_file().parent / 'executions'
+            or path.name != 'controller-manifest.json' or _RUN_ID.fullmatch(path.parent.name) is None
+            or os.path.lexists(path)):
+        raise ValueError('controller_execution_evidence_failed')
+    owner = os.environ.get('OA_APPROVAL_OWNER_TASK_ID')
+    if owner is not None:
+        UUID(owner)
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "kind": "preaudit_controller_run_manifest",
         "state": "running",
         "run_id": secrets.token_hex(16),
+        "invocation_id": path.parent.name,
+        "owner_task_id": owner,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "completed_at": None,
         "controller_pid": os.getpid(),
@@ -450,8 +633,7 @@ def begin(config: Mapping[str, object]) -> dict:
         "restart_verified": True,
         "health": "unknown",
     }
-    _record_execution_manifest(manifest)
-    _write_manifest(manifest)
+    _activate_manifest(manifest, snapshot)
     return manifest
 
 
@@ -461,10 +643,14 @@ def finish(
     status: str,
     children_reaped: bool,
     health: str,
+    expected_snapshot: tuple | None = None,
 ) -> dict:
     if status not in {"completed", "failed"} or health not in _HEALTH:
         raise ValueError("controller_handoff_untrusted")
-    current = _read_manifest()
+    snapshot = manifest_snapshot()
+    if expected_snapshot is not None and snapshot != expected_snapshot:
+        raise ValueError("controller_handoff_untrusted")
+    current = _validate_manifest(json.loads(manifest_payload(snapshot)))
     if current != dict(manifest):
         raise ValueError("controller_handoff_untrusted")
     terminal = {
@@ -474,8 +660,7 @@ def finish(
         "children_reaped": children_reaped,
         "health": health,
     }
-    _write_manifest(terminal)
-    _record_execution_manifest(terminal)
+    _write_manifest(terminal, previous=current, snapshot=snapshot)
     return {
         "status": terminal["state"],
         "code_revision": terminal["code_revision"],
@@ -491,6 +676,17 @@ def finish(
 
 
 def status() -> dict:
+    return _status(stopped=runtime_control.stop_requested())
+
+
+def _cycle_stop_recovery_status() -> dict:
+    with runtime_control.stop_control_lease():
+        if runtime_control.stop_reason() != "controller_cycle_stop":
+            raise ValueError("controller_handoff_recovery_blocked")
+        return _status(stopped=False)
+
+
+def _status(*, stopped: bool) -> dict:
     controller_active = runtime_control.controller_active()
     writer_active = runtime_control.writer_active()
     active_request_writers = runtime_control.active_request_writers()
@@ -504,6 +700,7 @@ def status() -> dict:
     if manifest is None:
         ready = (
             manifest_valid
+            and not stopped
             and not controller_active
             and not writer_active
             and active_request_writers == 0
@@ -541,6 +738,7 @@ def status() -> dict:
         and manifest["children_reaped"] is True
         and manifest["controller_instance_id"] != CONTROLLER_INSTANCE_ID
         and not controller_active
+        and not stopped
         and not writer_active
         and active_request_writers == 0
         and lock_owner_consistent

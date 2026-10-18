@@ -45,7 +45,7 @@ python -m apps.oa_finance_preaudit.production_release \
   --original-tool-session-id "$original_tool_session_id"
 ```
 
-原执行参数来自原轮监督执行的私有回执和原工具 session；不创建替代 attempt，不使用汇总 JSON 或人工写入的终态。程序使用目标解释器及既有 `read_execution` 只读接口重新核验原 invocation、owner、tool session、manifest 和完整日志哈希。原轮必须确实 exited、终态及 children_reaped 可信，与仍保留的 rolling manifest 相符，原 controller 进程组也必须已退出。目标状态、当前授权及冻结校验的每个只读子进程必须终态并无遗留进程组；异常或取消时阻断，只清理本次入口启动的只读进程组，等待退出并核验组内无遗留进程后才返回原异常。回收无法确认时保留原异常及回收失败，不报告同步就绪。
+原执行参数来自原轮监督执行的私有回执和原工具 session；不创建替代 attempt，不使用汇总 JSON 或人工写入的终态。程序使用目标解释器及既有 `read_execution` 只读接口重新核验原 invocation、owner、tool session、manifest 和完整日志哈希。原轮必须确实 exited、终态及 children_reaped 可信，与全局入口定位的权威 execution manifest 相符，旧完整 rolling manifest 继续显式兼容，原 controller 进程组也必须已退出。目标状态、当前授权及冻结校验的每个只读子进程必须终态并无遗留进程组；异常或取消时阻断，只清理本次入口启动的只读进程组，等待退出并核验组内无遗留进程后才返回原异常。回收无法确认时保留原异常及回收失败，不报告同步就绪。
 
 未指定其他源码维护分支时，该模式只接受本用户持有、私有普通文件中的精确 `stop_requested:codex_review_technical_failure` 标记。手动停止、未知原因、Writer 未知写入停止、官方错误冷却停止及环境停止请求仍拒绝。实际原 cron 必须是 `$CODEX_HOME/automations/oa-skill/automation.toml`，未配置 CODEX_HOME 时使用 `~/.codex`；文件内 ID 必须为 `oa-skill` 且状态为 PAUSED，拒绝副本和链接替换。项目、调度、模型、提示词及并发合同仍须通过原配置门。源码、身份、授权、冻结、continuation 和 controller/global/request Writer 门禁均保持。
 
@@ -77,9 +77,9 @@ python -m apps.oa_finance_preaudit.production_release \
   --supervisor-loss-source-only YES
 ```
 
-该参数必须与 `--stopped-maintenance YES` 同时使用；不提供时仍执行原有真实终态门禁。目标自己的原回执读取器必须核验 owner、invocation、真实 tool session，以及同轮 rolling/mirror manifest 的 failed、children_reaped 和代码修订。原监督者 PID、同轮 controller PID/进程组、登记 readonly worker/pool 和全局模型槽位都必须已退出，未登记完的启动意图也拒绝。标记 closed 的模型槽位还要核对实际 PID/进程组，不能仅凭槽位状态证明回收。官方冷却记录存在时拒绝，不清冷却、不做可用性探测。
+该参数必须与 `--stopped-maintenance YES` 同时使用；不提供时仍执行原有真实终态门禁。目标自己的原回执读取器必须核验 owner、invocation、真实 tool session，以及同轮全局入口及权威 execution manifest 的绑定、failed、children_reaped 和代码修订。原监督者 PID、同轮 controller PID/进程组、登记 readonly worker/pool 和全局模型槽位都必须已退出，未登记完的启动意图也拒绝。标记 closed 的模型槽位还要核对实际 PID/进程组，不能仅凭槽位状态证明回收。官方冷却记录存在时拒绝，不清冷却、不做可用性探测。
 
-固定只读桥接仅使用已安装在目标中的校验器，绑定同轮 progress 的项目、控制器身份和 action 列表。另从目标的最新本地 state 独立核验下述历史采集取消，不把它们补入原 progress。原 execution、tool-session、rolling/mirror manifest、stdout/stderr、progress、worker/pool、模型槽位、同轮 action/state/manual receipt 及这些历史取消的 action/state/manual receipt 的文件身份和哈希在快进前后必须相同。同内容替换也阻断。日志哈希标为 `observed_after_supervisor_loss`，表示丢失监督后的现场观测，不冒充原监督者封存的 wait 留证；不输出日志正文。
+固定只读桥接仅使用已安装在目标中的校验器，绑定同轮 progress 的项目、控制器身份和 action 列表。另从目标的最新本地 state 独立核验下述历史采集取消，不把它们补入原 progress。原 execution、tool-session、全局入口、权威 execution manifest、stdout/stderr、progress、worker/pool、模型槽位、同轮 action/state/manual receipt 及这些历史取消的 action/state/manual receipt 的文件身份和哈希在快进前后必须相同。同内容替换也阻断。日志哈希标为 `observed_after_supervisor_loss`，表示丢失监督后的现场观测，不冒充原监督者封存的 wait 留证；不输出日志正文。
 
 当前身份、OA/web 认证、授权、其他冻结材料、Controller/Writer 空闲和配置门禁保持。仅源码维护允许保留已验证的历史采集取消：`material_collection_failed`、`failure_detail_code=oa_run_stopped`，完整且验证通过的 controller-scope manual receipt，write_state=not_requested，无 Writer、执行、意见、提交产物及冻结材料。不要求原 progress 登记，也不据时间相近推断属于原轮；回执将 `historical_stopped_actions` 与原 `actions` 分列，并标明 `historical_stop_attribution=not_verified`。只有这些取消造成的 `pending_failure_not_isolated` 可以留作源码维护例外；数量须与当前待办隔离及 continuation 相符。其他 controller 失败、未知写入或对账阻断仍拒绝。程序不改变原 continuation、失败 state、隔离回执或 attempt，也不把取消列入单据隔离白名单。
 

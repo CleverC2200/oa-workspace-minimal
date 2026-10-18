@@ -53,7 +53,8 @@ def test_untrusted_or_stopping_active_controller_retains_failure(state, notifica
         elif state == "invalid":
             path.write_text("{}")
         elif state == "wrong_owner":
-            controller_handoff._write_manifest({**manifest, "controller_pid": manifest["controller_pid"] + 1})
+            authority = path.parent / "executions" / manifest["invocation_id"] / "controller-manifest.json"
+            approval_guard.write(authority, {**manifest, "controller_pid": manifest["controller_pid"] + 1})
         elif state == "terminal":
             controller_handoff.finish(manifest, status="failed", children_reaped=True, health="degraded")
         elif state == "stale_progress":

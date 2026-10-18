@@ -66,6 +66,9 @@ for file in (Path(os.environ['OA_CONTROLLER_EXECUTION_MANIFEST_FILE']),root/'run
 raise SystemExit(1)'''
     if getattr(request, 'param', None) == 'user_stop':
         child = child.replace("runtime_control.request_stop('codex_review_technical_failure')", "runtime_control.request_stop()")
+    if getattr(request, "param", None) == "pointer":
+        child = child.replace("manifest['completed_at']=", "manifest.update(invocation_id=Path(os.environ['OA_CONTROLLER_EXECUTION_MANIFEST_FILE']).parent.name, owner_task_id=os.environ['OA_APPROVAL_OWNER_TASK_ID'])\nmanifest['completed_at']=")
+        child = child.replace("raise SystemExit(1)", "pointer={'schema_version':1,'kind':'preaudit_controller_execution_pointer',**{key:manifest[key] for key in ('owner_task_id','invocation_id','run_id','controller_instance_id')}}\nguard.write(root/'runtime/control/rolling-controller-manifest.json',pointer)\nraise SystemExit(1)")
     supervisor = '''import json,sys
 from pathlib import Path
 from scripts.finance_preaudit_run import supervise
@@ -276,3 +279,19 @@ def test_public_restart_recovery_keeps_actual_clear_state_when_audit_fails(resta
     assert code == 1 and result['status'] == 'blocked'
     assert result['stop_cleared'] is (phase=='cleared')
     assert (root/'runtime/stop-preaudit.flag').exists() is (phase!='cleared')
+
+
+@pytest.mark.parametrize("restart_target", ["pointer"], indirect=True)
+def test_target_interpreter_restart_preflight_accepts_one_authority(restart_target, capsys):
+    root, original, action, cron, args, live = restart_target
+    path = root / "runtime/control/rolling-controller-manifest.json"
+    pointer = path.read_bytes()
+    authority = original.file.with_name("controller-manifest.json").read_bytes()
+    assert json.loads(pointer)["kind"] == "preaudit_controller_execution_pointer"
+    assert owner_restart_recovery.main(args, check_live=live) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == "ready"
+    assert report["original_exit_code"] == 1
+    assert report["original_wait_verified"] is True
+    assert path.read_bytes() == pointer
+    assert original.file.with_name("controller-manifest.json").read_bytes() == authority
