@@ -4,6 +4,8 @@ import json
 import io
 from pathlib import Path
 import signal
+import subprocess
+import sys
 import threading
 import time
 
@@ -209,6 +211,91 @@ def test_finance_reviewer_consumes_single_json_fence(tmp_path, monkeypatch, wrap
     assert closed["action"] == "closed"
     assert closed["business_state"] == "needs_human"
     assert closed["write_state"] == "not_requested"
+
+
+@pytest.mark.parametrize("facts,payment_status,amount_status,payment,amount,gaps", [
+    (
+        ["食品订单和实付32元与来访招待明细可信对应，原票与申报均32元。"],
+        "pass", "pass", "32元食品支出与当前招待费用对应。", "按32元核销。", [],
+    ),
+    (
+        ["原订单80元与同明细原餐费票对应，收款方与销售方一致，成功实付70元、优惠10元；开票日比付款日晚一天，招待上下文一致。"],
+        "pass", "pass", "70元餐费支出与当前招待费用对应。", "按优惠后实付70元核销。", [],
+    ),
+    (
+        ["第1行经营付款80元与原餐费票同明细同日同额，招待上下文一致，收款展示名与销售方不同。",
+         "第2行食品订单实付80元、同笔退款10元，原票80元、当前申报90元，费用对应已确认。",
+         "第3行转款30元成功，但用途尚未确认；另有历史核定999元和里程读数，未提供当前里程支出和本流程适用依据。"],
+        "uncertain", "fail", "三笔净支出180元已确认，第3行30元费用对应及里程支出、适用依据待核。",
+        "第1、2行已确认可核销150元，第2行超报20元；第3行和里程费用待核，历史999元未计入。",
+        ["第3行费用对应及里程支出、本流程适用依据"],
+    ),
+], ids=["food", "order-backed-invoice-date", "known-unknown-overclaim-history"])
+def test_entertainment_worker_delivers_attribution_rule_and_preserves_preview(
+    tmp_path, monkeypatch, facts, payment_status, amount_status, payment, amount, gaps,
+):
+    from tests.finance_preaudit.test_flow_engine_entertainment import _material, _decision
+
+    project = tmp_path / "project"
+    relative_rule = Path(".agents/skills/oa-finance-preaudit/references/flows/business-entertainment.md")
+    rule = project / relative_rule
+    rule.parent.mkdir(parents=True)
+    rule.write_bytes((Path(__file__).resolve().parents[2] / relative_rule).read_bytes())
+
+    def collect(request_id, _):
+        material = _material(request_id)
+        material["declared_fields"].extend({
+            "path": f"detail[0].row[{index}].field[6]", "name": "消费事实", "value": fact,
+        } for index, fact in enumerate(facts))
+        return material
+
+    engine = flow_engine.FlowEngine(
+        root=project / "runtime/finance_preaudit_flows",
+        discover_candidates=lambda key: [{"request_id": "synthetic-attribution",
+            "workflow_key": key, "received_at": "2026-10-10T09:00:00+08:00"}],
+        collect_material=collect,
+    )
+    action = engine.next_action("business_entertainment", mode="preview")
+    action_file = Path(action["action_file"])
+    frozen_material = action_file.with_name("material.json").read_bytes()
+    decision = _decision(action)
+    decision["overall"] = "pass" if amount_status == "pass" else "needs_human"
+    decision["items"][0].update(status=payment_status, conclusion=payment, missing_evidence=gaps)
+    decision["items"][2]["conclusion"] = "当前阶段按既定策略暂不校验，OA 暂未提供预算数据。"
+    decision["items"][3].update(status=amount_status, conclusion=amount, missing_evidence=gaps)
+    script = tmp_path / "recorded-reviewer.py"
+    script.write_text(
+        "import json,sys\nfrom pathlib import Path\n"
+        "args=sys.argv[1:];prompt=sys.stdin.read()\n"
+        + f"relative={str(relative_rule)!r}\n"
+        "assert 'references/flows/business-entertainment.md' in prompt\n"
+        "rule=Path(args[args.index('--cd')+1])/relative\n"
+        + f"assert rule.read_bytes()=={rule.read_bytes()!r}\n"
+        "assert '## 支付事实与费用归属' in rule.read_text()\n"
+        + "Path(args[args.index('--output-last-message')+1]).write_text("
+        + repr(json.dumps(decision, ensure_ascii=False)) + ")\n"
+        "print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'output_tokens':5}}))\n"
+    )
+    original_popen = subprocess.Popen
+    monkeypatch.setattr(codex_review_worker.subprocess, "Popen", lambda command, **kwargs:
+                        original_popen([sys.executable, str(script), *command[1:]], **kwargs))
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "offline-placeholder")
+
+    reviewed = codex_review_worker.review({
+        "project_root": str(project), "action_file": str(action_file), "timeout_seconds": 60,
+    })
+
+    assert reviewed["status"] == "reviewed"
+    assert reviewed["decision"] == decision
+    decision_file = tmp_path / "entertainment-decision.json"
+    json_artifact.write_json_atomic(decision_file, reviewed["decision"])
+    closed = engine.complete_review(action_file, decision_file)
+    assert closed["business_state"] == decision["overall"]
+    assert closed["write_state"] == "not_requested"
+    assert json.loads(Path(closed["decision_file"]).read_text()) == decision
+    remark = Path(closed["remark_file"]).read_text()
+    assert all(item["conclusion"] in remark for item in decision["items"])
+    assert action_file.with_name("material.json").read_bytes() == frozen_material
 
 
 @pytest.mark.parametrize("period_status,period_conclusion,period_gap", [

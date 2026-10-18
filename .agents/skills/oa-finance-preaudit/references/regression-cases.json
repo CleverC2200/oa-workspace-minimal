@@ -1012,6 +1012,62 @@
       "expected_output": "第1项保留实际收款法人和开票法人的主体关系待核；第4项fail并保留核销上限90元及10元差额，整单needs_human。费用与支付范围确实未知的其他案例仍按uncertain，不猜测为金额不符",
       "failure_mode": "其他关系未知覆盖了已确认的同范围金额不符",
       "rule_ref": "flows/general-expense.md#第-4-项金额孰低核销"
+    },
+    {
+      "id": "RC-072-entertainment-sufficient-consumption-and-role-evidence",
+      "scope": "business_entertainment",
+      "audit_item": "attachment_payment_evidence;reimbursable_minimum",
+      "status": "confirmed",
+      "input_facts": [
+        "合成食品商品订单与来访招待明细及成功实付32元可信对应，原票和申报均32元",
+        "另笔经营付款80元与原餐费票稳定属于同一明细、同日同额且招待上下文一致，收款展示名与销售方不同"
+      ],
+      "incorrect_output": "因食品不是餐馆消费、收款展示名不同或缺少独立菜单，要求补已有充分依据的费用用途",
+      "expected_output": "按原资料的充分组合采用两笔正常费用；名称差异不编造为别名，也不否定可信对应，不新增同名、同日或交易号的统一门槛",
+      "failure_mode": "纠正费用归属漏判后新增无依据补件或统一限制",
+      "rule_ref": "flows/business-entertainment.md#支付事实与费用归属"
+    },
+    {
+      "id": "RC-073-entertainment-invoice-nature-does-not-prove-payment-attribution",
+      "scope": "business_entertainment",
+      "audit_item": "attachment_payment_evidence;reimbursable_minimum",
+      "status": "confirmed",
+      "input_facts": [
+        "合成经营付款65元成功，原票记载餐饮服务，但现有原资料不能确认付款购买了该服务",
+        "另笔付款40元成功，商品栏仅重复商户名，有OA发票关联字段，没有独立原消费内容"
+      ],
+      "incorrect_output": "因原票是餐费或经营名含餐饮词，确认两笔付款属于招待费用；或因费用关系未知把支付本身一并改为未知",
+      "expected_output": "保留两笔支付105元已确认；票面性质和OA关联不补足付款归属，两笔费用对应分别待核，暂不计入已确认核销部分",
+      "failure_mode": "票面或商户性质替代付款与本次费用关系，或未知覆盖已确认支付",
+      "rule_ref": "flows/business-entertainment.md#支付事实与费用归属"
+    },
+    {
+      "id": "RC-074-entertainment-current-subtotal-keeps-history-and-unknown-separate",
+      "scope": "business_entertainment",
+      "audit_item": "attachment_payment_evidence;reimbursable_minimum",
+      "status": "confirmed",
+      "input_facts": [
+        "合成第1行可信招待支出及票、申报均80元；第2行食品费用对应已确认，实付80元、同笔退款10元、原票80元、申报90元",
+        "第3行成功转款30元用途未核；另有历史核定999元和里程读数，未提供当前里程支出及本流程适用依据"
+      ],
+      "incorrect_output": "历史999元进入当前确认小计，或把已确认150元当整单最终上限；其他未知使第2行20元超报消失",
+      "expected_output": "保留三笔净支出180元；已确认可核销部分150元，第2行超报20元，第4项fail；第3行费用对应和里程支出、适用依据分别待核，历史999元不计入，整单needs_human",
+      "failure_mode": "历史处置扩大当前范围，或已确认子集、异常及未知相互覆盖",
+      "rule_ref": "flows/business-entertainment.md#支付事实与费用归属;flows/business-entertainment.md#金额与支付范围"
+    },
+    {
+      "id": "RC-075-entertainment-invoice-issue-date-keeps-order-backed-settlement",
+      "scope": "business_entertainment",
+      "audit_item": "attachment_payment_evidence;reimbursable_minimum",
+      "status": "confirmed",
+      "input_facts": [
+        "合成原平台订单80元与同明细原餐费票对应，收款方和销售方一致，成功实付70元及优惠10元明确，招待上下文一致",
+        "开票日比消费付款日晚一天，商品说明只展示平台和门店名，没有其他真实冲突"
+      ],
+      "incorrect_output": "因开票日不同或商品说明没有菜单，要求重补已经闭合的原消费和结算证明",
+      "expected_output": "消费和付款日期按对应原凭证理解，开票日期只表示开具时点；费用对应组合已闭合，优惠后70元参与同范围孰低，不增加无依据补件",
+      "failure_mode": "开票日期或展示名称覆盖已确认的订单及结算事实",
+      "rule_ref": "flows/business-entertainment.md#支付事实与费用归属;flows/business-entertainment.md#金额与支付范围"
     }
   ]
 }
