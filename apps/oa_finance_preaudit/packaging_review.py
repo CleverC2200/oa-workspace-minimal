@@ -221,39 +221,41 @@ def _observations(action: Path, source: dict, refs: list[str] | None = None, *, 
     required = set(paths if refs is None else refs)
     if not required or not required.issubset(paths):
         raise ValueError('packaging_page_coverage')
-    raw = review_context.read_input(Path(source['session_file']))
     observed = {}
-    for number, line in enumerate(raw.splitlines(), 1):
-        if number >= source['line']:
-            break
-        row = json.loads(line)
-        payload = row.get('payload', {})
-        if row.get('type') != 'response_item' or payload.get('type') not in {'function_call', 'custom_tool_call'}:
-            continue
-        args = payload.get('arguments', payload.get('input', ''))
-        image_path = None
-        if payload.get('name') in {'view_image', 'functions.view_image'}:
-            try:
-                image_path = (json.loads(args) if isinstance(args, str) else args).get('path')
-            except (ValueError, AttributeError):
+    with host_chat_review._native_path(Path(source['session_file'])).open('rb') as stream:
+        for number, raw in host_chat_review._native_lines(stream):
+            if number >= source['line']:
+                break
+            if raw is None:
                 continue
-        elif payload.get('name') in {'functions.exec', 'exec'} and isinstance(args, str):
-            image_path = _single_image_path(args)
-        if image_path not in paths.values():
-            continue
-        stamp = row.get('timestamp')
-        if not isinstance(stamp, str) or datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp() < source['dispatched_at']:
-            continue
-        _, proof = host_chat_review._native_source(Path(source['session_file']), source['session_id'], number, output=True)
-        output = proof.pop('output')
-        failed = _tool_failed(output)
-        read = not failed and _image_output(output)
-        if proof['output_line'] >= source['line'] or not (read or allow_failed and failed):
-            continue
-        proof['observation_state'] = 'read' if read else 'failed'
-        for ref, path in paths.items():
-            if path == image_path and ref in required:
-                observed[ref] = {**proof, 'page_ref': ref, 'path_sha256': hashlib.sha256(review_context.read_input(Path(path))).hexdigest()}
+            row = json.loads(raw)
+            payload = row.get('payload', {})
+            if row.get('type') != 'response_item' or payload.get('type') not in {'function_call', 'custom_tool_call'}:
+                continue
+            args = payload.get('arguments', payload.get('input', ''))
+            image_path = None
+            if payload.get('name') in {'view_image', 'functions.view_image'}:
+                try:
+                    image_path = (json.loads(args) if isinstance(args, str) else args).get('path')
+                except (ValueError, AttributeError):
+                    continue
+            elif payload.get('name') in {'functions.exec', 'exec'} and isinstance(args, str):
+                image_path = _single_image_path(args)
+            if image_path not in paths.values():
+                continue
+            stamp = row.get('timestamp')
+            if not isinstance(stamp, str) or datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp() < source['dispatched_at']:
+                continue
+            _, proof = host_chat_review._native_source(Path(source['session_file']), source['session_id'], number, output=True)
+            output = proof.pop('output')
+            failed = _tool_failed(output)
+            read = not failed and _image_output(output)
+            if proof['output_line'] >= source['line'] or not (read or allow_failed and failed):
+                continue
+            proof['observation_state'] = 'read' if read else 'failed'
+            for ref, path in paths.items():
+                if path == image_path and ref in required:
+                    observed[ref] = {**proof, 'page_ref': ref, 'path_sha256': review_context.input_sha256(Path(path))}
     if set(observed) != required:
         raise ValueError('packaging_observation_missing')
     return [observed[ref] for ref in paths if ref in required]
