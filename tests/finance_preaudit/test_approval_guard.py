@@ -319,7 +319,7 @@ def test_writer_artifacts_never_reclassified_or_replayed(tmp_path, artifact):
 
 @pytest.mark.parametrize("entry", ["rolling", "dispatcher"])
 def test_mixed_interruption_and_permanent_quarantine_restarts_only_interrupted_item(tmp_path, monkeypatch, entry):
-    from apps.oa_finance_preaudit import process_pool
+    from scripts.finance_preaudit_concurrency_probe import PoolResult, TaskOutcome
     from apps.oa_finance_preaudit import codex_review_worker as worker, production_write
     from scripts import finance_preaudit_concurrency_probe as probe
     from tests.finance_preaudit.test_reconciliation import _state
@@ -366,9 +366,9 @@ def test_mixed_interruption_and_permanent_quarantine_restarts_only_interrupted_i
             "historical_unknown_identities": [], "recover_action_files": [str(path) for path in kwargs["recovery_action_files"]]})
         assert prepared["action"] == "review_required"
         assert json.loads(Path(prepared["action_file"]).read_text())["attempt"] == 2
-        return process_pool.PoolResult(requested=count, started=count, completed=count,
+        return PoolResult(requested=count, started=count, completed=count,
             failed=0, timed_out=0, stopped=0, peak_active=1, elapsed_seconds=1,
-            outcomes=(process_pool.TaskOutcome(index=0, status="completed", value={
+            outcomes=(TaskOutcome(index=0, status="completed", value={
                 "status": "retry_pending", "error_code": "codex_review_retry_pending",
                 "token_usage": {"status": "unknown"}}),))
 

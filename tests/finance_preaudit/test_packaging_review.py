@@ -175,7 +175,7 @@ def test_packaging_receipt_records_current_deepseek_identity(tmp_path, monkeypat
 
 def test_audit_timeout_retains_events_and_reaps_real_child(tmp_path, monkeypatch):
     import sys
-    from tests.finance_preaudit.test_process_pool import _install_fake_codex_tree, _assert_fake_codex_tree_reaped
+    from tests.finance_preaudit.process_helpers import _install_fake_codex_tree, _assert_fake_codex_tree_reaped
     monkeypatch.setenv('OA_REVIEW_API_KEY', 'unit-test-key')
     path = action(tmp_path)
     packet = json.loads(path.with_name('review-packet.json').read_text())

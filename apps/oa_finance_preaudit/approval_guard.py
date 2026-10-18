@@ -394,10 +394,11 @@ def register_model(value: dict, pid: int, command: list[str]) -> None:
     write(_slot_path(value["slot"]), value)
 
 
-def models_reaped(run_id: str | None = None) -> bool:
+def models_reaped(run_id: str | None = None, *, worker: dict | None = None) -> bool:
     for index in range(MAX_MODEL_WORKERS):
         value = _slot(index)
-        if value and (run_id is None or value["run_id"] == run_id) and not _slot_gone(value):
+        if (value and (run_id is None or value["run_id"] == run_id)
+                and (worker is None or value["worker"] == worker) and not _slot_gone(value)):
             return False
     return True
 
@@ -453,7 +454,7 @@ def reap_models(*, run_id: str | None = None, worker: dict | None = None, orphan
         if not _terminate_registered(identity):
             return False
         _close_slot(value)
-    return models_reaped(run_id)
+    return models_reaped(run_id, worker=worker)
 
 
 def maintenance_writer_idle() -> bool:

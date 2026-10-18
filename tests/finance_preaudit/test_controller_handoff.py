@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from scripts.finance_preaudit_concurrency_probe import PoolResult, TaskOutcome
+
 from contextlib import redirect_stdout
 import io
 import json
@@ -11,7 +13,7 @@ import pytest
 
 from apps import json_artifact
 from apps.oa_approval import runtime_control
-from apps.oa_finance_preaudit import approval_guard, cli, controller_handoff, process_pool
+from apps.oa_finance_preaudit import approval_guard, cli, controller_handoff
 from scripts import finance_preaudit_concurrency_probe
 
 
@@ -205,7 +207,7 @@ def test_unreaped_pipeline_blocks_terminal_handoff(
             capacity=6,
             live_status=live,
             reconcile_status=lambda: _reconciliation(current[0]),
-            pipeline_runner=lambda count, capacity: process_pool.PoolResult(
+            pipeline_runner=lambda count, capacity: PoolResult(
                 requested=count,
                 started=count,
                 completed=count,
@@ -215,7 +217,7 @@ def test_unreaped_pipeline_blocks_terminal_handoff(
                 peak_active=capacity,
                 elapsed_seconds=1,
                 outcomes=tuple(
-                    process_pool.TaskOutcome(
+                    TaskOutcome(
                         index=index,
                         status="completed",
                         value={
