@@ -1,6 +1,15 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+_MAX_ORIGINAL_BYTES = 50 * 1024 * 1024
+_CLOUD_DOWNLOAD_URL = 'https://api.mypiaojia.com/invoiceApi/file/download'
 
 
 _FINANCE_FLOWS = {
@@ -71,7 +80,7 @@ def resources(request_id: str, workflow: dict, workflow_key: str, evidence: dict
     return result
 
 
-def source_for_download(request_id: str, native_file_id: str) -> dict:
+def _download_context(request_id: str, native_file_id: str):
     from apps.oa_approval import api, flow, invoice_buyers
 
     client = api.build_api({})
@@ -80,7 +89,7 @@ def source_for_download(request_id: str, native_file_id: str) -> dict:
     flow.ensure_workflow_matches(request_id, workflow, config)
     workflow_key = config['flow_key']
     if workflow_key not in _FINANCE_FLOWS or str(workflow.get('requestId')) != request_id:
-        return {}
+        return client, {}, ''
     result = invoice_buyers.read_invoice_buyers(
         client, workflow, linked_detail_only=workflow_key == 'tpm_small_marketing_fee',
         include_evidence=True,
@@ -88,10 +97,78 @@ def source_for_download(request_id: str, native_file_id: str) -> dict:
     evidence = result.get('invoice_evidence') or {}
     trusted = resources(request_id, workflow, workflow_key, evidence)
     if not any(item['id'] == native_file_id for item in trusted):
-        return {}
-    sources = [file['original_source'] for invoice in evidence['invoices']
+        return client, {}, ''
+    sources = [(file['original_source'], _positive_id(invoice.get('data_id'))) for invoice in evidence['invoices']
                for file in invoice['files'] if file.get('original_source', {}).get('native_file_id') == native_file_id]
-    return sources[0] if sources and all(source == sources[0] for source in sources) else {}
+    if sources and all(source == sources[0][0] and data_id for source, data_id in sources):
+        return client, sources[0][0], sources[0][1]
+    return client, {}, ''
+
+
+def source_for_download(request_id: str, native_file_id: str) -> dict:
+    return _download_context(request_id, native_file_id)[1]
+
+
+class _NoCloudRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ValueError('attachment_download_failed')
+
+
+def download_original(resource: dict, *, dest_dir: Path, timeout_sec: int) -> tuple[Path | None, str]:
+    from apps.oa_approval import attachments, invoice_buyers, runtime_control
+
+    request_id = str(resource.get('_workflow_request_id') or '')
+    native_file_id = str(resource.get('id') or '')
+    dest = dest_dir / attachments.deterministic_filename(resource)
+    temporary = None
+    try:
+        client, source, data_id = _download_context(request_id, native_file_id)
+        if not source or source != resource.get('_invoice_original'):
+            return None, 'resource_ownership_untrusted'
+        token_response = client.get(invoice_buyers.TOKEN_PATH)
+        token = token_response.get('token')
+        if str(token_response.get('status')) != '1' or not isinstance(token, str) or not token:
+            return None, 'attachment_access_denied'
+        if runtime_control.stop_requested():
+            return None, runtime_control.STOP_CODE
+        query = urllib.parse.urlencode({'id': source['cloud_file_id'],
+                                       'fid': source['cloud_record_id'],
+                                       'dataId': data_id, 'token': token})
+        request = urllib.request.Request(
+            _CLOUD_DOWNLOAD_URL + '?' + query,
+            headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://inc.mypiaojia.com/'},
+        )
+        with urllib.request.build_opener(_NoCloudRedirect()).open(request, timeout=max(1, timeout_sec)) as response:
+            length = response.headers.get('Content-Length')
+            if length is not None and (not length.isdecimal() or int(length) > _MAX_ORIGINAL_BYTES):
+                return None, 'attachment_content_incomplete'
+            body = response.read(_MAX_ORIGINAL_BYTES + 1)
+            if (len(body) > _MAX_ORIGINAL_BYTES or not body.startswith(b'%PDF-')
+                    or length is not None and len(body) != int(length)):
+                return None, 'attachment_content_incomplete'
+        _, current_source, current_data_id = _download_context(request_id, native_file_id)
+        if current_source != source or current_data_id != data_id:
+            return None, 'resource_ownership_untrusted'
+        url, error = attachments._normalized_download_url(resource)
+        if error or not attachments._initialize_workflow_document_context(
+                resource, url, timeout_sec=timeout_sec, initialize=False):
+            return None, 'resource_ownership_untrusted'
+        if runtime_control.stop_requested():
+            return None, runtime_control.STOP_CODE
+        with tempfile.NamedTemporaryFile(dir=dest_dir, prefix=dest.name + '.', suffix='.cloud.part', delete=False) as output:
+            temporary = Path(output.name)
+            output.write(body)
+        temporary.replace(dest)
+        return dest, ''
+    except urllib.error.HTTPError as error:
+        return None, 'attachment_access_denied' if error.code in (401, 403) else 'attachment_download_failed'
+    except attachments.rpa_session.RpaSessionError as error:
+        return None, error.code
+    except Exception:
+        return None, 'attachment_download_failed'
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def prepared_body(source: dict, resource_rows: list, prepared: dict) -> dict:

@@ -316,6 +316,9 @@ def detect_oa_download_fail_code(value: Any) -> str:
 
 def download_error_code(message: str) -> str:
     text = str(message or "").strip()
+    for code in ("resource_ownership_untrusted", "attachment_content_incomplete"):
+        if text.startswith(f"{code}:"):
+            return code
     if text.startswith(f"{ATTACHMENT_ACCESS_DENIED_CODE}:"):
         return ATTACHMENT_ACCESS_DENIED_CODE
     for code in rpa_session.FATAL_SESSION_CODES:
@@ -1085,6 +1088,12 @@ def _download_resource_direct_uncoordinated(
             retry_path, retry_error = _direct_session_cookie_download(
                 resource, url, dest_dir=dest_dir, timeout_sec=timeout_sec
             )
+            if (retry_path is None and resource.get('_invoice_original')
+                    and download_error_code(retry_error) == ATTACHMENT_ACCESS_DENIED_CODE):
+                from apps.oa_approval import invoice_originals
+
+                cloud_path, cloud_error = invoice_originals.download_original(resource, dest_dir=dest_dir, timeout_sec=timeout_sec)
+                return cloud_path, f"{cloud_error}: 关联发票原件读取失败" if cloud_error else ""
             return retry_path, retry_error or (direct_err if retry_path is None else "")
     if direct_path is not None or direct_err:
         return direct_path, direct_err
