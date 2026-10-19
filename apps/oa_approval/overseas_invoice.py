@@ -58,6 +58,7 @@ def snapshot(data: dict, resources: list[dict], *, writable: bool = True,
     _require(bool(str(data.get('requestId') or '')) and bool(str(data.get('currentNodeId') or '')), 'invoice_identity_invalid')
     if writable:
         _require(data.get('canEdit') is True, 'invoice_not_editable')
+        _require(str(data['currentNodeId']) == RPA_NODE_ID, 'invoice_node_mismatch')
     main = data.get('workflowMainTableInfo', {}).get('requestRecords')
     _require(isinstance(main, list) and len(main) == 1, 'invoice_main_invalid')
     main_values = _values(main[0])
@@ -88,8 +89,6 @@ def snapshot(data: dict, resources: list[dict], *, writable: bool = True,
             bound = [r for r in logical if r.get('_trusted_source_field_path') == path]
             if not bound and empty_fields and path in empty_fields:
                 _require(not fields['scfp'].get('fieldValue'), 'invoice_attachment_unbound')
-                if writable:
-                    _require(str(data['currentNodeId']) == RPA_NODE_ID, 'invoice_node_mismatch')
                 rows.append({'key': row_key, 'table': ti, 'row': ri, 'values': _values(record),
                              'resource_ids': [], 'invoice_empty_source': empty_fields[path]})
                 continue

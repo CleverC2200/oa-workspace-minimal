@@ -69,7 +69,7 @@ worker 与外层监督进程每 5 秒观察本地原生错误，不产生模型 
 
 review_required 只读取当前冻结包装材料，逐页直接看原图，不用 OCR、不跨版本拼证据。按[包装只读审核](../agents/packaging-review.md)调用原 packaging_review；OpenAI 加本轮 owner-task-id 并持续原生派单/心跳，按需独立复核使用另一原槽，真实观察和父语义确认通过后走 App complete 包装入口。DeepSeek 沿用独立 API key/空 CODEX_HOME、原工具回执和调用者语义门，确认后才使用原 complete-review。供应商或来源失信不回退，不重提已提交意见。
 
-包装及结束对账完成后，保留原生 list_agents 确认本轮 3 个 Agent 均无运行任务的工具来源，再 close 同轮 App exchange，主对话才结束。取消先停止派单，原生中断原 Agent 并 close，继续等待原控制器与 Writer 收尾；迟到决定拒绝，未知写入保持原回执和人工处置。
+包装完成后按[统一收尾](../agents/controller-execution.md#app-统一收尾)保存本轮 3 个 Agent 的原生中断及终态来源、原工具退出和 Writer 空闲证据，取得 `status=verified` 后再进入海外阶段。取消时停止派单并收尾原控制器，不进入海外；迟到决定拒绝，未知写入保留原回执和人工处置。
 
 ## 海外采购付款
 
