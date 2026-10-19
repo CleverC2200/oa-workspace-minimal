@@ -15,7 +15,7 @@ from apps.oa_approval.overseas_invoice import FIELDS, _require
 class InvoiceApi(OaApi):
     def submit_invoice(self, request_id: str, remark: str, details: list[dict]) -> dict:
         _require(request_id.isdigit() and int(request_id) > 0, 'invoice_request_invalid')
-        _require(isinstance(details, list) and bool(details), 'invoice_details_missing')
+        _require(isinstance(details, list), 'invoice_details_missing')
         seen = set()
         for table in details:
             _require(set(table) == {'tableDBName', 'workflowRequestTableRecords'}, 'invoice_payload_invalid')
@@ -33,9 +33,10 @@ class InvoiceApi(OaApi):
                 _require(all(set(field) == {'fieldName', 'fieldValue'} and isinstance(field['fieldValue'], str) for field in fields), 'invoice_payload_invalid')
         body = {
             'requestId': int(request_id), 'remark': writer_api._format_remark(remark),
-            'detailData': json.dumps(details, ensure_ascii=False),
             'otherParams': json.dumps({'src': 'submit', 'judgeFormMustInput': '1'}),
         }
+        if details:
+            body['detailData'] = json.dumps(details, ensure_ascii=False)
         request = urllib.request.Request(
             self.base_url + writer_api.SUBMIT_ENDPOINT,
             data=urllib.parse.urlencode(body).encode('utf-8'),

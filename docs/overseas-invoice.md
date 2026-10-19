@@ -2,6 +2,8 @@
 
 本入口与六类财务预审、包装校对分开。Agent 读取原件提取字段，脚本负责材料冻结、限定字段、独立授权及提交后核验。相关需求：[Issue #239](https://github.com/CleverC2200/oa-workspace-minimal/issues/239)。
 
+小时调度在财务、包装及原审核槽统一收尾通过后，串行调用本入口。六类财务仍只给预审意见；本流程处理发票字段及当前 RPA 节点，不执行付款。无发票分支及调度接线见 [Issue #630](https://github.com/CleverC2200/oa-workspace-minimal/issues/630)。
+
 ## 授权与运行
 
 固定工作目录为生产克隆 `oa-workspace-minimal`，使用其 `.venv/bin/python`。开发只做离线测试和只读材料分析；真实提交要求生产干净 `main`。发布及生产同步仍按 [CONTRIBUTING](../CONTRIBUTING.md#开发与生产隔离及发布) 单独执行。
@@ -13,10 +15,30 @@
 ```bash
 .venv/bin/python -m scripts.overseas_invoice authorize --confirm-write YES
 .venv/bin/python -m scripts.overseas_invoice status
+.venv/bin/python -m scripts.overseas_invoice pending
 .venv/bin/python -m scripts.overseas_invoice collect --request-id REQUEST_ID
 ```
 
 `collect` 默认只读 OA；本地返回一个随机 attempt 和材料文件，下载限于当前明细 `scfp` 已可靠绑定的 PDF/PNG/JPEG。每次读取绕过附件缓存，提交前重新下载核验 SHA256。材料和提交计划均使用本地 OA 密钥签名，但不将密钥写入文件。材料不提交 Git。
+
+`pending` 仅返回当前执行身份的海外采购流程，按接收时间、请求 ID 排序，同时显示该请求是否已有提交回执。已有 `unknown` 或已提交回执但仍在待办时，保留原回执并转人工核对，不重新发送。
+
+### 无发票与混合明细
+
+用户已确认：此流程未上传发票时保留原字段，直接提交当前 RPA 节点。部署后，具有本范围授权的生产任务使用下面的独立授权选项启用该分支；旧授权默认不包含无发票提交：
+
+```bash
+.venv/bin/python -m scripts.overseas_invoice authorize --confirm-write YES --allow-no-invoice YES
+```
+
+`collect` 通过精确请求、主表 `formtable_main_1295` 及明细 `recordOrder` 关联只读源值。只有 API 无非空附件引用或 HTML 冲突，且唯一当前明细的 `scfp` 源值确为 NULL 时，才将 `invoice_empty_source` 随该明细冻结。显示占位或数据库读取失败保持未确认。混合明细分别绑定原件或空来源，只回填有发票行；全部无发票时材料的 `attachments=[]`。
+
+```bash
+.venv/bin/python -m scripts.overseas_invoice freeze --attempt ATTEMPT --no-invoice
+.venv/bin/python -m scripts.overseas_invoice submit --attempt ATTEMPT --confirm-write YES
+```
+
+无发票计划仅适用于 RPA 预审节点。提交前重新核对空来源和当前身份、节点、全部字段；只提交节点，不发送 `mainData` 或 `detailData`，并启用原生必填检查。节点操作组缺失等 OA 配置错误仍按实际提交失败/未知结果保留，不改配节点、不自动重试。无发票与混合明细均要求 `no_invoice_enabled=true`。
 
 使用 [独立技能](../.agents/skills/oa-overseas-invoice/SKILL.md) 阅读原件后，将识别结果写入本地 JSON。下例只说明结构，资源 ID、摘要、页码、原文和值必须从本次材料及原件取得：
 

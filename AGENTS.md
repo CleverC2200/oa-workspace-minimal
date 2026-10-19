@@ -21,7 +21,7 @@
 - 查询或修改 OA 接口调用时，优先查阅[泛微 E9 官方后端接口文档](https://e-cloudstore.com/ec/api/applist/index.html#/)，以对应接口的参数说明和展开示例为依据；提交及发票回填的已核实合同见 [OA 官方接口入口](docs/agents/oa-api.md)。
 
 - 用户要求排查、修复或清理隔离/历史失败时，安全止损与原会话收尾优先；排错先查 [Bug 快速索引](docs/bugs/README.md) 和匹配的 Issue，再读[隔离排障与恢复](docs/agents/quarantine-repair.md)。同轮追加发生记录，根因未明只标相关；记录与关闭标准见 [Bug 记录规范](docs/agents/bug-ledger.md)。生产隔离是止损，开发排障须继续诊断、回测并在已有同范围授权内显式恢复；隔离成功或普通队列为空不代表修复完成。
-- 海外采购付款的发票识别及字段回填使用 `.agents/skills/oa-overseas-invoice/SKILL.md`，独立授权与单据级提交，不进入财务预审滚动队列。
+- 海外采购付款（含权威确认无发票时保留字段并提交当前 RPA 节点）使用 `.agents/skills/oa-overseas-invoice/SKILL.md`，独立授权与单据级提交；小时调度按 `docs/runbooks/hourly-production.md` 串行处理，不进入六类财务滚动队列。
 - 实际单据预审使用 `.agents/skills/oa-finance-preaudit/SKILL.md`。开发结果结构读 [.agents/skills/oa-finance-preaudit/references/flow-engine-contract.md](.agents/skills/oa-finance-preaudit/references/flow-engine-contract.md)；证据规则读 [.agents/skills/oa-finance-preaudit/references/observation-contract.md](.agents/skills/oa-finance-preaudit/references/observation-contract.md)；流程规则经 [result-contract.md](.agents/skills/oa-finance-preaudit/references/result-contract.md) 只选择匹配流程。开发和测试不执行真实单据 next-action 或 complete-review。
 - 创建、更新 GitHub Issue 或拆分需求、依赖与验收：读 [Issue 追踪](docs/agents/issue-tracker.md)；设置工作状态或分类标签时再读 [标签规范](docs/agents/triage-labels.md)。
 - 准备提交、PR 或调整交付规则：读 `CONTRIBUTING.md` 中对应的“分支与提交”“Pull Request”或“验证层级”；涉及发布或生产同步时按上方发布入口读取。
