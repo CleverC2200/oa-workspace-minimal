@@ -87,7 +87,6 @@ def frozen_finance_action(tmp_path, monkeypatch, request):
         material = _travel_material_with_attachment(request, root)
         page = image(root / 'prepared', 'evidence.png', **dimensions)
         if tiff_frames is not None:
-            # Keep the existing filename to exercise actual-format detection.
             tiff_image(page, frame_count=tiff_frames)
         material['prepared']['images'][0].update(
             content_sha256=hashlib.sha256(page.read_bytes()).hexdigest(), owner_detail_id='row-2')
