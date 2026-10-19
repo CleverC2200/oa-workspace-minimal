@@ -1,6 +1,6 @@
 # 小时生产调度手册
 
-本手册与 `config/automations/oa-skill-prompt.txt` 是待发布的调度配置候选。启用前须按 [发布约定](../../CONTRIBUTING.md#开发与生产隔离及发布) 完成代码及手册发布、生产同步和只读核验，再通过原生 automation_update 更新现有自动化并回读。变更默认供应商时，先按[默认供应商迁移](production-source-release.md#默认供应商迁移)更新仍暂停的原 cron 提示词，使同步前的候选配置门可核验；源码同步失败时保持暂停。当前本地文件不表示生产已经加载。保留实际外层模型、推理级别、频率、状态、通知偏好、项目和目录；业务审核默认 model=host-current-chat reasoning_effort=unknown model_provider=openai service_tier=unknown transport=host_chat。外层调度保留 scheduler_model=gpt-6.1-sol scheduler_reasoning_effort=medium。OpenAI 审核由本轮固定 3 个 App 子 Agent 承载，复用原对话，不启动 OpenAI 审核 CLI；显式选择 DeepSeek 时通过 Responses API 使用 OA_REVIEW_API_KEY，requires_openai_auth=false，CODEX_HOME 按调用隔离。不调用 codex login、不复制认证、不改全局配置。外层调度继续使用现有原生 OpenAI 认证。历史回执保留原供应商、模型和推理身份，不改写为当前配置。
+本手册与 `config/automations/oa-skill-prompt.txt` 是待发布的调度配置候选。启用前须按 [发布约定](../../CONTRIBUTING.md#开发与生产隔离及发布) 完成代码及手册发布、生产同步和只读核验，再通过原生 automation_update 更新现有自动化并回读。海外阶段的提示词可先更新仍暂停的原 cron；入口与独立授权未部署时保持暂停，并在能力检查处阻断，不将配置更新视为生产能力已上线。变更默认供应商时，先按[默认供应商迁移](production-source-release.md#默认供应商迁移)更新仍暂停的原 cron 提示词，使同步前的候选配置门可核验；源码同步失败时保持暂停。当前本地文件不表示生产已经加载。保留实际外层模型、推理级别、频率、状态、通知偏好、项目和目录；业务审核默认 model=host-current-chat reasoning_effort=unknown model_provider=openai service_tier=unknown transport=host_chat。外层调度保留 scheduler_model=gpt-6.1-sol scheduler_reasoning_effort=medium。OpenAI 审核由本轮固定 3 个 App 子 Agent 承载，复用原对话，不启动 OpenAI 审核 CLI；显式选择 DeepSeek 时通过 Responses API 使用 OA_REVIEW_API_KEY，requires_openai_auth=false，CODEX_HOME 按调用隔离。不调用 codex login、不复制认证、不改全局配置。外层调度继续使用现有原生 OpenAI 认证。历史回执保留原供应商、模型和推理身份，不改写为当前配置。
 
 每轮必读“每轮启动与实时对账”；结束必读“结束对账与超期”和“清窗与留存”。其他章节仅在对应条件出现时读取，且原安全边界始终适用。
 
@@ -15,7 +15,7 @@ status_dir=$(mktemp -d /tmp/oa-status.XXXXXX) &&
 .venv/bin/python -m apps.oa_finance_preaudit.cli status --check-live --reconcile --summary --output-file "$status_dir/status.json"
 完整保留原 session_id、exit_code 和输出；运行中使用原 ID 的 write_stdin 等待，不把工具等待窗口当业务超时。仅在 exit_code=0 后解析终态：stdout 保留原安全门和计数，完整 JSON 已保存到 status_file.path，并返回字节数和 SHA-256。明细的 display_truncated=true 只表示未在界面展开，不代表待办或人工核对项为零；按需校验同一文件的字节数/哈希，再分字段、小批量读取全部必要明细，不将整份文件重新打印。stdout 若仍被宿主截断，从本次已知且确认成功的文件提取门禁，不为补读重复查询 OA。原会话、文件或校验结果不可信仍停止，不用部分数据放行。所有身份、授权、continuation、锁、Writer 和交接安全判断保持原要求。
 
-启动前发现正常活动控制器：只有 running 清单、当前代码一致、锁所有者一致、restart 已验证且 monitoring_action=wait_for_current_run 时，跳过本轮，不发故障提醒、不进入包装、不清故障窗口。已经由本任务启动的控制器仍归本任务收尾，后续 active/skipped 不能当成他人的运行。
+启动前发现正常活动控制器：只有 running 清单、当前代码一致、锁所有者一致、restart 已验证且 monitoring_action=wait_for_current_run 时，跳过本轮，不发故障提醒、不进入包装或海外、不清故障窗口。已经由本任务启动的控制器仍归本任务收尾，后续 active/skipped 不能当成他人的运行。
 
 继续须凭据、OA 接口与专用浏览器会话正常、执行身份 verified、授权与冻结可信、所有控制器和 Writer 空闲、上一轮终态及子进程回收可信。continuation 须 status=ready、blocking_reasons={}、isolated_pending为非负整数且等于pending_quarantined、scope与计数一致。code_matches_current=false 若只表示已终态旧版本清单，且当前 Git干净同步、ready_for_start=true、children_reaped=true、restart_verified=true，其余门禁可信，可由 fresh process加载新版；不复用旧进程。不因笼统 degraded 或可信隔离数量停止其他待办。
 
@@ -45,7 +45,7 @@ worker 与外层监督进程每 5 秒观察本地原生错误，不产生模型 
 
 `review-process-*.json` 保留原诊断，并分别记录实际停止请求与进程退出的观测时间，未观测到的时间保留 null。旧诊断和早先 launch 的证据不改写；文件冲突或失信保持阻断。
 
-只有所有登记的只读进程已回收、Writer 空闲、控制器维护租约可信，才撤销本轮未写入动作的旧授权并保存中断证据，OA 待办不变。冷却结束后的下一轮通过原身份、授权、待办/已办和冻结门后，用新 attempt 重新读取当前材料；不续跑旧审核，不复用旧决定。Writer 边界、决定/提交文件或未知写入存在时不自动恢复。此技术中断恢复独立于原“首 attempt 一次”隔离恢复，后者限制不变。到期只清除精确的官方冷却停止标记，不清人工、损坏或未知写入停止门。skipped/blocked/官方冷却停止不进入包装、清窗或程序修复派单。
+只有所有登记的只读进程已回收、Writer 空闲、控制器维护租约可信，才撤销本轮未写入动作的旧授权并保存中断证据，OA 待办不变。冷却结束后的下一轮通过原身份、授权、待办/已办和冻结门后，用新 attempt 重新读取当前材料；不续跑旧审核，不复用旧决定。Writer 边界、决定/提交文件或未知写入存在时不自动恢复。此技术中断恢复独立于原“首 attempt 一次”隔离恢复，后者限制不变。到期只清除精确的官方冷却停止标记，不清人工、损坏或未知写入停止门。skipped/blocked/官方冷却停止不进入包装、海外、清窗或程序修复派单。
 
 保留原工具会话并等待真实终态。需要进度时，按[原执行回执](../agents/controller-execution.md#只读进度等待与终态取回)使用同一 owner_task_id、invocation_id、receipt_file 的 `finance_preaudit_run --progress`；已绑定工具 ID 时同时精确核对。它不查询 OA、不启动或停止控制器，也不授权包装、恢复、清窗或留存清理。回执等待、清单未收尾与 children_reaped=false 是运行期状态，不按固定静默时长判断故障。归属、锁、代码、进程或回执证据失信仍转人工核对，不认领或启动另一控制器。
 
@@ -71,6 +71,14 @@ review_required 只读取当前冻结包装材料，逐页直接看原图，不�
 
 包装及结束对账完成后，保留原生 list_agents 确认本轮 3 个 Agent 均无运行任务的工具来源，再 close 同轮 App exchange，主对话才结束。取消先停止派单，原生中断原 Agent 并 close，继续等待原控制器与 Writer 收尾；迟到决定拒绝，未知写入保持原回执和人工处置。
 
+## 海外采购付款
+
+财务原 session 及回执可信正常终态、包装完成，且 OpenAI 已按[统一收尾](../agents/controller-execution.md#app-统一收尾)取得 `status=verified`（DeepSeek 对应原进程已回收）、全部 Controller/Writer 空闲、停止门与新鲜结束门禁可信后，主对话进入[海外采购发票技能](../../.agents/skills/oa-overseas-invoice/SKILL.md)。这是与六类财务队列分开的串行阶段，不新增审核槽。
+
+先运行 `scripts.overseas_invoice status` 核对四项入口能力及独立授权；`write_enabled`、`no_invoice_enabled` 均应为 true。缺少能力或授权时报告待部署/待启用，不通过 UI、直接接口或改材料绕过。使用 `pending` 返回的当前身份和 FIFO 顺序逐单采集；已有回执的待办先保留并报告冲突，不重新发送。用户已授权该流程有发票时识别回填，无发票时保持字段并提交当前 RPA 节点；具体识别、空来源和命令只以[执行说明](../overseas-invoice.md)为准。
+
+成功要求字段回读一致、已办命中且待办消失。`unknown`、中断或回读冲突停止海外阶段，保留原回执，仅使用只读 `postcheck` 核对，不重试。流程节点配置错误需要管理员处理，不替换流程节点或操作者。海外字段、提交及后查按独立回执统计；财务完成、网页关闭或待办减少均不代替海外成功证据。结束清窗前核对本阶段无未知写入或未完成处置。
+
 ## 结束对账与超期
 
 结束按前述文件输出方式重新取得完整实时对账，分别统计有实际提交/后查回执的完成、恢复、人工交接、隔离、未领取、当前未决写入与不支持流程。pending_dispositions 按当前 RPA received_at计龄；已有后续失败转 manual_takeover，默认责任目标绑定现有告警接收人。未经处理人实际确认，不调用 case_recovery --confirm-takeover YES、不假称已接管。超出 escalation_due_at 或 resolution_due_at、4小时仍无人接管、同类整轮故障连续2轮，报告处理目标、具体下一步与期限；存在真实超期时调用已发布 session_alert --error-code preaudit_pending_overdue --confirm-send YES 一次。提醒不阻断其他可信处理、不恢复单据。owner unconfigured 或绑定配置变化必须明确报告，不能编造负责人或改配新接收人。
@@ -81,7 +89,7 @@ review_required 只读取当前冻结包装材料，逐页直接看原图，不�
 
 ## 清窗与留存
 
-只有财务、包装、结束门禁全部可信，无当前隔离、未决写入或超期处置时，才用现行 --clear-production --confirm-recovered YES结束生产故障窗口。清除只改变窗口，不改变单据或回执。prune 仅在原控制器终态和全部Writer空闲后执行；retention_plan_invalid保留证据，按controller_failed映射提醒，不手工删除运行记录。
+只有财务、包装、海外、结束门禁全部可信，无当前隔离、未决写入或超期处置时，才用现行 --clear-production --confirm-recovered YES结束生产故障窗口。清除只改变窗口，不改变单据或回执。prune 仅在原控制器终态和全部Writer空闲后执行；retention_plan_invalid保留证据，按controller_failed映射提醒，不手工删除运行记录。
 
 ## 程序故障派单
 

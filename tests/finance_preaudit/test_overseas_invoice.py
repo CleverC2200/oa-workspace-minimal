@@ -278,9 +278,13 @@ def test_transport_uses_only_official_detail_payload(monkeypatch):
     assert set(body) == {'requestId', 'remark', 'detailData', 'otherParams'}
     assert json.loads(body['detailData'][0]) == details
     assert json.loads(body['otherParams'][0]) == {'src': 'submit', 'judgeFormMustInput': '1'}
+    assert api.submit_invoice('901', '未上传发票，原值保留', [])['code'] == 'SUCCESS'
+    empty_body = parse_qs(request.call_args.args[0].data.decode())
+    assert set(empty_body) == {'requestId', 'remark', 'otherParams'}
+    assert json.loads(empty_body['otherParams'][0]) == {'src': 'submit', 'judgeFormMustInput': '1'}
     details[0]['deleteAll'] = '1'
     with pytest.raises(ValueError): api.submit_invoice('901', '识别完成', details)
-    assert request.call_count == 1
+    assert request.call_count == 2
 
 
 def test_fresh_download_never_reads_cache(tmp_path, monkeypatch):

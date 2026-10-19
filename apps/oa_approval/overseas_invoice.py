@@ -13,10 +13,11 @@ import secrets
 import time
 from typing import Callable
 
-from apps.oa_approval import evidence_packet, flow, runtime_control
+from apps.oa_approval import evidence_packet, flow, official_sql, runtime_control
 
 WORKFLOW_ID = '199521'
 WORKFLOW_NAME = '海外采购付款流程（Application Process for Overseas Purchase Payment Request）'
+RPA_NODE_ID = '223128'
 FIELDS = ('fpje', 'fphm', 'fpdqr')
 LABELS = {'fpje': '发票金额', 'fphm': '发票号码', 'fpdqr': '发票到期日'}
 
@@ -50,7 +51,8 @@ def _values(record: dict) -> dict:
     return {name: field['fieldValue'] for name, field in _fields(record).items()}
 
 
-def snapshot(data: dict, resources: list[dict], *, writable: bool = True) -> dict:
+def snapshot(data: dict, resources: list[dict], *, writable: bool = True,
+             empty_fields: dict | None = None) -> dict:
     identity = flow.workflow_identity(data)
     _require(identity == {'workflow_id': WORKFLOW_ID, 'workflow_name': WORKFLOW_NAME}, 'invoice_workflow_mismatch')
     _require(bool(str(data.get('requestId') or '')) and bool(str(data.get('currentNodeId') or '')), 'invoice_identity_invalid')
@@ -81,11 +83,18 @@ def snapshot(data: dict, resources: list[dict], *, writable: bool = True) -> dic
                 rows.append({'key': row_key, 'table': ti, 'row': ri, 'values': _values(record), 'resource_ids': []})
                 continue
             _require(set(FIELDS).issubset(fields), 'invoice_fields_missing')
-            if writable:
-                _require(all(fields[k].get('edit') is True for k in FIELDS), 'invoice_field_not_editable')
             indexes = [i for i, f in enumerate(record['workflowRequestTableFields']) if f['fieldName'] == 'scfp']
             path = f'detail[{ti}].row[{ri}].field[{indexes[0]}]'
             bound = [r for r in logical if r.get('_trusted_source_field_path') == path]
+            if not bound and empty_fields and path in empty_fields:
+                _require(not fields['scfp'].get('fieldValue'), 'invoice_attachment_unbound')
+                if writable:
+                    _require(str(data['currentNodeId']) == RPA_NODE_ID, 'invoice_node_mismatch')
+                rows.append({'key': row_key, 'table': ti, 'row': ri, 'values': _values(record),
+                             'resource_ids': [], 'invoice_empty_source': empty_fields[path]})
+                continue
+            if writable:
+                _require(all(fields[k].get('edit') is True for k in FIELDS), 'invoice_field_not_editable')
             _require(bool(bound), 'invoice_attachment_unbound')
             ids = []
             for resource in bound:
@@ -98,7 +107,8 @@ def snapshot(data: dict, resources: list[dict], *, writable: bool = True) -> dic
             raw_ids = str(fields['scfp']['fieldValue'] or '').split(',')
             _require(len(ids) == 1 and len(raw_ids) == 1, 'invoice_multiple_attachments_need_mapping')
             rows.append({'key': row_key, 'table': ti, 'row': ri, 'values': _values(record), 'resource_ids': ids})
-    _require(bool(selected), 'invoice_attachments_missing')
+    _require(bool(selected) or any(row.get('invoice_empty_source') for row in rows),
+             'invoice_attachments_missing')
     return {
         'request_id': str(data['requestId']), 'workflow_id': WORKFLOW_ID,
         'node_id': str(data['currentNodeId']), 'last_operate_time': data.get('lastOperateTime'),
@@ -120,6 +130,10 @@ def build_plan(material: dict, recognition: dict) -> dict:
     _require(isinstance(invoices, list), 'invoice_recognition_invalid')
     originals = {a['resource_id']: a for a in material['attachments']}
     _require(len(invoices) == len(originals), 'invoice_recognition_incomplete')
+    if not originals:
+        _require(any(row.get('invoice_empty_source') for row in material['snapshot']['rows']),
+                 'invoice_attachments_missing')
+        return {'updates': [], 'remark': '未上传发票，保留原字段并提交当前 RPA 节点。'}
     by_id, updates, missing = {}, [], []
     for invoice in invoices:
         _require(isinstance(invoice, dict) and set(invoice) == {'resource_id', 'sha256', 'currency', *FIELDS}, 'invoice_recognition_invalid')
@@ -165,6 +179,8 @@ def build_plan(material: dict, recognition: dict) -> dict:
     remark = '已识别上传发票并回填可确认字段。'
     if missing:
         remark += '部分发票未明确列出' + '、'.join(LABELS[k] for k in FIELDS if k in missing) + '，原值保留。'
+    if any(row.get('invoice_empty_source') for row in material['snapshot']['rows']):
+        remark += '无发票明细保留原字段。'
     return {'updates': updates, 'remark': remark}
 
 
@@ -256,16 +272,45 @@ class InvoiceFlow:
         _require(row.get('workflow_id') == WORKFLOW_ID and row.get('workflow_name') == WORKFLOW_NAME and row.get('operator_id') == self.actor_id and bool(row.get('received_at')), 'invoice_identity_mismatch')
         return {k: row[k] for k in ('request_id', 'workflow_id', 'workflow_name', 'operator_id', 'received_at')}
 
-    def authorize(self, *, confirm: str) -> None:
+    def pending(self) -> list[dict]:
+        result, seen = [], set()
+        for row in self.api.pending_rows():
+            if row.get('workflow_id') != WORKFLOW_ID and row.get('workflow_name') != WORKFLOW_NAME:
+                continue
+            request_id = row.get('request_id')
+            _require(isinstance(request_id, str) and request_id.isdigit() and int(request_id) > 0
+                     and request_id not in seen, 'invoice_pending_not_unique')
+            _require(row.get('workflow_id') == WORKFLOW_ID and row.get('workflow_name') == WORKFLOW_NAME
+                     and row.get('operator_id') == self.actor_id and bool(row.get('received_at')),
+                     'invoice_identity_mismatch')
+            seen.add(request_id)
+            journal = self.root / 'receipts' / (digest(request_id) + '.json')
+            result.append({**{k: row[k] for k in ('request_id', 'workflow_id', 'workflow_name', 'received_at')},
+                           'receipt_status': self._read(journal)['status'] if journal.exists() else None})
+        return sorted(result, key=lambda row: (row['received_at'], int(row['request_id'])))
+
+    def _snapshot(self, data: dict, resources: list[dict], *, writable: bool = True) -> dict:
+        _require(flow.workflow_identity(data) == {'workflow_id': WORKFLOW_ID, 'workflow_name': WORKFLOW_NAME},
+                 'invoice_workflow_mismatch')
+        empty_fields = official_sql.confirmed_empty_attachment_fields(
+            data, request_id=str(data.get('requestId') or ''), workflow_key='overseas_invoice')
+        return snapshot(data, resources, writable=writable, empty_fields=empty_fields)
+
+    def authorize(self, *, confirm: str, allow_no_invoice: bool = False) -> None:
         _require(confirm == 'YES', 'invoice_confirmation_required')
+        _require(type(allow_no_invoice) is bool, 'invoice_authorization_invalid')
         policy = {'kind': 'overseas_invoice_write_policy', 'workflow_id': WORKFLOW_ID,
                   'actor_id': self.actor_id, 'fields': list(FIELDS), 'enabled': True}
+        if allow_no_invoice:
+            policy['allow_no_invoice'] = True
         runtime_control.write_control_bytes_atomic(self.root / 'write-policy.json', _json(policy))
 
     def _policy(self) -> dict:
         try:
             policy = json.loads(runtime_control.read_control_bytes(self.root / 'write-policy.json') or b'null')
-            _require(isinstance(policy, dict) and set(policy) == {'kind', 'workflow_id', 'actor_id', 'fields', 'enabled'}, 'invoice_authorization_invalid')
+            keys = {'kind', 'workflow_id', 'actor_id', 'fields', 'enabled'}
+            _require(isinstance(policy, dict) and set(policy) in (keys, keys | {'allow_no_invoice'})
+                     and type(policy.get('allow_no_invoice', False)) is bool, 'invoice_authorization_invalid')
             _require(policy['kind'] == 'overseas_invoice_write_policy' and policy['workflow_id'] == WORKFLOW_ID and policy['actor_id'] == self.actor_id and policy['fields'] == list(FIELDS) and policy['enabled'] is True, 'invoice_authorization_invalid')
             return policy
         except (TypeError, RuntimeError, json.JSONDecodeError):
@@ -276,13 +321,13 @@ class InvoiceFlow:
         _require(isinstance(request_id, str) and request_id.isdigit(), 'invoice_request_invalid')
         pending = self._pending(request_id)
         data, resources = self.api.request_context(request_id)
-        snap = snapshot(data, resources)
+        snap = self._snapshot(data, resources)
         _require(snap['request_id'] == request_id, 'invoice_identity_mismatch')
         attempt = secrets.token_hex(16)
         directory = self._attempt(attempt)
         selected = [r for r in evidence_packet.logical_attachment_resources(data, resources)
                     if str(r.get('id')) in {str(s['id']) for s in snap['resources']}]
-        files = self.download(selected, directory / 'attachments')
+        files = self.download(selected, directory / 'attachments') if selected else []
         frozen = self._freeze_files(directory, files)
         _require({a['resource_id'] for a in frozen} == {str(r['id']) for r in snap['resources']}, 'invoice_download_incomplete')
         material = {'kind': 'overseas_invoice_material', 'attempt': attempt, 'pending': pending,
@@ -328,7 +373,7 @@ class InvoiceFlow:
     def _postcheck(self, material: dict, expected: dict) -> dict:
         request_id = material['snapshot']['request_id']
         current, resources = self.api.request_context(request_id)
-        after = snapshot(current, resources, writable=False)
+        after = self._snapshot(current, resources, writable=False)
         _require(after['request_id'] == request_id, 'invoice_identity_mismatch')
         pending = [r for r in self.api.pending_rows() if r.get('request_id') == request_id]
         handled = [r for r in self.api.handled_rows(max_pages=None) if r.get('request_id') == request_id]
@@ -345,7 +390,7 @@ class InvoiceFlow:
             selected = [r for r in evidence_packet.logical_attachment_resources(current, resources)
                         if str(r.get('id')) in selected_ids]
             directory = self._attempt(material['attempt']) / ('postcheck-' + secrets.token_hex(8))
-            fresh = self._freeze_files(directory, self.download(selected, directory / 'attachments'))
+            fresh = self._freeze_files(directory, self.download(selected, directory / 'attachments') if selected else [])
             evidence['attachments_digest'] = digest(fresh)
             evidence['attachments_match'] = (
                 {a['resource_id']: a['sha256'] for a in fresh}
@@ -389,6 +434,7 @@ class InvoiceFlow:
         _require(confirm == 'YES', 'invoice_confirmation_required')
         material = self.read_material(attempt)
         request_id = material['snapshot']['request_id']
+        _require(not runtime_control.controller_active(), 'invoice_controller_active')
         # One journal per request survives re-collection and copied attempts. No automatic retry.
         journal = self.root / 'receipts' / (digest(request_id) + '.json')
         with runtime_control.request_writer_lease(request_id), runtime_control.global_writer_lease():
@@ -397,7 +443,10 @@ class InvoiceFlow:
                 _require(receipt['attempt'] == attempt, 'invoice_already_attempted')
                 return receipt
             _require(not runtime_control.stop_requested(), 'invoice_stopped')
+            _require(not runtime_control.controller_active(), 'invoice_controller_active')
             policy = self._policy()
+            _require(not any(row.get('invoice_empty_source') for row in material['snapshot']['rows'])
+                     or policy.get('allow_no_invoice') is True, 'invoice_no_invoice_not_authorized')
             envelope = self._read(self._attempt(attempt) / 'plan.json')
             _require(envelope['attempt'] == attempt and envelope['material_digest'] == digest(material), 'invoice_artifact_invalid')
             expires = datetime.fromisoformat(envelope['expires_at'])
@@ -406,18 +455,19 @@ class InvoiceFlow:
             _require(plan == envelope['plan'], 'invoice_artifact_invalid')
             _require(self._pending(request_id) == material['pending'], 'invoice_target_changed')
             data, resources = self.api.request_context(request_id)
-            _require(stable_snapshot(snapshot(data, resources)) == stable_snapshot(material['snapshot']), 'invoice_target_changed')
+            _require(stable_snapshot(self._snapshot(data, resources)) == stable_snapshot(material['snapshot']), 'invoice_target_changed')
             # Fresh download: the injected host downloader must not reuse the attachment cache.
             selected_ids = {a['resource_id'] for a in material['attachments']}
             selected = [r for r in evidence_packet.logical_attachment_resources(data, resources) if str(r.get('id')) in selected_ids]
             directory = self._attempt(attempt) / ('recheck-' + secrets.token_hex(8))
-            fresh = self._freeze_files(directory, self.download(selected, directory / 'attachments'))
+            fresh = self._freeze_files(directory, self.download(selected, directory / 'attachments') if selected else [])
             _require({a['resource_id']: a['sha256'] for a in fresh} == {a['resource_id']: a['sha256'] for a in material['attachments']}, 'invoice_attachment_changed')
             updated = patched_workflow(data, material['snapshot'], plan)
             _require(self._pending(request_id) == material['pending'] and self._policy() == policy, 'invoice_target_changed')
             latest_data, latest_resources = self.api.request_context(request_id)
-            _require(stable_snapshot(snapshot(latest_data, latest_resources)) == stable_snapshot(material['snapshot']), 'invoice_target_changed')
+            _require(stable_snapshot(self._snapshot(latest_data, latest_resources)) == stable_snapshot(material['snapshot']), 'invoice_target_changed')
             _require(not runtime_control.stop_requested(), 'invoice_stopped')
+            _require(not runtime_control.controller_active(), 'invoice_controller_active')
             receipt = {'kind': 'overseas_invoice_receipt', 'attempt': attempt,
                        'plan_digest': digest(envelope), 'status': 'unknown', 'reason': 'submission_started'}
             self._write(journal, receipt)
@@ -427,7 +477,7 @@ class InvoiceFlow:
                     receipt['reason'] = 'submission_rejected_or_unknown'
                 else:
                     receipt['reason'] = 'postcheck_failed'
-                    expected = snapshot(updated, resources)
+                    expected = self._snapshot(updated, resources)
                     for check in range(3):
                         if self._postcheck(material, expected)['confirmed']:
                             receipt.update(status='submitted', reason=None)
