@@ -186,14 +186,15 @@ def compress_image(source: Path, *, output_dir: Path | None = None, max_dimensio
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description='Create a bounded image reading copy while preserving the source.')
-    parser.add_argument('--file', type=Path, required=True)
-    parser.add_argument('--output-dir', type=Path)
-    parser.add_argument('--max-dimension', type=int, default=8192)
-    parser.add_argument('--max-pixels', type=int, default=16_000_000)
-    parser.add_argument('--max-bytes', type=int, default=8 * 1024 * 1024)
-    parser.add_argument('--quality', type=int, default=90)
-    parser.add_argument('--timeout-seconds', type=float, default=60)
+    parser = argparse.ArgumentParser(description='Create a bounded image reading copy while preserving the source.',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--file', type=Path, required=True, help='Local static source image; source remains unchanged.')
+    parser.add_argument('--output-dir', type=Path, help='New private directory outside frozen attempts.')
+    parser.add_argument('--max-dimension', type=int, default=8192, help='Longest output edge, 1..8192 pixels.')
+    parser.add_argument('--max-pixels', type=int, default=16_000_000, help='Output pixel count, 1..16000000.')
+    parser.add_argument('--max-bytes', type=int, default=8 * 1024 * 1024, help='Output bytes, 1024..33554432.')
+    parser.add_argument('--quality', type=int, default=90, help='JPEG encoding quality, 40..95.')
+    parser.add_argument('--timeout-seconds', type=float, default=60, help='Worker wait limit, greater than 0 and at most 60.')
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.worker:
