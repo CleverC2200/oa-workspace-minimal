@@ -712,10 +712,10 @@ def test_cancel_closes_registered_round_and_never_terminates_writer(exchange, mo
     assert not request.with_name(request.name.replace(host.REQUEST, host.SUBMISSION)).exists()
 
 
-def seal_execution(owner, manifest):
+def seal_execution(owner, manifest, *, run_id=None):
     from datetime import datetime, timezone
     import hashlib
-    value = json.loads(host.registry_file(owner).read_text())
+    value = json.loads(host.registry_file(owner, run_id).read_text())
     path = Path(value['original_execution']['receipt_file'])
     receipt = json.loads(path.read_text())
     terminal = controller_handoff._read_manifest()
