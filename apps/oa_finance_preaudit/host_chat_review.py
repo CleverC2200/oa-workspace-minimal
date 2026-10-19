@@ -836,7 +836,7 @@ def _fingerprints(action: Path) -> dict:
     return frozen
 
 
-def _live(request: dict, action: Path, *, owner: str | None = None) -> None:
+def _live(request: dict, action: Path, *, owner: str | None = None, accepted_request: Path | None = None) -> None:
     if runtime_control.stop_requested():
         raise ValueError('stop_requested')
     UUID(request['owner_task_id']); UUID(hex=request['run_id']); UUID(hex=request['controller_instance_id'])
@@ -876,7 +876,9 @@ def _live(request: dict, action: Path, *, owner: str | None = None) -> None:
                 or not guard.execution_owners_alive()):
             raise ValueError('host_review_run_untrusted')
     if time.time() >= request['expires_at']:
-        raise ValueError('host_review_request_expired')
+        if accepted_request is None or not os.path.lexists(_submission_file(accepted_request)):
+            raise ValueError('host_review_request_expired')
+        _submission(accepted_request, request, registered=registered)
 
 
 def _base() -> dict:
@@ -937,8 +939,13 @@ def _submission(request_file: Path, request: dict, *, registered: dict | None = 
     raw, submitted = _read(_submission_file(request_file))
     if registered is None:
         registered = _registry(request['owner_task_id'], run_id=request['run_id'])
+    fingerprint = {'request_file': str(request_file.absolute()),
+                   'request_sha256': hashlib.sha256(_read(request_file)[0]).hexdigest()}
+    if registered.get('requests', {}).get(request['request_id']) != fingerprint:
+        raise ValueError('host_review_request_untrusted')
     assigned = registered['assignments'].get(request['request_id'])
     if (assigned is None or assigned['state'] != 'submitted'
+            or assigned.get('request_sha256') != fingerprint['request_sha256']
             or assigned.get('submission_sha256') != hashlib.sha256(raw).hexdigest()
             or set(submitted) != ({'schema_version', 'kind', 'owner_task_id', 'request_sha256',
                                   'decision', 'source', 'assignment', 'submitted_at'} |
@@ -949,10 +956,32 @@ def _submission(request_file: Path, request: dict, *, registered: dict | None = 
             or submitted['assignment'] != {key: assigned[key] for key in ('slot', 'reviewer_task_id', 'dispatched_at')}
             or not isinstance(submitted['decision'], dict)):
         raise ValueError('host_review_submission_untrusted')
+    slot = assigned['slot']
+    if (type(slot) is not int or slot not in range(3)
+            or assigned['request_id'] != request['request_id']
+            or assigned['reviewer_task_id'] != registered['reviewers'][slot]['reviewer_task_id']):
+        raise ValueError('host_review_assignment_untrusted')
+    dispatch = _dispatch_source(request_file, request, registered, slot=slot,
+        source=Path(assigned['dispatch_source']['session_file']), source_line=assigned['dispatch_source']['line'])
+    if (any(assigned.get(key) != value for key, value in dispatch.items())
+            or _dispatch_reused(registered, dispatch, exclude=request['request_id'])):
+        raise ValueError('host_review_assignment_untrusted')
+    if (not guard._timestamp(submitted['submitted_at'])
+            or submitted['submitted_at'] != assigned.get('submitted_at')
+            or not request['created_at'] <= assigned['dispatched_at'] <= submitted['submitted_at'] < request['expires_at']
+            or submitted['submitted_at'] > time.time()):
+        raise ValueError('host_review_submission_untrusted')
     source = submitted['source']
+    if source.get('session_file') != registered['reviewers'][slot]['child_source']['session_file']:
+        raise ValueError('host_review_source_untrusted')
     if source != _source_receipt(Path(source['session_file']), source['line'], assigned['reviewer_task_id'],
                                  Path(source['decision_file']), assigned=assigned):
         raise ValueError('host_review_source_untrusted')
+    from datetime import datetime
+    native, _ = _native_source(Path(source['session_file']), assigned['reviewer_task_id'], source['line'])
+    published_at = datetime.fromisoformat(native['anchor']['timestamp'].replace('Z', '+00:00')).timestamp()
+    if published_at > submitted['submitted_at']:
+        raise ValueError('host_review_submission_untrusted')
     return raw, submitted
 
 
@@ -1001,7 +1030,7 @@ def read_result(request_file: Path) -> dict:
     """Read one published result and revalidate the same immutable native evidence."""
     request_raw, request = _read(request_file)
     action = Path(request['action_file'])
-    _live(request, action)
+    _live(request, action, accepted_request=request_file)
     raw, submitted = _submission(request_file, request)
     return {**_base(), 'status': 'reviewed', 'error_code': None,
             'agent_wall_seconds': max(0, int(submitted['submitted_at'] - request['created_at'])),
@@ -1018,6 +1047,7 @@ def _failure_detail(error: Exception) -> dict:
         'host_review_parent_lost_or_closed', 'host_review_registry_untrusted', 'host_review_frozen_untrusted',
         'host_review_submission_untrusted', 'host_review_assignment_untrusted', 'host_review_source_untrusted',
         'host_review_heartbeat_untrusted', 'host_review_phase_untrusted', 'host_review_finance_incomplete',
+        'host_review_stale_source', 'host_review_stale_dispatch', 'host_review_result_untrusted', 'host_review_timing_untrusted',
         'host_review_bootstrap_failed', 'host_review_not_ready', 'host_review_transport_invalid', 'codex_review_task_invalid', 'stop_requested',
     }
     classes = (ValueError, RuntimeError, OSError, KeyError, TypeError, FileNotFoundError, PermissionError, TimeoutError)
@@ -1025,7 +1055,7 @@ def _failure_detail(error: Exception) -> dict:
             'exception_type': type(error).__name__ if type(error) in classes else 'Exception'}
 
 
-def _record_exchange_failure(request_file: Path, detail: dict) -> bool:
+def _record_exchange_failure(request_file: Path, detail: dict, *, operation: str = 'await_result', phase: str | None = None) -> bool:
     """Keep the first bounded, registered-request failure; never save exception bodies."""
     try:
         raw, request = _read(request_file)
@@ -1044,7 +1074,8 @@ def _record_exchange_failure(request_file: Path, detail: dict) -> bool:
                 return False
             if 'first_failure' not in registered:
                 registered['first_failure'] = {
-                    'kind': 'preaudit_host_exchange_failure', 'operation': 'await_result', **detail, **fingerprint,
+                    'kind': 'preaudit_host_exchange_failure', 'operation': operation, **detail, **fingerprint,
+                    **({'failure_phase': phase} if phase is not None else {}),
                     'observed_at': time.time(),
                     'request_created_at': request.get('created_at') if guard._timestamp(request.get('created_at')) else None,
                     'request_expires_at': request.get('expires_at') if guard._timestamp(request.get('expires_at')) else None,
@@ -1067,7 +1098,7 @@ def poll_result(request_file: Path) -> dict | None:
             if registered.get('requests', {}).get(request['request_id']) != {
                     'request_file': str(request_file.absolute()), 'request_sha256': hashlib.sha256(raw).hexdigest()}:
                 raise ValueError('host_review_request_untrusted')
-            _live(request, action)
+            _live(request, action, accepted_request=request_file)
             if not submission_exists and not os.path.lexists(submission):
                 return None
             return read_result(request_file)
@@ -1418,6 +1449,9 @@ def submit(request_file: Path, decision_file: Path, *, owner: str, source: Path,
 
 def complete(action: Path, reviewed: dict, *, completer=None) -> dict:
     from . import codex_review_worker as worker
+    request_file = None
+    fingerprint = {}
+    phase = 'result_validation'
     try:
         if reviewed.get('kind') != 'preaudit_host_review_result' or reviewed.get('status') != 'reviewed':
             raise ValueError('host_review_result_untrusted')
@@ -1428,22 +1462,29 @@ def complete(action: Path, reviewed: dict, *, completer=None) -> dict:
         request_file = Path(proof['request_file'])
         submission_file = _submission_file(request_file)
         request_raw, request = _read(request_file)
+        fingerprint = {'request_file': str(request_file), 'request_sha256': hashlib.sha256(request_raw).hexdigest()}
         submission_raw, submitted = _read(submission_file)
         if proof != {'request_file': str(request_file), 'request_sha256': hashlib.sha256(request_raw).hexdigest(),
                      'submission_file': str(submission_file), 'submission_sha256': hashlib.sha256(submission_raw).hexdigest()}:
             raise ValueError('host_review_result_untrusted')
-        _live(request, action, owner=owner)
+        phase = 'live_validation'
+        _live(request, action, owner=owner, accepted_request=request_file)
         if submitted['decision'] != reviewed['decision'] or submitted['request_sha256'] != proof['request_sha256']:
             raise ValueError('host_review_result_untrusted')
+        phase = 'submission_validation'
         _, submitted = _submission(request_file, request)
+        phase = 'decision_validation'
         source = submitted['source']
         draft = Path(source['decision_file'])
         if submitted['decision'] != worker._normalize_decision(action, _read(draft)[1]):
             raise ValueError('host_review_result_untrusted')
+        phase = 'timing'
         if not worker._write_agent_timing(action, wall_seconds=reviewed['agent_wall_seconds'], attempts=0,
                                           token_usage={'status': 'unknown'}, identity=IDENTITY):
             raise ValueError('host_review_timing_untrusted')
+        phase = 'write'
         error = (completer or worker._complete_decision)(action, reviewed['decision'])
+        phase = 'completion_receipt'
         business = worker._read_completed(action)
         if error is None and business is not None:
             return {**_base(), 'host_receipt': proof, 'status': 'completed', 'execution_state': 'closed',
@@ -1451,9 +1492,13 @@ def complete(action: Path, reviewed: dict, *, completer=None) -> dict:
         # Existing completer owns rejection/unknown-write classification and stop publication.
         return {**_base(), 'status': 'failed', 'error_code': error or 'host_review_submit_incomplete',
                 'write_state': 'unknown' if error in worker._UNKNOWN_WRITE_FAILURE_CODES else 'not_requested'}
-    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+        detail = _failure_detail(error)
+        recorded = (request_file is not None
+                    and _record_exchange_failure(request_file, detail, operation='complete', phase=phase))
         runtime_control.request_cycle_stop()
-        return {**_base(), 'status': 'failed', 'error_code': 'host_review_result_untrusted'}
+        return {**_base(), 'status': 'failed', 'error_code': 'host_review_result_untrusted',
+                **detail, **fingerprint, 'operation': 'complete', 'failure_phase': phase, 'failure_recorded': recorded}
 
 
 
