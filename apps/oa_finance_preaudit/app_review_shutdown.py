@@ -151,9 +151,11 @@ def _verify_completed_close(value: dict, *, owner: str, execution: dict, require
     idle_at = datetime.fromisoformat(anchor['timestamp'].replace('Z', '+00:00')).timestamp()
     completed_at = datetime.fromisoformat(execution['completed_at'])
     verified_at = time.time() if require_idle else plan['verified_at']
+    # Reviewer idleness and the driver's wait receipt independently precede close.
     if (proof != saved or completed_at.tzinfo is None
             or not host.guard._timestamp(verified_at)
-            or not completed_at.timestamp() <= idle_at <= value['closed_at'] < plan['started_at'] <= verified_at <= time.time()
+            or not completed_at.timestamp() <= value['closed_at']
+            or not idle_at <= value['closed_at'] < plan['started_at'] <= verified_at <= time.time()
             or verified_at < last_proof_at):
         raise ValueError('host_review_shutdown_incomplete')
 
