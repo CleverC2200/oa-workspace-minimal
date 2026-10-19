@@ -18,7 +18,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from uuid import uuid4
 
 import fitz
-from PIL import Image
+from PIL import Image, JpegImagePlugin
 
 from . import attachment_extractors, auth, retention, runtime_control
 
@@ -27,6 +27,7 @@ ENDPOINT = 'https://api.deepseek.com/chat/completions'
 MAX_FILE_BYTES = 32 * 1024 * 1024
 MAX_SOURCE_BYTES = 512 * 1024 * 1024
 MAX_IMAGE_DIMENSION = 8192
+MAX_DECODED_IMAGE_BYTES = 1024 * 1024 * 1024
 TEXT_CHUNK_CHARS = 24000
 DEFAULT_PROMPT = '完整识别附件中的文字、表格和可见事实，保留数字、单位、日期、位置及看不清的内容。'
 SYSTEM_PROMPT = (
@@ -155,11 +156,53 @@ def _image_block(raw: bytes) -> dict:
     }}
 
 
-def _image_tiles(raw: bytes):
+def _jpeg_sof(raw: bytes) -> int | None:
+    offset = 2
+    while offset + 4 <= len(raw):
+        if raw[offset] != 255:
+            break
+        while offset < len(raw) and raw[offset] == 255:
+            offset += 1
+        if offset + 3 > len(raw):
+            break
+        marker = raw[offset]
+        offset += 1
+        length = int.from_bytes(raw[offset:offset + 2], 'big')
+        if marker in {0xDA, 0xD9} or length < 2 or offset + length > len(raw):
+            break
+        if 0xC0 <= marker <= 0xCF and marker not in {0xC4, 0xC8, 0xCC}:
+            return marker
+        offset += length
+    return None
+
+
+def _open_image(raw: bytes):
     try:
-        image = Image.open(BytesIO(raw))
-    except (OSError, ValueError, Image.DecompressionBombError):
+        return Image.open(BytesIO(raw))
+    except Image.DecompressionBombError:
+        pass
+    except (OSError, ValueError):
         raise ValueError('attachment_image_invalid') from None
+    if not raw.startswith(b'\xff\xd8\xff'):
+        raise ValueError('attachment_image_large_decode_unsupported')
+    try:
+        image = JpegImagePlugin.JpegImageFile(BytesIO(raw))
+    except (OSError, ValueError, SyntaxError):
+        raise ValueError('attachment_image_invalid') from None
+    if (_jpeg_sof(raw) != 0xC0 or image.mode != 'RGB' or image.bits != 8 or image.layers != 3
+            or image.info.get('progressive') or image.info.get('progression')
+            or 'mp' in image.info or 'mpoffset' in image.info
+            or getattr(image, 'n_frames', 1) != 1):
+        image.close()
+        raise ValueError('attachment_image_large_decode_unsupported')
+    if image.width * image.height * 4 > MAX_DECODED_IMAGE_BYTES:
+        image.close()
+        raise ValueError('attachment_image_decoded_memory_limit')
+    return image
+
+
+def _image_tiles(raw: bytes):
+    image = _open_image(raw)
     with image:
         if max(image.size) <= MAX_IMAGE_DIMENSION:
             yield None, _image_block(raw)
@@ -171,13 +214,16 @@ def _image_tiles(raw: bytes):
             x0, y0, x1, y1 = box
             width, height = x1 - x0, y1 - y0
             if max(width, height) <= MAX_IMAGE_DIMENSION:
-                with image.crop(box) as tile:
-                    encoded = BytesIO()
-                    if tile.mode == 'CMYK':
-                        with tile.convert('RGB') as rgb:
-                            rgb.save(encoded, format='PNG')
-                    else:
-                        tile.save(encoded, format='PNG')
+                try:
+                    with image.crop(box) as tile:
+                        encoded = BytesIO()
+                        if tile.mode == 'CMYK':
+                            with tile.convert('RGB') as rgb:
+                                rgb.save(encoded, format='PNG')
+                        else:
+                            tile.save(encoded, format='PNG')
+                except OSError:
+                    raise ValueError('attachment_image_invalid') from None
                 encoded = encoded.getvalue()
                 if len(encoded) <= MAX_FILE_BYTES:
                     yield box, _image_block(encoded)

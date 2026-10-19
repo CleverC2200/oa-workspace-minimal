@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError
@@ -549,11 +550,14 @@ def test_wide_page_is_read_without_resampling_or_changing_source(tmp_path, monke
 
 
 @pytest.mark.parametrize('failure', ['http_400', 'incomplete'])
-def test_failed_tile_keeps_partial_read_without_completing_page(tmp_path, monkeypatch, failure):
-    source = tmp_path / 'wide.png'
-    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 9042, 80), False)
-    pix.clear_with(255)
-    pix.save(source)
+@pytest.mark.parametrize('format', ['PNG', 'JPEG'])
+def test_failed_tile_keeps_partial_read_without_completing_page(tmp_path, monkeypatch, failure, format):
+    from PIL import Image
+
+    source = tmp_path / ('wide.' + format.lower())
+    Image.new('RGB', (9042, 80), 'white').save(source, format=format)
+    if format == 'JPEG':
+        monkeypatch.setattr(Image, 'MAX_IMAGE_PIXELS', 200000)
     count = 0
 
     def respond(body):
@@ -567,7 +571,8 @@ def test_failed_tile_keeps_partial_read_without_completing_page(tmp_path, monkey
                 'usage': {'total_tokens': 7}}
 
     fake_http(monkeypatch, respond)
-    report = recognition.recognize(files=[source], output_dir=tmp_path / 'out')
+    with pytest.warns(Image.DecompressionBombWarning) if format == 'JPEG' else nullcontext():
+        report = recognition.recognize(files=[source], output_dir=tmp_path / 'out')
 
     assert report['status'] == 'failed'
     assert report['error_code'] == ('attachment_api_http_400' if failure == 'http_400'
@@ -582,12 +587,13 @@ def test_failed_tile_keeps_partial_read_without_completing_page(tmp_path, monkey
     assert json.loads(saved) == report
 
 
-def test_normal_webp_sends_original_bytes(tmp_path, monkeypatch):
+@pytest.mark.parametrize('format', ['WEBP', 'JPEG'])
+def test_normal_image_sends_original_bytes(tmp_path, monkeypatch, format):
     import base64
     from PIL import Image
 
-    source = tmp_path / 'normal.webp'
-    Image.new('RGB', (8, 8), 'blue').save(source, format='WEBP', lossless=True)
+    source = tmp_path / ('normal.' + format.lower())
+    Image.new('RGB', (8, 8), 'blue').save(source, format=format)
     original = source.read_bytes()
     calls = fake_http(monkeypatch, lambda _: {
         'choices': [{'finish_reason': 'stop', 'message': {'content': 'blue'}}]})
@@ -597,7 +603,7 @@ def test_normal_webp_sends_original_bytes(tmp_path, monkeypatch):
     assert report['status'] == 'complete'
     assert len(calls) == 1
     block = calls[0]['messages'][-1]['content'][1]
-    assert block['image_url']['url'].startswith('data:image/webp;base64,')
+    assert block['image_url']['url'].startswith(f'data:image/{format.lower()};base64,')
     assert base64.b64decode(block['image_url']['url'].split(',', 1)[1]) == original
     assert 'image_tiles' not in report['parts'][0]
     assert source.read_bytes() == original
@@ -652,3 +658,93 @@ def test_oversized_cmyk_jpeg_reads_all_regions_as_rgb(tmp_path, monkeypatch):
     assert received == [((4585, 80), 'RGB', (0, 255, 255))] * 2
     assert source.read_bytes() == original
     assert report['parts'][0]['content_sha256'] == hashlib.sha256(original).hexdigest()
+
+
+@pytest.mark.parametrize('orientation', [None, 6])
+def test_pixel_protected_baseline_jpeg_preserves_original_pixels_and_guard(tmp_path, monkeypatch, orientation):
+    import base64
+    from io import BytesIO
+    from PIL import Image
+
+    source = tmp_path / 'protected.jpg'
+    pixels = Image.new('RGB', (64, 48), 'white')
+    pixels.paste('red', (0, 0, 23, 17))
+    pixels.paste('blue', (31, 19, 64, 48))
+    exif = Image.Exif()
+    if orientation is not None:
+        exif[274] = orientation
+    pixels.save(source, format='JPEG', subsampling=0, dpi=(300, 300), exif=exif)
+    original = source.read_bytes()
+    with Image.open(BytesIO(original)) as normal:
+        expected = normal.copy()
+    received = []
+
+    def respond(body):
+        url = body['messages'][-1]['content'][1]['image_url']['url']
+        with Image.open(BytesIO(base64.b64decode(url.split(',', 1)[1]))) as tile:
+            received.append((tile.size, tile.tobytes()))
+        return {'choices': [{'finish_reason': 'stop', 'message': {'content': 'visible facts'}}]}
+
+    fake_http(monkeypatch, respond)
+    monkeypatch.setattr(Image, 'MAX_IMAGE_PIXELS', 1000)
+    monkeypatch.setattr(recognition, 'MAX_IMAGE_DIMENSION', 24)
+    monkeypatch.setattr(recognition, 'MAX_DECODED_IMAGE_BYTES', 64 * 48 * 4)
+    with pytest.raises(Image.DecompressionBombError):
+        Image.open(BytesIO(original))
+
+    report = recognition.recognize(files=[source], output_dir=tmp_path / 'out')
+
+    assert report['status'] == 'complete'
+    tiles = report['parts'][0]['image_tiles']
+    assert len(tiles) == len(received) > 1
+    for tile, (size, raw) in zip(tiles, received):
+        with expected.crop(tile['box']) as reference:
+            assert (size, raw) == (reference.size, reference.tobytes())
+    assert source.read_bytes() == original
+    assert report['parts'][0]['content_sha256'] == hashlib.sha256(original).hexdigest()
+    assert Image.MAX_IMAGE_PIXELS == 1000
+
+
+@pytest.mark.parametrize('kind,expected', [
+    ('progressive', 'attachment_image_large_decode_unsupported'),
+    ('extended', 'attachment_image_large_decode_unsupported'),
+    ('CMYK', 'attachment_image_large_decode_unsupported'),
+    ('MPO', 'attachment_image_large_decode_unsupported'),
+    ('PNG', 'attachment_image_large_decode_unsupported'),
+    ('budget', 'attachment_image_decoded_memory_limit'),
+    ('corrupt', 'attachment_image_invalid'),
+    ('truncated', 'attachment_image_invalid'),
+])
+def test_unsafe_pixel_protected_image_fails_without_http_and_keeps_report(
+        tmp_path, monkeypatch, capsys, kind, expected):
+    from PIL import Image
+
+    source = tmp_path / ('protected.png' if kind == 'PNG' else 'protected.jpg')
+    pixels = Image.new('CMYK' if kind == 'CMYK' else 'RGB', (64, 48))
+    if kind == 'MPO':
+        pixels.save(source, format='MPO', save_all=True,
+                    append_images=[Image.new('RGB', (64, 48), 'blue')])
+    else:
+        pixels.save(source, format='PNG' if kind == 'PNG' else 'JPEG', progressive=kind == 'progressive')
+    if kind == 'extended':
+        source.write_bytes(source.read_bytes().replace(b'\xff\xc0', b'\xff\xc1', 1))
+    if kind == 'corrupt':
+        source.write_bytes(b'\xff\xd8\xff\xe0\x00\x10invalid')
+    if kind == 'truncated':
+        source.write_bytes(source.read_bytes()[:-10])
+    original = source.read_bytes()
+    calls = fake_http(monkeypatch, lambda _: pytest.fail('Rejected image must not reach HTTP'))
+    monkeypatch.setattr(Image, 'MAX_IMAGE_PIXELS', 1000)
+    monkeypatch.setattr(recognition, 'MAX_IMAGE_DIMENSION', 24)
+    monkeypatch.setattr(recognition, 'MAX_DECODED_IMAGE_BYTES',
+                        64 * 48 * 4 - (1 if kind == 'budget' else 0))
+
+    assert recognition.main(['--file', str(source), '--output-dir', str(tmp_path / 'out')]) == 1
+
+    summary = json.loads(capsys.readouterr().out)
+    report = json.loads(Path(summary['report_file']).read_bytes())
+    assert summary['error_code'] == report['error_code'] == expected
+    assert report['status'] == 'failed' and report['parts'] == []
+    assert report['failed_part']['content_sha256'] == hashlib.sha256(original).hexdigest()
+    assert source.read_bytes() == original
+    assert calls == [] and Image.MAX_IMAGE_PIXELS == 1000
