@@ -376,3 +376,24 @@ def test_timely_acceptance_does_not_restore_current_write_eligibility(exchange, 
         assert failed['error_code'] == 'write_authorization_invalid'
     else:
         assert json.loads(action.with_name('state.json').read_text())['write_state'] == 'unknown'
+
+
+def test_completion_reports_owner_mismatch_without_claiming_failure_evidence(exchange, native_writer, monkeypatch):
+    from uuid import uuid4
+
+    _, actions, _, writes, complete, _ = native_writer
+    action = actions[0]
+    request = accept_native(exchange, action)
+    reviewed = host.read_result(request)
+    monkeypatch.setenv(host.guard.OWNER_ENV, str(uuid4()))
+    monkeypatch.setattr(host.time, 'time', lambda: json.loads(request.read_text())['expires_at'] + 1)
+
+    failed = host.complete(action, reviewed, completer=complete)
+
+    assert failed['status'] == 'failed' and failed['error_code'] == 'host_review_result_untrusted'
+    assert failed['failure_detail_code'] == 'host_review_owner_mismatch'
+    assert failed['exception_type'] == 'ValueError' and failed['failure_phase'] == 'live_validation'
+    assert failed['request_sha256'] == reviewed['host_receipt']['request_sha256']
+    assert failed['failure_recorded'] is False and writes == []
+    assert 'first_failure' not in json.loads(host.registry_file(exchange[2]).read_text())
+    assert host.runtime_control.stop_requested()
