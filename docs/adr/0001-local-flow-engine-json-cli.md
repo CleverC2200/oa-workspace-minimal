@@ -4,6 +4,7 @@
 - 日期：2026-08-22
 - 关联：GitHub Issue #38
 - 修订：多单据活动、提交授权与锁粒度由 ADR 0002 替代
+- 修订：审核并发与原生 App 执行由 [ADR 0010 当前决定](0010-bounded-process-pool.md#当前决定2026-10-18)及[控制器执行回执](../agents/controller-execution.md)替代，下文单审核 Agent 与后续进程池安排保留为历史决定
 - 修订：动作存储与当前动作投影由 [ADR 0012](0012-canonical-attempt-state.md) 替代，下文保留历史决定
 
 ## 背景
