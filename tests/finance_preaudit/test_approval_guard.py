@@ -183,11 +183,12 @@ def test_multi_process_race_never_admits_fourth_and_dead_owner_intents_stay_occu
     action = tmp_path / "action.json"
     action.write_text("{}")
     script = ('import sys,time;from pathlib import Path;from apps.oa_finance_preaudit import approval_guard as g;'
+              'from apps.oa_approval import runtime_control as control;'
               'root=Path(sys.argv[1]);marker=root/sys.argv[2]\n'
               'try:\n'
               ' with g.model_slot(root/"action.json",root,60):\n'
-              '  marker.write_text("admitted");time.sleep(60)\n'
-              'except ValueError as e: marker.write_text(str(e))\n')
+              '  control.write_control_bytes_atomic(marker,b"admitted");time.sleep(60)\n'
+              'except ValueError as e: control.write_control_bytes_atomic(marker,str(e).encode())\n')
     processes = [subprocess.Popen([sys.executable, "-c", script, str(tmp_path), str(index)],
                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE) for index in range(4)]
     try:
