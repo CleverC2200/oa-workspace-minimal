@@ -1043,7 +1043,7 @@ def read_result(request_file: Path) -> dict:
 
 def _failure_detail(error: Exception) -> dict:
     codes = {
-        'host_review_request_expired', 'host_review_request_untrusted', 'host_review_run_untrusted',
+        'host_review_request_expired', 'host_review_request_untrusted', 'host_review_run_untrusted', 'host_review_owner_mismatch',
         'host_review_parent_lost_or_closed', 'host_review_registry_untrusted', 'host_review_frozen_untrusted',
         'host_review_submission_untrusted', 'host_review_assignment_untrusted', 'host_review_source_untrusted',
         'host_review_heartbeat_untrusted', 'host_review_phase_untrusted', 'host_review_finance_incomplete',
