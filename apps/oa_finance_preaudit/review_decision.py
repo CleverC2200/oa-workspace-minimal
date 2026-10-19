@@ -18,6 +18,10 @@ def bind_frozen_fields(action_file: Path, decision: dict) -> dict:
         raise ValueError("read_only_port_unavailable")
     reader = FlowEngine(root=path.parents[4], discover_candidates=unavailable, collect_material=unavailable)
     action, _state, packet = reader._open_attempt(path)
+    return bind_fields(action, packet, decision)
+
+
+def bind_fields(action: dict, packet: dict, decision: dict) -> dict:
     if not isinstance(decision, dict):
         raise ValueError("review_decision_invalid")
     result = dict(decision)
@@ -27,6 +31,24 @@ def bind_frozen_fields(action_file: Path, decision: dict) -> dict:
     }.items():
         result.setdefault(key, value)
     return result
+
+
+def normalize_keyed_items(decision: dict, item_keys: tuple[str, ...]) -> dict:
+    keyed_items = decision.get("items")
+    if (
+        not item_keys
+        or not isinstance(keyed_items, dict)
+        or set(keyed_items) != set(item_keys)
+        or not all(isinstance(keyed_items[item_key], dict) for item_key in item_keys)
+    ):
+        return decision
+    return {
+        **decision,
+        "items": [
+            {**keyed_items[item_key], "item_key": item_key}
+            for item_key in item_keys
+        ],
+    }
 
 
 def main(argv=None) -> int:

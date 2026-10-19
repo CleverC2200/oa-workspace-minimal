@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from uuid import UUID
 
-from . import app_review_shutdown, attempt_state, flow_engine, host_chat_review as host
+from . import app_review_shutdown, attempt_state, flow_engine, host_chat_review as host, review_decision
 
 
 def summarize(*, root: Path, owner: str, run_ids: list[str]) -> dict:
@@ -69,7 +69,10 @@ def summarize(*, root: Path, owner: str, run_ids: list[str]) -> dict:
                             and frozen['action.json'] != state['action_reference_sha256']):
                         raise ValueError('request_untrusted')
                     item.update(action_file=str(action_file), workflow_key=state['workflow_key'])
-                    if (action.get('action') != 'closed' or action.get('execution_state') != 'closed'
+                    assigned = host.sealed_assignment(path, request, value)
+                    if assigned['state'] in {'assigned', 'failed_fenced', 'failed_sealed'}:
+                        item.update(status='excluded', reason='not_submitted_in_round')
+                    elif (action.get('action') != 'closed' or action.get('execution_state') != 'closed'
                             or state.get('action') != 'closed' or state.get('execution_state') != 'closed'):
                         item.update(status='excluded', reason='action_not_closed')
                     else:
@@ -86,6 +89,19 @@ def summarize(*, root: Path, owner: str, run_ids: list[str]) -> dict:
                         elif action.get('write_state') != 'submitted' or state.get('write_state') != 'submitted':
                             item.update(status='excluded', reason='not_submitted')
                         else:
+                            submitted = host.sealed_submission(path, request, value)
+                            if kind == 'finance':
+                                _, model = host._read(Path(submitted['source']['decision_file']))
+                                packet = json.loads(attempt_state.read_input(action_file.with_name('review-packet.json')))
+                                frozen_action = {**action, 'action_token': decision['action_token']}
+                                normalized = review_decision.bind_fields(frozen_action, packet, model)
+                                if state['workflow_key'] == 'small_marketing_fee' and packet['rule_version'] == 'small_marketing_fee:2':
+                                    normalized = review_decision.normalize_keyed_items(
+                                        normalized, tuple(item['item_key'] for item in packet['items']))
+                                material = json.loads(attempt_state.read_input(action_file.with_name('material.json')))
+                                if (normalized != submitted['decision'] or flow_engine._validate_review_decision(
+                                        frozen_action, packet, material, normalized).decision != decision):
+                                    raise ValueError('host_review_submission_untrusted')
                             if kind == 'packaging_draft':
                                 host._package_completion(request, value['assignments'][request_id])
                             if str(action_file) in seen:

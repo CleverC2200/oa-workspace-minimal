@@ -231,7 +231,7 @@ def test_verify_keeps_semantic_rejection_details_in_private_report(acceptance_re
     assert before == {p: p.read_bytes() for p in audit.rglob('*') if p.is_file()}
 
 
-@pytest.mark.parametrize('destination', ['existing_report', 'review', 'material', 'symlink', 'model_project', 'missing_parent'])
+@pytest.mark.parametrize('destination', ['existing_report', 'review', 'material', 'symlink', 'parent_symlink', 'model_project', 'missing_parent'])
 def test_verify_report_failure_preserves_evidence_and_rejects_acceptance(acceptance_records, capsys, destination):
     check, audit, _, review = acceptance_records
     manifest = finance_preaudit_native_replay.read(audit / 'prepare.json')
@@ -244,6 +244,10 @@ def test_verify_report_failure_preserves_evidence_and_rejects_acceptance(accepta
         target = Path(manifest['original_material'])
     elif destination == 'symlink':
         target.symlink_to(review)
+    elif destination == 'parent_symlink':
+        parent = review.parent / 'linked-directory'
+        parent.symlink_to(review.parent, target_is_directory=True)
+        target = parent / target.name
     elif destination == 'model_project':
         target = Path(manifest['project_root']) / 'acceptance-report.json'
     elif destination == 'missing_parent':
