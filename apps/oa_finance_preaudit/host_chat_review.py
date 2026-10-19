@@ -246,6 +246,8 @@ def _previous_rounds_closed(owner: str, run_id: str | None = None, reviewers: li
                 or report.get('exit_code') != receipt.get('driver_exit_code')
                 or any(report.get(key) != previous.get(key) for key in ('run_id', 'controller_instance_id'))):
             raise ValueError('host_review_previous_round_incomplete')
+    from . import app_review_shutdown
+    app_review_shutdown.assert_unregistered_executions_closed(exclude_run_id=run_id)
     if runtime_control.writer_active() or runtime_control.active_request_writers():
         raise ValueError('host_review_previous_round_incomplete')
 
@@ -1663,7 +1665,7 @@ def source_anchor(*, owner: str, operation: str = 'heartbeat', run_id: str | Non
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--operation', choices=['register', 'pending', 'assign', 'submit', 'heartbeat', 'enter-packaging', 'close', 'begin-shutdown', 'finish-shutdown', 'write-draft', 'release-failed-slot', 'status', 'source-anchor'], default='submit')
+    parser.add_argument('--operation', choices=['register', 'pending', 'assign', 'submit', 'heartbeat', 'enter-packaging', 'close', 'begin-shutdown', 'finish-shutdown', 'finish-unregistered-shutdown', 'write-draft', 'release-failed-slot', 'status', 'source-anchor'], default='submit')
     parser.add_argument('--owner-task-id', required=True)
     parser.add_argument('--run-id')
     parser.add_argument('--request-file', type=Path)
@@ -1706,6 +1708,19 @@ def main(argv=None) -> int:
                            for path, line in zip(args.reviewer_session_file, args.spawn_line)],
                           owner=owner, source=args.source_session_file, receipt_file=args.receipt_file,
                           invocation_id=args.invocation_id, tool_session_id=args.tool_session_id, run_id=args.run_id)
+    elif args.operation == 'finish-unregistered-shutdown':
+        from . import app_review_shutdown
+        if (args.source_session_file is None or args.receipt_file is None or args.invocation_id is None
+                or args.tool_session_id is None or len(args.reviewer_session_file or []) != 3
+                or len(args.spawn_line or []) != 3 or len(args.interrupt_line or []) != 3
+                or args.source_line is None or args.wait_line is None):
+            parser.error('finish-unregistered-shutdown requires original execution, three native children/spawns/interrupts, status and wait')
+        result = app_review_shutdown.finish_unregistered(owner=owner,
+            reviewers=[{'session_file': str(path), 'spawn_line': line}
+                       for path, line in zip(args.reviewer_session_file, args.spawn_line)],
+            source=args.source_session_file, receipt_file=args.receipt_file, invocation_id=args.invocation_id,
+            tool_session_id=args.tool_session_id, interrupt_lines=args.interrupt_line,
+            status_line=args.source_line, wait_line=args.wait_line)
     elif args.operation == 'source-anchor':
         anchor = source_anchor(owner=owner, operation=args.anchor_operation, run_id=args.run_id,
                                request_file=args.request_file, slot=args.slot)
