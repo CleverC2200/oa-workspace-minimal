@@ -26,6 +26,30 @@ OA GET 及已有白名单只读 POST 的网络连接异常最多重试一次，�
 
 处置记录的 `owner_key` 绑定实际告警目标的脱敏哈希；未配置目标时显示 unconfigured，不能确认接管。旧接管回执保留原目标绑定，配置改变时显式显示变化，不把责任静默转给新目标。未知写入、身份或授权故障另输出 2 小时升级期限。超过升级或处置时限，调用已有告警入口的 `preaudit_pending_overdue` 稳定码；告警仍受去重与 unknown 送达保护，提醒本身不停止可信处理或恢复单据。
 
+## 同一快照的范围汇总
+
+需要汇总本轮完成、各类待办、历史 unknown 及 cron 时，使用已有成功调用的文件，避免为显示重复查询 OA：
+
+```bash
+.venv/bin/python -m apps.oa_finance_preaudit.cli status \
+  --root /absolute/path/to/finance_preaudit_flows \
+  --summary-input-file /absolute/path/to/summary-inputs.json
+```
+
+输入是本机 JSON。`status_file` 直接复制原成功 status stdout 的路径、bytes、sha256；原调用及文件来源须先核实。可选 `overseas_status_file` 绑定[海外只读 status](../overseas-invoice.md)的完整原输出，`cron_file` 绑定指定 cron TOML，两者使用相同文件元数据格式。cron 仅展示 provided_configuration 的 id 和状态，未校验唯一 OA 调度的项目及目录绑定时，OA cron 状态仍为 unknown。元数据只证明内容完整性，不证明调用来源或快照仍是当前状态。
+
+```json
+{
+  "status_file": {"path": "/absolute/status.json", "bytes": 123, "sha256": "原回执摘要"},
+  "completed": {"owner_task_id": "原宿主聊天UUID", "run_ids": ["本轮已封存run_id"]},
+  "excluded_workflows": [{"workflow_id": "已明确排除的精确ID", "workflow_name": "对应精确名称"}]
+}
+```
+
+`completed` 只选择本轮原生封存记录，计数重新经过 [completed-receipts](../agents/controller-execution.md#已封存轮次的完成数量)的原始证据校验；不能输入已完成总数。缺少、无效和排除回执分别保留。财务、包装、海外始终属于处理范围，排除映射不能覆盖它们；其他待办只有精确匹配调用者明确选择的 ID 和名称才计为范围外，未分类项保持 unclassified。旧快照没有流程明细时计数保持 unknown，不能用总数相减猜测。
+
+输出保存原 handoff 与 continuation 阻断项，并列出文件摘要、快照时间及年龄。缺少海外、cron、完成选择或来源不完整时保留 unknown。`all_clear=false` 和 `startup_authorized=false` 表示本入口只汇总历史快照；源码可用、配置授权、生产部署、cron 配置与实际业务验收分别报告。启动仍需新一轮完整实时门禁；海外实际验收见[独立流程证据要求](../overseas-invoice.md)，App 只读业务回归见[原生回放](finance-native-replay.md)。
+
 ## 一次跨轮恢复
 
 用户已明确授权该范围后，唯一小时调度使用：
