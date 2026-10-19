@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import sys
 from zoneinfo import ZoneInfo
 
 from apps.oa_approval import auth, writer_outcomes
@@ -117,6 +118,8 @@ def select_once(root: Path, report: dict, allowed_workflows: frozenset[str]) -> 
 def pending_dispositions(root: Path, states: list[dict], pending: list[dict],
                          manual: list[dict], now: datetime, findings: list[dict] | None = None) -> dict:
     """Every current pending identity gets a bounded, non-authorizing next step."""
+    from .flow_engine import FlowEngine
+
     by_identity = {(s["request_id"], s["received_at"]): s for s in states}
     by_case = {item["item_key"]: item for item in manual}
     by_finding = {item["item_key"]: item for item in (findings or [])}
@@ -155,6 +158,17 @@ def pending_dispositions(root: Path, states: list[dict], pending: list[dict],
             next_step, owner = "verify_identity_or_authorization", OWNER
         if started is None:
             next_step, owner = "verify_received_at", OWNER
+        action = Path(str(state.get("action_file") or ""))
+        explicit = bool(
+            started is not None and not security_fault
+            and item.get("recommendation") == "confirmed_no_write_recovery_candidate"
+            and item.get("scope") == "item" and item.get("receipt_status") == "verified"
+            and state.get("write_state") == "not_requested"
+            and FlowEngine.recoverable_no_write(root, action)
+        )
+        automatic = explicit and not attempted and item.get("failure_code") in ALLOWED_REASONS
+        if explicit and attempted:
+            next_step = "explicit_authorized_recovery"
         due = started + timedelta(hours=24 if owner == OWNER else 2) if started else None
         escalation = started + timedelta(hours=2) if started else None
         acknowledged = _takeover_receipt(state) if state else None
@@ -174,6 +188,15 @@ def pending_dispositions(root: Path, states: list[dict], pending: list[dict],
             "owner_status": "bound" if acknowledged or owner != OWNER or owner_key else "unconfigured",
             "owner_configuration_changed": bool(acknowledged and acknowledged["owner_key"] != owner_key),
             "next_step": next_step, "recovery_limit_reached": attempted,
+            "automatic_recovery_eligible": automatic,
+            "explicit_recovery_eligible": explicit,
+            "recovery_authorization": "required",
+            "recovery_action_file": str(action) if explicit else None,
+            "recovery_command": ([sys.executable, "-m", "scripts.finance_preaudit_run",
+                "--owner-task-id", "<current-task-uuid>", "--", "--rolling",
+                "--fixed-capacity", "--capacity", "3", "--max-capacity", "3",
+                "--confirm-write", "YES", "--workflow", state["workflow_key"],
+                "--recover-action-file", str(action)] if explicit else None),
             "takeover_status": "acknowledged" if acknowledged else "not_acknowledged",
             "takeover_due_at": (started + timedelta(hours=4)).isoformat() if owner == OWNER and started else None,
             "resolution_due_at": due.isoformat() if due else None, "overdue": now > due if due else False,

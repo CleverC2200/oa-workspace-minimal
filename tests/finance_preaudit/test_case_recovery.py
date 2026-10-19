@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -31,6 +32,9 @@ def test_authorized_selection_is_once_per_identity_and_never_replays_unknown(tmp
     before = path.read_bytes(), path.with_name("state.json").read_bytes()
     selected = case_recovery.select_once(root, report, frozenset({"travel_expense"}))
     assert selected == (path,)
+    first_row = report["pending_dispositions"]["items"][0]
+    assert first_row["automatic_recovery_eligible"] is True
+    assert first_row["explicit_recovery_eligible"] is True
     assert before == (path.read_bytes(), path.with_name("state.json").read_bytes())
     assert case_recovery.select_once(root, report, frozenset({"general_expense"})) == ()
     next_action = engine.recover_confirmed_no_write(path, confirmed=True)
@@ -40,9 +44,13 @@ def test_authorized_selection_is_once_per_identity_and_never_replays_unknown(tmp
     next_report = reconciliation.reconcile(root, pending_rows=rows, handled_rows=[])
     assert case_recovery.select_once(root, next_report, frozenset({"travel_expense"})) == ()
     row = next_report["pending_dispositions"]["items"][0]
-    assert row["recovery_limit_reached"] is True and row["next_step"] == "manual_takeover"
+    assert row["recovery_limit_reached"] is True and row["next_step"] == "explicit_authorized_recovery"
     engine._persist_attempt_needs_admin(next_path, "writer_result_unknown")
     unknown_report = reconciliation.reconcile(root, pending_rows=rows, handled_rows=[])
+    unknown_row = unknown_report["pending_dispositions"]["items"][0]
+    assert unknown_row["automatic_recovery_eligible"] is False
+    assert unknown_row["explicit_recovery_eligible"] is False
+    assert unknown_row["recovery_command"] is None
     with pytest.raises(ValueError, match="production_rolling_reconciliation_invalid"):
         case_recovery.select_once(root, unknown_report, frozenset({"travel_expense"}))
 
@@ -134,3 +142,32 @@ def test_verified_deferred_history_keeps_fresh_round_in_fifo(tmp_path: Path):
     }])
     row = result["items"][0]
     assert row["next_step"] == "continue_fifo" and row["owner"] == "rolling_controller"
+
+
+def test_disposition_exposes_explicit_recovery_after_automatic_limit(tmp_path: Path):
+    root = tmp_path / 'flows'
+    rows = [{'request_id': 'pending-case', 'received_at': '2026-09-01 09:00:00',
+             'workflow_key': 'travel_expense'}]
+    engine = flow_engine.FlowEngine(root=root, discover_candidates=lambda _: rows,
+        discover_handled=lambda: [], collect_material=lambda request_id, _: _material(request_id))
+    first = Path(engine.next_action('travel_expense')['action_file'])
+    engine._persist_attempt_needs_admin(first, 'codex_decision_invalid')
+    second = Path(engine.recover_confirmed_no_write(first, confirmed=True)['action_file'])
+    engine._persist_attempt_needs_admin(second, 'codex_decision_invalid')
+    report = reconciliation.reconcile(root, pending_rows=rows, handled_rows=[])
+    row = report['pending_dispositions']['items'][0]
+    assert row['automatic_recovery_eligible'] is False
+    assert row['explicit_recovery_eligible'] is True
+    assert row['recovery_action_file'] == str(second)
+    assert row['recovery_authorization'] == 'required'
+    assert row['next_step'] == 'explicit_authorized_recovery'
+    assert row['recovery_command'][-2:] == ['--recover-action-file', str(second)]
+    assert row['recovery_command'][0] == sys.executable
+    workflow_flag = row['recovery_command'].index('--workflow')
+    assert row['recovery_command'][workflow_flag + 1] == 'travel_expense'
+    second.with_name('writer-boundary.json').write_text('{}')
+    rejected = reconciliation.reconcile(root, pending_rows=rows, handled_rows=[])
+    rejected_row = rejected['pending_dispositions']['items'][0]
+    assert rejected_row['explicit_recovery_eligible'] is False
+    assert rejected_row['recovery_action_file'] is None
+    assert rejected_row['recovery_command'] is None

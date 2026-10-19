@@ -52,6 +52,8 @@ def status(
     ]
     by_workflow = Counter(str(item["flow_key"]) for item in supported)
     unsupported = len(identities) - len(supported)
+    workflow_counts = Counter((item['workflow_id'], item['workflow_name'], item['flow_key'],
+                               item['support_status']) for item in identities)
 
     return {
         "schema_version": 1,
@@ -69,6 +71,8 @@ def status(
             "supported": len(supported),
             "unsupported": unsupported,
             "by_workflow": dict(sorted(by_workflow.items())),
+            "workflow_counts": [dict(zip(('workflow_id', 'workflow_name', 'flow_key', 'support_status'), key),
+                                     count=count) for key, count in sorted(workflow_counts.items())],
         },
         "web_session": web_session,
         "write_state": "not_requested",
