@@ -54,12 +54,17 @@ def test_cli_summarizes_only_explicit_sealed_round_without_writes(exchange, tmp_
 
 
 def completed_case(exchange, tmp_path, *, controlled=True, legacy=False, close_action=True, submitted=True,
-                   workflow='business_support_fee'):
+                   workflow='business_support_fee', bootstrap_revision=None, bootstrap_dirty=False,
+                   bootstrap_before_start=False, bootstrap_native_mismatch=False):
     from apps import json_artifact
     from apps.oa_finance_preaudit import host_chat_review as host
     from tests.finance_preaudit.test_flow_engine_support import _engine, _decision, _reviewed_items
     from tests.finance_preaudit.test_host_chat_review import draft_source, native_call
     action, _, owner, child, _, manifest, _ = exchange
+    if bootstrap_revision is not None:
+        manifest.update(code_revision=bootstrap_revision, code_dirty=bootstrap_dirty)
+        host.guard.write(controller_handoff.manifest_file().parent / 'executions' /
+                         manifest['invocation_id'] / 'controller-manifest.json', manifest)
     root = action.parents[4]
     engine = _engine(root, material_workflow=workflow, controlled=controlled)
     opened = engine.next_action(workflow, mode='controlled_write' if controlled else 'preview')
@@ -72,6 +77,17 @@ def completed_case(exchange, tmp_path, *, controlled=True, legacy=False, close_a
         json_artifact.write_json_atomic(state_file, state)
     host.approval_lifecycle.heartbeat(manifest['run_id'], manifest['controller_instance_id'], {current}, [], writer_active=False)
     request_file = host.publish(current, prompt='Read the frozen support materials.', timeout_seconds=60)
+    if bootstrap_revision is not None:
+        from datetime import datetime
+        import hashlib
+        registered_file = host.registry_file(owner, manifest['run_id'])
+        registered = json.loads(registered_file.read_text())
+        request = json.loads(request_file.read_text())
+        started = datetime.fromisoformat(manifest['started_at']).timestamp()
+        request['created_at'] = started - 1 if bootstrap_before_start else (started + registered['registered_at']) / 2
+        host.guard.write(request_file, request)
+        registered['requests'][request['request_id']]['request_sha256'] = hashlib.sha256(request_file.read_bytes()).hexdigest()
+        host.guard.write(registered_file, registered)
     parent = child.with_name('parent.jsonl')
     dispatch = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(request_file)},
                            'completion-dispatch', {})
@@ -97,9 +113,71 @@ def completed_case(exchange, tmp_path, *, controlled=True, legacy=False, close_a
         engine.complete_review(current, consumed)
     shutdown.begin(owner=owner, reason='completed' if close_action else 'cancelled')
     controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
-    seal_execution(owner, manifest)
-    shutdown.finish(owner=owner, **proofs(owner, child))
+    execution = seal_execution(owner, manifest)
+    shutdown_proofs = proofs(owner, child)
+    if bootstrap_revision is not None:
+        source = shutdown_proofs['source']
+        rows = source.read_text().splitlines()
+        record = json.loads(rows[shutdown_proofs['wait_line']])
+        recorded_execution = json.loads(execution.read_text())
+        recorded_execution['receipt_file'] = str(execution)
+        if bootstrap_native_mismatch:
+            recorded_execution['code_revision'] = '3a424978234dcf85b9176256925a8ac609e4c322'
+        record['payload']['output'] = json.dumps({'exit_code': 0, 'output': json.dumps(recorded_execution)})
+        rows[shutdown_proofs['wait_line']] = json.dumps(record)
+        source.write_text('\n'.join(rows) + '\n')
+    shutdown.finish(owner=owner, **shutdown_proofs)
     return root, owner, manifest['run_id'], current, host.registry_file(owner, manifest['run_id']), request_file
+
+
+def test_cli_counts_a_sealed_legacy_bootstrap_request_created_before_registration(exchange, tmp_path, capsys):
+    root, owner, run, _, _, _ = completed_case(
+        exchange, tmp_path, bootstrap_revision='64a85b569b94a32ff7b7c0efebff10be05c07cd4')
+    original = {file: file.read_bytes() for file in tmp_path.rglob('*') if file.is_file()}
+
+    assert cli.main(['completed-receipts', '--root', str(root), '--owner-task-id', owner, '--run-id', run]) == 0
+
+    assert json.loads(capsys.readouterr().out)['counts'] == {
+        'completed': 1, 'excluded': 0, 'invalid': 0, 'duplicate': 0}
+    assert all(file.read_bytes() == raw for file, raw in original.items())
+
+
+@pytest.mark.parametrize('damage', ['migration_revision', 'current_revision', 'missing_git_object', 'dirty',
+                                  'before_run', 'dispatch_before_registration', 'closed_before_shutdown',
+                                  'native_revision_mismatch', 'missing_revision'])
+def test_cli_rejects_untrusted_or_new_format_bootstrap_history(exchange, tmp_path, capsys, damage):
+    from apps.oa_finance_preaudit import host_chat_review as host
+    revision = {'migration_revision': '40cbb88a163335a7bf8f3d3e985f39ed7937f76c',
+                'current_revision': '3a424978234dcf85b9176256925a8ac609e4c322',
+                'missing_git_object': 'f' * 40}.get(damage, '64a85b569b94a32ff7b7c0efebff10be05c07cd4')
+    root, owner, run, _, registry_file, request_file = completed_case(
+        exchange, tmp_path, bootstrap_revision=revision, bootstrap_dirty=damage == 'dirty',
+        bootstrap_before_start=damage == 'before_run', bootstrap_native_mismatch=damage == 'native_revision_mismatch')
+    registered = json.loads(registry_file.read_text())
+    original_manifest = None
+    if damage == 'dispatch_before_registration':
+        request = json.loads(request_file.read_text())
+        registered['registered_at'] = registered['assignments'][request['request_id']]['dispatched_at'] + .001
+    elif damage == 'closed_before_shutdown':
+        registered['closed_at'] = registered['shutdown']['started_at'] - .001
+    elif damage == 'missing_revision':
+        path = Path(registered['original_execution']['receipt_file']).with_name('controller-manifest.json')
+        original_manifest = path, path.read_bytes()
+        manifest = json.loads(path.read_text())
+        manifest.pop('code_revision')
+        host.guard.write(path, manifest)
+    host.guard.write(registry_file, registered)
+    original = {file: file.read_bytes() for file in tmp_path.rglob('*') if file.is_file()}
+
+    try:
+        assert cli.main(['completed-receipts', '--root', str(root), '--owner-task-id', owner, '--run-id', run]) == 0
+
+        assert json.loads(capsys.readouterr().out)['counts'] == {
+            'completed': 0, 'excluded': 0, 'invalid': 1, 'duplicate': 0}
+        assert all(file.read_bytes() == raw for file, raw in original.items())
+    finally:
+        if original_manifest is not None:
+            original_manifest[0].write_bytes(original_manifest[1])
 
 
 def test_cli_never_counts_a_request_without_native_assignment(exchange, tmp_path, capsys):

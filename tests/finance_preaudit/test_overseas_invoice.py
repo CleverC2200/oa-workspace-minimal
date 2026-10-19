@@ -16,7 +16,7 @@ def case():
     ]
     fields[-1]['filedHtmlShow'] = '<a href="/news/download.do?fileid=601&filename=invoice.pdf">invoice.pdf</a>'
     return {
-        'requestId': '901', 'canEdit': True, 'currentNodeId': '5', 'lastOperateTime': '2026-09-17',
+        'requestId': '901', 'canEdit': True, 'currentNodeId': inv.RPA_NODE_ID, 'lastOperateTime': '2026-09-17',
         'workflowBaseInfo': {'workflowId': inv.WORKFLOW_ID, 'workflowName': inv.WORKFLOW_NAME},
         'workflowMainTableInfo': {'requestRecords': [{'workflowRequestTableFields': [
             {'fieldName': 'bz', 'fieldValue': 'USD'}, {'fieldName': 'zfjehj', 'fieldValue': '10'}]}]},
@@ -118,17 +118,26 @@ def test_partial_recognition_preserves_other_fields_and_uses_original_row(harnes
     assert len(api.calls) == 1
 
 
-@pytest.mark.parametrize('change', ['actor', 'workflow', 'field', 'row', 'attachment'])
+@pytest.mark.parametrize('change', ['actor', 'workflow', 'node', 'field', 'row', 'attachment'])
 def test_changed_target_never_submits(harness, change):
     engine, api, attempt, material = harness
     engine.freeze(attempt, recognized(material)); authorize(engine)
     row = api.data['workflowDetailTableInfos'][0]['workflowRequestTableRecords'][0]
     if change == 'actor': api.pending[0]['operator_id'] = '88'
     if change == 'workflow': api.data['workflowBaseInfo']['workflowId'] = 'other'
+    if change == 'node': api.data['currentNodeId'] = '999'
     if change == 'field': row['workflowRequestTableFields'][0]['fieldValue'] = '99'
     if change == 'row': row['recordOrder'] = 9
     if change == 'attachment': row['workflowRequestTableFields'][-1]['fieldValue'] = 'new-doc'
     with pytest.raises(ValueError): engine.submit(attempt, confirm='YES')
+    assert not api.calls
+
+
+def test_invoice_collection_rejects_non_rpa_node(harness):
+    engine, api, _, _ = harness
+    api.data['currentNodeId'] = '999'
+    with pytest.raises(ValueError, match='node_mismatch'):
+        engine.collect('901')
     assert not api.calls
 
 
@@ -278,9 +287,13 @@ def test_transport_uses_only_official_detail_payload(monkeypatch):
     assert set(body) == {'requestId', 'remark', 'detailData', 'otherParams'}
     assert json.loads(body['detailData'][0]) == details
     assert json.loads(body['otherParams'][0]) == {'src': 'submit', 'judgeFormMustInput': '1'}
+    assert api.submit_invoice('901', '未上传发票，原值保留', [])['code'] == 'SUCCESS'
+    empty_body = parse_qs(request.call_args.args[0].data.decode())
+    assert set(empty_body) == {'requestId', 'remark', 'otherParams'}
+    assert json.loads(empty_body['otherParams'][0]) == {'src': 'submit', 'judgeFormMustInput': '1'}
     details[0]['deleteAll'] = '1'
     with pytest.raises(ValueError): api.submit_invoice('901', '识别完成', details)
-    assert request.call_count == 1
+    assert request.call_count == 2
 
 
 def test_fresh_download_never_reads_cache(tmp_path, monkeypatch):
