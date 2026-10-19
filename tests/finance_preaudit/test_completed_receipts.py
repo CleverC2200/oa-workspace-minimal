@@ -53,15 +53,16 @@ def test_cli_summarizes_only_explicit_sealed_round_without_writes(exchange, tmp_
     assert {file for file in tmp_path.rglob('*') if file.is_file()} - set(original) == {output}
 
 
-def completed_case(exchange, tmp_path, *, controlled=True, legacy=False, close_action=True, submitted=True):
+def completed_case(exchange, tmp_path, *, controlled=True, legacy=False, close_action=True, submitted=True,
+                   workflow='business_support_fee'):
     from apps import json_artifact
     from apps.oa_finance_preaudit import host_chat_review as host
     from tests.finance_preaudit.test_flow_engine_support import _engine, _decision, _reviewed_items
     from tests.finance_preaudit.test_host_chat_review import draft_source, native_call
     action, _, owner, child, _, manifest, _ = exchange
     root = action.parents[4]
-    engine = _engine(root, controlled=controlled)
-    opened = engine.next_action('business_support_fee', mode='controlled_write' if controlled else 'preview')
+    engine = _engine(root, material_workflow=workflow, controlled=controlled)
+    opened = engine.next_action(workflow, mode='controlled_write' if controlled else 'preview')
     current = Path(opened['action_file'])
     if legacy:
         state_file = current.with_name('state.json')
@@ -76,9 +77,17 @@ def completed_case(exchange, tmp_path, *, controlled=True, legacy=False, close_a
                            'completion-dispatch', {})
     host.assign(request_file, slot=0, owner=owner, source=parent, source_line=dispatch)
     decision = tmp_path / 'completed-decision.json'
-    payload = _decision(opened, _reviewed_items(['pass'] * 4))
-    for field in ('schema_version', 'kind', 'action_token', 'workflow_key', 'rule_version'):
-        payload.pop(field)
+    if workflow == 'business_support_fee':
+        payload = _decision(opened, _reviewed_items(['pass'] * 4))
+        for field in ('schema_version', 'kind', 'action_token', 'workflow_key', 'rule_version'):
+            payload.pop(field)
+    else:
+        packet = json.loads(current.with_name('review-packet.json').read_text())
+        payload = {'overall': 'needs_human', 'items': [
+            {'item_key': item['item_key'], 'status': 'uncertain', 'conclusion': '需核对原始材料。',
+             'evidence_refs': [], 'missing_evidence': ['缺少可核实材料']} for item in packet['items']]}
+        if 'company_comparison_contract' in packet:
+            payload['company_comparison'] = {'observed_refs': [], 'result': 'unknown', 'reason': '需核对公司信息。'}
     line = draft_source(child, request_file, decision, owner, payload=payload)
     if submitted:
         host.submit(request_file, decision, owner=owner, source=child, source_line=line)
@@ -276,8 +285,42 @@ def test_cli_keeps_supported_legacy_action_and_state_layout_read_only(exchange, 
     assert all(file.read_bytes() == raw for file, raw in original.items())
 
 
-@pytest.mark.parametrize('old_submitted', [True, False])
-def test_cli_deduplicates_same_action_across_independently_sealed_rounds(exchange, tmp_path, monkeypatch, capsys, old_submitted):
+@pytest.mark.parametrize('legacy,state_version,workflow,changed', [
+    (True, None, 'small_marketing_fee', None), (True, 'small_marketing_fee:1', 'small_marketing_fee', None),
+    (False, None, 'small_marketing_fee', None), (True, None, 'tpm_small_marketing_fee', None),
+    (True, None, 'small_marketing_fee', 'review-packet.json'),
+    (True, None, 'small_marketing_fee', 'review-decision.json'),
+])
+def test_cli_reconstructs_missing_legacy_version_from_bound_completion(
+    exchange, tmp_path, capsys, legacy, state_version, workflow, changed,
+):
+    from apps.oa_finance_preaudit import host_chat_review as host
+    root, owner, run, action, _, _ = completed_case(
+        exchange, tmp_path, legacy=legacy, workflow=workflow)
+    state_file = action.with_name('state.json')
+    state = json.loads(state_file.read_text())
+    if state_version is None:
+        state.pop('rule_version')
+    else:
+        state['rule_version'] = state_version
+    host.guard.write(state_file, state)
+    if changed is not None:
+        path = action.with_name(changed)
+        payload = json.loads(path.read_text())
+        payload['rule_version'] = 'small_marketing_fee:conflicting'
+        host.guard.write(path, payload)
+    original = {file: file.read_bytes() for file in tmp_path.rglob('*') if file.is_file()}
+    assert cli.main(['completed-receipts', '--root', str(root), '--owner-task-id', owner, '--run-id', run]) == 0
+    accepted = legacy and state_version is None and changed is None
+    assert json.loads(capsys.readouterr().out)['counts'] == {
+        'completed': int(accepted), 'excluded': 0, 'invalid': int(not accepted), 'duplicate': 0}
+    assert all(file.read_bytes() == raw for file, raw in original.items())
+
+
+@pytest.mark.parametrize('old_submitted,renewed', [(True, False), (False, False), (True, True)])
+def test_cli_deduplicates_same_action_across_independently_sealed_rounds(
+    exchange, tmp_path, monkeypatch, capsys, old_submitted, renewed,
+):
     import os
     from uuid import uuid4
     from apps.oa_finance_preaudit import host_chat_review as host
@@ -285,7 +328,8 @@ def test_cli_deduplicates_same_action_across_independently_sealed_rounds(exchang
     from tests.finance_preaudit.test_host_chat_review import native_call
     from apps import json_artifact
     from apps.oa_approval import runtime_control
-    from tests.finance_preaudit.test_flow_engine_support import _engine
+    from tests.finance_preaudit.test_flow_engine_support import _engine, _grant
+    from apps.oa_finance_preaudit import flow_engine
     from tests.finance_preaudit.test_host_chat_review import draft_source
     root, owner, first_run, action, _, original_request = completed_case(exchange, tmp_path, close_action=False, submitted=old_submitted)
     original = json.loads((tmp_path / 'completed-decision.json').read_text())
@@ -312,6 +356,15 @@ def test_cli_deduplicates_same_action_across_independently_sealed_rounds(exchang
         line = native_call(parent, 'functions.exec', 'heartbeat ' + owner, 'next-heartbeat', {})
         host.heartbeat(owner=owner, source=parent, source_line=line, run_id=manifest['run_id'])
         host.approval_lifecycle.heartbeat(manifest['run_id'], manifest['controller_instance_id'], {action}, [], writer_active=False)
+        if renewed:
+            engine = flow_engine.FlowEngine(root=root, discover_candidates=lambda _: (),
+                collect_material=lambda *_: pytest.fail('renewal_collected_new_material'),
+                authorization_source=_grant,
+                authorization_verifier=lambda grant, context: grant == _grant(context),
+                authorization_renewer=lambda _previous, context: _grant(context),
+                authorization_refresh_needed=lambda _: True,
+                submit_frozen=lambda *_: pytest.fail('renewal_submitted'))
+            engine.next_action('business_support_fee', mode='controlled_write')
         request_file = host.publish(action, prompt='Review the still-open frozen action.', timeout_seconds=60)
         dispatch = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(request_file)},
                                'next-completion-dispatch', {})
@@ -330,11 +383,32 @@ def test_cli_deduplicates_same_action_across_independently_sealed_rounds(exchang
     assert cli.main(['completed-receipts', '--root', str(root), '--owner-task-id', owner,
                      '--run-id', first_run, '--run-id', manifest['run_id']]) == 0
     result = json.loads(capsys.readouterr().out)
-    assert result['counts'] == {'completed': 1, 'excluded': int(not old_submitted), 'invalid': 0, 'duplicate': int(old_submitted)}
+    assert result['counts'] == {'completed': 1, 'excluded': int(not old_submitted or renewed),
+                                'invalid': 0, 'duplicate': int(old_submitted and not renewed)}
     assert original_request.read_bytes() == original_request_bytes
     assert (tmp_path / 'completed-decision.json').read_bytes() == original_draft_bytes
     assert result['selected_rounds'] == 2
     assert all(file.read_bytes() == raw for file, raw in evidence.items())
+    if renewed:
+        selected = ['completed-receipts', '--root', str(root), '--owner-task-id', owner]
+        assert cli.main([*selected, '--run-id', manifest['run_id'], '--run-id', first_run]) == 0
+        assert json.loads(capsys.readouterr().out)['counts'] == result['counts']
+        assert cli.main([*selected, '--run-id', first_run]) == 0
+        assert json.loads(capsys.readouterr().out)['counts'] == {
+            'completed': 0, 'excluded': 0, 'invalid': 1, 'duplicate': 0}
+        old_submission = json.loads(host._submission_file(original_request).read_text())
+        source = Path(old_submission['source']['session_file'])
+        rows = source.read_text().splitlines()
+        index = old_submission['source']['line'] - 1
+        row = json.loads(rows[index])
+        row['payload']['input'] += '\ntext("unrelated statement");'
+        rows[index] = json.dumps(row)
+        source.write_text('\n'.join(rows) + '\n')
+        evidence = {file: file.read_bytes() for file in tmp_path.rglob('*') if file.is_file()}
+        assert cli.main([*selected, '--run-id', first_run, '--run-id', manifest['run_id']]) == 0
+        assert json.loads(capsys.readouterr().out)['counts'] == {
+            'completed': 1, 'excluded': 0, 'invalid': 1, 'duplicate': 0}
+        assert all(file.read_bytes() == raw for file, raw in evidence.items())
 
 
 def test_cli_rejects_completion_artifact_symlink_even_when_bytes_match(exchange, tmp_path, capsys):

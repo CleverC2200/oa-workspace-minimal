@@ -24,7 +24,7 @@ def summarize(*, root: Path, owner: str, run_ids: list[str]) -> dict:
                                     collect_material=lambda request, attempt: {})
     counts = Counter(completed=0, excluded=0, invalid=0, duplicate=0)
     workflows = Counter()
-    details, rounds, seen = [], [], set()
+    details, rounds, seen, superseded = [], [], set(), []
     for run in dict.fromkeys(run_ids):
         try:
             value = app_review_shutdown.sealed_round(owner=owner, run_id=run)
@@ -80,31 +80,45 @@ def summarize(*, root: Path, owner: str, run_ids: list[str]) -> dict:
                             attempt_state.read_input(action_file.with_name(name))
                         receipt = engine._completion_receipt(action_file.parent, state)
                         decision = json.loads(attempt_state.read_input(action_file.with_name('review-decision.json')))
-                        if hashlib.sha256(decision['action_token'].encode()).hexdigest() != frozen['action_token_sha256']:
+                        submitted = host.sealed_submission(path, request, value)
+                        submitted_decision = submitted['decision']
+                        if hashlib.sha256(submitted_decision['action_token'].encode()).hexdigest() != frozen['action_token_sha256']:
                             raise ValueError('request_untrusted')
-                        flow_engine.validate_frozen_review_inputs(attempt_root=action_file.parent, state=state,
-                                                                 workflow_key=state['workflow_key'])
+                        packet = json.loads(attempt_state.read_input(action_file.with_name('review-packet.json')))
+                        try:
+                            flow_engine.validate_frozen_review_inputs(attempt_root=action_file.parent, state=state,
+                                                                     workflow_key=state['workflow_key'])
+                        except ValueError as error:
+                            version = decision.get('rule_version')
+                            if (str(error) != 'frozen_packet_changed' or 'rule_version' in state
+                                    or not attempt_state.legacy_contract(state) or not isinstance(version, str)
+                                    or packet.get('rule_version') != version):
+                                raise
+                            flow_engine.validate_frozen_review_inputs(
+                                attempt_root=action_file.parent, state={**state, 'rule_version': version},
+                                workflow_key=state['workflow_key'])
                         if state['mode'] != 'controlled_write':
                             item.update(status='excluded', reason='preview')
                         elif action.get('write_state') != 'submitted' or state.get('write_state') != 'submitted':
                             item.update(status='excluded', reason='not_submitted')
                         else:
-                            submitted = host.sealed_submission(path, request, value)
                             if kind == 'finance':
                                 _, model = host._read(Path(submitted['source']['decision_file']))
-                                packet = json.loads(attempt_state.read_input(action_file.with_name('review-packet.json')))
-                                frozen_action = {**action, 'action_token': decision['action_token']}
+                                frozen_action = {**action, 'action_token': submitted_decision['action_token']}
                                 normalized = review_decision.bind_fields(frozen_action, packet, model)
                                 if state['workflow_key'] == 'small_marketing_fee' and packet['rule_version'] == 'small_marketing_fee:2':
                                     normalized = review_decision.normalize_keyed_items(
                                         normalized, tuple(item['item_key'] for item in packet['items']))
                                 material = json.loads(attempt_state.read_input(action_file.with_name('material.json')))
-                                if (normalized != submitted['decision'] or flow_engine._validate_review_decision(
-                                        frozen_action, packet, material, normalized).decision != decision):
+                                if (normalized != submitted_decision or flow_engine._validate_review_decision(
+                                        frozen_action, packet, material, normalized).decision != submitted_decision):
                                     raise ValueError('host_review_submission_untrusted')
                             if kind == 'packaging_draft':
                                 host._package_completion(request, value['assignments'][request_id])
-                            if str(action_file) in seen:
+                            if submitted_decision != decision:
+                                item.update(status='invalid', reason='completion_unverified')
+                                superseded.append(item)
+                            elif str(action_file) in seen:
                                 item.update(status='duplicate', reason='same_action')
                             else:
                                 item.update(status='completed', business_state=receipt['business_state'])
@@ -114,6 +128,11 @@ def summarize(*, root: Path, owner: str, run_ids: list[str]) -> dict:
                 item.update(status='invalid', reason='completion_unverified')
             counts[item['status']] += 1
             details.append(item)
+    for item in superseded:
+        if item['action_file'] in seen:
+            counts['invalid'] -= 1
+            counts['excluded'] += 1
+            item.update(status='excluded', reason='superseded_review')
     return {'schema_version': 1, 'kind': 'preaudit_completed_receipts', 'read_only': True,
             'owner_task_id': owner, 'business_acceptance': 'not_verified', 'counts': dict(counts),
             'workflows': dict(workflows), 'rounds': rounds, 'details': details}
