@@ -81,13 +81,15 @@ def _wait_result(anchor: dict, output: dict, session: str) -> dict:
         r'text\((?:(?P=variable)|JSON\.stringify\((?P=variable)\))\);?\s*', code or '', re.DOTALL)
     if wrapped is not None:
         code = 'text(await tools.write_stdin(' + wrapped['wait'] + '));'
+    command_call = r'text\(await tools\.exec_command\((\{(?:[^{}"]|"(?:[^"\\]|\\.)*")*\})\)\);\s*'
     match = re.fullmatch(
-        r'\s*(?:text\(await tools\.exec_command\((?P<command>\{.*\})\)\);\s*)?'
+        r'\s*(?P<commands>(?:' + command_call + r'){0,2})'
         r'text\(await tools\.write_stdin\((?P<wait>\{.*\})\)\);?\s*', code or '', re.DOTALL)
     if match is None:
         raise ValueError('host_review_source_untrusted')
-    if match['command'] is not None:
-        command = _literal_arguments(match['command'], {'cmd', 'workdir', 'max_output_tokens', 'yield_time_ms'})
+    commands = re.findall(command_call, match['commands'], re.DOTALL)
+    for raw in commands:
+        command = _literal_arguments(raw, {'cmd', 'workdir', 'max_output_tokens', 'yield_time_ms'})
         if (not isinstance(command.get('cmd'), str) or not command['cmd']
                 or 'workdir' in command and not isinstance(command['workdir'], str)
                 or any(type(command[key]) is not int for key in {'max_output_tokens', 'yield_time_ms'} & command.keys())):
@@ -116,7 +118,7 @@ def _wait_result(anchor: dict, output: dict, session: str) -> dict:
             else:
                 for part in item.values(): visit(part)
     visit(output)
-    if (len(results) != (2 if match['command'] is not None else 1)
+    if (len(results) != len(commands) + 1
             or any(type(result.get('exit_code')) is not int or result.get('session_id') is not None
                    for result in results)):
         raise ValueError('host_review_shutdown_wait_untrusted')
