@@ -725,7 +725,7 @@ def test_prepared_provider_is_frozen_and_cannot_change_at_run(recorded_case, cap
     assert not manifest_file.with_name("worker-result.json").exists()
 
 
-def test_default_app_replay_refuses_run_before_consuming_prepared_preview(recorded_case, capsys, monkeypatch):
+def test_default_app_replay_requires_owner_before_consuming_prepared_preview(recorded_case, capsys, monkeypatch):
     from apps.oa_finance_preaudit import production_config
     monkeypatch.delenv(production_config.REVIEW_PROVIDER_ENV, raising=False)
     monkeypatch.delenv(production_config.REVIEW_TRANSPORT_ENV, raising=False)
@@ -750,3 +750,19 @@ def test_default_app_replay_refuses_run_before_consuming_prepared_preview(record
     assert action_file.read_bytes() == action_bytes
     assert state_file.read_bytes() == state_bytes
     assert original_material.read_bytes() == original_bytes
+
+
+def test_app_preview_rejects_injected_execution_without_starting_a_run(recorded_case, capsys, monkeypatch):
+    from apps.oa_finance_preaudit import production_config
+    from uuid import uuid4
+    monkeypatch.setenv(production_config.REVIEW_PROVIDER_ENV, 'openai')
+    monkeypatch.setenv(production_config.REVIEW_TRANSPORT_ENV, 'host_chat')
+    monkeypatch.setattr(codex_review_worker, 'REVIEW_SETTINGS', production_config.review_settings())
+    arguments, _, _ = recorded_case
+    assert finance_preaudit_native_replay.main(arguments) == 0
+    prepared = json.loads(capsys.readouterr().out)
+    run_arguments = ['--run' if arg == '--prepare' else arg for arg in arguments]
+    with pytest.raises(ValueError, match='app_replay_executor_forbidden'):
+        finance_preaudit_native_replay.main(run_arguments + ['--owner-task-id', str(uuid4())],
+            executor=lambda *_: pytest.fail('injected App execution was invoked'))
+    assert sorted(p.name for p in Path(prepared['audit']).iterdir()) == ['prepare.json']

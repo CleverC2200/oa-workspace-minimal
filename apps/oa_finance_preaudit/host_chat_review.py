@@ -327,6 +327,7 @@ def register(reviewers: list[dict], *, owner: str, source: Path, receipt_file: P
             or report.get('controller_instance_id') != manifest['controller_instance_id']):
         raise ValueError('host_review_parent_untrusted')
     receipt = _read(receipt_file)[1]
+    preview = _preview_binding(receipt_file, manifest)
     owners = receipt.get('owner_processes', []) + [receipt.get('supervisor_process'), receipt.get('controller_process')]
     if not owners or not all(guard._valid_identity(item) and guard.process_identity(item['pid']) == item for item in owners):
         raise ValueError('host_review_parent_untrusted')
@@ -338,6 +339,8 @@ def register(reviewers: list[dict], *, owner: str, source: Path, receipt_file: P
              'run_id': manifest['run_id'], 'controller_instance_id': manifest['controller_instance_id'],
              'reviewers': registered, 'original_execution': binding, 'execution_owners': owners, 'phase': 'finance', 'state': 'open',
              'heartbeat_at': registered_at, 'registered_at': registered_at, 'assignments': {}}
+    if preview is not None:
+        value['preview_binding'] = preview
     with _registration_lease(owner):
         with _round_lease(owner, run_id) as path:
             if os.path.lexists(path):
@@ -350,6 +353,41 @@ def register(reviewers: list[dict], *, owner: str, source: Path, receipt_file: P
             _previous_rounds_closed(owner, run_id, registered)
             _write_new(path, value)
     return value
+
+
+def _preview_binding(receipt_file: Path, manifest: dict) -> dict | None:
+    path = receipt_file.with_name('preview-binding.json')
+    if not os.path.lexists(path):
+        return None
+    _, binding = _read(path)
+    from . import controller_handoff
+    if (set(binding) != {'prepare_file', 'prepare_sha256', 'owner_task_id', 'invocation_id', 'mode', 'write_authorized'}
+            or binding['mode'] != 'preview' or binding['write_authorized'] is not False
+            or binding['owner_task_id'] != manifest['owner_task_id']
+            or binding['invocation_id'] != manifest['invocation_id']
+            or manifest['config_fingerprint'] != controller_handoff._config_fingerprint(
+                {'review_configuration': IDENTITY, 'preview': binding})):
+        raise ValueError('host_review_preview_untrusted')
+    raw, prepared = _read(Path(binding['prepare_file']))
+    audit = Path(binding['prepare_file']).parent
+    project = audit.parents[2] / 'native-projects' / prepared['label'] / prepared['case'] / 'project'
+    if (hashlib.sha256(raw).hexdigest() != binding['prepare_sha256']
+            or audit / 'control/executions' / binding['invocation_id'] / 'execution.json' != receipt_file
+            or prepared['mode'] != 'preview' or prepared['write_authorized'] is not False
+            or prepared.get('oa_client_config_or_submit_callback') is not False
+            or prepared.get('review_configuration') != IDENTITY
+            or not Path(prepared['action_file']).is_relative_to(Path(prepared['engine_root']))
+            or Path(prepared['action_file']).name != 'action.json'
+            or Path(prepared['project_root']) != project
+            or Path(prepared['engine_root']) != project / 'runtime/finance_preaudit_flows'):
+        raise ValueError('host_review_preview_untrusted')
+    return binding
+
+
+def _action_root(registered: dict) -> Path:
+    preview = registered.get('preview_binding')
+    return (Path(_read(Path(preview['prepare_file']))[1]['engine_root']) if preview is not None
+            else runtime_control.PROJECT_ROOT / 'runtime/finance_preaudit_flows')
 
 
 def _registry(owner: str, *, live: bool = True, run_id: str | None = None, legacy: bool = False) -> dict:
@@ -373,6 +411,10 @@ def _registry(owner: str, *, live: bool = True, run_id: str | None = None, legac
         raise ValueError('host_review_registry_untrusted')
     if run_id is not None and value['run_id'] != run_id:
         raise ValueError('host_review_run_untrusted')
+    binding = value['original_execution']
+    original = _read(Path(binding['receipt_file']).with_name('controller-manifest.json'))[1]
+    if value.get('preview_binding') != _preview_binding(Path(binding['receipt_file']), original):
+        raise ValueError('host_review_preview_untrusted')
     entries = [{'session_file': item['child_source']['session_file'], 'spawn_line': item['spawn_source']['line']}
                for item in value['reviewers']]
     if value['reviewers'] != _reviewers(entries, owner, Path(value['reviewers'][0]['spawn_source']['session_file'])):
@@ -609,6 +651,8 @@ def enter_packaging(*, owner: str, receipt_file: Path | None = None, invocation_
     from . import controller_handoff
     with _round_lease(owner, run_id) as path:
         value = _registry(owner, live=False, run_id=run_id)
+        if value.get('preview_binding') is not None:
+            raise ValueError('host_review_preview_untrusted')
         if (value.get('state') != 'open' or value.get('shutdown') is not None or runtime_control.stop_requested()
                 or not guard._timestamp(value.get('heartbeat_at'))
                 or not 0 <= time.time() - value['heartbeat_at'] < PARENT_HEARTBEAT_MAX_AGE):
@@ -843,6 +887,13 @@ def _live(request: dict, action: Path, *, owner: str | None = None, accepted_req
     if owner is not None and owner != request['owner_task_id']:
         raise ValueError('host_review_owner_mismatch')
     registered = _registry(request['owner_task_id'], run_id=request['run_id'])
+    preview = registered.get('preview_binding')
+    if preview is not None:
+        _, prepared = _read(Path(preview['prepare_file']))
+        state = attempt_state.read_action(action)
+        if (action != Path(prepared['action_file']) or request.get('review_kind') != 'finance'
+                or state.get('mode') != 'preview' or state.get('write_authorized') is not False):
+            raise ValueError('host_review_preview_untrusted')
     if request['request_id'] in registered.get('request_failures', {}):
         raise ValueError('host_review_request_expired')
     if (request.get('kind') != 'preaudit_host_review_request' or request.get('schema_version') != 1
@@ -1049,6 +1100,7 @@ def _failure_detail(error: Exception) -> dict:
         'host_review_heartbeat_untrusted', 'host_review_phase_untrusted', 'host_review_finance_incomplete',
         'host_review_stale_source', 'host_review_stale_dispatch', 'host_review_result_untrusted', 'host_review_timing_untrusted',
         'host_review_bootstrap_failed', 'host_review_not_ready', 'host_review_transport_invalid', 'codex_review_task_invalid', 'stop_requested',
+        'host_review_preview_untrusted', 'host_review_preview_completion_required',
     }
     classes = (ValueError, RuntimeError, OSError, KeyError, TypeError, FileNotFoundError, PermissionError, TimeoutError)
     return {'failure_detail_code': str(error) if str(error) in codes else 'host_review_exception',
@@ -1061,9 +1113,10 @@ def _record_exchange_failure(request_file: Path, detail: dict, *, operation: str
         raw, request = _read(request_file)
         owner = os.environ.get(guard.OWNER_ENV)
         action = Path(request['action_file'])
+        registered = _registry(owner, live=False, run_id=request['run_id'])
         if (owner != request['owner_task_id']
                 or request_file.absolute() != _request_file(action, request['review_kind'], owner=owner, run_id=request['run_id'])
-                or not action.is_relative_to(runtime_control.PROJECT_ROOT / 'runtime/finance_preaudit_flows')):
+                or not action.is_relative_to(_action_root(registered))):
             return False
         with _round_lease(owner, request['run_id']) as path:
             registered = _registry(owner, live=False, run_id=request['run_id'])
@@ -1407,7 +1460,8 @@ def submit(request_file: Path, decision_file: Path, *, owner: str, source: Path,
         raise ValueError('host_review_run_untrusted')
     run_id = request['run_id']
     action = Path(request['action_file'])
-    if request_file != _request_file(action, request['review_kind'], owner=owner, run_id=run_id) or not action.is_relative_to(runtime_control.PROJECT_ROOT / 'runtime/finance_preaudit_flows'):
+    registered = _registry(owner, run_id=run_id)
+    if request_file != _request_file(action, request['review_kind'], owner=owner, run_id=run_id) or not action.is_relative_to(_action_root(registered)):
         raise ValueError('host_review_request_untrusted')
     _live(request, action, owner=owner)
     with _round_lease(owner, run_id) as path:
@@ -1469,6 +1523,8 @@ def complete(action: Path, reviewed: dict, *, completer=None) -> dict:
             raise ValueError('host_review_result_untrusted')
         phase = 'live_validation'
         _live(request, action, owner=owner, accepted_request=request_file)
+        if _registry(request['owner_task_id'], run_id=request['run_id']).get('preview_binding') is not None:
+            raise ValueError('host_review_preview_completion_required')
         if submitted['decision'] != reviewed['decision'] or submitted['request_sha256'] != proof['request_sha256']:
             raise ValueError('host_review_result_untrusted')
         phase = 'submission_validation'

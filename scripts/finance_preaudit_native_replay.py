@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Recorded-evidence preview replay; native runs require explicit DeepSeek CLI."""
+"""Frozen-evidence preview through the current App or retained DeepSeek CLI."""
 from __future__ import annotations
 import argparse
+from contextlib import contextmanager
 import copy
 import hashlib
 import json
@@ -11,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import time
+from uuid import UUID, uuid4
 
 
 def digest(path):
@@ -104,7 +106,8 @@ def prepare(args):
     tracked = subprocess.check_output(['git', 'ls-tree', '-r', '-z', source_head], cwd=args.project).split(b'\0')
     def included(name):
         return ((name.startswith('apps/') or name.startswith('.agents/skills/')
-            or name.startswith('docs/agents/') or name in {'AGENTS.md', 'CONTRIBUTING.md', 'CONTEXT.md', 'GLOSSARY.md', production_config.MODEL_CATALOG})
+            or name.startswith('docs/agents/') or name in {'AGENTS.md', 'CONTRIBUTING.md', 'CONTEXT.md', 'GLOSSARY.md', production_config.MODEL_CATALOG,
+                'scripts/finance_preaudit_native_replay.py', 'scripts/finance_preaudit_run.py'})
             and Path(name).name not in {'regression-cases.json', 'confirmed-feedback.md'})
     source_manifest = []
     source_blobs = []
@@ -177,6 +180,133 @@ def original_dependency_error(manifest):
     return None
 
 
+@contextmanager
+def app_controls(audit, *, owned=False):
+    previous = dict(os.environ)
+    environment = {key: value for key, value in previous.items()
+                   if key in {'PATH', 'HOME', 'CODEX_HOME', 'LANG', 'LC_ALL', 'TMPDIR', 'UV_CACHE_DIR'}}
+    environment.update(OA_REVIEW_PROVIDER='openai', OA_REVIEW_TRANSPORT='host_chat',
+        OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE=str(audit / 'control/controller.lock'),
+        OA_FINANCE_PREAUDIT_STOP_FILE=str(audit / 'control/stop.flag'),
+        OA_FROZEN_WRITER_LOCK_FILE=str(audit / 'control/writer.lock'))
+    if owned:
+        for key in ('OA_CONTROLLER_EXECUTION_MANIFEST_FILE', 'OA_APPROVAL_OWNER_TASK_ID', 'OA_APPROVAL_EXECUTION_OWNERS'):
+            if previous.get(key):
+                environment[key] = previous[key]
+    os.environ.clear()
+    os.environ.update(environment)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(previous)
+
+
+def app_run(args, manifest, audit):
+    from apps.oa_approval import runtime_control
+    from apps.oa_finance_preaudit import approval_guard, approval_lifecycle, controller_handoff, host_chat_review
+    from scripts import finance_preaudit_run
+
+    binding_file = audit / 'app-preview.json'
+    owner = str(args.owner_task_id)
+    if (manifest['mode'] != 'preview' or manifest['write_authorized'] is not False
+            or manifest.get('oa_client_config_or_submit_callback') is not False):
+        raise ValueError('app_replay_preview_required')
+    paths = {item['path'] for item in manifest['source_manifest']}
+    if not {'scripts/finance_preaudit_native_replay.py', 'scripts/finance_preaudit_run.py',
+            'apps/oa_finance_preaudit/host_chat_review.py'} <= paths:
+        raise ValueError('app_replay_source_snapshot_incomplete')
+    for item in manifest['source_manifest']:
+        if digest(Path(manifest['project_root']) / item['path']) != item['sha256']:
+            raise ValueError('frozen_source_changed')
+        if item['path'].startswith(('apps/', 'scripts/')) and digest(Path(__file__).resolve().parents[1] / item['path']) != item['sha256']:
+            raise ValueError('execution_source_changed_since_prepare')
+    if not args.owned_preview:
+        if binding_file.exists():
+            raise RuntimeError('native_run_already_started_do_not_repeat')
+        error = original_dependency_error(manifest)
+        if error:
+            raise ValueError(error)
+        scope = {'prepare_file': str(audit / 'prepare.json'), 'prepare_sha256': digest(audit / 'prepare.json'),
+                 'owner_task_id': owner, 'invocation_id': uuid4().hex, 'mode': 'preview', 'write_authorized': False}
+        host_chat_review._write_new(binding_file, scope)
+        with app_controls(audit):
+            directory = audit / 'control/executions' / scope['invocation_id']
+            arguments = [sys.executable, '-B', '-m', 'scripts.finance_preaudit_native_replay',
+                '--run', '--case', args.case, '--label', args.label, '--project', str(args.project),
+                '--inventory', str(args.inventory), '--audit', str(args.audit), '--timeout', str(args.timeout),
+                '--owner-task-id', owner, '--owned-preview']
+            receipt = finance_preaudit_run.supervise(arguments, directory=directory, owner_task_id=owner,
+                detached=True)
+        print(json.dumps({'status': receipt['result'], 'receipt_file': receipt['receipt_file'],
+                          'mode': 'preview', 'write_authorized': False, 'oa_writes': 0}))
+        return 0 if receipt['result'] == 'completed' else 1
+    scope = read(binding_file)
+    expected = audit / 'control/executions' / scope['invocation_id'] / 'controller-manifest.json'
+    if (scope['owner_task_id'] != owner or scope['prepare_sha256'] != digest(audit / 'prepare.json')
+            or os.environ.get(finance_preaudit_run.MANIFEST_ENV) != str(expected)
+            or os.environ.get(approval_guard.OWNER_ENV) != owner):
+        raise ValueError('app_replay_execution_untrusted')
+    with app_controls(audit, owned=True), runtime_control.global_controller_lease():
+        host_chat_review._write_new(expected.with_name('preview-binding.json'), scope)
+        current = controller_handoff.begin({'review_configuration': host_chat_review.IDENTITY, 'preview': scope})
+        successful = False
+        result = {'case': args.case, 'review_status': 'not_started', 'attempts': [],
+            'execution_transport': 'native', 'oa_writes': 0, 'write_state': 'not_requested',
+            'business_acceptance': 'not_verified', 'original_material_unchanged': None,
+            'app_execution': {'receipt_file': str(expected.with_name('execution.json')),
+                              'owner_task_id': owner, 'invocation_id': scope['invocation_id']},
+            'app_run_id': current['run_id'], 'app_scope': scope, 'observed_model': 'unknown',
+            'token_usage': {'status': 'unknown'}}
+        try:
+            with approval_lifecycle.run_scope(current, Path(manifest['project_root'])):
+                deadline = time.monotonic() + args.timeout
+                action = Path(manifest['action_file'])
+                while not host_chat_review.round_status(owner=owner, run_id=current['run_id'])['ready']:
+                    if time.monotonic() >= deadline or runtime_control.stop_requested():
+                        raise ValueError('app_replay_registration_expired')
+                    approval_lifecycle.heartbeat(current['run_id'], current['controller_instance_id'],
+                        {action}, [], writer_active=False)
+                    time.sleep(.1)
+                remaining = int(deadline - time.monotonic())
+                if remaining < 60:
+                    raise ValueError('app_replay_registration_expired')
+                reviewed = host_chat_review.review({'project_root': manifest['project_root'],
+                    'action_file': str(action), 'timeout_seconds': remaining})
+                dump(audit / 'worker-result.json', reviewed)
+                result.update(review_status=reviewed['status'], **{
+                    key: reviewed.get(key) for key in ('model', 'reasoning_effort', 'model_provider', 'requested_service_tier')})
+                if reviewed['status'] != 'reviewed':
+                    raise ValueError(reviewed.get('failure_detail_code') or reviewed.get('error_code'))
+                request = Path(reviewed['host_receipt']['request_file'])
+                if host_chat_review.read_result(request) != reviewed:
+                    raise ValueError('host_review_result_untrusted')
+                error = original_dependency_error(manifest)
+                if error:
+                    raise ValueError(error)
+                decision = action.with_name('native-preview-decision.json')
+                dump(decision, reviewed['decision'])
+                closed = engine_for(Path(manifest['engine_root'])).complete_review(action, decision)
+                dump(audit / 'closure.json', closed)
+                result.update(original_material_unchanged=True, closure_action=closed.get('action'),
+                    execution_state=closed.get('execution_state'), business_state=closed.get('business_state'),
+                    write_state=closed.get('write_state'), decision_sha256=digest(decision),
+                    state_sha256=digest(closed['state_file']), host_receipt=reviewed['host_receipt'])
+                successful = (closed.get('action') == 'closed' and closed.get('execution_state') == 'closed'
+                    and closed.get('mode') == 'preview' and closed.get('write_state') == 'not_requested'
+                    and closed.get('write_authorized') is False)
+                result['preview_closed_no_write'] = successful
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError) as error:
+            result['error_code'] = str(error)
+        finally:
+            reaped = approval_lifecycle.readonly_reaped(current)
+            controller_handoff.finish(current, status='completed' if successful and reaped else 'failed',
+                children_reaped=reaped, health='healthy' if successful else 'degraded')
+            dump(audit / 'result.json', result)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0 if successful and reaped else 1
+
+
 def run(args, *, executor=None):
     from apps.oa_finance_preaudit import codex_review_worker as worker
     from apps.oa_finance_preaudit import process_diagnostics, production_config
@@ -190,9 +320,15 @@ def run(args, *, executor=None):
     configuration = manifest.get('review_configuration', production_config.LEGACY_OPENAI_IDENTITY)
     if worker.REVIEW_SETTINGS != configuration:
         raise RuntimeError('review_model_identity_changed')
+    if args.owned_preview and configuration.get('transport') != 'host_chat':
+        raise ValueError('app_replay_execution_untrusted')
+    if configuration.get('transport') == 'host_chat' and getattr(args, 'owner_task_id', None):
+        if executor is not None:
+            raise ValueError('app_replay_executor_forbidden')
+        return app_run(args, manifest, audit)
     if configuration != production_config.review_settings('deepseek', transport='cli'):
-        raise ValueError('native_replay_transport_unsupported:App preview replay is not supported; '
-                         'prepare a new label with OA_REVIEW_PROVIDER=deepseek OA_REVIEW_TRANSPORT=cli')
+        raise ValueError('native_replay_transport_unsupported:App preview requires the current --owner-task-id; '
+                         'retained CLI requires a new label with OA_REVIEW_PROVIDER=deepseek OA_REVIEW_TRANSPORT=cli')
     # Import source must match the snapshot given to the reviewer.
     if digest(Path(worker.__file__)) != manifest['worker_source_sha256']:
         raise RuntimeError('worker_source_changed_since_prepare')
@@ -283,6 +419,42 @@ def _write_verification_report(target, report, project):
     return _private_report_file(report, target)
 
 
+def verify_app_source(audit, manifest, result, closure):
+    from apps.oa_finance_preaudit import app_review_shutdown, host_chat_review
+    from scripts import finance_preaudit_run
+    with app_controls(audit):
+        execution = result['app_execution']
+        owner, run = execution['owner_task_id'], result['app_run_id']
+        registered = app_review_shutdown.sealed_round(owner=owner, run_id=run)
+        scope = registered['preview_binding']
+        if (scope != result['app_scope'] or scope['prepare_file'] != str(audit / 'prepare.json')
+                or scope['prepare_sha256'] != digest(audit / 'prepare.json')
+                or manifest['source_head'] != read(scope['prepare_file'])['source_head']
+                or any(execution[key] != registered['original_execution'][key]
+                       for key in ('receipt_file', 'owner_task_id', 'invocation_id'))):
+            raise ValueError('app_preview_binding_mismatch')
+        report = finance_preaudit_run.read_execution(**registered['original_execution'])
+        if report['status'] != 'completed' or report['terminal'] is not True or report['exit_code'] != 0:
+            raise ValueError('app_preview_execution_incomplete')
+        proof = result['host_receipt']
+        request_file = Path(proof['request_file'])
+        raw, request = host_chat_review._read(request_file)
+        submitted = host_chat_review.sealed_submission(request_file, request, registered)
+        submission = host_chat_review._submission_file(request_file)
+        expected = {'request_file': str(request_file), 'request_sha256': hashlib.sha256(raw).hexdigest(),
+                    'submission_file': str(submission), 'submission_sha256': digest(submission)}
+        if (proof != expected or request['action_file'] != manifest['action_file']
+                or request['run_id'] != run or request['owner_task_id'] != owner
+                or submitted['decision'] != read(closure['decision_file'])
+                or read(audit / 'worker-result.json')['host_receipt'] != proof):
+            raise ValueError('app_preview_decision_mismatch')
+        receipt = read(closure['receipt_file'])
+        if (receipt.get('no_write_evidence') != 'confirmed_no_write'
+                or receipt.get('write_state') != 'not_requested'
+                or any(receipt.get(field) is not False for field in ('write', 'submit_ok', 'done_hit', 'postcheck_done_hit'))):
+            raise ValueError('app_preview_write_receipt_invalid')
+
+
 def verify(args):
     """Validate separately reviewed evidence, without generating a business opinion."""
     from apps.oa_finance_preaudit.flow_engine import validate_frozen_review_inputs
@@ -319,6 +491,11 @@ def verify(args):
                 or closure.get('write_state') != 'not_requested' or closure.get('write_authorized') is not False):
             findings.append('native_preview_not_closed:finish the original native preview before business verification')
         configuration = manifest.get('review_configuration', production_config.LEGACY_OPENAI_IDENTITY)
+        if configuration.get('transport') == 'host_chat':
+            try:
+                verify_app_source(audit, manifest, result, closure)
+            except (OSError, ValueError, RuntimeError, KeyError, TypeError):
+                findings.append('app_native_source_unverified:require the original execution, sealed three-reviewer round and native decision receipts')
         if (result.get('execution_transport') != 'native'
                 or not production_config.valid_review_configuration(configuration)
                 or any(result.get(key) != configuration[key] for key in ('model', 'reasoning_effort', 'requested_service_tier'))
@@ -408,7 +585,7 @@ def main(argv=None, *, executor=None):
     parser = argparse.ArgumentParser(description=__doc__)
     phase = parser.add_mutually_exclusive_group(required=True)
     phase.add_argument('--prepare', action='store_true', help='copy immutable historical evidence and freeze a fresh preview; no native call')
-    phase.add_argument('--run', action='store_true', help='explicit retained DeepSeek CLI review then close only preview; App replay is unsupported; one run per label/case')
+    phase.add_argument('--run', action='store_true', help='one native App or retained DeepSeek CLI review per label/case; close only preview')
     phase.add_argument('--verify', action='store_true', help='read-only check of actual native result, frozen expectations and independent business review')
     parser.add_argument('--case', required=True)
     parser.add_argument('--label', required=True)
@@ -416,12 +593,16 @@ def main(argv=None, *, executor=None):
     parser.add_argument('--inventory', type=Path, required=True)
     parser.add_argument('--audit', type=Path, required=True)
     parser.add_argument('--timeout', type=int, default=1800)
+    parser.add_argument('--owner-task-id', type=UUID)
+    parser.add_argument('--owned-preview', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--expectations', type=Path)
     parser.add_argument('--expectations-sha256')
     parser.add_argument('--independent-review', type=Path)
     parser.add_argument('--review-sha256')
     parser.add_argument('--output-file', type=Path, help='save a new private verification report, keeping semantic details out of stdout')
     args = parser.parse_args(argv)
+    if args.owned_preview and (not args.run or args.owner_task_id is None):
+        parser.error('owned preview requires run and the original owner')
     if args.output_file is not None and not args.verify:
         parser.error('--output-file is only available with --verify')
     if args.verify and (args.expectations is None or args.independent_review is None
@@ -434,6 +615,7 @@ def main(argv=None, *, executor=None):
     if not 60 <= args.timeout <= 3600:
         raise ValueError('invalid_timeout')
     args.project = args.project.resolve()
+    args.audit = args.audit.expanduser().resolve()
     os.umask(0o077)
     if args.verify:
         return verify(args)
