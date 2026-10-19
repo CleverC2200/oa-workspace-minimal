@@ -216,7 +216,9 @@ def test_host_request_reads_complete_material_view_for_every_finance_workflow(
     assert "完整读取 `references/payment-screenshot-exemption.md`" in prompt
     assert "body_read_status=not_read 表示正文未读取" in prompt
     assert "prepared.images" in prompt
-    assert read_material.read(action_file) == read_material.render(json.loads(material_file.read_text()))
+    material_view, _, navigation = read_material.read(action_file).partition('\n[reader.image_tool_routes]\n')
+    assert material_view == read_material.render(json.loads(material_file.read_text()))
+    assert json.loads(navigation)['coverage'] == 'navigation_only'
 
 
 def _mock_final_output(monkeypatch, raw):

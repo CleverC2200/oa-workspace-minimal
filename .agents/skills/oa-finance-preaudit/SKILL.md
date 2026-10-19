@@ -29,7 +29,11 @@ python3 -m apps.oa_finance_preaudit.cli next-action \
 
 ## 2. 读取证据
 
-先确认审核包的 `workflow_key`，再从[共享结果接口与流程路由](references/result-contract.md)只加载对应的一个流程规则包。完整读取[证据阅读规则](references/observation-contract.md)，并满足以下完成条件：
+先确认审核包的 `workflow_key`，再从[共享结果接口与流程路由](references/result-contract.md)只加载对应的一个流程规则包。完整读取[证据阅读规则](references/observation-contract.md)。
+
+通过 `python3 -m apps.oa_finance_preaudit.read_material ACTION_FILE` 读取材料时，末尾 `reader.image_tool_routes` 是本地生成的工具导航，保留每页的资源指针、原始页元数据及指纹。大图、局部细节或辅助副本按其中对应入口及覆盖要求处理，具体预算见[附件识别](../../../docs/agents/attachment-recognition.md)和[图片压缩](../../../docs/agents/image-compression.md)。普通页继续直接读取；生成导航本身不读取图片。
+
+证据读取满足以下完成条件：
 
 - 表单明细、相关资源和准备页全部覆盖；页面按证据阅读规则采用直接观察、足够的结构化内容或页级精确重复复用，保留每页资源归属；
 - 每条采用的证据同时证明资源归属和审核项关系；
