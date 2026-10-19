@@ -815,6 +815,7 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str,
                 receipt.update(state="exited", exit_code=code,
                                exit_signal=-code if code < 0 else None, completed_at=_now())
                 persist()
+            phase = "output_binding"
             for stream in (stdout, stderr):
                 stream.flush()
                 os.fsync(stream.fileno())
