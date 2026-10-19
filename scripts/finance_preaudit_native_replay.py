@@ -146,7 +146,7 @@ def prepare(args):
         'case': args.case, 'label': args.label, 'project_root': str(project), 'engine_root': str(root),
         'action_file': action['action_file'], 'mode': 'preview', 'write_authorized': False,
         'original_material': str(source), 'original_material_sha256': digest(source),
-        'original_state_sha256': digest(state_file),
+        'original_state': str(state_file), 'original_state_sha256': digest(state_file),
         'original_evidence_fingerprint_verified': state['evidence_fingerprint'], 'original_path_prefix': str(original['original_attempt']),
         'archived_path_prefix': str(archive), 'fresh_material_sha256': digest(fresh_state['material_file']),
         'fresh_evidence_fingerprint': fresh_state['evidence_fingerprint'],
@@ -162,6 +162,21 @@ def prepare(args):
         'project_root': str(project), 'action_file': action['action_file'], 'image_count': len(prepared_material['prepared']['images']),
         'material_changes': changed_top_level, 'mode': 'preview', 'write_authorized': False}, ensure_ascii=False))
 
+def original_dependency_error(manifest):
+    dependencies = [('original_material', manifest['original_material'], manifest['original_material_sha256'])]
+    if manifest.get('original_state'):
+        dependencies.append(('original_state', manifest['original_state'], manifest['original_state_sha256']))
+    dependencies.extend(('original_evidence', item['source'], item['sha256']) for item in manifest['file_mapping'])
+    for kind, path, expected in dependencies:
+        try:
+            actual = digest(path)
+        except OSError:
+            return kind + '_unavailable'
+        if actual != expected:
+            return kind + '_changed'
+    return None
+
+
 def run(args, *, executor=None):
     from apps.oa_finance_preaudit import codex_review_worker as worker
     from apps.oa_finance_preaudit import process_diagnostics, production_config
@@ -169,6 +184,8 @@ def run(args, *, executor=None):
     manifest = read(audit / 'prepare.json')
     if (audit / 'worker-result.json').exists() or (audit / 'native-attempt-1').exists():
         raise RuntimeError('native_run_already_started_do_not_repeat')
+    if (audit / 'result.json').exists():
+        raise RuntimeError('replay_result_already_exists_use_new_label')
     project, action_file = Path(manifest['project_root']), Path(manifest['action_file'])
     configuration = manifest.get('review_configuration', production_config.LEGACY_OPENAI_IDENTITY)
     if worker.REVIEW_SETTINGS != configuration:
@@ -180,16 +197,34 @@ def run(args, *, executor=None):
     if digest(Path(worker.__file__)) != manifest['worker_source_sha256']:
         raise RuntimeError('worker_source_changed_since_prepare')
     attempts = []
+    result = {'case': args.case, 'review_status': 'not_started', 'attempts': attempts,
+        'execution_transport': 'recorded' if executor is not None else 'native', 'oa_writes': 0,
+        'business_acceptance': 'not_verified', 'original_material_unchanged': None}
+    dependency_error = original_dependency_error(manifest)
+    if dependency_error:
+        result['error_code'] = dependency_error
+        dump(audit / 'result.json', result)
+        print(json.dumps(result, ensure_ascii=False))
+        return 1
     def audit_executor(project_root, frozen_action, timeout):
         attempt_audit = audit / f'native-attempt-{len(attempts) + 1}'
         attempt_audit.mkdir(mode=0o700)
         stderr = {}
         started = time.monotonic()
-        execution = (executor(project_root, frozen_action, timeout) if executor is not None
-                     else worker._execute_codex_raw(project_root, frozen_action, timeout,
-                         stderr_summary=stderr, audit_directory=attempt_audit))
+        try:
+            execution = (executor(project_root, frozen_action, timeout) if executor is not None
+                         else worker._execute_codex_raw(project_root, frozen_action, timeout,
+                             stderr_summary=stderr, audit_directory=attempt_audit))
+        except OSError as error:
+            record = {'attempt': len(attempts) + 1, 'elapsed_seconds': time.monotonic() - started,
+                'error_code': 'native_replay_execution_io_error', 'io_error_type': type(error).__name__,
+                'process_state': 'unknown', 'exit_code': None, 'decision_state': 'not_available',
+                'token_usage': {'status': 'unknown'}, 'native_receipt_files': stderr.get('tool_receipt_files', []),
+                'native_receipt_unavailable': stderr.get('tool_receipt_unavailable', False)}
+            attempts.append(record)
+            dump(attempt_audit / 'receipt.json', record)
+            raise
         elapsed = time.monotonic() - started
-        process_diagnostics.record(frozen_action, execution=execution, elapsed_seconds=elapsed, stderr=stderr)
         record = {'attempt': len(attempts) + 1, 'elapsed_seconds': elapsed,
             'error_code': execution.error_code, 'process_state': execution.process_state,
             'exit_code': execution.exit_code, 'decision_state': execution.decision_state,
@@ -197,17 +232,28 @@ def run(args, *, executor=None):
             'native_receipt_unavailable': stderr.get('tool_receipt_unavailable', False)}
         attempts.append(record)
         dump(attempt_audit / 'receipt.json', record)
+        process_diagnostics.record(frozen_action, execution=execution, elapsed_seconds=elapsed, stderr=stderr)
         return execution
-    reviewed = worker.review({'project_root': str(project), 'action_file': str(action_file),
-        'timeout_seconds': args.timeout}, executor=audit_executor)
+    try:
+        reviewed = worker.review({'project_root': str(project), 'action_file': str(action_file),
+            'timeout_seconds': args.timeout}, executor=audit_executor)
+    except OSError:
+        result.update(review_status='failed', error_code='native_replay_execution_io_error')
+        dump(audit / 'result.json', result)
+        print(json.dumps(result, ensure_ascii=False))
+        return 1
     dump(audit / 'worker-result.json', reviewed)
-    result = {'case': args.case, 'review_status': reviewed['status'], 'attempts': attempts,
+    result.update({'review_status': reviewed['status'],
         'model': reviewed.get('model'), 'reasoning_effort': reviewed.get('reasoning_effort'),
         'model_provider': reviewed.get('model_provider'),
-        'requested_service_tier': reviewed.get('requested_service_tier'),
-        'execution_transport': 'recorded' if executor is not None else 'native', 'oa_writes': 0,
-        'business_acceptance': 'not_verified',
-        'original_material_unchanged': digest(manifest['original_material']) == manifest['original_material_sha256']}
+        'requested_service_tier': reviewed.get('requested_service_tier')})
+    dependency_error = original_dependency_error(manifest)
+    if dependency_error:
+        result['error_code'] = dependency_error
+        dump(audit / 'result.json', result)
+        print(json.dumps(result, ensure_ascii=False))
+        return 1
+    result['original_material_unchanged'] = True
     if reviewed['status'] == 'reviewed':
         decision_file = action_file.with_name('native-preview-decision.json')
         dump(decision_file, reviewed['decision'])
@@ -282,7 +328,7 @@ def verify(args):
             findings.append('frozen_source_changed:use a new label without rewriting the old snapshot')
         if digest(manifest['original_material']) != manifest['original_material_sha256']:
             findings.append('original_material_changed:preserve the original evidence')
-        if digest(Path(manifest['archived_path_prefix']) / 'state.json') != manifest['original_state_sha256']:
+        if digest(manifest.get('original_state', Path(manifest['archived_path_prefix']) / 'state.json')) != manifest['original_state_sha256']:
             findings.append('original_state_changed:preserve the original state')
         if not all(digest(x[p]) == x['sha256'] for x in manifest['file_mapping'] for p in ('source', 'target')):
             findings.append('evidence_fingerprint_mismatch:preserve original and frozen attachments')
