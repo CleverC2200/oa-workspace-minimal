@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 import socket
+from threading import Event
 
 import pytest
 
 
 @pytest.fixture(autouse=True)
-def reject_unrecorded_network(monkeypatch: pytest.MonkeyPatch) -> None:
+def reject_unrecorded_network(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Guard this Python test process and its threads; preserve local IPC."""
+    violation = Event()
+
     def reject(*_args, **_kwargs):
+        violation.set()
         # pytest.fail raises outside Exception so read-failure adapters cannot
         # turn an unintended external call into a passing negative test.
         pytest.fail(
@@ -32,6 +37,12 @@ def reject_unrecorded_network(monkeypatch: pytest.MonkeyPatch) -> None:
             return _original(channel, *args, **kwargs)
 
         monkeypatch.setattr(socket.socket, name, guarded)
+
+    yield
+    # Threads, unobserved Futures and unraisable callbacks can retain the failure
+    # instead of propagating it to pytest's test call.
+    if violation.is_set():
+        pytest.fail('offline_network_forbidden: a blocked network attempt occurred in this pytest case', pytrace=False)
 
 
 @pytest.fixture(autouse=True)
