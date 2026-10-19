@@ -956,6 +956,11 @@ def publish(action: Path, *, prompt: str, timeout_seconds: int, kind: str = 'fin
     manifest = controller_handoff._read_manifest()
     if manifest is None:
         raise ValueError('host_review_run_untrusted')
+    if registered.get('preview_binding') is not None:
+        _, prepared = _read(Path(registered['preview_binding']['prepare_file']))
+        prompt = (f"本次冻结项目根为 {prepared['project_root']}。提示中的相对 Skill、文档路径均以该根解析。"
+                  f"Python 模块命令必须显式使用 workdir={runtime_control.PROJECT_ROOT.absolute()}，"
+                  '以加载已核对的执行源码；材料仍只读取本次冻结项目与动作引用。\n' + prompt)
     started_at = time.time()
     request = {'schema_version': 1, 'kind': 'preaudit_host_review_request', 'review_kind': kind,
                'request_id': uuid4().hex, 'owner_task_id': owner, 'run_id': registered['run_id'],
@@ -966,12 +971,14 @@ def publish(action: Path, *, prompt: str, timeout_seconds: int, kind: str = 'fin
                'expires_at': started_at + timeout_seconds, 'prompt': prompt, 'review_context': review_context or {}}
     _live(request, action, owner=owner)
     request_file = _request_file(action, kind, owner=owner, run_id=registered['run_id'])
+    draft_options = ('{"cmd":规范命令字符串字面量,"workdir":' + json.dumps(str(runtime_control.PROJECT_ROOT.absolute())) + '}'
+                     if registered.get('preview_binding') is not None else '{"cmd":规范命令字符串字面量}')
     request['prompt'] += (
         '\n保存 model JSON 必须调用专用 write-draft 接口，不使用通用文件写入或已有文件。\n'
         f'用 {MODULE}.draft_command(Path({str(request_file)!r}), Path(新的私有决定文件绝对路径), '
         f'model_payload, owner={owner!r}) 生成规范命令。\n'
         '将返回命令作为 JSON 字符串字面量，独立原生 exec 只执行 '
-        'text(await tools.exec_command({"cmd":规范命令字符串字面量}));。\n'
+        f'text(await tools.exec_command({draft_options}));。\n'
         '专用接口独占写入并返回绑定本请求和实际字节 SHA256 的回执。'
         '等待该次配对工具输出真实完成，再 submit；回执生成后禁止更改决定文件。\n'
     )
@@ -1026,7 +1033,8 @@ def _submission(request_file: Path, request: dict, *, registered: dict | None = 
     if source.get('session_file') != registered['reviewers'][slot]['child_source']['session_file']:
         raise ValueError('host_review_source_untrusted')
     if source != _source_receipt(Path(source['session_file']), source['line'], assigned['reviewer_task_id'],
-                                 Path(source['decision_file']), assigned=assigned):
+                                 Path(source['decision_file']), assigned=assigned,
+                                 preview=registered.get('preview_binding') is not None):
         raise ValueError('host_review_source_untrusted')
     from datetime import datetime
     native, _ = _native_source(Path(source['session_file']), assigned['reviewer_task_id'], source['line'])
@@ -1378,7 +1386,7 @@ def _shell_result(output) -> dict:
     return results[0]
 
 
-def _draft_publication(input_text, output, decision_file: Path) -> dict:
+def _draft_publication(input_text, output, decision_file: Path, *, preview: bool = False) -> dict:
     # A full single-statement match excludes commented paths, branches, extra
     # commands, shell operators and unrelated successful results.
     if not isinstance(input_text, str):
@@ -1391,6 +1399,8 @@ def _draft_publication(input_text, output, decision_file: Path) -> dict:
         if set(args) not in ({'cmd'}, {'cmd', 'workdir'}) or not isinstance(args['cmd'], str):
             raise ValueError('invalid_command')
         if 'workdir' in args and args['workdir'] != str(runtime_control.PROJECT_ROOT.absolute()):
+            raise ValueError('invalid_project_directory')
+        if preview and args.get('workdir') != str(runtime_control.PROJECT_ROOT.absolute()):
             raise ValueError('invalid_project_directory')
         command_tokens = shlex.split(args['cmd'])
         if len(command_tokens) not in {17, 20}:
@@ -1431,7 +1441,7 @@ def validate_source(source: Path, line: int, session: str, decision_file: Path, 
     """Validate a native observation source for the caller's public acceptance seam."""
     return _source_receipt(source, line, session, decision_file, assigned={'dispatched_at': dispatched_at})
 
-def _source_receipt(source: Path, line: int, reviewer: str, decision_file: Path, *, assigned: dict) -> dict:
+def _source_receipt(source: Path, line: int, reviewer: str, decision_file: Path, *, assigned: dict, preview: bool = False) -> dict:
     """Bind the registered child and its successful native decision-writing call."""
     native, proof = _native_source(source, reviewer, line, output=True)
     payload = native['anchor'].get('payload', {})
@@ -1441,7 +1451,7 @@ def _source_receipt(source: Path, line: int, reviewer: str, decision_file: Path,
 ):
         raise ValueError('host_review_source_untrusted')
     output = proof.pop('output')
-    publication = _draft_publication(payload.get('arguments', payload.get('input')), output, decision_file)
+    publication = _draft_publication(payload.get('arguments', payload.get('input')), output, decision_file, preview=preview)
     if assigned.get('request_sha256') is not None and publication['request_sha256'] != assigned['request_sha256']:
         raise ValueError('host_review_source_untrusted')
     from datetime import datetime
@@ -1476,7 +1486,8 @@ def submit(request_file: Path, decision_file: Path, *, owner: str, source: Path,
             raise ValueError('host_review_source_untrusted')
         _, decision = _read(decision_file)
         review_payload = decision
-        provenance = _source_receipt(source, source_line, assigned['reviewer_task_id'], decision_file, assigned=assigned)
+        provenance = _source_receipt(source, source_line, assigned['reviewer_task_id'], decision_file,
+            assigned=assigned, preview=registered.get('preview_binding') is not None)
         if request['review_kind'] == 'finance':
             from . import codex_review_worker as worker
             decision = worker._normalize_decision(action, decision)

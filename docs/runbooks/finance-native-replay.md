@@ -86,7 +86,7 @@ export OA_FROZEN_WRITER_LOCK_FILE=/private/local-evidence/replay/runs/candidate-
 
 复用[当前 App 登记与原始执行回执](../agents/controller-execution.md)的三个真实子会话、原生父心跳及 assign/submit 来源校验。父会话创建和派发 reviewer，Python 不创建 agent。审核请求只接受本次冻结的唯一 preview action，不能改为受控写入或包装阶段。登记和审核共用本次 `--timeout` 预算，剩余不足一分钟时不开始审核。
 
-审核者仍调用专用 write-draft 并等待真实配对工具输出。完成宿主验证同一 request/assignment/source/decision，再由离线 FlowEngine 闭合，保持 `write_state=not_requested`。不要另调生产 Worker 的 complete 入口。
+相对 Skill 和文档路径以请求声明的冻结项目为根；Python 模块命令使用请求指定的执行源码目录，不能依赖聊天默认 checkout。专用 write-draft 的原生 exec 必须显式传入该 workdir，并等待真实配对工具输出。完成宿主验证同一 request/assignment/source/decision，再由离线 FlowEngine 闭合，保持 `write_state=not_requested`。不要另调生产 Worker 的 complete 入口。
 
 等待原执行真实退出后，按同一收尾入口取得三个 interrupt、list_agents 和原 session 的 terminal wait，再封存该只读轮次。进程退出与 reviewer idle 分别核验。只读失败保留在本 case 的私有目录，不清除生产停止门，也不自动重跑。App 实际模型名和 Token 用量无法观测时保持 `unknown`。
 

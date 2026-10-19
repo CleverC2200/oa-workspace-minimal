@@ -112,6 +112,14 @@ def test_app_preview_closes_one_frozen_case_through_native_exchange(app_case, tm
         target = tmp_path / 'native-decision.json'
         child = Path(reviewers[0]['session_file'])
         written = draft_source(child, request, target, owner, payload=decision)
+        with pytest.raises(ValueError, match='host_review_source_untrusted'):
+            host.submit(request, target, owner=owner, source=child, source_line=written, run_id=run)
+        target = tmp_path / 'native-decision-with-directory.json'
+        published = host.publish_draft(request, target, decision, owner=owner)
+        command = host.draft_command(request, target, decision, owner=owner)
+        written = native_call(child, 'functions.exec', 'text(await tools.exec_command(' + json.dumps({
+            'cmd': command, 'workdir': str(Path(__file__).resolve().parents[2])}) + '));',
+            'draft-with-directory', {'exit_code': 0, 'output': json.dumps(published) + '\n'})
         assert host.submit(request, target, owner=owner, source=child, source_line=written, run_id=run)['status'] == 'published'
         stdout, stderr = process.communicate(timeout=15)
         assert process.returncode == 0, (stdout, stderr)
