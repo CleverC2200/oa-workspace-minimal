@@ -55,7 +55,6 @@ def test_registry_rejects_a_child_without_native_parent_spawn_ancestry(tmp_path,
 
 
 def original_execution(owner, manifest):
-    from datetime import datetime, timedelta, timezone
     from pathlib import Path
     import os
     from apps.oa_finance_preaudit import approval_guard, controller_handoff
@@ -66,7 +65,7 @@ def original_execution(owner, manifest):
         'invocation_id': invocation, 'state': 'waiting', 'controller_pid': os.getpid(), 'process_group_id': os.getpid(),
         'supervisor_pid': os.getpid(), 'supervisor_process': approval_guard.process_identity(os.getpid()),
         'controller_process': approval_guard.process_identity(os.getpid()), 'children_reaped': 'unknown',
-        'started_at': (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), 'completed_at': None,
+        'started_at': manifest['started_at'], 'completed_at': None,
         'review_configuration': host.IDENTITY, 'exit_code': None}
     approval_guard.write(receipt_file, receipt)
     finance_preaudit_run.bind_tool_session(receipt_file, owner_task_id=owner, session_id='original-session')
