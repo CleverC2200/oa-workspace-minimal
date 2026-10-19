@@ -10,6 +10,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import signal
 import time
 
 from apps.oa_approval import runtime_control
@@ -275,8 +276,11 @@ def _unregistered_proofs(*, owner: str, reviewers: list[dict], source: Path, rec
     completed = runner._timestamp(execution['completed_at']).timestamp()
     if (report['state'] != 'exited' or report.get('controller_state') != 'failed'
             or report.get('children_reaped') is not True or type(report.get('exit_code')) is not int
+            or not -signal.NSIG < report['exit_code'] <= 255
+            or execution.get('exit_signal') != (-report['exit_code'] if report['exit_code'] < 0 else None)
             or execution.get('review_configuration') != host.IDENTITY
-            or not started <= runner._timestamp(manifest['completed_at']).timestamp() <= completed <= time.time()
+            or not started <= runner._timestamp(manifest['started_at']).timestamp()
+            <= runner._timestamp(manifest['completed_at']).timestamp() <= completed <= time.time()
             or (require_idle and (runtime_control.writer_active() or runtime_control.active_request_writers()))
             or host.guard.group_alive(execution['process_group_id'])
             or not host.guard._valid_identity(execution.get('supervisor_process'))

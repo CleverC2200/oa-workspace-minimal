@@ -90,7 +90,8 @@ def test_pre_registration_shutdown_seals_native_exit_without_rewriting_partial_e
 
 @pytest.mark.parametrize('damage', ['wrong_child', 'wrong_target', 'wrong_session', 'wrong_exit',
     'missing_interrupt', 'status_before_interrupt', 'stale_wait', 'stale_spawn', 'actions', 'writer',
-    'process_attempts', 'completed_work', 'missing_progress', 'registered_round', 'changed_after_seal'])
+    'process_attempts', 'completed_work', 'missing_progress', 'registered_round', 'changed_after_seal',
+    'wrong_signal', 'reversed_manifest_clock'])
 def test_pre_registration_shutdown_rejects_mismatched_or_work_bearing_evidence(failed_start, damage):
     args, result = failed_start
     original = args['receipt_file'].read_bytes()
@@ -138,6 +139,16 @@ def test_pre_registration_shutdown_rejects_mismatched_or_work_bearing_evidence(f
             host.guard.write(path, progress)
     elif damage == 'registered_round':
         host.guard.write(host.registry_file(args['owner'], result['run_id']), {'state': 'open'})
+    elif damage == 'wrong_signal':
+        receipt = json.loads(args['receipt_file'].read_text())
+        receipt['exit_signal'] = 9
+        host.guard.write(args['receipt_file'], receipt)
+        original = args['receipt_file'].read_bytes()
+    elif damage == 'reversed_manifest_clock':
+        path = args['receipt_file'].with_name('controller-manifest.json')
+        manifest = json.loads(path.read_text())
+        manifest['completed_at'] = json.loads(original)['started_at']
+        host.guard.write(path, manifest)
     else:
         path = args['receipt_file'].with_name('stdout.log')
         payload = json.loads(path.read_text())
