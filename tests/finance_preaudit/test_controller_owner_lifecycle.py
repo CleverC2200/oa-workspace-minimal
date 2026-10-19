@@ -421,3 +421,80 @@ def test_supervisor_observation_write_failure_preserves_original_loss(tmp_path, 
     assert report['status'] == 'blocked' and report['error_code'] == 'controller_supervisor_lost'
     assert report['terminal'] is False and report['exit_code'] is None
     assert not (directory / 'supervisor-exit.json').exists()
+
+
+@pytest.mark.parametrize("failure_code", ["controller_execution_snapshot_changed", "token_secret_identifier"])
+def test_supervisor_callback_failure_keeps_original_error_and_terminal_evidence(tmp_path, monkeypatch, failure_code):
+    monkeypatch.setenv('OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE', str(tmp_path / 'rolling.lock'))
+    owner = str(uuid4())
+    directory = tmp_path / 'executions' / uuid4().hex
+    identity = approval_guard.process_identity(os.getpid())
+    original_identity = approval_guard.process_identity
+    calls = []
+
+    def owner_identity(pid):
+        receipt_file = directory / 'execution.json'
+        if pid == identity['pid'] and receipt_file.exists() and json.loads(receipt_file.read_text())['state'] == 'waiting':
+            return None
+        return original_identity(pid)
+
+    monkeypatch.setattr(approval_guard, 'process_identity', owner_identity)
+
+    def controller_owner():
+        calls.append(True)
+        if len(calls) == 1:
+            raise ValueError(failure_code)
+        return json.loads((directory / 'execution.json').read_text())['controller_pid']
+
+    def stop_failure():
+        raise RuntimeError('controller_stop_request_failed')
+
+    monkeypatch.setattr(runtime_control, 'controller_owner_pid', controller_owner)
+    monkeypatch.setattr(runtime_control, 'request_cycle_stop', stop_failure)
+    command = [sys.executable, '-c', '''import time
+from apps.oa_approval import runtime_control as control
+from apps.oa_finance_preaudit import controller_handoff as handoff
+with control.global_controller_lease():
+    manifest=handoff.begin({'capacity':3})
+    time.sleep(.15)
+    handoff.finish(manifest,status='failed',children_reaped=True,health='degraded')
+print('offline callback failure')
+raise SystemExit(7)
+''']
+    with pytest.raises(ValueError, match=failure_code):
+        runner.supervise(command, directory=directory, owner_task_id=owner, owners=[identity])
+    receipt = json.loads((directory / 'execution.json').read_text())
+    assert receipt['primary_failure'] == {'error_type': 'ValueError', 'error_code': failure_code if failure_code.startswith('controller_') else 'controller_supervisor_failure',
+                                           'phase': 'controller_wait'}
+    assert receipt['cleanup_failures'] == [{'error_type': 'RuntimeError', 'error_code': 'controller_stop_request_failed',
+                                            'phase': 'stop_request'}]
+    report = runner.read_execution(directory / 'execution.json', owner_task_id=owner, invocation_id=directory.name)
+    assert report['terminal'] is True and report['status'] == 'blocked'
+    assert report['exit_code'] == 7 and report['children_reaped'] is True
+    assert report['primary_failure'] == receipt['primary_failure']
+    assert report['output_files']['stdout.log']['size_bytes'] > 0
+
+
+def test_terminal_log_limit_failure_keeps_actual_wait_and_manifest(tmp_path, monkeypatch):
+    monkeypatch.setenv('OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE', str(tmp_path / 'rolling.lock'))
+    monkeypatch.setattr(runner, 'LOG_LIMIT', 4)
+    owner = str(uuid4())
+    directory = tmp_path / 'executions' / uuid4().hex
+    command = [sys.executable, '-c', '''from apps.oa_approval import runtime_control as control
+from apps.oa_finance_preaudit import controller_handoff as handoff
+with control.global_controller_lease():
+    manifest=handoff.begin({'capacity':3})
+    handoff.finish(manifest,status='failed',children_reaped=True,health='degraded')
+print('larger than the bound')
+raise SystemExit(7)
+''']
+    with pytest.raises(ValueError, match='controller_execution_output_limit'):
+        runner.supervise(command, directory=directory, owner_task_id=owner)
+    receipt = json.loads((directory / 'execution.json').read_text())
+    assert receipt['exit_code'] == 7 and receipt['children_reaped'] is True
+    assert receipt['primary_failure'] == {'error_type': 'ValueError', 'error_code': 'controller_execution_output_limit',
+                                           'phase': 'terminal_binding'}
+    assert receipt['cleanup_failures'][0]['error_code'] == 'controller_execution_output_limit'
+    assert receipt['manifest_sha256'] and 'result' not in receipt
+    report = runner.read_execution(directory / 'execution.json', owner_task_id=owner, invocation_id=directory.name, retrieve=True)
+    assert report['terminal'] is False and report['status'] == 'blocked'

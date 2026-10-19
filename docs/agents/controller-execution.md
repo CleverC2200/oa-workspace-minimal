@@ -20,6 +20,8 @@
 
 `state=exited` 只证明监督进程实际 `wait` 得到子控制器退出码；`result=completed` 还需要同 PID、本次开始时间之后的清单为 completed 且 children_reaped=true。终态缺口或不可信结果为 blocked，不证明已安全回收或可以再次启动。进程信号退出记录真实负退出码和信号。监督者被 SIGKILL 或机器断电时，原保存记录可能仍是 waiting；读取入口在可确认监督者丢失时投影 state=supervisor_lost、recorded_state=waiting、status=blocked、terminal=false，保留未知退出码，不改写原证据。新回执用 supervisor_process 核对 PID 复用，历史缺失该字段时只使用原兼容存活检查。子清单收尾或已确认回收不代替真实 wait，按原隔离排障入口核对，不能重放。
 
+监督回调异常将首个安全错误码、异常类和阶段保存在 `primary_failure`，停止或末尾留证错误另列 `cleanup_failures`；任意异常正文不保存。监督者继续等待原控制器，终态时绑定实际 wait、日志与匹配清单。缺少可信绑定仍为 blocked，不把首错诊断当作根因或业务完成证明。
+
 启动竞争后，只有本次子进程退出0、确认没有本轮镜像且原输出完整验证正常活动控制器门禁时，才记录 result=skipped；此时不能认领他人 run、进入包装或清窗。存在但损坏/不匹配的镜像仍 blocked，不能靠 skipped 输出覆盖坏证据。
 
 ## 固定 App 审核槽的原生派单
@@ -113,6 +115,16 @@ python -B -m apps.oa_finance_preaudit.host_chat_review --operation submit --owne
 暂缓对象必须是本轮流程范围内的最新 attempt，保持可信 `review_required / controlled_write / authorized`，身份、冻结和授权原状态校验通过，且不存在规范决定、意见、Writer 边界、执行回执或提交信封。域外路径、符号链接、重复路径、旧 attempt、与恢复选择重叠或任何校验失败均拒绝。私有草稿不等于已提交决定，不自动复制到新轮次。
 
 全局对账和 Writer 门禁先按原规则通过，之后才从可行动数量中扣除当前待办的暂缓项，其余单据保持 FIFO。暂缓不能掩盖身份冲突、未知写入或损坏冻结，也不能代替隔离恢复。结果中的 `deferred_action_files` 和 `deferred_selected_count` 只说明本次选择；暂缓不计作提交或隔离。只剩暂缓项时本轮可结束，仍须明确报告这些待办没有完成，不把本轮结束称为全部待办已清空。
+
+### App 登记前失败
+
+原控制器已失败退出、三个原生审核者尚未登记时，使用 `finish-unregistered-shutdown`。保留原 execution、清单、日志和 progress；取得原 session 的真实 terminal wait、原三个 spawn、interrupt 和最后 list_agents 来源，再将这些来源交给该入口。它只接受没有 action、准备/审核执行及 Writer 活动的失败轮，核对原进程已退出、回收、身份和时间顺序，独占新增 `pre-registration-shutdown.json`；原部分回执保持原字节，业务结果继续为失败。
+
+```bash
+python -B -m apps.oa_finance_preaudit.host_chat_review --operation finish-unregistered-shutdown --owner-task-id <原父会话UUID> --receipt-file <原execution.json> --invocation-id <原调用ID> --tool-session-id <原session_id> --source-session-file <原父会话jsonl> --reviewer-session-file <槽0子会话jsonl> --spawn-line <槽0spawn行> --reviewer-session-file <槽1子会话jsonl> --spawn-line <槽1spawn行> --reviewer-session-file <槽2子会话jsonl> --spawn-line <槽2spawn行> --interrupt-line <槽0interrupt行> --interrupt-line <槽1interrupt行> --interrupt-line <槽2interrupt行> --source-line <最终list_agents行> --wait-line <原session终态wait行>
+```
+
+新 App 轮次启动时复核原 execution 的收尾，包含未登记的失败轮；全局 ready、进程消失或待办为空不能代替该回执。来源缺失或存在取材、审核、写入时保持阻断，沿隔离排障入口处理。
 
 ### App 统一收尾
 
