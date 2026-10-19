@@ -1084,8 +1084,139 @@ def test_prune_compacts_raw_metrics_before_delete_and_keeps_daily_180_days(
     ] in {"exact", "unknown"}
 
 
-def test_prune_refreshes_a_late_unknown_outcome_without_changing_its_state(
+@pytest.mark.parametrize("expired_count", [0, 1, 2])
+def test_repeated_prune_preserves_accumulated_outcomes_after_source_deletion(
+    tmp_path: Path, expired_count: int,
+) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    for index, workflow in enumerate(("travel_expense", "business_entertainment")):
+        attempt = _attempt(
+            root, case_key=f"original-{index}", attempt=1, age_days=90,
+            workflow_key="travel_expense" if expired_count else workflow,
+            archived=index < expired_count,
+        )
+        created = (NOW - timedelta(days=90)).timestamp()
+        os.utime(attempt / "state.json", (created, created))
+
+    first = runtime_maintenance.prune(root, now=NOW)
+    original = runtime_maintenance.status(root, now=NOW)["daily_history"]
+    assert first["deleted"] == expired_count
+    assert len(original) == 1
+    assert original[0]["metrics"]["outcomes"]["overall"]["attempt_count"] == 2
+
+    for days in (1, 2):
+        assert runtime_maintenance.prune(
+            root, now=NOW + timedelta(days=days),
+        )["status"] == "ok"
+        assert runtime_maintenance.status(root, now=NOW)["daily_history"] == original
+
+    late = _attempt(
+        root, case_key="late", attempt=1, age_days=90,
+        workflow_key="general_expense", archived=True,
+    )
+    added = (NOW + timedelta(days=2, minutes=1)).timestamp()
+    os.utime(late / "state.json", (added, added))
+    assert runtime_maintenance.prune(
+        root, now=NOW + timedelta(days=3),
+    )["status"] == "ok"
+    assert not late.exists()
+    accumulated = runtime_maintenance.status(root, now=NOW)["daily_history"]
+    assert accumulated[0]["metrics"]["outcomes"]["overall"]["attempt_count"] == 3
+    assert runtime_maintenance.prune(
+        root, now=NOW + timedelta(days=4),
+    )["status"] == "ok"
+    assert runtime_maintenance.status(root, now=NOW)["daily_history"] == accumulated
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_prune_only_upgrades_legacy_totals_when_sources_still_prove_them(
+    tmp_path: Path, expired: bool,
+) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    attempt = _attempt(root, case_key="original", attempt=1, age_days=90, archived=expired)
+    earlier = (NOW - timedelta(minutes=1)).timestamp()
+    os.utime(attempt / "state.json", (earlier, earlier))
+    assert runtime_maintenance.prune(root, now=NOW)["status"] == "ok"
+    original = runtime_maintenance.status(root, now=NOW)["daily_history"][0]
+    daily_path = root / ".metrics" / "daily" / f"{original['day']}.json"
+    legacy = {key: value for key, value in original.items() if key != "outcome_sources"}
+    json_artifact.write_json_atomic(daily_path, legacy)
+    legacy_bytes = daily_path.read_bytes()
+    if expired:
+        _attempt(root, case_key="other", attempt=1, age_days=90)
+        with pytest.raises(ValueError, match="retention_plan_invalid") as failure:
+            runtime_maintenance.prune(root, now=NOW + timedelta(days=1))
+        assert str(failure.value.__cause__) == "daily_metric_conflict"
+        assert daily_path.read_bytes() == legacy_bytes
+    else:
+        assert runtime_maintenance.prune(root, now=NOW)["status"] == "ok"
+        upgraded = runtime_maintenance.status(root, now=NOW)["daily_history"][0]
+        assert upgraded["metrics"] == legacy["metrics"]
+        assert upgraded["prior_fingerprints"] == [
+            f"sha256:{hashlib.sha256(legacy_bytes).hexdigest()}",
+        ]
+        assert runtime_maintenance.prune(root, now=NOW)["status"] == "ok"
+        assert runtime_maintenance.status(root, now=NOW)["daily_history"] == [upgraded]
+
+
+def test_prune_rejects_reclassified_remaining_source_after_partial_deletion(
     tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    surviving = _attempt(root, case_key="remaining", attempt=1, age_days=90)
+    _attempt(root, case_key="expired", attempt=1, age_days=90, archived=True)
+    assert runtime_maintenance.prune(root, now=NOW)["deleted"] == 1
+    original = runtime_maintenance.status(root, now=NOW)["daily_history"]
+    state_path = surviving / "state.json"
+    state = json.loads(state_path.read_text())
+    state["business_state"] = "needs_human"
+    json_artifact.write_json_atomic(state_path, state)
+
+    with pytest.raises(ValueError, match="retention_plan_invalid") as failure:
+        runtime_maintenance.prune(root, now=NOW + timedelta(days=1))
+
+    assert str(failure.value.__cause__) == "daily_metric_conflict"
+    assert runtime_maintenance.status(root, now=NOW)["daily_history"] == original
+    assert surviving.is_dir()
+
+
+@pytest.mark.parametrize("damage", ["count", "workflow", "extra_field"])
+def test_prune_rejects_damaged_accumulated_source_metrics(
+    tmp_path: Path, damage: str,
+) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    retention.initialize_root(root)
+    _attempt(root, case_key="original", attempt=1, age_days=90)
+    assert runtime_maintenance.prune(root, now=NOW)["status"] == "ok"
+    original = runtime_maintenance.status(root, now=NOW)["daily_history"][0]
+    daily_path = root / ".metrics" / "daily" / f"{original['day']}.json"
+    source = next(iter(original["outcome_sources"].values()))
+    if damage == "count":
+        source["metrics"]["attempt_count"] = 2
+    elif damage == "workflow":
+        source["workflow_key"] = "general_expense"
+    else:
+        source["request_id"] = "unapproved-field"
+    json_artifact.write_json_atomic(daily_path, original)
+    damaged_bytes = daily_path.read_bytes()
+
+    with pytest.raises(ValueError, match="retention_plan_invalid") as failure:
+        runtime_maintenance.prune(root, now=NOW)
+
+    assert str(failure.value.__cause__) == "runtime_state_invalid"
+    assert daily_path.read_bytes() == damaged_bytes
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_prune_refreshes_a_late_unknown_outcome_without_changing_its_state(
+    tmp_path: Path, legacy: bool,
 ) -> None:
     root = tmp_path / "runtime"
     root.mkdir()
@@ -1104,6 +1235,8 @@ def test_prune_refreshes_a_late_unknown_outcome_without_changing_its_state(
     assert len(old_payloads) == 1
     daily_path, old_payload = next(iter(old_payloads.items()))
     assert old_payload["metrics"]["outcomes"]["overall"]["attempt_count"] == 6
+    if legacy:
+        old_payload.pop("outcome_sources")
     daily_path.parent.mkdir(parents=True)
     json_artifact.write_json_atomic(daily_path, old_payload)
 
