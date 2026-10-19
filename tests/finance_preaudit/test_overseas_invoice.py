@@ -434,7 +434,10 @@ def test_readonly_postcheck_rejects_changed_evidence_without_resubmit(harness, c
     assert len(api.calls) == 1
 
 
-@pytest.mark.parametrize('response_mode', ['complete', 'conflict', 'failed'])
+@pytest.mark.parametrize('response_mode', [
+    'complete', 'complete_nested', 'complete_bare', 'conflict', 'failed',
+    'login_html', 'missing_list', 'invalid_rows', 'mixed_rows', 'missing_request',
+])
 def test_postcheck_checks_handled_pages_beyond_five(harness, monkeypatch, response_mode):
     from io import BytesIO
     from urllib.parse import parse_qs
@@ -448,10 +451,29 @@ def test_postcheck_checks_handled_pages_beyond_five(harness, monkeypatch, respon
             rows = ([{'requestId': str(10000 + page * 100 + index)} for index in range(100)]
                     if page <= 5 else [{'requestId': '901'}])
         else:
-            if response_mode == 'failed':
-                return BytesIO(b'{"code":"ERROR"}')
+            invalid = {
+                'failed': b'{"code":"ERROR"}',
+                'login_html': b'<html>synthetic login HTML</html>',
+                'missing_list': b'{"code":"SUCCESS"}',
+                'invalid_rows': b'{"code":"SUCCESS","data":["not a row"]}',
+                'mixed_rows': b'{"code":"SUCCESS","data":[{"requestId":"902"},"not a row"]}',
+                'missing_request': b'{"code":"SUCCESS","data":[{}]}',
+            }
+            if response_mode in invalid:
+                return BytesIO(invalid[response_mode])
+            if response_mode == 'complete_nested':
+                return BytesIO(b'{"data":{"list":[]}}')
+            if response_mode == 'complete_bare':
+                return BytesIO(b'[]')
             rows = [{'requestId': '901', 'workflowId': 'different'}] if response_mode == 'conflict' else []
         return BytesIO(json.dumps({'code': 'SUCCESS', 'data': rows}).encode())
     monkeypatch.setattr('apps.oa_approval.safe_http.urlopen', response)
     api.handled_rows = handled_api.handled_rows
-    assert engine.submit(attempt, confirm='YES')['status'] == ('submitted' if response_mode == 'complete' else 'unknown')
+    complete = response_mode in {'complete', 'complete_nested', 'complete_bare'}
+    assert engine.submit(attempt, confirm='YES')['status'] == ('submitted' if complete else 'unknown')
+    if not complete:
+        journal = engine.root / 'receipts' / (inv.digest('901') + '.json')
+        original_bytes = journal.read_bytes()
+        assert engine.postcheck(attempt)['status'] == 'unresolved'
+        assert journal.read_bytes() == original_bytes
+        assert len(api.calls) == 1
