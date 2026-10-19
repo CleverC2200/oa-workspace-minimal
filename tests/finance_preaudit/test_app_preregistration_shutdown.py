@@ -39,6 +39,9 @@ raise SystemExit(1)
     receipt = json.loads((directory / 'execution.json').read_text())
     for key in ['result', 'output_sha256', 'manifest_sha256']:
         receipt.pop(key)
+    receipt.update(run_id=None, controller_instance_id=None, controller_state='unknown', children_reaped='unknown',
+                   stop_wait_error='controller_stop_timeout')
+    receipt.pop('code_revision', None)
     host.guard.write(directory / 'execution.json', receipt)
     rows = [json.loads(row) for row in parent.read_text().splitlines()]
     for row in rows[1:]:
@@ -59,6 +62,11 @@ raise SystemExit(1)
 def test_pre_registration_shutdown_seals_native_exit_without_rewriting_partial_execution(failed_start, capsys):
     args, result = failed_start
     original = args['receipt_file'].read_bytes()
+    partial = json.loads(original)
+    assert partial['run_id'] is None and partial['controller_state'] == 'unknown' and partial['children_reaped'] == 'unknown'
+    projected = runner.read_execution(args['receipt_file'], owner_task_id=args['owner'], invocation_id=args['invocation_id'])
+    assert projected['controller_state'] == 'failed' and projected['children_reaped'] is True
+    assert projected['terminal'] is False
     with pytest.raises(ValueError, match='previous_round_incomplete'):
         host.assert_previous_rounds_closed(owner=str(uuid4()))
     command = ['--operation', 'finish-unregistered-shutdown', '--owner-task-id', args['owner'],
@@ -140,3 +148,12 @@ def test_pre_registration_shutdown_rejects_mismatched_or_work_bearing_evidence(f
     assert args['receipt_file'].read_bytes() == original
     if damage != 'changed_after_seal':
         assert not args['receipt_file'].with_name('pre-registration-shutdown.json').exists()
+
+
+def test_sealed_pre_registration_history_can_be_read_while_current_writer_is_active(failed_start, monkeypatch):
+    args, _ = failed_start
+    saved = shutdown.finish_unregistered(**args)
+    monkeypatch.setattr(shutdown.runtime_control, 'writer_active', lambda: True)
+    assert shutdown.sealed_unregistered(args['receipt_file']) == saved
+    with pytest.raises(ValueError, match='previous_round_incomplete'):
+        host.assert_previous_rounds_closed(owner=str(uuid4()))

@@ -263,7 +263,7 @@ def finish(*, owner: str, source: Path, interrupt_lines: list[int], status_line:
 
 def _unregistered_proofs(*, owner: str, reviewers: list[dict], source: Path, receipt_file: Path,
                          invocation_id: str, tool_session_id: str, interrupt_lines: list[int],
-                         status_line: int, wait_line: int) -> dict:
+                         status_line: int, wait_line: int, require_idle: bool = True) -> dict:
     from scripts import finance_preaudit_run as runner
     from . import approval_lifecycle
     binding = {'receipt_file': str(receipt_file.absolute()), 'owner_task_id': owner,
@@ -277,7 +277,7 @@ def _unregistered_proofs(*, owner: str, reviewers: list[dict], source: Path, rec
             or report.get('children_reaped') is not True or type(report.get('exit_code')) is not int
             or execution.get('review_configuration') != host.IDENTITY
             or not started <= runner._timestamp(manifest['completed_at']).timestamp() <= completed <= time.time()
-            or runtime_control.writer_active() or runtime_control.active_request_writers()
+            or (require_idle and (runtime_control.writer_active() or runtime_control.active_request_writers()))
             or host.guard.group_alive(execution['process_group_id'])
             or not host.guard._valid_identity(execution.get('supervisor_process'))
             or host.guard.process_identity(execution['supervisor_process']['pid']) == execution['supervisor_process']
@@ -355,7 +355,7 @@ def sealed_unregistered(receipt_file: Path) -> dict:
             source=Path(saved['children_source']['session_file']), receipt_file=receipt_file,
             invocation_id=binding['invocation_id'], tool_session_id=binding['tool_session_id'],
             interrupt_lines=[item['line'] for item in saved['interrupt_sources']],
-            status_line=saved['children_source']['line'], wait_line=saved['driver_wait_source']['line'])
+            status_line=saved['children_source']['line'], wait_line=saved['driver_wait_source']['line'], require_idle=False)
         if saved != expected:
             raise ValueError('host_review_unregistered_shutdown_incomplete')
     except (KeyError, TypeError) as error:
