@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from uuid import UUID
 
-from . import app_review_shutdown, attempt_state, codex_review_worker, flow_engine, host_chat_review as host, review_decision
+from . import app_review_shutdown, attempt_state, flow_engine, host_chat_review as host, review_decision
 
 
 def summarize(*, root: Path, owner: str, run_ids: list[str]) -> dict:
@@ -96,7 +96,7 @@ def summarize(*, root: Path, owner: str, run_ids: list[str]) -> dict:
                                 frozen_action = {**action, 'action_token': decision['action_token']}
                                 normalized = review_decision.bind_fields(frozen_action, packet, model)
                                 if state['workflow_key'] == 'small_marketing_fee' and packet['rule_version'] == 'small_marketing_fee:2':
-                                    normalized = codex_review_worker._normalize_keyed_items(
+                                    normalized = review_decision.normalize_keyed_items(
                                         normalized, tuple(item['item_key'] for item in packet['items']))
                                 material = json.loads(attempt_state.read_input(action_file.with_name('material.json')))
                                 if (normalized != submitted['decision'] or flow_engine._validate_review_decision(

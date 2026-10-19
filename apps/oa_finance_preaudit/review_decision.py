@@ -33,6 +33,24 @@ def bind_fields(action: dict, packet: dict, decision: dict) -> dict:
     return result
 
 
+def normalize_keyed_items(decision: dict, item_keys: tuple[str, ...]) -> dict:
+    keyed_items = decision.get("items")
+    if (
+        not item_keys
+        or not isinstance(keyed_items, dict)
+        or set(keyed_items) != set(item_keys)
+        or not all(isinstance(keyed_items[item_key], dict) for item_key in item_keys)
+    ):
+        return decision
+    return {
+        **decision,
+        "items": [
+            {**keyed_items[item_key], "item_key": item_key}
+            for item_key in item_keys
+        ],
+    }
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--action-file", type=Path, required=True)

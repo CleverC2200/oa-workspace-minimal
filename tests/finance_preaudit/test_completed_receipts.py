@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -9,6 +11,25 @@ from apps.oa_finance_preaudit import cli, controller_handoff
 from apps.oa_finance_preaudit import app_review_shutdown as shutdown
 from tests.finance_preaudit.test_app_review_shutdown import proofs
 from tests.finance_preaudit.test_host_chat_review import exchange, seal_execution
+
+
+def test_cli_completed_receipts_does_not_load_current_model_settings(tmp_path):
+    code = '''
+import sys
+from apps.oa_finance_preaudit import production_config
+def unavailable():
+    raise RuntimeError("current_model_settings_must_not_be_loaded")
+production_config.review_settings = unavailable
+from apps.oa_finance_preaudit import cli
+raise SystemExit(cli.main(['completed-receipts', '--root', sys.argv[1],
+    '--owner-task-id', '00000000-0000-0000-0000-000000000001', '--run-id', '0' * 32]))
+'''
+    result = subprocess.run([sys.executable, '-c', code, str(tmp_path)],
+                            cwd=Path(__file__).resolve().parents[2], text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report['counts'] == {'completed': 0, 'excluded': 0, 'invalid': 1, 'duplicate': 0}
+    assert report['gaps'] == {'sealed_round_unverified': 1}
 
 
 def test_cli_summarizes_only_explicit_sealed_round_without_writes(exchange, tmp_path, capsys):

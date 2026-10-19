@@ -811,21 +811,8 @@ def _normalize_decision(action_file: Path, decision: dict) -> dict:
 
 
 def _normalize_keyed_items(decision: dict, item_keys: tuple[str, ...]) -> dict:
-    keyed_items = decision.get("items")
-    if (
-        not item_keys
-        or not isinstance(keyed_items, dict)
-        or set(keyed_items) != set(item_keys)
-        or not all(isinstance(keyed_items[item_key], dict) for item_key in item_keys)
-    ):
-        return decision
-    return {
-        **decision,
-        "items": [
-            {**keyed_items[item_key], "item_key": item_key}
-            for item_key in item_keys
-        ],
-    }
+    from .review_decision import normalize_keyed_items
+    return normalize_keyed_items(decision, item_keys)
 
 
 def _unknown_usage() -> dict:
