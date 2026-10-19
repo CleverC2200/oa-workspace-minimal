@@ -5,6 +5,7 @@ import base64
 from contextlib import nullcontext
 from datetime import datetime, timezone
 import hashlib
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from uuid import uuid4
 
 import fitz
+from PIL import Image
 
 from . import attachment_extractors, auth, retention, runtime_control
 
@@ -24,6 +26,7 @@ MODEL = 'deepseek-flash'
 ENDPOINT = 'https://api.deepseek.com/chat/completions'
 MAX_FILE_BYTES = 32 * 1024 * 1024
 MAX_SOURCE_BYTES = 512 * 1024 * 1024
+MAX_IMAGE_DIMENSION = 8192
 TEXT_CHUNK_CHARS = 24000
 DEFAULT_PROMPT = '完整识别附件中的文字、表格和可见事实，保留数字、单位、日期、位置及看不清的内容。'
 SYSTEM_PROMPT = (
@@ -150,6 +153,47 @@ def _image_block(raw: bytes) -> dict:
     return {'type': 'image_url', 'image_url': {
         'url': 'data:' + mime + ';base64,' + base64.b64encode(raw).decode('ascii'),
     }}
+
+
+def _image_tiles(raw: bytes):
+    try:
+        image = Image.open(BytesIO(raw))
+    except (OSError, ValueError, Image.DecompressionBombError):
+        raise ValueError('attachment_image_invalid') from None
+    with image:
+        if max(image.size) <= MAX_IMAGE_DIMENSION:
+            yield None, _image_block(raw)
+            return
+        if getattr(image, 'n_frames', 1) > 1:
+            raise ValueError('attachment_animated_image_too_large')
+
+        def split(box):
+            x0, y0, x1, y1 = box
+            width, height = x1 - x0, y1 - y0
+            if max(width, height) <= MAX_IMAGE_DIMENSION:
+                with image.crop(box) as tile:
+                    encoded = BytesIO()
+                    if tile.mode == 'CMYK':
+                        with tile.convert('RGB') as rgb:
+                            rgb.save(encoded, format='PNG')
+                    else:
+                        tile.save(encoded, format='PNG')
+                encoded = encoded.getvalue()
+                if len(encoded) <= MAX_FILE_BYTES:
+                    yield box, _image_block(encoded)
+                    return
+            if width >= height:
+                middle = (x0 + x1) // 2
+                overlap = min(64, width // 4)
+                yield from split((x0, y0, middle + overlap, y1))
+                yield from split((middle - overlap, y0, x1, y1))
+            else:
+                middle = (y0 + y1) // 2
+                overlap = min(64, height // 4)
+                yield from split((x0, y0, x1, middle + overlap))
+                yield from split((x0, middle - overlap, x1, y1))
+
+        yield from split((0, 0, image.width, image.height))
 
 
 def _frozen(action: Path) -> tuple[dict, dict]:
@@ -327,27 +371,48 @@ def recognize(*, files: list[Path] | None = None, action_file: Path | None = Non
                 digest = _digest(raw)
                 if source.get('content_sha256') and digest != source['content_sha256']:
                     raise ValueError('attachment_page_changed')
-                block = _image_block(raw)
+                blocks = _image_tiles(raw)
             else:
                 digest = _digest(source.encode())
-                block = {'type': 'text', 'text': source}
+                blocks = [(None, {'type': 'text', 'text': source})]
             current['content_sha256'] = digest
             cache_key = (current['kind'], digest)
             if cache_key in cache:
                 previous = cache[cache_key]
                 result = {**current, 'answer': previous['answer'], 'reused_from': previous['part_id']}
+                if 'image_tiles' in previous:
+                    result['image_tiles'] = previous['image_tiles']
             else:
-                body = {'model': MODEL, 'stream': False, 'max_tokens': 8192,
-                        'thinking': {'type': 'disabled'},
-                        'messages': [{'role': 'system', 'content': SYSTEM_PROMPT},
-                                     {'role': 'user', 'content': [
-                                         {'type': 'text', 'text': prompt}, block]}]}
-                response = _post(body, key=key, timeout=min(timeout_seconds, max(.1, deadline - time.monotonic())))
-                try:
-                    answer, usage = _answer(response)
-                except ValueError:
-                    report['failed_response'] = _response_diagnostic(response)
-                    raise
+                tiles = []
+                for box, block in blocks:
+                    if box is not None:
+                        current['image_tiles'] = tiles
+                        current['failed_tile_box'] = list(box)
+                    if time.monotonic() >= deadline:
+                        raise ValueError('attachment_recognition_budget_exhausted')
+                    question = prompt
+                    if box is not None:
+                        question += f'\n当前为同一原图的无缩放分区，像素坐标 {list(box)}，相邻分区有重叠。仅读取本分区可见内容。'
+                    body = {'model': MODEL, 'stream': False, 'max_tokens': 8192,
+                            'thinking': {'type': 'disabled'},
+                            'messages': [{'role': 'system', 'content': SYSTEM_PROMPT},
+                                         {'role': 'user', 'content': [
+                                             {'type': 'text', 'text': question}, block]}]}
+                    response = _post(body, key=key, timeout=min(timeout_seconds, max(.1, deadline - time.monotonic())))
+                    try:
+                        answer, usage = _answer(response)
+                    except ValueError:
+                        report['failed_response'] = _response_diagnostic(response)
+                        raise
+                    if box is not None:
+                        tiles.append({'box': list(box), 'answer': answer, 'usage': usage})
+                if tiles:
+                    current.pop('failed_tile_box', None)
+                    answer = '以下分区属于同一原图，重叠内容不代表多笔或多份证据。\n\n'
+                    answer += '\n\n'.join(f'分区 {t["box"]}：\n{t["answer"]}' for t in tiles)
+                    usage = {name: sum(t['usage'][name] for t in tiles)
+                             for name in ('prompt_tokens', 'completion_tokens', 'total_tokens')
+                             if all(type(t['usage'].get(name)) is int for t in tiles)}
                 result = {**current, 'answer': answer, 'usage': usage}
                 cache[cache_key] = result
             report['parts'].append(result)

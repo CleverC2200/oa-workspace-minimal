@@ -44,3 +44,7 @@ python -m apps.oa_approval.attachment_recognition \
 识别回答是模型读取结果，不是官方主数据，也不证明附件归属、OA 发票关联、付款费用关系或未显示事实。审核仍按[证据阅读规则](../../.agents/skills/oa-finance-preaudit/references/observation-contract.md)绑定原资源和审核项。金额、主体、日期、里程等高影响原值需定向复读并按规则验算；不稳定内容保留具体缺口。包装生产的原图观察及独立复核回执合同继续单独验收，本工具的文本回答不能替代其 App 完成回执。
 
 API 图片输入合同见 [DeepSeek 官方文档](https://api-docs.deepseek.com/guides/vision)。
+
+图片任一边超过官方单图 8192 像素限制时，识别入口按原像素切分为有重叠的无损 PNG 分区，逐区请求，不缩放或覆盖原图。每块继续满足单图尺寸及字节上限；相邻分区重叠内容不能重复计入金额或数量。`parts[*].image_tiles` 保存原图坐标、各区回答及用量，页面回答按坐标汇总，原页引用和内容指纹仍对应原文件。全部分区成功才算该页读取完成；任一区失败时，`failed_part` 保留已完成分区和失败坐标，整次状态仍为 failed，不重试或生成意见。分区请求共用原整次预算，实际调用和成本可能增加；用量缺失保持未知。
+
+尺寸读取与裁切使用固定依赖 Pillow。尺寸合规的图片仍发送原字节，包括 WebP 和 GIF；超限动画明确返回 `attachment_animated_image_too_large`，不能只读首帧就声称完整识别。

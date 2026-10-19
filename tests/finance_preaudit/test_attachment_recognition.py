@@ -12,9 +12,9 @@ import pytest
 from apps.oa_approval import attachment_recognition as recognition
 
 
-def image(tmp_path, name='one.png'):
+def image(tmp_path, name='one.png', width=8, height=8):
     path = tmp_path / name
-    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 8, 8), False)
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, width, height), False)
     pix.clear_with(255)
     pix.save(path)
     return path
@@ -55,7 +55,7 @@ def fake_http(monkeypatch, respond):
 
 
 @pytest.fixture
-def frozen_finance_action(tmp_path, monkeypatch):
+def frozen_finance_action(tmp_path, monkeypatch, request):
     from apps.oa_finance_preaudit import FlowEngine
     from tests.finance_preaudit.test_flow_engine import _travel_material_with_attachment
 
@@ -67,9 +67,11 @@ def frozen_finance_action(tmp_path, monkeypatch):
     monkeypatch.setattr(recognition.auth, 'load_local_env', forbidden)
     monkeypatch.setattr(recognition.attachment_extractors, 'prepare_materials', forbidden)
 
+    dimensions = getattr(request, 'param', {})
+
     def collect(request, root):
         material = _travel_material_with_attachment(request, root)
-        page = image(root / 'prepared', 'evidence.png')
+        page = image(root / 'prepared', 'evidence.png', **dimensions)
         material['prepared']['images'][0].update(
             content_sha256=hashlib.sha256(page.read_bytes()).hexdigest(), owner_detail_id='row-2')
         material['prepared']['manifest'][0]['status'] = 'image'
@@ -84,8 +86,11 @@ def frozen_finance_action(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize('storage', ['canonical', 'legacy'])
+@pytest.mark.parametrize('frozen_finance_action,expected_calls', [
+    ({}, 1), ({'width': 9042, 'height': 80}, 2),
+], indirect=['frozen_finance_action'])
 def test_action_file_cli_reads_frozen_finance_pages(
-        tmp_path, monkeypatch, capsys, frozen_finance_action, storage):
+        tmp_path, monkeypatch, capsys, frozen_finance_action, storage, expected_calls):
     from apps import json_artifact
 
     action = frozen_finance_action
@@ -101,12 +106,12 @@ def test_action_file_cli_reads_frozen_finance_pages(
         'message': {'content': '读数 12345；右下角日期无法确认。'}}]})
 
     result = recognition.main(['--action-file', str(path), '--output-dir', str(tmp_path / 'out')])
-    assert (result, len(calls)) == (0, 1)
+    assert (result, len(calls)) == (0, expected_calls)
 
     summary = json.loads(capsys.readouterr().out)
     report = json.loads(Path(summary['report_file']).read_bytes())
     assert summary['status'] == 'complete' and summary['parts'] == 1
-    assert len(calls) == 1
+    assert len(calls) == expected_calls
     assert report['parts'][0]['owner_detail_id'] == 'row-2'
     assert report['parts'][0]['evidence_ref'] == 'material:prepared.images.evidence-1.1'
     assert report['frozen_binding']['action_file'] == str(path)
@@ -393,7 +398,7 @@ def test_http_request_uses_only_deepseek_endpoint_and_custom_prompt(monkeypatch)
                         'timeout': 15, 'authorization': 'Bearer private'}
 
 
-@pytest.mark.parametrize('error_code', ['attachment_api_http_429', 'attachment_response_incomplete'])
+@pytest.mark.parametrize('error_code', ['attachment_api_http_400', 'attachment_api_http_429', 'attachment_response_incomplete'])
 def test_failed_second_page_keeps_first_page_answer(tmp_path, monkeypatch, error_code):
     first = image(tmp_path)
     second = image(tmp_path, 'second.png')
@@ -407,7 +412,7 @@ def test_failed_second_page_keeps_first_page_answer(tmp_path, monkeypatch, error
         if count == 2:
             if error_code == 'attachment_response_incomplete':
                 return {'choices': [{'finish_reason': 'length', 'message': {'content': 'partial'}}]}
-            raise HTTPError(recognition.ENDPOINT, 429, 'offline', {}, None)
+            raise HTTPError(recognition.ENDPOINT, int(error_code.rsplit('_', 1)[1]), 'offline', {}, None)
         return {'choices': [{'finish_reason': 'stop', 'message': {'content': 'first answer'}}]}
     calls = fake_http(monkeypatch, respond)
     report = recognition.recognize(files=[first, second], prompt='读取', output_dir=tmp_path / 'out')
@@ -495,3 +500,155 @@ def test_container_larger_than_page_limit_is_streamed(tmp_path, monkeypatch):
     assert result['status'] == 'complete'
     assert len(calls) == 1
     assert result['parts'][0]['kind'] == 'text'
+
+
+@pytest.mark.parametrize('width,height,boxes,format', [
+    (9042, 80, [[0, 0, 4585, 80], [4457, 0, 9042, 80]], 'PNG'),
+    (80, 9042, [[0, 0, 80, 4585], [0, 4457, 80, 9042]], 'PNG'),
+    (9042, 80, [[0, 0, 4585, 80], [4457, 0, 9042, 80]], 'WEBP'),
+])
+def test_wide_page_is_read_without_resampling_or_changing_source(tmp_path, monkeypatch, width, height, boxes, format):
+    import base64
+    from io import BytesIO
+    from PIL import Image
+
+    source = tmp_path / ('wide.' + format.lower())
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, width, height), False)
+    pix.clear_with(255)
+    pix.set_pixel(0, 0, (255, 0, 0))
+    pix.set_pixel(width - 1, height - 1, (0, 0, 255))
+    Image.open(BytesIO(pix.tobytes('png'))).save(source, format=format, lossless=True)
+    original = source.read_bytes()
+    received = []
+
+    def respond(body):
+        blocks = body['messages'][-1]['content']
+        url = next(b['image_url']['url'] for b in blocks if b['type'] == 'image_url')
+        page = fitz.Pixmap(base64.b64decode(url.split(',', 1)[1]))
+        received.append(page)
+        if max(page.width, page.height) > 8192:
+            raise HTTPError(recognition.ENDPOINT, 400, 'offline dimension limit', {}, None)
+        return {'choices': [{'finish_reason': 'stop', 'message': {'content': '完整分区读取'}}]}
+
+    fake_http(monkeypatch, respond)
+    report = recognition.recognize(files=[source], output_dir=tmp_path / 'out')
+
+    assert report['status'] == 'complete'
+    assert source.read_bytes() == original
+    assert len(report['parts']) == 1
+    part = report['parts'][0]
+    tiles = part['image_tiles']
+    assert len(tiles) == len(received) == 2
+    assert [t['box'] for t in tiles] == boxes
+    assert received[0].pixel(0, 0) == (255, 0, 0)
+    assert received[1].pixel(received[1].width - 1, received[1].height - 1) == (0, 0, 255)
+    assert all(p.width <= 8192 and p.height <= 8192 for p in received)
+    assert part['content_sha256'] == hashlib.sha256(original).hexdigest()
+    assert all(t['answer'] == '完整分区读取' for t in tiles)
+    assert part['usage'] == {}
+
+
+@pytest.mark.parametrize('failure', ['http_400', 'incomplete'])
+def test_failed_tile_keeps_partial_read_without_completing_page(tmp_path, monkeypatch, failure):
+    source = tmp_path / 'wide.png'
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 9042, 80), False)
+    pix.clear_with(255)
+    pix.save(source)
+    count = 0
+
+    def respond(body):
+        nonlocal count
+        count += 1
+        if count == 2:
+            if failure == 'http_400':
+                raise HTTPError(recognition.ENDPOINT, 400, 'private upstream error', {}, None)
+            return {'choices': [{'finish_reason': 'length', 'message': {'content': 'private partial'}}]}
+        return {'choices': [{'finish_reason': 'stop', 'message': {'content': 'first tile'}}],
+                'usage': {'total_tokens': 7}}
+
+    fake_http(monkeypatch, respond)
+    report = recognition.recognize(files=[source], output_dir=tmp_path / 'out')
+
+    assert report['status'] == 'failed'
+    assert report['error_code'] == ('attachment_api_http_400' if failure == 'http_400'
+                                    else 'attachment_response_incomplete')
+    assert count == 2
+    assert report['parts'] == []
+    assert report['failed_part']['failed_tile_box'] == [4457, 0, 9042, 80]
+    assert report['failed_part']['image_tiles'] == [
+        {'box': [0, 0, 4585, 80], 'answer': 'first tile', 'usage': {'total_tokens': 7}}]
+    saved = Path(report['report_file']).read_text()
+    assert 'private upstream error' not in saved and 'private partial' not in saved
+    assert json.loads(saved) == report
+
+
+def test_normal_webp_sends_original_bytes(tmp_path, monkeypatch):
+    import base64
+    from PIL import Image
+
+    source = tmp_path / 'normal.webp'
+    Image.new('RGB', (8, 8), 'blue').save(source, format='WEBP', lossless=True)
+    original = source.read_bytes()
+    calls = fake_http(monkeypatch, lambda _: {
+        'choices': [{'finish_reason': 'stop', 'message': {'content': 'blue'}}]})
+
+    report = recognition.recognize(files=[source], output_dir=tmp_path / 'out')
+
+    assert report['status'] == 'complete'
+    assert len(calls) == 1
+    block = calls[0]['messages'][-1]['content'][1]
+    assert block['image_url']['url'].startswith('data:image/webp;base64,')
+    assert base64.b64decode(block['image_url']['url'].split(',', 1)[1]) == original
+    assert 'image_tiles' not in report['parts'][0]
+    assert source.read_bytes() == original
+
+
+@pytest.mark.parametrize('width,expected', [(8, 'complete'), (9042, 'failed')])
+def test_animated_gif_is_never_silently_replaced_by_first_frame(tmp_path, monkeypatch, width, expected):
+    import base64
+    from PIL import Image
+
+    source = tmp_path / 'animated.gif'
+    frames = [Image.new('RGB', (width, 80), color) for color in ('red', 'blue')]
+    frames[0].save(source, save_all=True, append_images=frames[1:], duration=100, loop=0)
+    original = source.read_bytes()
+    calls = fake_http(monkeypatch, lambda _: {
+        'choices': [{'finish_reason': 'stop', 'message': {'content': 'two frames'}}]})
+
+    report = recognition.recognize(files=[source], output_dir=tmp_path / 'out')
+
+    assert report['status'] == expected
+    assert source.read_bytes() == original
+    if expected == 'complete':
+        assert len(calls) == 1
+        url = calls[0]['messages'][-1]['content'][1]['image_url']['url']
+        assert base64.b64decode(url.split(',', 1)[1]) == original
+    else:
+        assert report['error_code'] == 'attachment_animated_image_too_large'
+        assert report['parts'] == []
+        assert calls == []
+
+
+def test_oversized_cmyk_jpeg_reads_all_regions_as_rgb(tmp_path, monkeypatch):
+    import base64
+    from io import BytesIO
+    from PIL import Image
+
+    source = tmp_path / 'cmyk.jpg'
+    Image.new('CMYK', (9042, 80), (255, 0, 0, 0)).save(source, format='JPEG')
+    original = source.read_bytes()
+    received = []
+
+    def respond(body):
+        url = body['messages'][-1]['content'][1]['image_url']['url']
+        with Image.open(BytesIO(base64.b64decode(url.split(',', 1)[1]))) as tile:
+            received.append((tile.size, tile.mode, tile.getpixel((0, 0))))
+        return {'choices': [{'finish_reason': 'stop', 'message': {'content': 'cyan'}}]}
+
+    fake_http(monkeypatch, respond)
+    report = recognition.recognize(files=[source], output_dir=tmp_path / 'out')
+
+    assert report['status'] == 'complete'
+    assert received == [((4585, 80), 'RGB', (0, 255, 255))] * 2
+    assert source.read_bytes() == original
+    assert report['parts'][0]['content_sha256'] == hashlib.sha256(original).hexdigest()
