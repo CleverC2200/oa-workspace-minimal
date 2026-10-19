@@ -48,3 +48,7 @@ API 图片输入合同见 [DeepSeek 官方文档](https://api-docs.deepseek.com/
 图片任一边超过官方单图 8192 像素限制时，识别入口按原像素切分为有重叠的无损 PNG 分区，逐区请求，不缩放或覆盖原图。每块继续满足单图尺寸及字节上限；相邻分区重叠内容不能重复计入金额或数量。`parts[*].image_tiles` 保存原图坐标、各区回答及用量，页面回答按坐标汇总，原页引用和内容指纹仍对应原文件。全部分区成功才算该页读取完成；任一区失败时，`failed_part` 保留已完成分区和失败坐标，整次状态仍为 failed，不重试或生成意见。分区请求共用原整次预算，实际调用和成本可能增加；用量缺失保持未知。
 
 尺寸读取与裁切使用固定依赖 Pillow。尺寸合规的图片仍发送原字节，包括 WebP 和 GIF；超限动画明确返回 `attachment_animated_image_too_large`，不能只读首帧就声称完整识别。
+
+Pillow 默认像素保护保持启用。只有默认读取因像素保护拒绝时，入口才允许单帧 RGB8、三通道 baseline JPEG 使用同一 Pillow JPEG 解码器继续读取，并要求原图宽×高×4 不超过 1 GiB，即最多 268,435,456 像素。该预算仅估算底图缓冲，分区、PNG 编码及请求数据另占内存；这是完整底图解码，不是流式读取。原图不缩放，后续仍遵循已有分区、字节和整次时间预算。
+
+此受限路径不接受 progressive、其他 JPEG 编码、CMYK、带 MPF 的 MPO 或非 JPEG 巨幅图，返回 `attachment_image_large_decode_unsupported`；超过底图预算返回 `attachment_image_decoded_memory_limit`。安全拒绝不表示原件损坏。无法解析或裁区解码发现损坏时返回 `attachment_image_invalid`。正常尺寸输入继续使用原格式支持和默认读取路径。
