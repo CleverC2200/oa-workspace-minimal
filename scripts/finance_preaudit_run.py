@@ -931,6 +931,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             targeted = _target_arguments([sys.executable, "-m", "scripts.finance_preaudit_concurrency_probe", *arguments]) is not None
             phase = "startup_gate"
             gate = approval_lifecycle.startup(PROJECT_ROOT)
+            if (gate.get("reason") == "previous_run_busy"
+                    and gate.get("owner_task_id") == str(args.owner_task_id)):
+                phase = "app_round_closure"
+                raise ValueError("host_review_previous_round_incomplete")
             if gate["status"] == "ready":
                 phase = "app_round_closure"
                 host_chat_review.assert_previous_rounds_closed(owner=str(args.owner_task_id))

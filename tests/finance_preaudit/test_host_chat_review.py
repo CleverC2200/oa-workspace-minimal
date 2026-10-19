@@ -634,6 +634,8 @@ def test_host_mode_forbids_building_a_codex_command(monkeypatch):
 
 
 def test_fresh_round_selects_host_and_next_round_resets_to_cli(monkeypatch, capsys):
+    monkeypatch.setenv('OA_REVIEW_PROVIDER', 'openai')
+    monkeypatch.setenv(host.TRANSPORT_ENV, 'cli')
     monkeypatch.setattr(finance_preaudit_run.auth, 'load_local_env', lambda: None)
     monkeypatch.setattr(finance_preaudit_run.approval_lifecycle, 'startup', lambda _: {'status': 'ready'})
     seen = []
@@ -1202,12 +1204,29 @@ def test_parent_cli_requires_the_exact_round_and_native_heartbeat(exchange):
 
 
 
-def test_new_controller_cannot_start_before_same_parent_shutdown_is_verified(exchange, monkeypatch, capsys):
-    _, _, owner, *_ = exchange
+@pytest.mark.parametrize('same_owner', [True, False])
+def test_new_controller_cannot_abandon_same_parent_active_unsealed_round(exchange, monkeypatch, capsys, same_owner):
+    _, _, owner, _, _, manifest, _ = exchange
+    monkeypatch.setattr(finance_preaudit_run, 'PROJECT_ROOT', runtime_control.PROJECT_ROOT)
     monkeypatch.setattr(finance_preaudit_run.auth, 'load_local_env', lambda: None)
-    monkeypatch.setattr(finance_preaudit_run.approval_lifecycle, 'startup', lambda _: pytest.fail('Unsealed prior round admitted'))
-    assert finance_preaudit_run.main(['--owner-task-id', owner, '--review-transport', 'host_chat', '--', '--rolling']) == 1
-    assert json.loads(capsys.readouterr().out)['error_code'] == 'controller_execution_evidence_failed'
+    monkeypatch.setattr(host.guard, 'observe_project_errors', lambda _: None)
+    gate = finance_preaudit_run.approval_lifecycle.startup(runtime_control.PROJECT_ROOT)
+    assert gate['status'] == 'skipped' and gate['reason'] == 'previous_run_busy' and gate['owner_task_id'] == owner
+    current_owner = owner if same_owner else str(uuid4())
+    registry = host.registry_file(owner, manifest['run_id'])
+    original = registry.read_bytes()
+    monkeypatch.setattr(finance_preaudit_run, 'supervise', lambda *_args, **_options: pytest.fail('unsealed round started another controller'))
+    result = finance_preaudit_run.main(['--owner-task-id', current_owner, '--review-transport', 'host_chat', '--', '--rolling'])
+    output = json.loads(capsys.readouterr().out)
+    if same_owner:
+        assert result == 1
+        assert output['error_code'] == 'controller_execution_evidence_failed'
+        assert output['primary_failure']['error_code'] == 'host_review_previous_round_incomplete'
+    else:
+        assert result == 0 and output['status'] == 'skipped' and output['reason'] == 'previous_run_busy'
+    assert registry.read_bytes() == original
+    assert runtime_control.controller_active() and not runtime_control.stop_requested()
+
 
 def test_failed_slot_reuse_requires_fresh_native_idle_proof(exchange, monkeypatch):
     action, _, owner, child, _, manifest, engine = exchange
