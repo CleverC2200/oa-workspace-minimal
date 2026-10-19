@@ -163,7 +163,7 @@ def test_non_travel_schema_and_timing_follow_bound_action(tmp_path: Path) -> Non
     )
     assert timing["workflow_key"] == "business_entertainment"
     prompt = codex_review_worker._prompt(action_file)
-    assert "业务招待费生产预审" in prompt
+    assert "业务招待费预审的单据审核者" in prompt
     assert "business-entertainment.md" in prompt
     assert "page_routing" not in prompt
 
@@ -248,7 +248,7 @@ def _mock_final_output(monkeypatch, raw):
     return prompts
 
 
-def _real_final_output(monkeypatch, raw, *, mutation="", usage=None):
+def _real_final_output(monkeypatch, raw, *, mutation="", usage=None, prompt_checks=""):
     monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
     payload = raw if isinstance(raw, bytes) else raw.encode()
     event = {"type": "turn.completed"}
@@ -256,7 +256,8 @@ def _real_final_output(monkeypatch, raw, *, mutation="", usage=None):
         event["usage"] = usage
     script = (
         "import json,sys; from pathlib import Path; "
-        f"Path(sys.argv[1]).write_bytes({payload!r}); "
+        + ("prompt=sys.stdin.read(); " + prompt_checks if prompt_checks else "")
+        + f"Path(sys.argv[1]).write_bytes({payload!r}); "
         + mutation
         + f"print({json.dumps(event)!r}, flush=True)"
     )
@@ -445,6 +446,7 @@ def test_entertainment_worker_delivers_attribution_rule_and_preserves_preview(
         discover_candidates=lambda key: [{"request_id": "synthetic-attribution",
             "workflow_key": key, "received_at": "2026-10-10T09:00:00+08:00"}],
         collect_material=collect,
+        submit_frozen=lambda *_: pytest.fail("preview must not submit"),
     )
     action = engine.next_action("business_entertainment", mode="preview")
     action_file = Path(action["action_file"])
@@ -458,6 +460,11 @@ def test_entertainment_worker_delivers_attribution_rule_and_preserves_preview(
     script.write_text(
         "import json,re,shlex,sys\nfrom pathlib import Path\n"
         "args=sys.argv[1:];prompt=sys.stdin.read()\n"
+        "assert '用户当前明确授权本轮真实审批提交' not in prompt\n"
+        "assert '不是手工 preview' not in prompt\n"
+        "assert '只读取当前冻结材料并返回结构化决定，不执行 OA 写入' in prompt\n"
+        "assert '宿主按冻结动作的 mode 和实际授权门处理后续步骤' in prompt\n"
+        "assert 'preview 仅生成预览，不提交 OA' in prompt\n"
         + f"relative={str(relative_rule)!r}\n"
         "assert 'references/flows/business-entertainment.md' in prompt\n"
         "rule=Path(args[args.index('--cd')+1])/relative\n"
@@ -757,7 +764,7 @@ def test_general_expense_worker_uses_bound_rule_pack(tmp_path: Path) -> None:
         "type": "string",
         "const": "general_expense:1",
     }
-    assert "通用费用报销生产预审" in prompt
+    assert "通用费用报销预审的单据审核者" in prompt
     assert "general-expense.md" in prompt
     assert "实付0元，均为收到货后自动付款" in prompt
     assert "“先乘车后付款”不等于“先用后付”" in prompt
@@ -1102,7 +1109,7 @@ def test_small_marketing_v2_worker_uses_six_item_requirements(
     )
     assert "item_key" not in attachment_schema["properties"]
     assert "item_key" not in attachment_schema["required"]
-    assert "小额市场费生产预审" in prompt
+    assert "小额市场费预审的单据审核者" in prompt
     assert "small-marketing-fee.md" in prompt
     assert "六项必须逐项" in prompt
     assert "逐字同时包含“支付截图”和“发票”" in prompt
@@ -1602,6 +1609,49 @@ def test_production_review_phase_returns_decision_without_completing_action(
     )
     assert not action_file.with_name("agent-timing.json").exists()
     assert not action_file.with_name("execution-receipt.json").exists()
+
+
+def test_controlled_worker_returns_decision_for_host_authorized_submission(tmp_path, monkeypatch):
+    from tests.finance_preaudit.test_flow_engine_submission import (
+        _decision, _engine, _grant, _success, _verify_grant,
+    )
+
+    calls = []
+
+    def submit(job):
+        calls.append(dict(job))
+        return _success(job)
+
+    project = tmp_path / "project"
+    engine = _engine(
+        project / "runtime/finance_preaudit_flows", "synthetic-role",
+        authorization_source=_grant, authorization_verifier=_verify_grant,
+        submit_frozen=submit,
+    )
+    action = engine.next_action("travel_expense")
+    assert action["mode"] == "controlled_write" and action["write_authorized"] is True
+    action_file = Path(action["action_file"])
+    before = action_file.read_bytes()
+    decision = _decision(action)
+    _real_final_output(monkeypatch, json.dumps(decision), prompt_checks=(
+        "assert '只读取当前冻结材料并返回结构化决定，不执行 OA 写入' in prompt; "
+        "assert '宿主按冻结动作的 mode 和实际授权门处理后续步骤' in prompt; "
+        "assert '用户当前明确授权本轮真实审批提交' not in prompt; "
+        "assert '不得调用 `next-action`、`complete-review` 或任何 OA 写入' in prompt; "
+    ))
+
+    reviewed = codex_review_worker.review({
+        "project_root": str(project), "action_file": str(action_file), "timeout_seconds": 60,
+    })
+
+    assert reviewed["status"] == "reviewed" and reviewed["decision"] == decision
+    assert reviewed["write_state"] == "not_requested" and calls == []
+    assert action_file.read_bytes() == before
+    assert not action_file.with_name("execution-receipt.json").exists()
+    decision_file = tmp_path / "controlled-decision.json"
+    json_artifact.write_json_atomic(decision_file, reviewed["decision"])
+    closed = engine.complete_review(action_file, decision_file)
+    assert closed["write_state"] == "submitted" and len(calls) == 1
 
 
 def test_production_review_retains_first_failure_events_and_tokens(
