@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from apps.oa_finance_preaudit import app_review_shutdown, host_chat_review as host
+from apps.oa_finance_preaudit import app_review_shutdown, controller_handoff, host_chat_review as host
 from scripts import finance_preaudit_native_replay as replay, finance_preaudit_run
 from tests.finance_preaudit.test_native_replay import recorded_case
 from tests.finance_preaudit.test_app_reviewer_slots import native_sessions
@@ -85,7 +85,10 @@ def test_app_preview_closes_one_frozen_case_through_native_exchange(app_case, tm
                    'tool_session_id': 'synthetic-original-tool'}
         finance_preaudit_run.bind_tool_session(execution, owner_task_id=owner,
             session_id=binding['tool_session_id'])
-        wait_for(lambda: execution.with_name('controller-manifest.json').is_file(), process)
+        wait_for(lambda: (manifest := controller_handoff._read_manifest())
+            and manifest['state'] == 'running'
+            and manifest.get('owner_task_id') == owner
+            and manifest.get('invocation_id') == binding['invocation_id'], process)
         with pytest.raises(ValueError):
             host.register(reviewers, owner=str(__import__('uuid').uuid4()), source=parent, **binding)
         registered = host.register(reviewers, owner=owner, source=parent, **binding)
