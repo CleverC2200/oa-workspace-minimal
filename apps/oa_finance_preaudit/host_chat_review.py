@@ -588,6 +588,11 @@ def _requests_terminal(value: dict) -> bool:
     return True
 
 
+def _last_result_at(value: dict) -> float:
+    return max([value['heartbeat_at'], *(item['observed_at'] for item in value.get('request_failures', {}).values()),
+                *(max(item.get('submitted_at', 0), item.get('completed_at', 0)) for item in value['assignments'].values())])
+
+
 def close(*, owner: str, reason: str = 'completed', source: Path | None = None, source_line: int | None = None, run_id: str | None = None) -> dict:
     """Close the exchange; cancellation never signals the Writer process."""
     if reason not in {'completed', 'cancelled', 'parent_lost', 'reviewer_failed'}:
@@ -615,7 +620,7 @@ def close(*, owner: str, reason: str = 'completed', source: Path | None = None, 
             agents = proof['output'].get('agents')
             from datetime import datetime
             timestamp = native['anchor'].get('timestamp')
-            last_result = max([value['heartbeat_at'], *(item['observed_at'] for item in value.get('request_failures', {}).values()), *(max(item.get('submitted_at', 0), item.get('completed_at', 0)) for item in value['assignments'].values())])
+            last_result = _last_result_at(value)
             if not isinstance(timestamp, str) or not last_result <= datetime.fromisoformat(timestamp.replace('Z', '+00:00')).timestamp() <= time.time():
                 raise ValueError('host_review_stale_source')
             if not isinstance(agents, list) or any(not isinstance(agent, dict) for agent in agents):
@@ -1096,9 +1101,12 @@ def sealed_assignment(request_file: Path, request: dict, registered: dict) -> di
     earliest = registered['registered_at']
     if request['created_at'] < earliest:
         earliest = _legacy_bootstrap_start(request, registered)
+    shutdown_at, closed_at = registered['shutdown']['started_at'], registered['closed_at']
+    if closed_at < shutdown_at and registered['close_reason'] != 'completed':
+        raise ValueError('host_review_stale_source')
     if (not earliest <= request['created_at'] <= assigned['dispatched_at']
             or not registered['registered_at'] <= assigned['dispatched_at']
-            <= registered['shutdown']['started_at'] <= registered['closed_at']
+            <= min(shutdown_at, closed_at)
             or not assigned['dispatched_at'] < request['expires_at']
             or assigned['dispatch_source']['output_line'] >= min(
                 proof['line'] for proof in registered['shutdown']['receipt']['interrupt_sources'])):
@@ -1117,7 +1125,7 @@ def sealed_submission(request_file: Path, request: dict, registered: dict) -> di
     native, _ = _native_source(Path(source['session_file']), reviewer['reviewer_task_id'], source['line'])
     published_at = datetime.fromisoformat(native['anchor']['timestamp'].replace('Z', '+00:00')).timestamp()
     if (not assigned['dispatched_at'] <= published_at <= submitted['submitted_at'] == assigned['submitted_at']
-            or not submitted['submitted_at'] <= registered['shutdown']['started_at'] <= registered['closed_at']
+            or not submitted['submitted_at'] <= min(registered['shutdown']['started_at'], registered['closed_at'])
             or not submitted['submitted_at'] < request['expires_at']):
         raise ValueError('host_review_stale_source')
     return submitted
