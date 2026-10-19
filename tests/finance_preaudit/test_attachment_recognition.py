@@ -661,7 +661,8 @@ def test_oversized_cmyk_jpeg_reads_all_regions_as_rgb(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize('orientation', [None, 6])
-def test_pixel_protected_baseline_jpeg_preserves_original_pixels_and_guard(tmp_path, monkeypatch, orientation):
+@pytest.mark.parametrize('region', [None, (1, 2, 20, 22)])
+def test_pixel_protected_baseline_jpeg_preserves_original_pixels_and_guard(tmp_path, monkeypatch, orientation, region):
     import base64
     from io import BytesIO
     from PIL import Image
@@ -692,11 +693,12 @@ def test_pixel_protected_baseline_jpeg_preserves_original_pixels_and_guard(tmp_p
     with pytest.raises(Image.DecompressionBombError):
         Image.open(BytesIO(original))
 
-    report = recognition.recognize(files=[source], output_dir=tmp_path / 'out')
+    report = recognition.recognize(files=[source], output_dir=tmp_path / 'out', region=region)
 
     assert report['status'] == 'complete'
     tiles = report['parts'][0]['image_tiles']
-    assert len(tiles) == len(received) > 1
+    assert len(tiles) == len(received)
+    assert len(tiles) == 1 if region else len(tiles) > 1
     for tile, (size, raw) in zip(tiles, received):
         with expected.crop(tile['box']) as reference:
             assert (size, raw) == (reference.size, reference.tobytes())
@@ -715,8 +717,9 @@ def test_pixel_protected_baseline_jpeg_preserves_original_pixels_and_guard(tmp_p
     ('corrupt', 'attachment_image_invalid'),
     ('truncated', 'attachment_image_invalid'),
 ])
+@pytest.mark.parametrize('region', [None, (1, 2, 20, 22)])
 def test_unsafe_pixel_protected_image_fails_without_http_and_keeps_report(
-        tmp_path, monkeypatch, capsys, kind, expected):
+        tmp_path, monkeypatch, capsys, kind, expected, region):
     from PIL import Image
 
     source = tmp_path / ('protected.png' if kind == 'PNG' else 'protected.jpg')
@@ -739,7 +742,10 @@ def test_unsafe_pixel_protected_image_fails_without_http_and_keeps_report(
     monkeypatch.setattr(recognition, 'MAX_DECODED_IMAGE_BYTES',
                         64 * 48 * 4 - (1 if kind == 'budget' else 0))
 
-    assert recognition.main(['--file', str(source), '--output-dir', str(tmp_path / 'out')]) == 1
+    arguments = ['--file', str(source), '--output-dir', str(tmp_path / 'out')]
+    if region:
+        arguments.extend(['--region', *map(str, region)])
+    assert recognition.main(arguments) == 1
 
     summary = json.loads(capsys.readouterr().out)
     report = json.loads(Path(summary['report_file']).read_bytes())
@@ -748,3 +754,171 @@ def test_unsafe_pixel_protected_image_fails_without_http_and_keeps_report(
     assert report['failed_part']['content_sha256'] == hashlib.sha256(original).hexdigest()
     assert source.read_bytes() == original
     assert calls == [] and Image.MAX_IMAGE_PIXELS == 1000
+
+
+def test_region_cli_sends_only_original_stored_pixels_with_partial_provenance(tmp_path, monkeypatch, capsys):
+    import base64
+    from io import BytesIO
+    from PIL import Image
+
+    source = tmp_path / 'oriented.png'
+    pixels = Image.new('RGB', (8, 6), 'white')
+    pixels.paste((255, 0, 0), (2, 1, 4, 3))
+    pixels.putpixel((4, 3), (0, 0, 255))
+    exif = Image.Exif()
+    exif[274] = 6
+    pixels.save(source, exif=exif)
+    original = source.read_bytes()
+    guard = Image.MAX_IMAGE_PIXELS
+    calls = fake_http(monkeypatch, lambda _: {'choices': [{'finish_reason': 'stop',
+        'message': {'content': '原样局部回答'}}]})
+
+    assert recognition.main(['--file', str(source), '--region', '2', '1', '5', '4',
+                             '--output-dir', str(tmp_path / 'out')]) == 0
+
+    summary = json.loads(capsys.readouterr().out)
+    report = json.loads(Path(summary['report_file']).read_bytes())
+    assert summary['coverage'] == report['coverage'] == 'image_region'
+    assert len(calls) == len(report['parts']) == 1
+    raw = base64.b64decode(calls[0]['messages'][-1]['content'][1]['image_url']['url'].split(',', 1)[1])
+    with Image.open(BytesIO(raw)) as sent:
+        assert sent.format == 'PNG' and sent.size == (3, 3)
+        assert sent.getexif().get(274) is None
+        assert list(sent.get_flattened_data()) == [(255, 0, 0), (255, 0, 0), (255, 255, 255),
+                                       (255, 0, 0), (255, 0, 0), (255, 255, 255),
+                                       (255, 255, 255), (255, 255, 255), (0, 0, 255)]
+    part = report['parts'][0]
+    assert part['source_image_size'] == [8, 6]
+    assert part['region'] == [2, 1, 5, 4]
+    assert part['image_tiles'][0]['box'] == [2, 1, 5, 4]
+    assert part['image_tiles'][0]['png_sha256'] == hashlib.sha256(raw).hexdigest()
+    assert part['image_tiles'][0]['answer'] == '原样局部回答'
+    assert '仅覆盖指定区域' in part['answer']
+    assert '仅覆盖指定区域' in calls[0]['messages'][-1]['content'][0]['text']
+    assert part['content_sha256'] == report['sources'][0]['sha256'] == hashlib.sha256(original).hexdigest()
+    assert report['sources'][0]['path'] == str(source)
+    assert source.read_bytes() == original and Image.MAX_IMAGE_PIXELS == guard
+
+
+@pytest.mark.parametrize('region', [True, '0123', [0, 0, 1], [0, False, 1, 1],
+                                    [0, 0, 1.5, 1], [-1, 0, 1, 1], [1, 0, 1, 1],
+                                    [0, 2, 1, 1], [0, 0, 8193, 1]])
+def test_region_rejects_invalid_coordinates_before_http(tmp_path, monkeypatch, region):
+    source = image(tmp_path)
+    calls = fake_http(monkeypatch, lambda _: pytest.fail('Invalid region must not reach HTTP'))
+    with pytest.raises(ValueError, match='^attachment_region_invalid$'):
+        recognition.recognize(files=[source], region=region, output_dir=tmp_path / 'out')
+    assert calls == []
+
+
+@pytest.mark.parametrize('kind', ['multiple', 'action', 'pdf', 'text', 'animated', 'bounds', 'disguised'])
+def test_region_rejects_sources_it_cannot_cover(tmp_path, monkeypatch, kind):
+    from PIL import Image
+
+    source = image(tmp_path)
+    files, action = [source], None
+    if kind == 'multiple':
+        files.append(image(tmp_path, 'two.png'))
+    elif kind == 'action':
+        files, action = None, tmp_path / 'action.json'
+    elif kind == 'pdf':
+        source = tmp_path / 'one.pdf'
+        with fitz.open() as pdf:
+            pdf.new_page()
+            pdf.save(source)
+        files = [source]
+    elif kind == 'text':
+        source = tmp_path / 'one.txt'
+        source.write_text('synthetic text')
+        files = [source]
+    elif kind == 'animated':
+        source = tmp_path / 'one.gif'
+        Image.new('RGB', (8, 8), 'red').save(source, save_all=True,
+            append_images=[Image.new('RGB', (8, 8), 'blue')], duration=100)
+        files = [source]
+    elif kind == 'disguised':
+        source = tmp_path / 'not-a-jpeg.jpg'
+        source.write_text('synthetic text')
+        files = [source]
+    calls = fake_http(monkeypatch, lambda _: pytest.fail('Rejected source must not reach HTTP'))
+    if kind in {'multiple', 'action'}:
+        with pytest.raises(ValueError, match='^attachment_region_source_invalid$'):
+            recognition.recognize(files=files, action_file=action, region=[0, 0, 2, 2],
+                                  output_dir=tmp_path / 'out')
+    else:
+        report = recognition.recognize(files=files, region=[0, 0, 9 if kind == 'bounds' else 2, 2],
+                                       output_dir=tmp_path / 'out')
+        assert report['status'] == 'failed' and report['parts'] == []
+        assert report['coverage'] == 'image_region'
+        assert report['error_code'] == {'bounds': 'attachment_region_out_of_bounds',
+            'animated': 'attachment_region_source_invalid',
+            'disguised': 'attachment_image_invalid'}.get(kind, 'attachment_image_invalid')
+        assert report['sources'][0]['sha256'] == hashlib.sha256(source.read_bytes()).hexdigest()
+        assert report['failed_part']['region'] == [0, 0, 9 if kind == 'bounds' else 2, 2]
+    assert calls == []
+
+
+@pytest.mark.parametrize('failure', ['http_400', 'incomplete', 'source_changed'])
+def test_region_failure_keeps_source_and_region_without_retry(tmp_path, monkeypatch, failure):
+    source = image(tmp_path)
+    original = source.read_bytes()
+    def respond(body):
+        if failure == 'http_400':
+            raise HTTPError(recognition.ENDPOINT, 400, 'private failure', {}, None)
+        if failure == 'source_changed':
+            source.write_bytes(original + b'changed')
+        return {'choices': [{'finish_reason': 'length' if failure == 'incomplete' else 'stop',
+                              'message': {'content': 'private response'}}]}
+    calls = fake_http(monkeypatch, respond)
+
+    report = recognition.recognize(files=[source], region=(1, 1, 5, 4), output_dir=tmp_path / 'out')
+
+    assert len(calls) == 1 and report['status'] == 'failed'
+    assert report['error_code'] == {'http_400': 'attachment_api_http_400',
+        'incomplete': 'attachment_response_incomplete', 'source_changed': 'attachment_source_changed'}[failure]
+    assert report['coverage'] == 'image_region'
+    assert report['sources'][0]['sha256'] == report['failed_part']['content_sha256'] == hashlib.sha256(original).hexdigest()
+    assert report['failed_part']['source_image_size'] == [8, 8]
+    assert report['failed_part']['region'] == [1, 1, 5, 4]
+    assert len(report['failed_part']['region_png_sha256']) == 64
+    assert json.loads(Path(report['report_file']).read_bytes()) == report
+    if failure != 'source_changed':
+        assert report['parts'] == [] and 'private response' not in json.dumps(report)
+
+
+def test_region_excess_png_bytes_is_rejected_without_splitting(tmp_path, monkeypatch):
+    import random
+    from PIL import Image
+
+    source = tmp_path / 'noise.jpg'
+    Image.frombytes('RGB', (64, 64), random.Random(0).randbytes(64 * 64 * 3)).save(source)
+    original = source.read_bytes()
+    monkeypatch.setattr(recognition, 'MAX_FILE_BYTES', len(original) + 1)
+    calls = fake_http(monkeypatch, lambda _: pytest.fail('Oversize region must not reach HTTP'))
+
+    report = recognition.recognize(files=[source], region=[0, 0, 64, 64], output_dir=tmp_path / 'out')
+
+    assert report['status'] == 'failed' and report['error_code'] == 'attachment_image_too_large'
+    assert report['coverage'] == 'image_region' and calls == []
+    assert report['failed_part']['region'] == [0, 0, 64, 64]
+    assert report['failed_part']['content_sha256'] == hashlib.sha256(original).hexdigest()
+    assert len(report['failed_part']['region_png_sha256']) == 64
+
+
+@pytest.mark.parametrize('kind,error', [('coordinates', 'attachment_region_invalid'),
+    ('bounds', 'attachment_region_out_of_bounds'), ('multiple', 'attachment_region_source_invalid'),
+    ('action', 'attachment_region_source_invalid')])
+def test_region_cli_reports_rejected_input_without_http(tmp_path, monkeypatch, capsys, kind, error):
+    source = image(tmp_path)
+    args = ['--file', str(source)] if kind != 'action' else ['--action-file', str(tmp_path / 'action.json')]
+    if kind == 'multiple':
+        args.extend(['--file', str(source)])
+    args.extend(['--region', '0', '0', '8193' if kind == 'coordinates' else '9' if kind == 'bounds' else '2', '2',
+                 '--output-dir', str(tmp_path / 'out')])
+    calls = fake_http(monkeypatch, lambda _: pytest.fail('Invalid region must not reach HTTP'))
+
+    assert recognition.main(args) == 1
+
+    summary = json.loads(capsys.readouterr().out)
+    assert summary['status'] == 'failed' and summary['error_code'] == error
+    assert calls == []

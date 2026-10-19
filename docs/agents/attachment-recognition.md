@@ -23,6 +23,19 @@ python -m apps.oa_approval.attachment_recognition \
 
 `--prompt` 是本次问题，可以自由修改；不传时使用完整识别的默认问题。定向复读可对单页 `--file` 再提问，例如“只读取仪表累计里程与单位，区分小计里程”。定向回答仅覆盖所问事实，不能据此声称已经完成整页其他事项或整单审核。
 
+只需核读原图的一处文字时，可指定一个无缩放区域，单次至多发送一个 PNG 请求，不自动拆分或重试：
+
+```bash
+python -m apps.oa_approval.attachment_recognition \
+  --file /absolute/path/image.png \
+  --region 100 200 700 500 \
+  --prompt '逐字读取这个区域的文字，保留无法确认的字符。'
+```
+
+Python 入口同样接受 `recognize(files=[path], region=(100, 200, 700, 500))`。四个坐标必须为整数，不接受布尔值，按原始存储像素的左上角计算，右、下边界不包含在区域内。入口不按 EXIF 旋转、不缩放、不补白，要求区域有正面积、完整落在原图内、每边不超过 8192 像素且编码 PNG 不超过 32 MiB。只允许一个静态 JPEG、PNG、WebP 或 GIF 文件，实际格式由解码器核对；拒绝动画、PDF、Office、文本、多文件及 `--action-file` 组合。完整原图仍须通过下文的像素保护和底图预算，小选区不会绕过解码保护或变成流式读取。
+
+区域报告使用 `coverage=image_region`，`status=complete` 只表示该区域获得完整回答并通过来源检查。`sources[*].sha256`、`parts[*].content_sha256` 仍指原件；`source_image_size` 和 `region` 保留原尺寸及绝对坐标，`region_png_sha256` 与 `image_tiles[*].png_sha256` 记录实际发送 PNG 的摘要。失败时保留已知来源及选区元数据。原始区域回答保存在 `image_tiles[*].answer`，页面回答明确提示仅覆盖该区域。调用者须核对原件归属并独立检查答案；指定区域本身不证明文字读对，也不满足整页或整单读取要求。
+
 标准输出只返回状态、结果文件、分段数量和错误码。读取返回的 `report_file` 获得 `parts[*].answer`，其中保留问题、模型、来源、页码或文本分段及 Token 用量。结果文件和展开页保存在独立私有目录，不覆盖冻结材料。可用 `--output-dir` 指定尚不存在的结果目录；冻结动作模式拒绝写入该 attempt 内部。
 
 默认目录为 `runtime/finance_preaudit_flows/.attachment-recognitions/<id>/`，也随 `OA_FINANCE_PREAUDIT_FLOW_ROOT` 使用指定的 flow 根。报告在读取原材料前记录 `created_at`、`retention` 和运行状态，结束时记录 `completed_at`；action 模式及直接读取该 flow 根内 attempt 文件时保留所属 attempt。独立的 `retention.json` 只保存这些生命周期字段，作为清理依据，避免大段转写正文影响原材料保护。每次先保存正文、再原子保存生命周期；中断时保留较早的运行状态。识别请求期间不持有维护锁。
