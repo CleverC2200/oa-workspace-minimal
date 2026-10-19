@@ -344,3 +344,136 @@ def test_production_guard_requires_production_working_directory(monkeypatch, tmp
     monkeypatch.chdir(tmp_path)
     with pytest.raises(ValueError, match='production_checkout_required'): cli._production_guard()
     assert not process.called
+
+
+def test_refreshed_download_url_preserves_target_identity(harness):
+    engine, api, attempt, material = harness
+    engine.freeze(attempt, recognized(material)); authorize(engine)
+    api.request_context = lambda request_id: (deepcopy(api.data), [
+        {**resources()[0], 'downloadUrl': '/weaver/weaver.file.FileDownload?fileid=refreshed-token'}
+    ])
+    assert engine.submit(attempt, confirm='YES')['status'] == 'submitted'
+
+
+def test_postcheck_accepts_generated_flow_number_and_handled_without_workflow(harness):
+    engine, api, _, _ = harness
+    fields = api.data['workflowMainTableInfo']['requestRecords'][0]['workflowRequestTableFields']
+    fields.append({'fieldName': 'lcbh', 'fieldValue': ''})
+    attempt = engine.collect('901'); material = engine.read_material(attempt)
+    engine.freeze(attempt, recognized(material)); authorize(engine)
+    original = api.submit_invoice
+    def submitted(*args):
+        result = original(*args)
+        fields[-1]['fieldValue'] = 'FLOW-SERVER-001'
+        api.done[0].pop('workflow_id')
+        return result
+    api.submit_invoice = submitted
+    assert engine.submit(attempt, confirm='YES')['status'] == 'submitted'
+
+
+def test_readonly_cli_postcheck_preserves_unknown_receipt(harness, monkeypatch, capsys):
+    from scripts import overseas_invoice as cli
+    engine, api, attempt, material = harness
+    engine.freeze(attempt, recognized(material)); authorize(engine)
+    original = api.submit_invoice
+    def lost_response(*args):
+        original(*args)
+        raise TimeoutError('synthetic lost response')
+    api.submit_invoice = lost_response
+    assert engine.submit(attempt, confirm='YES')['status'] == 'unknown'
+    journal = engine.root / 'receipts' / (inv.digest('901') + '.json')
+    original_bytes = journal.read_bytes()
+    monkeypatch.setattr(cli.auth, 'load_local_env', lambda: None)
+    monkeypatch.setattr(cli.auth, 'env', lambda key: {'OA_UID': '77', 'OA_APP_SECRET': 'test-key'}[key])
+    monkeypatch.setattr(cli, 'ROOT', engine.root)
+    monkeypatch.setattr(cli.overseas_invoice_api, 'build_api', lambda: api)
+    monkeypatch.setattr(cli.overseas_invoice_api, 'download_fresh', engine.download)
+    assert cli.main(['postcheck', '--attempt', attempt]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result['status'] == 'confirmed_submitted'
+    assert Path(result['postcheck_file']).is_file()
+    assert journal.read_bytes() == original_bytes
+    assert engine.submit(attempt, confirm='YES')['status'] == 'unknown'
+    assert len(api.calls) == 1
+
+
+@pytest.mark.parametrize('change', ['workflow', 'request', 'main', 'row', 'amount', 'resource', 'bytes', 'pending', 'existing_flow_number'])
+def test_readonly_postcheck_rejects_changed_evidence_without_resubmit(harness, change):
+    engine, api, _, _ = harness
+    main = api.data['workflowMainTableInfo']['requestRecords'][0]['workflowRequestTableFields']
+    main.append({'fieldName': 'lcbh', 'fieldValue': 'EXISTING'})
+    attempt = engine.collect('901'); material = engine.read_material(attempt)
+    engine.freeze(attempt, recognized(material)); authorize(engine)
+    original = api.submit_invoice
+    def lost_response(*args):
+        original(*args)
+        raise TimeoutError('synthetic lost response')
+    api.submit_invoice = lost_response
+    engine.submit(attempt, confirm='YES')
+    journal = engine.root / 'receipts' / (inv.digest('901') + '.json')
+    original_bytes = journal.read_bytes()
+    row = api.data['workflowDetailTableInfos'][0]['workflowRequestTableRecords'][0]
+    if change == 'workflow': api.done[0]['workflow_id'] = 'different'
+    if change == 'request': api.data['requestId'] = '902'
+    if change == 'main': main[1]['fieldValue'] = '99'
+    if change == 'row': row['recordOrder'] = 99
+    if change == 'amount': row['workflowRequestTableFields'][1]['fieldValue'] = '99'
+    if change == 'resource':
+        api.request_context = lambda request_id: (deepcopy(api.data), [{**resources()[0], 'name': 'changed.pdf'}])
+    if change == 'bytes':
+        original_download = engine.download
+        def changed(rs, directory):
+            files = original_download(rs, directory)
+            Path(files[0]['path']).write_bytes(b'%PDF-changed-original')
+            return files
+        engine.download = changed
+    if change == 'pending': api.pending = deepcopy(api.done)
+    if change == 'existing_flow_number': main[-1]['fieldValue'] = 'CHANGED'
+    assert engine.postcheck(attempt)['status'] == 'unresolved'
+    assert journal.read_bytes() == original_bytes
+    assert len(api.calls) == 1
+
+
+@pytest.mark.parametrize('response_mode', [
+    'complete', 'complete_nested', 'complete_bare', 'conflict', 'failed',
+    'login_html', 'missing_list', 'invalid_rows', 'mixed_rows', 'missing_request',
+])
+def test_postcheck_checks_handled_pages_beyond_five(harness, monkeypatch, response_mode):
+    from io import BytesIO
+    from urllib.parse import parse_qs
+    from apps.oa_approval.overseas_invoice_api import InvoiceApi
+    engine, api, attempt, material = harness
+    engine.freeze(attempt, recognized(material)); authorize(engine)
+    handled_api = InvoiceApi('test-token', '77', app_id='test', base_url='https://example.invalid')
+    def response(request, **kwargs):
+        page = int(parse_qs(request.data.decode())['pageNo'][0])
+        if request.full_url.endswith('getHandledWorkflowRequestList4Ofs'):
+            rows = ([{'requestId': str(10000 + page * 100 + index)} for index in range(100)]
+                    if page <= 5 else [{'requestId': '901'}])
+        else:
+            invalid = {
+                'failed': b'{"code":"ERROR"}',
+                'login_html': b'<html>synthetic login HTML</html>',
+                'missing_list': b'{"code":"SUCCESS"}',
+                'invalid_rows': b'{"code":"SUCCESS","data":["not a row"]}',
+                'mixed_rows': b'{"code":"SUCCESS","data":[{"requestId":"902"},"not a row"]}',
+                'missing_request': b'{"code":"SUCCESS","data":[{}]}',
+            }
+            if response_mode in invalid:
+                return BytesIO(invalid[response_mode])
+            if response_mode == 'complete_nested':
+                return BytesIO(b'{"data":{"list":[]}}')
+            if response_mode == 'complete_bare':
+                return BytesIO(b'[]')
+            rows = [{'requestId': '901', 'workflowId': 'different'}] if response_mode == 'conflict' else []
+        return BytesIO(json.dumps({'code': 'SUCCESS', 'data': rows}).encode())
+    monkeypatch.setattr('apps.oa_approval.safe_http.urlopen', response)
+    api.handled_rows = handled_api.handled_rows
+    complete = response_mode in {'complete', 'complete_nested', 'complete_bare'}
+    assert engine.submit(attempt, confirm='YES')['status'] == ('submitted' if complete else 'unknown')
+    if not complete:
+        journal = engine.root / 'receipts' / (inv.digest('901') + '.json')
+        original_bytes = journal.read_bytes()
+        assert engine.postcheck(attempt)['status'] == 'unresolved'
+        assert journal.read_bytes() == original_bytes
+        assert len(api.calls) == 1

@@ -27,13 +27,19 @@ def _decode_json(text: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {"data": value}
 
 
-def _extract_rows(payload: Any) -> list[dict[str, Any]]:
+def _extract_rows(payload: Any, *, strict: bool = False) -> list[dict[str, Any]]:
     if isinstance(payload, list):
+        if strict and any(not isinstance(item, dict) for item in payload):
+            raise ValueError("handled_pagination_incomplete")
         return [item for item in payload if isinstance(item, dict)]
     if not isinstance(payload, dict):
+        if strict:
+            raise ValueError("handled_pagination_incomplete")
         return []
     for value in (payload.get("data"), payload.get("result"), payload):
         if isinstance(value, list):
+            if strict and any(not isinstance(item, dict) for item in value):
+                raise ValueError("handled_pagination_incomplete")
             return [item for item in value if isinstance(item, dict)]
         if not isinstance(value, dict):
             continue
@@ -47,7 +53,11 @@ def _extract_rows(payload: Any) -> list[dict[str, Any]]:
         ):
             rows = value.get(key)
             if isinstance(rows, list):
+                if strict and any(not isinstance(item, dict) for item in rows):
+                    raise ValueError("handled_pagination_incomplete")
                 return [item for item in rows if isinstance(item, dict)]
+    if strict:
+        raise ValueError("handled_pagination_incomplete")
     return []
 
 
@@ -192,35 +202,44 @@ class OaApi:
         self,
         *,
         page_size: int = 100,
-        max_pages: int = 5,
+        max_pages: int | None = 5,
     ) -> list[dict[str, str]]:
         cases: list[dict[str, str]] = []
         seen_request_ids: set[str] = set()
         for path in HANDLED_ENDPOINTS:
             previous_page: list[dict[str, Any]] | None = None
-            for page_no in range(1, max(1, int(max_pages)) + 1):
-                page = _extract_rows(
-                    self._post_readonly(
-                        path,
-                        {
-                            "pageNo": str(page_no),
-                            "pageSize": str(max(1, int(page_size))),
-                            "isNeedOs": True,
-                        },
-                    )
+            page_no = 1
+            while max_pages is None or page_no <= max(1, int(max_pages)):
+                payload = self._post_readonly(
+                    path,
+                    {
+                        "pageNo": str(page_no),
+                        "pageSize": str(max(1, int(page_size))),
+                        "isNeedOs": True,
+                    },
                 )
-                if not page or page == previous_page:
+                if max_pages is None:
+                    _raise_on_readonly_error(payload, code="handled_pagination_incomplete")
+                page = _extract_rows(payload, strict=max_pages is None)
+                if not page:
+                    break
+                if page == previous_page:
+                    if max_pages is None:
+                        raise ValueError("handled_pagination_incomplete")
                     break
                 for row in page:
                     case = _handled_case(row)
                     request_id = case["request_id"]
-                    if not request_id or request_id in seen_request_ids:
+                    if max_pages is None and not request_id:
+                        raise ValueError("handled_pagination_incomplete")
+                    if not request_id or (max_pages is not None and request_id in seen_request_ids):
                         continue
                     seen_request_ids.add(request_id)
                     cases.append(case)
                 if len(page) < max(1, int(page_size)):
                     break
                 previous_page = page
+                page_no += 1
         return cases
 
     def pending_rows(
