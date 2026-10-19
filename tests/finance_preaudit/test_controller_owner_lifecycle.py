@@ -229,6 +229,12 @@ def test_detached_snapshot_race_does_not_cancel_healthy_controller(tmp_path, mon
     interrupted = []
     started = tmp_path / 'controller-started'
 
+    def execution_diagnostics():
+        fields = ('state', 'exit_code', 'exit_signal', 'error_type', 'received_signals',
+                  'children_reaped', 'stop_wait_error', 'stop_request_error', 'owner_process_lost')
+        return json.dumps({**{key: receipt.get(key) for key in fields}, 'started': started.exists()},
+                          sort_keys=True)
+
     def raced_read(path):
         if path.name == 'execution.json' and not interrupted:
             wait_until(started.exists)
@@ -242,15 +248,15 @@ def test_detached_snapshot_race_does_not_cancel_healthy_controller(tmp_path, mon
     command = [sys.executable, '-c', f"import time\nfrom pathlib import Path\nPath({str(started)!r}).touch()\ntime.sleep(.4)"]
     if error_code == 'controller_execution_snapshot_changed':
         receipt = runner.supervise(command, **options)
-        assert receipt['exit_code'] == 0 and not receipt['received_signals']
-        assert not runtime_control.stop_requested()
+        assert receipt['exit_code'] == 0 and not receipt['received_signals'], execution_diagnostics()
+        assert not runtime_control.stop_requested(), execution_diagnostics()
     else:
         with pytest.raises(ValueError, match=error_code):
             runner.supervise(command, **options)
         receipt = json.loads((directory / 'execution.json').read_text())
-        assert receipt['state'] == 'exited' and receipt['exit_code'] == 0
-        assert receipt['received_signals'] == [signal.SIGTERM]
-    assert interrupted
+        assert receipt['state'] == 'exited' and receipt['exit_code'] == 0, execution_diagnostics()
+        assert receipt['received_signals'] == [signal.SIGTERM], execution_diagnostics()
+    assert interrupted, execution_diagnostics()
 
 
 def test_lost_legacy_supervisor_is_not_projected_as_waiting(tmp_path, monkeypatch):
