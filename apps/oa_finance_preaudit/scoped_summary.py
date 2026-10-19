@@ -101,9 +101,15 @@ def summarize(root: Path, input_file: Path) -> dict:
     pending = _pending(status, exclusions) if generated else dict.fromkeys(
         ('finance', 'packaging', 'overseas', 'out_of_scope', 'unclassified'), 'unknown')
     overseas = _bound_input(sources['overseas_status_file']) if 'overseas_status_file' in sources else {}
+    capabilities = {'invoice_backfill', 'no_invoice_submit', 'pending', 'postcheck'}
     if overseas and (overseas.get('schema_version') != 1 or overseas.get('kind') != 'overseas_invoice_result'
             or overseas.get('status') == 'blocked' or not isinstance(overseas.get('unknown_dispositions'), list)
-            or not isinstance(overseas.get('capability_status'), dict)):
+            or not isinstance(overseas.get('capability_status'), dict)
+            or set(overseas['capability_status']) != capabilities
+            or not isinstance(overseas.get('capabilities'), list)
+            or set(overseas['capabilities']) != capabilities
+            or type(overseas.get('write_enabled')) is not bool
+            or type(overseas.get('no_invoice_enabled')) is not bool):
         raise ValueError('status_summary_source_invalid')
     unknowns = overseas.get('unknown_dispositions')
     if unknowns is not None and any(not isinstance(row, dict) or row.get('receipt_status') != 'unknown' for row in unknowns):

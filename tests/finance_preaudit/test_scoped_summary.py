@@ -39,9 +39,9 @@ def test_file_summary_retains_overseas_unknown_and_excludes_only_explicit_scope(
             'quarantine': {'actionable_pending': 0, 'pending_quarantined': 0},
             'continuation': {'status': 'ready', 'blocking_reasons': {}}, 'pending_dispositions': {'items': []}},
         'controller_handoff': {'ready_for_start': False, 'reason': 'original_invocation_unsealed'}}
-    unknown = {'schema_version': 1, 'kind': 'overseas_invoice_result',
-               'capability_status': {'no_invoice_submit': {'implementation': 'available',
-                   'authorization': 'enabled', 'deployment': 'unknown', 'business_acceptance': 'not_verified'}},
+    invoice_status = overseas_invoice.InvoiceFlow(tmp_path / 'invoice-root', None, 'fake-actor',
+        'fake-secret', lambda *_: None).status()
+    unknown = {**invoice_status, 'schema_version': 1, 'kind': 'overseas_invoice_result',
                'unknown_dispositions': [{'attempt': 'a' * 32, 'receipt_status': 'unknown',
                                          'next_action': 'readonly_postcheck_or_manual_reconciliation'}]}
     manifest = {'status_file': bound_file(tmp_path / 'status.json', status),
@@ -203,3 +203,13 @@ def test_unknown_source_metadata_fields_are_rejected_without_echo(tmp_path, caps
     raw = capsys.readouterr().out
     assert 'private-content' not in raw
     assert json.loads(raw)['failure']['code'] == 'status_summary_source_invalid'
+
+
+def test_incomplete_overseas_snapshot_cannot_assert_zero_unknown(tmp_path, capsys):
+    source = tmp_path / 'inputs.json'
+    partial = {'schema_version': 1, 'kind': 'overseas_invoice_result',
+               'capability_status': {}, 'unknown_dispositions': []}
+    source.write_text(json.dumps({'overseas_status_file': bound_file(tmp_path / 'overseas.json', partial)}))
+    assert cli.main(['status', '--root', str(tmp_path), '--summary-input-file', str(source)],
+                    runtime_status=no_live) == 1
+    assert json.loads(capsys.readouterr().out)['failure']['code'] == 'status_summary_source_invalid'
