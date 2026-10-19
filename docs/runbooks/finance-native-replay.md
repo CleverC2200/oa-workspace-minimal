@@ -32,6 +32,8 @@
 
 在已授权的开发工作树使用 Python 3.11 或更新版本，先准备，不调用模型：
 
+先提交将被复制的源码、规则和配置；准备入口要求这些文件与声明的提交一致，快照范围外的本地文件不阻断准备。
+
 ```bash
 OA_REVIEW_PROVIDER=deepseek OA_REVIEW_TRANSPORT=cli \
 python3 -m scripts.finance_preaudit_native_replay \
@@ -55,6 +57,8 @@ python3 -m scripts.finance_preaudit_native_replay \
 ```
 
 沿用准备时冻结的模型、推理和供应商配置，请求普通服务档。当前 Worker 每次只执行一次审核进程，不添加业务重试；历史记录保留原实际尝试数。每个案例原生尝试、事件、工具回执、Token 用量、决定和闭合结果保存在私有审计目录。一次运行启动后，等待原进程结束；已有运行记录时入口拒绝重跑。
+
+运行前核对原材料、明确绑定的原状态和原证据指纹。依赖缺失、不可读或变化时返回非零，在私有 `result.json` 留下原因、`review_status=not_started` 和空 attempts，执行器调用为 0；修复输入后使用新 label 重新准备。执行中发生 I/O 失败时，结果保留实际尝试及已返回回执，未知终态继续未知；保存的失败结果同样不能重跑或覆盖。
 
 ## 核对结果
 
