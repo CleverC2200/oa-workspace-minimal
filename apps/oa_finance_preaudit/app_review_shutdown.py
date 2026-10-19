@@ -125,25 +125,7 @@ def _wait_result(anchor: dict, output: dict, session: str) -> dict:
     return results[-1]
 
 
-def _verified_proofs(value: dict, *, owner: str, source: Path, interrupt_lines: list[int], status_line: int, wait_line: int, require_idle: bool) -> dict:
-    from scripts import finance_preaudit_run
-    if len(interrupt_lines) != 3 or len(set(interrupt_lines)) != 3:
-        raise ValueError('host_review_shutdown_three_interrupts_required')
-    stops = []
-    for reviewer, line in zip(value['reviewers'], interrupt_lines):
-        anchor, proof = _source(value, owner, source, line, earliest=value['shutdown']['started_at'])
-        arguments = host._tool(anchor, 'interrupt_agent')
-        previous = proof.pop('output')
-        if (arguments != {'target': reviewer['agent_path']} or not isinstance(previous, dict)
-                or set(previous) != {'previous_status'}):
-            raise ValueError('host_review_shutdown_interrupt_untrusted')
-        host._native_agent_status(previous['previous_status'])
-        stops.append(proof)
-    anchor, statuses = _source(value, owner, source, status_line, earliest=value['shutdown']['started_at'])
-    host._tool(anchor, 'list_agents')
-    if status_line <= max(item['output_line'] for item in stops):
-        raise ValueError('host_review_stale_source')
-    output = statuses.pop('output')
+def _idle_reviewers(value: dict, output: dict) -> list[dict]:
     if not isinstance(output, dict) or output.get('isError') is True or output.get('error'):
         raise ValueError('host_review_children_status_untrusted')
     agents = output.get('agents')
@@ -155,8 +137,52 @@ def _verified_proofs(value: dict, *, owner: str, source: Path, interrupt_lines: 
         if len(matches) != 1 or host._native_agent_status(matches[0].get('agent_status')) not in {'idle', 'completed', 'interrupted'}:
             raise ValueError('host_review_children_not_idle')
         canonical.append({'agent_name': reviewer['agent_path'], 'agent_status': host._native_agent_status(matches[0]['agent_status'])})
-    statuses['reviewers'] = canonical
+    return canonical
+
+
+def _verify_completed_close(value: dict, *, owner: str, execution: dict, require_idle: bool, last_proof_at: float) -> None:
+    plan = value['shutdown']
+    if value.get('close_reason') != 'completed' or value.get('state') != 'closed':
+        raise ValueError('host_review_shutdown_incomplete')
+    saved = value['children_idle_source']
+    anchor, proof = _source(value, owner, Path(saved['session_file']), saved['line'], earliest=host._last_result_at(value))
+    host._tool(anchor, 'list_agents')
+    proof['reviewers'] = _idle_reviewers(value, proof.pop('output'))
+    idle_at = datetime.fromisoformat(anchor['timestamp'].replace('Z', '+00:00')).timestamp()
+    completed_at = datetime.fromisoformat(execution['completed_at'])
+    verified_at = time.time() if require_idle else plan['verified_at']
+    if (proof != saved or completed_at.tzinfo is None
+            or not host.guard._timestamp(verified_at)
+            or not completed_at.timestamp() <= idle_at <= value['closed_at'] < plan['started_at'] <= verified_at <= time.time()
+            or verified_at < last_proof_at):
+        raise ValueError('host_review_shutdown_incomplete')
+
+
+def _verified_proofs(value: dict, *, owner: str, source: Path, interrupt_lines: list[int], status_line: int, wait_line: int, require_idle: bool) -> dict:
+    from scripts import finance_preaudit_run
+    if len(interrupt_lines) != 3 or len(set(interrupt_lines)) != 3:
+        raise ValueError('host_review_shutdown_three_interrupts_required')
+    stops = []
+    last_proof_at = value['shutdown']['started_at']
+    for reviewer, line in zip(value['reviewers'], interrupt_lines):
+        anchor, proof = _source(value, owner, source, line, earliest=value['shutdown']['started_at'])
+        last_proof_at = max(last_proof_at, datetime.fromisoformat(anchor['timestamp'].replace('Z', '+00:00')).timestamp())
+        arguments = host._tool(anchor, 'interrupt_agent')
+        previous = proof.pop('output')
+        if (arguments != {'target': reviewer['agent_path']} or not isinstance(previous, dict)
+                or set(previous) != {'previous_status'}):
+            raise ValueError('host_review_shutdown_interrupt_untrusted')
+        host._native_agent_status(previous['previous_status'])
+        stops.append(proof)
+    anchor, statuses = _source(value, owner, source, status_line, earliest=value['shutdown']['started_at'])
+    last_proof_at = max(last_proof_at, datetime.fromisoformat(anchor['timestamp'].replace('Z', '+00:00')).timestamp())
+    host._tool(anchor, 'list_agents')
+    if status_line <= max(item['output_line'] for item in stops):
+        raise ValueError('host_review_stale_source')
+    output = statuses.pop('output')
+    statuses['reviewers'] = _idle_reviewers(value, output)
     anchor, wait = _source(value, owner, source, wait_line, earliest=value['registered_at'])
+    last_proof_at = max(last_proof_at, datetime.fromisoformat(anchor['timestamp'].replace('Z', '+00:00')).timestamp())
     exit_result = _wait_result(anchor, wait.pop('output'), value['original_execution']['tool_session_id'])
     report = finance_preaudit_run.read_execution(**value['original_execution'])
     if (report.get('terminal') is not True or report.get('children_reaped') is not True
@@ -168,9 +194,12 @@ def _verified_proofs(value: dict, *, owner: str, source: Path, interrupt_lines: 
     # gates. Nonzero driver exit is allowed only for an aborted round.
     if value['shutdown']['reason'] == 'completed' and report.get('status') != 'completed':
         raise ValueError('host_review_shutdown_incomplete')
+    execution_raw, execution = host._read(Path(value['original_execution']['receipt_file']))
+    if value.get('state') == 'closed' and value['closed_at'] < value['shutdown']['started_at']:
+        _verify_completed_close(value, owner=owner, execution=execution, require_idle=require_idle, last_proof_at=last_proof_at)
     return {'interrupt_sources': stops, 'children_source': statuses, 'driver_wait_source': wait,
             'driver_exit_code': report['exit_code'], 'children_reaped': True, 'writer_active': False,
-            'execution_sha256': hashlib.sha256(host._read(Path(value['original_execution']['receipt_file']))[0]).hexdigest()}
+            'execution_sha256': hashlib.sha256(execution_raw).hexdigest()}
 
 
 def sealed_round(*, owner: str, run_id: str) -> dict:

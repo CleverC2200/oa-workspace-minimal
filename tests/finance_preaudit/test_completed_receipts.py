@@ -55,7 +55,7 @@ def test_cli_summarizes_only_explicit_sealed_round_without_writes(exchange, tmp_
 
 def completed_case(exchange, tmp_path, *, controlled=True, legacy=False, close_action=True, submitted=True,
                    workflow='business_support_fee', bootstrap_revision=None, bootstrap_dirty=False,
-                   bootstrap_before_start=False, bootstrap_native_mismatch=False):
+                   bootstrap_before_start=False, bootstrap_native_mismatch=False, close_before_shutdown=False):
     from apps import json_artifact
     from apps.oa_finance_preaudit import host_chat_review as host
     from tests.finance_preaudit.test_flow_engine_support import _engine, _decision, _reviewed_items
@@ -111,9 +111,15 @@ def completed_case(exchange, tmp_path, *, controlled=True, legacy=False, close_a
         consumed = tmp_path / 'consumed-decision.json'
         json_artifact.write_json_atomic(consumed, host.read_result(request_file)['decision'])
         engine.complete_review(current, consumed)
-    shutdown.begin(owner=owner, reason='completed' if close_action else 'cancelled')
+    if not close_before_shutdown:
+        shutdown.begin(owner=owner, reason='completed' if close_action else 'cancelled')
     controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
     execution = seal_execution(owner, manifest)
+    if close_before_shutdown:
+        idle = native_call(parent, 'list_agents', {}, 'independent-close-idle', {'agents': [
+            {'agent_name': f'/root/reviewer_{slot}', 'agent_status': 'completed'} for slot in range(3)]})
+        host.close(owner=owner, reason='completed', source=parent, source_line=idle, run_id=manifest['run_id'])
+        shutdown.begin(owner=owner, reason='completed', run_id=manifest['run_id'])
     shutdown_proofs = proofs(owner, child)
     if bootstrap_revision is not None:
         source = shutdown_proofs['source']
@@ -128,6 +134,72 @@ def completed_case(exchange, tmp_path, *, controlled=True, legacy=False, close_a
         source.write_text('\n'.join(rows) + '\n')
     shutdown.finish(owner=owner, **shutdown_proofs)
     return root, owner, manifest['run_id'], current, host.registry_file(owner, manifest['run_id']), request_file
+
+
+def test_cli_counts_completed_exchange_sealed_after_its_original_close(exchange, tmp_path, capsys):
+    root, owner, run, _, registry_file, _ = completed_case(exchange, tmp_path, close_before_shutdown=True)
+    registered = json.loads(registry_file.read_text())
+    assert registered['closed_at'] < registered['shutdown']['started_at']
+    assert registered['shutdown']['status'] == 'verified'
+    original = {file: file.read_bytes() for file in tmp_path.rglob('*') if file.is_file()}
+
+    assert cli.main(['completed-receipts', '--root', str(root), '--owner-task-id', owner, '--run-id', run]) == 0
+
+    assert json.loads(capsys.readouterr().out)['counts'] == {
+        'completed': 1, 'excluded': 0, 'invalid': 0, 'duplicate': 0}
+    assert all(file.read_bytes() == raw for file, raw in original.items())
+
+
+@pytest.mark.parametrize('damage', ['missing_idle', 'idle_source', 'idle_running', 'completion_after_close',
+                                  'verified_before_shutdown', 'verified_before_last_tool', 'after_closed', 'after_shutdown'])
+def test_cli_refuses_unproven_late_completed_shutdown(exchange, tmp_path, capsys, damage):
+    from datetime import datetime
+    import hashlib
+    from apps.oa_finance_preaudit import host_chat_review as host
+    root, owner, run, _, registry_file, request_file = completed_case(exchange, tmp_path, close_before_shutdown=True)
+    registered = json.loads(registry_file.read_text())
+    request = json.loads(request_file.read_text())
+    assigned = registered['assignments'][request['request_id']]
+    plan = registered['shutdown']
+    if damage == 'missing_idle':
+        registered.pop('children_idle_source')
+    elif damage == 'idle_source':
+        registered['children_idle_source']['session_id'] = 'unrelated-owner'
+    elif damage == 'idle_running':
+        saved = registered['children_idle_source']
+        path = Path(saved['session_file'])
+        rows = path.read_text().splitlines()
+        record = json.loads(rows[saved['output_line'] - 1])
+        output = json.loads(record['payload']['output'])
+        output['agents'][0]['agent_status'] = 'running'
+        record['payload']['output'] = json.dumps(output)
+        rows[saved['output_line'] - 1] = json.dumps(record)
+        path.write_text('\n'.join(rows) + '\n')
+    elif damage == 'completion_after_close':
+        path = Path(registered['original_execution']['receipt_file'])
+        execution = json.loads(path.read_text())
+        execution['completed_at'] = datetime.fromtimestamp(
+            (registered['closed_at'] + plan['started_at']) / 2, tz=datetime.now().astimezone().tzinfo).isoformat()
+        host.guard.write(path, execution)
+        plan['receipt']['execution_sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+    elif damage == 'verified_before_shutdown':
+        plan['verified_at'] = plan['started_at'] - .001
+    elif damage == 'verified_before_last_tool':
+        saved = plan['receipt']['driver_wait_source']
+        row = json.loads(Path(saved['session_file']).read_text().splitlines()[saved['line'] - 1])
+        plan['verified_at'] = datetime.fromisoformat(row['timestamp']).timestamp() - .000001
+    elif damage == 'after_closed':
+        registered['closed_at'] = assigned['submitted_at'] - .001
+    else:
+        plan['started_at'] = assigned['submitted_at'] - .001
+    host.guard.write(registry_file, registered)
+    original = {file: file.read_bytes() for file in tmp_path.rglob('*') if file.is_file()}
+
+    assert cli.main(['completed-receipts', '--root', str(root), '--owner-task-id', owner, '--run-id', run]) == 0
+
+    assert json.loads(capsys.readouterr().out)['counts'] == {
+        'completed': 0, 'excluded': 0, 'invalid': 1, 'duplicate': 0}
+    assert all(file.read_bytes() == raw for file, raw in original.items())
 
 
 def test_cli_counts_a_sealed_legacy_bootstrap_request_created_before_registration(exchange, tmp_path, capsys):
