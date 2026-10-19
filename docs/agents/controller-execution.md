@@ -180,3 +180,9 @@ python3 -B -m scripts.finance_preaudit_run --owner-task-id <原任务 UUID> --re
 确已确认的外部对账失信采用有限停止理由 production_reconciliation_blocked；已写停止原因不覆盖，原真正首错优先。终态原输出的 primary_error_code 与通知保留具体原因，取回入口只验证并返回原结果，不改写它。普通停止或无法验证的原因保留通用失败语义，不能自动清除；普通周期停止仍按原回收门处理。
 
 回执不授予恢复、清警报或新的 OA 写入权限。原始输出仅本地留存，不提交 Git 或上传 Issue。父 Bug #325 的历史退出触发者仍待证实；本地回归不代替发布及正常生产轮次验收。
+
+### 已封存轮次的完成数量
+
+汇总同一主聊天的一个或多个明确轮次时，使用审批 CLI 的 `completed-receipts --owner-task-id <主会话UUID> --run-id <run_id> --run-id <另一run_id> --output-file <新私有JSON文件>`；需要读取独立开发夹具时传入 `--root <流程运行根目录>`。它只读取所选轮次，复验原生收尾、冻结材料与实际执行回执，并按 action 去重。标准输出保留计数和有界缺口，完整明细只保存在新建的 0600 文件中。
+
+`completed` 仅表示已提交并后查的技术闭环，`business_acceptance=not_verified` 保留业务准确性的独立验收边界。草稿、preview、未闭合、缺失或损坏证据不会计作完成。此汇总不替代上方三槽中断和原 session wait，也不替代新鲜 OA 对账；有 invalid 或 excluded 时查看私有明细，不根据计数补造旧记录。
