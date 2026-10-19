@@ -380,15 +380,15 @@ def _pending_job_timings(jobs, identity):
     pending = False
     for job in rows:
         current = job['name'] == 'quality-complete'
-        running = job['status'] == 'in_progress' and job['conclusion'] is None
-        if current or running:
-            if not running or job['completed_at'] is not None:
+        unfinished = job['status'] in {'queued', 'in_progress'} and job['conclusion'] is None
+        if current or unfinished:
+            if not unfinished or job['completed_at'] is not None:
                 raise ValueError('job_timing_status_untrusted')
-            pending = pending or not current
+            pending = pending or not current or job['status'] == 'queued'
         elif job['status'] != 'completed' or job['conclusion'] != 'success':
             raise ValueError('job_timing_status_untrusted')
         start = datetime.fromisoformat(job['started_at'])
-        end = start if running else datetime.fromisoformat(job['completed_at'])
+        end = start if unfinished else datetime.fromisoformat(job['completed_at'])
         if (start.tzinfo is None or end.tzinfo is None
                 or not 0 <= start.timestamp() <= end.timestamp() <= aggregation_start.timestamp()):
             raise ValueError('job_timing_clock_untrusted')
