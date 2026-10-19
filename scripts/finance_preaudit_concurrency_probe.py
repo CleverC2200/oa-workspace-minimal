@@ -2242,11 +2242,15 @@ def _initialize_readonly_worker(role: str, binding: tuple[str, str, str] | None)
             if os.getpgrp() == os.getpid():
                 os.killpg(os.getpgrp(), signal.SIGKILL)
 
-    threading.Thread(
-        target=reap_after_parent_exit,
-        name="oa-preparation-parent-watch",
-        daemon=True,
-    ).start()
+    previous_sigterm_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    try:
+        threading.Thread(
+            target=reap_after_parent_exit,
+            name="oa-preparation-parent-watch",
+            daemon=True,
+        ).start()
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_sigterm_mask)
 
 
 def _initialize_preparation_worker(binding: tuple[str, str, str] | None = None) -> None:

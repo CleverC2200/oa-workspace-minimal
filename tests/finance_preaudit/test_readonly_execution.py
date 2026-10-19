@@ -6,6 +6,7 @@ import multiprocessing
 import json
 from pathlib import Path
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -120,6 +121,110 @@ def test_readonly_timeout_reaps_registered_real_model_tree(tmp_path, monkeypatch
     assert not action.with_name("execution-receipt.json").exists()
     _assert_fake_codex_tree_reaped(pid_file, fake_codex, marker)
 
+
+def _review_with_stop_at_model_launch(task):
+    from unittest.mock import patch
+    from apps.oa_finance_preaudit import approval_guard as guard
+
+    root = Path(task["project_root"])
+    popen, identity_popen = subprocess.Popen, guard._identity_popen
+    model_pid = None
+
+    def launch(command, *args, **kwargs):
+        nonlocal model_pid
+        process = popen(command, *args, **kwargs)
+        if command[0] == "codex":
+            model_pid = process.pid
+            deadline = time.monotonic() + 5
+            while not (root.parent / "codex-tree-pids.txt").exists():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("fixture_model_not_started")
+                time.sleep(.005)
+        return process
+
+    def identify(command, *args, **kwargs):
+        if command[:3] == ["ps", "-p", str(model_pid)]:
+            (root / "model-launch-barrier").touch()
+            deadline = time.monotonic() + 5
+            while signal.SIGTERM not in signal.sigpending():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("fixture_stop_not_received")
+                time.sleep(.005)
+        return identity_popen(command, *args, **kwargs)
+
+    with patch.object(subprocess, "Popen", launch), patch.object(guard, "_identity_popen", identify):
+        return codex_review_worker.run_read_only(task)
+
+
+def test_readonly_stop_during_model_launch_registers_and_reaps_tree(tmp_path, monkeypatch):
+    task, action = _task(tmp_path)
+    root = Path(task["project_root"])
+    monkeypatch.setenv("OA_REVIEW_API_KEY", "unit-test-key")
+    monkeypatch.setattr(probe, "_reviewable_action_files", lambda _: [action])
+    monkeypatch.setattr(probe.codex_review_worker, "run_read_only", _review_with_stop_at_model_launch)
+    pid_file, fake_codex, marker = _install_fake_codex_tree(tmp_path, monkeypatch, ignore_child_sigterm=True)
+    with runtime_control.global_controller_lease():
+        manifest = controller_handoff.begin({"capacity": 3})
+        with approval_lifecycle.run_scope(manifest, root):
+            result = probe.run_read_only_probe(
+                capacity=1, sample_size=1, project_root=root,
+                run_reviews=partial(probe._run_read_only_reviews,
+                                    stop_requested=(root / "model-launch-barrier").exists),
+            )
+        diagnostics = _readonly_reap_diagnostics(manifest, result)
+        _assert_fake_codex_tree_reaped(pid_file, fake_codex, marker)
+        assert approval_lifecycle.readonly_reaped(manifest), json.dumps(diagnostics)
+    assert result["stopped"] == 1
+    assert result["error_counts"] == {"stop_requested": 1}
+    assert result["processes_reaped"] is True
+    assert diagnostics["models"][0]["state"] == "closed"
+    assert diagnostics["models"][0]["closed_at_present"] is True
+    assert diagnostics["models"][0]["model"]["pid"] is not None
+    assert not action.with_name("execution-receipt.json").exists()
+
+
+def _initialize_review_with_failed_watcher(binding):
+    from unittest.mock import patch
+    from apps.oa_finance_preaudit import approval_guard as guard
+
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
+    observed = {"before": sorted(signal.pthread_sigmask(signal.SIG_BLOCK, set()))}
+
+    def fail_start(_thread):
+        observed["during"] = sorted(signal.pthread_sigmask(signal.SIG_BLOCK, set()))
+        raise RuntimeError("fixture_thread_start_failed")
+
+    try:
+        with patch.object(probe.threading.Thread, "start", fail_start):
+            probe._initialize_review_worker(binding)
+    finally:
+        observed["after"] = sorted(signal.pthread_sigmask(signal.SIG_BLOCK, set()))
+        guard.write(Path(binding[2]) / "watcher-start-failure.json", observed)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def test_readonly_watcher_start_failure_restores_worker_signal_mask(tmp_path, monkeypatch):
+    from apps.oa_finance_preaudit import approval_guard as guard
+
+    task, action = _task(tmp_path)
+    root = Path(task["project_root"])
+    monkeypatch.setattr(probe, "_reviewable_action_files", lambda _: [action])
+    monkeypatch.setattr(probe, "_process_executor", lambda capacity: ProcessPoolExecutor(
+        max_workers=capacity, mp_context=multiprocessing.get_context("spawn"),
+        initializer=_initialize_review_with_failed_watcher,
+        initargs=(approval_lifecycle.context(),),
+    ))
+    with runtime_control.global_controller_lease():
+        manifest = controller_handoff.begin({"capacity": 3})
+        with approval_lifecycle.run_scope(manifest, root):
+            result = probe.run_read_only_probe(capacity=1, sample_size=1, project_root=root)
+        assert approval_lifecycle.readonly_reaped(manifest)
+    observed = guard.read(guard.directory() / "watcher-start-failure.json")
+    assert signal.SIGUSR1 in observed["before"]
+    assert signal.SIGTERM in observed["during"]
+    assert observed["after"] == observed["before"]
+    assert result["error_counts"] == {"worker_process_failed": 1}
+    assert result["processes_reaped"] is True
 
 def _recorded_readonly_worker(task):
     time.sleep(task["delay"])
