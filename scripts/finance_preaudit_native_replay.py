@@ -100,13 +100,19 @@ def prepare(args):
     project.mkdir(parents=True, mode=0o700)
     subprocess.run(['git', 'init', '--quiet', str(project)], check=True)
     audit.mkdir(parents=True, mode=0o700)
-    tracked = subprocess.check_output(['git', 'ls-files', '-z'], cwd=args.project).decode().split('\0')
+    source_head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=args.project).decode().strip()
+    tracked = subprocess.check_output(['git', 'ls-tree', '-r', '-z', source_head], cwd=args.project).split(b'\0')
+    def included(name):
+        return ((name.startswith('apps/') or name.startswith('.agents/skills/')
+            or name.startswith('docs/agents/') or name in {'AGENTS.md', 'CONTRIBUTING.md', 'CONTEXT.md', 'GLOSSARY.md', production_config.MODEL_CATALOG})
+            and Path(name).name not in {'regression-cases.json', 'confirmed-feedback.md'})
     source_manifest = []
-    for name in tracked:
-        if not name or not (name.startswith('apps/') or name.startswith('.agents/skills/')
-                or name.startswith('docs/agents/') or name in {'AGENTS.md', 'CONTRIBUTING.md', 'CONTEXT.md', 'GLOSSARY.md', production_config.MODEL_CATALOG}):
+    source_blobs = []
+    for entry in tracked:
+        if not entry:
             continue
-        if Path(name).name in {'regression-cases.json', 'confirmed-feedback.md'}:
+        metadata, name = entry.decode().split('\t', 1)
+        if not included(name):
             continue
         p = args.project / name
         if p.is_symlink() or not p.is_file():
@@ -115,7 +121,16 @@ def prepare(args):
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         shutil.copyfile(p, target)
         target.chmod(0o600)
-        source_manifest.append({'path': name, 'sha256': digest(p)})
+        source_manifest.append({'path': name, 'sha256': digest(target)})
+        source_blobs.append(metadata.split()[2])
+    copied_blobs = subprocess.check_output(['git', 'hash-object', '--no-filters', '--',
+        *(str(project / item['path']) for item in source_manifest)], cwd=args.project).decode().splitlines()
+    if copied_blobs != source_blobs:
+        raise RuntimeError('source_snapshot_not_committed')
+    staged = subprocess.check_output(['git', 'diff', '--cached', '--name-only', '-z', source_head],
+                                    cwd=args.project).decode().split('\0')
+    if any(included(name) for name in staged if name):
+        raise RuntimeError('source_snapshot_not_committed')
     root = project / 'runtime' / 'finance_preaudit_flows'
     engine = engine_for(root, material, original)
     action = engine.next_action(state['workflow_key'], mode='preview')
@@ -137,10 +152,10 @@ def prepare(args):
         'fresh_evidence_fingerprint': fresh_state['evidence_fingerprint'],
         'material_rebinding_lossless': True, 'current_engine_changed_top_level_fields': changed_top_level,
         'file_mapping': original['mapping'], 'source_manifest': source_manifest,
-        'source_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=args.project).decode().strip(),
+        'source_head': source_head,
         'model_has_no_historical_decisions_or_expectations': True, 'oa_client_config_or_submit_callback': False,
         'excluded_reviewer_files': ['confirmed-feedback.md', 'regression-cases.json', 'tests/', 'inventory', 'historical decisions'],
-        'worker_source_sha256': digest(args.project / 'apps/oa_finance_preaudit/codex_review_worker.py'),
+        'worker_source_sha256': digest(project / 'apps/oa_finance_preaudit/codex_review_worker.py'),
         'review_configuration': production_config.review_settings()}
     dump(audit / 'prepare.json', manifest)
     print(json.dumps({'status': 'prepared', 'case': args.case, 'audit': str(audit),
