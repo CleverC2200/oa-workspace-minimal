@@ -66,7 +66,8 @@ def test_pre_registration_shutdown_seals_native_exit_without_rewriting_partial_e
     assert partial['run_id'] is None and partial['controller_state'] == 'unknown' and partial['children_reaped'] == 'unknown'
     projected = runner.read_execution(args['receipt_file'], owner_task_id=args['owner'], invocation_id=args['invocation_id'])
     assert projected['controller_state'] == 'failed' and projected['children_reaped'] is True
-    assert projected['terminal'] is False
+    assert projected['state'] == 'supervisor_lost' and projected['recorded_state'] == 'exited'
+    assert projected['status'] == 'blocked' and projected['terminal'] is False
     with pytest.raises(ValueError, match='previous_round_incomplete'):
         host.assert_previous_rounds_closed(owner=str(uuid4()))
     command = ['--operation', 'finish-unregistered-shutdown', '--owner-task-id', args['owner'],
@@ -85,6 +86,7 @@ def test_pre_registration_shutdown_seals_native_exit_without_rewriting_partial_e
     report = runner.read_execution(args['receipt_file'], owner_task_id=args['owner'],
                                    invocation_id=args['invocation_id'], tool_session_id='native-session')
     assert report['status'] == 'blocked' and report['terminal'] is False
+    assert report['state'] == 'supervisor_lost' and report['recorded_state'] == 'exited'
     assert shutdown.finish_unregistered(**args) == receipt
 
 

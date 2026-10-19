@@ -275,7 +275,9 @@ def _unregistered_proofs(*, owner: str, reviewers: list[dict], source: Path, rec
     manifest_raw, manifest = host._read(receipt_file.with_name('controller-manifest.json'))
     started = runner._timestamp(execution['started_at']).timestamp()
     completed = runner._timestamp(execution['completed_at']).timestamp()
-    if (report['state'] != 'exited' or report.get('controller_state') != 'failed'
+    exited = report['state'] == 'exited' or (
+        report['state'] == 'supervisor_lost' and report.get('recorded_state') == 'exited')
+    if (not exited or execution.get('state') != 'exited' or report.get('controller_state') != 'failed'
             or report.get('children_reaped') is not True or type(report.get('exit_code')) is not int
             or not -signal.NSIG < report['exit_code'] <= 255
             or execution.get('exit_signal') != (-report['exit_code'] if report['exit_code'] < 0 else None)
