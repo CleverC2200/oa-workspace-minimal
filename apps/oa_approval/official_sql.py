@@ -173,6 +173,7 @@ def confirmed_empty_attachment_fields(data: dict, *, request_id: str, workflow_k
     sources = {
         "general_expense": ("formtable_main_569", {"scfj", "fj", "glfp"}),
         "tpm_small_marketing_fee": ("formtable_main_912", {"fj", "glfp"}),
+        "overseas_invoice": ("formtable_main_1295", {"scfp"}),
     }
     if workflow_key not in sources:
         return {}
@@ -200,8 +201,14 @@ def confirmed_empty_attachment_fields(data: dict, *, request_id: str, workflow_k
             fields = [extracted[f"detail[{table_index}].row[{row_index}].field[{index}]"]
                       for index, field in enumerate(record.get("workflowRequestTableFields") or [])
                       if field.get("fieldName") in codes]
+            if (workflow_key == "overseas_invoice" and len(fields) == 1
+                    and (fields[0]["raw_value"].strip()
+                         or not _attachment_placeholder_html(fields[0]["attachment_html"]))):
+                continue
             if ({field["field_name"] for field in fields} != codes or len(fields) != len(codes)
-                    or any(field["read_status"] != "unresolved" or field["raw_value"].strip() not in (
+                    or any(field["read_status"] not in (
+                               {"empty", "unresolved"} if workflow_key == "overseas_invoice" else {"unresolved"})
+                           or field["raw_value"].strip() not in (
                                {"", "[]"} if workflow_key == "tpm_small_marketing_fee" and field["field_name"] == "fj" else {""})
                            or not _attachment_placeholder_html(field["attachment_html"]) for field in fields)):
                 return {}
