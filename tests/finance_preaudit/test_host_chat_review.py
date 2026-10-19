@@ -1268,3 +1268,70 @@ def test_normal_close_accepts_trusted_expired_request_and_preserves_failure_proo
     material['warnings'] = ['Changed input']
     host.guard.write(action.with_name('material.json'), material)
     assert host.verified_failure(action, failed) is None
+
+
+def test_followup_source_anchor_ignores_nested_exec_text(exchange):
+    action, _, owner, child, _, manifest, _ = exchange
+    parent = child.with_name('parent.jsonl')
+    request = host.publish(action, prompt='Review this frozen action.', timeout_seconds=60)
+    line = native_call(parent, 'collaboration.followup_task',
+                       {'target': '/root/reviewer_0', 'message': str(request)}, 'actual-followup', {})
+    native_call(parent, 'functions.exec',
+                "source_anchor(operation='followup_task') " + owner + ' ' + manifest['run_id'],
+                'nested-source-anchor', {})
+    anchor = host.source_anchor(owner=owner, operation='followup_task', run_id=manifest['run_id'], request_file=request, slot=0)
+    assert anchor == {'source': parent, 'source_line': line}
+    assert host.assign(request, slot=0, owner=owner, run_id=manifest['run_id'], **anchor)['state'] == 'assigned'
+
+
+def test_source_anchor_cli_returns_an_executable_assign_invocation(exchange, capsys):
+    import shlex
+    import sys
+    action, _, owner, child, _, manifest, _ = exchange
+    parent = child.with_name('parent.jsonl')
+    request = host.publish(action, prompt='Review this frozen action.', timeout_seconds=60)
+    native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(request)}, 'cli-followup', {})
+    assert host.main(['--operation', 'source-anchor', '--anchor-operation', 'followup_task',
+                      '--owner-task-id', owner, '--run-id', manifest['run_id'],
+                      '--request-file', str(request), '--slot', '0']) == 0
+    result = json.loads(capsys.readouterr().out)
+    invocation = result['next_invocation']
+    assert invocation['workdir'] == str(runtime_control.PROJECT_ROOT.absolute())
+    command = shlex.split(invocation['cmd'])
+    assert command[:3] == ['/usr/bin/env',
+                           'OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE=' + str(runtime_control.controller_lock_file().absolute()),
+                           'OA_FINANCE_PREAUDIT_STOP_FILE=' + str(runtime_control.stop_file().absolute())]
+    assert command[3:7] == [str(Path(sys.executable).absolute()), '-B', '-m', host.MODULE]
+    assert host.main(command[7:]) == 0
+    assert json.loads(capsys.readouterr().out)['state'] == 'assigned'
+
+
+@pytest.mark.parametrize('damage', ['unpaired', 'wrong_slot', 'wrong_request', 'failed'])
+def test_followup_source_anchor_rejects_incomplete_or_unrelated_dispatch(exchange, damage):
+    action, _, owner, child, _, manifest, _ = exchange
+    parent = child.with_name('parent.jsonl')
+    request = host.publish(action, prompt='Review this frozen action.', timeout_seconds=60)
+    native_call(parent, 'followup_task',
+                {'target': '/root/reviewer_1' if damage == 'wrong_slot' else '/root/reviewer_0',
+                 'message': '/other/request.json' if damage == 'wrong_request' else str(request)},
+                'untrusted-followup', {'error': 'dispatch_failed'} if damage == 'failed' else {})
+    if damage == 'unpaired':
+        lines = parent.read_text().splitlines(keepends=True)
+        parent.write_text(''.join(lines[:-1]))
+    with pytest.raises(ValueError, match='host_review_source_untrusted'):
+        host.source_anchor(owner=owner, operation='followup_task', run_id=manifest['run_id'],
+                           request_file=request, slot=0)
+
+
+def test_heartbeat_cli_returns_pending_snapshot_in_the_same_parent_call(exchange, capsys):
+    action, _, owner, child, _, manifest, _ = exchange
+    parent = child.with_name('parent.jsonl')
+    request = host.publish(action, prompt='Review this frozen action.', timeout_seconds=60)
+    line = native_call(parent, 'functions.exec', 'heartbeat ' + owner, 'snapshot-heartbeat', {})
+    assert host.main(['--operation', 'heartbeat', '--include-pending', '--owner-task-id', owner,
+                      '--run-id', manifest['run_id'], '--source-session-file', str(parent),
+                      '--source-line', str(line)]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result['state'] == 'open'
+    assert result['round']['run_id'] == manifest['run_id']
+    assert [item['request_file'] for item in result['requests']] == [str(request)]
