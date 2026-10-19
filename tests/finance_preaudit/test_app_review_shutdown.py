@@ -309,6 +309,21 @@ def test_cli_shutdown_binds_wait_after_literal_command(exchange, damage):
     assert args['source'].read_bytes() == original
 
 
+@pytest.mark.parametrize('damage', [None, 'extra_wait'])
+def test_cli_shutdown_binds_wait_after_delayed_registration(monkeypatch, request, damage):
+    from datetime import datetime, timedelta
+
+    class EarlierStart(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.now(tz) - timedelta(seconds=2)
+
+    with monkeypatch.context() as clock:
+        clock.setattr(controller_handoff, 'datetime', EarlierStart)
+        delayed_exchange = request.getfixturevalue('exchange')
+    test_cli_shutdown_binds_wait_after_literal_command(delayed_exchange, damage)
+
+
 def test_cli_close_cannot_skip_unified_shutdown_proofs(exchange):
     _, _, owner, *_ = exchange
     with pytest.raises(SystemExit) as error:
