@@ -12,7 +12,21 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 def run_pytest_case(tmp_path: Path, source: str) -> subprocess.CompletedProcess[str]:
     (tmp_path / 'conftest.py').write_bytes((PROJECT_ROOT / 'tests/conftest.py').read_bytes())
     (tmp_path / 'test_case.py').write_text(source, encoding='utf-8')
-    environment = dict(os.environ, PYTHONPATH=str(PROJECT_ROOT),
+    inherited = (
+        'PATH', 'USER', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ',
+        'SYSTEMROOT', 'WINDIR', 'OA_FINANCE_PREAUDIT_STOP_FILE',
+        'OA_FINANCE_PREAUDIT_STOP_REQUESTED', 'OA_FROZEN_WRITER_LOCK_FILE',
+        'OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE', 'OA_APPROVAL_OWNER_TASK_ID',
+        'OA_APPROVAL_RUN_ID', 'OA_APPROVAL_INSTANCE_ID', 'OA_APPROVAL_EXECUTION_OWNERS',
+        'OA_CONTROLLER_EXECUTION_MANIFEST_FILE',
+    )
+    environment = {name: os.environ[name] for name in inherited if name in os.environ}
+    home = tmp_path / 'synthetic-home'
+    home.mkdir(mode=0o700)
+    auth_file = home / 'auth.env'
+    auth_file.touch(mode=0o600)
+    environment.update(HOME=str(home), XDG_CONFIG_HOME=str(home / '.config'),
+                       OA_AUTH_ENV_FILE=str(auth_file), PYTHONPATH=str(PROJECT_ROOT),
                        PYTEST_DISABLE_PLUGIN_AUTOLOAD='1')
     return subprocess.run(
         [sys.executable, '-B', '-m', 'pytest', '-q', '--tb=short',
@@ -114,3 +128,54 @@ def test_local_ipc(tmp_path, monkeypatch):
 ''')
     assert result.returncode == 0, result.stdout + result.stderr
     assert '2 passed' in result.stdout
+
+
+def test_child_collection_uses_synthetic_auth_without_parent_credentials(tmp_path, monkeypatch):
+    parent_home = tmp_path / 'parent-home'
+    parent_home.mkdir()
+    parent_auth = parent_home / 'auth.env'
+    parent_auth.write_text('OA_AUTH_FILE_SENTINEL=parent-file-only\n', encoding='utf-8')
+    parent_auth.chmod(0o600)
+    monkeypatch.setenv('HOME', str(parent_home))
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(parent_home / 'config'))
+    monkeypatch.setenv('CODEX_HOME', str(parent_home / 'codex'))
+    monkeypatch.setenv('OA_AUTH_ENV_FILE', str(parent_auth))
+    for name in ('OA_BASE_URL', 'OA_APP_ID', 'OA_APP_SECRET', 'OA_UID', 'OA_REVIEW_API_KEY',
+                 'OPENAI_API_KEY', 'DEEPSEEK_API_KEY', 'ANTHROPIC_API_KEY', 'CODEX_API_KEY'):
+        monkeypatch.setenv(name, 'synthetic-parent-secret')
+    preserved = {
+        'OA_APPROVAL_OWNER_TASK_ID': '00000000-0000-4000-8000-000000000001',
+        'OA_APPROVAL_RUN_ID': '00000000000040008000000000000002',
+        'OA_APPROVAL_INSTANCE_ID': '00000000000040008000000000000003',
+        'OA_APPROVAL_EXECUTION_OWNERS': '[{"pid":12345,"start_time":"synthetic"}]',
+        'OA_CONTROLLER_EXECUTION_MANIFEST_FILE': str(tmp_path / 'execution.json'),
+        'OA_FINANCE_PREAUDIT_STOP_FILE': str(tmp_path / 'stop.flag'),
+        'OA_FROZEN_WRITER_LOCK_FILE': str(tmp_path / 'writer.lock'),
+        'OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE': str(tmp_path / 'controller.lock'),
+    }
+    for name, value in preserved.items():
+        monkeypatch.setenv(name, value)
+    result = run_pytest_case(tmp_path, '''
+import os
+from pathlib import Path
+from apps.oa_approval import attachments, auth
+
+assert auth.configuration_status() == {'status': 'missing', 'configured': 0, 'required': 4, 'source': 'none'}
+assert 'OA_AUTH_FILE_SENTINEL' not in os.environ
+assert not any(os.environ.get(name) for name in (
+    'OA_BASE_URL', 'OA_APP_ID', 'OA_APP_SECRET', 'OA_UID', 'OA_REVIEW_API_KEY',
+    'OPENAI_API_KEY', 'DEEPSEEK_API_KEY', 'ANTHROPIC_API_KEY', 'CODEX_API_KEY'))
+assert 'CODEX_HOME' not in os.environ
+assert Path.home() != Path(PARENT_HOME)
+assert os.environ['XDG_CONFIG_HOME'] != PARENT_CONFIG
+assert Path(os.environ['OA_AUTH_ENV_FILE']).read_bytes() == b''
+assert Path(os.environ['OA_AUTH_ENV_FILE']).stat().st_mode & 0o777 == 0o600
+assert {name: os.environ.get(name) for name in PRESERVED} == PRESERVED
+
+def test_import_completed():
+    assert attachments.OA_HOST == ''
+'''.replace('PARENT_HOME', repr(str(parent_home))).replace(
+        'PARENT_CONFIG', repr(str(parent_home / 'config'))).replace('PRESERVED', repr(preserved)))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert '1 passed' in result.stdout
+    assert parent_auth.read_text() == 'OA_AUTH_FILE_SENTINEL=parent-file-only\n'
