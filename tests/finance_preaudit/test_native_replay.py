@@ -106,6 +106,102 @@ def test_prepare_freezes_complete_recorded_material_without_exposing_answers(rec
     assert material_file.read_text() == json.dumps(material)
 
 
+@pytest.mark.parametrize('staged', [False, True])
+@pytest.mark.parametrize('relative', [
+    '.agents/skills/oa-finance-preaudit/references/payment-screenshot-exemption.md',
+    'apps/oa_finance_preaudit/codex_review_worker.py',
+])
+def test_prepare_rejects_uncommitted_snapshot_input(recorded_case, staged, relative) -> None:
+    arguments, _, _ = recorded_case
+    source = Path(arguments[arguments.index('--project') + 1])
+    candidate = source / relative
+    candidate.write_text('Uncommitted candidate input\n')
+    if staged:
+        subprocess.run(['git', 'add', str(candidate)], cwd=source, check=True)
+
+    with pytest.raises(RuntimeError, match='source_snapshot_not_committed'):
+        finance_preaudit_native_replay.main(arguments)
+
+    audit = Path(arguments[arguments.index('--audit') + 1])
+    assert not list(audit.rglob('prepare.json'))
+
+
+def test_prepare_rejects_staged_rule_even_when_worktree_matches_head(recorded_case) -> None:
+    arguments, _, _ = recorded_case
+    source = Path(arguments[arguments.index('--project') + 1])
+    rule = source / '.agents/skills/oa-finance-preaudit/references/payment-screenshot-exemption.md'
+    rule.write_text('Staged candidate rule\n')
+    subprocess.run(['git', 'add', str(rule)], cwd=source, check=True)
+    rule.write_text('The current rule\n')
+
+    with pytest.raises(RuntimeError, match='source_snapshot_not_committed'):
+        finance_preaudit_native_replay.main(arguments)
+
+    audit = Path(arguments[arguments.index('--audit') + 1])
+    assert not list(audit.rglob('prepare.json'))
+
+
+def test_prepare_rejects_changed_copy_even_when_source_is_restored(recorded_case, monkeypatch) -> None:
+    arguments, _, _ = recorded_case
+    source = Path(arguments[arguments.index('--project') + 1])
+    rule = source / '.agents/skills/oa-finance-preaudit/references/payment-screenshot-exemption.md'
+    copyfile = shutil.copyfile
+    def changing_copyfile(src, target, *args, **kwargs):
+        if Path(src) != rule:
+            return copyfile(src, target, *args, **kwargs)
+        rule.write_text('Transient uncommitted candidate\n')
+        try:
+            return copyfile(src, target, *args, **kwargs)
+        finally:
+            rule.write_text('The current rule\n')
+    monkeypatch.setattr(shutil, 'copyfile', changing_copyfile)
+
+    with pytest.raises(RuntimeError, match='source_snapshot_not_committed'):
+        finance_preaudit_native_replay.main(arguments)
+
+    assert rule.read_text() == 'The current rule\n'
+    audit = Path(arguments[arguments.index('--audit') + 1])
+    assert not list(audit.rglob('prepare.json'))
+
+
+def test_prepare_ignores_changes_outside_snapshot_and_preserves_prior_label(recorded_case, capsys) -> None:
+    arguments, _, _ = recorded_case
+    source = Path(arguments[arguments.index('--project') + 1])
+    references = source / '.agents/skills/oa-finance-preaudit/references'
+    (references / 'confirmed-feedback.md').write_text('Changed historical answer\n')
+    subprocess.run(['git', 'add', str(references / 'confirmed-feedback.md')], cwd=source, check=True)
+    (source / 'local-notes.txt').write_text('Local notes outside the snapshot\n')
+    (source / 'apps/untracked.py').write_text('UNTRACKED = True\n')
+    assert finance_preaudit_native_replay.main(arguments) == 0
+    prepared = json.loads(capsys.readouterr().out)
+    project = Path(prepared['project_root'])
+    manifest_path = Path(prepared['audit']) / 'prepare.json'
+    first_manifest = json.loads(manifest_path.read_text())
+    first_files = {path: path.read_bytes() for path in project.rglob('*') if path.is_file()}
+    manifest_bytes = manifest_path.read_bytes()
+    assert first_manifest['source_head'] == subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=source).decode().strip()
+    assert all((project / item['path']).read_bytes() == subprocess.check_output(
+        ['git', 'show', first_manifest['source_head'] + ':' + item['path']], cwd=source)
+        for item in first_manifest['source_manifest'])
+    assert not (project / 'local-notes.txt').exists()
+    assert not (project / 'apps/untracked.py').exists()
+    assert not (project / references.relative_to(source) / 'confirmed-feedback.md').exists()
+
+    rule = references / 'payment-screenshot-exemption.md'
+    rule.write_text('The next committed rule\n')
+    subprocess.run(['git', 'add', str(rule)], cwd=source, check=True)
+    subprocess.run(['git', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                    'commit', '--quiet', '-m', 'next fixture rule'], cwd=source, check=True)
+    next_arguments = ['next-version' if arg == 'baseline' else arg for arg in arguments]
+    assert finance_preaudit_native_replay.main(next_arguments) == 0
+    next_prepared = json.loads(capsys.readouterr().out)
+    next_manifest = json.loads((Path(next_prepared['audit']) / 'prepare.json').read_text())
+    assert next_manifest['source_head'] != first_manifest['source_head']
+    assert (Path(next_prepared['project_root']) / rule.relative_to(source)).read_text() == 'The next committed rule\n'
+    assert first_files == {path: path.read_bytes() for path in project.rglob('*') if path.is_file()}
+    assert manifest_path.read_bytes() == manifest_bytes
+
+
 def test_prepare_routes_frozen_travel_material_to_its_eight_review_items(recorded_case, capsys) -> None:
     arguments, material_file, material = recorded_case
     material['workflow_key'] = 'travel_expense'
