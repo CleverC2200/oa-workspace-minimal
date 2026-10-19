@@ -89,6 +89,26 @@ def _read_evidence(path: Path) -> bytes | None:
             os.close(descriptor)
 
 
+def _supervisor_exit_observation(path: Path, receipt: dict) -> dict | None:
+    try:
+        value = _object(_read_evidence(path.with_name("supervisor-exit.json")))
+        code = value.get("wait_returncode")
+        if (set(value) != {"kind", "schema_version", "owner_task_id", "invocation_id",
+                           "supervisor_pid", "wait_returncode", "wait_signal", "observed_at"}
+                or value["kind"] != "preaudit_supervisor_exit_observation"
+                or type(value["schema_version"]) is not int or value["schema_version"] != 1
+                or any(value[key] != receipt.get(key) for key in ("owner_task_id", "invocation_id", "supervisor_pid"))
+                or type(value["supervisor_pid"]) is not int or value["supervisor_pid"] <= 0
+                or type(code) is not int or not -signal.NSIG < code <= 255
+                or (code < 0 and (type(value["wait_signal"]) is not int or value["wait_signal"] != -code))
+                or (code >= 0 and value["wait_signal"] is not None)
+                or not _timestamp(receipt["started_at"]) <= _timestamp(value["observed_at"]) <= datetime.now(timezone.utc)):
+            return None
+        return value
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        return None
+
+
 def _log_evidence(path: Path) -> tuple[dict, bytes | None]:
     """Hash terminal logs in chunks; retain only a bounded stdout candidate."""
     with runtime_control.pinned_directory(path.parent) as parent:
@@ -316,6 +336,9 @@ def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str
         if state in {"starting", "waiting"} and not supervisor_alive:
             report.update(state="supervisor_lost", recorded_state=state,
                           status="blocked", error_code="controller_supervisor_lost")
+            observation = _supervisor_exit_observation(path, receipt)
+            if observation is not None:
+                report["supervisor_exit_observation"] = observation
         elif state in {"starting", "waiting"} and receipt.get("stop_wait_error"):
             report.update(status="blocked", error_code=receipt["stop_wait_error"])
         manifest_path = path.with_name("controller-manifest.json")
@@ -520,9 +543,23 @@ def _supervise_detached(command: Sequence[str], *, directory: Path, owner_task_i
                                           "owner_task_id": owner_task_id, "controller_pid": receipt["controller_pid"]}), flush=True)
                         announced = True
                 if waiter.poll() is not None:
-                    waiter.wait()
+                    code = waiter.wait()
                     receipt = _object(_read_evidence(path))
                     if receipt.get("state") not in {"exited", "start_failed"} or "result" not in receipt:
+                        observation = {"kind": "preaudit_supervisor_exit_observation", "schema_version": 1,
+                            "owner_task_id": owner_task_id, "invocation_id": directory.name,
+                            "supervisor_pid": waiter.pid, "wait_returncode": code,
+                            "wait_signal": -code if code < 0 else None, "observed_at": _now()}
+                        try:
+                            with runtime_control.pinned_directory(directory) as parent:
+                                descriptor = os.open("supervisor-exit.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                                     0o600, dir_fd=parent)
+                            with os.fdopen(descriptor, "wb") as stream:
+                                stream.write((json.dumps(observation, sort_keys=True) + "\n").encode())
+                                stream.flush()
+                                os.fsync(stream.fileno())
+                        except (OSError, RuntimeError):
+                            pass
                         raise ValueError("controller_supervisor_lost")
                     return {**receipt, "receipt_file": str(path)}
                 time.sleep(.1)
