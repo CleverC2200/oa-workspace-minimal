@@ -1,12 +1,12 @@
 # 财务预审实际模型只读回归
 
-需要验证保留的 DeepSeek CLI Worker 判断时，使用 `scripts.finance_preaudit_native_replay`。该入口从已保存材料生成新的 `preview`，调用现有 `codex_review_worker.review`，再通过 `FlowEngine.complete_review` 验证并闭合。它不配置 OA 连接、授权源或提交回调。当前不支持原生 App 的独立 preview 回放。
+验证当前 App 或保留的 DeepSeek CLI 判断时，使用 `scripts.finance_preaudit_native_replay`。该入口从已保存材料生成新的 `preview`，沿冻结的审核传输取得决定，再通过离线 `FlowEngine.complete_review` 闭合。它不配置 OA 连接、授权源或提交回调。
 
 准备时使用历史状态中的 `workflow_key`，保留对应流程的固定审核项；差旅材料不会转成通用费用审核。
 
-每次回放在准备阶段冻结 `OA_REVIEW_PROVIDER` 和 `OA_REVIEW_TRANSPORT` 选择的审核配置。项目默认是 OpenAI 原生 App（`host_chat`）；`--prepare` 可以只读冻结该配置，但本入口的 `--run` 尚未接入其 owner、Controller 注册与原生工具回执合同，因此会在创建运行标记或调用执行器前明确拒绝。不能借用生产轮次，也不能改用已禁止的 OpenAI CLI。
+每次回放在准备阶段冻结 `OA_REVIEW_PROVIDER` 和 `OA_REVIEW_TRANSPORT` 选择的审核配置。项目默认是 OpenAI 原生 App（`host_chat`）。App 的 `--run` 必须提供当前父会话 UUID，并独立登记恰好三个 direct reviewer。每个 label/case 只运行一次，不能借用生产轮次、注入 executor 或改用已禁止的 OpenAI CLI。旧快照未冻结回放入口源码时，使用新 label 重新准备。
 
-需要运行本入口时，准备和运行均显式设置 `OA_REVIEW_PROVIDER=deepseek OA_REVIEW_TRANSPORT=cli`，使用保留的隔离 DeepSeek CLI 配置与独立凭据。入口不会自动切换供应商。默认 App 配置已经准备的快照保持不变；选择 DeepSeek 后必须用新标签重新准备。模型目录纳入准备源码快照。历史 OpenAI 或 App 配置的记录仍可只读 `--verify`；未记录配置的历史回放继续按原 OpenAI/medium 合同验证，这不授予重新执行旧 CLI 的许可。不能以回放闭合代替独立业务验收。
+需要运行保留的 DeepSeek CLI 时，准备和运行均显式设置 `OA_REVIEW_PROVIDER=deepseek OA_REVIEW_TRANSPORT=cli`，使用保留的隔离 DeepSeek CLI 配置与独立凭据。入口不会自动切换供应商。默认 App 配置已经准备的快照保持不变；选择 DeepSeek 后必须用新标签重新准备。模型目录纳入准备源码快照。历史 OpenAI 或 App 配置的记录仍可只读 `--verify`；未记录配置的历史回放继续按原 OpenAI/medium 合同验证，这不授予重新执行旧 CLI 的许可。不能以回放闭合代替独立业务验收。
 
 ## 准备私有输入
 
@@ -60,11 +60,41 @@ python3 -m scripts.finance_preaudit_native_replay \
 
 运行前核对原材料、明确绑定的原状态和原证据指纹。依赖缺失、不可读或变化时返回非零，在私有 `result.json` 留下原因、`review_status=not_started` 和空 attempts，执行器调用为 0；修复输入后使用新 label 重新准备。执行中发生 I/O 失败时，结果保留实际尝试及已返回回执，未知终态继续未知；保存的失败结果同样不能重跑或覆盖。
 
+## 当前 App 只读运行
+
+真实审核需另有明确模型调用授权。准备及离线测试不提供调用额度。先以新的 label 冻结同一候选和完整材料，再由当前父会话启动：
+
+```bash
+OA_REVIEW_PROVIDER=openai OA_REVIEW_TRANSPORT=host_chat \
+python3 -m scripts.finance_preaudit_native_replay \
+  --run --case employee-payment --label candidate-a \
+  --project /absolute/development-project \
+  --inventory /private/local-evidence/cases.json \
+  --audit /private/local-evidence/replay \
+  --owner-task-id CURRENT_PARENT_UUID
+```
+
+入口复用已有监督进程和 lifecycle，在本 case 的私有 `runs/<label>/<case>/control` 下持有租约并记录真实 PID、原执行及退出事实。不启动生产调度，不加载 OA 认证。子进程仅继承必要运行环境及新的只读绑定，清除旧认证、授权和控制环境。准备包、原件和实际执行源码不一致时拒绝启动。
+
+父会话等待原工具返回可续读的 session_id，沿现有 execution 入口绑定该原 session。之后所有登记、读取进度、心跳、派发、草稿提交和收尾调用，都必须显式使用本 case 的私有控制文件：
+
+```bash
+export OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE=/private/local-evidence/replay/runs/candidate-a/employee-payment/control/controller.lock
+export OA_FINANCE_PREAUDIT_STOP_FILE=/private/local-evidence/replay/runs/candidate-a/employee-payment/control/stop.flag
+export OA_FROZEN_WRITER_LOCK_FILE=/private/local-evidence/replay/runs/candidate-a/employee-payment/control/writer.lock
+```
+
+复用[当前 App 登记与原始执行回执](../agents/controller-execution.md)的三个真实子会话、原生父心跳及 assign/submit 来源校验。父会话创建和派发 reviewer，Python 不创建 agent。审核请求只接受本次冻结的唯一 preview action，不能改为受控写入或包装阶段。登记和审核共用本次 `--timeout` 预算，剩余不足一分钟时不开始审核。
+
+相对 Skill 和文档路径以请求声明的冻结项目为根；Python 模块命令使用请求指定的执行源码目录，不能依赖聊天默认 checkout。专用 write-draft 的原生 exec 必须显式传入该 workdir，并等待真实配对工具输出。完成宿主验证同一 request/assignment/source/decision，再由离线 FlowEngine 闭合，保持 `write_state=not_requested`。不要另调生产 Worker 的 complete 入口。
+
+等待原执行真实退出后，按同一收尾入口取得三个 interrupt、list_agents 和原 session 的 terminal wait，再封存该只读轮次。进程退出与 reviewer idle 分别核验。只读失败保留在本 case 的私有目录，不清除生产停止门，也不自动重跑。App 实际模型名和 Token 用量无法观测时保持 `unknown`。
+
 ## 核对结果
 
 成功闭合需要 `preview_closed_no_write=true`、`write_state=not_requested`、原材料哈希未变。`business_state=needs_human` 可以是有效结果；逐项对照私有预期，保留真实缺材料、付款归属不明、未支付、退款和金额差额等异常。
 
-`execution_transport=native` 表示本入口调用保留的 DeepSeek CLI 原生执行器，不表示原生 App 回放。离线测试注入记录执行器时标为 `recorded`，不作为实际模型验收。源码改变后用新 label 重新准备，不修改正在运行或已冻结的快照。回归结果不授权重写 OA 意见、上线或恢复生产。
+`execution_transport=native` 必须同时核对冻结配置和对应原生来源。App 验收要求已封存的三槽登记、派发、专用草稿、原工具退出及无写闭合回执；单独这个字段不能证明原生执行。离线测试注入记录执行器时标为 `recorded`，不作为实际模型验收。源码改变后用新 label 重新准备，不修改正在运行或已冻结的快照。回归结果不授权重写 OA 意见、上线或恢复生产。
 
 ### 独立业务验收检查
 
