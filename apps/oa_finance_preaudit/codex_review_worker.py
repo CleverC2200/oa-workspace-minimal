@@ -547,7 +547,7 @@ def _prompt(action_file: Path) -> str:
         and frozen_rule_version == "small_marketing_fee:2"
         else "最终只输出符合 flow-engine-contract“结构化审核决定”的单个 JSON 对象。"
     )
-    return f"""你是{workflow_name}生产预审的单据工作进程。用户当前明确授权本轮真实审批提交；这是受控生产工作进程，不是手工 preview。
+    return f"""你是{workflow_name}预审的单据审核者。你只读取当前冻结材料并返回结构化决定，不执行 OA 写入。宿主按冻结动作的 mode 和实际授权门处理后续步骤；preview 仅生成预览，不提交 OA。
 
 只处理这个已冻结动作：{action_file}
 {fallback_routing}
@@ -557,7 +557,7 @@ def _prompt(action_file: Path) -> str:
 1. 附件读取按 `docs/agents/attachment-recognition.md` 调用本地 DeepSeek HTTP API 工具，可传自定义问题；先完整覆盖当前单附件，再按需对单页定向复读。只读取文本回答及其逐页来源，不通过看图工具或附件上传把原文件传入本审核会话。完整读取项目 `.agents/skills/oa-finance-preaudit/SKILL.md`，按其路由读取 `references/result-contract.md`、`references/observation-contract.md`、`{rule_reference}`，完整读取 `references/payment-screenshot-exemption.md`，再读取动作引用的审核包、材料和准备页；{workflow_requirement}{frozen_item_requirement}不得读取其他 attempt。
 2. 不修改任何文件、项目代码、Skill、配置、授权清单或冻结材料；不得调用 `next-action`、`complete-review` 或任何 OA 写入，不得领取其他单据；不得读取现有审核决定、意见或 `review-output-*.txt` 失败原输出。
 3. 根据审核包中的固定审核项动态形成结构化决定。证据不足使用 `uncertain` 交财务判断，不得因为材料缺口卡住业务流程；身份、归属、冻结或授权不可信时停止。自动读取失败、材料全空或旧降级审核包须停止当前单据，不生成可提交决定。`collection_gaps` 不证明申请人未填写、未上传或没有发票；按 FlowEngine 合同保留技术失败。
-4. {_OPINION_BREVITY_REQUIREMENT}结论内保留规则要求的具体金额、实际公司全称等必要业务原值；不得输出密钥、凭据或无关附件原文。宿主会校验并负责受控提交。
+4. {_OPINION_BREVITY_REQUIREMENT}结论内保留规则要求的具体金额、实际公司全称等必要业务原值；不得输出密钥、凭据或无关附件原文。宿主会校验决定。
 
 5. {output_requirement}JSON 之外不添加 Markdown、解释、日志或额外意见正文。
 """
