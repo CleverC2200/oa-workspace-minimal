@@ -759,7 +759,8 @@ def _read_daily_metric(path: Path) -> dict:
     }
     if (
         not isinstance(payload, dict)
-        or set(payload) not in (required_fields, required_fields | {"prior_fingerprints"})
+        or not required_fields <= set(payload)
+        or set(payload) - required_fields - {"prior_fingerprints", "outcome_sources"}
         or payload.get("schema_version") != SCHEMA_VERSION
         or payload.get("kind") != "preaudit_daily_metric"
         or payload.get("day") != path.stem
@@ -778,6 +779,24 @@ def _read_daily_metric(path: Path) -> dict:
         raise ValueError("runtime_state_invalid")
     _timestamp(payload.get("generated_at"))
     payload["metrics"] = _validate_daily_rollup(payload.get("metrics"))
+    if "outcome_sources" in payload:
+        sources = payload["outcome_sources"]
+        if not isinstance(sources, dict):
+            raise ValueError("runtime_state_invalid")
+        for key, source in sources.items():
+            if (
+                not isinstance(key, str)
+                or re.fullmatch(r"[0-9a-f]{64}", key) is None
+                or not isinstance(source, dict)
+                or set(source) != {"workflow_key", "metrics"}
+                or not isinstance(source["workflow_key"], str)
+                or source["workflow_key"] not in _WORKFLOW_KEYS
+            ):
+                raise ValueError("runtime_state_invalid")
+            if _validate_outcome_metrics(source["metrics"])["attempt_count"] != 1:
+                raise ValueError("runtime_state_invalid")
+        if _source_outcomes(sources) != payload["metrics"]["outcomes"]:
+            raise ValueError("runtime_state_invalid")
     return payload
 
 
@@ -800,6 +819,24 @@ def _daily_outcomes(cases: list[dict]) -> dict:
             if samples
         },
     }
+
+
+def _source_outcomes(sources: dict) -> dict:
+    by_flow: dict[str, dict] = {}
+    overall = _empty_outcome_metrics()
+    for source in sources.values():
+        flow = by_flow.setdefault(source["workflow_key"], _empty_outcome_metrics())
+        for target in (overall, flow):
+            for field, value in source["metrics"].items():
+                if field == "evidence_status":
+                    if value == "unknown":
+                        target[field] = "unknown"
+                elif isinstance(value, dict):
+                    for key, count in value.items():
+                        target[field][key] += count
+                else:
+                    target[field] += value
+    return {"overall": overall, "by_flow": dict(sorted(by_flow.items()))}
 
 
 def _late_daily_outcomes_are_additive(
@@ -881,6 +918,17 @@ def _daily_payloads(root: Path, *, now: datetime) -> dict[Path, dict]:
             continue
         day_entries = cases_by_day.get(day, [])
         day_cases = [metric for metric, _state_path in day_entries]
+        sources = {
+            hashlib.sha256(
+                f"{metric['workflow_key']}\x1f{metric['item_key']}".encode("utf-8")
+            ).hexdigest(): {
+                "workflow_key": metric["workflow_key"],
+                "metrics": _aggregate_case_metrics([metric]),
+            }
+            for metric in day_cases
+        }
+        if len(sources) != len(day_cases):
+            raise ValueError("runtime_state_identity_invalid")
         metrics = {
             "observability": operational,
             "outcomes": _daily_outcomes(day_cases),
@@ -892,6 +940,7 @@ def _daily_payloads(root: Path, *, now: datetime) -> dict[Path, dict]:
             "day": day,
             "generated_at": now.isoformat(),
             "metrics": metrics,
+            "outcome_sources": sources,
         }
         if target.is_symlink():
             raise ValueError("runtime_path_symlink")
@@ -901,9 +950,28 @@ def _daily_payloads(root: Path, *, now: datetime) -> dict[Path, dict]:
                 "event_count"
             ]
             current_count = metrics["observability"]["overall"]["event_count"]
+            prior_sources = existing.get("outcome_sources")
+            if prior_sources is not None:
+                if any(
+                    key in prior_sources and prior_sources[key] != source
+                    for key, source in sources.items()
+                ):
+                    raise ValueError("daily_metric_conflict")
+                sources = {**prior_sources, **sources}
+                payload["outcome_sources"] = sources
+                metrics["outcomes"] = _source_outcomes(sources)
+            elif (
+                existing["metrics"]["outcomes"] == metrics["outcomes"]
+                and any(
+                    datetime.fromtimestamp(state_path.stat().st_mtime, tz=timezone.utc)
+                    > _timestamp(existing["generated_at"])
+                    for _metric, state_path in day_entries
+                )
+            ):
+                raise ValueError("daily_metric_conflict")
             if existing_count > current_count:
-                continue
-            if existing["metrics"] == metrics:
+                metrics["observability"] = existing["metrics"]["observability"]
+            if existing["metrics"] == metrics and prior_sources is not None:
                 continue
             if (
                 existing_count == current_count
@@ -912,6 +980,7 @@ def _daily_payloads(root: Path, *, now: datetime) -> dict[Path, dict]:
                 raise ValueError("daily_metric_conflict")
             if (
                 existing["metrics"]["outcomes"] != metrics["outcomes"]
+                and prior_sources is None
                 and not _late_daily_outcomes_are_additive(
                     existing, metrics, day_entries,
                     same_event_count=existing_count == current_count,
