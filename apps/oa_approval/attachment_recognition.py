@@ -201,6 +201,20 @@ def _open_image(raw: bytes):
     return image
 
 
+def _png_crop(image, box) -> bytes:
+    try:
+        with image.crop(box) as tile:
+            encoded = BytesIO()
+            if tile.mode == 'CMYK':
+                with tile.convert('RGB') as rgb:
+                    rgb.save(encoded, format='PNG')
+            else:
+                tile.save(encoded, format='PNG')
+    except OSError:
+        raise ValueError('attachment_image_invalid') from None
+    return encoded.getvalue()
+
+
 def _image_tiles(raw: bytes):
     image = _open_image(raw)
     with image:
@@ -214,17 +228,7 @@ def _image_tiles(raw: bytes):
             x0, y0, x1, y1 = box
             width, height = x1 - x0, y1 - y0
             if max(width, height) <= MAX_IMAGE_DIMENSION:
-                try:
-                    with image.crop(box) as tile:
-                        encoded = BytesIO()
-                        if tile.mode == 'CMYK':
-                            with tile.convert('RGB') as rgb:
-                                rgb.save(encoded, format='PNG')
-                        else:
-                            tile.save(encoded, format='PNG')
-                except OSError:
-                    raise ValueError('attachment_image_invalid') from None
-                encoded = encoded.getvalue()
+                encoded = _png_crop(image, box)
                 if len(encoded) <= MAX_FILE_BYTES:
                     yield box, _image_block(encoded)
                     return
@@ -331,9 +335,20 @@ def _retention_binding(root: Path, *, action_file: Path | None, files: list[Path
 
 def recognize(*, files: list[Path] | None = None, action_file: Path | None = None,
               prompt: str = DEFAULT_PROMPT, output_dir: Path | None = None,
-              timeout_seconds: float = 90, budget_seconds: float = 1800) -> dict:
+              timeout_seconds: float = 90, budget_seconds: float = 1800,
+              region: list[int] | tuple[int, int, int, int] | None = None) -> dict:
     if bool(files) == bool(action_file) or not isinstance(prompt, str) or not prompt.strip():
         raise ValueError('attachment_recognition_input_invalid')
+    if region is not None:
+        if action_file is not None or not files or len(files) != 1:
+            raise ValueError('attachment_region_source_invalid')
+        if (not isinstance(region, (list, tuple)) or len(region) != 4
+                or any(type(value) is not int for value in region)):
+            raise ValueError('attachment_region_invalid')
+        x0, y0, x1, y1 = region
+        if (not 0 <= x0 < x1 or not 0 <= y0 < y1
+                or max(x1 - x0, y1 - y0) > MAX_IMAGE_DIMENSION):
+            raise ValueError('attachment_region_invalid')
     if not 0 < timeout_seconds <= 300 or not 0 < budget_seconds <= 3600:
         raise ValueError('attachment_recognition_timeout_invalid')
     key = _api_key()
@@ -363,6 +378,8 @@ def recognize(*, files: list[Path] | None = None, action_file: Path | None = Non
               'created_at': datetime.now(timezone.utc).isoformat(), 'completed_at': None,
               'retention': _retention_binding(flow_root, action_file=action_file, files=files or []),
               'report_file': str(report_file), 'parts': [], 'sources': []}
+    if region is not None:
+        report.update(coverage='image_region', region=list(region))
     deadline = time.monotonic() + budget_seconds
     cache = {}
     current = None
@@ -395,7 +412,12 @@ def recognize(*, files: list[Path] | None = None, action_file: Path | None = Non
                 attachments.append(source)
             native = [item for item in attachments if Path(item['path']).suffix.lower() not in {
                 '.txt', '.md', '.csv', '.tsv', '.json', '.log', '.yaml', '.yml', '.gif'}]
-            images, manifest, structured = attachment_extractors.prepare_materials(native, out_dir=output_dir / 'prepared')
+            if region is not None:
+                images = [{**item, 'content_sha256': item['sha256'], 'kind': 'image'} for item in attachments]
+                manifest, structured = [], []
+                native = attachments
+            else:
+                images, manifest, structured = attachment_extractors.prepare_materials(native, out_dir=output_dir / 'prepared')
             for item in attachments:
                 if item in native:
                     continue
@@ -407,7 +429,8 @@ def recognize(*, files: list[Path] | None = None, action_file: Path | None = Non
             prepared = {'images': images, 'manifest': manifest, 'structured_contents': structured}
         _validate_prepared(prepared, frozen=action_file is not None)
         report['skipped_sources'] = attachment_extractors.skipped_video_sources(prepared.get('manifest', []))
-        report['coverage'] = 'non_video_only' if report['skipped_sources'] else 'all_prepared_content'
+        if region is None:
+            report['coverage'] = 'non_video_only' if report['skipped_sources'] else 'all_prepared_content'
         save()
         for current, source in _parts(prepared):
             if time.monotonic() >= deadline:
@@ -417,7 +440,19 @@ def recognize(*, files: list[Path] | None = None, action_file: Path | None = Non
                 digest = _digest(raw)
                 if source.get('content_sha256') and digest != source['content_sha256']:
                     raise ValueError('attachment_page_changed')
-                blocks = _image_tiles(raw)
+                if region is not None:
+                    current.update(region=list(region), content_sha256=digest)
+                    with _open_image(raw) as original:
+                        current['source_image_size'] = list(original.size)
+                        if original.format not in {'JPEG', 'PNG', 'WEBP', 'GIF'} or getattr(original, 'n_frames', 1) != 1:
+                            raise ValueError('attachment_region_source_invalid')
+                        if region[2] > original.width or region[3] > original.height:
+                            raise ValueError('attachment_region_out_of_bounds')
+                        encoded = _png_crop(original, region)
+                    current['region_png_sha256'] = _digest(encoded)
+                    blocks = [(region, _image_block(encoded))]
+                else:
+                    blocks = _image_tiles(raw)
             else:
                 digest = _digest(source.encode())
                 blocks = [(None, {'type': 'text', 'text': source})]
@@ -437,7 +472,9 @@ def recognize(*, files: list[Path] | None = None, action_file: Path | None = Non
                     if time.monotonic() >= deadline:
                         raise ValueError('attachment_recognition_budget_exhausted')
                     question = prompt
-                    if box is not None:
+                    if region is not None:
+                        question += f'\n仅覆盖指定区域，原图像素坐标 {list(box)}。不代表整图或整单读取完成。'
+                    elif box is not None:
                         question += f'\n当前为同一原图的无缩放分区，像素坐标 {list(box)}，相邻分区有重叠。仅读取本分区可见内容。'
                     body = {'model': MODEL, 'stream': False, 'max_tokens': 8192,
                             'thinking': {'type': 'disabled'},
@@ -451,10 +488,14 @@ def recognize(*, files: list[Path] | None = None, action_file: Path | None = Non
                         report['failed_response'] = _response_diagnostic(response)
                         raise
                     if box is not None:
-                        tiles.append({'box': list(box), 'answer': answer, 'usage': usage})
+                        tile = {'box': list(box), 'answer': answer, 'usage': usage}
+                        if region is not None:
+                            tile['png_sha256'] = current['region_png_sha256']
+                        tiles.append(tile)
                 if tiles:
                     current.pop('failed_tile_box', None)
-                    answer = '以下分区属于同一原图，重叠内容不代表多笔或多份证据。\n\n'
+                    answer = ('以下回答仅覆盖指定区域，不代表整图或整单读取完成。\n\n' if region is not None
+                              else '以下分区属于同一原图，重叠内容不代表多笔或多份证据。\n\n')
                     answer += '\n\n'.join(f'分区 {t["box"]}：\n{t["answer"]}' for t in tiles)
                     usage = {name: sum(t['usage'][name] for t in tiles)
                              for name in ('prompt_tokens', 'completion_tokens', 'total_tokens')
@@ -494,6 +535,7 @@ def main(argv=None) -> int:
     parser.add_argument('--output-dir', type=Path)
     parser.add_argument('--timeout-seconds', type=float, default=90)
     parser.add_argument('--budget-seconds', type=float, default=1800)
+    parser.add_argument('--region', type=int, nargs=4, metavar=('X0', 'Y0', 'X1', 'Y1'))
     args = parser.parse_args(argv)
     try:
         report = recognize(**vars(args))
@@ -502,7 +544,7 @@ def main(argv=None) -> int:
                             'coverage': report.get('coverage'), 'error_code': report.get('error_code')}, ensure_ascii=False))
         return 0 if report['status'] in {'complete', 'skipped'} else 1
     except (OSError, ValueError) as error:
-        code = str(error) if str(error) in {'attachment_api_key_missing', 'attachment_recognition_input_invalid', 'attachment_recognition_timeout_invalid', 'attachment_output_inside_frozen_attempt'} else 'attachment_recognition_start_failed'
+        code = str(error) if str(error) in {'attachment_api_key_missing', 'attachment_recognition_input_invalid', 'attachment_recognition_timeout_invalid', 'attachment_output_inside_frozen_attempt', 'attachment_region_invalid', 'attachment_region_source_invalid'} else 'attachment_recognition_start_failed'
         print(json.dumps({'status': 'failed', 'error_code': code}))
         return 1
 
