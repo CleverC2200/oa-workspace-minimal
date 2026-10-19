@@ -157,6 +157,18 @@ def test_app_preview_closes_one_frozen_case_through_native_exchange(app_case, tm
         capsys.readouterr()
         assert replay.main(verify_arguments) == 0
         assert json.loads(capsys.readouterr().out)['business_acceptance'] == 'accepted'
+        receipt_file = Path(json.loads((audit / 'closure.json').read_text())['receipt_file'])
+        receipt_bytes = receipt_file.read_bytes()
+        changed_receipt = json.loads(receipt_bytes)
+        changed_receipt['decision_fingerprint'] = 'sha256:' + '0' * 64
+        receipt_file.write_text(json.dumps(changed_receipt))
+        try:
+            assert replay.main(verify_arguments) == 1
+            assert any(item.startswith('app_native_source_unverified:')
+                       for item in json.loads(capsys.readouterr().out)['findings'])
+        finally:
+            receipt_file.write_bytes(receipt_bytes)
+        capsys.readouterr()
         private_binding.unlink()
         assert replay.main(verify_arguments) == 1
         capsys.readouterr()

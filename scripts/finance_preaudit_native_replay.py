@@ -448,11 +448,10 @@ def verify_app_source(audit, manifest, result, closure):
                 or submitted['decision'] != read(closure['decision_file'])
                 or read(audit / 'worker-result.json')['host_receipt'] != proof):
             raise ValueError('app_preview_decision_mismatch')
-        receipt = read(closure['receipt_file'])
-        if (receipt.get('no_write_evidence') != 'confirmed_no_write'
-                or receipt.get('write_state') != 'not_requested'
-                or any(receipt.get(field) is not False for field in ('write', 'submit_ok', 'done_hit', 'postcheck_done_hit'))):
+        state = read(closure['state_file'])
+        if state.get('mode') != 'preview' or state.get('write_authorized') is not False:
             raise ValueError('app_preview_write_receipt_invalid')
+        engine_for(Path(manifest['engine_root']))._completion_receipt(Path(manifest['action_file']).parent, state)
 
 
 def verify(args):
