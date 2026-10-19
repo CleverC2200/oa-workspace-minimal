@@ -1612,11 +1612,16 @@ def test_crash_after_postcheck_or_close_without_receipt_never_retries_write(
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("boundary", ["receipt_persisted", "closed_state_persisted"])
+@pytest.mark.parametrize("boundary,recovery_entry", [
+    ("receipt_persisted", "next_action"),
+    ("receipt_persisted", "complete_review"),
+    ("closed_state_persisted", "complete_review"),
+])
 def test_preview_receipt_recovers_closed_without_repeating_review(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     boundary: str,
+    recovery_entry: str,
 ) -> None:
     clock = Mock(wraps=datetime)
     clock.now.return_value = datetime(2026, 8, 22, tzinfo=timezone.utc)
@@ -1650,7 +1655,13 @@ def test_preview_receipt_recovers_closed_without_repeating_review(
         engine.complete_review(Path(action["action_file"]), decision_file)
 
     action_path = Path(action["action_file"])
-    preserved = [action_path, action_path.with_name("execution-receipt.json"), Path(action["events_file"])]
+    preserved = [
+        action_path, Path(action["events_file"]),
+        *(action_path.with_name(name) for name in (
+            "execution-receipt.json", "review-decision.json", "remark.txt",
+            "submission-envelope.json",
+        )),
+    ]
     if boundary == "closed_state_persisted":
         preserved.append(Path(action["state_file"]))
     before = {path: path.read_bytes() for path in preserved}
@@ -1658,7 +1669,7 @@ def test_preview_receipt_recovers_closed_without_repeating_review(
     assert len([event for event in events if event["event_id"] == "03-review"]) == 1
     clock.now.return_value += timedelta(seconds=1)
     restarted = _engine(tmp_path)
-    recovered = (restarted.next_action("travel_expense") if boundary == "receipt_persisted"
+    recovered = (restarted.next_action("travel_expense") if recovery_entry == "next_action"
                  else restarted.complete_review(action_path, decision_file))
 
     assert recovered["action"] == "closed"
@@ -1666,6 +1677,61 @@ def test_preview_receipt_recovers_closed_without_repeating_review(
     assert recovered["no_write_evidence"] == "confirmed_no_write"
     assert len(list(Path(action["action_file"]).parent.parent.glob("attempt-*"))) == 1
     assert {path: path.read_bytes() for path in preserved} == before
+
+
+@pytest.mark.parametrize("mutation", ["decision", "identity", "receipt", "no_write"])
+def test_preview_receipt_checkpoint_keeps_decision_and_no_write_guards(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    engine = _engine(tmp_path)
+    action = engine.next_action("travel_expense")
+    action_path = Path(action["action_file"])
+    decision_file = tmp_path / "decision.json"
+    decision = _decision(action)
+    json_artifact.write_json_atomic(decision_file, decision)
+    original_write = json_artifact.write_json_atomic
+
+    def crash_after_receipt(path: Path, payload: object, *args, **kwargs) -> None:
+        original_write(path, payload, *args, **kwargs)
+        if Path(path).name == "execution-receipt.json":
+            raise SystemExit("receipt_persisted")
+
+    monkeypatch.setattr(json_artifact, "write_json_atomic", crash_after_receipt)
+    with pytest.raises(SystemExit, match="receipt_persisted"):
+        engine.complete_review(action_path, decision_file)
+    monkeypatch.setattr(json_artifact, "write_json_atomic", original_write)
+    receipt_file = action_path.with_name("execution-receipt.json")
+    if mutation in {"decision", "identity"}:
+        if mutation == "decision":
+            decision = _decision(action, conclusion="冲突的审核结论。")
+        else:
+            decision["action_token"] = "different-action-token"
+        json_artifact.write_json_atomic(decision_file, decision)
+    else:
+        receipt = json.loads(receipt_file.read_text(encoding="utf-8"))
+        if mutation == "receipt":
+            receipt["case_key"] = "different-case"
+        else:
+            receipt.pop("no_write_evidence")
+        json_artifact.write_json_atomic(receipt_file, receipt)
+    before = {path: path.read_bytes() for path in (
+        receipt_file, action_path.with_name("review-decision.json"),
+        Path(action["events_file"]),
+    )}
+
+    if mutation in {"decision", "identity"}:
+        with pytest.raises(ValueError, match="review_decision_conflict"):
+            _engine(tmp_path).complete_review(action_path, decision_file)
+    else:
+        blocked = _engine(tmp_path).complete_review(action_path, decision_file)
+        assert blocked["action"] == "needs_admin"
+        assert blocked["reason"] == (
+            "confirmed_no_write_missing" if mutation == "no_write"
+            else "execution_receipt_invalid"
+        )
+    assert {path: path.read_bytes() for path in before} == before
 
 
 def test_unknown_recovery_does_not_depend_on_candidate_discovery(

@@ -4424,6 +4424,10 @@ class FlowEngine:
         if (
             persisted_action.get("action") == "closed"
             or (
+                persisted_state.get("mode") == "preview"
+                and os.path.lexists(action_path.with_name("execution-receipt.json"))
+            )
+            or (
                 recovered_submission_result is None
                 and persisted_state.get("write_state") in {"submitting", "unknown"}
             )
