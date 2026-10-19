@@ -98,8 +98,23 @@ def test_cancelled_round_reuses_frozen_attempt_without_overwriting_old_request(e
     old_source = draft_source(child, old_request, draft, owner)
     host.close(owner=owner, reason='cancelled')
     controller_handoff.finish(manifest, status='failed', children_reaped=True, health='degraded')
+    from tests.finance_preaudit.test_app_review_shutdown import proofs
+    from apps.oa_finance_preaudit import app_review_shutdown
+    app_review_shutdown.begin(owner=owner, reason='cancelled')
+    execution = seal_execution(owner, manifest)
+    receipt = json.loads(execution.read_text())
+    receipt.update(result='blocked', controller_state='failed', exit_code=1)
+    host.guard.write(execution, receipt)
+    app_review_shutdown.finish(owner=owner, **proofs(owner, child, exit_code=1))
     assert runtime_control.clear_cycle_stop()
+    original_home = Path(os.environ['CODEX_HOME'])
     new_owner, parent, reviewers = native_sessions(tmp_path / 'next-round', monkeypatch)
+    shared_sources = original_home / 'sessions/next-round'
+    parent.parent.rename(shared_sources)
+    parent = shared_sources / parent.name
+    for reviewer in reviewers:
+        reviewer['session_file'] = str(shared_sources / Path(reviewer['session_file']).name)
+    monkeypatch.setenv('CODEX_HOME', str(original_home))
     monkeypatch.setenv(host.guard.OWNER_ENV, new_owner)
     monkeypatch.setattr(controller_handoff, 'CONTROLLER_INSTANCE_ID', uuid4().hex)
     current = controller_handoff.begin({'review_configuration': host.IDENTITY})

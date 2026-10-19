@@ -10,6 +10,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import signal
 import time
 
 from apps.oa_approval import runtime_control
@@ -259,3 +260,162 @@ def finish(*, owner: str, source: Path, interrupt_lines: list[int], status_line:
         current['shutdown'] = {**plan, 'status': 'verified', 'verified_at': time.time(), 'receipt': receipt}
         host.guard.write(path, current)
     return receipt
+
+
+def _unregistered_proofs(*, owner: str, reviewers: list[dict], source: Path, receipt_file: Path,
+                         invocation_id: str, tool_session_id: str, interrupt_lines: list[int],
+                         status_line: int, wait_line: int, require_idle: bool = True) -> dict:
+    from scripts import finance_preaudit_run as runner
+    from . import approval_lifecycle
+    binding = {'receipt_file': str(receipt_file.absolute()), 'owner_task_id': owner,
+               'invocation_id': invocation_id, 'tool_session_id': tool_session_id}
+    report = runner.read_execution(**binding)
+    raw, execution = host._read(receipt_file)
+    manifest_raw, manifest = host._read(receipt_file.with_name('controller-manifest.json'))
+    started = runner._timestamp(execution['started_at']).timestamp()
+    completed = runner._timestamp(execution['completed_at']).timestamp()
+    if (report['state'] != 'exited' or report.get('controller_state') != 'failed'
+            or report.get('children_reaped') is not True or type(report.get('exit_code')) is not int
+            or not -signal.NSIG < report['exit_code'] <= 255
+            or execution.get('exit_signal') != (-report['exit_code'] if report['exit_code'] < 0 else None)
+            or execution.get('review_configuration') != host.IDENTITY
+            or not started <= runner._timestamp(manifest['started_at']).timestamp()
+            <= runner._timestamp(manifest['completed_at']).timestamp() <= completed <= time.time()
+            or (require_idle and (runtime_control.writer_active() or runtime_control.active_request_writers()))
+            or host.guard.group_alive(execution['process_group_id'])
+            or not host.guard._valid_identity(execution.get('supervisor_process'))
+            or host.guard.process_identity(execution['supervisor_process']['pid']) == execution['supervisor_process']
+            or host.registry_file(owner, report['run_id']).exists()
+            or (host.registry_file(owner, legacy=True).exists()
+                and host._read(host.registry_file(owner, legacy=True))[1].get('run_id') == report['run_id'])):
+        raise ValueError('host_review_unregistered_shutdown_incomplete')
+    registered = host._reviewers(reviewers, owner, source)
+    value = {'reviewers': registered}
+    if len(interrupt_lines) != 3 or len(set(interrupt_lines)) != 3:
+        raise ValueError('host_review_shutdown_three_interrupts_required')
+    stops = []
+    stopped_at = []
+    for reviewer, line in zip(registered, interrupt_lines):
+        spawn, _ = _source(value, owner, source, reviewer['spawn_source']['line'], earliest=started)
+        spawn_at = datetime.fromisoformat(spawn['timestamp'].replace('Z', '+00:00')).timestamp()
+        anchor, proof = _source(value, owner, source, line, earliest=spawn_at)
+        arguments = host._tool(anchor, 'interrupt_agent')
+        previous = proof.pop('output')
+        if (line <= reviewer['spawn_source']['output_line'] or arguments != {'target': reviewer['agent_path']}
+                or not isinstance(previous, dict) or set(previous) != {'previous_status'}):
+            raise ValueError('host_review_shutdown_interrupt_untrusted')
+        host._native_agent_status(previous['previous_status'])
+        stops.append(proof)
+        stopped_at.append(datetime.fromisoformat(anchor['timestamp'].replace('Z', '+00:00')).timestamp())
+    anchor, statuses = _source(value, owner, source, status_line, earliest=started)
+    host._tool(anchor, 'list_agents')
+    if (status_line <= max(item['output_line'] for item in stops)
+            or datetime.fromisoformat(anchor['timestamp'].replace('Z', '+00:00')).timestamp() < max(stopped_at)):
+        raise ValueError('host_review_stale_source')
+    statuses['reviewers'] = _idle_reviewers(value, statuses.pop('output'))
+    anchor, wait = _source(value, owner, source, wait_line, earliest=completed)
+    exit_result = _wait_result(anchor, wait.pop('output'), tool_session_id)
+    if exit_result['exit_code'] != report['exit_code']:
+        raise ValueError('host_review_shutdown_wait_untrusted')
+    progress = approval_lifecycle._progress(manifest)
+    if (progress is None or progress['actions'] or progress['phase_deadlines'] or progress['writer_active']
+            or not started <= progress['heartbeat_at'] <= completed):
+        raise ValueError('host_review_unregistered_work_detected')
+    progress_path = approval_lifecycle.run_directory(manifest['run_id']) / 'progress.json'
+    progress_raw = host._read(progress_path)[0]
+    logs, payload = {}, None
+    for name in ('stdout.log', 'stderr.log'):
+        fingerprint, content = runner._log_evidence(receipt_file.with_name(name))
+        logs[name] = fingerprint
+        if name == 'stdout.log':
+            payload = runner._object(content)
+    if (payload.get('kind') != 'preaudit_production_rolling_drain' or payload.get('status') != 'failed'
+            or any(type(payload.get(key)) is not int or payload[key] != 0
+                   for key in ('completed', 'process_attempts', 'peak_active'))
+            or type(payload.get('prepare_active_seconds')) not in {int, float} or payload['prepare_active_seconds'] != 0
+            or payload.get('processes_reaped') is not True
+            or type(payload.get('pipeline', {}).get('writer', {}).get('max_concurrency')) is not int
+            or payload['pipeline']['writer']['max_concurrency'] != 0):
+        raise ValueError('host_review_unregistered_work_detected')
+    return {'kind': 'preaudit_app_unregistered_shutdown', 'status': 'verified', 'owner_task_id': owner,
+            'run_id': manifest['run_id'], 'controller_instance_id': manifest['controller_instance_id'],
+            'original_execution': binding, 'reviewers': registered,
+            'interrupt_sources': stops, 'children_source': statuses, 'driver_wait_source': wait,
+            'driver_exit_code': report['exit_code'], 'children_reaped': True, 'writer_active': False,
+            'no_actions_or_writes': True, 'execution_sha256': hashlib.sha256(raw).hexdigest(),
+            'manifest_sha256': hashlib.sha256(manifest_raw).hexdigest(),
+            'progress_sha256': hashlib.sha256(progress_raw).hexdigest(), 'output_files': logs}
+
+
+def sealed_unregistered(receipt_file: Path) -> dict:
+    _, saved = host._read(receipt_file.with_name('pre-registration-shutdown.json'))
+    try:
+        binding = saved['original_execution']
+        if binding['receipt_file'] != str(receipt_file.absolute()):
+            raise ValueError('host_review_unregistered_shutdown_incomplete')
+        expected = _unregistered_proofs(owner=binding['owner_task_id'],
+            reviewers=[{'session_file': item['child_source']['session_file'], 'spawn_line': item['spawn_source']['line']}
+                       for item in saved['reviewers']],
+            source=Path(saved['children_source']['session_file']), receipt_file=receipt_file,
+            invocation_id=binding['invocation_id'], tool_session_id=binding['tool_session_id'],
+            interrupt_lines=[item['line'] for item in saved['interrupt_sources']],
+            status_line=saved['children_source']['line'], wait_line=saved['driver_wait_source']['line'], require_idle=False)
+        if saved != expected:
+            raise ValueError('host_review_unregistered_shutdown_incomplete')
+    except (KeyError, TypeError) as error:
+        raise ValueError('host_review_unregistered_shutdown_incomplete') from error
+    return saved
+
+
+def finish_unregistered(*, owner: str, reviewers: list[dict], source: Path, receipt_file: Path,
+                        invocation_id: str, tool_session_id: str, interrupt_lines: list[int],
+                        status_line: int, wait_line: int) -> dict:
+    with host._registration_lease(owner):
+        expected = _unregistered_proofs(owner=owner, reviewers=reviewers, source=source, receipt_file=receipt_file,
+            invocation_id=invocation_id, tool_session_id=tool_session_id, interrupt_lines=interrupt_lines,
+            status_line=status_line, wait_line=wait_line)
+        path = receipt_file.with_name('pre-registration-shutdown.json')
+        if path.exists():
+            if sealed_unregistered(receipt_file) != expected:
+                raise ValueError('host_review_unregistered_shutdown_incomplete')
+        else:
+            host._write_new(path, expected)
+        return expected
+
+
+def assert_unregistered_executions_closed(*, exclude_run_id: str | None = None) -> None:
+    from . import controller_handoff
+    for path in (controller_handoff.manifest_file().parent / 'executions').glob('*/execution.json'):
+        execution = host._read(path)[1]
+        if execution.get('review_configuration') != host.IDENTITY:
+            continue
+        manifest_path = path.with_name('controller-manifest.json')
+        if not manifest_path.exists():
+            from scripts import finance_preaudit_run as runner
+            report = runner.read_execution(path, owner_task_id=execution['owner_task_id'], invocation_id=path.parent.name)
+            if report['status'] == 'skipped' and report['terminal'] is True:
+                continue
+            supervisor = execution.get('supervisor_process')
+            if (execution.get('state') == 'start_failed' and execution.get('controller_pid') is None
+                    and host.guard._valid_identity(supervisor)
+                    and host.guard.process_identity(supervisor['pid']) != supervisor):
+                continue
+            raise ValueError('host_review_previous_round_incomplete')
+        manifest = host._read(manifest_path)[1]
+        if manifest.get('run_id') == exclude_run_id:
+            continue
+        owner, run_id = execution.get('owner_task_id'), manifest.get('run_id')
+        registry = host.registry_file(owner, run_id)
+        legacy = host.registry_file(owner, legacy=True)
+        if registry.exists() or (legacy.exists() and host._read(legacy)[1].get('run_id') == run_id):
+            try:
+                registered = sealed_round(owner=owner, run_id=run_id)
+                if registered['original_execution']['receipt_file'] != str(path.absolute()):
+                    raise ValueError('host_review_previous_round_incomplete')
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+                raise ValueError('host_review_previous_round_incomplete') from error
+            continue
+        try:
+            sealed_unregistered(path)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+            raise ValueError('host_review_previous_round_incomplete') from error
