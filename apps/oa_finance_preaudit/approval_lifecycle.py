@@ -269,7 +269,8 @@ def startup(project_root: Path, *, observe_errors: bool = True) -> dict:
             runtime_control.request_cycle_stop()
             guard.reap_models(run_id=manifest["run_id"])
             return {"status": "blocked", "reason": "previous_run_deadline_exceeded", "cleanup": "readonly_only"}
-        return {"status": "skipped", "reason": "previous_run_busy", "run_id": manifest["run_id"]}
+        return {"status": "skipped", "reason": "previous_run_busy", "run_id": manifest["run_id"],
+                "owner_task_id": manifest.get("owner_task_id")}
     with runtime_control.global_controller_lease():
         if runtime_control.writer_active() or runtime_control.active_request_writers():
             return {"status": "blocked", "reason": "writer_in_progress"}

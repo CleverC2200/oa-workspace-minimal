@@ -174,7 +174,8 @@ def test_public_cli_provider_switch_keeps_original_app_closure_gate(failed_start
     args, _ = failed_start
     original = args['receipt_file'].read_bytes()
     monkeypatch.setattr(runner.auth, 'load_local_env', lambda: None)
-    monkeypatch.setattr(runner.approval_lifecycle, 'startup', lambda _root: {'status': 'ready'})
+    monkeypatch.setattr(runner.approval_guard, 'observe_project_errors', lambda _: None)
+    assert runner.approval_lifecycle.startup(runner.PROJECT_ROOT)['status'] == 'ready'
     monkeypatch.setattr(runner, 'supervise', lambda *_args, **_options: pytest.fail('unclosed App round launched'))
     assert runner.main(['--owner-task-id', str(uuid4()), '--review-provider', 'deepseek', '--', '--rolling']) == 1
     result = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
