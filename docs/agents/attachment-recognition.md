@@ -46,3 +46,5 @@ python -m apps.oa_approval.attachment_recognition \
 API 图片输入合同见 [DeepSeek 官方文档](https://api-docs.deepseek.com/guides/vision)。
 
 图片任一边超过官方单图 8192 像素限制时，识别入口按原像素切分为有重叠的无损 PNG 分区，逐区请求，不缩放或覆盖原图。每块继续满足单图尺寸及字节上限；相邻分区重叠内容不能重复计入金额或数量。`parts[*].image_tiles` 保存原图坐标、各区回答及用量，页面回答按坐标汇总，原页引用和内容指纹仍对应原文件。全部分区成功才算该页读取完成；任一区失败时，`failed_part` 保留已完成分区和失败坐标，整次状态仍为 failed，不重试或生成意见。分区请求共用原整次预算，实际调用和成本可能增加；用量缺失保持未知。
+
+尺寸读取与裁切使用固定依赖 Pillow。尺寸合规的图片仍发送原字节，包括 WebP 和 GIF；超限动画明确返回 `attachment_animated_image_too_large`，不能只读首帧就声称完整识别。

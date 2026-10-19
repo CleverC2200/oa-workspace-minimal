@@ -5,6 +5,7 @@ import base64
 from contextlib import nullcontext
 from datetime import datetime, timezone
 import hashlib
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from uuid import uuid4
 
 import fitz
+from PIL import Image
 
 from . import attachment_extractors, auth, retention, runtime_control
 
@@ -155,38 +157,39 @@ def _image_block(raw: bytes) -> dict:
 
 def _image_tiles(raw: bytes):
     try:
-        pix = fitz.Pixmap(raw)
-    except Exception:
+        image = Image.open(BytesIO(raw))
+    except (OSError, ValueError, Image.DecompressionBombError):
         raise ValueError('attachment_image_invalid') from None
-    if max(pix.width, pix.height) <= MAX_IMAGE_DIMENSION:
-        yield None, _image_block(raw)
-        return
-    if pix.colorspace.n not in (1, 3):
-        pix = fitz.Pixmap(fitz.csRGB, pix)
+    with image:
+        if max(image.size) <= MAX_IMAGE_DIMENSION:
+            yield None, _image_block(raw)
+            return
+        if getattr(image, 'n_frames', 1) > 1:
+            raise ValueError('attachment_animated_image_too_large')
 
-    def split(box):
-        x0, y0, x1, y1 = box
-        width, height = x1 - x0, y1 - y0
-        if max(width, height) <= MAX_IMAGE_DIMENSION:
-            tile = fitz.Pixmap(pix.colorspace, fitz.IRect(box), pix.alpha)
-            tile.copy(pix, fitz.IRect(box))
-            tile.set_origin(0, 0)
-            encoded = tile.tobytes('png')
-            if len(encoded) <= MAX_FILE_BYTES:
-                yield box, _image_block(encoded)
-                return
-        if width >= height:
-            middle = (x0 + x1) // 2
-            overlap = min(64, width // 4)
-            yield from split((x0, y0, middle + overlap, y1))
-            yield from split((middle - overlap, y0, x1, y1))
-        else:
-            middle = (y0 + y1) // 2
-            overlap = min(64, height // 4)
-            yield from split((x0, y0, x1, middle + overlap))
-            yield from split((x0, middle - overlap, x1, y1))
+        def split(box):
+            x0, y0, x1, y1 = box
+            width, height = x1 - x0, y1 - y0
+            if max(width, height) <= MAX_IMAGE_DIMENSION:
+                with image.crop(box) as tile:
+                    encoded = BytesIO()
+                    tile.save(encoded, format='PNG')
+                encoded = encoded.getvalue()
+                if len(encoded) <= MAX_FILE_BYTES:
+                    yield box, _image_block(encoded)
+                    return
+            if width >= height:
+                middle = (x0 + x1) // 2
+                overlap = min(64, width // 4)
+                yield from split((x0, y0, middle + overlap, y1))
+                yield from split((middle - overlap, y0, x1, y1))
+            else:
+                middle = (y0 + y1) // 2
+                overlap = min(64, height // 4)
+                yield from split((x0, y0, x1, middle + overlap))
+                yield from split((x0, middle - overlap, x1, y1))
 
-    yield from split((0, 0, pix.width, pix.height))
+        yield from split((0, 0, image.width, image.height))
 
 
 def _frozen(action: Path) -> tuple[dict, dict]:
@@ -401,7 +404,8 @@ def recognize(*, files: list[Path] | None = None, action_file: Path | None = Non
                         tiles.append({'box': list(box), 'answer': answer, 'usage': usage})
                 if tiles:
                     current.pop('failed_tile_box', None)
-                    answer = '\n\n'.join(f'分区 {t["box"]}：\n{t["answer"]}' for t in tiles)
+                    answer = '以下分区属于同一原图，重叠内容不代表多笔或多份证据。\n\n'
+                    answer += '\n\n'.join(f'分区 {t["box"]}：\n{t["answer"]}' for t in tiles)
                     usage = {name: sum(t['usage'][name] for t in tiles)
                              for name in ('prompt_tokens', 'completion_tokens', 'total_tokens')
                              if all(type(t['usage'].get(name)) is int for t in tiles)}

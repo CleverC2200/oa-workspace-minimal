@@ -502,19 +502,22 @@ def test_container_larger_than_page_limit_is_streamed(tmp_path, monkeypatch):
     assert result['parts'][0]['kind'] == 'text'
 
 
-@pytest.mark.parametrize('width,height,boxes', [
-    (9042, 80, [[0, 0, 4585, 80], [4457, 0, 9042, 80]]),
-    (80, 9042, [[0, 0, 80, 4585], [0, 4457, 80, 9042]]),
+@pytest.mark.parametrize('width,height,boxes,format', [
+    (9042, 80, [[0, 0, 4585, 80], [4457, 0, 9042, 80]], 'PNG'),
+    (80, 9042, [[0, 0, 80, 4585], [0, 4457, 80, 9042]], 'PNG'),
+    (9042, 80, [[0, 0, 4585, 80], [4457, 0, 9042, 80]], 'WEBP'),
 ])
-def test_wide_page_is_read_without_resampling_or_changing_source(tmp_path, monkeypatch, width, height, boxes):
+def test_wide_page_is_read_without_resampling_or_changing_source(tmp_path, monkeypatch, width, height, boxes, format):
     import base64
+    from io import BytesIO
+    from PIL import Image
 
-    source = tmp_path / 'wide.png'
+    source = tmp_path / ('wide.' + format.lower())
     pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, width, height), False)
     pix.clear_with(255)
     pix.set_pixel(0, 0, (255, 0, 0))
     pix.set_pixel(width - 1, height - 1, (0, 0, 255))
-    pix.save(source)
+    Image.open(BytesIO(pix.tobytes('png'))).save(source, format=format, lossless=True)
     original = source.read_bytes()
     received = []
 
@@ -577,3 +580,50 @@ def test_failed_tile_keeps_partial_read_without_completing_page(tmp_path, monkey
     saved = Path(report['report_file']).read_text()
     assert 'private upstream error' not in saved and 'private partial' not in saved
     assert json.loads(saved) == report
+
+
+def test_normal_webp_sends_original_bytes(tmp_path, monkeypatch):
+    import base64
+    from PIL import Image
+
+    source = tmp_path / 'normal.webp'
+    Image.new('RGB', (8, 8), 'blue').save(source, format='WEBP', lossless=True)
+    original = source.read_bytes()
+    calls = fake_http(monkeypatch, lambda _: {
+        'choices': [{'finish_reason': 'stop', 'message': {'content': 'blue'}}]})
+
+    report = recognition.recognize(files=[source], output_dir=tmp_path / 'out')
+
+    assert report['status'] == 'complete'
+    assert len(calls) == 1
+    block = calls[0]['messages'][-1]['content'][1]
+    assert block['image_url']['url'].startswith('data:image/webp;base64,')
+    assert base64.b64decode(block['image_url']['url'].split(',', 1)[1]) == original
+    assert 'image_tiles' not in report['parts'][0]
+    assert source.read_bytes() == original
+
+
+@pytest.mark.parametrize('width,expected', [(8, 'complete'), (9042, 'failed')])
+def test_animated_gif_is_never_silently_replaced_by_first_frame(tmp_path, monkeypatch, width, expected):
+    import base64
+    from PIL import Image
+
+    source = tmp_path / 'animated.gif'
+    frames = [Image.new('RGB', (width, 80), color) for color in ('red', 'blue')]
+    frames[0].save(source, save_all=True, append_images=frames[1:], duration=100, loop=0)
+    original = source.read_bytes()
+    calls = fake_http(monkeypatch, lambda _: {
+        'choices': [{'finish_reason': 'stop', 'message': {'content': 'two frames'}}]})
+
+    report = recognition.recognize(files=[source], output_dir=tmp_path / 'out')
+
+    assert report['status'] == expected
+    assert source.read_bytes() == original
+    if expected == 'complete':
+        assert len(calls) == 1
+        url = calls[0]['messages'][-1]['content'][1]['image_url']['url']
+        assert base64.b64decode(url.split(',', 1)[1]) == original
+    else:
+        assert report['error_code'] == 'attachment_animated_image_too_large'
+        assert report['parts'] == []
+        assert calls == []
