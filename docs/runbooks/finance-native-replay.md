@@ -93,10 +93,13 @@ python3 -m scripts.finance_preaudit_native_replay \
   --expectations /private/local-evidence/expectations.json \
   --expectations-sha256 "$FROZEN_EXPECTATIONS_SHA256" \
   --independent-review /private/local-evidence/business-review.json \
-  --review-sha256 "$INDEPENDENT_REVIEW_SHA256"
+  --review-sha256 "$INDEPENDENT_REVIEW_SHA256" \
+  --output-file /private/local-evidence/candidate-a-verification.json
 ```
 
 返回码 0 表示指定的全部工程记录、逐项预期和独立复核绑定通过；否则返回 1，给出错误及对应处理入口。输出报告包含 `business_acceptance`，不写回原始记录。模型输入与闭合决定允许 JSON 键顺序不同，但内容必须一致且各自符合原指纹。
+
+`--output-file` 可选，只用于 `--verify`。目标须是模型项目外已有目录中的新文件；命令独占创建权限为 `0600` 的报告，不覆盖材料、复核记录或旧报告，不创建目录或改变目录权限。stdout 保留验收摘要及报告路径、字节数和 SHA-256，不输出业务复核原文。只有复核、预期与实际闭合决定的指纹绑定可信时，私有报告的 `independent_review` 才保留原复核的 verdict 和 findings；每次最多显示 20 条、每条 1000 字符，`total` 与 `display_truncated` 标明截断，完整发现仍以原复核文件为准。报告写入或读回核对失败时返回非零且不给成功文件回执；可能留下的部分文件保留排查，不能当作成功验收记录。真实复核内容仅本地查看，不上传 Issue 或 CI。
 
 该检查核对既定指纹和复核结果，不证明预期本身正确、实际看图完成或复核身份独立。状态完全相同但理由错误时，仍由独立复核记录 `rejected`，不能仅依靠状态数组签收。程序不解释意见文字或生成财务判断。CI 离线夹具覆盖检查行为，不能作为新一次实际模型调用。
 

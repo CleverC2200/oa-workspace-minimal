@@ -57,6 +57,8 @@ _RUNTIME_FAILURE_CODES = {
     "cache_clean_runtime_active",
     "status_output_file_exists",
     "status_output_file_failed",
+    "completed_receipts_selection_invalid",
+    "completed_receipts_root_invalid",
 }
 _FLOW_FAILURE_CODES = {
     "flow_candidate_invalid",
@@ -95,32 +97,34 @@ def _print_payload(payload: dict) -> None:
 
 
 
-def _status_file_payload(payload: dict, target: Path) -> dict:
+def _private_report_file(payload: dict, target: Path) -> dict:
     """Keep the full snapshot locally before emitting a small, unchanged gate view."""
-    from .case_recovery import summary
-
     target = target.expanduser().absolute()
     raw = (json.dumps(payload, ensure_ascii=False, sort_keys=True,
                       default=_json_default) + "\n").encode("utf-8")
     digest = hashlib.sha256(raw).hexdigest()
     try:
-        descriptor = os.open(target, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "w+b") as stream:
-            stream.write(raw)
-            stream.flush()
-            os.fsync(stream.fileno())
-            stream.seek(0)
-            if hashlib.sha256(stream.read()).hexdigest() != digest:
-                raise OSError("status_output_readback_failed")
+        with runtime_control.pinned_directory(target.parent) as parent:
+            descriptor = os.open(target.name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+            with os.fdopen(descriptor, "w+b") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+                stream.seek(0)
+                if hashlib.sha256(stream.read()).hexdigest() != digest:
+                    raise OSError("status_output_readback_failed")
     except FileExistsError as error:
         raise RuntimeError("status_output_file_exists") from error
-    except OSError as error:
+    except (OSError, RuntimeError) as error:
         # Preserve any partial file as evidence; it is not a successful receipt.
         raise RuntimeError("status_output_file_failed") from error
-    return {
-        **summary(payload, detail_limit=0),
-        "status_file": {"path": str(target), "bytes": len(raw), "sha256": digest},
-    }
+    return {"path": str(target), "bytes": len(raw), "sha256": digest}
+
+
+def _status_file_payload(payload: dict, target: Path) -> dict:
+    from .case_recovery import summary
+    metadata = _private_report_file(payload, target)
+    return {**summary(payload, detail_limit=0), "status_file": metadata}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -153,6 +157,11 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--summary", action="store_true")
     status.add_argument("--output-file", type=Path, default=None,
                         help="Save full JSON to a new private file; print gates and counts only")
+    completed = subparsers.add_parser("completed-receipts")
+    completed.add_argument("--root", type=Path, default=None)
+    completed.add_argument("--owner-task-id", required=True)
+    completed.add_argument("--run-id", action="append", required=True)
+    completed.add_argument("--output-file", type=Path, default=None)
     prune = subparsers.add_parser("prune")
     prune.add_argument("--root", type=Path, default=None)
     clean = subparsers.add_parser("clean")
@@ -314,7 +323,7 @@ def _matches_confirmed_unknown_recovery(
 
 
 def _failure_payload(error: Exception, *, command: str = "next-action") -> dict:
-    if command in {"status", "prune", "clean"}:
+    if command in {"status", "prune", "clean", "completed-receipts"}:
         raw_code = str(error).strip()
         code = raw_code if raw_code in _RUNTIME_FAILURE_CODES else "runtime_failed"
         failure = {"code": code, "stage": command}
@@ -354,7 +363,7 @@ def _failure_payload(error: Exception, *, command: str = "next-action") -> dict:
 def _fail(args: argparse.Namespace, error: Exception) -> int:
     failure = _failure_payload(error, command=args.command)
     _print_payload(failure)
-    if args.command in {"status", "prune", "clean"}:
+    if args.command in {"status", "prune", "clean", "completed-receipts"}:
         print(failure["failure"]["code"], file=sys.stderr)
     return 1
 
@@ -381,7 +390,7 @@ def _emit_invocation(
         [workflow_key]
         if workflow_key in flow_engine.WORKFLOW_KEYS
         else ["global"]
-        if command in {"status", "prune", "clean"}
+        if command in {"status", "prune", "clean", "completed-receipts"}
         else []
     )
     for current_workflow in workflow_keys:
@@ -546,7 +555,7 @@ def main(
 ) -> int:
     args = build_parser().parse_args(argv)
     sink = invocation_sink
-    if sink is None and persist_invocations:
+    if sink is None and persist_invocations and args.command != "completed-receipts":
         cli_log = (
             _runtime_root(getattr(args, "root", None))
             / ".metrics"
@@ -583,6 +592,12 @@ def main(
             elif args.summary:
                 from .case_recovery import summary
                 payload = summary(payload)
+        elif args.command == "completed-receipts":
+            from . import completed_receipts
+            report = completed_receipts.summarize(root=_runtime_root(args.root), owner=args.owner_task_id, run_ids=args.run_id)
+            payload = completed_receipts.summary(report)
+            if args.output_file is not None:
+                payload["report_file"] = _private_report_file(report, args.output_file)
         elif args.command == "prune":
             operation = runtime_prune or runtime_maintenance.prune
             payload = operation(_runtime_root(args.root))

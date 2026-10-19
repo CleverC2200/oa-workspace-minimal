@@ -211,6 +211,14 @@ def run(args, *, executor=None):
     return 0
 
 
+def _write_verification_report(target, report, project):
+    from apps.oa_finance_preaudit.cli import _private_report_file
+    target = target.expanduser().absolute()
+    if target.resolve().is_relative_to(project.resolve()):
+        raise ValueError('acceptance_report_inside_model_input')
+    return _private_report_file(report, target)
+
+
 def verify(args):
     """Validate separately reviewed evidence, without generating a business opinion."""
     from apps.oa_finance_preaudit.flow_engine import validate_frozen_review_inputs
@@ -219,6 +227,8 @@ def verify(args):
     audit = args.audit / 'runs' / args.label / args.case
     findings = []
     source_head = None
+    independent_details = None
+    project = args.project
     try:
         manifest = read(audit / 'prepare.json')
         source_head = manifest['source_head']
@@ -227,9 +237,11 @@ def verify(args):
         project = Path(manifest['project_root']).resolve()
         if any(p.resolve().is_relative_to(project) for p in (args.expectations, args.independent_review)):
             findings.append('business_review_inside_model_input:keep expectations and review outside the native project')
-        if digest(args.expectations) != args.expectations_sha256:
+        expectations_match = digest(args.expectations) == args.expectations_sha256
+        review_matches = digest(args.independent_review) == args.review_sha256
+        if not expectations_match:
             findings.append('expectations_fingerprint_mismatch:use the independently frozen digest')
-        if digest(args.independent_review) != args.review_sha256:
+        if not review_matches:
             findings.append('review_fingerprint_mismatch:use the independently reviewed digest')
         expectations = read(args.expectations)
         independent = read(args.independent_review)
@@ -268,16 +280,25 @@ def verify(args):
             findings.append('frozen_review_inputs_changed:preserve the actual frozen material and review packet')
         decision_file = Path(manifest['action_file']).with_name('native-preview-decision.json')
         decision_hash = digest(decision_file)
-        if (decision_hash != result['decision_sha256']
-                or read(closure['decision_file']) != read(decision_file)
-                or state['decision_fingerprint'] != 'sha256:' + digest(closure['decision_file'])):
+        decision_bound = (decision_hash == result['decision_sha256']
+                and read(closure['decision_file']) == read(decision_file)
+                and state['decision_fingerprint'] == 'sha256:' + digest(closure['decision_file']))
+        if not decision_bound:
             findings.append('decision_fingerprint_mismatch:review the actual closed decision')
-        if (independent.get('schema_version') != 1 or independent.get('case') != args.case
-                or independent.get('label') != args.label
-                or independent.get('source_head') != manifest['source_head']
-                or independent.get('expectations_sha256') != args.expectations_sha256
-                or independent.get('decision_sha256') != decision_hash):
+        review_bound = (independent.get('schema_version') == 1 and independent.get('case') == args.case
+                and independent.get('label') == args.label
+                and independent.get('source_head') == manifest['source_head']
+                and independent.get('expectations_sha256') == args.expectations_sha256
+                and independent.get('decision_sha256') == decision_hash)
+        if not review_bound:
             findings.append('independent_review_binding_mismatch:bind review to this source, expectation and decision')
+        details = independent.get('findings')
+        if (independent.get('verdict') not in {'accepted', 'rejected'} or not isinstance(details, list)
+                or any(not isinstance(item, str) or not item.strip() for item in details)):
+            raise ValueError('independent_review_schema_invalid')
+        if expectations_match and review_matches and decision_bound and review_bound:
+            independent_details = {'verdict': independent['verdict'], 'findings': [item[:1000] for item in details[:20]],
+                                   'total': len(details), 'display_truncated': len(details) > 20 or any(len(item) > 1000 for item in details[:20])}
         if independent.get('verdict') != 'accepted' or independent.get('findings') != []:
             findings.append('independent_review_not_accepted:resolve business findings in a new candidate')
         cases = [c for c in expectations['cases'] if c['case'] == args.case]
@@ -305,8 +326,18 @@ def verify(args):
               'source_head': source_head, 'qualification_scope': 'single_frozen_native_case',
               'business_acceptance': 'not_accepted' if findings else 'accepted',
               'findings': sorted(set(findings)), 'oa_writes': 0, 'model_calls': 0}
+    if args.output_file is not None:
+        try:
+            report_file = _write_verification_report(args.output_file,
+                {**report, 'independent_review': independent_details}, project)
+        except (OSError, RuntimeError, ValueError):
+            report['findings'].append('acceptance_report_file_failed:choose a new file outside the native project in an existing private directory')
+            report['business_acceptance'] = 'not_accepted'
+        else:
+            report['report_file'] = report_file
+    report['independent_review_findings_count'] = independent_details['total'] if independent_details is not None else None
     print(json.dumps(report, ensure_ascii=False))
-    return 1 if findings else 0
+    return 1 if report['business_acceptance'] != 'accepted' else 0
 
 
 def main(argv=None, *, executor=None):
@@ -325,7 +356,10 @@ def main(argv=None, *, executor=None):
     parser.add_argument('--expectations-sha256')
     parser.add_argument('--independent-review', type=Path)
     parser.add_argument('--review-sha256')
+    parser.add_argument('--output-file', type=Path, help='save a new private verification report, keeping semantic details out of stdout')
     args = parser.parse_args(argv)
+    if args.output_file is not None and not args.verify:
+        parser.error('--output-file is only available with --verify')
     if args.verify and (args.expectations is None or args.independent_review is None
                        or not all(isinstance(x, str) and len(x) == 64
                                   and all(c in '0123456789abcdef' for c in x)

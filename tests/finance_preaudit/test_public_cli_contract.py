@@ -11,7 +11,7 @@ from apps.oa_finance_preaudit import cli
 from apps.oa_approval import frozen_writer
 
 
-PUBLIC_COMMANDS = {"next-action", "complete-review", "status", "prune", "clean"}
+PUBLIC_COMMANDS = {"next-action", "complete-review", "status", "prune", "clean", "completed-receipts"}
 
 
 def test_public_cli_exposes_only_the_supported_commands() -> None:

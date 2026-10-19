@@ -192,13 +192,148 @@ def acceptance_records(recorded_case, capsys):
         'decision_sha256': result['decision_sha256'], 'verdict': 'accepted', 'findings': [],
     })
     initial_review_hash = finance_preaudit_native_replay.digest(review)
-    def check(*, expected_hash=None, review_hash=None):
+    def check(*, expected_hash=None, review_hash=None, output_file=None):
         check_args = ['--verify' if x == '--prepare' else x for x in arguments]
+        if output_file is not None:
+            check_args += ['--output-file', str(output_file)]
         return finance_preaudit_native_replay.main(check_args + [
             '--expectations', str(expectations), '--expectations-sha256', expected_hash or finance_preaudit_native_replay.digest(expectations),
             '--independent-review', str(review), '--review-sha256', review_hash or (finance_preaudit_native_replay.digest(review) if review.exists() else initial_review_hash),
         ])
     return check, audit, expectations, review
+
+
+@pytest.mark.parametrize('finding', [
+    'fuel_subsidy: page mileage-2 reads 45123; the opinion transcribed 45128',
+    'supplementary_checks: omitted the observed storage-heading anomaly on page-1',
+])
+def test_verify_keeps_semantic_rejection_details_in_private_report(acceptance_records, capsys, finding):
+    check, audit, _, review = acceptance_records
+    independent = finance_preaudit_native_replay.read(review)
+    independent.update(verdict='rejected', findings=[finding])
+    finance_preaudit_native_replay.dump(review, independent)
+    before = {p: p.read_bytes() for p in audit.rglob('*') if p.is_file()}
+    target = review.with_name('acceptance-report.json')
+
+    assert check(output_file=target) == 1
+
+    output = capsys.readouterr().out
+    summary = json.loads(output)
+    report = finance_preaudit_native_replay.read(target)
+    assert finding not in output
+    assert summary['business_acceptance'] == 'not_accepted'
+    assert summary['report_file']['path'] == str(target)
+    assert summary['report_file']['sha256'] == finance_preaudit_native_replay.digest(target)
+    assert report['independent_review']['findings'] == [finding]
+    assert report['independent_review']['display_truncated'] is False
+    assert not any('item_status_mismatch' in item for item in report['findings'])
+    assert target.stat().st_mode & 0o777 == 0o600
+    assert before == {p: p.read_bytes() for p in audit.rglob('*') if p.is_file()}
+
+
+@pytest.mark.parametrize('destination', ['existing_report', 'review', 'material', 'symlink', 'parent_symlink', 'model_project', 'missing_parent'])
+def test_verify_report_failure_preserves_evidence_and_rejects_acceptance(acceptance_records, capsys, destination):
+    check, audit, _, review = acceptance_records
+    manifest = finance_preaudit_native_replay.read(audit / 'prepare.json')
+    target = review.with_name('acceptance-report.json')
+    if destination == 'existing_report':
+        target.write_text('previous report')
+    elif destination == 'review':
+        target = review
+    elif destination == 'material':
+        target = Path(manifest['original_material'])
+    elif destination == 'symlink':
+        target.symlink_to(review)
+    elif destination == 'parent_symlink':
+        parent = review.parent / 'linked-directory'
+        parent.symlink_to(review.parent, target_is_directory=True)
+        target = parent / target.name
+    elif destination == 'model_project':
+        target = Path(manifest['project_root']) / 'acceptance-report.json'
+    elif destination == 'missing_parent':
+        target = target.parent / 'missing' / target.name
+    before = {p: p.read_bytes() for p in review.parent.parent.rglob('*') if p.is_file()}
+    parent_mode = review.parent.stat().st_mode
+
+    assert check(output_file=target) == 1
+
+    summary = json.loads(capsys.readouterr().out)
+    assert summary['business_acceptance'] == 'not_accepted'
+    assert 'report_file' not in summary
+    assert any('acceptance_report_file_failed' in finding for finding in summary['findings'])
+    assert before == {p: p.read_bytes() for p in review.parent.parent.rglob('*') if p.is_file()}
+    assert review.parent.stat().st_mode == parent_mode
+
+
+@pytest.mark.parametrize('mistake', ['review_hash', 'expectations_hash', 'decision_binding', 'review_binding', 'invalid_findings'])
+def test_verify_does_not_publish_unbound_semantic_details(acceptance_records, capsys, mistake):
+    check, audit, _, review = acceptance_records
+    finding = 'synthetic sensitive factual finding'
+    independent = finance_preaudit_native_replay.read(review)
+    independent.update(verdict='rejected', findings=[finding])
+    if mistake == 'review_binding':
+        independent['decision_sha256'] = '0' * 64
+    if mistake == 'invalid_findings':
+        independent['findings'] = {'untrusted': finding}
+    finance_preaudit_native_replay.dump(review, independent)
+    if mistake == 'decision_binding':
+        result = finance_preaudit_native_replay.read(audit / 'result.json')
+        result['decision_sha256'] = '0' * 64
+        finance_preaudit_native_replay.dump(audit / 'result.json', result)
+    options = {'review_hash': '0' * 64} if mistake == 'review_hash' else {}
+    if mistake == 'expectations_hash':
+        options['expected_hash'] = '0' * 64
+    target = review.with_name('acceptance-report.json')
+
+    assert check(output_file=target, **options) == 1
+
+    output = capsys.readouterr().out
+    assert finding not in output
+    assert finding not in target.read_text()
+    assert finance_preaudit_native_replay.read(target)['independent_review'] is None
+
+
+def test_verify_bounds_semantic_report_without_changing_independent_review(acceptance_records, capsys):
+    check, _, _, review = acceptance_records
+    independent = finance_preaudit_native_replay.read(review)
+    independent.update(verdict='rejected', findings=['x' * 1001, *[f'finding-{index}' for index in range(20)]])
+    finance_preaudit_native_replay.dump(review, independent)
+    before = review.read_bytes()
+    target = review.with_name('acceptance-report.json')
+
+    assert check(output_file=target) == 1
+
+    summary = json.loads(capsys.readouterr().out)
+    details = finance_preaudit_native_replay.read(target)['independent_review']
+    assert summary['independent_review_findings_count'] == 21
+    assert details['total'] == 21
+    assert len(details['findings']) == 20
+    assert details['findings'][0] == 'x' * 1000
+    assert details['display_truncated'] is True
+    assert review.read_bytes() == before
+
+
+def test_verify_does_not_issue_report_receipt_after_output_io_failure(acceptance_records, capsys, monkeypatch):
+    check, _, _, review = acceptance_records
+    finding = 'synthetic sensitive review detail'
+    independent = finance_preaudit_native_replay.read(review)
+    independent.update(verdict='rejected', findings=[finding])
+    finance_preaudit_native_replay.dump(review, independent)
+    before = review.read_bytes()
+    target = review.with_name('acceptance-report.json')
+    def failed_flush(_descriptor):
+        raise OSError('synthetic flush failure')
+    monkeypatch.setattr(finance_preaudit_native_replay.os, 'fsync', failed_flush)
+
+    assert check(output_file=target) == 1
+
+    output = capsys.readouterr().out
+    summary = json.loads(output)
+    assert finding not in output
+    assert 'report_file' not in summary
+    assert any('acceptance_report_file_failed' in item for item in summary['findings'])
+    assert target.stat().st_mode & 0o777 == 0o600
+    assert review.read_bytes() == before
 
 
 def test_verify_requires_bound_independent_business_review(acceptance_records, capsys):
