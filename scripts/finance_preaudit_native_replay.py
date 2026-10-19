@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit native regression using recorded evidence and preview-only closure."""
+"""Recorded-evidence preview replay; native runs require explicit DeepSeek CLI."""
 from __future__ import annotations
 import argparse
 import copy
@@ -158,6 +158,9 @@ def run(args, *, executor=None):
     configuration = manifest.get('review_configuration', production_config.LEGACY_OPENAI_IDENTITY)
     if worker.REVIEW_SETTINGS != configuration:
         raise RuntimeError('review_model_identity_changed')
+    if configuration != production_config.review_settings('deepseek', transport='cli'):
+        raise ValueError('native_replay_transport_unsupported:App preview replay is not supported; '
+                         'prepare a new label with OA_REVIEW_PROVIDER=deepseek OA_REVIEW_TRANSPORT=cli')
     # Import source must match the snapshot given to the reviewer.
     if digest(Path(worker.__file__)) != manifest['worker_source_sha256']:
         raise RuntimeError('worker_source_changed_since_prepare')
@@ -344,7 +347,7 @@ def main(argv=None, *, executor=None):
     parser = argparse.ArgumentParser(description=__doc__)
     phase = parser.add_mutually_exclusive_group(required=True)
     phase.add_argument('--prepare', action='store_true', help='copy immutable historical evidence and freeze a fresh preview; no native call')
-    phase.add_argument('--run', action='store_true', help='explicit native Worker.review call then close only preview; one run per label/case')
+    phase.add_argument('--run', action='store_true', help='explicit retained DeepSeek CLI review then close only preview; App replay is unsupported; one run per label/case')
     phase.add_argument('--verify', action='store_true', help='read-only check of actual native result, frozen expectations and independent business review')
     parser.add_argument('--case', required=True)
     parser.add_argument('--label', required=True)

@@ -37,6 +37,8 @@ def main(argv: list[str] | None = None) -> int:
     submit = commands.add_parser('submit', help='按独立授权回填三个字段并提交')
     submit.add_argument('--attempt', required=True)
     submit.add_argument('--confirm-write', choices=['YES'], required=True)
+    postcheck = commands.add_parser('postcheck', help='仅核对未知提交，保留原回执，不重新提交 OA')
+    postcheck.add_argument('--attempt', required=True)
     authorize = commands.add_parser('authorize', help='仅在生产开启本流程独立写入授权')
     authorize.add_argument('--confirm-write', choices=['YES'], required=True)
     commands.add_parser('disable', help='撤销本流程授权；不改变其他流程')
@@ -81,6 +83,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == 'collect':
                 attempt = engine.collect(args.request_id)
                 result = {'status': 'collected', 'attempt': attempt, 'material_file': str(ROOT / 'attempts' / attempt / 'material.json')}
+            elif args.command == 'postcheck':
+                result = engine.postcheck(args.attempt)
             else:
                 result = engine.submit(args.attempt, confirm=args.confirm_write)
         print(json.dumps({'schema_version': 1, 'kind': 'overseas_invoice_result', **result}, ensure_ascii=False))

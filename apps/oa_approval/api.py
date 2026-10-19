@@ -192,35 +192,42 @@ class OaApi:
         self,
         *,
         page_size: int = 100,
-        max_pages: int = 5,
+        max_pages: int | None = 5,
     ) -> list[dict[str, str]]:
         cases: list[dict[str, str]] = []
         seen_request_ids: set[str] = set()
         for path in HANDLED_ENDPOINTS:
             previous_page: list[dict[str, Any]] | None = None
-            for page_no in range(1, max(1, int(max_pages)) + 1):
-                page = _extract_rows(
-                    self._post_readonly(
-                        path,
-                        {
-                            "pageNo": str(page_no),
-                            "pageSize": str(max(1, int(page_size))),
-                            "isNeedOs": True,
-                        },
-                    )
+            page_no = 1
+            while max_pages is None or page_no <= max(1, int(max_pages)):
+                payload = self._post_readonly(
+                    path,
+                    {
+                        "pageNo": str(page_no),
+                        "pageSize": str(max(1, int(page_size))),
+                        "isNeedOs": True,
+                    },
                 )
-                if not page or page == previous_page:
+                if max_pages is None:
+                    _raise_on_readonly_error(payload, code="handled_pagination_incomplete")
+                page = _extract_rows(payload)
+                if not page:
+                    break
+                if page == previous_page:
+                    if max_pages is None:
+                        raise ValueError("handled_pagination_incomplete")
                     break
                 for row in page:
                     case = _handled_case(row)
                     request_id = case["request_id"]
-                    if not request_id or request_id in seen_request_ids:
+                    if not request_id or (max_pages is not None and request_id in seen_request_ids):
                         continue
                     seen_request_ids.add(request_id)
                     cases.append(case)
                 if len(page) < max(1, int(page_size)):
                     break
                 previous_page = page
+                page_no += 1
         return cases
 
     def pending_rows(

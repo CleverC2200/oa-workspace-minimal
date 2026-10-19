@@ -1,10 +1,12 @@
 # 财务预审实际模型只读回归
 
-需要验证真实 Worker 判断时，使用 `scripts.finance_preaudit_native_replay`。该入口从已保存材料生成新的 `preview`，调用现有 `codex_review_worker.review`，再通过 `FlowEngine.complete_review` 验证并闭合。它不配置 OA 连接、授权源或提交回调。
+需要验证保留的 DeepSeek CLI Worker 判断时，使用 `scripts.finance_preaudit_native_replay`。该入口从已保存材料生成新的 `preview`，调用现有 `codex_review_worker.review`，再通过 `FlowEngine.complete_review` 验证并闭合。它不配置 OA 连接、授权源或提交回调。当前不支持原生 App 的独立 preview 回放。
 
 准备时使用历史状态中的 `workflow_key`，保留对应流程的固定审核项；差旅材料不会转成通用费用审核。
 
-每次新回放在准备阶段冻结 `OA_REVIEW_PROVIDER` 选择的审核配置，默认 Codex/OpenAI，显式 `deepseek` 使用隔离 DeepSeek API；运行时必须沿用该配置。模型目录纳入准备源码快照。历史未记录配置的回放继续按原 OpenAI/medium 合同验证，不重写历史文件；运行这种历史输入时显式使用 `OA_REVIEW_PROVIDER=openai`。切换供应商应使用新标签重新准备，不能修改旧输入或以回放闭合代替独立业务验收。
+每次回放在准备阶段冻结 `OA_REVIEW_PROVIDER` 和 `OA_REVIEW_TRANSPORT` 选择的审核配置。项目默认是 OpenAI 原生 App（`host_chat`）；`--prepare` 可以只读冻结该配置，但本入口的 `--run` 尚未接入其 owner、Controller 注册与原生工具回执合同，因此会在创建运行标记或调用执行器前明确拒绝。不能借用生产轮次，也不能改用已禁止的 OpenAI CLI。
+
+需要运行本入口时，准备和运行均显式设置 `OA_REVIEW_PROVIDER=deepseek OA_REVIEW_TRANSPORT=cli`，使用保留的隔离 DeepSeek CLI 配置与独立凭据。入口不会自动切换供应商。默认 App 配置已经准备的快照保持不变；选择 DeepSeek 后必须用新标签重新准备。模型目录纳入准备源码快照。历史 OpenAI 或 App 配置的记录仍可只读 `--verify`；未记录配置的历史回放继续按原 OpenAI/medium 合同验证，这不授予重新执行旧 CLI 的许可。不能以回放闭合代替独立业务验收。
 
 ## 准备私有输入
 
@@ -31,6 +33,7 @@
 在已授权的开发工作树使用 Python 3.11 或更新版本，先准备，不调用模型：
 
 ```bash
+OA_REVIEW_PROVIDER=deepseek OA_REVIEW_TRANSPORT=cli \
 python3 -m scripts.finance_preaudit_native_replay \
   --prepare --case employee-payment --label candidate-a \
   --project /absolute/development-project \
@@ -43,6 +46,7 @@ python3 -m scripts.finance_preaudit_native_replay \
 获得实际模型调用授权后，使用同一组参数显式调用：
 
 ```bash
+OA_REVIEW_PROVIDER=deepseek OA_REVIEW_TRANSPORT=cli \
 python3 -m scripts.finance_preaudit_native_replay \
   --run --case employee-payment --label candidate-a \
   --project /absolute/development-project \
@@ -56,7 +60,7 @@ python3 -m scripts.finance_preaudit_native_replay \
 
 成功闭合需要 `preview_closed_no_write=true`、`write_state=not_requested`、原材料哈希未变。`business_state=needs_human` 可以是有效结果；逐项对照私有预期，保留真实缺材料、付款归属不明、未支付、退款和金额差额等异常。
 
-`execution_transport=native` 表示调用原生执行器。离线测试注入记录执行器时标为 `recorded`，不作为实际模型验收。源码改变后用新 label 重新准备，不修改正在运行或已冻结的快照。回归结果不授权重写 OA 意见、上线或恢复生产。
+`execution_transport=native` 表示本入口调用保留的 DeepSeek CLI 原生执行器，不表示原生 App 回放。离线测试注入记录执行器时标为 `recorded`，不作为实际模型验收。源码改变后用新 label 重新准备，不修改正在运行或已冻结的快照。回归结果不授权重写 OA 意见、上线或恢复生产。
 
 ### 独立业务验收检查
 
