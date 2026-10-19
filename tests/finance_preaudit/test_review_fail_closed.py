@@ -1249,3 +1249,51 @@ def test_controller_retains_failure_result_before_reaping_pool(tmp_path):
 @pytest.fixture(autouse=True)
 def fake_review_api_key(monkeypatch, retained_deepseek_cli):
     monkeypatch.setenv("OA_REVIEW_API_KEY", "offline-fake-key")
+
+
+@pytest.mark.parametrize('emission', ['line', 'chunked_tail'])
+def test_late_stdout_official_notice_after_generic_failure_retains_cooldown(tmp_path, monkeypatch, emission):
+    task, action = _task(tmp_path)
+    monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+    events = [{'type': 'error', 'message': 'generic failure'},
+              {'type': 'error', 'codexErrorInfo': 'usageLimitExceeded'}]
+    official = (json.dumps(events[1]) + ('\n' if emission == 'line' else '')).encode()
+    emit = (f'os.write(1, {official!r})' if emission == 'line' else
+            f'os.write(1, {official[:20]!r}); time.sleep(.05); os.write(1, {official[20:]!r})')
+    script = ('import os,sys,time,signal\n'
+              'def finish(signum, frame):\n'
+              f'    {emit}\n'
+              '    sys.exit(0)\n'
+              'signal.signal(signal.SIGTERM, finish)\n'
+              'signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})\n'
+              'sys.stdin.read()\n'
+              f'print({json.dumps(events[0])!r}, flush=True)\n'
+              'time.sleep(60)\n')
+    monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c', script])
+    popen = worker.subprocess.Popen
+    descriptors = []
+
+    def capture(*args, **kwargs):
+        if hasattr(kwargs.get('stdout'), 'fileno'):
+            descriptors.append(os.dup(kwargs['stdout'].fileno()))
+        return popen(*args, **kwargs)
+
+    monkeypatch.setattr(worker.subprocess, 'Popen', capture)
+    started = time.monotonic()
+    try:
+        result = worker.review(task)
+        emitted = os.pread(descriptors[0], 4096, 0).decode()
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+    assert time.monotonic() - started < 8
+    assert [json.loads(line) for line in emitted.splitlines()] == events
+    assert result['process_attempts'] == 1
+    assert result['error_code'] == 'codex_process_failed' and result['process_retries'] == 0
+    assert guard.cooldown() is not None, {'emitted': emitted, 'result': result['error_code']}
+    assert guard.cooldown()['notice_code'] == 'usage_limit'
+    notices = worker.process_diagnostics.read_notices(action)
+    assert notices['first_blocking_notice']['classification'] == 'unknown_error'
+    assert notices['first_official_notice']['classification'] == 'usage_limit'
+    assert notices['first_official_notice']['source'] == 'stdout'
+    assert guard.models_reaped()
