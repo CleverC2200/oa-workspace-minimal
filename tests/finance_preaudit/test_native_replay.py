@@ -127,6 +127,8 @@ def test_run_uses_worker_then_closes_preview_with_real_anomalies_preserved(recor
     assert result['preview_closed_no_write'] is True
     assert result['write_state'] == 'not_requested'
     assert result['business_state'] == 'needs_human'
+    assert result['execution_transport'] == 'recorded'
+    assert result['business_acceptance'] == 'not_verified'
     assert result['original_material_unchanged'] is True
     decision = json.loads(Path(prepared['action_file']).with_name('review-decision.json').read_text())
     assert all(item['status'] == 'uncertain' for item in decision['items'])
@@ -437,3 +439,30 @@ def test_prepared_provider_is_frozen_and_cannot_change_at_run(recorded_case, cap
         finance_preaudit_native_replay.main(["--run" if arg == "--prepare" else arg for arg in arguments],
                                            executor=lambda *args: pytest.fail("changed provider started a model"))
     assert not manifest_file.with_name("worker-result.json").exists()
+
+
+def test_default_app_replay_refuses_run_before_consuming_prepared_preview(recorded_case, capsys, monkeypatch):
+    from apps.oa_finance_preaudit import production_config
+    monkeypatch.delenv(production_config.REVIEW_PROVIDER_ENV, raising=False)
+    monkeypatch.delenv(production_config.REVIEW_TRANSPORT_ENV, raising=False)
+    monkeypatch.setattr(codex_review_worker, 'REVIEW_SETTINGS', production_config.review_settings())
+    arguments, original_material, _ = recorded_case
+    original_bytes = original_material.read_bytes()
+    assert finance_preaudit_native_replay.main(arguments) == 0
+    prepared = json.loads(capsys.readouterr().out)
+    audit = Path(prepared['audit'])
+    prepared_bytes = (audit / 'prepare.json').read_bytes()
+    action_file = Path(prepared['action_file'])
+    action_bytes = action_file.read_bytes()
+    state_file = action_file.with_name('state.json')
+    state_bytes = state_file.read_bytes()
+    run_arguments = ['--run' if arg == '--prepare' else arg for arg in arguments]
+    for _ in range(2):
+        with pytest.raises(ValueError, match='native_replay_transport_unsupported.*OA_REVIEW_PROVIDER=deepseek'):
+            finance_preaudit_native_replay.main(run_arguments,
+                executor=lambda *_args: pytest.fail('unsupported App replay invoked an executor'))
+    assert sorted(path.name for path in audit.iterdir()) == ['prepare.json']
+    assert (audit / 'prepare.json').read_bytes() == prepared_bytes
+    assert action_file.read_bytes() == action_bytes
+    assert state_file.read_bytes() == state_bytes
+    assert original_material.read_bytes() == original_bytes
