@@ -111,7 +111,9 @@ def test_readonly_timeout_reaps_registered_real_model_tree(tmp_path, monkeypatch
                 capacity=1, sample_size=1, project_root=Path(task["project_root"]),
                 run_reviews=partial(probe._run_read_only_reviews, **options),
             )
-        assert approval_lifecycle.readonly_reaped(manifest), _readonly_reap_diagnostics(manifest, result)
+        assert approval_lifecycle.readonly_reaped(manifest), json.dumps(
+            _readonly_reap_diagnostics(manifest, result), ensure_ascii=False,
+        )
     assert result["stopped" if mode == "stop" else "timed_out"] == 1
     assert result["error_counts"] == {expected: 1}
     assert result["processes_reaped"] is True
