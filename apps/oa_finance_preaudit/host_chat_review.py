@@ -25,6 +25,7 @@ SUBMISSION = 'host-review-submission.json'
 # App scheduling and native tool calls can exceed the controller observer's 45s.
 # Keep this parent lease bounded without changing process/Writer supervision.
 PARENT_HEARTBEAT_MAX_AGE = 300
+BOOTSTRAP_PUBLICATION_MIGRATION = '40cbb88a163335a7bf8f3d3e985f39ed7937f76c'
 
 
 def selected() -> bool:
@@ -985,6 +986,39 @@ def _submission(request_file: Path, request: dict, *, registered: dict | None = 
     return raw, submitted
 
 
+def _legacy_bootstrap_start(request: dict, registered: dict) -> float:
+    from datetime import datetime
+    from . import app_review_shutdown, production_release
+    try:
+        binding = registered['original_execution']
+        execution_raw, execution = _read(Path(binding['receipt_file']))
+        manifest_raw, manifest = _read(Path(binding['receipt_file']).with_name('controller-manifest.json'))
+        receipt = registered['shutdown']['receipt']
+        saved = receipt['driver_wait_source']
+        native, proof = _native_source(Path(saved['session_file']), registered['owner_task_id'], saved['line'], output=True)
+        waited = app_review_shutdown._wait_result(native['anchor'], proof.pop('output'), binding['tool_session_id'])
+        if (proof != saved or json.loads(waited['output']) != {**execution, 'receipt_file': binding['receipt_file']}
+                or hashlib.sha256(execution_raw).hexdigest() != receipt['execution_sha256']
+                or execution['manifest_sha256'] != hashlib.sha256(manifest_raw).hexdigest()
+                or manifest['code_dirty'] is not False
+                or any(execution[key] != manifest[key] for key in ('run_id', 'controller_instance_id', 'code_revision'))
+                or any(manifest[key] != request[key] or manifest[key] != registered[key]
+                       for key in ('run_id', 'controller_instance_id'))):
+            raise ValueError('host_review_stale_source')
+        started = datetime.fromisoformat(manifest['started_at'])
+        execution_started = datetime.fromisoformat(execution['started_at'])
+        if (started.tzinfo is None or execution_started.tzinfo is None
+                or not execution_started <= started
+                or not guard._timestamp(request['created_at'])
+                or not started.timestamp() <= request['created_at']):
+            raise ValueError('host_review_stale_source')
+        production_release._git(Path(__file__).resolve().parents[2], 'merge-base', '--is-ancestor',
+                                manifest['code_revision'], BOOTSTRAP_PUBLICATION_MIGRATION + '^')
+        return started.timestamp()
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+        raise ValueError('host_review_stale_source') from error
+
+
 def sealed_assignment(request_file: Path, request: dict, registered: dict) -> dict:
     assigned = registered['assignments'][request['request_id']]
     slot = assigned['slot']
@@ -1000,7 +1034,11 @@ def sealed_assignment(request_file: Path, request: dict, registered: dict) -> di
     if (any(assigned[key] != value for key, value in dispatch.items())
             or _dispatch_reused(registered, dispatch, exclude=request['request_id'])):
         raise ValueError('host_review_assignment_untrusted')
-    if (not registered['registered_at'] <= request['created_at'] <= assigned['dispatched_at']
+    earliest = registered['registered_at']
+    if request['created_at'] < earliest:
+        earliest = _legacy_bootstrap_start(request, registered)
+    if (not earliest <= request['created_at'] <= assigned['dispatched_at']
+            or not registered['registered_at'] <= assigned['dispatched_at']
             <= registered['shutdown']['started_at'] <= registered['closed_at']
             or not assigned['dispatched_at'] < request['expires_at']
             or assigned['dispatch_source']['output_line'] >= min(
