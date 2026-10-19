@@ -171,3 +171,14 @@ def test_progressive_header_over_decode_budget_is_rejected_before_loading(tmp_pa
     result, report = invoke(source, tmp_path / 'output')
     assert result.returncode == 1
     assert report['error_code'] == 'image_progressive_decode_budget_exceeded'
+
+
+@pytest.mark.parametrize('size', [(400, 1), (1, 400)])
+def test_thin_images_obey_total_pixel_limit_after_rounding(tmp_path, size):
+    source = tmp_path / 'thin.png'
+    with Image.new('RGB', size, 'red') as image:
+        image.save(source)
+    result, report = invoke(source, tmp_path / 'out', '--max-pixels', '1')
+    assert result.returncode == 0
+    with Image.open(report['output']['path']) as image:
+        assert image.size == (1, 1)

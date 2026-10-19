@@ -37,7 +37,13 @@ def _read_source(path: Path) -> bytes:
 
 def _target_size(width, height, dimension, pixels):
     scale = min(1, dimension / width, dimension / height, math.sqrt(pixels / (width * height)))
-    return max(1, int(width * scale)), max(1, int(height * scale))
+    width, height = max(1, int(width * scale)), max(1, int(height * scale))
+    if width * height > pixels:
+        if width >= height:
+            width = max(1, pixels // height)
+        else:
+            height = max(1, pixels // width)
+    return width, height
 
 
 def _worker(args) -> dict:
@@ -82,7 +88,8 @@ def _worker(args) -> dict:
                     else:
                         rendered.save(encoded, format='JPEG', quality=args.quality, subsampling=0)
                     raw = encoded.getvalue()
-                    if len(raw) <= args.max_bytes:
+                    if (len(raw) <= args.max_bytes and max(rendered.size) <= args.max_dimension
+                            and rendered.width * rendered.height <= args.max_pixels):
                         name = 'image.png' if output_format == 'PNG' else 'image.jpg'
                         target_file = args.output_dir / name
                         descriptor = os.open(target_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
