@@ -1,5 +1,7 @@
 # DeepSeek 附件识别
 
+需要先生成较小的辅助阅读副本时，使用[Agent 图片压缩工具](image-compression.md)，保留原资源和处理回执。副本的压缩成功及可识别状态不代替原图完整读取或清晰度验收。
+
 需要读取财务附件或大图片时，使用本地 Python 工具直接调用 DeepSeek HTTP API。子 Agent 只接收文本结果，不通过看图工具把原图传入自己的会话。工具不启动 Codex CLI 或其他模型进程，不访问 OA，也不形成或提交审批决定。
 
 在当前 checkout 的 Python 环境执行。凭据从进程环境或现有 OA 私有配置的 `OA_REVIEW_API_KEY` 读取，不放在参数或聊天中。
