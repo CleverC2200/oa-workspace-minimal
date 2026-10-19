@@ -509,10 +509,10 @@ def test_late_quota_classification_after_generic_stdout_failure_publishes_cooldo
 def test_blocking_stdout_notice_keeps_later_official_error_from_same_read(tmp_path, monkeypatch):
     task, action = _task(tmp_path)
     monkeypatch.setattr(worker, '_reviewer_environment', lambda: dict(os.environ))
+    events = (b'{"type":"error","message":"generic failure"}\n'
+              b'{"type":"error","codexErrorInfo":"usageLimitExceeded"}\n')
     monkeypatch.setattr(worker, '_codex_command', lambda *a, **kw: [sys.executable, '-c',
-        'import sys,json; sys.stdin.read(); '
-        'print(json.dumps({"type":"error","message":"generic failure"}),flush=True); '
-        'print(json.dumps({"type":"error","codexErrorInfo":"usageLimitExceeded"}),flush=True)'])
+        'import os,sys; sys.stdin.read(); os.write(1, ' + repr(events) + ')'])
     result = worker.review(task)
     assert result['error_code'] == 'codex_process_failed'
     assert guard.cooldown()['notice_code'] == 'usage_limit'
