@@ -107,6 +107,13 @@ def snapshot(data: dict, resources: list[dict], *, writable: bool = True) -> dic
     }
 
 
+def stable_snapshot(snap: dict) -> dict:
+    result = deepcopy(snap)
+    for resource in result['resources']:
+        resource.pop('downloadUrl', None)
+    return result
+
+
 def build_plan(material: dict, recognition: dict) -> dict:
     _require(set(recognition) == {'material_digest', 'invoices'} and recognition['material_digest'] == digest(material), 'invoice_recognition_material_mismatch')
     invoices = recognition['invoices']
@@ -175,6 +182,11 @@ def patched_workflow(data: dict, snap: dict, plan: dict) -> dict:
 
 
 def postcheck_fields_match(after: dict, expected: dict) -> bool:
+    after, expected = stable_snapshot(after), stable_snapshot(expected)
+    if expected['main'].get('lcbh') in (None, '') and 'lcbh' in expected['main']:
+        value = after['main'].get('lcbh')
+        if isinstance(value, str) and value.strip():
+            after['main']['lcbh'] = expected['main']['lcbh']
     if any(after[key] != expected[key] for key in ('request_id', 'workflow_id', 'currency', 'main', 'resources')):
         return False
     current_rows, expected_rows = deepcopy(after['rows']), deepcopy(expected['rows'])
@@ -313,6 +325,66 @@ class InvoiceFlow:
             self._write(directory / 'plan.json', envelope)
             return plan
 
+    def _postcheck(self, material: dict, expected: dict) -> dict:
+        request_id = material['snapshot']['request_id']
+        current, resources = self.api.request_context(request_id)
+        after = snapshot(current, resources, writable=False)
+        _require(after['request_id'] == request_id, 'invoice_identity_mismatch')
+        pending = [r for r in self.api.pending_rows() if r.get('request_id') == request_id]
+        handled = [r for r in self.api.handled_rows(max_pages=None) if r.get('request_id') == request_id]
+        identity_matches = bool(handled) and all(
+            r.get('workflow_id') in (None, '', WORKFLOW_ID) for r in handled
+        )
+        fields_match = postcheck_fields_match(after, expected)
+        evidence = {'context_digest': digest(after), 'pending_digest': digest(pending),
+                    'handled_digest': digest(handled), 'pending_absent': not pending,
+                    'handled_identity_matches': identity_matches, 'fields_match': fields_match,
+                    'attachments_match': False}
+        if not pending and identity_matches and fields_match:
+            selected_ids = {a['resource_id'] for a in material['attachments']}
+            selected = [r for r in evidence_packet.logical_attachment_resources(current, resources)
+                        if str(r.get('id')) in selected_ids]
+            directory = self._attempt(material['attempt']) / ('postcheck-' + secrets.token_hex(8))
+            fresh = self._freeze_files(directory, self.download(selected, directory / 'attachments'))
+            evidence['attachments_digest'] = digest(fresh)
+            evidence['attachments_match'] = (
+                {a['resource_id']: a['sha256'] for a in fresh}
+                == {a['resource_id']: a['sha256'] for a in material['attachments']}
+            )
+        evidence['confirmed'] = (not pending and identity_matches and fields_match
+                                 and evidence['attachments_match'])
+        return evidence
+
+    def postcheck(self, attempt: str) -> dict:
+        material = self.read_material(attempt)
+        request_id = material['snapshot']['request_id']
+        journal = self.root / 'receipts' / (digest(request_id) + '.json')
+        with runtime_control.request_writer_lease(request_id):
+            receipt = self._read(journal)
+            _require(receipt.get('attempt') == attempt and receipt.get('status') == 'unknown',
+                     'invoice_unknown_receipt_required')
+            envelope = self._read(self._attempt(attempt) / 'plan.json')
+            _require(envelope['attempt'] == attempt and envelope['material_digest'] == digest(material)
+                     and receipt['plan_digest'] == digest(envelope), 'invoice_artifact_invalid')
+            plan = build_plan(material, envelope['recognition'])
+            _require(plan == envelope['plan'], 'invoice_artifact_invalid')
+            expected = deepcopy(material['snapshot'])
+            for update in plan['updates']:
+                next(row for row in expected['rows'] if row['key'] == update['row_key'])['values'].update(update['values'])
+            result = {'kind': 'overseas_invoice_postcheck', 'attempt': attempt,
+                      'receipt_digest': digest(receipt), 'plan_digest': digest(envelope),
+                      'observed_at': datetime.now(timezone.utc).isoformat(),
+                      'status': 'unresolved', 'reason': 'postcheck_failed'}
+            try:
+                result['evidence'] = self._postcheck(material, expected)
+                if result['evidence']['confirmed']:
+                    result.update(status='confirmed_submitted', reason=None)
+            except Exception:
+                result['reason'] = 'postcheck_unavailable'
+            path = self._attempt(attempt) / 'postchecks' / (secrets.token_hex(16) + '.json')
+            self._write(path, result)
+            return {**result, 'postcheck_file': str(path)}
+
     def submit(self, attempt: str, *, confirm: str) -> dict:
         _require(confirm == 'YES', 'invoice_confirmation_required')
         material = self.read_material(attempt)
@@ -334,7 +406,7 @@ class InvoiceFlow:
             _require(plan == envelope['plan'], 'invoice_artifact_invalid')
             _require(self._pending(request_id) == material['pending'], 'invoice_target_changed')
             data, resources = self.api.request_context(request_id)
-            _require(snapshot(data, resources) == material['snapshot'], 'invoice_target_changed')
+            _require(stable_snapshot(snapshot(data, resources)) == stable_snapshot(material['snapshot']), 'invoice_target_changed')
             # Fresh download: the injected host downloader must not reuse the attachment cache.
             selected_ids = {a['resource_id'] for a in material['attachments']}
             selected = [r for r in evidence_packet.logical_attachment_resources(data, resources) if str(r.get('id')) in selected_ids]
@@ -344,7 +416,7 @@ class InvoiceFlow:
             updated = patched_workflow(data, material['snapshot'], plan)
             _require(self._pending(request_id) == material['pending'] and self._policy() == policy, 'invoice_target_changed')
             latest_data, latest_resources = self.api.request_context(request_id)
-            _require(snapshot(latest_data, latest_resources) == material['snapshot'], 'invoice_target_changed')
+            _require(stable_snapshot(snapshot(latest_data, latest_resources)) == stable_snapshot(material['snapshot']), 'invoice_target_changed')
             _require(not runtime_control.stop_requested(), 'invoice_stopped')
             receipt = {'kind': 'overseas_invoice_receipt', 'attempt': attempt,
                        'plan_digest': digest(envelope), 'status': 'unknown', 'reason': 'submission_started'}
@@ -357,11 +429,7 @@ class InvoiceFlow:
                     receipt['reason'] = 'postcheck_failed'
                     expected = snapshot(updated, resources)
                     for check in range(3):
-                        current, current_resources = self.api.request_context(request_id)
-                        after = snapshot(current, current_resources, writable=False)
-                        pending = [r for r in self.api.pending_rows() if r.get('request_id') == request_id]
-                        handled = [r for r in self.api.handled_rows() if r.get('request_id') == request_id and r.get('workflow_id') == WORKFLOW_ID]
-                        if not pending and handled and postcheck_fields_match(after, expected):
+                        if self._postcheck(material, expected)['confirmed']:
                             receipt.update(status='submitted', reason=None)
                             break
                         if check < 2:
