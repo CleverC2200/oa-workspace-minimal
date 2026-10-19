@@ -260,7 +260,8 @@ def _failure(error: Exception, phase: str) -> dict:
     codes = {"controller_execution_evidence_failed", "controller_execution_snapshot_changed",
              "controller_execution_output_limit", "controller_execution_owner_untrusted",
              "controller_execution_override_mismatch", "controller_start_cancelled",
-             "controller_stop_request_failed", "approval_official_history_unavailable"}
+             "controller_stop_request_failed", "approval_official_history_unavailable",
+             "host_review_previous_round_incomplete"}
     code = str(error) if str(error) in codes else detail["failure_detail_code"]
     return {"error_type": detail["exception_type"],
             "error_code": "controller_supervisor_failure" if code == "host_review_exception" else code,
@@ -876,6 +877,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments[:1] == ["--"]:
         arguments = arguments[1:]
     directory = None
+    phase = "arguments"
     try:
         original_fields = (args.original_receipt_file, args.original_owner_task_id, args.original_tool_session_id)
         if args.ignore_cooldown_once or any(value is not None for value in original_fields):
@@ -896,6 +898,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0 if result["status"] in {"completed", "skipped"} else (2 if result["status"] == "waiting" else 1)
         if args.invocation_id is not None or args.tool_session_id is not None or args.wait_seconds:
             raise ValueError("controller_execution_readback_invalid")
+        phase = "configuration"
         auth.load_local_env()
         if args.bind_tool_session is not None:
             if args.receipt_file is None or arguments or args.review_provider or args.review_transport:
@@ -923,23 +926,29 @@ def main(argv: Sequence[str] | None = None) -> int:
                 invocation_id=invocation_directory.name,
                 original=maintenance_runtime.OriginalExecution(args.original_receipt_file,
                     str(args.original_owner_task_id), args.original_tool_session_id))
+        phase = "cooldown_override" if args.ignore_cooldown_once == "YES" else "startup_gate"
         with scope:
             targeted = _target_arguments([sys.executable, "-m", "scripts.finance_preaudit_concurrency_probe", *arguments]) is not None
             gate = approval_lifecycle.startup(PROJECT_ROOT) if targeted else None
-            if configuration.get("transport") == "host_chat" and (gate is None or gate["status"] == "ready"):
+            if gate is None or gate["status"] == "ready":
+                phase = "app_round_closure"
                 host_chat_review.assert_previous_rounds_closed(owner=str(args.owner_task_id))
+            phase = "startup_gate"
             gate = gate or approval_lifecycle.startup(PROJECT_ROOT)
             if gate["status"] != "ready" and not targeted:
                 print(json.dumps({"schema_version": 1, "kind": "approval_startup_gate", **gate}, sort_keys=True))
                 return 0 if gate["status"] == "skipped" else 1
             directory = invocation_directory
+            phase = "supervision"
             receipt = supervise(
                 [sys.executable, "-m", "scripts.finance_preaudit_concurrency_probe", *arguments],
                 directory=directory, owner_task_id=str(args.owner_task_id),
                 detached=True,
             )
-    except (OSError, RuntimeError, ValueError, TypeError, KeyError):
-        print(json.dumps({"error_code": "controller_execution_evidence_failed", "receipt_file": str(directory / "execution.json") if directory else None}))
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
+        print(json.dumps({"error_code": "controller_execution_evidence_failed",
+                          "primary_failure": _failure(error, phase),
+                          "receipt_file": str(directory / "execution.json") if directory else None}))
         return 1
     print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
     return 0 if receipt["result"] in {"completed", "skipped"} else 1

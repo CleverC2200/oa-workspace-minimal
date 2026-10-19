@@ -270,7 +270,7 @@ print(json.dumps(result))
         return result
     monkeypatch.setattr(finance_preaudit_run, "supervise", supervised)
     monkeypatch.setattr(finance_preaudit_run.auth, "load_local_env", lambda: None)
-    assert finance_preaudit_run.main(["--owner-task-id", owner, "--ignore-cooldown-once", "YES",
+    assert finance_preaudit_run.main(["--owner-task-id", owner, "--review-provider", "deepseek", "--ignore-cooldown-once", "YES",
         "--original-receipt-file", str(original.file), "--original-owner-task-id", original.owner_task_id,
         "--original-tool-session-id", original.tool_session_id, "--", *arguments()]) == 0
     receipt = receipts[0]
@@ -281,3 +281,26 @@ print(json.dumps(result))
     runtime_control.write_control_bytes_atomic(audit, audit.read_bytes() + b" ")
     with pytest.raises(ValueError, match="controller_execution_override_mismatch"):
         finance_preaudit_run.read_execution(path, owner_task_id=owner, invocation_id=path.parent.name)
+
+
+@pytest.mark.parametrize('official_production', ['openai'], indirect=True)
+@pytest.mark.parametrize('provider', ['openai', 'deepseek'])
+def test_public_cli_unclosed_app_round_preserves_stop_and_creates_no_waiver(stopped, monkeypatch, capsys, provider):
+    root, original, _calls = stopped
+    assert json.loads(original.file.read_bytes())['review_configuration']['transport'] == 'host_chat'
+    before = runtime_control.stop_file().read_bytes()
+    original_bytes = original.file.read_bytes()
+    monkeypatch.setattr(finance_preaudit_run.auth, 'load_local_env', lambda: None)
+    monkeypatch.setattr(finance_preaudit_run, 'supervise', lambda *_args, **_options: pytest.fail('unclosed App round launched'))
+    result = finance_preaudit_run.main(['--owner-task-id', str(uuid4()), '--review-provider', provider,
+        '--ignore-cooldown-once', 'YES', '--original-receipt-file', str(original.file),
+        '--original-owner-task-id', original.owner_task_id, '--original-tool-session-id', original.tool_session_id,
+        '--', *arguments()])
+    assert result == 1
+    assert runtime_control.stop_file().read_bytes() == before
+    assert original.file.read_bytes() == original_bytes
+    assert not (guard.directory() / 'cooldown-overrides').exists()
+    output = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert output['error_code'] == 'controller_execution_evidence_failed'
+    assert output['primary_failure'] == {'error_type': 'ValueError', 'error_code': 'host_review_previous_round_incomplete',
+                                         'phase': 'cooldown_override'}
