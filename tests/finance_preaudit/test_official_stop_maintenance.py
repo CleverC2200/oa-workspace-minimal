@@ -24,7 +24,7 @@ from tests.finance_preaudit.test_reconciliation import _state
 
 
 @pytest.fixture
-def official_production(tmp_path, monkeypatch, compiled_maintenance_source):
+def official_production(tmp_path, monkeypatch, compiled_maintenance_source, request):
     root = tmp_path / 'oa-workspace-minimal'
     root.mkdir()
     source = Path(maintenance_runtime.__file__).resolve().parents[2]
@@ -78,6 +78,9 @@ raise SystemExit(1)'''
     directory = root / 'runtime/control/executions' / uuid4().hex
     owner = str(uuid4())
     with monkeypatch.context() as environment:
+        provider = getattr(request, 'param', 'deepseek')
+        environment.setenv('OA_REVIEW_PROVIDER', provider)
+        environment.setenv('OA_REVIEW_TRANSPORT', 'host_chat' if provider == 'openai' else 'cli')
         environment.chdir(root)
         environment.setenv('OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE',
             str(root / 'runtime/control/rolling-controller.lock'))

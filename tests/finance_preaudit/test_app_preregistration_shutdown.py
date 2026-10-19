@@ -168,3 +168,16 @@ def test_sealed_pre_registration_history_can_be_read_while_current_writer_is_act
     assert shutdown.sealed_unregistered(args['receipt_file']) == saved
     with pytest.raises(ValueError, match='previous_round_incomplete'):
         host.assert_previous_rounds_closed(owner=str(uuid4()))
+
+
+def test_public_cli_provider_switch_keeps_original_app_closure_gate(failed_start, monkeypatch, capsys):
+    args, _ = failed_start
+    original = args['receipt_file'].read_bytes()
+    monkeypatch.setattr(runner.auth, 'load_local_env', lambda: None)
+    monkeypatch.setattr(runner.approval_lifecycle, 'startup', lambda _root: {'status': 'ready'})
+    monkeypatch.setattr(runner, 'supervise', lambda *_args, **_options: pytest.fail('unclosed App round launched'))
+    assert runner.main(['--owner-task-id', str(uuid4()), '--review-provider', 'deepseek', '--', '--rolling']) == 1
+    result = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert result['primary_failure'] == {'error_type': 'ValueError', 'error_code': 'host_review_previous_round_incomplete',
+                                         'phase': 'app_round_closure'}
+    assert args['receipt_file'].read_bytes() == original
