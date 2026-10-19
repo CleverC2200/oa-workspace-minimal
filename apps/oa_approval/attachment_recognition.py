@@ -173,7 +173,11 @@ def _image_tiles(raw: bytes):
             if max(width, height) <= MAX_IMAGE_DIMENSION:
                 with image.crop(box) as tile:
                     encoded = BytesIO()
-                    tile.save(encoded, format='PNG')
+                    if tile.mode == 'CMYK':
+                        with tile.convert('RGB') as rgb:
+                            rgb.save(encoded, format='PNG')
+                    else:
+                        tile.save(encoded, format='PNG')
                 encoded = encoded.getvalue()
                 if len(encoded) <= MAX_FILE_BYTES:
                     yield box, _image_block(encoded)

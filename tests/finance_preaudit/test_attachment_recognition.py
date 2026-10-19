@@ -627,3 +627,28 @@ def test_animated_gif_is_never_silently_replaced_by_first_frame(tmp_path, monkey
         assert report['error_code'] == 'attachment_animated_image_too_large'
         assert report['parts'] == []
         assert calls == []
+
+
+def test_oversized_cmyk_jpeg_reads_all_regions_as_rgb(tmp_path, monkeypatch):
+    import base64
+    from io import BytesIO
+    from PIL import Image
+
+    source = tmp_path / 'cmyk.jpg'
+    Image.new('CMYK', (9042, 80), (255, 0, 0, 0)).save(source, format='JPEG')
+    original = source.read_bytes()
+    received = []
+
+    def respond(body):
+        url = body['messages'][-1]['content'][1]['image_url']['url']
+        with Image.open(BytesIO(base64.b64decode(url.split(',', 1)[1]))) as tile:
+            received.append((tile.size, tile.mode, tile.getpixel((0, 0))))
+        return {'choices': [{'finish_reason': 'stop', 'message': {'content': 'cyan'}}]}
+
+    fake_http(monkeypatch, respond)
+    report = recognition.recognize(files=[source], output_dir=tmp_path / 'out')
+
+    assert report['status'] == 'complete'
+    assert received == [((4585, 80), 'RGB', (0, 255, 255))] * 2
+    assert source.read_bytes() == original
+    assert report['parts'][0]['content_sha256'] == hashlib.sha256(original).hexdigest()
