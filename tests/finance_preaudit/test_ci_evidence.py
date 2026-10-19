@@ -8,6 +8,7 @@ import subprocess
 import shutil
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -468,3 +469,166 @@ def test_reused_job_metadata_still_enforces_original_execution_budget(tmp_path, 
     assert report['errors'] == ['ci_time_budget_exceeded']
     assert report['upstream_seconds'] == 0
     assert report['reused_job_seconds'][role] == pytest.approx(171, abs=0.01)
+
+
+@pytest.fixture
+def fetched_matrix(matrix_evidence, tmp_path, monkeypatch):
+    from scripts import pytest_evidence
+
+    now = time.time()
+    clock = [now]
+    output = tmp_path / 'merged.json'
+    jobs_file = tmp_path / 'job-timings.json'
+    for key, value in {**CI_IDENTITY, 'GITHUB_REPOSITORY': 'example/oa',
+                       'OA_CI_REQUIRED_RESULTS': json.dumps(attempt_needs((1, 1, 1, 1)))}.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(sys, 'argv', ['pytest_evidence', '--merge-directory', str(matrix_evidence),
+        '--output', str(output), '--jobs-file', str(jobs_file), '--fetch-jobs'])
+    monkeypatch.setattr(pytest_evidence, 'time', SimpleNamespace(
+        time=lambda: clock[0], sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds)))
+
+    def run(snapshots):
+        responses = [json.dumps(snapshot, indent=3).encode() + b'\n' for snapshot in snapshots]
+        received = []
+
+        def gh(command, **kwargs):
+            assert command == ['gh', 'api',
+                'repos/example/oa/actions/runs/1234/attempts/1/jobs?per_page=100']
+            received.append(responses[min(len(received), len(responses) - 1)])
+            return SimpleNamespace(returncode=0, stdout=received[-1], stderr=b'')
+
+        monkeypatch.setattr(subprocess, 'run', gh)
+        result = pytest_evidence.main()
+        return result, json.loads(output.read_text()), received, jobs_file, clock[0] - now
+
+    return run
+
+
+def test_fetched_matrix_waits_for_same_attempt_metadata_and_preserves_raw_snapshots(
+        matrix_evidence, tmp_path, fetched_matrix):
+    ready = job_timings()
+    stale = json.loads(json.dumps(ready))
+    stale['jobs'][0].update(status='in_progress', conclusion=None, completed_at=None)
+    offline = tmp_path / 'offline'
+    shutil.copytree(matrix_evidence, offline)
+    (offline / 'job-timings.json').write_text(json.dumps(stale))
+    original = merge_matrix(offline, tmp_path / 'original-failure.json')
+    assert original.returncode == 1
+    assert json.loads((tmp_path / 'original-failure.json').read_text())['errors'] == [
+        'job_timing_status_untrusted']
+
+    result, report, received, jobs_file, waited = fetched_matrix([stale, ready])
+    assert result == 0
+    assert report['status'] == 'verified' and report['counts'] == {'passed': 32}
+    assert waited == 1
+    assert jobs_file.read_bytes() == received[-1]
+    assert [path.read_bytes() for path in sorted(jobs_file.with_suffix('.snapshots').glob('*.json'))] == received
+    assert json.loads((tmp_path / 'original-failure.json').read_text())['errors'] == [
+        'job_timing_status_untrusted']
+
+
+@pytest.mark.parametrize(('defect', 'error'), [
+    ('failure', 'job_timing_status_untrusted'), ('cancelled', 'job_timing_status_untrusted'),
+    ('timed_out', 'job_timing_status_untrusted'), ('queued', 'job_timing_status_untrusted'),
+    ('running_conclusion', 'job_timing_status_untrusted'),
+    ('running_completed_at', 'job_timing_status_untrusted'),
+    ('current_completed', 'job_timing_status_untrusted'),
+    ('current_completed_at', 'job_timing_status_untrusted'),
+    ('run', 'job_timing_identity_mismatch'), ('attempt', 'job_timing_identity_mismatch'),
+    ('head', 'job_timing_identity_mismatch'), ('missing', 'job_timing_set_untrusted'),
+    ('duplicate', 'job_timing_set_untrusted'), ('truncated', 'job_timing_set_untrusted'),
+    ('clock', 'job_timing_clock_untrusted'), ('current_clock', 'job_timing_clock_untrusted'),
+])
+def test_fetched_matrix_rejects_untrusted_snapshot_without_waiting(fetched_matrix, defect, error):
+    ready = job_timings()
+    invalid = json.loads(json.dumps(ready))
+    invalid['jobs'][0].update(status='in_progress', conclusion=None, completed_at=None)
+    job = invalid['jobs'][2]
+    if defect in {'failure', 'cancelled', 'timed_out'}:
+        job['conclusion'] = defect
+    elif defect == 'queued':
+        job.update(status='queued', conclusion=None, completed_at=None)
+    elif defect == 'running_conclusion':
+        job['status'] = 'in_progress'
+    elif defect == 'running_completed_at':
+        job.update(status='in_progress', conclusion=None)
+    elif defect == 'current_completed':
+        invalid['jobs'][-1].update(status='completed', conclusion='success')
+    elif defect == 'current_completed_at':
+        invalid['jobs'][-1]['completed_at'] = job['completed_at']
+    elif defect == 'run':
+        job['run_id'] = 9999
+    elif defect == 'attempt':
+        job['run_attempt'] = 2
+    elif defect == 'head':
+        job['head_sha'] = CI_IDENTITY['GITHUB_SHA']
+    elif defect == 'missing':
+        invalid['jobs'].pop()
+        invalid['total_count'] -= 1
+    elif defect == 'duplicate':
+        invalid['jobs'][1] = job
+    elif defect == 'truncated':
+        invalid['total_count'] += 1
+    elif defect == 'clock':
+        job['started_at'] = '2026-10-17T00:00:00'
+    elif defect == 'current_clock':
+        invalid['jobs'][-1]['started_at'] = '9999-01-01T00:00:00Z'
+    result, report, received, jobs_file, waited = fetched_matrix([invalid, ready])
+    assert result == 1 and report['errors'] == [error]
+    assert len(received) == 1 and waited == 0
+    assert jobs_file.read_bytes() == received[0]
+    assert list(jobs_file.with_suffix('.snapshots').iterdir()) == [
+        jobs_file.with_suffix('.snapshots') / '01.json']
+
+
+def test_fetched_matrix_exhausts_readiness_limit_without_real_sleep(fetched_matrix):
+    stale = job_timings()
+    stale['jobs'][0].update(status='in_progress', conclusion=None, completed_at=None)
+    result, report, received, jobs_file, waited = fetched_matrix([stale])
+    assert result == 1 and report['errors'] == ['job_timing_readiness_exhausted']
+    assert len(received) == 20 and waited == 19
+    assert [path.read_bytes() for path in sorted(jobs_file.with_suffix('.snapshots').glob('*.json'))] == received
+    assert jobs_file.read_bytes() == received[-1]
+
+
+def test_fetched_matrix_readiness_wait_still_exceeds_original_budget(fetched_matrix):
+    ready = job_timings()
+    ready['jobs'][-1]['started_at'] = datetime.fromtimestamp(time.time() - 39.5, timezone.utc).isoformat()
+    stale = json.loads(json.dumps(ready))
+    stale['jobs'][0].update(status='in_progress', conclusion=None, completed_at=None)
+    result, report, received, jobs_file, waited = fetched_matrix([stale, ready])
+    assert result == 1 and report['errors'] == ['ci_time_budget_exceeded']
+    assert waited == 1 and len(received) == 2
+    assert report['budget_seconds'] == 170 and 170 < report['elapsed_seconds'] < 171
+    assert report['upstream_seconds'] == 130 and 40 < report['aggregation_seconds'] < 41
+    assert jobs_file.read_bytes() == received[-1]
+
+
+def test_offline_jobs_file_never_fetches_metadata(matrix_evidence, tmp_path, monkeypatch):
+    from scripts import pytest_evidence
+
+    def forbidden(*args, **kwargs):
+        pytest.fail('offline jobs file invoked an external process')
+
+    output = tmp_path / 'merged.json'
+    for key, value in {**CI_IDENTITY,
+                       'OA_CI_REQUIRED_RESULTS': json.dumps(attempt_needs((1, 1, 1, 1)))}.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv('GITHUB_REPOSITORY', raising=False)
+    monkeypatch.setattr(subprocess, 'run', forbidden)
+    monkeypatch.setattr(sys, 'argv', ['pytest_evidence', '--merge-directory', str(matrix_evidence),
+        '--output', str(output), '--jobs-file', str(matrix_evidence / 'job-timings.json')])
+    assert pytest_evidence.main() == 0
+    assert json.loads(output.read_text())['status'] == 'verified'
+    assert not (matrix_evidence / 'job-timings.snapshots').exists()
+
+
+def test_fetched_matrix_can_converge_on_last_permitted_read(fetched_matrix):
+    ready = job_timings()
+    stale = json.loads(json.dumps(ready))
+    stale['jobs'][0].update(status='in_progress', conclusion=None, completed_at=None)
+    result, report, received, jobs_file, waited = fetched_matrix([*[stale] * 19, ready])
+    assert result == 0 and report['status'] == 'verified'
+    assert len(received) == 20 and waited == 19
+    assert len(list(jobs_file.with_suffix('.snapshots').glob('*.json'))) == 20
+    assert jobs_file.read_bytes() == received[-1]
