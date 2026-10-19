@@ -292,6 +292,7 @@ with control.global_controller_lease():
     assert not receipt.get('owner_process_lost') and not runtime_control.stop_requested()
     report = runner.read_execution(directory / 'execution.json', owner_task_id=owner, invocation_id=directory.name)
     assert report['status'] == 'completed' and report['terminal'] is True
+    assert not (directory / 'supervisor-exit.json').exists()
 
 
 def test_pid_reused_supervisor_is_blocked_without_changing_original_receipt(tmp_path, monkeypatch):
@@ -308,3 +309,115 @@ def test_pid_reused_supervisor_is_blocked_without_changing_original_receipt(tmp_
     report = runner.read_execution(path, owner_task_id=owner, invocation_id=directory.name)
     assert report['state'] == 'supervisor_lost' and report['status'] == 'blocked'
     assert report['exit_code'] is None and path.read_bytes() == saved
+
+
+def lost_supervisor(tmp_path, monkeypatch, returncode):
+    controls = {key: value for key, value in os.environ.items() if key in {
+        'OA_FINANCE_PREAUDIT_STOP_FILE', 'OA_FROZEN_WRITER_LOCK_FILE',
+        'OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE'}}
+    for key in list(os.environ):
+        if key.startswith('OA_') or key in {'PYTHONPATH', 'PYTHONHOME'}:
+            monkeypatch.delenv(key)
+    for key, value in {**controls, 'HOME': str(tmp_path / 'home'),
+                       'CODEX_HOME': str(tmp_path / 'home/codex'),
+                       'OA_REVIEW_PROVIDER': 'openai', 'OA_REVIEW_TRANSPORT': 'host_chat'}.items():
+        monkeypatch.setenv(key, value)
+    guard = '''import socket
+def reject_network(*args, **kwargs): raise RuntimeError('offline_network_forbidden')
+socket.getaddrinfo=reject_network
+socket.socket.connect=reject_network
+socket.create_connection=reject_network
+'''
+    real_popen = subprocess.Popen
+    entry = 'from scripts.finance_preaudit_run import _supervisor_entry; _supervisor_entry()'
+
+    def launch(command, *args, **kwargs):
+        if command == [sys.executable, '-c', entry]:
+            handler = f'import os,signal\nsignal.signal(signal.SIGUSR1,lambda *_: os._exit({returncode}))\n'
+            command = [sys.executable, '-c', guard + handler + entry]
+        return real_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, 'Popen', launch)
+    owner = str(uuid4())
+    directory = tmp_path / 'control/executions' / uuid4().hex
+    before = tmp_path / 'before.json'
+    signum = signal.SIGKILL if returncode < 0 else signal.SIGUSR1
+    child = guard + f'''import os,json,time,signal
+from pathlib import Path
+path=Path(os.environ['OA_CONTROLLER_EXECUTION_MANIFEST_FILE']).with_name('execution.json')
+deadline=time.monotonic()+5
+while time.monotonic()<deadline:
+    value=json.loads(path.read_text())
+    if value['state']=='waiting' and value['controller_pid']==os.getpid():break
+    time.sleep(.01)
+else:raise RuntimeError('synthetic_controller_not_waiting')
+assert value['supervisor_pid']==os.getppid()
+Path({str(before)!r}).write_bytes(path.read_bytes())
+os.kill(os.getppid(),{int(signum)})
+os._exit(0)
+'''
+    with pytest.raises(ValueError, match='^controller_supervisor_lost$'):
+        runner.supervise([sys.executable, '-c', child], directory=directory,
+                         owner_task_id=owner, detached=True)
+    saved = before.read_bytes()
+    receipt = json.loads(saved)
+    wait_until(lambda: approval_guard.process_identity(receipt['controller_pid']) is None)
+    assert (directory / 'execution.json').read_bytes() == saved
+    return owner, directory, receipt
+
+
+@pytest.mark.parametrize('returncode,signum', [(0, None), (7, None), (-signal.SIGKILL, signal.SIGKILL)])
+def test_lost_supervisor_retains_actual_wait_observation_without_claiming_completion(tmp_path, monkeypatch, returncode, signum):
+    owner, directory, receipt = lost_supervisor(tmp_path, monkeypatch, returncode)
+    report = runner.read_execution(directory / 'execution.json', owner_task_id=owner,
+                                   invocation_id=directory.name)
+    observation = report['supervisor_exit_observation']
+    assert observation['wait_returncode'] == returncode and observation['wait_signal'] == signum
+    assert observation['supervisor_pid'] == receipt['supervisor_pid']
+    assert observation['owner_task_id'] == owner and observation['invocation_id'] == directory.name
+    assert report['state'] == 'supervisor_lost' and report['status'] == 'blocked'
+    assert report['terminal'] is False and report['exit_code'] is None
+    assert report['children_reaped'] == 'unknown'
+    assert (directory / 'supervisor-exit.json').stat().st_mode & 0o777 == 0o600
+
+
+def test_missing_or_invalid_supervisor_observation_cannot_complete_lost_execution(tmp_path, monkeypatch):
+    owner, directory, _ = lost_supervisor(tmp_path, monkeypatch, 0)
+    path = directory / 'execution.json'
+    saved = path.read_bytes()
+    diagnostic = directory / 'supervisor-exit.json'
+    observation = json.loads(diagnostic.read_bytes())
+    diagnostic.unlink()
+    invalid = [None, b'{', *[json.dumps({**observation, key: value}).encode() for key, value in (
+        ('owner_task_id', str(uuid4())), ('invocation_id', uuid4().hex),
+        ('supervisor_pid', observation['supervisor_pid'] + 1), ('wait_signal', signal.SIGTERM),
+        ('wait_returncode', True), ('observed_at', '2000-01-01T00:00:00+00:00'))]]
+    for content in invalid:
+        if content is not None:
+            diagnostic.write_bytes(content)
+        report = runner.read_execution(path, owner_task_id=owner, invocation_id=directory.name)
+        assert report['status'] == 'blocked' and report['terminal'] is False
+        assert report['exit_code'] is None and report['children_reaped'] == 'unknown'
+        assert 'supervisor_exit_observation' not in report
+        assert path.read_bytes() == saved
+    diagnostic.unlink()
+    diagnostic.symlink_to(path)
+    assert 'supervisor_exit_observation' not in runner.read_execution(
+        path, owner_task_id=owner, invocation_id=directory.name)
+
+
+def test_supervisor_observation_write_failure_preserves_original_loss(tmp_path, monkeypatch):
+    real_open = os.open
+
+    def unwritable(path, flags, *args, **kwargs):
+        if path == 'supervisor-exit.json' and flags & os.O_CREAT:
+            raise PermissionError('synthetic_diagnostic_unwritable')
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, 'open', unwritable)
+    owner, directory, _ = lost_supervisor(tmp_path, monkeypatch, 7)
+    report = runner.read_execution(directory / 'execution.json', owner_task_id=owner,
+                                   invocation_id=directory.name)
+    assert report['status'] == 'blocked' and report['error_code'] == 'controller_supervisor_lost'
+    assert report['terminal'] is False and report['exit_code'] is None
+    assert not (directory / 'supervisor-exit.json').exists()
