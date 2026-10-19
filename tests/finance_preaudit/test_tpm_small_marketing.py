@@ -385,7 +385,7 @@ def test_tpm_worker_uses_only_the_tpm_rule_pack(tmp_path: Path) -> None:
 
     assert schema["properties"]["workflow_key"]["const"] == WORKFLOW_KEY
     assert schema["properties"]["rule_version"]["const"] == RULE_VERSION
-    assert "TPM小额市场费生产预审" in prompt
+    assert "TPM小额市场费预审的单据审核者" in prompt
     assert "tpm-small-marketing-fee.md" in prompt
     assert "四项" in prompt
     assert "第六项" not in prompt
