@@ -18,6 +18,10 @@ def bind_frozen_fields(action_file: Path, decision: dict) -> dict:
         raise ValueError("read_only_port_unavailable")
     reader = FlowEngine(root=path.parents[4], discover_candidates=unavailable, collect_material=unavailable)
     action, _state, packet = reader._open_attempt(path)
+    return bind_fields(action, packet, decision)
+
+
+def bind_fields(action: dict, packet: dict, decision: dict) -> dict:
     if not isinstance(decision, dict):
         raise ValueError("review_decision_invalid")
     result = dict(decision)

@@ -32,12 +32,11 @@ def test_cli_summarizes_only_explicit_sealed_round_without_writes(exchange, tmp_
     assert {file for file in tmp_path.rglob('*') if file.is_file()} - set(original) == {output}
 
 
-def completed_case(exchange, tmp_path, *, controlled=True, legacy=False):
-    import hashlib
-    from uuid import uuid4
+def completed_case(exchange, tmp_path, *, controlled=True, legacy=False, close_action=True, submitted=True):
     from apps import json_artifact
     from apps.oa_finance_preaudit import host_chat_review as host
     from tests.finance_preaudit.test_flow_engine_support import _engine, _decision, _reviewed_items
+    from tests.finance_preaudit.test_host_chat_review import draft_source, native_call
     action, _, owner, child, _, manifest, _ = exchange
     root = action.parents[4]
     engine = _engine(root, controlled=controlled)
@@ -49,27 +48,91 @@ def completed_case(exchange, tmp_path, *, controlled=True, legacy=False):
         state.pop('action_reference_sha256')
         json_artifact.write_json_atomic(current, opened)
         json_artifact.write_json_atomic(state_file, state)
-    fingerprints = host._fingerprints(current)
+    host.approval_lifecycle.heartbeat(manifest['run_id'], manifest['controller_instance_id'], {current}, [], writer_active=False)
+    request_file = host.publish(current, prompt='Read the frozen support materials.', timeout_seconds=60)
+    parent = child.with_name('parent.jsonl')
+    dispatch = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(request_file)},
+                           'completion-dispatch', {})
+    host.assign(request_file, slot=0, owner=owner, source=parent, source_line=dispatch)
     decision = tmp_path / 'completed-decision.json'
-    json_artifact.write_json_atomic(decision, _decision(opened, _reviewed_items(['pass'] * 4)))
-    engine.complete_review(current, decision)
-    shutdown.begin(owner=owner, reason='completed')
+    payload = _decision(opened, _reviewed_items(['pass'] * 4))
+    for field in ('schema_version', 'kind', 'action_token', 'workflow_key', 'rule_version'):
+        payload.pop(field)
+    line = draft_source(child, request_file, decision, owner, payload=payload)
+    if submitted:
+        host.submit(request_file, decision, owner=owner, source=child, source_line=line)
+    if close_action:
+        consumed = tmp_path / 'consumed-decision.json'
+        json_artifact.write_json_atomic(consumed, host.read_result(request_file)['decision'])
+        engine.complete_review(current, consumed)
+    shutdown.begin(owner=owner, reason='completed' if close_action else 'cancelled')
     controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
     seal_execution(owner, manifest)
     shutdown.finish(owner=owner, **proofs(owner, child))
-    registry_file = host.registry_file(owner, manifest['run_id'])
+    return root, owner, manifest['run_id'], current, host.registry_file(owner, manifest['run_id']), request_file
+
+
+def test_cli_never_counts_a_request_without_native_assignment(exchange, tmp_path, capsys):
+    from apps.oa_finance_preaudit import host_chat_review as host
+    root, owner, run, _, registry_file, _ = completed_case(exchange, tmp_path)
     registry = json.loads(registry_file.read_text())
-    request_id = uuid4().hex
-    request_file = host._request_file(current, 'finance', owner=owner, run_id=manifest['run_id'])
-    request = {'schema_version': 1, 'kind': 'preaudit_host_review_request', 'review_kind': 'finance',
-               'request_id': request_id, 'owner_task_id': owner, 'run_id': manifest['run_id'],
-               'controller_instance_id': manifest['controller_instance_id'], 'action_file': str(current),
-               'input_fingerprints': fingerprints}
-    host.guard.write(request_file, request)
-    registry['requests'] = {request_id: {'request_file': str(request_file),
-                           'request_sha256': hashlib.sha256(request_file.read_bytes()).hexdigest()}}
+    registry['assignments'] = {}
     host.guard.write(registry_file, registry)
-    return root, owner, manifest['run_id'], current, registry_file, request_file
+    assert cli.main(['completed-receipts', '--root', str(root), '--owner-task-id', owner, '--run-id', run]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result['counts']['completed'] == 0
+    assert result['counts']['invalid'] == 1
+
+
+@pytest.mark.parametrize('damage', ['dispatch', 'draft_source', 'draft_bytes', 'missing_submission',
+                                  'submission_decision', 'late_submission', 'reviewer', 'dispatch_reused'])
+def test_cli_revalidates_each_rounds_native_submission(exchange, tmp_path, capsys, damage):
+    import hashlib
+    from apps.oa_finance_preaudit import host_chat_review as host
+    root, owner, run, _, registry_file, request_file = completed_case(exchange, tmp_path)
+    registry = json.loads(registry_file.read_text())
+    request = json.loads(request_file.read_text())
+    assigned = registry['assignments'][request['request_id']]
+    submission_file = host._submission_file(request_file)
+    submitted = json.loads(submission_file.read_text())
+    if damage in {'dispatch', 'draft_source'}:
+        proof = assigned['dispatch_source'] if damage == 'dispatch' else submitted['source']
+        source = Path(proof['session_file'])
+        rows = source.read_text().splitlines()
+        index = proof['line'] - 1
+        row = json.loads(rows[index])
+        if damage == 'dispatch':
+            row['payload']['arguments'] = json.dumps({'target': '/root/reviewer_0', 'message': 'unrelated request'})
+        else:
+            row['payload']['input'] += '\ntext("unrelated statement");'
+        rows[index] = json.dumps(row)
+        source.write_text('\n'.join(rows) + '\n')
+    elif damage == 'draft_bytes':
+        Path(submitted['source']['decision_file']).write_text('{}')
+    elif damage == 'missing_submission':
+        submission_file.unlink()
+    elif damage == 'dispatch_reused':
+        registry['assignments']['unrelated-request'] = dict(assigned)
+        host.guard.write(registry_file, registry)
+    else:
+        if damage == 'submission_decision':
+            submitted['decision']['items'][0]['conclusion'] = 'A different decision with the same status.'
+        elif damage == 'late_submission':
+            submitted['submitted_at'] = assigned['submitted_at'] = registry['shutdown']['started_at'] + .001
+        else:
+            assigned['reviewer_task_id'] = registry['reviewers'][1]['reviewer_task_id']
+            submitted['assignment']['reviewer_task_id'] = assigned['reviewer_task_id']
+        host.guard.write(submission_file, submitted)
+        assigned['submission_sha256'] = hashlib.sha256(submission_file.read_bytes()).hexdigest()
+        host.guard.write(registry_file, registry)
+    original = {file: file.read_bytes() for file in tmp_path.rglob('*') if file.is_file()}
+
+    assert cli.main(['completed-receipts', '--root', str(root), '--owner-task-id', owner, '--run-id', run]) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert result['counts']['completed'] == 0
+    assert result['counts']['invalid'] == 1
+    assert all(file.read_bytes() == raw for file, raw in original.items())
 
 
 @pytest.mark.parametrize('fingerprint', ['material.json', 'action_token_sha256'])
@@ -192,15 +255,22 @@ def test_cli_keeps_supported_legacy_action_and_state_layout_read_only(exchange, 
     assert all(file.read_bytes() == raw for file, raw in original.items())
 
 
-def test_cli_deduplicates_same_action_across_independently_sealed_rounds(exchange, tmp_path, monkeypatch, capsys):
-    import hashlib
+@pytest.mark.parametrize('old_submitted', [True, False])
+def test_cli_deduplicates_same_action_across_independently_sealed_rounds(exchange, tmp_path, monkeypatch, capsys, old_submitted):
     import os
     from uuid import uuid4
     from apps.oa_finance_preaudit import host_chat_review as host
     from tests.finance_preaudit.test_app_reviewer_slots import original_execution
     from tests.finance_preaudit.test_host_chat_review import native_call
-    root, owner, first_run, action, _, original_request = completed_case(exchange, tmp_path)
-    original = json.loads(original_request.read_text())
+    from apps import json_artifact
+    from apps.oa_approval import runtime_control
+    from tests.finance_preaudit.test_flow_engine_support import _engine
+    from tests.finance_preaudit.test_host_chat_review import draft_source
+    root, owner, first_run, action, _, original_request = completed_case(exchange, tmp_path, close_action=False, submitted=old_submitted)
+    original = json.loads((tmp_path / 'completed-decision.json').read_text())
+    original_request_bytes = original_request.read_bytes()
+    original_draft_bytes = (tmp_path / 'completed-decision.json').read_bytes()
+    assert runtime_control.clear_cycle_stop()
     parent = Path(exchange[3]).with_name('parent.jsonl')
     reviewers = []
     for slot in range(3):
@@ -220,25 +290,28 @@ def test_cli_deduplicates_same_action_across_independently_sealed_rounds(exchang
         monkeypatch.delenv(host.guard.EXECUTION_OWNERS_ENV)
         line = native_call(parent, 'functions.exec', 'heartbeat ' + owner, 'next-heartbeat', {})
         host.heartbeat(owner=owner, source=parent, source_line=line, run_id=manifest['run_id'])
+        host.approval_lifecycle.heartbeat(manifest['run_id'], manifest['controller_instance_id'], {action}, [], writer_active=False)
+        request_file = host.publish(action, prompt='Review the still-open frozen action.', timeout_seconds=60)
+        dispatch = native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(request_file)},
+                               'next-completion-dispatch', {})
+        host.assign(request_file, slot=0, owner=owner, source=parent, source_line=dispatch)
+        target = tmp_path / 'next-completed-decision.json'
+        source_line = draft_source(Path(reviewers[0]['session_file']), request_file, target, owner, payload=original)
+        host.submit(request_file, target, owner=owner, source=Path(reviewers[0]['session_file']), source_line=source_line)
+        consumed = tmp_path / 'next-consumed-decision.json'
+        json_artifact.write_json_atomic(consumed, host.read_result(request_file)['decision'])
+        _engine(root, controlled=True).complete_review(action, consumed)
         shutdown.begin(owner=owner, reason='completed', run_id=manifest['run_id'])
         controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
         seal_execution(owner, manifest, run_id=manifest['run_id'])
         shutdown.finish(owner=owner, run_id=manifest['run_id'], **proofs(owner, child))
-    registry_file = host.registry_file(owner, manifest['run_id'])
-    registry = json.loads(registry_file.read_text())
-    request_id = uuid4().hex
-    request_file = host._request_file(action, 'finance', owner=owner, run_id=manifest['run_id'])
-    request = {**original, 'request_id': request_id, 'run_id': manifest['run_id'],
-               'controller_instance_id': manifest['controller_instance_id']}
-    host.guard.write(request_file, request)
-    registry['requests'] = {request_id: {'request_file': str(request_file),
-                            'request_sha256': hashlib.sha256(request_file.read_bytes()).hexdigest()}}
-    host.guard.write(registry_file, registry)
     evidence = {file: file.read_bytes() for file in tmp_path.rglob('*') if file.is_file()}
     assert cli.main(['completed-receipts', '--root', str(root), '--owner-task-id', owner,
                      '--run-id', first_run, '--run-id', manifest['run_id']]) == 0
     result = json.loads(capsys.readouterr().out)
-    assert result['counts'] == {'completed': 1, 'excluded': 0, 'invalid': 0, 'duplicate': 1}
+    assert result['counts'] == {'completed': 1, 'excluded': int(not old_submitted), 'invalid': 0, 'duplicate': int(old_submitted)}
+    assert original_request.read_bytes() == original_request_bytes
+    assert (tmp_path / 'completed-decision.json').read_bytes() == original_draft_bytes
     assert result['selected_rounds'] == 2
     assert all(file.read_bytes() == raw for file, raw in evidence.items())
 

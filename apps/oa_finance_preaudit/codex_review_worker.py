@@ -807,6 +807,10 @@ def _normalize_decision(action_file: Path, decision: dict) -> dict:
     ):
         return decision
     item_keys = _frozen_item_keys(action_file, workflow_key)
+    return _normalize_keyed_items(decision, item_keys)
+
+
+def _normalize_keyed_items(decision: dict, item_keys: tuple[str, ...]) -> dict:
     keyed_items = decision.get("items")
     if (
         not item_keys

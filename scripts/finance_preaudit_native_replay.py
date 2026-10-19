@@ -212,20 +212,11 @@ def run(args, *, executor=None):
 
 
 def _write_verification_report(target, report, project):
+    from apps.oa_finance_preaudit.cli import _private_report_file
     target = target.expanduser().absolute()
     if target.resolve().is_relative_to(project.resolve()):
         raise ValueError('acceptance_report_inside_model_input')
-    raw = (json.dumps(report, ensure_ascii=False, sort_keys=True) + '\n').encode('utf-8')
-    fingerprint = hashlib.sha256(raw).hexdigest()
-    descriptor = os.open(target, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, 'w+b') as stream:
-        stream.write(raw)
-        stream.flush()
-        os.fsync(stream.fileno())
-        stream.seek(0)
-        if hashlib.sha256(stream.read()).hexdigest() != fingerprint:
-            raise OSError('acceptance_report_readback_failed')
-    return {'path': str(target), 'bytes': len(raw), 'sha256': fingerprint}
+    return _private_report_file(report, target)
 
 
 def verify(args):
@@ -339,7 +330,7 @@ def verify(args):
         try:
             report_file = _write_verification_report(args.output_file,
                 {**report, 'independent_review': independent_details}, project)
-        except (OSError, ValueError):
+        except (OSError, RuntimeError, ValueError):
             report['findings'].append('acceptance_report_file_failed:choose a new file outside the native project in an existing private directory')
             report['business_acceptance'] = 'not_accepted'
         else:

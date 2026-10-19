@@ -722,6 +722,42 @@ def pending(*, owner: str | None = None, manifest: dict | None = None, run_id: s
     return results
 
 
+def _dispatch_source(request_file: Path, request: dict, registered: dict, *, slot: int, source: Path, source_line: int) -> dict:
+    owner = request['owner_task_id']
+    reviewer = registered['reviewers'][slot]
+    if str(source.absolute()) != registered['reviewers'][0]['spawn_source']['session_file']:
+        raise ValueError('host_review_source_untrusted')
+    native, proof = _native_source(source, owner, source_line, output=True)
+    arguments = _tool(native['anchor'], 'followup_task')
+    message = arguments.get('message')
+    readable = isinstance(message, str) and str(request_file) in message
+    opaque = (isinstance(message, str) and 100 <= len(message) <= 1024 * 1024
+              and re.fullmatch(r'gAAAA[A-Za-z0-9_-]+={0,2}', message) is not None)
+    call_id = native['anchor']['payload']['call_id']
+    if (arguments.get('target') not in {reviewer['agent_path'], reviewer['agent_path'].rsplit('/', 1)[-1]}
+            or not (readable or opaque) or not isinstance(call_id, str)
+            or proof['output'].get('error') or proof['output'].get('isError') is True):
+        raise ValueError('host_review_source_untrusted')
+    from datetime import datetime
+    timestamp = native['anchor'].get('timestamp')
+    if not isinstance(timestamp, str):
+        raise ValueError('host_review_stale_dispatch')
+    dispatched_at = datetime.fromisoformat(timestamp.replace('Z', '+00:00')).timestamp()
+    if not request['created_at'] <= dispatched_at <= time.time():
+        raise ValueError('host_review_stale_dispatch')
+    return {'dispatch_source': proof, 'dispatch_call_id': call_id,
+            'dispatch_message_readable': readable, 'dispatched_at': dispatched_at}
+
+
+def _dispatch_reused(registered: dict, dispatch: dict, *, exclude: str | None = None) -> bool:
+    source = dispatch['dispatch_source']
+    return any(request_id != exclude and (
+        item.get('dispatch_call_id') == dispatch['dispatch_call_id']
+        or (item['dispatch_source']['session_file'] == source['session_file']
+            and item['dispatch_source']['line'] == source['line']))
+        for request_id, item in registered['assignments'].items())
+
+
 def assign(request_file: Path, *, slot: int, owner: str, source: Path, source_line: int, run_id: str | None = None) -> dict:
     """Bind one current request to a fixed child after an actual followup_task call."""
     request_file = request_file.absolute()
@@ -737,45 +773,20 @@ def assign(request_file: Path, *, slot: int, owner: str, source: Path, source_li
             raise ValueError('host_review_slot_untrusted')
         if registered.get('requests', {}).get(request['request_id']) != {'request_file': str(request_file), 'request_sha256': hashlib.sha256(raw).hexdigest()}:
             raise ValueError('host_review_request_untrusted')
-        reviewer = registered['reviewers'][slot]
-        if str(source.absolute()) != registered['reviewers'][0]['spawn_source']['session_file']:
-            raise ValueError('host_review_source_untrusted')
-        native, proof = _native_source(source, owner, source_line, output=True)
-        arguments = _tool(native['anchor'], 'followup_task')
-        message = arguments.get('message')
-        readable = isinstance(message, str) and str(request_file) in message
-        # Some App recordings make messages opaque. This shape is not decrypted
-        # or authenticated here; the actual child's request-bound publication is
-        # still mandatory before any result can be accepted.
-        opaque = (isinstance(message, str) and 100 <= len(message) <= 1024 * 1024
-                  and re.fullmatch(r'gAAAA[A-Za-z0-9_-]+={0,2}', message) is not None)
-        call_id = native['anchor']['payload']['call_id']
-        if (arguments.get('target') not in {reviewer['agent_path'], reviewer['agent_path'].rsplit('/', 1)[-1]}
-                or not (readable or opaque) or not isinstance(call_id, str)
-                or proof['output'].get('error') or proof['output'].get('isError') is True):
-            raise ValueError('host_review_source_untrusted')
+        dispatch = _dispatch_source(request_file, request, registered, slot=slot, source=source, source_line=source_line)
+        proof = dispatch['dispatch_source']
         existing = registered['assignments'].get(request['request_id'])
         if existing is not None:
             if existing['slot'] == slot and existing['dispatch_source'] == proof:
                 return existing
             raise ValueError('host_review_assignment_rebinding')
-        if any(item.get('dispatch_call_id') == call_id
-               or (item['dispatch_source']['session_file'] == str(source.absolute()) and item['dispatch_source']['line'] == source_line)
-               for item in registered['assignments'].values()):
+        if _dispatch_reused(registered, dispatch):
             raise ValueError('host_review_dispatch_reused')
         if any(item['slot'] == slot and item['state'] in {'assigned', 'failed_fenced'} for item in registered['assignments'].values()):
             raise ValueError('host_review_slot_busy')
-        from datetime import datetime
-        timestamp = native['anchor'].get('timestamp')
-        if not isinstance(timestamp, str):
-            raise ValueError('host_review_stale_dispatch')
-        dispatched_at = datetime.fromisoformat(timestamp.replace('Z', '+00:00')).timestamp()
-        if not request['created_at'] <= dispatched_at <= time.time():
-            raise ValueError('host_review_stale_dispatch')
         value = {'request_id': request['request_id'], 'request_sha256': hashlib.sha256(raw).hexdigest(),
-                 'slot': slot, 'reviewer_task_id': reviewer['reviewer_task_id'], 'state': 'assigned',
-                 'dispatch_source': proof, 'dispatch_call_id': call_id, 'dispatch_message_readable': readable,
-                 'dispatched_at': dispatched_at}
+                 'slot': slot, 'reviewer_task_id': registered['reviewers'][slot]['reviewer_task_id'],
+                 'state': 'assigned', **dispatch}
         registered['assignments'][request['request_id']] = value
         guard.write(path, registered)
     return value
@@ -921,10 +932,11 @@ def publish(action: Path, *, prompt: str, timeout_seconds: int, kind: str = 'fin
     return request_file
 
 
-def _submission(request_file: Path, request: dict) -> tuple[bytes, dict]:
+def _submission(request_file: Path, request: dict, *, registered: dict | None = None) -> tuple[bytes, dict]:
     action = Path(request['action_file'])
     raw, submitted = _read(_submission_file(request_file))
-    registered = _registry(request['owner_task_id'], run_id=request['run_id'])
+    if registered is None:
+        registered = _registry(request['owner_task_id'], run_id=request['run_id'])
     assigned = registered['assignments'].get(request['request_id'])
     if (assigned is None or assigned['state'] != 'submitted'
             or assigned.get('submission_sha256') != hashlib.sha256(raw).hexdigest()
@@ -942,6 +954,47 @@ def _submission(request_file: Path, request: dict) -> tuple[bytes, dict]:
                                  Path(source['decision_file']), assigned=assigned):
         raise ValueError('host_review_source_untrusted')
     return raw, submitted
+
+
+def sealed_assignment(request_file: Path, request: dict, registered: dict) -> dict:
+    assigned = registered['assignments'][request['request_id']]
+    slot = assigned['slot']
+    if type(slot) is not int or slot not in range(3):
+        raise ValueError('host_review_assignment_untrusted')
+    reviewer = registered['reviewers'][slot]
+    if (assigned['request_id'] != request['request_id']
+            or assigned['request_sha256'] != hashlib.sha256(_read(request_file)[0]).hexdigest()
+            or assigned['reviewer_task_id'] != reviewer['reviewer_task_id']):
+        raise ValueError('host_review_assignment_untrusted')
+    dispatch = _dispatch_source(request_file, request, registered, slot=slot,
+        source=Path(assigned['dispatch_source']['session_file']), source_line=assigned['dispatch_source']['line'])
+    if (any(assigned[key] != value for key, value in dispatch.items())
+            or _dispatch_reused(registered, dispatch, exclude=request['request_id'])):
+        raise ValueError('host_review_assignment_untrusted')
+    if (not registered['registered_at'] <= request['created_at'] <= assigned['dispatched_at']
+            <= registered['shutdown']['started_at'] <= registered['closed_at']
+            or not assigned['dispatched_at'] < request['expires_at']
+            or assigned['dispatch_source']['output_line'] >= min(
+                proof['line'] for proof in registered['shutdown']['receipt']['interrupt_sources'])):
+        raise ValueError('host_review_stale_source')
+    return assigned
+
+
+def sealed_submission(request_file: Path, request: dict, registered: dict) -> dict:
+    from datetime import datetime
+    assigned = sealed_assignment(request_file, request, registered)
+    reviewer = registered['reviewers'][assigned['slot']]
+    _, submitted = _submission(request_file, request, registered=registered)
+    source = submitted['source']
+    if source['session_file'] != reviewer['child_source']['session_file']:
+        raise ValueError('host_review_source_untrusted')
+    native, _ = _native_source(Path(source['session_file']), reviewer['reviewer_task_id'], source['line'])
+    published_at = datetime.fromisoformat(native['anchor']['timestamp'].replace('Z', '+00:00')).timestamp()
+    if (not assigned['dispatched_at'] <= published_at <= submitted['submitted_at'] == assigned['submitted_at']
+            or not submitted['submitted_at'] <= registered['shutdown']['started_at'] <= registered['closed_at']
+            or not submitted['submitted_at'] < request['expires_at']):
+        raise ValueError('host_review_stale_source')
+    return submitted
 
 
 def read_result(request_file: Path) -> dict:
