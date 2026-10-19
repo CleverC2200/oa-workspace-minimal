@@ -1028,7 +1028,7 @@ def test_child_decision_bytes_cannot_be_replaced_after_the_completed_native_writ
 
 
 @pytest.mark.parametrize('damage', ['commented_command', 'unrelated_success', 'mixed_failure', 'actual_output_list'])
-def test_native_publisher_requires_executable_command_and_its_exact_receipt(exchange, damage):
+def test_native_publisher_requires_executable_command_and_its_exact_receipt(exchange, damage, monkeypatch):
     _, draft, owner, child, *_ = exchange
     thread, results, request = start(exchange)
     rows = child.read_text().splitlines()
@@ -1045,15 +1045,32 @@ def test_native_publisher_requires_executable_command_and_its_exact_receipt(exch
             {'type': 'input_text', 'text': 'Script completed\nWall time 0.1 seconds\nOutput:'},
             {'type': 'input_text', 'text': json.dumps(shell)}])
     rows[1], rows[2] = json.dumps(call), json.dumps(output)
-    child.write_text('\n'.join(rows) + '\n')
+    observations = []
+    original_open, original_replace = Path.open, os.replace
+
+    def observe_open(path, mode='r', *args, **kwargs):
+        stream = original_open(path, mode, *args, **kwargs)
+        if path == child and 'w' in mode:
+            observations.append(host.poll_result(request))
+        return stream
+
+    def observe_replace(source, target, **kwargs):
+        if target == child.name:
+            observations.append(host.poll_result(request))
+        return original_replace(source, target, **kwargs)
+
+    monkeypatch.setattr(Path, 'open', observe_open)
+    monkeypatch.setattr(os, 'replace', observe_replace)
     try:
+        runtime_control.write_control_bytes_atomic(child, ('\n'.join(rows) + '\n').encode('utf-8'))
+        assert observations == [None], json.dumps(observations)
         if damage == 'actual_output_list':
             assert host.submit(request, draft, owner=owner, source=child, source_line=2)['status'] == 'published'
         else:
             with pytest.raises(ValueError, match='source_untrusted'):
                 host.submit(request, draft, owner=owner, source=child, source_line=2)
     finally:
-        if damage != 'actual_output_list':
+        if damage != 'actual_output_list' or observations != [None]:
             host.close(owner=owner, reason='cancelled')
         thread.join(3)
     assert not thread.is_alive()
