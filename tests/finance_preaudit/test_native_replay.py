@@ -58,6 +58,34 @@ def recorded_case(tmp_path: Path):
     return arguments, material_file, material
 
 
+@pytest.fixture
+def recorded_case_with_evidence(recorded_case):
+    arguments, material_file, material = recorded_case
+    archive = material_file.parent
+    attachment = archive / 'attachments' / 'receipt.bin'
+    page = archive / 'prepared' / 'receipt.png'
+    attachment.parent.mkdir()
+    page.parent.mkdir()
+    attachment.write_bytes(b'synthetic original attachment')
+    page.write_bytes(b'synthetic prepared page')
+    state_file = archive / 'state.json'
+    state = json.loads(state_file.read_text())
+    original_attempt = Path(state['material_file']).parent
+    material['resources'] = [{'request_id': 'recorded-case', 'resource_id': 'receipt-a',
+        'source_resource_id': 'receipt-a',
+        'local_readonly_path': str(original_attempt / 'attachments' / attachment.name)}]
+    material['prepared']['images'] = [{'resource_id': 'receipt-a', 'kind': 'image',
+        'path': str(original_attempt / 'prepared' / page.name)}]
+    material['prepared']['manifest'] = [{'resource_id': 'receipt-a', 'status': 'prepared', 'image_count': 1}]
+    material_file.write_text(json.dumps(material))
+    state['material_fingerprint'] = 'sha256:' + hashlib.sha256(material_file.read_bytes()).hexdigest()
+    evidence = b''.join(str(original_attempt / path.relative_to(archive)).encode() + b'\0'
+                       + path.read_bytes() + b'\0' for path in (attachment, page))
+    state['evidence_fingerprint'] = 'sha256:' + hashlib.sha256(evidence).hexdigest()
+    state_file.write_text(json.dumps(state))
+    return arguments, material_file, material
+
+
 def test_prepare_freezes_complete_recorded_material_without_exposing_answers(recorded_case, capsys) -> None:
     arguments, material_file, material = recorded_case
     assert finance_preaudit_native_replay.main(arguments) == 0
@@ -103,15 +131,41 @@ def test_prepare_routes_frozen_travel_material_to_its_eight_review_items(recorde
     assert summary['write_authorized'] is False
 
 
-def test_run_uses_worker_then_closes_preview_with_real_anomalies_preserved(recorded_case, capsys) -> None:
-    arguments, _material_file, _material = recorded_case
+@pytest.mark.parametrize('state_location', ['archive', 'separate_directory', 'legacy_separate_directory'])
+def test_run_uses_worker_without_source_checkout_and_preserves_recorded_pages(
+        recorded_case_with_evidence, capsys, state_location) -> None:
+    arguments, material_file, _material = recorded_case_with_evidence
+    state_file = material_file.with_name('state.json')
+    if state_location != 'archive':
+        renamed_state = material_file.parent.parent / 'states' / 'recorded-state.json'
+        renamed_state.parent.mkdir()
+        state_file.rename(renamed_state)
+        inventory_file = Path(arguments[arguments.index('--inventory') + 1])
+        inventory = json.loads(inventory_file.read_text())
+        inventory['cases'][0]['state_file'] = str(renamed_state)
+        inventory_file.write_text(json.dumps(inventory))
+        state_file = renamed_state
+    archived_bytes = {path: path.read_bytes() for path in material_file.parent.rglob('*') if path.is_file()}
+    original_state_bytes = state_file.read_bytes()
     finance_preaudit_native_replay.main(arguments)
     prepared = json.loads(capsys.readouterr().out)
+    assert prepared['image_count'] == 1
+    if state_location == 'legacy_separate_directory':
+        manifest_file = Path(prepared['audit']) / 'prepare.json'
+        manifest = json.loads(manifest_file.read_text())
+        del manifest['original_state']
+        manifest_file.write_text(json.dumps(manifest))
+    shutil.rmtree(arguments[arguments.index('--project') + 1])
     calls = []
     def recorded_native(project, action_file, timeout):
         calls.append((project, action_file, timeout))
         action = attempt_state.read_action(action_file)
         packet = json.loads(Path(action['review_packet_file']).read_text())
+        state = json.loads(Path(action['state_file']).read_text())
+        material = json.loads(Path(state['material_file']).read_text())
+        assert len(material['resources']) == len(material['prepared']['images']) == 1
+        assert Path(material['resources'][0]['local_readonly_path']).read_bytes() == b'synthetic original attachment'
+        assert Path(material['prepared']['images'][0]['path']).read_bytes() == b'synthetic prepared page'
         decision = {'schema_version': 1, 'kind': 'preaudit_review_decision',
                     'action_token': action['action_token'], 'workflow_key': 'general_expense',
                     'rule_version': packet['rule_version'], 'overall': 'needs_human',
@@ -132,6 +186,8 @@ def test_run_uses_worker_then_closes_preview_with_real_anomalies_preserved(recor
     assert result['original_material_unchanged'] is True
     decision = json.loads(Path(prepared['action_file']).with_name('review-decision.json').read_text())
     assert all(item['status'] == 'uncertain' for item in decision['items'])
+    assert archived_bytes == {path: path.read_bytes() for path in material_file.parent.rglob('*') if path.is_file()}
+    assert state_file.read_bytes() == original_state_bytes
 
 
 def test_prepare_rejects_changed_original_evidence_before_freezing(recorded_case) -> None:
@@ -153,6 +209,138 @@ def test_prepare_rejects_changed_original_evidence_before_freezing(recorded_case
     original_path.write_bytes(b'changed payment evidence')
     with pytest.raises(ValueError, match='original_evidence_fingerprint_mismatch'):
         finance_preaudit_native_replay.main(arguments)
+
+
+@pytest.mark.parametrize('dependency,mutation,error_code', [
+    ('material.json', 'missing', 'original_material_unavailable'),
+    ('material.json', 'unreadable', 'original_material_unavailable'),
+    ('material.json', 'changed', 'original_material_changed'),
+    ('state.json', 'missing', 'original_state_unavailable'),
+    ('state.json', 'changed', 'original_state_changed'),
+    ('attachments/receipt.bin', 'missing', 'original_evidence_unavailable'),
+    ('attachments/receipt.bin', 'changed', 'original_evidence_changed'),
+    ('prepared/receipt.png', 'missing', 'original_evidence_unavailable'),
+    ('prepared/receipt.png', 'changed', 'original_evidence_changed'),
+])
+def test_run_rejects_unavailable_original_before_executing_review(
+        recorded_case_with_evidence, capsys, monkeypatch, dependency, mutation, error_code):
+    arguments, material_file, _ = recorded_case_with_evidence
+    assert finance_preaudit_native_replay.main(arguments) == 0
+    prepared = json.loads(capsys.readouterr().out)
+    audit = Path(prepared['audit'])
+    manifest_bytes = (audit / 'prepare.json').read_bytes()
+    target = material_file.parent / dependency
+    if mutation == 'missing':
+        target.unlink()
+    elif mutation == 'changed':
+        target.write_bytes(b'changed original')
+    else:
+        read_bytes = Path.read_bytes
+        def unreadable_original(path):
+            if path == target:
+                raise PermissionError('synthetic original read failure')
+            return read_bytes(path)
+        monkeypatch.setattr(Path, 'read_bytes', unreadable_original)
+
+    assert finance_preaudit_native_replay.main(
+        ['--run' if value == '--prepare' else value for value in arguments],
+        executor=lambda *_args: pytest.fail('unavailable original started a review'),
+    ) == 1
+
+    result = json.loads(capsys.readouterr().out)
+    assert result['error_code'] == error_code
+    assert result['review_status'] == 'not_started'
+    assert result['attempts'] == []
+    assert result['business_acceptance'] == 'not_verified'
+    assert result['oa_writes'] == 0
+    assert json.loads((audit / 'result.json').read_text()) == result
+    assert (audit / 'prepare.json').read_bytes() == manifest_bytes
+    assert not (audit / 'worker-result.json').exists()
+    assert not (audit / 'native-attempt-1').exists()
+    assert not (audit / 'closure.json').exists()
+    failure_bytes = (audit / 'result.json').read_bytes()
+    with pytest.raises(RuntimeError, match='replay_result_already_exists_use_new_label'):
+        finance_preaudit_native_replay.main(
+            ['--run' if value == '--prepare' else value for value in arguments],
+            executor=lambda *_args: pytest.fail('failed preflight was repeated'),
+        )
+    assert (audit / 'result.json').read_bytes() == failure_bytes
+
+
+def test_run_keeps_executed_receipt_when_original_disappears(recorded_case, capsys):
+    arguments, material_file, _ = recorded_case
+    assert finance_preaudit_native_replay.main(arguments) == 0
+    prepared = json.loads(capsys.readouterr().out)
+    audit = Path(prepared['audit'])
+    calls = []
+    def recorded_native(_project, action_file, _timeout):
+        calls.append(action_file)
+        action = attempt_state.read_action(action_file)
+        packet = json.loads(Path(action['review_packet_file']).read_text())
+        material_file.unlink()
+        return CodexExecution(None, {'status': 'unknown'}, {
+            'schema_version': 1, 'kind': 'preaudit_review_decision',
+            'action_token': action['action_token'], 'workflow_key': 'general_expense',
+            'rule_version': packet['rule_version'], 'overall': 'needs_human',
+            'items': [{'item_key': item['item_key'], 'status': 'uncertain',
+                       'conclusion': '当前费用对应关系待核。', 'evidence_refs': [],
+                       'missing_evidence': ['费用对应关系']} for item in packet['items']],
+        }, process_state='exited', decision_state='valid_object', exit_code=0)
+    run_arguments = ['--run' if value == '--prepare' else value for value in arguments]
+
+    assert finance_preaudit_native_replay.main(run_arguments, executor=recorded_native) == 1
+
+    result = json.loads(capsys.readouterr().out)
+    assert len(calls) == 1
+    assert result['review_status'] == 'reviewed'
+    assert result['error_code'] == 'original_material_unavailable'
+    assert result['original_material_unchanged'] is None
+    assert len(result['attempts']) == 1
+    assert result['attempts'][0]['exit_code'] == 0
+    assert result['attempts'][0]['decision_state'] == 'valid_object'
+    assert json.loads((audit / 'result.json').read_text()) == result
+    assert json.loads((audit / 'worker-result.json').read_text())['status'] == 'reviewed'
+    receipt = json.loads((audit / 'native-attempt-1' / 'receipt.json').read_text())
+    assert receipt == result['attempts'][0]
+    assert not (audit / 'closure.json').exists()
+    with pytest.raises(RuntimeError, match='native_run_already_started_do_not_repeat'):
+        finance_preaudit_native_replay.main(run_arguments,
+            executor=lambda *_args: pytest.fail('an executed replay ran twice'))
+
+
+def test_run_records_io_failure_from_started_execution_without_retry(recorded_case, capsys):
+    arguments, material_file, _ = recorded_case
+    original_bytes = material_file.read_bytes()
+    assert finance_preaudit_native_replay.main(arguments) == 0
+    audit = Path(json.loads(capsys.readouterr().out)['audit'])
+    calls = []
+    def unavailable_evidence(*_args):
+        calls.append('started')
+        raise PermissionError('synthetic evidence became unreadable')
+    run_arguments = ['--run' if value == '--prepare' else value for value in arguments]
+
+    assert finance_preaudit_native_replay.main(run_arguments, executor=unavailable_evidence) == 1
+
+    result = json.loads(capsys.readouterr().out)
+    assert calls == ['started']
+    assert result['review_status'] == 'failed'
+    assert result['error_code'] == 'native_replay_execution_io_error'
+    assert len(result['attempts']) == 1
+    receipt = json.loads((audit / 'native-attempt-1' / 'receipt.json').read_text())
+    assert receipt == result['attempts'][0]
+    assert receipt['error_code'] == 'native_replay_execution_io_error'
+    assert receipt['io_error_type'] == 'PermissionError'
+    assert receipt['process_state'] == 'unknown'
+    assert receipt['exit_code'] is None
+    assert result['business_acceptance'] == 'not_verified'
+    assert result['oa_writes'] == 0
+    assert json.loads((audit / 'result.json').read_text()) == result
+    assert material_file.read_bytes() == original_bytes
+    assert not (audit / 'worker-result.json').exists()
+    assert not (audit / 'closure.json').exists()
+    with pytest.raises(RuntimeError, match='native_run_already_started_do_not_repeat'):
+        finance_preaudit_native_replay.main(run_arguments,
+            executor=lambda *_args: pytest.fail('failed execution was retried'))
 
 
 @pytest.fixture
