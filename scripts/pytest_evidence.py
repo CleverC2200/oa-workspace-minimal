@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import resource
+import subprocess
 import sys
 import time
 from xml.etree import ElementTree
@@ -232,20 +233,27 @@ def macos_evidence(path, budget):
             'elapsed_seconds': elapsed, 'budget_seconds': budget, 'test_count': len(cases), 'errors': errors}
 
 
-def matrix_timing(jobs, identity, selected):
+def _timing_jobs(jobs, identity):
     names = {*(f'quality ({shard})' for shard in SHARDS), 'macos-stop-recovery', 'quality-complete'}
     head = os.environ.get('OA_CI_HEAD_SHA')
     if (not head or not identity['run_id'] or not identity['run_attempt']
             or jobs['total_count'] != len(jobs['jobs'])
             or len(jobs['jobs']) != len(names) or {job['name'] for job in jobs['jobs']} != names):
         raise ValueError('job_timing_set_untrusted')
-    observed = time.time()
-    intervals, timings = {}, {}
     for job in jobs['jobs']:
-        name = job['name']
         if (str(job['run_id']) != identity['run_id']
                 or str(job['run_attempt']) != str(identity['run_attempt']) or job['head_sha'] != head):
             raise ValueError('job_timing_identity_mismatch')
+    return jobs['jobs']
+
+
+def matrix_timing(jobs, identity, selected):
+    rows = _timing_jobs(jobs, identity)
+    head = os.environ.get('OA_CI_HEAD_SHA')
+    observed = time.time()
+    intervals, timings = {}, {}
+    for job in rows:
+        name = job['name']
         current = name == 'quality-complete'
         if (job['status'] != ('in_progress' if current else 'completed')
                 or job['conclusion'] != (None if current else 'success')):
@@ -362,6 +370,60 @@ def merge_evidence(directory, budget, jobs):
             'budget_seconds': budget, 'errors': errors}
 
 
+def _pending_job_timings(jobs, identity):
+    rows = _timing_jobs(jobs, identity)
+    observed = time.time()
+    aggregation = next(job for job in rows if job['name'] == 'quality-complete')
+    aggregation_start = datetime.fromisoformat(aggregation['started_at'])
+    if aggregation_start.tzinfo is None or not 0 <= aggregation_start.timestamp() <= observed:
+        raise ValueError('job_timing_clock_untrusted')
+    pending = False
+    for job in rows:
+        current = job['name'] == 'quality-complete'
+        running = job['status'] == 'in_progress' and job['conclusion'] is None
+        if current or running:
+            if not running or job['completed_at'] is not None:
+                raise ValueError('job_timing_status_untrusted')
+            pending = pending or not current
+        elif job['status'] != 'completed' or job['conclusion'] != 'success':
+            raise ValueError('job_timing_status_untrusted')
+        start = datetime.fromisoformat(job['started_at'])
+        end = start if running else datetime.fromisoformat(job['completed_at'])
+        if (start.tzinfo is None or end.tzinfo is None
+                or not 0 <= start.timestamp() <= end.timestamp() <= aggregation_start.timestamp()):
+            raise ValueError('job_timing_clock_untrusted')
+    return pending
+
+
+def fetch_job_timings(path):
+    identity = {'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': os.environ['GITHUB_RUN_ATTEMPT']}
+    repository = os.environ['GITHUB_REPOSITORY']
+    endpoint = (f'repos/{repository}/actions/runs/{identity["run_id"]}'
+                f'/attempts/{identity["run_attempt"]}/jobs?per_page=100')
+    snapshots = path.with_suffix('.snapshots')
+    snapshots.mkdir()
+    for read in range(1, 21):
+        response = subprocess.run(['gh', 'api', endpoint], capture_output=True, timeout=30)
+        with (snapshots / f'{read:02}.json').open('xb') as file:
+            file.write(response.stdout)
+        try:
+            if response.returncode:
+                raise ValueError('job_timing_fetch_failed')
+            jobs = json.loads(response.stdout)
+            pending = _pending_job_timings(jobs, identity)
+        except (KeyError, TypeError, ValueError):
+            with path.open('xb') as file:
+                file.write(response.stdout)
+            raise
+        if not pending or read == 20:
+            with path.open('xb') as file:
+                file.write(response.stdout)
+            if pending:
+                raise ValueError('job_timing_readiness_exhausted')
+            return jobs
+        time.sleep(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Verify complete offline CI evidence')
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -369,15 +431,20 @@ def main():
     mode.add_argument('--macos-report', type=Path)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--jobs-file', type=Path)
+    parser.add_argument('--fetch-jobs', action='store_true')
     parser.add_argument('--budget-seconds', type=float, default=170)
     args = parser.parse_args()
     if args.merge_directory and args.jobs_file is None:
         parser.error('--merge-directory requires --jobs-file')
+    if args.fetch_jobs and not args.merge_directory:
+        parser.error('--fetch-jobs requires --merge-directory')
     try:
-        report = (merge_evidence(args.merge_directory, args.budget_seconds, json.loads(args.jobs_file.read_text()))
+        jobs = (fetch_job_timings(args.jobs_file) if args.fetch_jobs else
+                json.loads(args.jobs_file.read_text()) if args.merge_directory else None)
+        report = (merge_evidence(args.merge_directory, args.budget_seconds, jobs)
                   if args.merge_directory
                   else macos_evidence(args.macos_report, args.budget_seconds))
-    except (OSError, ValueError, KeyError, TypeError, ElementTree.ParseError) as error:
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, ElementTree.ParseError) as error:
         report = {'status': 'failed', 'counts': {}, 'elapsed_seconds': None,
                   'errors': [str(error) if type(error) is ValueError else f'evidence_input_invalid:{type(error).__name__}']}
     with args.output.open('x', encoding='utf-8') as file:
