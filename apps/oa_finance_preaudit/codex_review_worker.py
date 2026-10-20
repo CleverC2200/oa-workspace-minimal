@@ -1524,8 +1524,7 @@ def _execute_codex_raw(
                     stderr_summary["tool_receipt_files"] = []
                     stderr_summary["tool_receipt_unavailable"] = True
 
-        if fatal_stderr.is_set():
-            # A fast CLI exit can precede the stderr reader's final classification.
+        if observe_failure():
             live_failure = True
             try:
                 if official_notices:
