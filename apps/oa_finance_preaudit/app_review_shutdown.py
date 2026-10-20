@@ -104,30 +104,33 @@ def _wait_result(anchor: dict, output: dict, session: str, *, allow_interrupt: b
         r'text\((?:(?P=variable)|JSON\.stringify\((?P=variable)\))\);?\s*', code or '', re.DOTALL)
     if wrapped is not None:
         code = 'text(await tools.write_stdin(' + wrapped['wait'] + '));'
-    command_call = r'text\(await tools\.exec_command\((\{(?:[^{}"]|"(?:[^"\\]|\\.)*")*\})\)\);\s*'
-    match = re.fullmatch(
-        r'\s*(?P<commands>(?:' + command_call + r'){0,2})'
-        r'text\(await tools\.write_stdin\((?P<wait>\{.*\})\)\);?\s*', code or '', re.DOTALL)
-    if match is None:
+    call = r'text\(await tools\.(exec_command|write_stdin)\((\{(?:[^{}"]|"(?:[^"\\]|\\.)*")*\})\)\);?\s*'
+    if re.fullmatch(r'\s*(?:' + call + r'){1,3}', code or '', re.DOTALL) is None:
         raise ValueError('host_review_source_untrusted')
-    commands = re.findall(command_call, match['commands'], re.DOTALL)
-    for raw in commands:
-        command = _literal_arguments(raw, {'cmd', 'workdir', 'max_output_tokens', 'yield_time_ms'})
-        if (not isinstance(command.get('cmd'), str) or not command['cmd']
-                or 'workdir' in command and not isinstance(command['workdir'], str)
-                or any(type(command[key]) is not int for key in {'max_output_tokens', 'yield_time_ms'} & command.keys())):
+    calls = re.findall(call, code, re.DOTALL)
+    if calls[-1][0] != 'write_stdin':
+        raise ValueError('host_review_source_untrusted')
+    prior_sessions = {session}
+    for index, (tool, raw) in enumerate(calls):
+        if tool == 'exec_command':
+            command = _literal_arguments(raw, {'cmd', 'workdir', 'max_output_tokens', 'yield_time_ms'})
+            if (not isinstance(command.get('cmd'), str) or not command['cmd']
+                    or 'workdir' in command and not isinstance(command['workdir'], str)
+                    or any(type(command[key]) is not int for key in {'max_output_tokens', 'yield_time_ms'} & command.keys())):
+                raise ValueError('host_review_shutdown_wait_untrusted')
+            continue
+        args = _literal_arguments(raw, {'session_id', 'chars', 'yield_time_ms', 'max_output_tokens'})
+        final = index == len(calls) - 1
+        if (not args.get('session_id') or (str(args['session_id']) != session if final else str(args['session_id']) in prior_sessions)
+                or args.get('chars', '') not in ({'', '\x03'} if final and allow_interrupt else {''})):
             raise ValueError('host_review_shutdown_wait_untrusted')
-    args = _literal_arguments(match['wait'], {'session_id', 'chars', 'yield_time_ms', 'max_output_tokens'})
-    if (not isinstance(args, dict) or str(args.get('session_id')) != session
-            or args.get('chars', '') not in ({'', '\x03'} if allow_interrupt else {''})
-            or set(args) - {'session_id', 'chars', 'yield_time_ms', 'max_output_tokens'}):
-        raise ValueError('host_review_shutdown_wait_untrusted')
-    # Sequential text(await ...) calls emit their actual results in call order.
-    # Bind the final result to the sole wait, never to the preceding command.
+        prior_sessions.add(str(args['session_id']))
     results = _execution_results(output)
-    if (len(results) != len(commands) + 1
+    if (len(results) != len(calls)
             or any(type(result.get('exit_code')) is not int or result.get('session_id') is not None
-                   for result in results)):
+                   for result in results)
+            or any(tool == 'write_stdin' and result['exit_code'] != 0
+                   for (tool, _raw), result in zip(calls[:-1], results[:-1]))):
         raise ValueError('host_review_shutdown_wait_untrusted')
     return results[-1]
 

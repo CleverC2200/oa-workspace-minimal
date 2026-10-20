@@ -85,6 +85,7 @@ def test_app_preview_closes_one_frozen_case_through_native_exchange(app_case, tm
                    'tool_session_id': 'synthetic-original-tool'}
         finance_preaudit_run.bind_tool_session(execution, owner_task_id=owner,
             session_id=binding['tool_session_id'])
+        wait_for(lambda: controller_handoff.manifest_file().exists(), process)
         wait_for(lambda: (manifest := controller_handoff._read_manifest())
             and manifest['state'] == 'running'
             and manifest.get('owner_task_id') == owner

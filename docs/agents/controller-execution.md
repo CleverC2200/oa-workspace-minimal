@@ -172,7 +172,7 @@ python -B -m apps.oa_finance_preaudit.host_chat_review --operation begin-shutdow
 text(await tools.write_stdin({"session_id":12345,"chars":"","yield_time_ms":1000}));
 ```
 
-等待调用继续优先使用上方 JSON 引号键。收尾读取器也接受同一白名单属性的无引号 JavaScript 名称，值限 JSON 字符串或非负整数字面量；变量、计算属性、表达式、重复键及附加语句均拒绝。历史调用若在唯一末尾 wait 前顺序执行至多两次 `text(await tools.exec_command({...}));`，也可兼容核验；命令参数限 cmd、workdir、max_output_tokens、yield_time_ms 的原字面量白名单。每次命令和末尾 wait 都须有按序配对的真实终态结果，数量必须一致，最终退出只取原 session 的末尾 wait。第二次 wait、尾随命令、动态参数、额外或缺失结果继续拒绝。兼容只解析原始调用，不执行 JavaScript，不改原生来源或配对输出；原会话、真实退出、回收及 Writer 校验保持。
+等待调用继续优先使用上方 JSON 引号键。收尾读取器也接受同一白名单属性的无引号 JavaScript 名称，值限 JSON 字符串或非负整数字面量；变量、计算属性、表达式、重复键及附加语句均拒绝。历史调用在唯一原 session 末尾 wait 前至多顺序执行两个固定字面量调用，也可兼容核验。前置调用可为 `text(await tools.exec_command({...}));`，参数限 cmd、workdir、max_output_tokens、yield_time_ms；或其他不同 session 的空 stdin `write_stdin`，且其真实结果必须已终态、退出 0。原 session 不得提前出现，前置轮询的 session 也不得重复。每个调用均须有按序配对的真实终态结果，数量必须一致，最终退出只取原 session 的末尾 wait。原 session 重复 wait、前置轮询非零或仍等待、尾随命令、动态参数、额外或缺失结果继续拒绝。兼容只解析原始调用，不执行 JavaScript，不改原生来源或配对输出；原会话、真实退出、回收及 Writer 校验保持。
 
 ```bash
 python -B -m apps.oa_finance_preaudit.host_chat_review --operation finish-shutdown --owner-task-id <主会话UUID> --source-session-file <父原生会话jsonl> --interrupt-line <槽0interrupt行> --interrupt-line <槽1interrupt行> --interrupt-line <槽2interrupt行> --source-line <最终list_agents行> --wait-line <原session真实终态wait行>
