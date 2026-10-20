@@ -321,12 +321,18 @@ def _unregistered_proofs(*, owner: str, reviewers: list[dict], source: Path, rec
             or datetime.fromisoformat(anchor['timestamp'].replace('Z', '+00:00')).timestamp() < max(stopped_at)):
         raise ValueError('host_review_stale_source')
     statuses['reviewers'] = _idle_reviewers(value, statuses.pop('output'))
-    anchor, wait = _source(value, source_owner, source, wait_line, earliest=completed)
+    anchor, wait = _source(value, source_owner, source, wait_line,
+        earliest=started if legacy_source_owner is not None else completed)
     exit_result = _wait_result(anchor, wait.pop('output'), tool_session_id,
         allow_interrupt=legacy_source_owner is not None and execution.get('received_signals') == [signal.SIGTERM])
     if exit_result['exit_code'] != report['exit_code']:
         raise ValueError('host_review_shutdown_wait_untrusted')
     if legacy_source_owner is not None:
+        terminal, _ = host._native_source(source, source_owner, wait['output_line'])
+        terminal_at = runner._timestamp(terminal['anchor']['timestamp']).timestamp()
+        call_at = runner._timestamp(anchor['timestamp']).timestamp()
+        if not max(completed, call_at) <= terminal_at <= time.time():
+            raise ValueError('host_review_stale_source')
         try:
             native_execution = json.loads(exit_result['output'])
         except (ValueError, TypeError) as error:

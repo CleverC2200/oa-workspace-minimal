@@ -137,7 +137,7 @@ python -B -m apps.oa_finance_preaudit.host_chat_review --operation finish-unregi
 
 历史启动门命中未登记失败轮，且原轮已有准备动作时，先核对原执行、原生来源和后续单据归属。有当前明确维护授权后，使用 `python -m apps.oa_finance_preaudit.legacy_app_shutdown --help` 的单轮入口，提供原 execution、owner、invocation、tool session、真实父会话、三个原子会话及 spawn/interrupt、最终 list_agents 和原工具终态 wait 来源。默认预检返回 `status=ready`，不封存；确认调用增加 `--confirm-seal YES`，只有 `status=verified` 才取得历史封存。
 
-该分支要求原监督回执已完整封存为失败，原生工具终态中的完整 execution 与原文件一致，实际进程组已回收、三槽已中断且空闲，原轮审核执行与 Writer 计数为零。原 action 可以存在或已由后续轮次处理，封存始终保留 `historical_action_outcomes=not_verified`，不恢复、重提或重判这些单据。当前未知写入仍由新轮完整对账阻断。
+该分支要求原监督回执已完整封存为失败，原生工具终态中的完整 execution 与原文件一致，配对终态输出时间不早于原退出及 wait 调用时间。wait 可以在退出前开始，配对输出须在退出后返回。实际进程组已回收、三槽已中断且空闲，原轮审核执行与 Writer 计数为零。原 action 可以存在或已由后续轮次处理，封存始终保留 `historical_action_outcomes=not_verified`，不恢复、重提或重判这些单据。当前未知写入仍由新轮完整对账阻断。
 
 历史 owner 与真实父会话不一致时，分别提供原 owner 与 `--source-owner-task-id`；完整原工具结果必须绑定同一原 execution，原 owner 字节保持不变，封存明确记录身份差异。历史 wait 曾发送中断字符时，仅在原监督回执记录 SIGTERM、真实工具已终态且完整结果匹配时，接受该历史退出来源；普通 App 收尾仍只接受空 stdin 的轮询。原始证据、来源或回收不可信时继续阻断。
 

@@ -1,5 +1,6 @@
 import hashlib
 import json
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -7,7 +8,17 @@ import pytest
 from apps.oa_finance_preaudit import approval_lifecycle, host_chat_review as host
 from scripts import finance_preaudit_run as runner
 from tests.finance_preaudit.test_app_preregistration_shutdown import failed_start as failed_start
-from tests.finance_preaudit.test_host_chat_review import native_call
+from tests.finance_preaudit.test_host_chat_review import native_call as recorded_call
+
+
+def native_call(parent, *args):
+    line = recorded_call(parent, *args)
+    rows = parent.read_text().splitlines()
+    output = json.loads(rows[line])
+    output['timestamp'] = datetime.now(timezone.utc).isoformat()
+    rows[line] = json.dumps(output)
+    parent.write_text('\n'.join(rows) + '\n')
+    return line
 
 
 @pytest.fixture
@@ -147,3 +158,24 @@ def test_public_legacy_sealing_cli_defaults_to_preview(legacy_failure, monkeypat
     assert legacy.main([*command, '--confirm-seal', 'YES']) == 0
     assert json.loads(capsys.readouterr().out)['status'] == 'verified'
     host.assert_previous_rounds_closed(owner=str(uuid4()))
+
+
+@pytest.mark.parametrize('terminal_before_exit', [False, True])
+def test_legacy_wait_can_begin_before_exit_when_paired_terminal_returns_after_exit(legacy_failure, terminal_before_exit):
+    args, _ = legacy_failure
+    from apps.oa_finance_preaudit import legacy_app_shutdown as legacy
+    completed = datetime.fromisoformat(json.loads(args['receipt_file'].read_text())['completed_at'])
+    rows = args['source'].read_text().splitlines()
+    item = json.loads(rows[args['wait_line'] - 1])
+    item['timestamp'] = (completed - timedelta(milliseconds=1)).isoformat()
+    rows[args['wait_line'] - 1] = json.dumps(item)
+    if terminal_before_exit:
+        item = json.loads(rows[args['wait_line']])
+        item['timestamp'] = (completed - timedelta(milliseconds=1)).isoformat()
+        rows[args['wait_line']] = json.dumps(item)
+    args['source'].write_text('\n'.join(rows) + '\n')
+    if terminal_before_exit:
+        with pytest.raises(ValueError, match='stale_source'):
+            legacy.finish(**args, confirm=True)
+    else:
+        assert legacy.finish(**args, confirm=True)['status'] == 'verified'
