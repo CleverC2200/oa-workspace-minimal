@@ -43,6 +43,7 @@
 | 实际模型执行与业务验收分别留证 | 回放 `--run` 始终返回 `business_acceptance=not_verified`；[现有回放 CLI 的 `--verify`](docs/runbooks/finance-native-replay.md#独立业务验收检查)核对原生闭合、冻结指纹、完整逐项预期与独立复核回执。CI 只离线测试该检查，不调用模型。 |
 | pytest 离线验证使用显式录制或 fake 传输 | `tests/conftest.py` 默认拒绝测试进程及线程的 DNS、TCP/UDP 外联，意外调用报 `offline_network_forbidden`；子进程和独立脚本边界见[质量检查](docs/agents/quality-checks.md)。 |
 | OA 关联、票面字段、文件记录与正文覆盖分别核验 | FlowEngine 冻结关联合同，以及 `test_invoice_linkage_preview.py`、`test_invoice_evidence_coverage.py` 和 `test_invoice_material_diagnostics.py` 的真实公开入口回归。 |
+| 生命周期回收测试先证实对象就绪，再触发原有超时 | `test_dispatcher_prepare_timeout_reclaims_owned_child_process_group` 等待真实子进程与阶段快照就绪，使用超过 watchdog 预算的启动延迟回归，保留原 1 秒超时和全部回收断言。 |
 
 - 局部代码改动采用聚焦测试、受影响静态检查和一次聚焦审查。写入、授权、幂等、进程回收、跨模块契约或发布改动保留 Standards/Spec 双路审查及必要完整验收；细则读 `CONTRIBUTING.md` 的“验证层级”。
 - 文档改动检查受影响链接和 `git diff --check`；修改 Skill 时校验对应 Skill，修改 AGENTS 或指令路由时执行指令审计。
