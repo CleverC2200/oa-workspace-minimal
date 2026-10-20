@@ -17,6 +17,7 @@ import zipfile
 import zlib
 
 import fitz
+from PIL import Image
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 PREPARABLE_IMAGE_EXTS = IMAGE_EXTS | {".heic", ".tif", ".tiff"}
@@ -750,6 +751,16 @@ def _prepare_one_attachment(
         )
         return
     suffix = path.suffix.lower()
+    if not suffix:
+        try:
+            with Image.open(path) as image:
+                suffix = {
+                    "PNG": ".png", "JPEG": ".jpg", "WEBP": ".webp",
+                    "BMP": ".bmp", "TIFF": ".tiff",
+                }.get(image.format, "")
+                image.verify()
+        except (OSError, ValueError, SyntaxError):
+            suffix = ""
     source_content_sha256 = _file_sha256(path)
     base = {
         "path": path,
@@ -771,7 +782,7 @@ def _prepare_one_attachment(
             )
             image_status = "image_converted"
             image_content_sha256 = _file_sha256(image_path)
-        elif parent_resource_id:
+        elif parent_resource_id or not path.suffix:
             image_path = out_dir / (
                 f"{safe_name(resource_id, path.stem)}_archive{suffix}"
             )
