@@ -98,8 +98,23 @@ def test_cancelled_round_reuses_frozen_attempt_without_overwriting_old_request(e
     old_source = draft_source(child, old_request, draft, owner)
     host.close(owner=owner, reason='cancelled')
     controller_handoff.finish(manifest, status='failed', children_reaped=True, health='degraded')
+    from tests.finance_preaudit.test_app_review_shutdown import proofs
+    from apps.oa_finance_preaudit import app_review_shutdown
+    app_review_shutdown.begin(owner=owner, reason='cancelled')
+    execution = seal_execution(owner, manifest)
+    receipt = json.loads(execution.read_text())
+    receipt.update(result='blocked', controller_state='failed', exit_code=1)
+    host.guard.write(execution, receipt)
+    app_review_shutdown.finish(owner=owner, **proofs(owner, child, exit_code=1))
     assert runtime_control.clear_cycle_stop()
+    original_home = Path(os.environ['CODEX_HOME'])
     new_owner, parent, reviewers = native_sessions(tmp_path / 'next-round', monkeypatch)
+    shared_sources = original_home / 'sessions/next-round'
+    parent.parent.rename(shared_sources)
+    parent = shared_sources / parent.name
+    for reviewer in reviewers:
+        reviewer['session_file'] = str(shared_sources / Path(reviewer['session_file']).name)
+    monkeypatch.setenv('CODEX_HOME', str(original_home))
     monkeypatch.setenv(host.guard.OWNER_ENV, new_owner)
     monkeypatch.setattr(controller_handoff, 'CONTROLLER_INSTANCE_ID', uuid4().hex)
     current = controller_handoff.begin({'review_configuration': host.IDENTITY})
@@ -619,6 +634,8 @@ def test_host_mode_forbids_building_a_codex_command(monkeypatch):
 
 
 def test_fresh_round_selects_host_and_next_round_resets_to_cli(monkeypatch, capsys):
+    monkeypatch.setenv('OA_REVIEW_PROVIDER', 'openai')
+    monkeypatch.setenv(host.TRANSPORT_ENV, 'cli')
     monkeypatch.setattr(finance_preaudit_run.auth, 'load_local_env', lambda: None)
     monkeypatch.setattr(finance_preaudit_run.approval_lifecycle, 'startup', lambda _: {'status': 'ready'})
     seen = []
@@ -1187,12 +1204,29 @@ def test_parent_cli_requires_the_exact_round_and_native_heartbeat(exchange):
 
 
 
-def test_new_controller_cannot_start_before_same_parent_shutdown_is_verified(exchange, monkeypatch, capsys):
-    _, _, owner, *_ = exchange
+@pytest.mark.parametrize('same_owner', [True, False])
+def test_new_controller_cannot_abandon_same_parent_active_unsealed_round(exchange, monkeypatch, capsys, same_owner):
+    _, _, owner, _, _, manifest, _ = exchange
+    monkeypatch.setattr(finance_preaudit_run, 'PROJECT_ROOT', runtime_control.PROJECT_ROOT)
     monkeypatch.setattr(finance_preaudit_run.auth, 'load_local_env', lambda: None)
-    monkeypatch.setattr(finance_preaudit_run.approval_lifecycle, 'startup', lambda _: pytest.fail('Unsealed prior round admitted'))
-    assert finance_preaudit_run.main(['--owner-task-id', owner, '--review-transport', 'host_chat', '--', '--rolling']) == 1
-    assert json.loads(capsys.readouterr().out)['error_code'] == 'controller_execution_evidence_failed'
+    monkeypatch.setattr(host.guard, 'observe_project_errors', lambda _: None)
+    gate = finance_preaudit_run.approval_lifecycle.startup(runtime_control.PROJECT_ROOT)
+    assert gate['status'] == 'skipped' and gate['reason'] == 'previous_run_busy' and gate['owner_task_id'] == owner
+    current_owner = owner if same_owner else str(uuid4())
+    registry = host.registry_file(owner, manifest['run_id'])
+    original = registry.read_bytes()
+    monkeypatch.setattr(finance_preaudit_run, 'supervise', lambda *_args, **_options: pytest.fail('unsealed round started another controller'))
+    result = finance_preaudit_run.main(['--owner-task-id', current_owner, '--review-transport', 'host_chat', '--', '--rolling'])
+    output = json.loads(capsys.readouterr().out)
+    if same_owner:
+        assert result == 1
+        assert output['error_code'] == 'controller_execution_evidence_failed'
+        assert output['primary_failure']['error_code'] == 'host_review_previous_round_incomplete'
+    else:
+        assert result == 0 and output['status'] == 'skipped' and output['reason'] == 'previous_run_busy'
+    assert registry.read_bytes() == original
+    assert runtime_control.controller_active() and not runtime_control.stop_requested()
+
 
 def test_failed_slot_reuse_requires_fresh_native_idle_proof(exchange, monkeypatch):
     action, _, owner, child, _, manifest, engine = exchange
@@ -1253,3 +1287,70 @@ def test_normal_close_accepts_trusted_expired_request_and_preserves_failure_proo
     material['warnings'] = ['Changed input']
     host.guard.write(action.with_name('material.json'), material)
     assert host.verified_failure(action, failed) is None
+
+
+def test_followup_source_anchor_ignores_nested_exec_text(exchange):
+    action, _, owner, child, _, manifest, _ = exchange
+    parent = child.with_name('parent.jsonl')
+    request = host.publish(action, prompt='Review this frozen action.', timeout_seconds=60)
+    line = native_call(parent, 'collaboration.followup_task',
+                       {'target': '/root/reviewer_0', 'message': str(request)}, 'actual-followup', {})
+    native_call(parent, 'functions.exec',
+                "source_anchor(operation='followup_task') " + owner + ' ' + manifest['run_id'],
+                'nested-source-anchor', {})
+    anchor = host.source_anchor(owner=owner, operation='followup_task', run_id=manifest['run_id'], request_file=request, slot=0)
+    assert anchor == {'source': parent, 'source_line': line}
+    assert host.assign(request, slot=0, owner=owner, run_id=manifest['run_id'], **anchor)['state'] == 'assigned'
+
+
+def test_source_anchor_cli_returns_an_executable_assign_invocation(exchange, capsys):
+    import shlex
+    import sys
+    action, _, owner, child, _, manifest, _ = exchange
+    parent = child.with_name('parent.jsonl')
+    request = host.publish(action, prompt='Review this frozen action.', timeout_seconds=60)
+    native_call(parent, 'followup_task', {'target': '/root/reviewer_0', 'message': str(request)}, 'cli-followup', {})
+    assert host.main(['--operation', 'source-anchor', '--anchor-operation', 'followup_task',
+                      '--owner-task-id', owner, '--run-id', manifest['run_id'],
+                      '--request-file', str(request), '--slot', '0']) == 0
+    result = json.loads(capsys.readouterr().out)
+    invocation = result['next_invocation']
+    assert invocation['workdir'] == str(runtime_control.PROJECT_ROOT.absolute())
+    command = shlex.split(invocation['cmd'])
+    assert command[:3] == ['/usr/bin/env',
+                           'OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE=' + str(runtime_control.controller_lock_file().absolute()),
+                           'OA_FINANCE_PREAUDIT_STOP_FILE=' + str(runtime_control.stop_file().absolute())]
+    assert command[3:7] == [str(Path(sys.executable).absolute()), '-B', '-m', host.MODULE]
+    assert host.main(command[7:]) == 0
+    assert json.loads(capsys.readouterr().out)['state'] == 'assigned'
+
+
+@pytest.mark.parametrize('damage', ['unpaired', 'wrong_slot', 'wrong_request', 'failed'])
+def test_followup_source_anchor_rejects_incomplete_or_unrelated_dispatch(exchange, damage):
+    action, _, owner, child, _, manifest, _ = exchange
+    parent = child.with_name('parent.jsonl')
+    request = host.publish(action, prompt='Review this frozen action.', timeout_seconds=60)
+    native_call(parent, 'followup_task',
+                {'target': '/root/reviewer_1' if damage == 'wrong_slot' else '/root/reviewer_0',
+                 'message': '/other/request.json' if damage == 'wrong_request' else str(request)},
+                'untrusted-followup', {'error': 'dispatch_failed'} if damage == 'failed' else {})
+    if damage == 'unpaired':
+        lines = parent.read_text().splitlines(keepends=True)
+        parent.write_text(''.join(lines[:-1]))
+    with pytest.raises(ValueError, match='host_review_source_untrusted'):
+        host.source_anchor(owner=owner, operation='followup_task', run_id=manifest['run_id'],
+                           request_file=request, slot=0)
+
+
+def test_heartbeat_cli_returns_pending_snapshot_in_the_same_parent_call(exchange, capsys):
+    action, _, owner, child, _, manifest, _ = exchange
+    parent = child.with_name('parent.jsonl')
+    request = host.publish(action, prompt='Review this frozen action.', timeout_seconds=60)
+    line = native_call(parent, 'functions.exec', 'heartbeat ' + owner, 'snapshot-heartbeat', {})
+    assert host.main(['--operation', 'heartbeat', '--include-pending', '--owner-task-id', owner,
+                      '--run-id', manifest['run_id'], '--source-session-file', str(parent),
+                      '--source-line', str(line)]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result['state'] == 'open'
+    assert result['round']['run_id'] == manifest['run_id']
+    assert [item['request_file'] for item in result['requests']] == [str(request)]

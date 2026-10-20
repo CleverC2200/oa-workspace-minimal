@@ -285,3 +285,71 @@ def test_original_tool_session_binding_is_exclusive_and_not_overwritten(tmp_path
         runner.bind_tool_session(path, owner_task_id=owner, session_id='different')
     with pytest.raises(ValueError, match='controller_tool_session_binding_invalid'):
         runner.bind_tool_session(path, owner_task_id=str(uuid4()), session_id='82550')
+
+
+@pytest.mark.parametrize('targeted', [False, True])
+@pytest.mark.parametrize('same_owner', [False, True])
+def test_public_startup_preserves_active_app_controller_ownership(tmp_path, monkeypatch, capsys, targeted, same_owner):
+    import subprocess
+    from scripts import finance_preaudit_run as runner
+    from tests.finance_preaudit.test_controller_owner_lifecycle import wait_until
+
+    monkeypatch.setenv('OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE', str(tmp_path / 'rolling.lock'))
+    monkeypatch.setenv('OA_REVIEW_PROVIDER', 'openai')
+    monkeypatch.setenv('OA_REVIEW_TRANSPORT', 'host_chat')
+    monkeypatch.setattr(runner.auth, 'load_local_env', lambda: None)
+    monkeypatch.setattr(runner.approval_guard, 'observe_project_errors', lambda _: None)
+    ready, release = tmp_path / 'ready', tmp_path / 'release'
+    directory = tmp_path / 'executions' / uuid4().hex
+    command = [sys.executable, '-c', f'''import time
+from pathlib import Path
+from apps.oa_approval import runtime_control as control
+from apps.oa_finance_preaudit import controller_handoff as handoff,approval_lifecycle as lifecycle,host_chat_review as host
+with control.global_controller_lease():
+    manifest=handoff.begin({{'review_configuration':host.IDENTITY}})
+    with lifecycle.run_scope(manifest,Path.cwd()):
+        Path({str(ready)!r}).touch()
+        while not Path({str(release)!r}).exists():time.sleep(.02)
+    handoff.finish(manifest,status='completed',children_reaped=True,health='healthy')
+''']
+    original_owner = str(uuid4())
+    wrapper = f'from pathlib import Path\nfrom scripts.finance_preaudit_run import supervise\nsupervise({command!r},directory=Path({str(directory)!r}),owner_task_id={original_owner!r})'
+    process = subprocess.Popen([sys.executable, '-c', wrapper], cwd=runner.PROJECT_ROOT,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        wait_until(ready.exists)
+        original = (directory / 'execution.json').read_bytes()
+        manifest_path = directory / 'controller-manifest.json'
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = json.loads(manifest_bytes)
+        assert manifest['state'] == 'running' and manifest['review_configuration']['transport'] == 'host_chat'
+        gate = runner.approval_lifecycle.startup(runner.PROJECT_ROOT)
+        assert gate['reason'] == 'previous_run_busy' and gate['owner_task_id'] == original_owner
+        calls = []
+        def supervised(command, **options):
+            assert targeted and not same_owner, 'existing owner must keep waiting; foreign ordinary startup must skip'
+            calls.append(command)
+            return {'result': 'skipped'}
+        monkeypatch.setattr(runner, 'supervise', supervised)
+        options = ['--targets-only', '--resume-action-file', str(tmp_path / 'action.json')] if targeted else []
+        owner = original_owner if same_owner else str(uuid4())
+        result = runner.main(['--owner-task-id', owner, '--', '--rolling', *options])
+        output = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        if same_owner:
+            assert result == 1 and not calls
+            assert output['primary_failure']['error_code'] == 'host_review_previous_round_incomplete'
+        elif targeted:
+            assert result == 0
+            assert calls and '--targets-only' in calls[0]
+        else:
+            assert result == 0 and output['status'] == 'skipped' and output['reason'] == 'previous_run_busy'
+            assert output['run_id'] == manifest['run_id'] and not calls
+        assert not runtime_control.stop_requested()
+        assert runtime_control.controller_active() and process.poll() is None
+        assert (directory / 'execution.json').read_bytes() == original
+        assert manifest_path.read_bytes() == manifest_bytes
+        assert not (tmp_path / 'approval-guard/cooldown-overrides').exists()
+        assert len(list((tmp_path / 'executions').iterdir())) == 1
+    finally:
+        release.touch()
+        assert process.wait(timeout=6) == 0

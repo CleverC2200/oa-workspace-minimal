@@ -196,27 +196,72 @@ def patched_workflow(data: dict, snap: dict, plan: dict) -> dict:
     return result
 
 
-def postcheck_fields_match(after: dict, expected: dict) -> bool:
+def _postcheck_comparison(after: dict, expected: dict) -> tuple[dict, dict, bool]:
     after, expected = stable_snapshot(after), stable_snapshot(expected)
     if expected['main'].get('lcbh') in (None, '') and 'lcbh' in expected['main']:
         value = after['main'].get('lcbh')
         if isinstance(value, str) and value.strip():
             after['main']['lcbh'] = expected['main']['lcbh']
-    if any(after[key] != expected[key] for key in ('request_id', 'workflow_id', 'currency', 'main', 'resources')):
-        return False
-    current_rows, expected_rows = deepcopy(after['rows']), deepcopy(expected['rows'])
-    for rows in (current_rows, expected_rows):
+    valid = True
+    for rows in (after['rows'], expected['rows']):
         for row in rows:
             value = row['values'].get('fpje')
             if value not in (None, ''):
                 try:
                     amount = Decimal(str(value))
                     if not amount.is_finite():
-                        return False
-                    row['values']['fpje'] = amount
+                        valid = False
+                    else:
+                        row['values']['fpje'] = amount
                 except InvalidOperation:
-                    return False
-    return current_rows == expected_rows
+                    valid = False
+    return after, expected, valid
+
+
+def postcheck_fields_match(after: dict, expected: dict) -> bool:
+    after, expected, valid = _postcheck_comparison(after, expected)
+    return valid and all(after[key] == expected[key] for key in
+                         ('request_id', 'workflow_id', 'currency', 'main', 'resources', 'rows'))
+
+
+def _postcheck_differences(after: dict, expected: dict, *, pending: bool, handled: bool) -> dict:
+    after, expected, valid = _postcheck_comparison(after, expected)
+    differences = set()
+
+    def add(category, field):
+        name = field if isinstance(field, str) and re.fullmatch('[a-z][a-z0-9_]{0,63}', field) else 'redacted_field'
+        differences.add((category, name))
+
+    for key in ('request_id', 'workflow_id', 'currency'):
+        if after[key] != expected[key]:
+            add('workflow_identity', key)
+    if after['node_id'] != expected['node_id']:
+        add('node', 'node_id')
+    for field in after['main'].keys() | expected['main'].keys():
+        if field not in after['main'] or field not in expected['main'] or after['main'][field] != expected['main'][field]:
+            add('other_form_fields', field)
+    if after['resources'] != expected['resources']:
+        add('resources', 'metadata')
+    if not valid:
+        add('authorized_invoice_fields', 'fpje')
+    current_rows = {row['key']: row for row in after['rows']}
+    expected_rows = {row['key']: row for row in expected['rows']}
+    if list(current_rows) != list(expected_rows):
+        add('other_form_fields', 'row_identity')
+    for key in current_rows.keys() & expected_rows.keys():
+        current, original = current_rows[key], expected_rows[key]
+        if {k: v for k, v in current.items() if k != 'values'} != {k: v for k, v in original.items() if k != 'values'}:
+            add('other_form_fields', 'row_structure')
+        for field in current['values'].keys() | original['values'].keys():
+            if field not in current['values'] or field not in original['values'] or current['values'][field] != original['values'][field]:
+                add('authorized_invoice_fields' if field in FIELDS else 'other_form_fields', field)
+    if pending:
+        add('pending', 'pending_absent')
+    if not handled:
+        add('handled_identity', 'handled_identity_matches')
+    items = sorted(differences)
+    return {'items': [{'category': category, 'field': field} for category, field in items[:32]],
+            'total': len(items), 'truncated': len(items) > 32}
 
 
 def detail_data(data: dict, snap: dict, plan: dict) -> list[dict]:
@@ -287,6 +332,68 @@ class InvoiceFlow:
             result.append({**{k: row[k] for k in ('request_id', 'workflow_id', 'workflow_name', 'received_at')},
                            'receipt_status': self._read(journal)['status'] if journal.exists() else None})
         return sorted(result, key=lambda row: (row['received_at'], int(row['request_id'])))
+
+    def status(self, attempt: str | None = None) -> dict:
+        try:
+            policy = self._policy()
+        except ValueError:
+            policy = None
+        enabled = policy is not None
+        no_invoice = enabled and policy.get('allow_no_invoice') is True
+        capabilities = ('invoice_backfill', 'no_invoice_submit', 'pending', 'postcheck')
+        result = {'write_enabled': enabled, 'no_invoice_enabled': no_invoice,
+                  'capabilities': list(capabilities), 'capability_status': {},
+                  'unknown_dispositions': []}
+        for capability in capabilities:
+            authorization = 'not_required'
+            if capability in ('invoice_backfill', 'no_invoice_submit'):
+                authorization = 'enabled' if (no_invoice if capability == 'no_invoice_submit' else enabled) else 'disabled'
+            result['capability_status'][capability] = {
+                'implementation': 'available', 'authorization': authorization,
+                'authorization_scope': 'configuration_only', 'deployment': 'unknown',
+                'scheduling': 'unknown', 'business_acceptance': 'not_verified'}
+        for journal in sorted((self.root / 'receipts').glob('*.json')):
+            receipt = self._read(journal)
+            _require(receipt.get('kind') == 'overseas_invoice_receipt', 'invoice_artifact_invalid')
+            if receipt.get('status') != 'unknown':
+                continue
+            directory = self._attempt(receipt['attempt'])
+            receipt_digest = digest(receipt)
+            checks, untrusted = [], False
+            for source in sorted((directory / 'postchecks').glob('*.json')):
+                try:
+                    check = self._read(source)
+                    _require(check.get('kind') == 'overseas_invoice_postcheck'
+                             and check.get('attempt') == receipt['attempt']
+                             and check.get('receipt_digest') == receipt_digest
+                             and check.get('plan_digest') == receipt.get('plan_digest')
+                             and check.get('status') in ('unresolved', 'confirmed_submitted'),
+                             'invoice_artifact_invalid')
+                    observed = datetime.fromisoformat(check['observed_at'])
+                    _require(observed.tzinfo is not None, 'invoice_artifact_invalid')
+                    checks.append((observed, str(source), check))
+                except (ValueError, TypeError, KeyError):
+                    untrusted = True
+            latest = None
+            if checks and not untrusted:
+                _, source, check = max(checks, key=lambda item: (item[0], item[1]))
+                latest = {'source': source, 'observed_at': check['observed_at'],
+                          'status': check['status'], 'record_digest': digest(check),
+                          'differences': check.get('evidence', {}).get('differences')}
+            result['unknown_dispositions'].append({
+                'attempt': receipt['attempt'], 'receipt_source': str(journal),
+                'receipt_digest': receipt_digest, 'receipt_status': 'unknown',
+                'latest_postcheck': latest,
+                'postcheck_evidence': 'untrusted' if untrusted else ('bound' if checks else 'missing'),
+                'owner': 'manual_reconciliation', 'observed_at': None,
+                'age_seconds': None, 'deadline': None,
+                'next_action': 'readonly_postcheck_or_manual_reconciliation',
+                'automatic_retry_allowed': False})
+        if attempt is not None:
+            material = self.read_material(attempt)
+            journal = self.root / 'receipts' / (digest(material['snapshot']['request_id']) + '.json')
+            result['receipt'] = self._read(journal) if journal.exists() else None
+        return result
 
     def _snapshot(self, data: dict, resources: list[dict], *, writable: bool = True) -> dict:
         _require(flow.workflow_identity(data) == {'workflow_id': WORKFLOW_ID, 'workflow_name': WORKFLOW_NAME},
@@ -383,7 +490,8 @@ class InvoiceFlow:
         evidence = {'context_digest': digest(after), 'pending_digest': digest(pending),
                     'handled_digest': digest(handled), 'pending_absent': not pending,
                     'handled_identity_matches': identity_matches, 'fields_match': fields_match,
-                    'attachments_match': False}
+                    'attachments_match': False,
+                    'differences': _postcheck_differences(after, expected, pending=bool(pending), handled=identity_matches)}
         if not pending and identity_matches and fields_match:
             selected_ids = {a['resource_id'] for a in material['attachments']}
             selected = [r for r in evidence_packet.logical_attachment_resources(current, resources)
@@ -396,6 +504,13 @@ class InvoiceFlow:
                 {a['resource_id']: a['sha256'] for a in fresh}
                 == {a['resource_id']: a['sha256'] for a in material['attachments']}
             )
+        if 'attachments_digest' in evidence and not evidence['attachments_match']:
+            items = evidence['differences']['items']
+            if len(items) < 32:
+                items.append({'category': 'resources', 'field': 'content'})
+            else:
+                evidence['differences']['truncated'] = True
+            evidence['differences']['total'] += 1
         evidence['confirmed'] = (not pending and identity_matches and fields_match
                                  and evidence['attachments_match'])
         return evidence

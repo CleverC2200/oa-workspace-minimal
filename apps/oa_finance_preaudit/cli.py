@@ -57,6 +57,9 @@ _RUNTIME_FAILURE_CODES = {
     "cache_clean_runtime_active",
     "status_output_file_exists",
     "status_output_file_failed",
+    "status_summary_input_invalid",
+    "status_summary_source_invalid",
+    "status_summary_scope_invalid",
     "completed_receipts_selection_invalid",
     "completed_receipts_root_invalid",
 }
@@ -155,6 +158,8 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--check-live", action="store_true")
     status.add_argument("--reconcile", action="store_true")
     status.add_argument("--summary", action="store_true")
+    status.add_argument("--summary-input-file", type=Path, default=None,
+                        help="Summarize bound local snapshots and canonical completed receipts without OA reads")
     status.add_argument("--output-file", type=Path, default=None,
                         help="Save full JSON to a new private file; print gates and counts only")
     completed = subparsers.add_parser("completed-receipts")
@@ -563,7 +568,12 @@ def main(
         )
         sink = lambda receipt: observability.record_cli_invocation(cli_log, receipt)
     try:
-        if args.command == "status":
+        if args.command == "status" and args.summary_input_file is not None:
+            if args.check_live or args.reconcile or args.output_file is not None:
+                raise ValueError("status_summary_input_invalid")
+            from . import scoped_summary
+            payload = scoped_summary.summarize(_runtime_root(args.root), args.summary_input_file)
+        elif args.command == "status":
             operation = runtime_status or runtime_maintenance.status
             root = _runtime_root(args.root)
             payload = dict(operation(root))

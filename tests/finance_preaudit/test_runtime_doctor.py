@@ -68,6 +68,12 @@ def test_live_status_reports_only_sanitized_health_and_counts() -> None:
             "supported": 1,
             "unsupported": 1,
             "by_workflow": {"travel_expense": 1},
+            "workflow_counts": [
+                {'workflow_id': '138023', 'workflow_name': '差旅费报销流程',
+                 'flow_key': 'travel_expense', 'support_status': 'supported', 'count': 1},
+                {'workflow_id': 'recorded-unsupported', 'workflow_name': '未知流程',
+                 'flow_key': '', 'support_status': 'unsupported_workflow', 'count': 1},
+            ],
         },
         "web_session": {
             "status": "ok",
@@ -177,3 +183,33 @@ def test_live_status_stops_before_queue_read_when_web_session_expired() -> None:
                 RuntimeError("oa_session_expired")
             ),
         )
+
+
+def test_same_live_snapshot_preserves_workflow_support_counts_without_request_ids():
+    calls = []
+
+    class Client:
+        def pending_rows(self, **_kwargs):
+            calls.append('pending')
+            return [
+                {'request_id': 'private-one', 'workflow_id': '138023',
+                 'workflow_name': '差旅费报销流程', 'operator_id': 'same-user'},
+                {'request_id': 'private-two', 'workflow_id': 'other-flow',
+                 'workflow_name': 'other', 'operator_id': 'same-user'},
+                {'request_id': 'private-three', 'workflow_id': 'other-flow',
+                 'workflow_name': 'other', 'operator_id': 'same-user'},
+            ]
+
+    result = runtime_doctor.status(configuration_status=lambda: {'status': 'ok'},
+        configs_loader=lambda: [TRAVEL_CONFIG], api_factory=lambda _: Client(),
+        identity_provider=lambda: 'same-user',
+        web_session_provider=lambda: {'status': 'ok', 'authentication': 'ok', 'source': 'rpa_page'})
+    assert calls == ['pending']
+    assert result['oa']['workflow_counts'] == [
+        {'workflow_id': '138023', 'workflow_name': '差旅费报销流程', 'flow_key': 'travel_expense',
+         'support_status': 'supported', 'count': 1},
+        {'workflow_id': 'other-flow', 'workflow_name': 'other', 'flow_key': '',
+         'support_status': 'unsupported_workflow', 'count': 2},
+    ]
+    assert 'private-' not in json.dumps(result)
+    assert 'same-user' not in json.dumps(result)

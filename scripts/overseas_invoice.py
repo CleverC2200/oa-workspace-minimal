@@ -53,18 +53,7 @@ def main(argv: list[str] | None = None) -> int:
         auth.load_local_env()
         engine = overseas_invoice.InvoiceFlow(ROOT, None, auth.env('OA_UID'), auth.env('OA_APP_SECRET'), overseas_invoice_api.download_fresh)
         if args.command == 'status':
-            try:
-                engine._policy()
-                enabled = True
-            except ValueError:
-                enabled = False
-            result = {'write_enabled': enabled, 'stopped': runtime_control.stop_requested(),
-                      'no_invoice_enabled': enabled and engine._policy().get('allow_no_invoice') is True,
-                      'capabilities': ['invoice_backfill', 'no_invoice_submit', 'pending', 'postcheck']}
-            if args.attempt:
-                material = engine.read_material(args.attempt)
-                journal = ROOT / 'receipts' / (overseas_invoice.digest(material['snapshot']['request_id']) + '.json')
-                result['receipt'] = engine._read(journal) if journal.exists() else None
+            result = {**engine.status(args.attempt), 'stopped': runtime_control.stop_requested()}
         elif args.command == 'disable':
             _production_guard()
             try:

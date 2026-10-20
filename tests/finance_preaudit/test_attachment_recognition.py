@@ -108,6 +108,7 @@ def frozen_finance_action(tmp_path, monkeypatch, request):
 def test_action_file_cli_reads_frozen_finance_pages(
         tmp_path, monkeypatch, capsys, frozen_finance_action, storage, expected_calls):
     from apps import json_artifact
+    from apps.oa_finance_preaudit import read_material
 
     action = frozen_finance_action
     path = Path(action['action_file'])
@@ -121,7 +122,8 @@ def test_action_file_cli_reads_frozen_finance_pages(
     calls = fake_http(monkeypatch, lambda _: {'choices': [{'finish_reason': 'stop',
         'message': {'content': '读数 12345；右下角日期无法确认。'}}]})
 
-    result = recognition.main(['--action-file', str(path), '--output-dir', str(tmp_path / 'out')])
+    routes = json.loads(read_material.read(path).split('[reader.image_tool_routes]\n')[1])
+    result = recognition.main([*routes['original_read']['argv'][4:], '--output-dir', str(tmp_path / 'out')])
     assert (result, len(calls)) == (0, expected_calls)
 
     summary = json.loads(capsys.readouterr().out)
@@ -131,6 +133,31 @@ def test_action_file_cli_reads_frozen_finance_pages(
     assert report['parts'][0]['owner_detail_id'] == 'row-2'
     assert report['parts'][0]['evidence_ref'] == 'material:prepared.images.evidence-1.1'
     assert report['frozen_binding']['action_file'] == str(path)
+    assert all(p.read_bytes() == raw for p, raw in before.items())
+
+
+def test_dispatch_region_command_keeps_frozen_source_and_partial_coverage(
+        tmp_path, monkeypatch, capsys, frozen_finance_action):
+    from apps.oa_finance_preaudit import read_material
+
+    action = Path(frozen_finance_action['action_file'])
+    before = {p: p.read_bytes() for p in action.parent.rglob('*') if p.is_file()}
+    routes = json.loads(read_material.read(action).split('[reader.image_tool_routes]\n')[1])
+    page = routes['pages'][0]
+    calls = fake_http(monkeypatch, lambda _: {'choices': [{'finish_reason': 'stop',
+        'message': {'content': '局部文字无法确认'}}]})
+
+    assert recognition.main([*page['region_read']['argv_prefix'][4:],
+        '--region', '1', '1', '7', '7', '--prompt', '读取选区', '--output-dir', str(tmp_path / 'out')]) == 0
+
+    summary = json.loads(capsys.readouterr().out)
+    report = json.loads(Path(summary['report_file']).read_bytes())
+    assert len(calls) == 1
+    assert report['coverage'] == 'image_region'
+    assert report['sources'][0]['path'] == page['source']['path']
+    assert report['sources'][0]['sha256'] == page['source']['content_sha256']
+    assert report['parts'][0]['region'] == [1, 1, 7, 7]
+    assert page['source']['owner_detail_id'] == 'row-2'
     assert all(p.read_bytes() == raw for p, raw in before.items())
 
 

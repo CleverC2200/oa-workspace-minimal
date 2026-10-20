@@ -63,6 +63,61 @@ def render(material: dict) -> str:
     return '\n'.join(lines) + '\n'
 
 
+def _image_tool_routes(material: dict, action_file: Path) -> dict:
+    prepared = material.get('prepared') or {}
+    pages = prepared.get('images') or []
+    resources = material.get('resources') or []
+    if not pages:
+        return {}
+    recognition = ['python3', '-B', '-m', 'apps.oa_approval.attachment_recognition']
+    routes = {
+        'kind': 'generated_tool_navigation',
+        'readability': 'not_verified',
+        'coverage': 'navigation_only',
+        'original_read': {
+            'argv': [*recognition, '--action-file', str(action_file)],
+            'large_image_handling': 'existing_lossless_tiles_and_bounded_jpeg_decode',
+        },
+        'instructions': (
+            '按 argv 参数数组调用现有入口；普通页直接按原读取合同读取，无需先压缩或裁区。'
+            '原图识别入口自行选择无损分区或受限 JPEG 解码，安全拒绝保持失败。'
+            'region_read 先核对 source.path 的实际 SHA256 与 content_sha256，'
+            '再按原始存储像素填写整数选区和本次问题，事后核对报告的原件指纹；单区域回答只覆盖选区。'
+            '辅助副本用于识别前须核对当前授权范围，处理回执绑定原路径及指纹；'
+            '副本、区域回答和导航均不证明原页已完整读取。看不清的细节保持未知。'
+            '资源指针只指冻结归属，具体审核项与明细关系仍从原材料核对。'
+        ),
+        'pages': [],
+    }
+    numbers = {}
+    for index, page in enumerate(pages):
+        resource_id = str(page.get('parent_resource_id') or page.get('resource_id') or '')
+        numbers[resource_id] = numbers.get(resource_id, 0) + 1
+        route = {
+            'material_pointer': f'material.prepared.images[{index}]',
+            'evidence_ref': f'material:prepared.images.{resource_id}.{numbers[resource_id]}',
+            'resource_pointer': next((f'material.resources[{i}]' for i, resource in enumerate(resources)
+                                      if resource.get('resource_id') == resource_id), None),
+            'source': page,
+        }
+        path = page.get('path')
+        digest = page.get('content_sha256')
+        if (resource_id and route['resource_pointer'] is not None and path and isinstance(digest, str)
+                and re.fullmatch('[0-9a-f]{64}', digest)):
+            route['region_read'] = {
+                'argv_prefix': [*recognition, '--file', path],
+                'append_arguments': ['--region', 'X0', 'Y0', 'X1', 'Y1', '--prompt', 'QUESTION'],
+                'coverage': 'image_region',
+            }
+            route['auxiliary_copy'] = {
+                'argv': ['python3', '-B', '-m', 'apps.oa_approval.image_compression', '--file', path],
+                'recognition_authorization': 'requires_current_scope',
+                'counts_as_original_page_coverage': False,
+            }
+        routes['pages'].append(route)
+    return routes
+
+
 def read(action_file: Path) -> str:
     action_file = Path(action_file).absolute()
     packet_file = action_file.with_name('review-packet.json')
@@ -83,7 +138,11 @@ def read(action_file: Path) -> str:
         or action.get('workflow_key') != packet.get('workflow_key')
     ):
         raise ValueError('frozen_material_changed')
-    return render(material)
+    view = render(material)
+    routes = _image_tool_routes(material, action_file)
+    if routes:
+        view += '\n[reader.image_tool_routes]\n' + _json(routes) + '\n'
+    return view
 
 
 if __name__ == '__main__':

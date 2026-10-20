@@ -255,6 +255,19 @@ def _target_outcome(payload: object, *, terminal: bool, completed: bool, bound: 
         return bound if bound is not None else {"status": "blocked", "reason": "production_target_outcome_unverified"}
 
 
+def _failure(error: Exception, phase: str) -> dict:
+    detail = host_chat_review._failure_detail(error)
+    codes = {"controller_execution_evidence_failed", "controller_execution_snapshot_changed",
+             "controller_execution_output_limit", "controller_execution_owner_untrusted",
+             "controller_execution_override_mismatch", "controller_start_cancelled",
+             "controller_stop_request_failed", "approval_official_history_unavailable",
+             "host_review_previous_round_incomplete"}
+    code = str(error) if str(error) in codes else detail["failure_detail_code"]
+    return {"error_type": detail["exception_type"],
+            "error_code": "controller_supervisor_failure" if code == "host_review_exception" else code,
+            "phase": phase}
+
+
 def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str,
                    tool_session_id: str | None = None, retrieve: bool = False) -> dict:
     """Project one owned execution; reading never starts or controls a process."""
@@ -299,6 +312,18 @@ def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str
                   "controller_state": "unknown", "children_reaped": "unknown",
                   "exit_code": receipt.get("exit_code"), "exit_signal": receipt.get("exit_signal"),
                   "receipt_file": str(path)}
+        for key in ("primary_failure", "cleanup_failures"):
+            if key in receipt:
+                failures = receipt[key] if key == "cleanup_failures" else [receipt[key]]
+                if (not isinstance(failures, list) or len(failures) > 8
+                        or any(not isinstance(item, dict) or set(item) != {"error_type", "error_code", "phase"}
+                               or any(not isinstance(item[field], str)
+                                      or re.fullmatch(pattern, item[field]) is None for field, pattern in (
+                                          ("error_type", r"[A-Za-z_][A-Za-z0-9_]{0,79}"),
+                                          ("error_code", r"[a-z][a-z0-9_]{0,95}"),
+                                          ("phase", r"[a-z][a-z0-9_]{0,47}"))) for item in failures)):
+                    raise ValueError("controller_execution_evidence_failed")
+                report[key] = receipt[key]
         configuration = receipt.get("review_configuration")
         if configuration is not None:
             if (not production_config.valid_review_configuration(configuration)):
@@ -398,11 +423,11 @@ def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str
                 report["terminal"] = manifest["state"] in {"completed", "failed"} and manifest["children_reaped"] is True
             if (report["terminal"] and receipt["exit_code"] == 0 and report["controller_state"] == "completed"
                     and receipt["result"] == "completed" and "stop_request_error" not in receipt
-                    and "stop_wait_error" not in receipt):
+                    and "stop_wait_error" not in receipt and "primary_failure" not in receipt):
                 report["status"] = "completed"
             elif (manifest is None and receipt["exit_code"] == 0 and receipt["result"] == "skipped"
                     and "stop_request_error" not in receipt and "stop_wait_error" not in receipt
-                    and logs["stdout.log"] is not None):
+                    and "primary_failure" not in receipt and logs["stdout.log"] is not None):
                 payload = _object(logs["stdout.log"])
                 if payload.get("kind") == "approval_startup_gate":
                     # The supervisor verified this past skip; current gates may have changed.
@@ -606,6 +631,7 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str,
     process = None
     handlers = {}
     stop_attempted = False
+    phase = "initialization"
     owner_parent_pid = os.getppid()
     receipt["owner_parent_pid"] = owner_parent_pid
     receipt["supervisor_process"] = approval_guard.process_identity(os.getpid())
@@ -623,6 +649,11 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str,
             receipt_file, (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode(),
         )
 
+    def cleanup_failure(error: Exception, step: str) -> None:
+        receipt.setdefault("cleanup_failures", [])
+        if len(receipt["cleanup_failures"]) < 8:
+            receipt["cleanup_failures"].append(_failure(error, step))
+
     def forward(signum: int, _frame: object) -> None:
         receipt["received_signals"].append(signum)
         persist()
@@ -633,90 +664,59 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str,
         stop_deadline = None
         next_observation = 0.0
         while True:
-            if list(command[1:3]) == ["-m", "scripts.finance_preaudit_concurrency_probe"] and time.monotonic() >= next_observation:
-                try:
-                    approval_guard.observe_project_errors(PROJECT_ROOT)
-                except (OSError, RuntimeError, ValueError):
-                    runtime_control.request_stop("codex_review_technical_failure")
-                    receipt["stop_request_error"] = "approval_official_history_unavailable"
-                    persist()
-                next_observation = time.monotonic() + approval_guard.OBSERVATION_SECONDS
-            if os.getppid() != owner_parent_pid and not receipt.get("owner_process_lost"):
-                receipt["owner_process_lost"] = True
-                persist()
-            if owners and any(approval_guard.process_identity(owner["pid"]) != owner for owner in owners):
-                if not receipt.get("owner_process_lost"):
+            try:
+                if list(command[1:3]) == ["-m", "scripts.finance_preaudit_concurrency_probe"] and time.monotonic() >= next_observation:
+                    try:
+                        approval_guard.observe_project_errors(PROJECT_ROOT)
+                    except (OSError, RuntimeError, ValueError):
+                        runtime_control.request_stop("codex_review_technical_failure")
+                        receipt["stop_request_error"] = "approval_official_history_unavailable"
+                        persist()
+                    next_observation = time.monotonic() + approval_guard.OBSERVATION_SECONDS
+                if os.getppid() != owner_parent_pid and not receipt.get("owner_process_lost"):
                     receipt["owner_process_lost"] = True
                     persist()
-            approval_stopped = list(command[1:3]) == ["-m", "scripts.finance_preaudit_concurrency_probe"] and runtime_control.stop_requested()
-            cancelling = cancel or receipt["received_signals"] or receipt.get("owner_process_lost") or approval_stopped
-            if cancelling and stop_deadline is None:
-                stop_deadline = time.monotonic() + STOP_GRACE_SECONDS
-            if (cancelling
-                    and not stop_attempted
-                    and runtime_control.controller_owner_pid() == process.pid):
-                stop_attempted = True
+                if owners and any(approval_guard.process_identity(owner["pid"]) != owner for owner in owners):
+                    if not receipt.get("owner_process_lost"):
+                        receipt["owner_process_lost"] = True
+                        persist()
+                approval_stopped = list(command[1:3]) == ["-m", "scripts.finance_preaudit_concurrency_probe"] and runtime_control.stop_requested()
+                cancelling = cancel or receipt["received_signals"] or receipt.get("owner_process_lost") or approval_stopped
+                if cancelling and stop_deadline is None:
+                    stop_deadline = time.monotonic() + STOP_GRACE_SECONDS
                 try:
-                    runtime_control.request_cycle_stop()
-                except (OSError, RuntimeError, ValueError):
-                    receipt["stop_request_error"] = "controller_stop_request_failed"
-                else:
-                    receipt["stop_requested_by_supervisor"] = True
-                persist()
-            if (stop_deadline is not None and time.monotonic() >= stop_deadline
-                    and "stop_wait_error" not in receipt):
-                # Do not kill a possibly in-flight Writer or invent its exit code.
-                receipt["stop_wait_error"] = "controller_stop_timeout"
-                persist()
+                    owns_controller = cancelling and not stop_attempted and runtime_control.controller_owner_pid() == process.pid
+                except (OSError, RuntimeError, ValueError) as error:
+                    if not cancel:
+                        raise
+                    cleanup_failure(error, "stop_owner_check")
+                    stop_attempted = True
+                    owns_controller = False
+                if owns_controller:
+                    stop_attempted = True
+                    try:
+                        runtime_control.request_cycle_stop()
+                    except (OSError, RuntimeError, ValueError) as error:
+                        receipt["stop_request_error"] = "controller_stop_request_failed"
+                        cleanup_failure(error, "stop_request")
+                    else:
+                        receipt["stop_requested_by_supervisor"] = True
+                    persist()
+                if (stop_deadline is not None and time.monotonic() >= stop_deadline
+                        and "stop_wait_error" not in receipt):
+                    # Do not kill a possibly in-flight Writer or invent its exit code.
+                    receipt["stop_wait_error"] = "controller_stop_timeout"
+                    persist()
+            except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
+                if not cancel:
+                    raise
+                cleanup_failure(error, "stop_observation")
             try:
                 return process.wait(timeout=0.5)
             except subprocess.TimeoutExpired:
                 continue
 
-    def open_log(name: str):
-        with runtime_control.pinned_directory(directory) as parent:
-            descriptor = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
-        return os.fdopen(descriptor, "w+b")
-
-    try:
-        persist()
-        if override is not None and not approval_guard.cooldown_ignored(approval_guard.cooldown()):
-            raise ValueError("controller_execution_override_mismatch")
-        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-            handlers[signum] = signal.signal(signum, forward)
-        environment = {**os.environ, MANIFEST_ENV: str(manifest_file), approval_guard.OWNER_ENV: owner_task_id}
-        supervisor_identity = receipt["supervisor_process"]
-        if not approval_guard._valid_identity(supervisor_identity):
-            raise ValueError("controller_execution_owner_untrusted")
-        environment[approval_guard.EXECUTION_OWNERS_ENV] = json.dumps([supervisor_identity, *(owners or [])])
-        with open_log("stdout.log") as stdout, open_log("stderr.log") as stderr:
-            try:
-                if receipt["received_signals"] or (owners and any(
-                        approval_guard.process_identity(owner["pid"]) != owner for owner in owners)):
-                    raise InterruptedError("controller_start_cancelled")
-                process = subprocess.Popen(
-                    list(command), cwd=PROJECT_ROOT, env=environment,
-                    stdout=stdout, stderr=stderr, start_new_session=True,
-                )
-            except OSError as error:
-                receipt.update(state="start_failed", error_type=type(error).__name__, completed_at=_now())
-            else:
-                receipt.update(state="waiting", controller_pid=process.pid, process_group_id=process.pid,
-                               controller_process=approval_guard.process_identity(process.pid))
-                persist()
-                print(json.dumps({"state": "waiting", "receipt_file": str(receipt_file),
-                                  "owner_task_id": owner_task_id, "controller_pid": process.pid}), flush=True)
-                # Silence, elapsed time and warnings are not terminal evidence.
-                code = wait_owned()
-                receipt.update(state="exited", exit_code=code,
-                               exit_signal=-code if code < 0 else None, completed_at=_now())
-                persist()
-            receipt["output_sha256"] = {}
-            for name, stream in (("stdout.log", stdout), ("stderr.log", stderr)):
-                stream.flush()
-                os.fsync(stream.fileno())
-                stream.seek(0)
-                receipt["output_sha256"][name] = hashlib.file_digest(stream, "sha256").hexdigest()
+    def finalize() -> None:
         mirror_missing = False
         try:
             raw_manifest = runtime_control.read_control_bytes(manifest_file)
@@ -745,11 +745,13 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str,
                            controller_state=manifest["state"], children_reaped=manifest["children_reaped"],
                            code_revision=manifest["code_revision"])
             receipt["manifest_sha256"] = hashlib.sha256(raw_manifest).hexdigest()
+        receipt["output_sha256"] = {name: _log_evidence(directory / name)[0]["sha256"]
+                                    for name in ("stdout.log", "stderr.log")}
         receipt["result"] = (
             "completed" if receipt["state"] == "exited" and receipt["exit_code"] == 0
             and receipt["controller_state"] == "completed" and receipt["children_reaped"] is True
             and "stop_request_error" not in receipt
-            and "stop_wait_error" not in receipt
+            and "stop_wait_error" not in receipt and "primary_failure" not in receipt
             else "blocked"
         )
         if receipt["state"] == "exited" and receipt["exit_code"] == 0 and mirror_missing:
@@ -758,7 +760,8 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str,
                 verified_skip = isinstance(payload, dict) and _verified_skip(payload)
             except (OSError, RuntimeError, ValueError, AttributeError):
                 verified_skip = False
-            if verified_skip and "stop_request_error" not in receipt and "stop_wait_error" not in receipt:
+            if (verified_skip and "stop_request_error" not in receipt and "stop_wait_error" not in receipt
+                    and "primary_failure" not in receipt):
                 receipt["result"] = "skipped"
                 if payload.get("kind") == "approval_startup_gate":
                     receipt["skip_verification"] = _skip_verification(payload, receipt)
@@ -772,15 +775,80 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str,
                 completed=receipt["result"] == "completed", bound=_bound_target_outcome(receipt),
             )
         persist()
-        return {**receipt, "receipt_file": str(receipt_file)}
-    finally:
-        try:
-            if process is not None and process.poll() is None:
-                # An internal supervisor failure cannot abandon its direct child.
-                code = wait_owned(cancel=True)
+
+    def open_log(name: str):
+        with runtime_control.pinned_directory(directory) as parent:
+            descriptor = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+        return os.fdopen(descriptor, "w+b")
+
+    try:
+        persist()
+        if override is not None and not approval_guard.cooldown_ignored(approval_guard.cooldown()):
+            raise ValueError("controller_execution_override_mismatch")
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            handlers[signum] = signal.signal(signum, forward)
+        environment = {**os.environ, MANIFEST_ENV: str(manifest_file), approval_guard.OWNER_ENV: owner_task_id}
+        supervisor_identity = receipt["supervisor_process"]
+        if not approval_guard._valid_identity(supervisor_identity):
+            raise ValueError("controller_execution_owner_untrusted")
+        environment[approval_guard.EXECUTION_OWNERS_ENV] = json.dumps([supervisor_identity, *(owners or [])])
+        phase = "controller_start"
+        with open_log("stdout.log") as stdout, open_log("stderr.log") as stderr:
+            try:
+                if receipt["received_signals"] or (owners and any(
+                        approval_guard.process_identity(owner["pid"]) != owner for owner in owners)):
+                    raise InterruptedError("controller_start_cancelled")
+                process = subprocess.Popen(
+                    list(command), cwd=PROJECT_ROOT, env=environment,
+                    stdout=stdout, stderr=stderr, start_new_session=True,
+                )
+            except OSError as error:
+                receipt.update(state="start_failed", error_type=type(error).__name__, completed_at=_now(),
+                               primary_failure=_failure(error, phase))
+            else:
+                receipt.update(state="waiting", controller_pid=process.pid, process_group_id=process.pid,
+                               controller_process=approval_guard.process_identity(process.pid))
+                persist()
+                print(json.dumps({"state": "waiting", "receipt_file": str(receipt_file),
+                                  "owner_task_id": owner_task_id, "controller_pid": process.pid}), flush=True)
+                # Silence, elapsed time and warnings are not terminal evidence.
+                phase = "controller_wait"
+                code = wait_owned()
                 receipt.update(state="exited", exit_code=code,
                                exit_signal=-code if code < 0 else None, completed_at=_now())
                 persist()
+            phase = "output_binding"
+            for stream in (stdout, stderr):
+                stream.flush()
+                os.fsync(stream.fileno())
+        phase = "terminal_binding"
+        finalize()
+        return {**receipt, "receipt_file": str(receipt_file)}
+    except Exception as error:
+        receipt.setdefault("primary_failure", _failure(error, phase))
+        try:
+            persist()
+        except (OSError, RuntimeError, ValueError) as secondary:
+            cleanup_failure(secondary, "failure_persistence")
+        raise
+    finally:
+        try:
+            try:
+                if process is not None and (process.poll() is None or "primary_failure" in receipt):
+                    code = process.wait() if process.poll() is not None else wait_owned(cancel=True)
+                    receipt.update(state="exited", exit_code=code,
+                                   exit_signal=-code if code < 0 else None, completed_at=_now())
+                    persist()
+                if "primary_failure" in receipt and process is not None and process.poll() is not None:
+                    finalize()
+            except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
+                if "primary_failure" not in receipt:
+                    raise
+                cleanup_failure(error, "terminal_binding")
+                try:
+                    persist()
+                except (OSError, RuntimeError, ValueError):
+                    pass
         finally:
             for signum, handler in handlers.items():
                 signal.signal(signum, handler)
@@ -810,6 +878,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments[:1] == ["--"]:
         arguments = arguments[1:]
     directory = None
+    phase = "arguments"
     try:
         original_fields = (args.original_receipt_file, args.original_owner_task_id, args.original_tool_session_id)
         if args.ignore_cooldown_once or any(value is not None for value in original_fields):
@@ -830,6 +899,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0 if result["status"] in {"completed", "skipped"} else (2 if result["status"] == "waiting" else 1)
         if args.invocation_id is not None or args.tool_session_id is not None or args.wait_seconds:
             raise ValueError("controller_execution_readback_invalid")
+        phase = "configuration"
         auth.load_local_env()
         if args.bind_tool_session is not None:
             if args.receipt_file is None or arguments or args.review_provider or args.review_transport:
@@ -857,23 +927,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                 invocation_id=invocation_directory.name,
                 original=maintenance_runtime.OriginalExecution(args.original_receipt_file,
                     str(args.original_owner_task_id), args.original_tool_session_id))
+        phase = "cooldown_override" if args.ignore_cooldown_once == "YES" else "startup_gate"
         with scope:
             targeted = _target_arguments([sys.executable, "-m", "scripts.finance_preaudit_concurrency_probe", *arguments]) is not None
-            gate = approval_lifecycle.startup(PROJECT_ROOT) if targeted else None
-            if configuration.get("transport") == "host_chat" and (gate is None or gate["status"] == "ready"):
+            phase = "startup_gate"
+            gate = approval_lifecycle.startup(PROJECT_ROOT)
+            if (gate.get("reason") == "previous_run_busy"
+                    and gate.get("owner_task_id") == str(args.owner_task_id)):
+                phase = "app_round_closure"
+                raise ValueError("host_review_previous_round_incomplete")
+            if gate["status"] == "ready":
+                phase = "app_round_closure"
                 host_chat_review.assert_previous_rounds_closed(owner=str(args.owner_task_id))
-            gate = gate or approval_lifecycle.startup(PROJECT_ROOT)
+            phase = "startup_gate"
             if gate["status"] != "ready" and not targeted:
                 print(json.dumps({"schema_version": 1, "kind": "approval_startup_gate", **gate}, sort_keys=True))
                 return 0 if gate["status"] == "skipped" else 1
             directory = invocation_directory
+            phase = "supervision"
             receipt = supervise(
                 [sys.executable, "-m", "scripts.finance_preaudit_concurrency_probe", *arguments],
                 directory=directory, owner_task_id=str(args.owner_task_id),
                 detached=True,
             )
-    except (OSError, RuntimeError, ValueError, TypeError, KeyError):
-        print(json.dumps({"error_code": "controller_execution_evidence_failed", "receipt_file": str(directory / "execution.json") if directory else None}))
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
+        print(json.dumps({"error_code": "controller_execution_evidence_failed",
+                          "primary_failure": _failure(error, phase),
+                          "receipt_file": str(directory / "execution.json") if directory else None}))
         return 1
     print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
     return 0 if receipt["result"] in {"completed", "skipped"} else 1

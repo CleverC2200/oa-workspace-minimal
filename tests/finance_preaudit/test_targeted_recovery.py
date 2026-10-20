@@ -701,3 +701,33 @@ def test_unbound_child_cannot_supply_early_target_results(tmp_path, monkeypatch)
                                    directory=tmp_path / "control/executions" / uuid4().hex, owner_task_id=str(uuid4()))
     assert receipt["target_outcome"] == {"status": "blocked", "reason": "production_target_outcome_unverified"}
     assert "target_binding" not in receipt
+
+
+def test_disposition_recovery_command_only_processes_its_selected_action(tmp_path, monkeypatch, capsys):
+    env = RepairEnvironment(tmp_path, monkeypatch)
+    selected = env.seed('selected-a', 8)
+    outside = env.seed('outside-b', 7)
+    decision_validation.record_rejection(selected, {}, decision_validation.InvalidDecision('decision_json'))
+    cli._live_flow_engine(controlled=True).quarantine_invalid_review(selected)
+    original = {path: path.read_bytes() for path in outside.parent.rglob('*') if path.is_file()}
+    env.collected.clear()
+    monkeypatch.setattr(runtime_doctor.auth, 'configuration_status', lambda: {'status': 'ok'})
+    monkeypatch.setattr(runtime_doctor.auth, 'env', lambda key: 'synthetic-user' if key == 'OA_UID' else '')
+    monkeypatch.setattr(runtime_doctor.attachments, 'rpa_web_session_status', lambda: {
+        'status': 'ok', 'authentication': 'ok', 'source': 'rpa_page'})
+    assert cli.main(['status', '--root', str(env.root), '--reconcile'],
+        runtime_status=lambda _: {'schema_version': 1, 'kind': 'preaudit_runtime_status'}) == 0
+    report = json.loads(capsys.readouterr().out)
+    command = next(row['recovery_command'] for row in report['reconciliation']['pending_dispositions']['items']
+                   if row['recovery_action_file'] == str(selected))
+
+    assert controller.main(command[command.index('--') + 1:]) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert env.submitted == ['selected-a']
+    assert env.collected == ['selected-a']
+    assert [row['request_id'] for row in env.pending] == ['outside-b']
+    assert all(path.read_bytes() == raw for path, raw in original.items())
+    assert len(list(outside.parent.parent.glob('attempt-*'))) == 1
+    assert result['target_outcome']['status'] == 'complete'
+    assert result['target_outcome']['completed'] == 1

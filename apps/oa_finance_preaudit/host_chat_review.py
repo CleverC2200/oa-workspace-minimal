@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shlex
+import sys
 from pathlib import Path
 import time
 from uuid import UUID, uuid4
@@ -245,6 +246,8 @@ def _previous_rounds_closed(owner: str, run_id: str | None = None, reviewers: li
                 or report.get('exit_code') != receipt.get('driver_exit_code')
                 or any(report.get(key) != previous.get(key) for key in ('run_id', 'controller_instance_id'))):
             raise ValueError('host_review_previous_round_incomplete')
+    from . import app_review_shutdown
+    app_review_shutdown.assert_unregistered_executions_closed(exclude_run_id=run_id)
     if runtime_control.writer_active() or runtime_control.active_request_writers():
         raise ValueError('host_review_previous_round_incomplete')
 
@@ -786,7 +789,7 @@ def _dispatch_source(request_file: Path, request: dict, registered: dict, *, slo
     call_id = native['anchor']['payload']['call_id']
     if (arguments.get('target') not in {reviewer['agent_path'], reviewer['agent_path'].rsplit('/', 1)[-1]}
             or not (readable or opaque) or not isinstance(call_id, str)
-            or proof['output'].get('error') or proof['output'].get('isError') is True):
+            or not isinstance(proof['output'], dict) or proof['output'].get('error') or proof['output'].get('isError') is True):
         raise ValueError('host_review_source_untrusted')
     from datetime import datetime
     timestamp = native['anchor'].get('timestamp')
@@ -1615,13 +1618,24 @@ def complete(action: Path, reviewed: dict, *, completer=None) -> dict:
 
 
 
-def source_anchor(*, owner: str, operation: str = 'heartbeat', run_id: str | None = None) -> dict:
+def source_anchor(*, owner: str, operation: str = 'heartbeat', run_id: str | None = None,
+                  request_file: Path | None = None, slot: int | None = None) -> dict:
     """Find the actual already-logged parent call from inside its current tool invocation."""
+    if operation not in {'heartbeat', 'followup_task'}:
+        raise ValueError('host_review_source_untrusted')
     value = _registry(owner, live=False, run_id=run_id)
+    if operation == 'followup_task':
+        if request_file is None or type(slot) is not int or slot not in range(3):
+            raise ValueError('host_review_source_untrusted')
+        request_file = request_file.absolute()
+        request = _read(request_file)[1]
+        if request['owner_task_id'] != owner or request['run_id'] != value['run_id']:
+            raise ValueError('host_review_run_untrusted')
+        _live(request, Path(request['action_file']), owner=owner)
     source = Path(value['reviewers'][0]['spawn_source']['session_file'])
     _native_source(source, owner)
     found = None
-    with source.open('rb') as stream:
+    with _native_path(source).open('rb') as stream:
         for line, raw in _native_lines(stream):
             if raw is None:
                 continue
@@ -1630,21 +1644,35 @@ def source_anchor(*, owner: str, operation: str = 'heartbeat', run_id: str | Non
             name = payload.get('name')
             text = str(payload.get('arguments', payload.get('input', '')))
             if (record.get('type') == 'response_item' and payload.get('type') in {'function_call', 'custom_tool_call'}
-                    and (name in {operation, 'collaboration.' + operation, 'functions.collaboration.' + operation}
-                         or name in {'exec', 'functions.exec'} and operation in text and owner in text and value['run_id'] in text)):
+                    and (operation == 'followup_task'
+                         and name in {'followup_task', 'collaboration.followup_task', 'functions.collaboration.followup_task'}
+                         or operation == 'heartbeat' and name in {'exec', 'functions.exec'}
+                         and 'heartbeat' in text and owner in text and value['run_id'] in text)):
+                if operation == 'followup_task':
+                    arguments = _tool(record, operation)
+                    reviewer = value['reviewers'][slot]
+                    message = arguments.get('message')
+                    if (arguments.get('target') not in {reviewer['agent_path'], reviewer['agent_path'].rsplit('/', 1)[-1]}
+                            or not isinstance(message, str)
+                            or not (str(request_file) in message or re.fullmatch(r'gAAAA[A-Za-z0-9_-]+={0,2}', message))):
+                        continue
                 found = {'source': source, 'source_line': line}
     if found is None:
         raise ValueError('host_review_source_untrusted')
+    if operation == 'followup_task':
+        _dispatch_source(request_file, request, value, slot=slot, **found)
     return found
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--operation', choices=['register', 'pending', 'assign', 'submit', 'heartbeat', 'enter-packaging', 'close', 'begin-shutdown', 'finish-shutdown', 'write-draft', 'release-failed-slot', 'status'], default='submit')
+    parser.add_argument('--operation', choices=['register', 'pending', 'assign', 'submit', 'heartbeat', 'enter-packaging', 'close', 'begin-shutdown', 'finish-shutdown', 'finish-unregistered-shutdown', 'write-draft', 'release-failed-slot', 'status', 'source-anchor'], default='submit')
     parser.add_argument('--owner-task-id', required=True)
     parser.add_argument('--run-id')
     parser.add_argument('--request-file', type=Path)
     parser.add_argument('--decision-file', type=Path)
     parser.add_argument('--payload-json')
+    parser.add_argument('--anchor-operation', choices=['heartbeat', 'followup_task'], default='heartbeat')
+    parser.add_argument('--include-pending', action='store_true')
     parser.add_argument('--source-session-file', type=Path)
     parser.add_argument('--source-line', type=int)
     parser.add_argument('--interrupt-line', type=int, action='append')
@@ -1659,8 +1687,10 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     UUID(args.owner_task_id)
     owner = args.owner_task_id
+    if args.include_pending and args.operation != 'heartbeat':
+        parser.error('include-pending requires heartbeat')
     if args.operation in {'pending', 'status', 'heartbeat', 'enter-packaging', 'begin-shutdown',
-                          'finish-shutdown', 'close', 'assign', 'submit', 'release-failed-slot'} and args.run_id is None:
+                          'finish-shutdown', 'close', 'assign', 'submit', 'release-failed-slot', 'source-anchor'} and args.run_id is None:
         parser.error('run-id required to select one independent round')
     if args.run_id is not None:
         from . import controller_handoff
@@ -1678,6 +1708,33 @@ def main(argv=None) -> int:
                            for path, line in zip(args.reviewer_session_file, args.spawn_line)],
                           owner=owner, source=args.source_session_file, receipt_file=args.receipt_file,
                           invocation_id=args.invocation_id, tool_session_id=args.tool_session_id, run_id=args.run_id)
+    elif args.operation == 'finish-unregistered-shutdown':
+        from . import app_review_shutdown
+        if (args.source_session_file is None or args.receipt_file is None or args.invocation_id is None
+                or args.tool_session_id is None or len(args.reviewer_session_file or []) != 3
+                or len(args.spawn_line or []) != 3 or len(args.interrupt_line or []) != 3
+                or args.source_line is None or args.wait_line is None):
+            parser.error('finish-unregistered-shutdown requires original execution, three native children/spawns/interrupts, status and wait')
+        result = app_review_shutdown.finish_unregistered(owner=owner,
+            reviewers=[{'session_file': str(path), 'spawn_line': line}
+                       for path, line in zip(args.reviewer_session_file, args.spawn_line)],
+            source=args.source_session_file, receipt_file=args.receipt_file, invocation_id=args.invocation_id,
+            tool_session_id=args.tool_session_id, interrupt_lines=args.interrupt_line,
+            status_line=args.source_line, wait_line=args.wait_line)
+    elif args.operation == 'source-anchor':
+        anchor = source_anchor(owner=owner, operation=args.anchor_operation, run_id=args.run_id,
+                               request_file=args.request_file, slot=args.slot)
+        operation = 'assign' if args.anchor_operation == 'followup_task' else 'heartbeat'
+        command = ['/usr/bin/env',
+                   'OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE=' + str(runtime_control.controller_lock_file().absolute()),
+                   'OA_FINANCE_PREAUDIT_STOP_FILE=' + str(runtime_control.stop_file().absolute()),
+                   str(Path(sys.executable).absolute()), '-B', '-m', MODULE, '--operation', operation,
+                   '--owner-task-id', owner, '--run-id', args.run_id,
+                   '--source-session-file', str(anchor['source']), '--source-line', str(anchor['source_line'])]
+        if operation == 'assign':
+            command += ['--request-file', str(args.request_file.absolute()), '--slot', str(args.slot)]
+        result = {'source': str(anchor['source']), 'source_line': anchor['source_line'],
+                  'next_invocation': {'cmd': shlex.join(command), 'workdir': str(runtime_control.PROJECT_ROOT.absolute())}}
     elif args.operation == 'pending':
         result = {'requests': pending(owner=owner, run_id=args.run_id), 'round': round_status(owner=owner, run_id=args.run_id)}
     elif args.operation == 'status':
@@ -1691,6 +1748,9 @@ def main(argv=None) -> int:
         if args.source_session_file is None or args.source_line is None:
             parser.error('heartbeat requires the current parent native source call')
         result = heartbeat(owner=owner, source=args.source_session_file, source_line=args.source_line, run_id=args.run_id)
+        if args.include_pending:
+            result.update(requests=pending(owner=owner, run_id=args.run_id),
+                          round=round_status(owner=owner, run_id=args.run_id))
     elif args.operation == 'enter-packaging':
         result = enter_packaging(owner=owner, receipt_file=args.receipt_file, invocation_id=args.invocation_id,
                                 tool_session_id=args.tool_session_id, run_id=args.run_id)

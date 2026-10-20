@@ -503,7 +503,18 @@ def test_readonly_postcheck_rejects_changed_evidence_without_resubmit(harness, c
         engine.download = changed
     if change == 'pending': api.pending = deepcopy(api.done)
     if change == 'existing_flow_number': main[-1]['fieldValue'] = 'CHANGED'
-    assert engine.postcheck(attempt)['status'] == 'unresolved'
+    result = engine.postcheck(attempt)
+    assert result['status'] == 'unresolved'
+    expected_difference = {
+        'workflow': ('handled_identity', 'handled_identity_matches'),
+        'main': ('other_form_fields', 'zfjehj'), 'row': ('other_form_fields', 'row_identity'),
+        'amount': ('authorized_invoice_fields', 'fpje'), 'resource': ('resources', 'metadata'),
+        'bytes': ('resources', 'content'), 'pending': ('pending', 'pending_absent'),
+        'existing_flow_number': ('other_form_fields', 'lcbh'),
+    }.get(change)
+    if expected_difference:
+        category, field = expected_difference
+        assert {'category': category, 'field': field} in result['evidence']['differences']['items']
     assert journal.read_bytes() == original_bytes
     assert len(api.calls) == 1
 
@@ -551,3 +562,145 @@ def test_postcheck_checks_handled_pages_beyond_five(harness, monkeypatch, respon
         assert engine.postcheck(attempt)['status'] == 'unresolved'
         assert journal.read_bytes() == original_bytes
         assert len(api.calls) == 1
+
+
+def test_readonly_postcheck_reports_sanitized_differences(harness, monkeypatch, capsys):
+    from scripts import overseas_invoice as cli
+    engine, api, attempt, material = harness
+    engine.freeze(attempt, recognized(material)); authorize(engine)
+    api.mode = 'timeout'
+    engine.submit(attempt, confirm='YES')
+    journal = engine.root / 'receipts' / (inv.digest('901') + '.json')
+    original_bytes = journal.read_bytes()
+    main = api.data['workflowMainTableInfo']['requestRecords'][0]['workflowRequestTableFields']
+    main[1]['fieldValue'] = 'SECRET-PAYMENT-VALUE'
+    api.data['currentNodeId'] = 'SECRET-NODE'
+    row = api.data['workflowDetailTableInfos'][0]['workflowRequestTableRecords'][0]
+    row['workflowRequestTableFields'][2]['fieldValue'] = 'SECRET-INVOICE-VALUE'
+    monkeypatch.setattr(cli.auth, 'load_local_env', lambda: None)
+    monkeypatch.setattr(cli.auth, 'env', lambda key: {'OA_UID': '77', 'OA_APP_SECRET': 'test-key'}[key])
+    monkeypatch.setattr(cli, 'ROOT', engine.root)
+    monkeypatch.setattr(cli.overseas_invoice_api, 'build_api', lambda: api)
+    monkeypatch.setattr(cli.overseas_invoice_api, 'download_fresh', engine.download)
+    assert cli.main(['postcheck', '--attempt', attempt]) == 0
+    output = capsys.readouterr().out
+    result = json.loads(output)
+    differences = result['evidence']['differences']
+    assert {'category': 'authorized_invoice_fields', 'field': 'fphm'} in differences['items']
+    assert {'category': 'other_form_fields', 'field': 'zfjehj'} in differences['items']
+    assert {'category': 'node', 'field': 'node_id'} in differences['items']
+    assert {'category': 'pending', 'field': 'pending_absent'} in differences['items']
+    assert {'category': 'handled_identity', 'field': 'handled_identity_matches'} in differences['items']
+    assert differences['truncated'] is False
+    assert 'SECRET-' not in output
+    assert result['status'] == 'unresolved'
+    assert journal.read_bytes() == original_bytes
+    assert len(api.calls) == 1
+
+
+def test_readonly_postcheck_bounds_field_diagnostics_and_keeps_equivalence(harness):
+    engine, api, _, _ = harness
+    main = api.data['workflowMainTableInfo']['requestRecords'][0]['workflowRequestTableFields']
+    main.append({'fieldName': 'lcbh', 'fieldValue': ''})
+    attempt = engine.collect('901'); material = engine.read_material(attempt)
+    engine.freeze(attempt, recognized(material)); authorize(engine)
+    original = api.submit_invoice
+    def lost_response(*args):
+        original(*args)
+        raise TimeoutError('lost response')
+    api.submit_invoice = lost_response
+    engine.submit(attempt, confirm='YES')
+    row = api.data['workflowDetailTableInfos'][0]['workflowRequestTableRecords'][0]
+    row['workflowRequestTableFields'][1]['fieldValue'] = '55.0'
+    main[-1]['fieldValue'] = 'GENERATED-FLOW-NUMBER'
+    assert engine.postcheck(attempt)['evidence']['differences'] == {'items': [], 'total': 0, 'truncated': False}
+    for index in range(40):
+        main.append({'fieldName': f'extra_{index:02}', 'fieldValue': 'SECRET-VALUE'})
+    main.append({'fieldName': 'https://secret.invalid/path', 'fieldValue': 'SECRET-VALUE'})
+    result = engine.postcheck(attempt)
+    differences = result['evidence']['differences']
+    assert len(differences['items']) == 32
+    assert differences['total'] == 41
+    assert differences['truncated'] is True
+    assert 'SECRET' not in json.dumps(result)
+    assert 'secret.invalid' not in json.dumps(result)
+    assert result['status'] == 'unresolved'
+    assert len(api.calls) == 1
+
+
+def test_status_cli_separates_configuration_acceptance_and_bound_unknown(harness, monkeypatch, capsys):
+    from scripts import overseas_invoice as cli
+    engine, api, attempt, material = harness
+    engine.freeze(attempt, recognized(material)); authorize(engine)
+    api.mode = 'timeout'
+    engine.submit(attempt, confirm='YES')
+    journal = engine.root / 'receipts' / (inv.digest('901') + '.json')
+    original_bytes = journal.read_bytes()
+    checked = engine.postcheck(attempt)
+    monkeypatch.setattr(cli.auth, 'load_local_env', lambda: None)
+    monkeypatch.setattr(cli.auth, 'env', lambda key: {'OA_UID': '77', 'OA_APP_SECRET': 'test-key'}[key])
+    monkeypatch.setattr(cli, 'ROOT', engine.root)
+    def unexpected_api():
+        pytest.fail('local status must not create an OA client')
+    monkeypatch.setattr(cli.overseas_invoice_api, 'build_api', unexpected_api)
+    assert cli.main(['status', '--attempt', attempt]) == 0
+    result = json.loads(capsys.readouterr().out)
+    capabilities = result['capability_status']
+    assert capabilities['invoice_backfill']['authorization'] == 'enabled'
+    assert capabilities['no_invoice_submit']['authorization'] == 'disabled'
+    assert capabilities['pending']['authorization'] == 'not_required'
+    for capability in capabilities.values():
+        assert capability['implementation'] == 'available'
+        assert capability['deployment'] == 'unknown'
+        assert capability['scheduling'] == 'unknown'
+        assert capability['business_acceptance'] == 'not_verified'
+    disposition = result['unknown_dispositions'][0]
+    assert disposition['attempt'] == attempt
+    assert disposition['receipt_source'] == str(journal)
+    assert disposition['receipt_digest'] == checked['receipt_digest']
+    assert disposition['latest_postcheck']['source'] == checked['postcheck_file']
+    assert disposition['latest_postcheck']['observed_at'] == checked['observed_at']
+    assert disposition['latest_postcheck']['status'] == 'unresolved'
+    assert disposition['automatic_retry_allowed'] is False
+    assert disposition['owner'] == 'manual_reconciliation'
+    assert disposition['deadline'] is None
+    assert disposition['age_seconds'] is None
+    assert result['receipt']['status'] == 'unknown'
+    assert journal.read_bytes() == original_bytes
+    assert len(api.calls) == 1
+
+
+@pytest.mark.parametrize('corruption', ['signature', 'binding'])
+def test_status_preserves_unknown_when_newer_postcheck_is_untrusted(harness, corruption):
+    engine, api, attempt, material = harness
+    engine.freeze(attempt, recognized(material)); engine.authorize(confirm='YES', allow_no_invoice=True)
+    original = api.submit_invoice
+    def lost_response(*args):
+        original(*args)
+        raise TimeoutError('lost response')
+    api.submit_invoice = lost_response
+    engine.submit(attempt, confirm='YES')
+    journal = engine.root / 'receipts' / (inv.digest('901') + '.json')
+    original_bytes = journal.read_bytes()
+    checked = engine.postcheck(attempt)
+    assert checked['status'] == 'confirmed_submitted'
+    first = engine.status()
+    assert first['unknown_dispositions'][0]['latest_postcheck']['status'] == 'confirmed_submitted'
+    assert first['capability_status']['no_invoice_submit']['authorization'] == 'enabled'
+    assert first['capability_status']['no_invoice_submit']['business_acceptance'] == 'not_verified'
+    path = Path(checked['postcheck_file']).with_name('f' * 32 + '.json')
+    changed = {key: value for key, value in checked.items() if key != 'postcheck_file'}
+    changed['observed_at'] = '2099-01-01T00:00:00+00:00'
+    if corruption == 'binding': changed['receipt_digest'] = '0' * 64
+    engine._write(path, changed)
+    if corruption == 'signature':
+        document = json.loads(path.read_bytes()); document['proof'] = '0' * 64
+        path.write_text(json.dumps(document))
+    result = engine.status()
+    disposition = result['unknown_dispositions'][0]
+    assert disposition['latest_postcheck'] is None
+    assert disposition['postcheck_evidence'] == 'untrusted'
+    assert disposition['receipt_status'] == 'unknown'
+    assert disposition['automatic_retry_allowed'] is False
+    assert journal.read_bytes() == original_bytes
+    assert len(api.calls) == 1
