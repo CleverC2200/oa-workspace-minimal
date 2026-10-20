@@ -72,7 +72,7 @@ def _literal_arguments(raw: str, keys: set[str]) -> dict:
     return arguments
 
 
-def _wait_result(anchor: dict, output: dict, session: str) -> dict:
+def _wait_result(anchor: dict, output: dict, session: str, *, allow_interrupt: bool = False) -> dict:
     payload = anchor.get('payload', {})
     if payload.get('name') not in {'exec', 'functions.exec'} or not payload.get('call_id'):
         raise ValueError('host_review_source_untrusted')
@@ -96,7 +96,8 @@ def _wait_result(anchor: dict, output: dict, session: str) -> dict:
                 or any(type(command[key]) is not int for key in {'max_output_tokens', 'yield_time_ms'} & command.keys())):
             raise ValueError('host_review_shutdown_wait_untrusted')
     args = _literal_arguments(match['wait'], {'session_id', 'chars', 'yield_time_ms', 'max_output_tokens'})
-    if (not isinstance(args, dict) or str(args.get('session_id')) != session or args.get('chars', '') != ''
+    if (not isinstance(args, dict) or str(args.get('session_id')) != session
+            or args.get('chars', '') not in ({'', '\x03'} if allow_interrupt else {''})
             or set(args) - {'session_id', 'chars', 'yield_time_ms', 'max_output_tokens'}):
         raise ValueError('host_review_shutdown_wait_untrusted')
     # Sequential text(await ...) calls emit their actual results in call order.
@@ -265,7 +266,8 @@ def finish(*, owner: str, source: Path, interrupt_lines: list[int], status_line:
 
 def _unregistered_proofs(*, owner: str, reviewers: list[dict], source: Path, receipt_file: Path,
                          invocation_id: str, tool_session_id: str, interrupt_lines: list[int],
-                         status_line: int, wait_line: int, require_idle: bool = True) -> dict:
+                         status_line: int, wait_line: int, require_idle: bool = True,
+                         legacy_source_owner: str | None = None) -> dict:
     from scripts import finance_preaudit_run as runner
     from . import approval_lifecycle
     binding = {'receipt_file': str(receipt_file.absolute()), 'owner_task_id': owner,
@@ -292,16 +294,19 @@ def _unregistered_proofs(*, owner: str, reviewers: list[dict], source: Path, rec
             or (host.registry_file(owner, legacy=True).exists()
                 and host._read(host.registry_file(owner, legacy=True))[1].get('run_id') == report['run_id'])):
         raise ValueError('host_review_unregistered_shutdown_incomplete')
-    registered = host._reviewers(reviewers, owner, source)
+    source_owner = legacy_source_owner or owner
+    if legacy_source_owner is not None and report.get('terminal') is not True:
+        raise ValueError('host_review_unregistered_shutdown_incomplete')
+    registered = host._reviewers(reviewers, source_owner, source)
     value = {'reviewers': registered}
     if len(interrupt_lines) != 3 or len(set(interrupt_lines)) != 3:
         raise ValueError('host_review_shutdown_three_interrupts_required')
     stops = []
     stopped_at = []
     for reviewer, line in zip(registered, interrupt_lines):
-        spawn, _ = _source(value, owner, source, reviewer['spawn_source']['line'], earliest=started)
+        spawn, _ = _source(value, source_owner, source, reviewer['spawn_source']['line'], earliest=started)
         spawn_at = datetime.fromisoformat(spawn['timestamp'].replace('Z', '+00:00')).timestamp()
-        anchor, proof = _source(value, owner, source, line, earliest=spawn_at)
+        anchor, proof = _source(value, source_owner, source, line, earliest=spawn_at)
         arguments = host._tool(anchor, 'interrupt_agent')
         previous = proof.pop('output')
         if (line <= reviewer['spawn_source']['output_line'] or arguments != {'target': reviewer['agent_path']}
@@ -310,18 +315,27 @@ def _unregistered_proofs(*, owner: str, reviewers: list[dict], source: Path, rec
         host._native_agent_status(previous['previous_status'])
         stops.append(proof)
         stopped_at.append(datetime.fromisoformat(anchor['timestamp'].replace('Z', '+00:00')).timestamp())
-    anchor, statuses = _source(value, owner, source, status_line, earliest=started)
+    anchor, statuses = _source(value, source_owner, source, status_line, earliest=started)
     host._tool(anchor, 'list_agents')
     if (status_line <= max(item['output_line'] for item in stops)
             or datetime.fromisoformat(anchor['timestamp'].replace('Z', '+00:00')).timestamp() < max(stopped_at)):
         raise ValueError('host_review_stale_source')
     statuses['reviewers'] = _idle_reviewers(value, statuses.pop('output'))
-    anchor, wait = _source(value, owner, source, wait_line, earliest=completed)
-    exit_result = _wait_result(anchor, wait.pop('output'), tool_session_id)
+    anchor, wait = _source(value, source_owner, source, wait_line, earliest=completed)
+    exit_result = _wait_result(anchor, wait.pop('output'), tool_session_id,
+        allow_interrupt=legacy_source_owner is not None and execution.get('received_signals') == [signal.SIGTERM])
     if exit_result['exit_code'] != report['exit_code']:
         raise ValueError('host_review_shutdown_wait_untrusted')
+    if legacy_source_owner is not None:
+        try:
+            native_execution = json.loads(exit_result['output'])
+        except (ValueError, TypeError) as error:
+            raise ValueError('host_review_shutdown_wait_untrusted') from error
+        if native_execution != {**execution, 'receipt_file': str(receipt_file.absolute())}:
+            raise ValueError('host_review_shutdown_wait_untrusted')
     progress = approval_lifecycle._progress(manifest)
-    if (progress is None or progress['actions'] or progress['phase_deadlines'] or progress['writer_active']
+    if (progress is None or progress['writer_active']
+            or legacy_source_owner is None and (progress['actions'] or progress['phase_deadlines'])
             or not started <= progress['heartbeat_at'] <= completed):
         raise ValueError('host_review_unregistered_work_detected')
     progress_path = approval_lifecycle.run_directory(manifest['run_id']) / 'progress.json'
@@ -334,13 +348,17 @@ def _unregistered_proofs(*, owner: str, reviewers: list[dict], source: Path, rec
             payload = runner._object(content)
     if (payload.get('kind') != 'preaudit_production_rolling_drain' or payload.get('status') != 'failed'
             or any(type(payload.get(key)) is not int or payload[key] != 0
-                   for key in ('completed', 'process_attempts', 'peak_active'))
-            or type(payload.get('prepare_active_seconds')) not in {int, float} or payload['prepare_active_seconds'] != 0
+                   for key in ('completed', 'process_attempts'))
+            or legacy_source_owner is None and (type(payload.get('peak_active')) is not int
+                or payload['peak_active'] != 0 or payload.get('prepare_active_seconds') != 0)
+            or type(payload.get('prepare_active_seconds')) not in {int, float} or payload['prepare_active_seconds'] < 0
             or payload.get('processes_reaped') is not True
             or type(payload.get('pipeline', {}).get('writer', {}).get('max_concurrency')) is not int
-            or payload['pipeline']['writer']['max_concurrency'] != 0):
+            or payload['pipeline']['writer']['max_concurrency'] != 0
+            or legacy_source_owner is not None and (payload.get('business_results') not in ({}, None)
+                or payload['pipeline']['writer'].get('busy_seconds') != 0)):
         raise ValueError('host_review_unregistered_work_detected')
-    return {'kind': 'preaudit_app_unregistered_shutdown', 'status': 'verified', 'owner_task_id': owner,
+    result = {'kind': 'preaudit_app_unregistered_shutdown', 'status': 'verified', 'owner_task_id': owner,
             'run_id': manifest['run_id'], 'controller_instance_id': manifest['controller_instance_id'],
             'original_execution': binding, 'reviewers': registered,
             'interrupt_sources': stops, 'children_source': statuses, 'driver_wait_source': wait,
@@ -348,9 +366,18 @@ def _unregistered_proofs(*, owner: str, reviewers: list[dict], source: Path, rec
             'no_actions_or_writes': True, 'execution_sha256': hashlib.sha256(raw).hexdigest(),
             'manifest_sha256': hashlib.sha256(manifest_raw).hexdigest(),
             'progress_sha256': hashlib.sha256(progress_raw).hexdigest(), 'output_files': logs}
+    if legacy_source_owner is not None:
+        result.pop('no_actions_or_writes')
+        result.update(kind='preaudit_legacy_app_shutdown', source_owner_task_id=source_owner,
+            historical_owner_matches_native_source=owner == source_owner, no_writes_by_original_run=True,
+            historical_action_outcomes='not_verified', prepared_actions=progress['actions'])
+    return result
 
 
 def sealed_unregistered(receipt_file: Path) -> dict:
+    if receipt_file.with_name('legacy-app-shutdown.json').exists():
+        from . import legacy_app_shutdown
+        return legacy_app_shutdown.sealed(receipt_file)
     _, saved = host._read(receipt_file.with_name('pre-registration-shutdown.json'))
     try:
         binding = saved['original_execution']
