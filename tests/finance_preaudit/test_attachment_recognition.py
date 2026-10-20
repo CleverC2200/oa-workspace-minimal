@@ -21,6 +21,18 @@ def image(tmp_path, name='one.png', width=8, height=8):
     return path
 
 
+def tiff_image(path, *, frame_count):
+    from PIL import Image
+
+    frames = [Image.new('RGB', (16, 16), color) for color in ('red', 'blue')[:frame_count]]
+    try:
+        frames[0].save(path, format='TIFF', save_all=True, append_images=frames[1:])
+    finally:
+        for frame in frames:
+            frame.close()
+    return path
+
+
 def fake_api(monkeypatch):
     calls = []
     monkeypatch.setenv('OA_REVIEW_API_KEY', 'offline-secret')
@@ -68,11 +80,14 @@ def frozen_finance_action(tmp_path, monkeypatch, request):
     monkeypatch.setattr(recognition.auth, 'load_local_env', forbidden)
     monkeypatch.setattr(recognition.attachment_extractors, 'prepare_materials', forbidden)
 
-    dimensions = getattr(request, 'param', {})
+    dimensions = dict(getattr(request, 'param', {}))
+    tiff_frames = dimensions.pop('tiff_frames', None)
 
     def collect(request, root):
         material = _travel_material_with_attachment(request, root)
         page = image(root / 'prepared', 'evidence.png', **dimensions)
+        if tiff_frames is not None:
+            tiff_image(page, frame_count=tiff_frames)
         material['prepared']['images'][0].update(
             content_sha256=hashlib.sha256(page.read_bytes()).hexdigest(), owner_detail_id='row-2')
         material['prepared']['manifest'][0]['status'] = 'image'
@@ -633,6 +648,62 @@ def test_normal_image_sends_original_bytes(tmp_path, monkeypatch, format):
     assert block['image_url']['url'].startswith(f'data:image/{format.lower()};base64,')
     assert base64.b64decode(block['image_url']['url'].split(',', 1)[1]) == original
     assert 'image_tiles' not in report['parts'][0]
+    assert source.read_bytes() == original
+
+
+@pytest.mark.parametrize('suffix', ['.tiff', '.png'])
+def test_direct_multipage_tiff_is_rejected_before_http(tmp_path, monkeypatch, suffix):
+    source = tiff_image(tmp_path / ('two-pages' + suffix), frame_count=2)
+    original = source.read_bytes()
+    calls = fake_http(monkeypatch, lambda _: {
+        'choices': [{'finish_reason': 'stop', 'message': {'content': 'first page only'}}]})
+
+    report = recognition.recognize(files=[source], output_dir=tmp_path / 'out')
+
+    assert report['status'] == 'failed'
+    assert report['error_code'] == 'attachment_multipage_image_unsupported'
+    assert report['parts'] == [] and calls == []
+    assert report['failed_part']['content_sha256'] == hashlib.sha256(original).hexdigest()
+    assert report['sources'][0]['sha256'] == hashlib.sha256(original).hexdigest()
+    assert json.loads(Path(report['report_file']).read_bytes()) == report
+    assert source.read_bytes() == original
+
+
+@pytest.mark.parametrize('frozen_finance_action', [{'tiff_frames': 2}], indirect=True)
+def test_frozen_multipage_tiff_is_rejected_before_http(tmp_path, monkeypatch, frozen_finance_action):
+    action_file = Path(frozen_finance_action['action_file'])
+    before = {p: p.read_bytes() for p in action_file.parent.rglob('*') if p.is_file()}
+    calls = fake_http(monkeypatch, lambda _: {
+        'choices': [{'finish_reason': 'stop', 'message': {'content': 'first page only'}}]})
+
+    report = recognition.recognize(action_file=action_file, output_dir=tmp_path / 'out')
+
+    assert report['status'] == 'failed'
+    assert report['error_code'] == 'attachment_multipage_image_unsupported'
+    assert report['parts'] == [] and calls == []
+    assert report['failed_part']['evidence_ref'] == 'material:prepared.images.evidence-1.1'
+    assert report['failed_part']['owner_detail_id'] == 'row-2'
+    assert report['frozen_binding']['action_file'] == str(action_file)
+    assert all(p.read_bytes() == raw for p, raw in before.items())
+
+
+def test_single_page_tiff_keeps_pixels_and_source_binding(tmp_path, monkeypatch):
+    import base64
+
+    source = tiff_image(tmp_path / 'single-page.tiff', frame_count=1)
+    original = source.read_bytes()
+    calls = fake_http(monkeypatch, lambda _: {
+        'choices': [{'finish_reason': 'stop', 'message': {'content': 'red page'}}]})
+
+    report = recognition.recognize(files=[source], output_dir=tmp_path / 'out')
+
+    assert report['status'] == 'complete'
+    assert len(calls) == len(report['parts']) == 1
+    url = calls[0]['messages'][-1]['content'][1]['image_url']['url']
+    assert url.startswith('data:image/png;base64,')
+    sent = fitz.Pixmap(base64.b64decode(url.split(',', 1)[1]))
+    assert (sent.width, sent.height, sent.pixel(1, 1)) == (16, 16, (255, 0, 0))
+    assert report['parts'][0]['content_sha256'] == hashlib.sha256(original).hexdigest()
     assert source.read_bytes() == original
 
 

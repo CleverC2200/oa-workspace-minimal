@@ -51,13 +51,15 @@ def build_api() -> InvoiceApi:
     return InvoiceApi(auth.get_token(), auth.encrypt_user_id(auth.env('OA_UID')))
 
 
-def download_fresh(resources: list[dict], directory: Path) -> list[dict]:
+def download_fresh(resources: list[dict], directory: Path, *, request_id: str) -> list[dict]:
     """每次读取原件，不拿历史缓存代替提交前的附件版本核验。"""
     import fitz
 
+    _require(isinstance(request_id, str) and re.fullmatch(r'[1-9][0-9]*', request_id) is not None,
+             'invoice_request_invalid')
     files, errors = attachments.download_resources(
         resources, dest_dir=directory, timeout_sec=60, allow_browser_download=True,
-        request_id=directory.parent.name, flow_key='overseas_invoice', reuse_cache=False,
+        request_id=request_id, flow_key='overseas_invoice', reuse_cache=False,
     )
     _require(not errors and len(files) == len(resources), 'invoice_download_failed')
     for item in files:

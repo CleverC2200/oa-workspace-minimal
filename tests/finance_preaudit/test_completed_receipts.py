@@ -55,7 +55,8 @@ def test_cli_summarizes_only_explicit_sealed_round_without_writes(exchange, tmp_
 
 def completed_case(exchange, tmp_path, *, controlled=True, legacy=False, close_action=True, submitted=True,
                    workflow='business_support_fee', bootstrap_revision=None, bootstrap_dirty=False,
-                   bootstrap_before_start=False, bootstrap_native_mismatch=False, close_before_shutdown=False):
+                   bootstrap_before_start=False, bootstrap_native_mismatch=False, close_before_shutdown=False,
+                   close_idle_before_receipt=False):
     from apps import json_artifact
     from apps.oa_finance_preaudit import host_chat_review as host
     from tests.finance_preaudit.test_flow_engine_support import _engine, _decision, _reviewed_items
@@ -114,10 +115,15 @@ def completed_case(exchange, tmp_path, *, controlled=True, legacy=False, close_a
     if not close_before_shutdown:
         shutdown.begin(owner=owner, reason='completed' if close_action else 'cancelled')
     controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
+    idle = None
+    if close_before_shutdown and close_idle_before_receipt:
+        idle = native_call(parent, 'list_agents', {}, 'independent-close-idle-before-wait', {'agents': [
+            {'agent_name': f'/root/reviewer_{slot}', 'agent_status': 'completed'} for slot in range(3)]})
     execution = seal_execution(owner, manifest)
     if close_before_shutdown:
-        idle = native_call(parent, 'list_agents', {}, 'independent-close-idle', {'agents': [
-            {'agent_name': f'/root/reviewer_{slot}', 'agent_status': 'completed'} for slot in range(3)]})
+        if idle is None:
+            idle = native_call(parent, 'list_agents', {}, 'independent-close-idle', {'agents': [
+                {'agent_name': f'/root/reviewer_{slot}', 'agent_status': 'completed'} for slot in range(3)]})
         host.close(owner=owner, reason='completed', source=parent, source_line=idle, run_id=manifest['run_id'])
         shutdown.begin(owner=owner, reason='completed', run_id=manifest['run_id'])
     shutdown_proofs = proofs(owner, child)
@@ -132,15 +138,26 @@ def completed_case(exchange, tmp_path, *, controlled=True, legacy=False, close_a
         record['payload']['output'] = json.dumps({'exit_code': 0, 'output': json.dumps(recorded_execution)})
         rows[shutdown_proofs['wait_line']] = json.dumps(record)
         source.write_text('\n'.join(rows) + '\n')
+    native_sources = {path: path.read_bytes() for path in child.parent.glob('*.jsonl')}
     shutdown.finish(owner=owner, **shutdown_proofs)
+    assert all(path.read_bytes() == raw for path, raw in native_sources.items())
     return root, owner, manifest['run_id'], current, host.registry_file(owner, manifest['run_id']), request_file
 
 
-def test_cli_counts_completed_exchange_sealed_after_its_original_close(exchange, tmp_path, capsys):
-    root, owner, run, _, registry_file, _ = completed_case(exchange, tmp_path, close_before_shutdown=True)
+@pytest.mark.parametrize('idle_before_receipt', [False, True])
+def test_cli_counts_completed_exchange_sealed_after_its_original_close(exchange, tmp_path, capsys, idle_before_receipt):
+    from datetime import datetime
+    root, owner, run, _, registry_file, _ = completed_case(
+        exchange, tmp_path, close_before_shutdown=True, close_idle_before_receipt=idle_before_receipt)
     registered = json.loads(registry_file.read_text())
     assert registered['closed_at'] < registered['shutdown']['started_at']
     assert registered['shutdown']['status'] == 'verified'
+    idle = registered['children_idle_source']
+    source = json.loads(Path(idle['session_file']).read_text().splitlines()[idle['line'] - 1])
+    execution = json.loads(Path(registered['original_execution']['receipt_file']).read_text())
+    idle_at, completed_at = datetime.fromisoformat(source['timestamp']), datetime.fromisoformat(execution['completed_at'])
+    assert (idle_at < completed_at) is idle_before_receipt
+    assert completed_at.timestamp() <= registered['closed_at']
     original = {file: file.read_bytes() for file in tmp_path.rglob('*') if file.is_file()}
 
     assert cli.main(['completed-receipts', '--root', str(root), '--owner-task-id', owner, '--run-id', run]) == 0

@@ -221,6 +221,8 @@ def _png_crop(image, box) -> bytes:
 def _image_tiles(raw: bytes):
     image = _open_image(raw)
     with image:
+        if image.format == 'TIFF' and getattr(image, 'n_frames', 1) > 1:
+            raise ValueError('attachment_multipage_image_unsupported')
         if max(image.size) <= MAX_IMAGE_DIMENSION:
             yield None, _image_block(raw)
             return

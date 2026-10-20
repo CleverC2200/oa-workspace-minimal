@@ -358,7 +358,8 @@ def read_execution(receipt_file: Path, *, owner_task_id: str, invocation_id: str
             raise ValueError("controller_execution_evidence_failed")
         supervisor_alive = (approval_guard.process_identity(supervisor["pid"]) == supervisor
                             if supervisor is not None else _process_alive(receipt.get("supervisor_pid")))
-        if state in {"starting", "waiting"} and not supervisor_alive:
+        unsealed_exit = state == "exited" and "result" not in receipt
+        if (state in {"starting", "waiting"} or unsealed_exit) and not supervisor_alive:
             report.update(state="supervisor_lost", recorded_state=state,
                           status="blocked", error_code="controller_supervisor_lost")
             observation = _supervisor_exit_observation(path, receipt)

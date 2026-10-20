@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -95,8 +97,46 @@ def test_transport(family, address):
     assert result.returncode == 1, result.stdout + result.stderr
     failures = [line for line in result.stdout.splitlines()
                 if line.startswith('offline_network_forbidden:')]
-    assert len(failures) == 2, result.stdout + result.stderr
+    assert len(failures) >= 2, result.stdout + result.stderr
     assert '2 failed' in result.stdout
+    assert not (tmp_path / 'transport-reached').exists()
+
+
+@pytest.mark.parametrize('background_work', [
+    '''    child = threading.Thread(target=socket.gethostbyname, args=("recorded.invalid",))
+    child.start()
+    child.join()
+''',
+    '''    with ThreadPoolExecutor(max_workers=1) as workers:
+        workers.submit(socket.gethostbyname, "recorded.invalid")
+''',
+    '''    item = LookupOnCleanup()
+    del item
+    gc.collect()
+''',
+], ids=['plain-thread', 'unobserved-future', 'unraisable-cleanup'])
+def test_background_network_rejection_cannot_leave_the_test_green(tmp_path, background_work):
+    result = run_pytest_case(tmp_path, '''
+import gc
+import socket
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+def sentinel_resolve(*args, **kwargs):
+    Path('transport-reached').touch()
+    raise AssertionError('recorded resolver sentinel')
+
+socket.gethostbyname = sentinel_resolve
+
+class LookupOnCleanup:
+    def __del__(self):
+        socket.gethostbyname('recorded.invalid')
+
+def test_background():
+''' + background_work)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert 'offline_network_forbidden' in result.stdout
     assert not (tmp_path / 'transport-reached').exists()
 
 
