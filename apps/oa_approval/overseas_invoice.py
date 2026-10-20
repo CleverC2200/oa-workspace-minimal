@@ -326,7 +326,7 @@ class InvoiceFlow:
         directory = self._attempt(attempt)
         selected = [r for r in evidence_packet.logical_attachment_resources(data, resources)
                     if str(r.get('id')) in {str(s['id']) for s in snap['resources']}]
-        files = self.download(selected, directory / 'attachments') if selected else []
+        files = self.download(selected, directory / 'attachments', request_id=request_id) if selected else []
         frozen = self._freeze_files(directory, files)
         _require({a['resource_id'] for a in frozen} == {str(r['id']) for r in snap['resources']}, 'invoice_download_incomplete')
         material = {'kind': 'overseas_invoice_material', 'attempt': attempt, 'pending': pending,
@@ -389,7 +389,8 @@ class InvoiceFlow:
             selected = [r for r in evidence_packet.logical_attachment_resources(current, resources)
                         if str(r.get('id')) in selected_ids]
             directory = self._attempt(material['attempt']) / ('postcheck-' + secrets.token_hex(8))
-            fresh = self._freeze_files(directory, self.download(selected, directory / 'attachments') if selected else [])
+            fresh = self._freeze_files(
+                directory, self.download(selected, directory / 'attachments', request_id=request_id) if selected else [])
             evidence['attachments_digest'] = digest(fresh)
             evidence['attachments_match'] = (
                 {a['resource_id']: a['sha256'] for a in fresh}
@@ -459,7 +460,8 @@ class InvoiceFlow:
             selected_ids = {a['resource_id'] for a in material['attachments']}
             selected = [r for r in evidence_packet.logical_attachment_resources(data, resources) if str(r.get('id')) in selected_ids]
             directory = self._attempt(attempt) / ('recheck-' + secrets.token_hex(8))
-            fresh = self._freeze_files(directory, self.download(selected, directory / 'attachments') if selected else [])
+            fresh = self._freeze_files(
+                directory, self.download(selected, directory / 'attachments', request_id=request_id) if selected else [])
             _require({a['resource_id']: a['sha256'] for a in fresh} == {a['resource_id']: a['sha256'] for a in material['attachments']}, 'invoice_attachment_changed')
             updated = patched_workflow(data, material['snapshot'], plan)
             _require(self._pending(request_id) == material['pending'] and self._policy() == policy, 'invoice_target_changed')
