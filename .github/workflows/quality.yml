@@ -96,6 +96,7 @@ jobs:
           path: |
             ${{ runner.temp }}/collection.json
             ${{ runner.temp }}/execution.json
+            ${{ runner.temp }}/execution.json.failures.jsonl
             ${{ runner.temp }}/offline-tests.xml
           if-no-files-found: error
 
@@ -119,7 +120,7 @@ jobs:
       - run: python -m pip install --requirement requirements-dev.txt
       - name: Stop recovery tests with no skips
         run: |
-          python -m pytest -q --tb=short --junitxml="$RUNNER_TEMP/stop-recovery.xml" tests/finance_preaudit/test_manual_stop_recovery.py
+          python -m pytest -q --tb=short -o cache_dir="$RUNNER_TEMP/pytest-cache" --junitxml="$RUNNER_TEMP/stop-recovery.xml" tests/finance_preaudit/test_manual_stop_recovery.py
           python -m scripts.pytest_evidence --macos-report="$RUNNER_TEMP/stop-recovery.xml" --output="$RUNNER_TEMP/macos.json" --budget-seconds=170
       - name: Preserve macOS stop recovery evidence
         id: evidence
@@ -130,6 +131,7 @@ jobs:
           path: |
             ${{ runner.temp }}/stop-recovery.xml
             ${{ runner.temp }}/macos.json
+            ${{ runner.temp }}/pytest-cache/d/failure-records/*.jsonl
           if-no-files-found: error
 
   quality-complete:

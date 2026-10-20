@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import resource
+import secrets
 import subprocess
 import sys
 import time
@@ -66,7 +67,7 @@ def pytest_collection_modifyitems(config, items):
 
 
 def pytest_configure(config):
-    if config.getoption('ci_evidence_file') and not hasattr(config, 'workerinput'):
+    if not hasattr(config, 'workerinput'):
         config.pluginmanager.register(Evidence(config), 'offline-ci-evidence')
 
 
@@ -74,6 +75,10 @@ class Evidence:
     def __init__(self, config):
         self.config = config
         self.path = config.getoption('ci_evidence_file')
+        self.failure_path = (
+            self.path.with_name(self.path.name + '.failures.jsonl') if self.path is not None
+            else config.cache.mkdir('failure-records') / f'{secrets.token_hex(16)}.jsonl'
+        )
         self.started = time.monotonic()
         self.wall_started = time.time()
         self.cpu_started = time.process_time()
@@ -86,9 +91,9 @@ class Evidence:
         self.errors = []
         self.expected = None
         self.job_started = os.environ.get('OA_CI_STARTED_AT')
-        if self.path.exists():
+        if (self.path is not None and self.path.exists()) or self.failure_path.exists():
             raise pytest.UsageError('ci_evidence_already_exists')
-        if not config.option.collectonly:
+        if self.path is not None and not config.option.collectonly:
             reference = config.getoption('ci_expected_file')
             if reference is None:
                 raise pytest.UsageError('ci_independent_collection_required')
@@ -121,8 +126,25 @@ class Evidence:
             self.workers[worker]['executed'] += 1
         if report.failed:
             self.errors.append(f'test_failed:{report.nodeid}:{report.when}')
+            self.failure_path.parent.mkdir(parents=True, exist_ok=True)
+            failure = {
+                'schema_version': 1, 'kind': 'offline_pytest_failure',
+                'nodeid': report.nodeid, 'phase': report.when, 'worker': worker,
+                'collection_sha256': (self.expected['collection_sha256'] if self.expected is not None
+                                      else collection_digest(next(iter(self.collections.values()), []))),
+                'code_revision': os.environ.get('GITHUB_SHA'),
+                'run_id': os.environ.get('GITHUB_RUN_ID'),
+                'run_attempt': int(os.environ.get('GITHUB_RUN_ATTEMPT', '1')),
+                'job': os.environ.get('GITHUB_JOB'),
+            }
+            with self.failure_path.open('a', encoding='utf-8') as file:
+                file.write(json.dumps(failure, ensure_ascii=False) + '\n')
+                file.flush()
+                os.fsync(file.fileno())
 
     def pytest_sessionfinish(self, session, exitstatus):
+        if self.path is None:
+            return
         nodes = next(iter(self.collections.values()), [])
         if not nodes or len(nodes) != len(set(nodes)):
             self.errors.append('empty_or_duplicate_collection')
