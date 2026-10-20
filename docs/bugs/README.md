@@ -17,6 +17,7 @@
 | 领域 | 症状 / 搜索词 | 主记录或历史组件 | 回归 / 经验入口 |
 |---|---|---|---|
 | CI 重跑证据 | 同名旧失败 artifact、failed-only rerun、run_attempt、汇总旧时钟超时 | [#540](https://github.com/CleverC2200/oa-workspace-minimal/issues/540) | [CI 证据回归](../../tests/finance_preaudit/test_ci_evidence.py)、[质量检查](../agents/quality-checks.md)；按 job 输出的 artifact ID 和 attempt 选择，正确性复用与本次计时分别核验 |
+| CI 任务元数据滞后 | job_timing_status_untrusted、上游已成功但 jobs 仍 in_progress、readiness_exhausted | [#664](https://github.com/CleverC2200/oa-workspace-minimal/issues/664) | [合并证据 CLI 回归](../../tests/finance_preaudit/test_ci_evidence.py)、[质量 workflow](../../.github/workflows/quality.yml) |
 | 只读回收证明 | readonly_reaped=False、stop_requested、worker/model 进程组 | [#599](https://github.com/CleverC2200/oa-workspace-minimal/issues/599) | [只读公开回归](../../tests/finance_preaudit/test_readonly_execution.py)；保留失败判定与登记进程状态，根因与验收以票内证据为准 |
 | Preview 完成回执重放 | complete_review、receipt_persisted、03-review、observability_event_conflict | [#600](https://github.com/CleverC2200/oa-workspace-minimal/issues/600) | [恢复公开回归](../../tests/finance_preaudit/test_flow_engine_replay.py)；区分未闭合回执的 next_action 恢复与完整 closed 的同决定回读 |
 | 发票云原件正文 | body_read_status、原件未读、云文件与 OA 文档映射 | [#556](https://github.com/CleverC2200/oa-workspace-minimal/issues/556) | [真实采集入口回归](../../tests/finance_preaudit/test_invoice_original_bodies.py)、[来源合同](../agents/oa-api.md)；字段、文件记录、正文准备与业务审核分别验收 |
