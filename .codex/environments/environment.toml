@@ -33,3 +33,13 @@ command = "python3 -B -m scripts.dev_environment verify --tests tests/finance_pr
 name = "完整离线验收"
 icon = "tool"
 command = "python3 -B -m scripts.dev_environment verify --full"
+
+[[actions]]
+name = "只读空间报告"
+icon = "tool"
+command = "python3 -B -m scripts.project_space status"
+
+[[actions]]
+name = "创建实验空间"
+icon = "tool"
+command = "python3 -B -m scripts.project_space experiment --name experiment-$(date +%Y%m%d-%H%M%S)-$$"

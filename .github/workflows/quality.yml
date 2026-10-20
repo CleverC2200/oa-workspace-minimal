@@ -42,6 +42,9 @@ jobs:
       - name: Native local environment contract
         if: matrix.shard == 0
         run: python -m scripts.quality environment
+      - name: Shared project space policy
+        if: matrix.shard == 0
+        run: python -m scripts.quality storage
       - name: Production review configuration contract
         if: matrix.shard == 0
         run: python -m scripts.quality production-config
