@@ -216,4 +216,6 @@ python3 -B -m scripts.finance_preaudit_run --owner-task-id <原任务 UUID> --re
 
 汇总同一主聊天的一个或多个明确轮次时，使用审批 CLI 的 `completed-receipts --owner-task-id <主会话UUID> --run-id <run_id> --run-id <另一run_id> --output-file <新私有JSON文件>`；需要读取独立开发夹具时传入 `--root <流程运行根目录>`。它只读取所选轮次，复验原生收尾、冻结材料与实际执行回执，并按 action 去重。标准输出保留计数和有界缺口，完整明细只保存在新建的 0600 文件中。
 
+异常轮次也逐项核验已完成单据。原生收尾可信时，关闭及收尾开始前已派单、已接收的决定，仍须通过同一 action 的实际提交、后查和来源校验才计数。原轮次继续保留异常状态，未提交或迟到的决定不因汇总而恢复执行资格。
+
 `completed` 仅表示已提交并后查的技术闭环，`business_acceptance=not_verified` 保留业务准确性的独立验收边界。草稿、preview、未闭合、缺失或损坏证据不会计作完成。此汇总不替代上方三槽中断和原 session wait，也不替代新鲜 OA 对账；有 invalid 或 excluded 时查看私有明细，不根据计数补造旧记录。

@@ -56,7 +56,7 @@ def test_cli_summarizes_only_explicit_sealed_round_without_writes(exchange, tmp_
 def completed_case(exchange, tmp_path, *, controlled=True, legacy=False, close_action=True, submitted=True,
                    workflow='business_support_fee', bootstrap_revision=None, bootstrap_dirty=False,
                    bootstrap_before_start=False, bootstrap_native_mismatch=False, close_before_shutdown=False,
-                   close_idle_before_receipt=False):
+                   close_idle_before_receipt=False, automatic_close=False):
     from apps import json_artifact
     from apps.oa_finance_preaudit import host_chat_review as host
     from tests.finance_preaudit.test_flow_engine_support import _engine, _decision, _reviewed_items
@@ -112,21 +112,29 @@ def completed_case(exchange, tmp_path, *, controlled=True, legacy=False, close_a
         consumed = tmp_path / 'consumed-decision.json'
         json_artifact.write_json_atomic(consumed, host.read_result(request_file)['decision'])
         engine.complete_review(current, consumed)
-    if not close_before_shutdown:
+    if automatic_close:
+        host.close(owner=owner, reason='parent_lost')
+    elif not close_before_shutdown:
         shutdown.begin(owner=owner, reason='completed' if close_action else 'cancelled')
-    controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
+    controller_handoff.finish(manifest, status='failed' if automatic_close else 'completed',
+                              children_reaped=True, health='degraded' if automatic_close else 'healthy')
     idle = None
     if close_before_shutdown and close_idle_before_receipt:
         idle = native_call(parent, 'list_agents', {}, 'independent-close-idle-before-wait', {'agents': [
             {'agent_name': f'/root/reviewer_{slot}', 'agent_status': 'completed'} for slot in range(3)]})
     execution = seal_execution(owner, manifest)
+    if automatic_close:
+        receipt = json.loads(execution.read_text())
+        receipt.update(result='failed', exit_code=1, controller_state='failed')
+        host.guard.write(execution, receipt)
+        shutdown.begin(owner=owner, reason='parent_lost')
     if close_before_shutdown:
         if idle is None:
             idle = native_call(parent, 'list_agents', {}, 'independent-close-idle', {'agents': [
                 {'agent_name': f'/root/reviewer_{slot}', 'agent_status': 'completed'} for slot in range(3)]})
         host.close(owner=owner, reason='completed', source=parent, source_line=idle, run_id=manifest['run_id'])
         shutdown.begin(owner=owner, reason='completed', run_id=manifest['run_id'])
-    shutdown_proofs = proofs(owner, child)
+    shutdown_proofs = proofs(owner, child, exit_code=1 if automatic_close else 0)
     if bootstrap_revision is not None:
         source = shutdown_proofs['source']
         rows = source.read_text().splitlines()
@@ -165,6 +173,32 @@ def test_cli_counts_completed_exchange_sealed_after_its_original_close(exchange,
     assert json.loads(capsys.readouterr().out)['counts'] == {
         'completed': 1, 'excluded': 0, 'invalid': 0, 'duplicate': 0}
     assert all(file.read_bytes() == raw for file, raw in original.items())
+
+
+@pytest.mark.parametrize('close_action', [True, False])
+def test_cli_revalidates_submissions_before_automatic_close_and_later_shutdown(exchange, tmp_path, capsys, close_action):
+    from apps.oa_finance_preaudit import host_chat_review as host
+    root, owner, run, _, registry_file, request_file = completed_case(
+        exchange, tmp_path, close_action=close_action, submitted=close_action, automatic_close=True)
+    registered = shutdown.sealed_round(owner=owner, run_id=run)
+    assert registered['state'] == 'cancelled'
+    assert registered['close_reason'] == 'parent_lost'
+    assert registered['closed_at'] < registered['shutdown']['started_at']
+    assert registered['shutdown']['receipt']['driver_exit_code'] == 1
+    original = {file: file.read_bytes() for file in tmp_path.rglob('*') if file.is_file()}
+
+    assert cli.main(['completed-receipts', '--root', str(root), '--owner-task-id', owner, '--run-id', run]) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert report['counts'] == {'completed': int(close_action), 'excluded': int(not close_action),
+                                'invalid': 0, 'duplicate': 0}
+    request = json.loads(request_file.read_text())
+    assert host.sealed_assignment(request_file, request, registered)['state'] == ('submitted' if close_action else 'assigned')
+    if close_action:
+        submitted = host.sealed_submission(request_file, request, registered)
+        assert submitted['request_sha256'] == registered['requests'][request['request_id']]['request_sha256']
+    assert all(file.read_bytes() == raw for file, raw in original.items())
+    assert json.loads(registry_file.read_text())['close_reason'] == 'parent_lost'
 
 
 @pytest.mark.parametrize('damage', ['missing_idle', 'idle_source', 'idle_running', 'completion_after_close',
@@ -281,12 +315,13 @@ def test_cli_never_counts_a_request_without_native_assignment(exchange, tmp_path
     assert result['counts']['invalid'] == 1
 
 
+@pytest.mark.parametrize('automatic_close', [False, True])
 @pytest.mark.parametrize('damage', ['dispatch', 'draft_source', 'draft_bytes', 'missing_submission',
-                                  'submission_decision', 'late_submission', 'reviewer', 'dispatch_reused'])
-def test_cli_revalidates_each_rounds_native_submission(exchange, tmp_path, capsys, damage):
+                                  'submission_decision', 'late_submission', 'submission_after_close', 'reviewer', 'dispatch_reused'])
+def test_cli_revalidates_each_rounds_native_submission(exchange, tmp_path, capsys, damage, automatic_close):
     import hashlib
     from apps.oa_finance_preaudit import host_chat_review as host
-    root, owner, run, _, registry_file, request_file = completed_case(exchange, tmp_path)
+    root, owner, run, _, registry_file, request_file = completed_case(exchange, tmp_path, automatic_close=automatic_close)
     registry = json.loads(registry_file.read_text())
     request = json.loads(request_file.read_text())
     assigned = registry['assignments'][request['request_id']]
@@ -308,6 +343,9 @@ def test_cli_revalidates_each_rounds_native_submission(exchange, tmp_path, capsy
         Path(submitted['source']['decision_file']).write_text('{}')
     elif damage == 'missing_submission':
         submission_file.unlink()
+    elif damage == 'submission_after_close':
+        registry['closed_at'] = assigned['submitted_at'] - .000001
+        host.guard.write(registry_file, registry)
     elif damage == 'dispatch_reused':
         registry['assignments']['unrelated-request'] = dict(assigned)
         host.guard.write(registry_file, registry)

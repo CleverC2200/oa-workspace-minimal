@@ -1105,8 +1105,6 @@ def sealed_assignment(request_file: Path, request: dict, registered: dict) -> di
     if request['created_at'] < earliest:
         earliest = _legacy_bootstrap_start(request, registered)
     shutdown_at, closed_at = registered['shutdown']['started_at'], registered['closed_at']
-    if closed_at < shutdown_at and registered['close_reason'] != 'completed':
-        raise ValueError('host_review_stale_source')
     if (not earliest <= request['created_at'] <= assigned['dispatched_at']
             or not registered['registered_at'] <= assigned['dispatched_at']
             <= min(shutdown_at, closed_at)
