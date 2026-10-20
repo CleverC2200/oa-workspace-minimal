@@ -39,8 +39,6 @@ def reject_unrecorded_network(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]
         monkeypatch.setattr(socket.socket, name, guarded)
 
     yield
-    # Threads, unobserved Futures and unraisable callbacks can retain the failure
-    # instead of propagating it to pytest's test call.
     if violation.is_set():
         pytest.fail('offline_network_forbidden: a blocked network attempt occurred in this pytest case', pytrace=False)
 
