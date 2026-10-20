@@ -7670,6 +7670,34 @@ def test_explicit_recovery_gate_uses_real_reconciliation(tmp_path, monkeypatch, 
     assert before == {p: p.read_bytes() for p in root.rglob("*.json")}
 
 
+@pytest.mark.parametrize('explicit', [True, False])
+def test_explicit_recovery_does_not_mix_automatic_interruption_selection(tmp_path, monkeypatch, explicit):
+    from apps.oa_finance_preaudit import production_write, review_interruption
+    probe = finance_preaudit_concurrency_probe
+    monkeypatch.setattr(probe, 'PROJECT_ROOT', tmp_path)
+    (tmp_path / 'runtime/finance_preaudit_flows').mkdir(parents=True)
+    monkeypatch.setattr(probe.approval_lifecycle, 'startup', lambda *_a, **_k: {'status': 'ready'})
+    monkeypatch.setattr(probe.controller_handoff, 'assert_ready_for_start', lambda: None)
+    monkeypatch.setattr(probe.reconciliation, 'latest_states', lambda _: [{'reason': review_interruption.REASON}])
+    monkeypatch.setattr(production_write, '_authorized_workflows', lambda _: ['general_expense'])
+    calls = []
+    def select(*_args):
+        calls.append('automatic')
+        raise ValueError('production_rolling_reconciliation_invalid')
+    monkeypatch.setattr(review_interruption, 'select', select)
+    monkeypatch.setattr(probe.attachment_cache, 'prune_expired', lambda: {})
+    monkeypatch.setattr(probe, '_local_unknown_quarantined_identities', frozenset)
+    def begin(_config):
+        raise ValueError('reached_original_begin')
+    monkeypatch.setattr(probe.controller_handoff, 'begin', begin)
+    expected = 'reached_original_begin' if explicit else 'production_rolling_reconciliation_invalid'
+    with pytest.raises(ValueError, match='^' + expected + '$'):
+        probe.run_rolling_drain(capacity=3, max_capacity=3,
+            live_status=lambda: {}, reconcile_status=lambda: {},
+            recovery_action_files=(tmp_path / 'action.json',) if explicit else ())
+    assert calls == ([] if explicit else ['automatic'])
+
+
 def test_finance_success_does_not_clear_whole_task_production_fault(tmp_path, monkeypatch, capsys):
     probe = finance_preaudit_concurrency_probe
     alert = probe.session_alert
