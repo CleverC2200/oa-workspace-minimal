@@ -37,11 +37,14 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: requirements-dev.txt
-      - run: python -m pip install --requirement requirements-dev.txt
+          cache-dependency-path: requirements-dev.lock
+      - run: python -m pip install --requirement requirements-dev.lock
       - name: Native local environment contract
         if: matrix.shard == 0
         run: python -m scripts.quality environment
+      - name: Shared project space policy
+        if: matrix.shard == 0
+        run: python -m scripts.quality storage
       - name: Production review configuration contract
         if: matrix.shard == 0
         run: python -m scripts.quality production-config
@@ -115,8 +118,8 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: requirements-dev.txt
-      - run: python -m pip install --requirement requirements-dev.txt
+          cache-dependency-path: requirements-dev.lock
+      - run: python -m pip install --requirement requirements-dev.lock
       - name: Stop recovery tests with no skips
         run: |
           python -m pytest -q --tb=short --junitxml="$RUNNER_TEMP/stop-recovery.xml" tests/finance_preaudit/test_manual_stop_recovery.py

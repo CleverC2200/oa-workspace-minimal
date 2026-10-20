@@ -301,3 +301,5 @@ git diff --check
 恢复仍复用 `next-action --recover-action-file` 的明确确认、实时待办/已办与精确身份门，Writer 类未写入标签还必须有匹配冻结 job 的签名边界。新 attempt 的 `recovery-receipt.json` 在准备前记为 started，准备后记为 prepared 或 preparation_failed；恢复准备不代表已提交 OA。历史未知写入不自动重试，人工确认未知写入未发生的既有入口仍要求逐单明确确认。旧 attempt 保持不变，查询不会触发恢复、发送或写入。
 
 开发检查前使用 [只读环境预检与原生 Actions](docs/agents/dev-environment.md)，依赖准备单独显式执行。
+
+开发依赖与附件、实验文件统一通过[项目空间管理](docs/agents/project-space.md)维护；共享依赖按锁定版本复用，材料容量按项目合计计算。

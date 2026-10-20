@@ -19,15 +19,25 @@ python3 -B -m scripts.dev_environment preflight
 识别 `oa-workspace-dev` 与 `oa-workspace-minimal`，因此托管开发工作树继承开发克隆角色；未知克隆明确报告未知，
 不开放依赖准备或验证。依赖准备及验证还要求 `codex/` 开发分支。目录角色是操作检查，不能代替业务权限门禁。
 
-预检检查 git、uv、RTK、`.venv` 的实际 Python 3.11、全部 `requirements-dev.txt` 固定版本、依赖目录和模块来源。
+预检检查 git、uv、RTK、共享环境的实际 Python 3.11、完整 `requirements-dev.lock` 版本、依赖目录和模块来源。
+`requirements-dev.txt` 维护直接版本，锁文件固定全部间接版本；现有 `scripts.quality environment` 同时检查直接版本与锁文件一致。
+预检的 `environment.virtual_environment` 与 `environment.executable` 是当前工作树应使用的依赖环境。
 简要输出直接显示实际 `module_origin` 和该项目 CodeGraph 新鲜度；环境缺失时来源保持 unknown。
-需要完整路径和修订供审核工具使用时执行 `python3 -B -m scripts.dev_environment --json preflight`，
-采用输出中的 `source.root`、`source.branch`、`source.head`、`environment.executable` 和 `environment.module_origin`。
-源码检索和审核工具须针对这个实际工作树，不能只凭文件名或另一个分支的行号定位。
-共享 uv 解释器/包缓存合法；虚拟环境链接、系统 site-packages、链接到外部的可写依赖或 runtime 不合法。
-模块来源检查不导入应用、不加载认证，不把相同文件名当同一源码。探针用 `-S` 禁用 site 初始化，
-也不传入业务环境变量。未知启动钩子须检查；uv 当前原生引导文件只按已核验字节和指纹识别，
-探针始终不执行它，变更后明确报告检查缺口。
+需要完整路径和修订时执行 `python3 -B -m scripts.dev_environment --json preflight`。
+源码检索和审核工具须针对报告中的实际工作树。
+
+开发环境统一保存在 `~/.cache/oa-workspace/dependencies/`，不在每个工作树安装 `.venv`。
+同一个锁文件、Python 实际路径及完整版本、平台、架构和固定 uv 版本共用一个环境。
+直接版本变化必须更新锁文件；锁文件变化创建新环境，已准备环境保持只读，不原地同步或升级。
+`OA_DEVELOPMENT_ENV_ROOT` 可指定工作树外的私有环境根目录，所有参与工作树应使用同一位置。
+环境准备持有跨进程锁，只准备一次；准备失败仅清理由本次创建的不完整目录，保留命令失败证据。
+`uv` 使用本机原生下载缓存。安装采用 copy，冻结环境时不会修改缓存文件权限。
+生产虚拟环境与开发共享环境继续独立；历史工作树的 `.venv` 不自动迁移或删除。
+
+模块来源检查不导入应用、不加载认证，不把相同文件名当同一源码。
+探针用 `-S` 禁用 site 初始化，也不传入业务环境变量。拒绝系统 site-packages、依赖目录逃逸、
+共享 runtime、可写依赖及不匹配的准备清单。未知启动钩子须检查；uv 当前原生引导文件只按已核验字节和指纹识别，
+探针始终不执行它。版本变化后需要检查新的引导文件。
 
 “准备开发依赖”是独立显式 Action：
 
@@ -35,18 +45,22 @@ python3 -B -m scripts.dev_environment preflight
 python3 -B -m scripts.dev_environment prepare
 ```
 
-仅在开发克隆的开发分支执行。新环境使用 `uv venv --python 3.11 .venv`，然后按现有声明执行
-`uv pip install --python .venv/bin/python --requirement requirements-dev.txt`。
-不更新版本或锁文件，不复制生产 runtime/venv；已有不安全或不兼容环境需先人工检查，不自动删除重建。
-缺 uv 或命令失败保留非零状态，不能声称准备成功。
+仅在开发克隆的开发分支执行。使用已安装的 Python 3.11 和当前固定 uv 版本创建共享环境，
+随后执行 `uv pip sync --python <共享解释器> --link-mode copy requirements-dev.lock`。
+缺 Python、uv 版本不符、未知既有目录或命令失败均保留非零状态。
+环境准备不改变直接声明或锁文件。升级依赖时在开发分支更新直接声明，并重新生成完整锁：
+
+```bash
+uv pip compile requirements-dev.txt --python-version 3.11 --universal --no-header --no-annotate --output-file requirements-dev.lock
+```
 
 “静态检查”、“聚焦环境回归”、“聚焦执行回执回归”和“完整离线验收”直接复用 `scripts.quality` 和 pytest：
 
 ```bash
-.venv/bin/python -B -m scripts.dev_environment verify --check lint --check schema
-.venv/bin/python -B -m scripts.dev_environment verify --tests tests/finance_preaudit/test_dev_environment.py
-.venv/bin/python -B -m scripts.dev_environment verify --tests tests/finance_preaudit/test_execution_readback.py
-.venv/bin/python -B -m scripts.dev_environment verify --full
+python3 -B -m scripts.dev_environment verify --check lint --check schema
+python3 -B -m scripts.dev_environment verify --tests tests/finance_preaudit/test_dev_environment.py
+python3 -B -m scripts.dev_environment verify --tests tests/finance_preaudit/test_execution_readback.py
+python3 -B -m scripts.dev_environment verify --full
 ```
 
 可重复 `--check` 或 `--tests`；测试路径必须在本项目 tests 下。完整验收沿用现有质量集合、语法检查及全树测试，
@@ -59,7 +73,7 @@ python3 -B -m scripts.dev_environment prepare
 这不改变业务认证实现，也不授权 OA、模型、自动化或生产操作。现有测试仍须用合成数据和禁止真实业务端口的替身。
 
 默认输出简要状态；失败保留完整原始 stdout/stderr，RTK 使用 proxy 保留精确故障。
-全局 `--json` 输出源修订、脏状态、解释器/依赖条件、检查集合和每项终态；没有复杂缓存或自动复用逻辑。
+全局 `--json` 输出源修订、脏状态、解释器、锁文件指纹、检查集合和每项终态。
 原始失败输出可能包含项目路径或测试数据，分享前按仓库隐私约定检查。
 
 CodeGraph 记录明确项目、分支、HEAD，索引新鲜度固定为未核验；预检不创建或更新图谱。

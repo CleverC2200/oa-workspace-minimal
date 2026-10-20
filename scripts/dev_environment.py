@@ -1,7 +1,8 @@
-"""Read-only checkout preflight and explicit project-local development actions."""
+"""Read-only checkout preflight and explicit shared development dependency actions."""
 from __future__ import annotations
 
 import argparse
+
 import hashlib
 import json
 import os
@@ -12,6 +13,11 @@ import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
+
+try:
+    from scripts import shared_dependencies
+except ModuleNotFoundError:
+    import shared_dependencies
 
 
 class PrerequisiteError(ValueError):
@@ -36,28 +42,6 @@ def git(root, *args):
         raise PrerequisiteError('git_context_unavailable', evidence={
             'exit_code': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr})
     return result.stdout.strip()
-
-
-def requirements(root):
-    try:
-        if (root / 'requirements-dev.txt').is_symlink():
-            raise PrerequisiteError('dependency_declaration_unsafe')
-        raw = (root / 'requirements-dev.txt').read_bytes()
-        pins = {}
-        for line in raw.decode().splitlines():
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            match = re.fullmatch(r'([A-Za-z0-9_.-]+)==([A-Za-z0-9_.+-]+)', line)
-            if not match:
-                raise PrerequisiteError('dependency_declaration_unpinned')
-            name, version = match.groups()
-            if name in pins:
-                raise PrerequisiteError('dependency_declaration_duplicate')
-            pins[name] = version
-        return pins, hashlib.sha256(raw).hexdigest()
-    except (OSError, UnicodeError) as error:
-        raise PrerequisiteError('dependency_declaration_unavailable') from error
 
 
 def source_context(root, baseline, switch_to):
@@ -118,10 +102,15 @@ UV_BOOTSTRAP_SHA256 = '6cf30c56faf2a55228914dbbd17f8088ed371ebb08f5e7fa6fd931f91
 
 
 def environment_context(root):
-    pins, digest = requirements(root)
-    report = {'status': 'missing', 'requirements_sha256': digest, 'required_versions': pins,
-              'next_step': 'run_explicit_prepare_action'}
-    venv = root / '.venv'
+    try:
+        dependency = shared_dependencies.plan(root)
+    except shared_dependencies.DependencyError as error:
+        raise PrerequisiteError(str(error)) from error
+    pins, digest = dependency['required_versions'], dependency['requirements_sha256']
+    report = {'status': 'missing', 'requirements_sha256': digest, 'lock_sha256': dependency['lock_sha256'],
+              'required_versions': pins, 'virtual_environment': str(dependency['path']),
+              'identity': dependency['identity'], 'next_step': 'run_explicit_prepare_action'}
+    venv = dependency['path']
     interpreter = venv / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
     if venv.is_symlink():
         report.update(status='blocked', reason='shared_virtual_environment')
@@ -170,16 +159,21 @@ def environment_context(root):
                 or any(not Path(path).resolve().is_relative_to(venv.resolve())
                        for path in (*actual['dependency_locations'].values(), *actual['dependency_files']))):
             report.update(status='blocked', reason='shared_writable_dependencies')
-        elif actual['version'][:2] != [3, 11]:
-            report['reason'] = 'python_3_11_required'
+        elif (actual['version'] != dependency['identity']['version']
+              or str(interpreter.resolve()) != dependency['identity']['executable']):
+            report['reason'] = 'python_identity_mismatch'
         elif (not actual['module_origin'] or Path(actual['module_origin']).resolve()
               != root / 'apps/oa_finance_preaudit/__init__.py'):
             report.update(status='blocked', reason='module_origin_mismatch')
         elif any(actual['versions'].get(name) != version for name, version in pins.items()):
             report['reason'] = 'dependencies_missing_or_mismatched'
         else:
-            report.update(status='ready')
-            report.pop('next_step')
+            invalid = shared_dependencies.validate(venv, dependency['identity'])
+            if invalid:
+                report.update(status='blocked', reason=invalid)
+            else:
+                report.update(status='ready')
+                report.pop('next_step')
         report.pop('dependency_files', None)
     except (PrerequisiteError, OSError, ValueError, KeyError, TypeError) as error:
         report.update(status='blocked', reason='interpreter_probe_invalid')
@@ -256,32 +250,40 @@ def exit_code(checks):
 
 def prepare(root, baseline):
     source = development_source(root, baseline)
-    env = environment_context(root)
-    if env['status'] == 'blocked':
-        return {'kind': 'oa_dependency_preparation', 'status': 'missing_prerequisites',
-                'source': source, 'environment': env, 'reasons': [env['reason']], 'read_only': True}, 2
-    if env.get('reason') == 'python_3_11_required':
-        raise PrerequisiteError('python_3_11_required')
-    interpreter = root / '.venv/bin/python'
-    if os.name == 'nt':
-        interpreter = root / '.venv/Scripts/python.exe'
-    checks = []
-    environment = tool_environment()
-    if not interpreter.is_file():
-        if (root / '.venv').exists():
-            raise PrerequisiteError('existing_virtual_environment_requires_inspection')
-        checks.append(run_check(root, 'create_venv', ['uv', 'venv', '--python', '3.11', '.venv'], environment))
-    if not exit_code(checks):
-        checks.append(run_check(root, 'install_pins', ['uv', 'pip', 'install', '--python', str(interpreter),
-                                                       '--requirement', 'requirements-dev.txt'], environment))
-    code = exit_code(checks)
-    if not code:
-        env = environment_context(root)
-        if env['status'] != 'ready':
-            code = 2
-    result = {'kind': 'oa_dependency_preparation', 'status': 'ready' if not code else 'failed',
-              'read_only': False, 'source': source, 'environment': env, 'checks': checks}
-    return result, code
+    try:
+        dependency = shared_dependencies.plan(root)
+        with shared_dependencies.preparation_lock(dependency['base']):
+            env = environment_context(root)
+            if env['status'] == 'ready':
+                return {'kind': 'oa_dependency_preparation', 'status': 'ready', 'read_only': True,
+                        'source': source, 'environment': env, 'checks': [], 'reused': True}, 0
+            if env['status'] == 'blocked' or dependency['path'].exists():
+                raise PrerequisiteError(env.get('reason', 'existing_virtual_environment_requires_inspection'))
+            environment = tool_environment()
+            version = command(root, ['uv', '--version'], env=environment)
+            if version.returncode or version.stdout.split()[:2] != ['uv', dependency['identity']['uv']]:
+                raise PrerequisiteError('uv_version_mismatch')
+            interpreter = dependency['path'] / 'bin/python'
+            checks = [run_check(root, 'create_venv', ['uv', 'venv', '--python', dependency['identity']['executable'],
+                                                     str(dependency['path'])], environment)]
+            if not exit_code(checks):
+                checks.append(run_check(root, 'install_pins', ['uv', 'pip', 'sync', '--python', str(interpreter),
+                                                               '--link-mode', 'copy', 'requirements-dev.lock'], environment))
+            if not exit_code(checks):
+                checks.append(run_check(root, 'dependency_closure', ['uv', 'pip', 'check', '--python', str(interpreter)], environment))
+            code = exit_code(checks)
+            if code and dependency['path'].is_dir():
+                shutil.rmtree(dependency['path'])
+            if not code:
+                shared_dependencies.seal(dependency['path'], dependency['identity'])
+                env = environment_context(root)
+                if env['status'] != 'ready':
+                    code = 2
+            result = {'kind': 'oa_dependency_preparation', 'status': 'ready' if not code else 'failed',
+                      'read_only': False, 'source': source, 'environment': env, 'checks': checks, 'reused': False}
+            return result, code
+    except shared_dependencies.DependencyError as error:
+        raise PrerequisiteError(str(error)) from error
 
 
 QUALITY_CHECKS = ('skill', 'format', 'hygiene', 'links', 'yaml', 'schema', 'lint', 'environment')
@@ -289,26 +291,35 @@ QUALITY_CHECKS = ('skill', 'format', 'hygiene', 'links', 'yaml', 'schema', 'lint
 
 def check_configuration(root):
     import tomllib
-    prefix = '.venv/bin/python -B -m scripts.dev_environment '
+    prefix = 'python3 -B -m scripts.dev_environment '
     initial = 'python3 -B -m scripts.dev_environment '
     expected = {initial + 'preflight', initial + 'prepare',
                 prefix + 'verify --check lint --check schema',
                 prefix + 'verify --tests tests/finance_preaudit/test_dev_environment.py',
                 prefix + 'verify --tests tests/finance_preaudit/test_execution_readback.py',
                 prefix + 'verify --full'}
+    optional = {'python3 -B -m scripts.project_space status',
+                'python3 -B -m scripts.project_space experiment --name default'}
     try:
         value = tomllib.loads((root / '.codex/environments/environment.toml').read_text())
         actions = value['actions']
         if (set(value) != {'version', 'name', 'setup', 'actions'} or value['version'] != 1
                 or value['name'] != 'oa-workspace-dev' or value['setup'] != {'script': initial + 'preflight'}
-                or not isinstance(actions, list) or len(actions) != len(expected)
+                or not isinstance(actions, list) or len(actions) < len(expected) or len(actions) > len(expected | optional)
                 or any(set(action) != {'name', 'icon', 'command'} or action['icon'] != 'tool'
                        or not isinstance(action['name'], str) or not action['name'].strip() for action in actions)
                 or len({action['name'] for action in actions}) != len(actions)
-                or {action['command'] for action in actions} != expected):
+                or not expected <= {action['command'] for action in actions} <= expected | optional):
             raise ValueError
     except (OSError, ValueError, TypeError, KeyError):
         return ['native_environment_invalid']
+    try:
+        direct, _ = shared_dependencies.read_pins(root / 'requirements-dev.txt')
+        locked, _ = shared_dependencies.read_pins(root / 'requirements-dev.lock', markers=True)
+        if any(locked.get(name) != version for name, version in direct.items()):
+            return ['dependency_lock_out_of_date']
+    except shared_dependencies.DependencyError as error:
+        return [str(error)]
     return []
 
 
