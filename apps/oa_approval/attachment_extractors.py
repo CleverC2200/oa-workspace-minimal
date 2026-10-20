@@ -759,6 +759,9 @@ def _prepare_one_attachment(
                     "BMP": ".bmp", "TIFF": ".tiff",
                 }.get(image.format, "")
                 image.verify()
+            if suffix:
+                with Image.open(path) as image:
+                    image.load()
         except (OSError, ValueError, SyntaxError):
             suffix = ""
     source_content_sha256 = _file_sha256(path)

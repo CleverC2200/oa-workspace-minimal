@@ -44,6 +44,17 @@ def test_public_preparation_rejects_unreadable_suffixless_content(tmp_path, payl
     assert source.read_bytes() == payload
 
 
+def test_public_preparation_rejects_truncated_jpeg_pixels(tmp_path):
+    source = tmp_path / 'attachment'
+    Image.new('RGB', (32, 32), 'white').save(source, format='JPEG')
+    original = source.read_bytes()[:-20]
+    source.write_bytes(original)
+    with pytest.raises(RuntimeError, match='^attachment_content_incomplete$'):
+        prepare_materials([{'path': str(source), 'resource_id': 'photo'}], out_dir=tmp_path / 'prepared')
+    assert source.read_bytes() == original
+    assert list((tmp_path / 'prepared').iterdir()) == []
+
+
 def test_public_preparation_keeps_named_image_path(tmp_path):
     source = tmp_path / 'photo.png'
     Image.new('RGB', (8, 8), 'white').save(source)
