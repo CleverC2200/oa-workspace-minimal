@@ -259,7 +259,7 @@ def test_old_interrupts_cannot_be_reused_for_a_new_shutdown(exchange):
     'running_command', 'running_wait', 'wrong_exit', 'dynamic_command', 'duplicate_command_key',
     'extra_wait', 'trailing_command', 'too_many_commands', 'interleaved_statement'])
 @pytest.mark.parametrize('command_count', [1, 2])
-def test_cli_shutdown_binds_wait_after_literal_command(exchange, damage, command_count):
+def test_cli_shutdown_binds_wait_after_literal_command(exchange, damage, command_count, prior_poll=False):
     _, _, owner, child, _, manifest, _ = exchange
     shutdown.begin(owner=owner, reason='reviewer_failed')
     controller_handoff.finish(manifest, status='failed', children_reaped=True, health='degraded')
@@ -271,7 +271,7 @@ def test_cli_shutdown_binds_wait_after_literal_command(exchange, damage, command
     command = 'text(await tools.exec_command({cmd:"heartbeat {}",workdir:"/offline",max_output_tokens:2200}));\n'
     wait = 'text(await tools.write_stdin({session_id:"original-session",chars:"",yield_time_ms:1000}));'
     results = [{'exit_code': 0, 'output': 'heartbeat returned'}, {'exit_code': 1, 'output': 'original driver exited'}]
-    if damage is None:
+    if damage is None and not prior_poll:
         results[0]['exit_code'] = 1  # A failed heartbeat must not hide the actual nonzero wait.
     elif damage == 'wrong_session': wait = wait.replace('original-session', 'another-session')
     elif damage == 'missing_result': results.pop()
@@ -286,9 +286,25 @@ def test_cli_shutdown_binds_wait_after_literal_command(exchange, damage, command
     if damage == 'interleaved_statement': command += 'text(1);\n'
     if damage == 'too_many_commands': command_count = 3
     results[:0] = [{'exit_code': 0, 'output': 'another query returned'}] * (command_count - 1)
+    prefix = command * command_count
+    if prior_poll:
+        poll = 'text(await tools.write_stdin({session_id:"other-session",chars:"",yield_time_ms:1000}));\n'
+        if damage == 'poll_same_session': poll = poll.replace('other-session', 'original-session')
+        elif damage == 'poll_input': poll = poll.replace('chars:""', 'chars:"x"')
+        elif damage == 'poll_dynamic': poll = 'text(await tools.write_stdin(poll));\n'
+        elif damage == 'poll_duplicate': poll = poll.replace('session_id:"other-session"', 'session_id:"other-session",session_id:"third"')
+        elif damage == 'poll_nonzero': results[-2]['exit_code'] = 1
+        elif damage == 'poll_bool_exit': results[-2]['exit_code'] = False
+        elif damage == 'poll_running': results[-2] = {'session_id': 'other-session', 'output': 'waiting'}
+        elif damage == 'poll_error': results[-2]['isError'] = True
+        elif damage == 'poll_reordered': results[-2:] = reversed(results[-2:])
+        prefix = command * (command_count - 1) + poll
+        if damage == 'poll_repeated':
+            prefix = poll * 2
+            results[:] = [{'exit_code': 0, 'output': 'prior poll returned'}] * 2 + [results[-1]]
     rows = args['source'].read_text().splitlines()
     call = json.loads(rows[args['wait_line'] - 1])
-    call['payload']['input'] = command * command_count + wait
+    call['payload']['input'] = prefix + wait
     rows[args['wait_line'] - 1] = json.dumps(call)
     output = json.loads(rows[args['wait_line']])
     output['payload']['output'] = [{'type': 'input_text', 'text': 'Script completed'},
@@ -311,6 +327,14 @@ def test_cli_shutdown_binds_wait_after_literal_command(exchange, damage, command
         with pytest.raises(ValueError): host.main(cli)
         assert json.loads(host.registry_file(owner).read_text())['shutdown']['status'] == 'pending'
     assert args['source'].read_bytes() == original
+
+
+@pytest.mark.parametrize('damage', [None, 'poll_same_session', 'poll_input', 'poll_dynamic',
+    'poll_duplicate', 'poll_nonzero', 'poll_bool_exit', 'poll_running', 'poll_error',
+    'poll_reordered', 'poll_repeated', 'missing_result', 'extra_result', 'wrong_exit'])
+@pytest.mark.parametrize('command_count', [1, 2])
+def test_cli_shutdown_binds_wait_after_prior_terminal_poll(exchange, damage, command_count):
+    test_cli_shutdown_binds_wait_after_literal_command(exchange, damage, command_count, prior_poll=True)
 
 
 @pytest.mark.parametrize('damage', [None, 'extra_wait'])
