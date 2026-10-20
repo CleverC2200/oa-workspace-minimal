@@ -11,7 +11,8 @@ import subprocess
 
 MATERIAL_DIRECTORIES = {
     'attachments', 'prepared', 'raw', 'compression', 'compressed', 'downloads',
-    'extracted', 'rendered', 'finance_preaudit_attachments',
+    'extracted', 'rendered', 'finance_preaudit_attachments', 'finance_preaudit_prepared',
+    'image-compressions',
 }
 EXCLUDED_DIRECTORIES = {'.git', '.venv', '__pycache__', '.pytest_cache', '.ruff_cache', 'node_modules'}
 

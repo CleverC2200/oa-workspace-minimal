@@ -40,6 +40,8 @@ def test_registration_counts_legacy_materials_but_excludes_nested_repositories_a
         '.scratch/worktree/source.py': b'preserve source',
         '.scratch/.venv/site-packages/big.bin': b'dependency',
         'runtime/review/run/attempts/1/attachments/source.pdf': b'12345',
+        'runtime/finance_preaudit_prepared/page.png': b'12',
+        'runtime/image-compressions/old/output.png': b'123',
         'runtime/review/run/attempts/1/state.json': b'{}',
     }.items():
         path = root / relative
@@ -47,13 +49,13 @@ def test_registration_counts_legacy_materials_but_excludes_nested_repositories_a
         path.write_bytes(data)
     assert project_space.main(['--root', str(root), 'register-checkout']) == 0
     registered = json.loads(capsys.readouterr().out)
-    assert registered['registered_count'] == 2
-    assert registered['used_bytes'] == 9
+    assert registered['registered_count'] == 4
+    assert registered['used_bytes'] == 14
     assert project_space.main(['--root', str(root), 'status']) == 0
     report = json.loads(capsys.readouterr().out)
-    assert report['observed_bytes'] == 9
+    assert report['observed_bytes'] == 14
     assert report['unregistered_bytes'] == 0
-    assert report['protected_bytes'] == 9
+    assert report['protected_bytes'] == 14
     assert (root / '.scratch/worktree/source.py').exists()
 
 
