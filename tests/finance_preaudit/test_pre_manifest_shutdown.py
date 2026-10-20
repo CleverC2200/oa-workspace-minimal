@@ -35,8 +35,30 @@ def pre_manifest_failure(tmp_path, monkeypatch):
                'kind': 'preaudit_production_concurrency_probe_failed',
                'notification': {'delivery_state': 'not_authorized', 'error_code': 'controller_failed',
                                 'kind': 'oa_session_alert_receipt', 'schema_version': 1}, 'schema_version': 1}
-    command = [sys.executable, '-c', 'print(' + repr(json.dumps(payload)) + ');raise SystemExit(1)']
-    script = f"from pathlib import Path;from scripts.finance_preaudit_run import supervise;supervise({command!r},directory=Path({str(directory)!r}),owner_task_id={owner!r})"
+    release = tmp_path / 'identity-sampled'
+    command = [sys.executable, '-c', f"""from pathlib import Path
+import time
+print({json.dumps(payload)!r})
+deadline = time.monotonic() + 5
+while not Path({str(release)!r}).exists():
+    if time.monotonic() >= deadline:
+        raise RuntimeError('test_identity_sampling_timed_out')
+    time.sleep(.01)
+raise SystemExit(1)
+"""]
+    script = f"""import os
+from pathlib import Path
+from apps.oa_finance_preaudit import approval_guard
+from scripts.finance_preaudit_run import supervise
+original = approval_guard.process_identity
+def sampled(pid):
+    identity = original(pid)
+    if pid != os.getpid() and identity is not None:
+        Path({str(release)!r}).touch()
+    return identity
+approval_guard.process_identity = sampled
+supervise({command!r},directory=Path({str(directory)!r}),owner_task_id={owner!r})
+"""
     launch = native_call(parent, 'functions.exec',
         'text(await tools.exec_command(' + json.dumps({'cmd': '.venv/bin/python -m scripts.finance_preaudit_run --owner-task-id ' + owner + ' --review-provider openai --review-transport host_chat -- --rolling', 'workdir': str(tmp_path)}) + '));',
         'launch', {'session_id': 'native-session', 'output': ''})
@@ -55,6 +77,7 @@ def pre_manifest_failure(tmp_path, monkeypatch):
     statuses = native_call(parent, 'list_agents', {}, 'idle-status', {'agents': [
         {'agent_name': f'/root/reviewer_{slot}', 'agent_status': 'completed'} for slot in range(3)]})
     execution = json.loads((directory / 'execution.json').read_text())
+    assert host.guard._valid_identity(execution['controller_process'])
     wait = native_call(parent, 'functions.exec',
         'text(await tools.write_stdin({"session_id":"native-session","chars":"","yield_time_ms":1000}));',
         'terminal-wait', {'exit_code': 1, 'output': json.dumps({**execution, 'receipt_file': str(directory / 'execution.json')})})
