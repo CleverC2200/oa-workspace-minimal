@@ -9,12 +9,14 @@ import shutil
 import signal
 import subprocess
 import sys
-from tempfile import TemporaryDirectory
+from tempfile import mkdtemp
 import time
 from typing import Any, Dict, List, Tuple
 import xml.etree.ElementTree as ET
 import zipfile
 import zlib
+
+from apps.oa_approval import material_store
 
 import fitz
 from PIL import Image
@@ -27,6 +29,7 @@ SPREADSHEET_EXTS = {".xlsx", ".xlsm"}
 LEGACY_SPREADSHEET_EXTS = {".xls"}
 DOCX_EXTS = {".docx"}
 LEGACY_DOC_TIMEOUT_SECONDS = 60
+EXTERNAL_PAYLOAD_MAX_BYTES = 200_000_000
 XML_EXTS = {".xml"}
 OFD_EXTS = {".ofd"}
 RAR_EXTS = {".rar"}
@@ -64,6 +67,14 @@ def safe_name(value: str, fallback: str) -> str:
     return text or fallback
 
 
+def _bounded_converter_command(command: list[str], max_bytes: int) -> list[str]:
+    return [sys.executable, '-c',
+            'import os, resource, sys; limit=int(sys.argv[1]); '
+            'resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit)); '
+            'os.execv(sys.argv[2], sys.argv[2:])',
+            str(max_bytes), *command]
+
+
 def render_pdf(
     path: Path,
     *,
@@ -87,7 +98,7 @@ def render_pdf(
                 if len(jpeg) < len(image):
                     image, suffix = jpeg, ".jpg"
             dest = out_dir / f"{safe_name(resource_id, path.stem)}_p{index + 1}{suffix}"
-            dest.write_bytes(image)
+            material_store.write_bytes(dest, image, source={'resource_id': resource_id, 'kind': 'pdf_page'})
             out.append(
                 (
                     dest,
@@ -163,53 +174,71 @@ def render_office_document(
     converter = shutil.which(os.environ.get("OA_LIBREOFFICE_BIN") or "soffice")
     if converter is None:
         raise RuntimeError(f"{prefix}_converter_unavailable")
-    with TemporaryDirectory(prefix="pptx-" if presentation else "legacy-doc-", dir=out_dir) as temporary:
-        work = Path(temporary).resolve()
-        source = work / ("source.pptx" if presentation else "source.doc")
-        shutil.copyfile(path, source)
-        profile = work / "profile"
-        profile.mkdir()
-        # Use a private profile and disable document macros for each conversion.
-        (profile / "registrymodifications.xcu").write_text(
-            '<?xml version="1.0"?><oor:items xmlns:oor="http://openoffice.org/2001/registry">'
-            '<item oor:path="/org.openoffice.Office.Common/Security/Scripting">'
-            '<prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop>'
-            '</item></oor:items>', encoding="utf-8",
-        )
-        environment = os.environ.copy()
-        # Headless macOS builds may not discover system CJK fallback fonts.
-        mac_fonts = Path("/System/Library/Fonts/Supplemental")
-        if (sys.platform == "darwin" and mac_fonts.is_dir()
-                and not environment.get("FONTCONFIG_FILE")):
-            fontconfig = ET.Element("fontconfig")
-            ET.SubElement(fontconfig, "dir").text = str(mac_fonts)
-            ET.SubElement(fontconfig, "cachedir").text = str(work / "font-cache")
-            fontconfig_path = work / "fonts.conf"
-            ET.ElementTree(fontconfig).write(fontconfig_path, encoding="utf-8")
-            environment["FONTCONFIG_FILE"] = str(fontconfig_path)
-        try:
-            process = subprocess.Popen(
-                [converter, f"-env:UserInstallation={profile.as_uri()}",
-                 "--headless", "--nologo", "--nodefault", "--norestore",
-                 "--convert-to", pdf_filter, "--outdir", str(work), str(source)],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, start_new_session=True, env=environment,
-            )
-        except OSError:
-            raise RuntimeError(f"{prefix}_converter_unavailable") from None
-        try:
-            returncode = process.wait(timeout=LEGACY_DOC_TIMEOUT_SECONDS)
-        except BaseException as error:
-            try:
-                _reap_office_converter(process, prefix)
-            except BaseException as cleanup_error:
-                raise error from cleanup_error
-            raise
-        else:
-            _reap_office_converter(process, prefix)
-        pdf = work / "source.pdf"
-        if returncode != 0 or not pdf.is_file():
-            raise RuntimeError(f"{prefix}_conversion_failed")
+    from apps.oa_approval import bounded_staging
+
+    temporary = Path(mkdtemp(prefix="pptx-" if presentation else "legacy-doc-", dir=out_dir))
+    preserve = False
+    store = material_store.MaterialStore()
+    output_limit = EXTERNAL_PAYLOAD_MAX_BYTES
+    staging_limit = path.stat().st_size + output_limit * 2 + 32 * 1024 * 1024
+    try:
+        image_path = temporary / 'converter.dmg'
+        with store.reserved_file(image_path, max_bytes=staging_limit, external=True,
+                                 source={'resource_id': resource_id, 'kind': 'office_staging'}):
+            with bounded_staging.workspace(image_path, max_bytes=staging_limit) as work:
+                work = Path(work).resolve()
+                source = work / ("source.pptx" if presentation else "source.doc")
+                shutil.copyfile(path, source)
+                profile = work / "profile"
+                profile.mkdir()
+                (profile / "registrymodifications.xcu").write_text(
+                    '<?xml version="1.0"?><oor:items xmlns:oor="http://openoffice.org/2001/registry">'
+                    '<item oor:path="/org.openoffice.Office.Common/Security/Scripting">'
+                    '<prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop>'
+                    '</item></oor:items>', encoding="utf-8",
+                )
+                environment = os.environ.copy()
+                home = work / 'home'
+                home.mkdir()
+                environment.update(TMPDIR=str(work), TMP=str(work), TEMP=str(work), HOME=str(home),
+                                   XDG_CACHE_HOME=str(home / '.cache'), XDG_CONFIG_HOME=str(home / '.config'))
+                mac_fonts = Path("/System/Library/Fonts/Supplemental")
+                if (sys.platform == "darwin" and mac_fonts.is_dir()
+                        and not environment.get("FONTCONFIG_FILE")):
+                    fontconfig = ET.Element("fontconfig")
+                    ET.SubElement(fontconfig, "dir").text = str(mac_fonts)
+                    ET.SubElement(fontconfig, "cachedir").text = str(work / "font-cache")
+                    fontconfig_path = work / "fonts.conf"
+                    ET.ElementTree(fontconfig).write(fontconfig_path, encoding="utf-8")
+                    environment["FONTCONFIG_FILE"] = str(fontconfig_path)
+                try:
+                    process = subprocess.Popen(
+                        _bounded_converter_command([converter, f"-env:UserInstallation={profile.as_uri()}",
+                            "--headless", "--nologo", "--nodefault", "--norestore",
+                            "--convert-to", pdf_filter, "--outdir", str(work), str(source)], output_limit),
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL, start_new_session=True, env=environment,
+                    )
+                except OSError:
+                    raise RuntimeError(f"{prefix}_converter_unavailable") from None
+                try:
+                    returncode = process.wait(timeout=LEGACY_DOC_TIMEOUT_SECONDS)
+                except BaseException as error:
+                    try:
+                        _reap_office_converter(process, prefix)
+                    except BaseException as cleanup_error:
+                        raise error from cleanup_error
+                    raise
+                else:
+                    _reap_office_converter(process, prefix)
+                pdf = work / "source.pdf"
+                if returncode != 0 or not pdf.is_file() or pdf.stat().st_size > output_limit:
+                    raise RuntimeError(f"{prefix}_conversion_failed")
+                converted = pdf.read_bytes()
+        image_path.unlink(missing_ok=True)
+        pdf = temporary / 'source.pdf'
+        material_store.write_bytes(pdf, converted,
+                                   source={'resource_id': resource_id, 'kind': 'converted_pdf'})
         try:
             rendered = render_pdf(pdf, out_dir=out_dir, resource_id=resource_id)
         except Exception:
@@ -218,6 +247,12 @@ def render_office_document(
                 or (expected_pages is not None and rendered[1] != expected_pages)):
             raise RuntimeError(f"{prefix}_conversion_failed")
         return rendered
+    except bounded_staging.BoundedStagingCleanupError:
+        preserve = True
+        raise
+    finally:
+        if not preserve:
+            shutil.rmtree(temporary)
 
 
 # Preserve the existing helper name for legacy DOC callers.
@@ -249,16 +284,22 @@ def _convert_heic_to_png(path: Path, *, out_dir: Path, resource_id: str) -> Path
     if not converter.exists():
         raise RuntimeError("heic_converter_unavailable")
     destination = out_dir / f"{safe_name(resource_id, path.stem)}_heic.png"
-    result = subprocess.run(
-        [str(converter), "-s", "format", "png", str(path), "--out", str(destination)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-    if result.returncode != 0 or not destination.is_file() or destination.stat().st_size < 1:
-        raise RuntimeError("heic_conversion_failed")
+    store = material_store.MaterialStore()
+    output_limit = min(EXTERNAL_PAYLOAD_MAX_BYTES, store.limit_bytes)
+    with store.reserved_file(
+            destination, max_bytes=output_limit, external=True,
+            source={'resource_id': resource_id, 'kind': 'heic_png'}):
+        result = subprocess.run(
+            _bounded_converter_command([str(converter), "-s", "format", "png", str(path), "--out", str(destination)],
+                                       output_limit),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode != 0 or not destination.is_file() or destination.stat().st_size < 1:
+            raise RuntimeError("heic_conversion_failed")
     return destination
 
 
@@ -456,7 +497,7 @@ def docx_fact_and_images(
             target = (
                 out_dir / f"{safe_name(resource_id, path.stem)}_docx_{index}{suffix}"
             )
-            target.write_bytes(archive.read(item))
+            material_store.write_bytes(target, archive.read(item), source={'resource_id': resource_id, 'kind': 'docx_media'})
             images.append(
                 {
                     "path": target,
@@ -789,7 +830,9 @@ def _prepare_one_attachment(
             image_path = out_dir / (
                 f"{safe_name(resource_id, path.stem)}_archive{suffix}"
             )
-            shutil.copyfile(path, image_path)
+            with path.open('rb') as source:
+                material_store.copy_stream(image_path, source, expected_bytes=path.stat().st_size,
+                                           source={'resource_id': resource_id, 'kind': 'image_copy'})
         images.append(
             {
                 **base,
@@ -1036,59 +1079,69 @@ def prepare_materials(
     validation_manifest: List[Dict[str, Any]] = []
     structured_contents: List[Dict[str, Any]] = []
     out_dir.mkdir(parents=True, exist_ok=True)
-    for item in attachments:
-        extracted = (
-            item.get("extracted_files")
-            if isinstance(item.get("extracted_files"), list)
-            else []
-        )
-        if extracted:
-            child_manifest: List[Dict[str, Any]] = []
-            image_count_before = len(images)
-            for child in extracted:
-                if isinstance(child, dict):
-                    _prepare_one_attachment(
-                        child,
-                        out_dir=out_dir,
-                        images=images,
-                        manifest=child_manifest,
-                        structured_contents=structured_contents,
-                        compact_pdf=compact_pdf,
-                        compact_spreadsheet=compact_spreadsheet,
-                    )
-            validation_manifest.extend(child_manifest)
-            manifest.append(
-                {
-                    "resource_id": str(item.get("resource_id") or ""),
-                    "name": str(item.get("name") or ""),
-                    "status": "archive_extracted",
-                    "archive_extracted_count": len(extracted),
-                    "image_count": len(images) - image_count_before,
-                    "skipped_videos": skipped_video_sources(child_manifest),
-                }
+    material_store.MaterialStore().adopt_directory(out_dir, source={'kind': 'prepared'})
+    inputs = [Path(str(item.get('path') or '')) for item in attachments]
+    inputs.extend(Path(str(child.get('path') or '')) for item in attachments
+                  for child in item.get('extracted_files', []) if isinstance(child, dict))
+    with material_store.MaterialStore().read_lease(inputs):
+        for item in attachments:
+            source_path = Path(str(item.get('path') or ''))
+            if source_path.is_file():
+                material_store.MaterialStore().adopt(source_path, source={
+                    'resource_id': item.get('resource_id'), 'kind': 'attachment',
+                })
+            extracted = (
+                item.get("extracted_files")
+                if isinstance(item.get("extracted_files"), list)
+                else []
             )
-        else:
-            manifest_count_before = len(manifest)
-            _prepare_one_attachment(
-                item,
-                out_dir=out_dir,
-                images=images,
-                manifest=manifest,
-                structured_contents=structured_contents,
-                compact_pdf=compact_pdf,
-                compact_spreadsheet=compact_spreadsheet,
+            if extracted:
+                child_manifest: List[Dict[str, Any]] = []
+                image_count_before = len(images)
+                for child in extracted:
+                    if isinstance(child, dict):
+                        _prepare_one_attachment(
+                            child,
+                            out_dir=out_dir,
+                            images=images,
+                            manifest=child_manifest,
+                            structured_contents=structured_contents,
+                            compact_pdf=compact_pdf,
+                            compact_spreadsheet=compact_spreadsheet,
+                        )
+                validation_manifest.extend(child_manifest)
+                manifest.append(
+                    {
+                        "resource_id": str(item.get("resource_id") or ""),
+                        "name": str(item.get("name") or ""),
+                        "status": "archive_extracted",
+                        "archive_extracted_count": len(extracted),
+                        "image_count": len(images) - image_count_before,
+                        "skipped_videos": skipped_video_sources(child_manifest),
+                    }
+                )
+            else:
+                manifest_count_before = len(manifest)
+                _prepare_one_attachment(
+                    item,
+                    out_dir=out_dir,
+                    images=images,
+                    manifest=manifest,
+                    structured_contents=structured_contents,
+                    compact_pdf=compact_pdf,
+                    compact_spreadsheet=compact_spreadsheet,
+                )
+                validation_manifest.extend(manifest[manifest_count_before:])
+        if any(
+            str(item.get("status") or "") not in SUCCESSFUL_PREPARATION_STATUSES | SKIPPED_PREPARATION_STATUSES
+            for item in validation_manifest
+        ) or any(
+            str(item.get("status") or "") == "pdf_rendered"
+            and (
+                int(item.get("image_count") or 0) < 1
+                or int(item.get("image_count") or 0) != int(item.get("page_count") or 0)
             )
-            validation_manifest.extend(manifest[manifest_count_before:])
-    if any(
-        str(item.get("status") or "") not in SUCCESSFUL_PREPARATION_STATUSES | SKIPPED_PREPARATION_STATUSES
-        for item in validation_manifest
-    ) or any(
-        str(item.get("status") or "") == "pdf_rendered"
-        and (
-            int(item.get("image_count") or 0) < 1
-            or int(item.get("image_count") or 0) != int(item.get("page_count") or 0)
-        )
-        for item in validation_manifest
-    ):
-        raise RuntimeError("attachment_content_incomplete")
-    return images, manifest, structured_contents
+            for item in validation_manifest
+        ):
+            raise RuntimeError("attachment_content_incomplete")
+        return images, manifest, structured_contents

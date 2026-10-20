@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,9 +28,10 @@ def install_download_browser(
 
     class Download:
         suggested_filename = "fixture.txt"
+        url = 'https://download.example.test/fixture'
 
         def save_as(self, target):
-            Path(target).write_text("synthetic attachment", encoding="utf-8")
+            raise AssertionError('browser must not persist unreserved downloads')
 
     class Page:
         @contextmanager
@@ -44,9 +46,10 @@ def install_download_browser(
 
     class Browser:
         def new_context(self, **kwargs):
+            assert kwargs['accept_downloads'] is False
             if context_error:
                 raise RuntimeError("synthetic context failure")
-            return SimpleNamespace(new_page=lambda: Page())
+            return SimpleNamespace(new_page=lambda: Page(), cookies=lambda *_a: [])
 
         def close(self):
             events.append(("browser_close", active["driver"]))
@@ -73,6 +76,8 @@ def install_download_browser(
     monkeypatch.setattr(playwright.sync_api, "sync_playwright", driver)
     monkeypatch.setattr(attachments, "rpa_storage_state", lambda **kwargs: {"cookies": []})
     monkeypatch.setattr(attachments, "DOWNLOADS", tmp_path)
+    monkeypatch.setattr(attachments, 'EXTRA_DOWNLOAD_HOSTS', {'download.example.test'})
+    monkeypatch.setattr(attachments.safe_http, 'urlopen', lambda *_a, **_k: BytesIO(b'synthetic attachment'))
     monkeypatch.setenv("OA_BROWSER_SILENT", "1")
     monkeypatch.setenv("OA_BROWSER_VISIBLE_FALLBACK", "0")
     return events

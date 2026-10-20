@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -145,12 +144,11 @@ class _NoCloudRedirect(urllib.request.HTTPRedirectHandler):
 
 def download_original(resource: dict, *, dest_dir: Path, timeout_sec: int,
                       batch: DownloadBatch | None = None) -> tuple[Path | None, str]:
-    from apps.oa_approval import attachments, invoice_buyers, runtime_control
+    from apps.oa_approval import attachments, invoice_buyers, material_store, runtime_control
 
     request_id = str(resource.get('_workflow_request_id') or '')
     native_file_id = str(resource.get('id') or '')
     dest = dest_dir / attachments.deterministic_filename(resource)
-    temporary = None
     try:
         client, source, data_id = _download_context(request_id, native_file_id, batch)
         if not source or source != resource.get('_invoice_original'):
@@ -186,20 +184,18 @@ def download_original(resource: dict, *, dest_dir: Path, timeout_sec: int,
             return None, 'resource_ownership_untrusted'
         if runtime_control.stop_requested():
             return None, runtime_control.STOP_CODE
-        with tempfile.NamedTemporaryFile(dir=dest_dir, prefix=dest.name + '.', suffix='.cloud.part', delete=False) as output:
-            temporary = Path(output.name)
-            output.write(body)
-        temporary.replace(dest)
+        material_store.write_bytes(dest, body, source={
+            'request_id': request_id, 'resource_id': native_file_id, 'kind': 'invoice_original',
+        })
         return dest, ''
     except urllib.error.HTTPError as error:
         return None, 'attachment_access_denied' if error.code in (401, 403) else 'attachment_download_failed'
     except attachments.rpa_session.RpaSessionError as error:
         return None, error.code
+    except ValueError as error:
+        return None, str(error) if str(error).startswith('material_') else 'attachment_download_failed'
     except Exception:
         return None, 'attachment_download_failed'
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
 
 
 def prepared_body(source: dict, resource_rows: list, prepared: dict) -> dict:

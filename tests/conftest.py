@@ -69,3 +69,8 @@ def isolate_native_process_doubles(monkeypatch):
     # Explicit Popen-double IDs must never become real ps or killpg targets.
     monkeypatch.setattr(approval_guard, "process_identity", lambda pid: None if pid in {12345, 123456} else identity(pid))
     monkeypatch.setattr(approval_guard, "group_alive", lambda pid: False if pid in {12345, 123456} else alive(pid))
+
+
+@pytest.fixture(autouse=True)
+def isolate_project_material_budget(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('OA_PROJECT_SPACE_ROOT', str(tmp_path_factory.mktemp('project-space')))

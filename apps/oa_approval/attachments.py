@@ -6,6 +6,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import signal
 import shutil
 import stat
 import subprocess
@@ -18,6 +19,7 @@ import zipfile
 
 from apps.oa_approval import (
     attachment_cache,
+    material_store,
     auth,
     resource_slots,
     rpa_session,
@@ -317,7 +319,7 @@ def detect_oa_download_fail_code(value: Any) -> str:
 
 def download_error_code(message: str) -> str:
     text = str(message or "").strip()
-    for code in ("resource_ownership_untrusted", "attachment_content_incomplete"):
+    for code in ("resource_ownership_untrusted", "attachment_content_incomplete", "material_budget_exceeded", "material_path_untrusted"):
         if text.startswith(f"{code}:"):
             return code
     if text.startswith(f"{ATTACHMENT_ACCESS_DENIED_CODE}:"):
@@ -674,110 +676,73 @@ def _headless_download_timeout_sec() -> int:
         return 20
 
 
-def _headless_chrome_download(url: str, name: str) -> str:
+def _capture_browser_download(url: str, name: str, *, dest_dir: Path | None,
+                              resource: dict, timeout_sec: int, headless: bool) -> Path:
+    from playwright.sync_api import sync_playwright
+
     state = rpa_storage_state(timeout_sec=5)
     if not state:
-        return (
-            rpa_storage_state_error_message()
-            or f"{rpa_session.RPA_SESSION_MISSING_CODE}: RPA Chrome 未发现 OA 登录态"
-        )
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception as err:
-        return f"Playwright 不可用: {str(err).strip()[:120]}"
+        raise RuntimeError(rpa_storage_state_error_message() or
+                           f"{rpa_session.RPA_SESSION_MISSING_CODE}: RPA Chrome 未发现 OA 登录态")
+    with sync_playwright() as playwright:
+        browser = None
+        try:
+            launch_kwargs = {'headless': headless}
+            if Path(CHROME_BIN).exists():
+                launch_kwargs['executable_path'] = CHROME_BIN
+            browser = playwright.chromium.launch(**launch_kwargs)
+            context = browser.new_context(accept_downloads=False, storage_state=state)
+            page = context.new_page()
+            with page.expect_download(timeout=_browser_timeout_ms(timeout_sec)) as event:
+                try:
+                    page.goto(url, wait_until='domcontentloaded', timeout=_browser_timeout_ms(timeout_sec))
+                except Exception as navigation_error:
+                    if 'net::ERR_ABORTED' not in str(navigation_error):
+                        raise
+            download = event.value
+            captured_url = normalize_download_url(download.url, allow_extra_hosts=True)
+            host = urllib.parse.urlsplit(captured_url).hostname or ''
+            cookie = '; '.join(f"{item['name']}={item['value']}" for item in context.cookies(captured_url)
+                               if _cookie_domain_matches(host, item.get('domain', '')))
+            request = urllib.request.Request(_quote_download_url(captured_url),
+                headers={'User-Agent': 'Mozilla/5.0', 'Cookie': cookie})
+            suggested = download.suggested_filename or name
+            target = (dest_dir / deterministic_filename(resource, suggested)
+                      if dest_dir is not None else _unique_download_path(suggested))
+            with safe_http.urlopen(request, timeout=max(1, int(timeout_sec)),
+                                   allow_same_origin_redirects=True) as response:
+                material_store.copy_stream(target, response, source={
+                    'request_id': resource.get('_workflow_request_id'),
+                    'resource_id': resource.get('id'), 'kind': 'attachment',
+                })
+            return target
+        finally:
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
 
-    timeout_ms = _browser_timeout_ms(_headless_download_timeout_sec())
+
+def _headless_chrome_download(url: str, name: str, *, headless: bool = True) -> str:
     try:
-        with sync_playwright() as playwright:
-            browser = None
-            try:
-                launch_kwargs: Dict[str, Any] = {"headless": True}
-                if Path(CHROME_BIN).exists():
-                    launch_kwargs["executable_path"] = CHROME_BIN
-                browser = playwright.chromium.launch(**launch_kwargs)
-                context = browser.new_context(accept_downloads=True, storage_state=state)
-                page = context.new_page()
-                with page.expect_download(timeout=timeout_ms) as download_info:
-                    try:
-                        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-                    except Exception as err:
-                        if "net::ERR_ABORTED" not in str(err):
-                            raise
-                download = download_info.value
-                target = _unique_download_path(download.suggested_filename or name)
-                download.save_as(str(target))
-                return ""
-            finally:
-                if browser is not None:
-                    try:
-                        browser.close()
-                    except Exception:
-                        pass
-    except Exception as err:
-        detail = str(err).strip()[:300]
+        _capture_browser_download(url, name, dest_dir=None, resource={},
+                                  timeout_sec=_headless_download_timeout_sec(), headless=headless)
+        return ''
+    except Exception as error:
+        detail = str(error).strip()[:300]
         code = detect_oa_download_fail_code(detail)
-        if code:
-            return _download_block_message(code, name)
-        return detail or "headless download failed"
-
-
-def _launch_visible_chrome_download(url: str, name: str) -> str:
-    try:
-        proc = subprocess.Popen(
-            [
-                CHROME_BIN,
-                f"--user-data-dir={CHROME_USER_DATA_DIR}",
-                f"--profile-directory={RPA_PROFILE_DIRECTORY}",
-                *chrome_remote_debugging_args(),
-                url,
-            ],
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-    except subprocess.TimeoutExpired:
-        return _download_block_message(CHROME_LAUNCH_TIMEOUT_CODE, name)
-    except Exception as err:
-        detail = str(err).strip()[:300]
-        code = detect_oa_download_fail_code(detail)
-        if code:
-            return _download_block_message(code, name)
-        return (
-            f"attachment_download_launch_failed: {name}: Chrome 下载触发失败: {detail}"
-        )
-
-    settle = chrome_launch_settle_sec()
-    if settle > 0:
-        time.sleep(settle)
-    code = chrome_download_fail_code(close_blocking_tabs=True)
-    if code:
-        _close_process_pipes(proc)
-        return _download_block_message(code, name)
-    returncode = proc.poll()
-    if returncode is None:
-        _close_process_pipes(proc)
-        return ""
-    if returncode == 0:
-        _read_process_output(proc)
-        return ""
-    detail = _read_process_output(proc)
-    code = detect_oa_download_fail_code(detail)
-    if code:
-        return _download_block_message(code, name)
-    return f"attachment_download_launch_failed: {name}: Chrome 下载触发失败: {detail or returncode}"
+        return _download_block_message(code, name) if code else detail or 'browser download failed'
 
 
 def launch_chrome_download(url: str, name: str) -> str:
     if browser_silent_enabled() or headless_browser_download_enabled():
-        err = _headless_chrome_download(url, name)
-        if not err:
-            return ""
+        error = _headless_chrome_download(url, name)
+        if not error:
+            return ''
         if not browser_visible_fallback_enabled():
-            return f"attachment_download_headless_failed: {name}: {err}"
-    return _launch_visible_chrome_download(url, name)
+            return f'attachment_download_headless_failed: {name}: {error}'
+    return _headless_chrome_download(url, name, headless=False)
 
 
 def _direct_extra_host_download(
@@ -788,7 +753,6 @@ def _direct_extra_host_download(
         return None, ""
     name = resource_name(resource) or "attachment.bin"
     dest = dest_dir / deterministic_filename(resource, name)
-    temp = dest.with_name(f"{dest.name}.part")
     request = urllib.request.Request(
         _quote_download_url(url), headers={"User-Agent": "Mozilla/5.0"}
     )
@@ -796,18 +760,17 @@ def _direct_extra_host_download(
         with (
             safe_http.urlopen(request, timeout=max(1, int(timeout_sec)),
                               allow_same_origin_redirects=True) as resp,
-            temp.open("wb") as out,
         ):
-            shutil.copyfileobj(resp, out)
-        temp.replace(dest)
+            material_store.copy_stream(dest, resp, source={
+                'request_id': resource.get('_workflow_request_id'),
+                'resource_id': resource.get('id'), 'kind': 'attachment',
+            })
         return dest, ""
     except Exception as err:
-        try:
-            temp.unlink()
-        except Exception:
-            pass
         if isinstance(err, safe_http.HttpBoundaryError):
             raise
+        if str(err).startswith('material_'):
+            return None, f'{err}: 附件空间不足或路径不可信'
         return (
             None,
             f"attachment_download_failed: {name}: 直连下载失败: {str(err).strip()[:300]}",
@@ -865,7 +828,6 @@ def _direct_session_cookie_download(
         return None, ""
     name = resource_name(resource) or "attachment.bin"
     dest = dest_dir / deterministic_filename(resource, name)
-    temp = dest.with_name(f"{dest.name}.part")
     request = urllib.request.Request(
         _quote_download_url(url),
         headers={"User-Agent": "Mozilla/5.0", "Cookie": cookie_header},
@@ -877,26 +839,25 @@ def _direct_session_cookie_download(
             response_code = detect_oa_download_fail_code(resp.geturl())
             if response_code:
                 return None, _download_block_message(response_code, name)
-            with temp.open("wb") as out:
-                shutil.copyfileobj(resp, out)
-        if not valid_attachment_file(temp):
-            code = _file_download_fail_code(temp)
+            material_store.copy_stream(dest, resp, source={
+                'request_id': resource.get('_workflow_request_id'),
+                'resource_id': resource.get('id'), 'kind': 'attachment',
+            })
+        if not valid_attachment_file(dest):
+            code = _file_download_fail_code(dest)
             try:
-                temp.unlink()
+                dest.unlink()
             except Exception:
                 pass
             if code:
                 return None, _download_block_message(code, name)
             return None, ""
-        temp.replace(dest)
         return dest, ""
     except Exception as error:
-        try:
-            temp.unlink()
-        except Exception:
-            pass
         if isinstance(error, safe_http.HttpBoundaryError):
             raise
+        if str(error).startswith('material_'):
+            return None, f'{error}: 附件空间不足或路径不可信'
         return None, ""
 
 
@@ -1099,6 +1060,8 @@ def _download_resource_direct_uncoordinated(
     )
     if direct_path is not None:
         return direct_path, ""
+    if _direct_err.startswith('material_'):
+        return None, _direct_err
     resource = dict(resource)
     host = urllib.parse.urlsplit(url).hostname or ""
     if host in {urllib.parse.urlsplit(OA_HOST).hostname, *EXTRA_DOWNLOAD_HOSTS}:
@@ -1161,48 +1124,13 @@ def _download_resource_with_browser_uncoordinated(
     url, error = _normalized_download_url(resource)
     if error:
         return None, error
-    name = resource_name(resource) or "attachment.bin"
-    DOWNLOADS.mkdir(parents=True, exist_ok=True)
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    before = {str(item) for item in DOWNLOADS.iterdir() if item.is_file()}
+    name = resource_name(resource) or 'attachment.bin'
     try:
-        preflight_code = chrome_download_fail_code(close_blocking_tabs=True)
-        if preflight_code:
-            return None, _download_block_message(preflight_code, name)
-        launch_err = launch_chrome_download(url, name)
-        if launch_err:
-            return None, launch_err
-        downloaded, block_code = wait_new_download_or_block(
-            before, Path(name).suffix.lower(), timeout_sec
-        )
-        if block_code:
-            return None, _download_block_message(block_code, name)
-        if downloaded is None:
-            return None, _download_block_message(DOWNLOAD_TIMEOUT_CODE, name)
-        file_code = _file_download_fail_code(downloaded)
-        if file_code:
-            if not is_enabled(os.environ.get("OA_KEEP_DOWNLOAD_SOURCE")):
-                try:
-                    downloaded.unlink()
-                except Exception:
-                    pass
-            return None, _download_block_message(file_code, name)
-        dest = dest_dir / deterministic_filename(resource, downloaded.name)
-        try:
-            shutil.copy2(downloaded, dest)
-        except FileNotFoundError:
-            return None, f"{name}: 下载临时文件已失效，请重试附件下载"
-        except OSError as err:
-            return None, f"{name}: 下载文件复制失败: {err}"
-        if not is_enabled(os.environ.get("OA_KEEP_DOWNLOAD_SOURCE")):
-            try:
-                if downloaded.resolve() != dest.resolve():
-                    downloaded.unlink()
-            except Exception:
-                pass
-        return dest, ""
-    finally:
-        close_chrome_download_tab(url)
+        return _capture_browser_download(url, name, dest_dir=dest_dir, resource=resource,
+            timeout_sec=timeout_sec, headless=browser_silent_enabled() or headless_browser_download_enabled()), ''
+    except Exception as browser_error:
+        code = str(browser_error) if str(browser_error).startswith('material_') else 'attachment_download_failed'
+        return None, f'{code}: 浏览器会话下载失败'
 
 
 def _download_resource_with_browser(
@@ -1292,8 +1220,10 @@ def extract_zip_safely(
                 if _is_archive_metadata(info.filename):
                     continue
                 target.parent.mkdir(parents=True, exist_ok=True)
-                with archive.open(info) as src, target.open("wb") as dst:
-                    shutil.copyfileobj(src, dst)
+                with archive.open(info) as src:
+                    material_store.copy_stream(target, src, expected_bytes=info.file_size, source={
+                        'resource_id': resource.get('id'), 'kind': 'archive_member',
+                    })
                 extracted.append(
                     {
                         "resource_id": f"{resource_key(resource)}::{index}",
@@ -1326,6 +1256,17 @@ def _archive_child_item(
     }
 
 
+def _kill_archive_process(process) -> None:
+    if process.poll() is None:
+        try:
+            if getattr(process, 'pid', None):
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass
+
+
 def _rar_list_members(tool: str, path: Path) -> Tuple[List[Dict[str, Any]], str]:
     try:
         command = (
@@ -1333,15 +1274,25 @@ def _rar_list_members(tool: str, path: Path) -> Tuple[List[Dict[str, Any]], str]
             if Path(tool).name.startswith("7z")
             else [tool, "-tvf", str(path), "--numeric-owner"]
         )
-        proc = subprocess.run(
-            command, check=False, capture_output=True, text=True,
-            timeout=ARCHIVE_EXTRACT_TIMEOUT_SEC,
-        )
-        if proc.returncode != 0:
-            return [], proc.stderr.strip() or proc.stdout.strip() or "rar 列表读取失败"
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   start_new_session=True)
+        timer = threading.Timer(ARCHIVE_EXTRACT_TIMEOUT_SEC, _kill_archive_process, args=(process,))
+        timer.start()
+        try:
+            with process.stdout as stream:
+                raw = stream.read(4 * 1024 * 1024 + 1)
+            if len(raw) > 4 * 1024 * 1024:
+                return [], 'rar 成员列表超过限制'
+            if process.wait(timeout=ARCHIVE_EXTRACT_TIMEOUT_SEC) != 0:
+                return [], 'rar 列表读取失败'
+            output = raw.decode('utf-8')
+        finally:
+            timer.cancel()
+            _kill_archive_process(process)
+            process.wait()
         members = []
         if Path(tool).name.startswith("7z"):
-            for block in re.split(r"\n\s*\n", proc.stdout.strip()):
+            for block in re.split(r"\n\s*\n", output.strip()):
                 fields = {}
                 for line in block.splitlines():
                     key, separator, value = line.partition(" = ")
@@ -1358,7 +1309,7 @@ def _rar_list_members(tool: str, path: Path) -> Tuple[List[Dict[str, Any]], str]
                     "size": int(fields["Size"]),
                 })
         else:
-            for line in proc.stdout.splitlines():
+            for line in output.splitlines():
                 fields = line.split(maxsplit=8)
                 if (len(fields) != 9 or len(fields[0]) != 10
                         or fields[0][0] not in {"-", "d"} or not fields[4].isdigit()):
@@ -1372,29 +1323,33 @@ def _rar_list_members(tool: str, path: Path) -> Tuple[List[Dict[str, Any]], str]
         return [], str(err)
 
 
-def _rar_extract(tool: str, path: Path, extract_root: Path) -> str:
-    try:
-        if Path(tool).name.startswith("7z"):
-            proc = subprocess.run(
-                [tool, "x", "-y", f"-o{extract_root}", str(path)],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=ARCHIVE_EXTRACT_TIMEOUT_SEC,
-            )
-        else:
-            proc = subprocess.run(
-                [tool, "-xf", str(path), "-C", str(extract_root)],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=ARCHIVE_EXTRACT_TIMEOUT_SEC,
-            )
-        if proc.returncode != 0:
-            return proc.stderr.strip() or proc.stdout.strip() or "rar 解压失败"
-        return ""
-    except Exception as err:
-        return str(err)
+def _rar_extract(tool: str, path: Path, extract_root: Path, members: list[dict], resource: dict) -> str:
+    for member in members:
+        if member['is_dir']:
+            continue
+        target = _safe_archive_target(extract_root, member['name'])
+        if target is None:
+            return 'rar 路径不安全'
+        command = ([tool, 'x', '-so', str(path), member['name']]
+                   if Path(tool).name.startswith('7z') else [tool, '-xOf', str(path), member['name']])
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   start_new_session=True)
+        timer = threading.Timer(ARCHIVE_EXTRACT_TIMEOUT_SEC, _kill_archive_process, args=(process,))
+        timer.start()
+        try:
+            with process.stdout as source:
+                material_store.copy_stream(target, source, expected_bytes=member['size'], source={
+                    'resource_id': resource.get('id'), 'kind': 'archive_member',
+                })
+            if process.wait(timeout=ARCHIVE_EXTRACT_TIMEOUT_SEC) != 0:
+                return 'rar 成员读取失败'
+        except Exception as error:
+            return str(error) if str(error).startswith('material_') else 'rar 成员读取失败'
+        finally:
+            timer.cancel()
+            _kill_archive_process(process)
+            process.wait()
+    return ''
 
 
 def extract_rar_safely(
@@ -1436,7 +1391,7 @@ def extract_rar_safely(
             total_size += member["size"]
             if total_size > ARCHIVE_MAX_TOTAL_BYTES:
                 return [], f"{resource_name(resource) or path.name}: rar 总解压大小超过限制"
-    err = _rar_extract(tool, path, extract_root)
+    err = _rar_extract(tool, path, extract_root, members, resource)
     if err:
         return [], f"{resource_name(resource) or path.name}: rar 解压失败: {err}"
     extracted: List[Dict[str, Any]] = []
@@ -1590,6 +1545,9 @@ def download_resources(
     downloaded: List[Dict[str, Any]] = []
     errors: List[Dict[str, str]] = []
     dest_dir.mkdir(parents=True, exist_ok=True)
+    material_store.MaterialStore().adopt_directory(dest_dir, source={
+        'request_id': request_id, 'flow_key': flow_key, 'kind': 'attachment',
+    })
     cache_request_id, cache_flow_key = _cache_scope(
         dest_dir, request_id=request_id, flow_key=flow_key
     )
