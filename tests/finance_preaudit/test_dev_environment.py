@@ -14,6 +14,7 @@ SCRIPT = Path(__file__).resolve().parents[2] / 'scripts/dev_environment.py'
 @pytest.fixture(autouse=True)
 def command_adapters(tmp_path, monkeypatch):
     # Tool ports are controlled so clean CI needs neither uv installs nor RTK.
+    monkeypatch.setenv('OA_DEVELOPMENT_ENV_ROOT', str(tmp_path / 'shared-environments'))
     tools = tmp_path / 'command-adapters'
     tools.mkdir()
     uv = tools / 'uv'
@@ -25,6 +26,13 @@ def command_adapters(tmp_path, monkeypatch):
                    'raise SystemExit(subprocess.run(sys.argv[2:]).returncode)\n')
     rtk.chmod(0o700)
     monkeypatch.setenv('PATH', str(tools) + os.pathsep + os.environ['PATH'])
+    yield
+    for path in tmp_path.rglob('*'):
+        if not path.is_symlink():
+            try:
+                path.chmod(path.stat().st_mode | 0o200)
+            except OSError:
+                pass
 
 
 def git(root, *args):
@@ -38,6 +46,7 @@ def checkout(tmp_path, name='oa-workspace-dev'):
     git(root, 'init', '-q', '-b', 'codex/test')
     (root / '.gitignore').write_text('.venv/\n__pycache__/\n')
     (root / 'requirements-dev.txt').write_text('')
+    (root / 'requirements-dev.lock').write_text('')
     package = root / 'apps/oa_finance_preaudit'
     package.mkdir(parents=True)
     (package.parent / '__init__.py').write_text('')
@@ -48,9 +57,24 @@ def checkout(tmp_path, name='oa-workspace-dev'):
     return root
 
 
+def environment_path(root):
+    from scripts.shared_dependencies import plan
+    return plan(root)['path']
+
+
 def venv(root):
-    subprocess.run([sys.executable, '-B', '-m', 'venv', '--without-pip', str(root / '.venv')], check=True,
-                   capture_output=True)
+    from scripts.shared_dependencies import plan, preparation_lock, seal
+    dependency = plan(root)
+    with preparation_lock(dependency['base']):
+        subprocess.run([sys.executable, '-B', '-m', 'venv', '--without-pip', str(dependency['path'])],
+                       check=True, capture_output=True)
+        seal(dependency['path'], dependency['identity'])
+
+
+def writable(path):
+    for item in (path, *path.rglob('*')):
+        if not item.is_symlink():
+            item.chmod(item.stat().st_mode | 0o200)
 
 
 def run(root, *args, extra_env=None):
@@ -97,7 +121,7 @@ def test_concise_preflight_shows_actual_module_and_graph_source(tmp_path):
 
 
 @pytest.mark.parametrize('scenario,reason', [
-    ('interpreter', 'interpreter_missing'), ('dependencies', 'dependencies_missing_or_mismatched'),
+    ('interpreter', 'interpreter_missing'), ('dependencies', 'dependency_lock_out_of_date'),
     ('shared_venv', 'shared_virtual_environment'), ('shared_packages', 'shared_writable_dependencies'),
     ('module_source', 'module_origin_mismatch'), ('production', 'development_clone_required'),
     ('unknown_role', 'development_clone_required'), ('baseline', 'baseline_missing'),
@@ -110,11 +134,13 @@ def test_preflight_reports_missing_prerequisites_without_repairs(tmp_path, scena
     if scenario == 'dependencies':
         (root / 'requirements-dev.txt').write_text('nonexistent-test-package==1.0\n')
     elif scenario == 'shared_venv':
+        writable(environment_path(root))
         shared = tmp_path / 'shared'
-        (root / '.venv').rename(shared)
-        (root / '.venv').symlink_to(shared, target_is_directory=True)
+        environment_path(root).rename(shared)
+        environment_path(root).symlink_to(shared, target_is_directory=True)
     elif scenario == 'shared_packages':
-        cfg = root / '.venv/pyvenv.cfg'
+        writable(environment_path(root))
+        cfg = environment_path(root) / 'pyvenv.cfg'
         cfg.write_text(cfg.read_text().replace('include-system-site-packages = false', 'include-system-site-packages = true'))
     elif scenario == 'module_source':
         outside = tmp_path / 'outside'
@@ -149,7 +175,7 @@ def test_preflight_reports_occupied_branch_and_fixed_revision_difference(tmp_pat
 def test_preflight_accepts_shared_interpreter_cache_but_not_writable_environment(tmp_path):
     root = checkout(tmp_path)
     venv(root)
-    interpreter = root / '.venv/bin/python'
+    interpreter = environment_path(root) / 'bin/python'
     assert interpreter.resolve().is_relative_to(root) is False
     result = run(root, 'preflight', '--baseline', 'main')
     assert result.returncode == 0, result.stdout
@@ -163,8 +189,9 @@ def fake_uv(tmp_path):
     binary.write_text('#!' + sys.executable + '\nimport json, pathlib, sys\n'
                       "p=pathlib.Path.cwd()/'uv-invocations.jsonl'\n"
                       "with p.open('a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\n"
+                      "if sys.argv[1]=='--version': print('uv 0.11.6')\n"
                       "if sys.argv[1]=='venv':\n"
-                      " import venv; venv.EnvBuilder(with_pip=False).create('.venv')\n"
+                      " import venv; venv.EnvBuilder(with_pip=False, symlinks=True).create(sys.argv[-1])\n"
                       "if sys.argv[1]=='pip': print('synthetic install failure', file=sys.stderr); sys.exit(17)\n")
     binary.chmod(0o700)
     return str(directory) + os.pathsep + os.environ['PATH']
@@ -173,6 +200,7 @@ def fake_uv(tmp_path):
 def test_prepare_is_explicit_uses_uv_pins_and_preserves_failure(tmp_path):
     root = checkout(tmp_path)
     (root / 'requirements-dev.txt').write_text('pytest==9.1.1\n')
+    (root / 'requirements-dev.lock').write_text('pytest==9.1.1\n')
     tool_path = fake_uv(tmp_path)
     env = {'PATH':tool_path, 'OA_APP_SECRET':'synthetic-secret-must-not-leak'}
     assert run(root, 'preflight', '--baseline', 'main', extra_env=env).returncode == 2
@@ -180,8 +208,9 @@ def test_prepare_is_explicit_uses_uv_pins_and_preserves_failure(tmp_path):
     result = run(root, 'prepare', '--baseline', 'main', extra_env=env)
     assert result.returncode == 17, result.stdout + result.stderr
     calls = [json.loads(line) for line in (root / 'uv-invocations.jsonl').read_text().splitlines()]
-    assert calls[0] == ['venv', '--python', '3.11', '.venv']
-    assert calls[1] == ['pip', 'install', '--python', str(root / '.venv/bin/python'), '--requirement', 'requirements-dev.txt']
+    assert calls[1][0] == 'venv'
+    assert calls[2] == ['pip', 'sync', '--python', str(environment_path(root) / 'bin/python'),
+                        '--link-mode', 'copy', 'requirements-dev.lock']
     report = json.loads(result.stdout)
     assert report['checks'][-1]['exit_code'] == 17
     assert report['checks'][-1]['stderr'] == 'synthetic install failure\n'
@@ -249,6 +278,7 @@ def test_native_setup_and_actions_execute_the_formal_entry(tmp_path):
     scripts.mkdir()
     (scripts / '__init__.py').write_text('')
     (scripts / 'dev_environment.py').write_bytes(SCRIPT.read_bytes())
+    (scripts / 'shared_dependencies.py').write_bytes(SCRIPT.with_name('shared_dependencies.py').read_bytes())
     setup = command_from_config = shlex.split(configuration['setup']['script'])
     setup[0] = sys.executable
     process = subprocess.run(command_from_config, cwd=root, capture_output=True, text=True)
@@ -314,7 +344,8 @@ def test_later_check_not_run_cannot_be_hidden_by_first_success(tmp_path):
 def test_preflight_never_executes_startup_hooks_or_loads_process_credentials(tmp_path, hook):
     root = checkout(tmp_path)
     venv(root)
-    site = root / '.venv/lib/python3.11/site-packages'
+    site = environment_path(root) / 'lib/python3.11/site-packages'
+    writable(environment_path(root))
     marker = tmp_path / 'startup-side-effect'
     (site / hook).write_text('import pathlib; pathlib.Path(' + repr(str(marker)) + ').write_text("must not execute")\n')
     result = run(root, 'preflight', '--baseline', 'main', extra_env={'OA_APP_SECRET':'synthetic-secret'})
@@ -327,7 +358,8 @@ def test_preflight_never_executes_startup_hooks_or_loads_process_credentials(tmp
 def test_local_metadata_does_not_allow_external_package_files(tmp_path):
     root = checkout(tmp_path)
     venv(root)
-    site = root / '.venv/lib/python3.11/site-packages'
+    site = environment_path(root) / 'lib/python3.11/site-packages'
+    writable(environment_path(root))
     external = tmp_path / 'external-package'
     external.mkdir()
     (external / '__init__.py').write_text('')
@@ -337,6 +369,9 @@ def test_local_metadata_does_not_allow_external_package_files(tmp_path):
     (metadata / 'METADATA').write_text('Metadata-Version: 2.1\nName: syntheticpkg\nVersion: 1.0\n')
     (metadata / 'RECORD').write_text('syntheticpkg/__init__.py,,\n')
     (root / 'requirements-dev.txt').write_text('syntheticpkg==1.0\n')
+    (root / 'requirements-dev.lock').write_text('syntheticpkg==1.0\n')
+    old = site.parents[2]
+    old.rename(environment_path(root))
     result = run(root, 'preflight', '--baseline', 'main')
     assert result.returncode == 2
     assert 'shared_writable_dependencies' in json.loads(result.stdout)['reasons']
@@ -346,10 +381,14 @@ def test_local_metadata_does_not_allow_external_package_files(tmp_path):
 def test_verified_uv_bootstrap_is_accepted_without_execution(tmp_path, damage):
     root = checkout(tmp_path)
     venv(root)
-    site = root / '.venv/lib/python3.11/site-packages'
+    site = environment_path(root) / 'lib/python3.11/site-packages'
+    writable(environment_path(root))
     stock = SCRIPT.parents[1] / 'tests/fixtures/uv-bootstrap'
     (site / '_virtualenv.pth').write_bytes((stock / 'bootstrap.pth.fixture').read_bytes())
     (site / '_virtualenv.py').write_bytes((stock / '_virtualenv.py.txt').read_bytes())
+    if not damage:
+        from scripts.shared_dependencies import plan, seal
+        seal(environment_path(root), plan(root)['identity'])
     if damage:
         path = site / ('_virtualenv.pth' if damage == 'pth' else '_virtualenv.py')
         path.write_bytes(path.read_bytes() + b'\n# modified\n')
@@ -366,7 +405,8 @@ def test_verified_uv_bootstrap_is_accepted_without_execution(tmp_path, damage):
 def test_interpreter_failure_preserves_exit_and_raw_evidence(tmp_path):
     root = checkout(tmp_path)
     venv(root)
-    interpreter = root / '.venv/bin/python'
+    interpreter = environment_path(root) / 'bin/python'
+    writable(environment_path(root))
     interpreter.unlink()
     interpreter.write_text('#!' + sys.executable + '\nimport os, sys\n'
                            'assert "OA_APP_SECRET" not in os.environ\n'
@@ -403,3 +443,70 @@ def test_full_validation_defers_before_checks_and_keeps_process_failure_evidence
     else:
         assert report['failure_evidence']['exit_code'] == 29
         assert report['failure_evidence']['stderr'] == 'synthetic ps failure\n'
+
+
+@pytest.mark.parametrize('concurrent', [False, True])
+def test_prepare_reuses_one_immutable_environment_across_worktrees(tmp_path, concurrent):
+    root = checkout(tmp_path)
+    other = tmp_path / 'second-worktree'
+    git(root, 'worktree', 'add', '-q', '-b', 'codex/second', str(other), 'main')
+    tools = tmp_path / 'successful-uv'
+    tools.mkdir()
+    tool = tools / 'uv'
+    log = tmp_path / 'install-calls.jsonl'
+    tool.write_text('#!' + sys.executable + '\nimport json, pathlib, sys, venv\n'
+                    'with pathlib.Path(' + repr(str(log)) + ').open("a") as f: f.write(json.dumps(sys.argv[1:])+"\\n")\n'
+                    'if sys.argv[1] == "--version": print("uv 0.11.6")\n'
+                    'elif sys.argv[1] == "venv": venv.EnvBuilder(with_pip=False, symlinks=True).create(sys.argv[-1])\n')
+    tool.chmod(0o700)
+    env = {'PATH': str(tools) + os.pathsep + os.environ['PATH'],
+           'OA_DEVELOPMENT_ENV_ROOT': str(tmp_path / 'shared-environments')}
+    if concurrent:
+        process = subprocess.Popen([sys.executable, '-B', str(SCRIPT), '--root', str(root), '--json',
+                                    'prepare', '--baseline', 'main'], cwd=root, env=dict(os.environ, **env),
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    else:
+        first = run(root, 'prepare', '--baseline', 'main', extra_env=env)
+    second = run(other, 'prepare', '--baseline', 'main', extra_env=env)
+    if concurrent:
+        stdout, stderr = process.communicate(timeout=20)
+        first = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+    assert first.returncode == second.returncode == 0, first.stdout + second.stdout
+    a, b = json.loads(first.stdout), json.loads(second.stdout)
+    assert a['environment']['executable'] == b['environment']['executable']
+    assert a['environment']['module_origin'] == str(root / 'apps/oa_finance_preaudit/__init__.py')
+    assert b['environment']['module_origin'] == str(other / 'apps/oa_finance_preaudit/__init__.py')
+    assert not (root / '.venv').exists() and not (other / '.venv').exists()
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert sum(call[0] == 'venv' for call in calls) == 1
+    assert sum(call[:2] == ['pip', 'sync'] for call in calls) == 1
+    assert all(not path.stat().st_mode & 0o222 for path in Path(a['environment']['virtual_environment']).rglob('*') if not path.is_symlink())
+
+
+def test_preflight_rejects_mutable_shared_dependencies(tmp_path):
+    root = checkout(tmp_path)
+    venv(root)
+    writable(environment_path(root))
+    result = run(root, 'preflight', '--baseline', 'main')
+    assert result.returncode == 2
+    assert 'shared_dependencies_writable' in json.loads(result.stdout)['reasons']
+
+
+def test_dependency_lock_changes_create_a_distinct_environment(tmp_path):
+    root = checkout(tmp_path)
+    venv(root)
+    previous = environment_path(root)
+    (root / 'requirements-dev.lock').write_text('# new resolution\n')
+    result = run(root, 'preflight', '--baseline', 'main')
+    assert result.returncode == 2
+    assert json.loads(result.stdout)['environment']['virtual_environment'] != str(previous)
+    assert previous.is_dir()
+
+
+def test_dependency_lock_must_preserve_direct_pins(tmp_path):
+    root = checkout(tmp_path)
+    (root / 'requirements-dev.txt').write_text('pytest==9.1.1\n')
+    result = run(root, 'prepare', '--baseline', 'main')
+    assert result.returncode == 2
+    assert json.loads(result.stdout)['reasons'] == ['dependency_lock_out_of_date']
+    assert not Path(os.environ['OA_DEVELOPMENT_ENV_ROOT']).exists()
