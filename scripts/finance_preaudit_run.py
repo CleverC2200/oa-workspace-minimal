@@ -635,6 +635,14 @@ def supervise(command: Sequence[str], *, directory: Path, owner_task_id: str,
     owner_parent_pid = os.getppid()
     receipt["owner_parent_pid"] = owner_parent_pid
     receipt["supervisor_process"] = approval_guard.process_identity(os.getpid())
+    try:
+        before_launch = controller_handoff.manifest_snapshot()
+        receipt['pre_launch_controller'] = {'status': 'recorded', 'observed_at': time.time(),
+            'pointer_sha256': hashlib.sha256(before_launch[0]).hexdigest() if before_launch[0] is not None else None,
+            'manifest_sha256': hashlib.sha256(before_launch[1]).hexdigest() if before_launch[1] is not None else None,
+            'identities': [[path, list(identity)] for path, identity in before_launch[2]]}
+    except (OSError, ValueError, RuntimeError):
+        receipt['pre_launch_controller'] = {'status': 'unavailable'}
     if owners is not None:
         receipt["owner_processes"] = owners
     override = os.environ.get(approval_guard.COOLDOWN_OVERRIDE_ENV)

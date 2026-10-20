@@ -133,6 +133,18 @@ python -B -m apps.oa_finance_preaudit.host_chat_review --operation finish-unregi
 
 新 App 轮次启动时复核原 execution 的收尾，包含未登记的失败轮；全局 ready、进程消失或待办为空不能代替该回执。来源缺失或存在取材、审核、写入时保持阻断，沿隔离排障入口处理。
 
+#### 清单建立之前的失败
+
+原执行没有清单、真实退出 1 且保留 `children_reaped=unknown` 时，不补造清单。仅原错误为 `production_rolling_reconciliation_invalid`、原生启动命令属于同一监督入口、原生完整终态与原 execution 一致，且旧权威指针和旧清单的修改及变更时间均早于该次启动时，使用 `apps.oa_finance_preaudit.pre_manifest_shutdown`。它还要求关键调度源码与原生产提交一致且在启动后未修改、旧轮终态及回收可信、原进程身份和进程组已退出、原三个审核槽中断和空闲来源完整。合法相对 Agent 名只按已验证的直属父子身份解析。缺少任一证据继续阻断。
+
+从已审查、完整 CI 通过、合并并同步远端的干净候选 `main` 操作；生产仍保持唯一干净 `main`，可快进到该候选，原 cron 保持暂停。此维护可先于源码安装，只新增原 execution 旁的审计，不写 OA，不改停止门或原业务文件。
+
+1. 用 `pre_manifest_shutdown.command` 传入原 `target`、`binding`、`reviewers`、父 `source`、三个 `interrupt_lines`、最终 `status_line`、真实终态 `wait_line` 和原启动 `launch_line`，取得 `cmd/workdir`。来源均取实际原生记录，不猜路径。
+2. 将返回值用标准 JSON 编码器生成 `text(await tools.exec_command(<返回的 JSON 对象>));`，作为独立原生调用执行。只允许该表达式及 `cmd/workdir`。等待真实退出 0、`kind=preaudit_app_pre_manifest_observation` 和 `status=ready`；该步只读，尚未封存。
+3. 用同一模块的 `--operation seal --target-root <生产绝对路径> --expected-revision <候选 SHA> --owner-task-id <原父 UUID> --source-session-file <原父 jsonl> --source-line <上一步 observe 原生工具行>` 确认。它重新核对原证据、观察来源和未变化的权威指针，在 Controller/global Writer 租约内独占创建 `pre-manifest-shutdown.json`。只有 `status=verified` 才完成该执行的可信收尾。
+
+新审计明确记录 `controller_started=false`、`original_children_reaped=unknown` 和当前进程退出观察，不把原监督回执改成已回收。以后启动复验原生观察、退出和三槽来源；新的正常轮次可以更新权威指针，已封存观察不因此变成新事实。当前身份、授权、冻结、未知写入和完整实时对账仍独立核验。新监督执行额外留存启动前指针快照；旧执行没有该字段时仍须满足上述现存证据，不能补填快照。
+
 ### 历史已取材但未登记的失败轮
 
 历史启动门命中未登记失败轮，且原轮已有准备动作时，先核对原执行、原生来源和后续单据归属。有当前明确维护授权后，使用 `python -m apps.oa_finance_preaudit.legacy_app_shutdown --help` 的单轮入口，提供原 execution、owner、invocation、tool session、真实父会话、三个原子会话及 spawn/interrupt、最终 list_agents 和原工具终态 wait 来源。默认预检返回 `status=ready`，不封存；确认调用增加 `--confirm-seal YES`，只有 `status=verified` 才取得历史封存。
