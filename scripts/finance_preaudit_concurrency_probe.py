@@ -4428,7 +4428,7 @@ def run_rolling_drain(
                     PROJECT_ROOT / "runtime" / "finance_preaudit_flows",
                     scoped_reconcile_status(), allowed_workflows & authorized_workflows,
                 )
-            if native_pipeline and targets is None:
+            if native_pipeline and targets is None and not recovery_action_files:
                 from apps.oa_finance_preaudit import production_write, review_interruption
                 flow_root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
                 if flow_root.exists() and any(state.get("reason") == review_interruption.REASON for state in reconciliation.latest_states(flow_root)):
