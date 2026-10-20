@@ -527,9 +527,29 @@ def test_fetched_matrix_waits_for_same_attempt_metadata_and_preserves_raw_snapsh
         'job_timing_status_untrusted']
 
 
+@pytest.mark.parametrize('upstream_pending', [True, False])
+def test_fetched_matrix_waits_for_started_queued_jobs(fetched_matrix, upstream_pending):
+    ready = job_timings()
+    stale = json.loads(json.dumps(ready))
+    stale['jobs'][-1]['status'] = 'queued'
+    if upstream_pending:
+        for job in stale['jobs'][:-1]:
+            job.update(status='in_progress', conclusion=None, completed_at=None)
+        stale['jobs'][-2]['status'] = 'queued'
+    result, report, received, jobs_file, waited = fetched_matrix([stale, ready])
+    assert result == 0 and report['status'] == 'verified' and report['counts'] == {'passed': 32}
+    assert len(received) == 2 and waited == 1
+    assert [path.read_bytes() for path in sorted(jobs_file.with_suffix('.snapshots').glob('*.json'))] == received
+    assert jobs_file.read_bytes() == received[-1]
+
+
 @pytest.mark.parametrize(('defect', 'error'), [
     ('failure', 'job_timing_status_untrusted'), ('cancelled', 'job_timing_status_untrusted'),
-    ('timed_out', 'job_timing_status_untrusted'), ('queued', 'job_timing_status_untrusted'),
+    ('timed_out', 'job_timing_status_untrusted'),
+    ('queued_missing_start', 'evidence_input_invalid:TypeError'),
+    ('queued_clock', 'job_timing_clock_untrusted'),
+    ('queued_conclusion', 'job_timing_status_untrusted'),
+    ('queued_completed_at', 'job_timing_status_untrusted'),
     ('running_conclusion', 'job_timing_status_untrusted'),
     ('running_completed_at', 'job_timing_status_untrusted'),
     ('current_completed', 'job_timing_status_untrusted'),
@@ -546,8 +566,16 @@ def test_fetched_matrix_rejects_untrusted_snapshot_without_waiting(fetched_matri
     job = invalid['jobs'][2]
     if defect in {'failure', 'cancelled', 'timed_out'}:
         job['conclusion'] = defect
-    elif defect == 'queued':
+    elif defect.startswith('queued_'):
         job.update(status='queued', conclusion=None, completed_at=None)
+        if defect == 'queued_missing_start':
+            job['started_at'] = None
+        elif defect == 'queued_clock':
+            job['started_at'] = '2026-10-17T00:00:00'
+        elif defect == 'queued_conclusion':
+            job['conclusion'] = 'failure'
+        elif defect == 'queued_completed_at':
+            job['completed_at'] = ready['jobs'][2]['completed_at']
     elif defect == 'running_conclusion':
         job['status'] = 'in_progress'
     elif defect == 'running_completed_at':
@@ -581,9 +609,11 @@ def test_fetched_matrix_rejects_untrusted_snapshot_without_waiting(fetched_matri
         jobs_file.with_suffix('.snapshots') / '01.json']
 
 
-def test_fetched_matrix_exhausts_readiness_limit_without_real_sleep(fetched_matrix):
+@pytest.mark.parametrize('pending', ['running', 'queued_upstream', 'queued_current'])
+def test_fetched_matrix_exhausts_readiness_limit_without_real_sleep(fetched_matrix, pending):
     stale = job_timings()
-    stale['jobs'][0].update(status='in_progress', conclusion=None, completed_at=None)
+    job = stale['jobs'][-1 if pending == 'queued_current' else 0]
+    job.update(status='in_progress' if pending == 'running' else 'queued', conclusion=None, completed_at=None)
     result, report, received, jobs_file, waited = fetched_matrix([stale])
     assert result == 1 and report['errors'] == ['job_timing_readiness_exhausted']
     assert len(received) == 20 and waited == 19
@@ -591,11 +621,12 @@ def test_fetched_matrix_exhausts_readiness_limit_without_real_sleep(fetched_matr
     assert jobs_file.read_bytes() == received[-1]
 
 
-def test_fetched_matrix_readiness_wait_still_exceeds_original_budget(fetched_matrix):
+@pytest.mark.parametrize('status', ['in_progress', 'queued'])
+def test_fetched_matrix_readiness_wait_still_exceeds_original_budget(fetched_matrix, status):
     ready = job_timings()
     ready['jobs'][-1]['started_at'] = datetime.fromtimestamp(time.time() - 39.5, timezone.utc).isoformat()
     stale = json.loads(json.dumps(ready))
-    stale['jobs'][0].update(status='in_progress', conclusion=None, completed_at=None)
+    stale['jobs'][0].update(status=status, conclusion=None, completed_at=None)
     result, report, received, jobs_file, waited = fetched_matrix([stale, ready])
     assert result == 1 and report['errors'] == ['ci_time_budget_exceeded']
     assert waited == 1 and len(received) == 2

@@ -311,7 +311,7 @@ def test_pid_reused_supervisor_is_blocked_without_changing_original_receipt(tmp_
     assert report['exit_code'] is None and path.read_bytes() == saved
 
 
-def lost_supervisor(tmp_path, monkeypatch, returncode):
+def lost_supervisor(tmp_path, monkeypatch, returncode, *, after_controller_wait=False):
     controls = {key: value for key, value in os.environ.items() if key in {
         'OA_FINANCE_PREAUDIT_STOP_FILE', 'OA_FROZEN_WRITER_LOCK_FILE',
         'OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE'}}
@@ -334,6 +334,22 @@ socket.create_connection=reject_network
     def launch(command, *args, **kwargs):
         if command == [sys.executable, '-c', entry]:
             handler = f'import os,signal\nsignal.signal(signal.SIGUSR1,lambda *_: os._exit({returncode}))\n'
+            if after_controller_wait:
+                leave = f'os.kill(os.getpid(), {-returncode})' if returncode < 0 else f'os._exit({returncode})'
+                handler = f'''import os,json
+from pathlib import Path
+from apps.oa_approval import runtime_control
+original_write=runtime_control.write_control_bytes_atomic
+def persist_then_exit(path, raw):
+    result=original_write(path, raw)
+    if Path(path).name=='execution.json':
+        receipt=json.loads(raw)
+        if receipt.get('state')=='exited' and 'result' not in receipt:
+            Path({str(before)!r}).write_bytes(Path(path).read_bytes())
+            {leave}
+    return result
+runtime_control.write_control_bytes_atomic=persist_then_exit
+'''
             command = [sys.executable, '-c', guard + handler + entry]
         return real_popen(command, *args, **kwargs)
 
@@ -356,6 +372,13 @@ Path({str(before)!r}).write_bytes(path.read_bytes())
 os.kill(os.getppid(),{int(signum)})
 os._exit(0)
 '''
+    if after_controller_wait:
+        child = guard + '''from apps.oa_approval import runtime_control as control
+from apps.oa_finance_preaudit import controller_handoff as handoff
+with control.global_controller_lease():
+    manifest=handoff.begin({'capacity':3})
+    handoff.finish(manifest,status='completed',children_reaped=True,health='healthy')
+'''
     with pytest.raises(ValueError, match='^controller_supervisor_lost$'):
         runner.supervise([sys.executable, '-c', child], directory=directory,
                          owner_task_id=owner, detached=True)
@@ -367,8 +390,12 @@ os._exit(0)
 
 
 @pytest.mark.parametrize('returncode,signum', [(0, None), (7, None), (-signal.SIGKILL, signal.SIGKILL)])
-def test_lost_supervisor_retains_actual_wait_observation_without_claiming_completion(tmp_path, monkeypatch, returncode, signum):
-    owner, directory, receipt = lost_supervisor(tmp_path, monkeypatch, returncode)
+@pytest.mark.parametrize('after_controller_wait', [False, True])
+def test_lost_supervisor_retains_actual_wait_observation_without_claiming_completion(
+        tmp_path, monkeypatch, returncode, signum, after_controller_wait):
+    owner, directory, receipt = lost_supervisor(
+        tmp_path, monkeypatch, returncode, after_controller_wait=after_controller_wait)
+    original = (directory / 'execution.json').read_bytes()
     report = runner.read_execution(directory / 'execution.json', owner_task_id=owner,
                                    invocation_id=directory.name)
     observation = report['supervisor_exit_observation']
@@ -376,13 +403,18 @@ def test_lost_supervisor_retains_actual_wait_observation_without_claiming_comple
     assert observation['supervisor_pid'] == receipt['supervisor_pid']
     assert observation['owner_task_id'] == owner and observation['invocation_id'] == directory.name
     assert report['state'] == 'supervisor_lost' and report['status'] == 'blocked'
-    assert report['terminal'] is False and report['exit_code'] is None
-    assert report['children_reaped'] == 'unknown'
+    assert report['recorded_state'] == receipt['state'] == ('exited' if after_controller_wait else 'waiting')
+    assert report['terminal'] is False and report['exit_code'] == (0 if after_controller_wait else None)
+    assert report['exit_code'] == receipt['exit_code'] and report['exit_signal'] == receipt['exit_signal']
+    assert report['children_reaped'] == (True if after_controller_wait else 'unknown')
+    assert 'result' not in receipt
+    assert (directory / 'execution.json').read_bytes() == original
     assert (directory / 'supervisor-exit.json').stat().st_mode & 0o777 == 0o600
 
 
-def test_missing_or_invalid_supervisor_observation_cannot_complete_lost_execution(tmp_path, monkeypatch):
-    owner, directory, _ = lost_supervisor(tmp_path, monkeypatch, 0)
+@pytest.mark.parametrize('after_controller_wait', [False, True])
+def test_missing_or_invalid_supervisor_observation_cannot_complete_lost_execution(tmp_path, monkeypatch, after_controller_wait):
+    owner, directory, _ = lost_supervisor(tmp_path, monkeypatch, 0, after_controller_wait=after_controller_wait)
     path = directory / 'execution.json'
     saved = path.read_bytes()
     diagnostic = directory / 'supervisor-exit.json'
@@ -397,7 +429,9 @@ def test_missing_or_invalid_supervisor_observation_cannot_complete_lost_executio
             diagnostic.write_bytes(content)
         report = runner.read_execution(path, owner_task_id=owner, invocation_id=directory.name)
         assert report['status'] == 'blocked' and report['terminal'] is False
-        assert report['exit_code'] is None and report['children_reaped'] == 'unknown'
+        assert report['exit_code'] == (0 if after_controller_wait else None)
+        assert report['children_reaped'] == (True if after_controller_wait else 'unknown')
+        assert report['error_code'] == 'controller_supervisor_lost'
         assert 'supervisor_exit_observation' not in report
         assert path.read_bytes() == saved
     diagnostic.unlink()

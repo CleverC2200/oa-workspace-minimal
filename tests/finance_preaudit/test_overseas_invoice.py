@@ -81,7 +81,8 @@ def harness(tmp_path, monkeypatch):
     monkeypatch.setenv('OA_FROZEN_WRITER_LOCK_FILE', str(tmp_path / 'global.lock'))
     monkeypatch.setattr(runtime_control, 'stop_requested', lambda: False)
     api = Api()
-    def download(rs, directory):
+    def download(rs, directory, *, request_id):
+        assert request_id == '901'
         directory.mkdir(parents=True, exist_ok=True)
         result = []
         for r in rs:
@@ -97,6 +98,66 @@ def harness(tmp_path, monkeypatch):
 
 def authorize(engine):
     engine.authorize(confirm='YES')
+
+
+@pytest.mark.parametrize('lost_response', [False, True])
+def test_fresh_downloads_keep_workflow_identity_across_attempt_directories(harness, monkeypatch, lost_response):
+    import fitz
+    from apps.oa_approval import attachments, overseas_invoice_api
+
+    engine, api, _, _ = harness
+    with fitz.open() as document:
+        document.new_page()
+        original = document.tobytes()
+    downloads = []
+
+    def recorded_download(rs, *, dest_dir, request_id, flow_key, reuse_cache, **_kwargs):
+        downloads.append((request_id, dest_dir.parent.name))
+        assert flow_key == 'overseas_invoice' and reuse_cache is False
+        if request_id != api.data['requestId']:
+            return [], [{'code': 'attachment_access_denied'}]
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        path = dest_dir / 'invoice.pdf'
+        path.write_bytes(original)
+        return [{'resource_id': str(rs[0]['id']), 'path': str(path)}], []
+
+    monkeypatch.setattr(attachments, 'download_resources', recorded_download)
+    engine.download = overseas_invoice_api.download_fresh
+    attempt = engine.collect('901')
+    material = engine.read_material(attempt)
+    engine.freeze(attempt, recognized(material))
+    authorize(engine)
+    if lost_response:
+        original_submit = api.submit_invoice
+
+        def lose_response(*args):
+            original_submit(*args)
+            raise TimeoutError('synthetic lost response')
+
+        api.submit_invoice = lose_response
+    result = engine.submit(attempt, confirm='YES')
+    assert result['status'] == ('unknown' if lost_response else 'submitted')
+    if lost_response:
+        journal = engine.root / 'receipts' / (inv.digest('901') + '.json')
+        receipt_bytes = journal.read_bytes()
+        assert engine.postcheck(attempt)['status'] == 'confirmed_submitted'
+        assert journal.read_bytes() == receipt_bytes
+    assert [request_id for request_id, _ in downloads] == ['901'] * 3
+    assert downloads[0][1] == attempt
+    assert downloads[1][1].startswith('recheck-')
+    assert downloads[2][1].startswith('postcheck-')
+    assert engine.submit(attempt, confirm='YES') == result
+    assert len(api.calls) == 1
+
+
+@pytest.mark.parametrize('request_id', [None, '', 'attempt-id', '0', '01', '１２'])
+def test_fresh_download_rejects_invalid_workflow_identity_before_transport(tmp_path, monkeypatch, request_id):
+    from apps.oa_approval import attachments, overseas_invoice_api
+
+    monkeypatch.setattr(attachments, 'download_resources',
+                        lambda *_args, **_kwargs: pytest.fail('invalid identity reached transport'))
+    with pytest.raises(ValueError, match='invoice_request_invalid'):
+        overseas_invoice_api.download_fresh(resources(), tmp_path / '901' / 'attachments', request_id=request_id)
 
 
 def test_partial_recognition_preserves_other_fields_and_uses_original_row(harness):
@@ -220,8 +281,8 @@ def test_changed_remote_bytes_block_before_submit(harness):
     engine, api, attempt, material = harness
     engine.freeze(attempt, recognized(material)); authorize(engine)
     old = engine.download
-    def changed(rs, directory):
-        files = old(rs, directory)
+    def changed(rs, directory, *, request_id):
+        files = old(rs, directory, request_id=request_id)
         Path(files[0]['path']).write_bytes(b'%PDF-changed-original')
         return files
     engine.download = changed
@@ -435,8 +496,8 @@ def test_readonly_postcheck_rejects_changed_evidence_without_resubmit(harness, c
         api.request_context = lambda request_id: (deepcopy(api.data), [{**resources()[0], 'name': 'changed.pdf'}])
     if change == 'bytes':
         original_download = engine.download
-        def changed(rs, directory):
-            files = original_download(rs, directory)
+        def changed(rs, directory, *, request_id):
+            files = original_download(rs, directory, request_id=request_id)
             Path(files[0]['path']).write_bytes(b'%PDF-changed-original')
             return files
         engine.download = changed
