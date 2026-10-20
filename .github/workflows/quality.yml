@@ -157,10 +157,9 @@ jobs:
           OA_CI_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" > "$RUNNER_TEMP/job-timings.json"
           python -m scripts.pytest_evidence --merge-directory="$RUNNER_TEMP/evidence" \
             --output="$RUNNER_TEMP/full-ci.json" --budget-seconds=170 \
-            --jobs-file="$RUNNER_TEMP/job-timings.json"
+            --jobs-file="$RUNNER_TEMP/job-timings.json" --fetch-jobs
       - name: Preserve complete CI evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -169,4 +168,5 @@ jobs:
           path: |
             ${{ runner.temp }}/full-ci.json
             ${{ runner.temp }}/job-timings.json
+            ${{ runner.temp }}/job-timings.snapshots/
           if-no-files-found: warn
