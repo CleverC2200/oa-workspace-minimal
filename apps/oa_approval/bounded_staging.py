@@ -48,12 +48,16 @@ def _cleanup(image_path: Path, mount: Path, *, attach_started: bool) -> None:
         image_path.unlink(missing_ok=True)
     except Exception as error:
         marker = image_path.with_name(image_path.name + '.cleanup.json')
-        marker.write_text(json.dumps({
-            'image_path': str(image_path),
-            'mount_path': str(mount),
-            'status': 'cleanup_unknown',
-        }), encoding='utf-8')
-        marker.chmod(0o600)
+        try:
+            descriptor = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(descriptor, 'w', encoding='utf-8') as output:
+                json.dump({
+                    'image_path': str(image_path),
+                    'mount_path': str(mount),
+                    'status': 'cleanup_unknown',
+                }, output)
+        except OSError:
+            pass
         raise BoundedStagingCleanupError('bounded_staging_cleanup_unknown') from error
 
 
