@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+import time
 from typing import Any, Dict, List, Tuple
 import xml.etree.ElementTree as ET
 import zipfile
@@ -105,6 +106,34 @@ def render_pdf(
     return out, page_count, page_texts
 
 
+def _reap_office_converter(process: subprocess.Popen, prefix: str) -> None:
+    deadline = time.monotonic() + 5
+    try:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=max(0, deadline - time.monotonic()))
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"{prefix}_conversion_failed")
+            status = subprocess.run(
+                ["ps", "-axo", "pgid=,stat="], stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, check=True, timeout=remaining,
+            )
+            rows = [line.split() for line in status.stdout.splitlines()]
+            if not rows or any(len(row) != 2 or not row[0].isdigit() for row in rows):
+                raise RuntimeError(f"{prefix}_conversion_failed")
+            if not any(group == str(process.pid) and not state.startswith("Z")
+                       for group, state in rows):
+                return
+            time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+    except (OSError, subprocess.SubprocessError):
+        raise RuntimeError(f"{prefix}_conversion_failed") from None
+
+
 def render_office_document(
     path: Path, *, out_dir: Path, resource_id: str,
 ) -> tuple[List[Tuple[Path, str, str]], int, List[str]]:
@@ -169,13 +198,14 @@ def render_office_document(
             raise RuntimeError(f"{prefix}_converter_unavailable") from None
         try:
             returncode = process.wait(timeout=LEGACY_DOC_TIMEOUT_SECONDS)
-        finally:
-            # Include converter children; never signal another conversion/profile.
+        except BaseException as error:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
+                _reap_office_converter(process, prefix)
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
+            raise
+        else:
+            _reap_office_converter(process, prefix)
         pdf = work / "source.pdf"
         if returncode != 0 or not pdf.is_file():
             raise RuntimeError(f"{prefix}_conversion_failed")

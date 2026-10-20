@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import hashlib
 import fcntl
 import json
 import os
 from pathlib import Path
 import sys
+import threading
 
 import fitz
 import pytest
@@ -75,16 +77,18 @@ def test_legacy_doc_timeout_is_bounded(tmp_path, monkeypatch):
     assert not list((tmp_path / "out").glob("legacy-doc-*"))
 
 
-@pytest.mark.parametrize("timeout", [False, True])
-def test_converter_child_reaped_and_profile_isolated(tmp_path, monkeypatch, timeout):
+def _run_converter_reap_case(tmp_path, monkeypatch, timeout):
     lock_file = tmp_path / "child.lock"
     ready = tmp_path / "child.ready"
+    with fitz.open() as document:
+        document.new_page()
+        pdf_bytes = document.tobytes()
     child = (
         "import fcntl, pathlib, time; "
         f"f=open({str(lock_file)!r},'w'); fcntl.flock(f,fcntl.LOCK_EX); "
         f"pathlib.Path({str(ready)!r}).touch(); time.sleep(30)"
     )
-    script = f'''import os, pathlib, subprocess, sys, time, fitz
+    script = f'''import os, pathlib, subprocess, sys, time
 from urllib.parse import urlparse, unquote
 profile_arg = next(a for a in sys.argv if a.startswith('-env:UserInstallation='))
 profile = pathlib.Path(unquote(urlparse(profile_arg.split('=', 1)[1]).path))
@@ -100,7 +104,7 @@ p = subprocess.Popen([sys.executable, '-c', {child!r}])
 pathlib.Path({str(tmp_path / 'pid')!r}).write_text(str(p.pid))
 while not pathlib.Path({str(ready)!r}).exists(): time.sleep(.01)
 if {timeout!r}: time.sleep(30)
-doc = fitz.open(); doc.new_page(); doc.save(out/'source.pdf')
+(out/'source.pdf').write_bytes({pdf_bytes!r})
 '''
     _converter(tmp_path, monkeypatch, script)
     monkeypatch.delenv("FONTCONFIG_FILE", raising=False)
@@ -122,6 +126,59 @@ doc = fitz.open(); doc.new_page(); doc.save(out/'source.pdf')
                 os.kill(int(pid_file.read_text()), 9)
             except ProcessLookupError:
                 pass
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_converter_child_reaped_and_profile_isolated(tmp_path, monkeypatch, timeout):
+    _run_converter_reap_case(tmp_path, monkeypatch, timeout)
+
+
+def test_converter_waits_for_child_after_parent_exit(tmp_path, monkeypatch):
+    parent_killed = threading.Event()
+
+    def defer_child_exit(pgid, signum):
+        os.kill(pgid, signum)
+        parent_killed.set()
+
+    monkeypatch.setattr(os, "killpg", defer_child_exit)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_run_converter_reap_case, tmp_path, monkeypatch, True)
+        try:
+            assert parent_killed.wait(timeout=5)
+            with pytest.raises(FutureTimeoutError):
+                future.result(timeout=0.1)
+        finally:
+            pid_file = tmp_path / "pid"
+            if pid_file.exists():
+                try:
+                    os.kill(int(pid_file.read_text()), 9)
+                except ProcessLookupError:
+                    pass
+        future.result(timeout=5)
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_converter_status_failure_preserves_conversion_failure(tmp_path, monkeypatch, timeout):
+    with fitz.open() as document:
+        document.new_page()
+        pdf_bytes = document.tobytes()
+    body = "import time\ntime.sleep(30)\n" if timeout else f'''import pathlib, sys
+out = pathlib.Path(sys.argv[sys.argv.index('--outdir') + 1])
+(out/'source.pdf').write_bytes({pdf_bytes!r})
+'''
+    _converter(tmp_path, monkeypatch, body)
+    monkeypatch.setattr(extractors, "LEGACY_DOC_TIMEOUT_SECONDS", 0.1 if timeout else 2)
+    status_calls = []
+
+    def unavailable_status(*args, **kwargs):
+        status_calls.append(args)
+        raise OSError("synthetic process status unavailable")
+
+    monkeypatch.setattr(extractors.subprocess, "run", unavailable_status)
+    code = "legacy_doc_conversion_timeout" if timeout else "legacy_doc_conversion_failed"
+    with pytest.raises(RuntimeError, match=f"^{code}$"):
+        extractors.prepare_materials([_item(tmp_path)], out_dir=tmp_path / "out")
+    assert status_calls
 
 
 @pytest.mark.parametrize("code", [
