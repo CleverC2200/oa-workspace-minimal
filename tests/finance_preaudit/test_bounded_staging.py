@@ -65,7 +65,8 @@ def test_workspace_bounds_native_image_and_cleans_up_after_body_failure(tmp_path
     assert not list(tmp_path.iterdir())
 
 
-def test_workspace_preserves_image_and_mount_when_detach_cannot_be_confirmed(tmp_path, monkeypatch):
+@pytest.mark.parametrize('marker_failure', [False, True])
+def test_workspace_preserves_image_and_mount_when_detach_cannot_be_confirmed(tmp_path, monkeypatch, marker_failure):
     import json
     import plistlib
     import subprocess
@@ -87,12 +88,22 @@ def test_workspace_preserves_image_and_mount_when_detach_cannot_be_confirmed(tmp
     monkeypatch.setattr(bounded_staging.sys, 'platform', 'darwin')
     monkeypatch.setattr(bounded_staging.subprocess, 'run', run)
     monkeypatch.setattr(bounded_staging.os.path, 'ismount', lambda path: Path(path) in mounted)
+    if marker_failure:
+        original_open = bounded_staging.os.open
+
+        def fail_marker(path, *args, **kwargs):
+            if str(path).endswith('.cleanup.json'):
+                raise OSError('host_filesystem_full')
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(bounded_staging.os, 'open', fail_marker)
     with pytest.raises(bounded_staging.BoundedStagingCleanupError, match='cleanup_unknown'):
         with bounded_staging.workspace(image, max_bytes=16 * 1024 * 1024) as work:
             assert work in mounted
     assert image.read_bytes() == b'bounded'
-    marker = json.loads(image.with_name('image.dmg.cleanup.json').read_text())
-    assert marker == {'image_path': str(image), 'mount_path': str(work), 'status': 'cleanup_unknown'}
+    if not marker_failure:
+        marker = json.loads(image.with_name('image.dmg.cleanup.json').read_text())
+        assert marker == {'image_path': str(image), 'mount_path': str(work), 'status': 'cleanup_unknown'}
     assert work.is_dir()
 
 
