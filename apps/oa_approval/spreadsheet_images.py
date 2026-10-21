@@ -7,6 +7,8 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 import zipfile
 
+from apps.oa_approval import material_store
+
 import fitz
 
 _NS = {
@@ -85,7 +87,7 @@ def extract(path: Path, out_dir: Path, prefix: str, *, compact: bool = False) ->
                     if len(jpeg) < len(content):
                         content, suffix = jpeg, '.jpg'
             destination = out_dir / f'{prefix}_excel_{len(output)+1}{suffix}'
-            destination.write_bytes(content)
+            material_store.write_bytes(destination, content, source={'resource_id': prefix, 'kind': 'spreadsheet_image'})
             output.append((destination, cell))
 
         cell_images = {}

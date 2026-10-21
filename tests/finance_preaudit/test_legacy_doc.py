@@ -15,6 +15,7 @@ import pytest
 from apps.oa_approval import attachment_extractors as extractors
 from apps.oa_finance_preaudit import flow_engine
 
+pytestmark = pytest.mark.usefixtures('recorded_bounded_office_workspace')
 
 def _converter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str) -> Path:
     binary = tmp_path / "soffice"

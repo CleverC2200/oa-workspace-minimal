@@ -10,6 +10,7 @@ import pytest
 
 from apps.oa_approval import attachment_extractors as extractors
 
+pytestmark = pytest.mark.usefixtures('recorded_bounded_office_workspace')
 
 def _presentation(tmp_path: Path, pages: int = 4) -> dict:
     source = tmp_path / "presentation.pptx"

@@ -17,7 +17,7 @@ from typing import Callable, Iterable
 import fitz
 
 from apps import json_artifact
-from apps.oa_approval import runtime_control, writer_outcomes
+from apps.oa_approval import material_store, runtime_control, writer_outcomes
 
 from . import attempt_state, company_comparison, fuel_trip_observation, decision_validation, item_failure, manual_handoff, observability, packaging_contract, prepare_failure, review_failure_evidence, submission, tpm_price_reference
 
@@ -552,6 +552,7 @@ def _evidence_fingerprint(material: dict) -> str:
         for item in image_items
         if isinstance(item, dict)
     )
+    material_store.MaterialStore().require_available_files(paths)
     if any(str(path) in {"", "."} or not path.is_file() for path in paths):
         raise ValueError("frozen_material_changed")
     digest = hashlib.sha256()
@@ -1029,6 +1030,7 @@ def _path_within(value: object, root: Path, *, code: str) -> Path:
         raise ValueError(code)
     path = Path(raw).expanduser().resolve()
     expected_root = Path(root).expanduser().resolve()
+    material_store.MaterialStore().require_available(path)
     if not path.is_file() or not path.is_relative_to(expected_root):
         raise ValueError(code)
     return path
@@ -1106,6 +1108,7 @@ def _validate_material_bundle(
         else:
             raise ValueError("prepared_resource_unbound")
         image_path = Path(str(image.get("path") or "")).expanduser().resolve()
+        material_store.MaterialStore().require_available(image_path)
         if not image_path.is_file():
             raise ValueError("prepared_path_outside_request_root")
         if image_path.is_relative_to(prepared_path):
