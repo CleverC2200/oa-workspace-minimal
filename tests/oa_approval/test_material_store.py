@@ -46,6 +46,40 @@ def test_inventory_counts_unregistered_files_in_adopted_legacy_directory(tmp_pat
         store.write_bytes(tmp_path / 'new', b'x')
 
 
+def test_availability_check_does_not_traverse_unrelated_inventory_scopes(tmp_path):
+    store = MaterialStore(tmp_path / 'private')
+    target = tmp_path / 'downloaded' / 'invoice.pdf'
+    store.write_bytes(target, b'original')
+    unrelated = tmp_path / 'unrelated'
+    unrelated.mkdir()
+    store.adopt_directory(unrelated)
+    (unrelated / 'outside').symlink_to(target)
+    inventory = (store.root / 'inventory.json').read_bytes()
+
+    store.require_available_files([target])
+
+    assert target.read_bytes() == b'original'
+    assert (store.root / 'inventory.json').read_bytes() == inventory
+    with pytest.raises(ValueError, match='project_space_path_untrusted'):
+        store.report()
+
+
+def test_availability_check_observes_other_writer_retirement_even_after_file_reappears(tmp_path):
+    reader = MaterialStore(tmp_path / 'private', limit_bytes=10)
+    target = tmp_path / 'original.pdf'
+    reader.write_bytes(target, b'123456')
+    reader.require_available(target)
+
+    writer = MaterialStore(reader.root, limit_bytes=10)
+    writer.mark_disposable(target, closed=True, write_state='confirmed_no_write')
+    writer.write_bytes(tmp_path / 'next.pdf', b'12345')
+    assert not target.exists()
+    target.write_bytes(b'123456')
+
+    with pytest.raises(ValueError, match='material_retired'):
+        reader.require_available(target)
+
+
 @pytest.mark.parametrize('has_active_attempt', [False, True])
 def test_capacity_reclaims_closed_attempt_attachments_but_keeps_active_materials_and_receipts(tmp_path, has_active_attempt):
     import hashlib

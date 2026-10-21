@@ -464,7 +464,7 @@ class MaterialStore:
 
     def require_available_files(self, paths) -> None:
         paths = [_path(Path(path)) for path in paths]
-        with self._locked(readonly=True) as state:
+        with self._locked(readonly=True, refresh=False) as state:
             for path in paths:
                 entry = state['files'].get(str(path))
                 if entry and entry['status'] in {'retired', 'deletion_planned'}:
