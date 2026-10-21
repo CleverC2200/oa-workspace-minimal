@@ -37,13 +37,18 @@ def maintenance_material_read():
         return
     from apps.oa_approval import material_store
     store = material_store.MaterialStore()
-    with store._locked(readonly=True):
-        token = material_store._ACTIVE_OPERATIONS.set(
-            material_store._ACTIVE_OPERATIONS.get() | {str(store.root)})
-    try:
-        yield
-    finally:
-        material_store._ACTIVE_OPERATIONS.reset(token)
+    original_locked = material_store.MaterialStore._locked
+    with original_locked(store, readonly=True) as state:
+        @contextmanager
+        def locked_material_read(reader, *, readonly=False, refresh=True):
+            if not readonly or reader.root != store.root:
+                raise RuntimeError('maintenance_material_write_forbidden')
+            yield state
+        material_store.MaterialStore._locked = locked_material_read
+        try:
+            yield
+        finally:
+            material_store.MaterialStore._locked = original_locked
 with maintenance_material_read():
 ''' + textwrap.indent(program, '    ')
 
