@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import resource
+import secrets
 import subprocess
 import sys
 import time
@@ -19,6 +20,8 @@ import pytest
 
 SHARDS = (0, 1, 2)
 _MANUAL_STOP = 'tests/finance_preaudit/test_manual_stop_recovery.py::'
+_NATIVE_STAGING = ('tests/finance_preaudit/test_bounded_staging.py::'
+                   'test_native_workspace_caps_aggregate_files_and_leaves_no_mount')
 _LINUX_SKIPS = {
     _MANUAL_STOP + name for name in (
         'test_first_maintenance_identity_is_bound_to_original_file_birth',
@@ -28,7 +31,7 @@ _LINUX_SKIPS = {
           for defect in ('later_edit', 'replacement', 'birth_mismatch', 'call_after_birth',
                          'result_before_modify', 'ctime', 'missing_birth', 'saved_payload', 'observed_before_result')),
     )
-}
+} | {_NATIVE_STAGING}
 
 
 def pytest_addoption(parser):
@@ -66,7 +69,7 @@ def pytest_collection_modifyitems(config, items):
 
 
 def pytest_configure(config):
-    if config.getoption('ci_evidence_file') and not hasattr(config, 'workerinput'):
+    if not hasattr(config, 'workerinput'):
         config.pluginmanager.register(Evidence(config), 'offline-ci-evidence')
 
 
@@ -74,6 +77,10 @@ class Evidence:
     def __init__(self, config):
         self.config = config
         self.path = config.getoption('ci_evidence_file')
+        self.failure_path = (
+            self.path.with_name(self.path.name + '.failures.jsonl') if self.path is not None
+            else config.cache.mkdir('failure-records') / f'{secrets.token_hex(16)}.jsonl'
+        )
         self.started = time.monotonic()
         self.wall_started = time.time()
         self.cpu_started = time.process_time()
@@ -86,9 +93,9 @@ class Evidence:
         self.errors = []
         self.expected = None
         self.job_started = os.environ.get('OA_CI_STARTED_AT')
-        if self.path.exists():
+        if (self.path is not None and self.path.exists()) or self.failure_path.exists():
             raise pytest.UsageError('ci_evidence_already_exists')
-        if not config.option.collectonly:
+        if self.path is not None and not config.option.collectonly:
             reference = config.getoption('ci_expected_file')
             if reference is None:
                 raise pytest.UsageError('ci_independent_collection_required')
@@ -121,8 +128,25 @@ class Evidence:
             self.workers[worker]['executed'] += 1
         if report.failed:
             self.errors.append(f'test_failed:{report.nodeid}:{report.when}')
+            self.failure_path.parent.mkdir(parents=True, exist_ok=True)
+            failure = {
+                'schema_version': 1, 'kind': 'offline_pytest_failure',
+                'nodeid': report.nodeid, 'phase': report.when, 'worker': worker,
+                'collection_sha256': (self.expected['collection_sha256'] if self.expected is not None
+                                      else collection_digest(next(iter(self.collections.values()), []))),
+                'code_revision': os.environ.get('GITHUB_SHA'),
+                'run_id': os.environ.get('GITHUB_RUN_ID'),
+                'run_attempt': int(os.environ.get('GITHUB_RUN_ATTEMPT', '1')),
+                'job': os.environ.get('GITHUB_JOB'),
+            }
+            with self.failure_path.open('a', encoding='utf-8') as file:
+                file.write(json.dumps(failure, ensure_ascii=False) + '\n')
+                file.flush()
+                os.fsync(file.fileno())
 
     def pytest_sessionfinish(self, session, exitstatus):
+        if self.path is None:
+            return
         nodes = next(iter(self.collections.values()), [])
         if not nodes or len(nodes) != len(set(nodes)):
             self.errors.append('empty_or_duplicate_collection')
@@ -332,7 +356,8 @@ def merge_evidence(directory, budget, jobs):
     allowed = _LINUX_SKIPS if identity['platform'] == 'linux' else set()
     if any(values == ['skipped'] and node not in allowed for node, values in outcomes.items()):
         errors.append('unexpected_skip')
-    manual_nodes = [node.split('::')[-1] for node in nodes if node.startswith(_MANUAL_STOP)]
+    macos_nodes = [node.split('::')[-1] for node in nodes
+                   if node.startswith(_MANUAL_STOP) or node == _NATIVE_STAGING]
     macos = json.loads((paths['macos'] / 'macos.json').read_text())
     if (macos.get('schema_version') != 2 or macos.get('job') != 'macos-stop-recovery'
             or macos.get('platform') != 'darwin' or type(macos.get('run_attempt')) is not int
@@ -341,7 +366,7 @@ def merge_evidence(directory, budget, jobs):
         errors.append('macos_identity_mismatch')
     cases = ElementTree.parse(paths['macos'] / 'stop-recovery.xml').findall('.//testcase')
     if (macos.get('status') != 'verified' or macos.get('errors')
-            or Counter(case.get('name') for case in cases) != Counter(manual_nodes)
+            or Counter(case.get('name') for case in cases) != Counter(macos_nodes)
             or any(case.find(tag) is not None for case in cases for tag in ('skipped', 'failure', 'error'))):
         errors.append('macos_stop_recovery_incomplete')
     if (not _valid_time(macos.get('started_at')) or not _valid_time(macos.get('elapsed_seconds'))
@@ -365,7 +390,8 @@ def merge_evidence(directory, budget, jobs):
             'nodeids': nodes, 'collection_sha256': digest, 'collected_count': len(nodes),
             'executed_count': sum(len(values) for values in outcomes.values()),
             'counts': dict(Counter(value for values in outcomes.values() for value in values)),
-            'macos_stop_recovery_count': len(manual_nodes), 'shards': reports,
+            'macos_stop_recovery_count': sum(node.startswith(_MANUAL_STOP) for node in nodes),
+            'macos_native_staging_count': int(_NATIVE_STAGING in nodes), 'shards': reports,
             **timing,
             'budget_seconds': budget, 'errors': errors}
 

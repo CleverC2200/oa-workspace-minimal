@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from contextvars import copy_context
 import json
 import hashlib
@@ -1546,8 +1547,10 @@ def download_resources(
 
     downloaded: List[Dict[str, Any]] = []
     errors: List[Dict[str, str]] = []
-    with material_store.MaterialStore().operation():
+    store = material_store.MaterialStore()
+    with store.operation(), ExitStack() as content_leases:
         dest_dir.mkdir(parents=True, exist_ok=True)
+        existing_paths = frozenset(dest_dir.iterdir())
         material_store.MaterialStore().adopt_directory(dest_dir, source={
             'request_id': request_id, 'flow_key': flow_key, 'kind': 'attachment',
         })
@@ -1560,6 +1563,40 @@ def download_resources(
             return [], [
                 runtime_control.stop_error("已请求停止财务预审，停止本单附件下载")
             ]
+
+        content_paths: dict[tuple[str, str], Path] = {}
+        content_lock = threading.Lock()
+
+        def share_content(path: Path, *, newly_downloaded: bool = False) -> Path:
+            with content_lock:
+                with store.read_lease([path]):
+                    store.adopt_files([path])
+                    digest = _attachment_content_sha256(path)
+                    if not digest:
+                        raise RuntimeError("attachment_content_unreadable")
+                    key = (path.suffix.lower(), digest)
+                    previous = content_paths.get(key)
+                    if previous is None:
+                        content_leases.enter_context(store.read_lease([path]))
+                        content_paths[key] = path
+                        return path
+                if (
+                    newly_downloaded and path != previous
+                    and path not in existing_paths
+                    and path.parent.resolve() == dest_dir.resolve()
+                    and not path.is_symlink()
+                ):
+                    store.discard_duplicate(path, original=previous)
+                return previous
+
+        def download(resource: Dict[str, Any]) -> Tuple[Path | None, str]:
+            path, error = _download_resource_direct(
+                resource, dest_dir=dest_dir, timeout_sec=timeout_sec,
+                original_batch=original_batch,
+            )
+            if path is not None and not error:
+                path = share_content(path, newly_downloaded=True)
+            return path, error
 
         outcomes: List[Dict[str, Any]] = [{} for _item in targets]
         pending: List[tuple[int, Dict[str, Any]]] = []
@@ -1598,6 +1635,7 @@ def download_resources(
             if cached_entry:
                 cached_item = _manifest_entry_to_item(dest_dir, resource, cached_entry)
                 if cached_item:
+                    cached_item["path"] = str(share_content(Path(cached_item["path"])))
                     outcomes[index] = {"item": cached_item}
                     continue
             pending.append((index, resource))
@@ -1613,11 +1651,8 @@ def download_resources(
                         index,
                         executor.submit(
                             copy_context().run,
-                            _download_resource_direct,
+                            download,
                             resource,
-                            dest_dir=dest_dir,
-                            timeout_sec=timeout_sec,
-                            original_batch=original_batch,
                         ),
                     )
                     for index, resource in pending
@@ -1651,6 +1686,8 @@ def download_resources(
                         dest_dir=dest_dir,
                         timeout_sec=timeout_sec,
                     )
+                    if path is not None and not err:
+                        path = share_content(path, newly_downloaded=True)
                 item = None
             if err:
                 code = download_error_code(err)

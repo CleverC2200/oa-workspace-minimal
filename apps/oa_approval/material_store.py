@@ -507,6 +507,30 @@ class MaterialStore:
                         source: dict | None = None) -> dict:
         return self.adopt(path, source=source, disposable=True, closed=closed, write_state=write_state)
 
+    def discard_duplicate(self, path: Path, *, original: Path) -> bool:
+        path, original = _path(path), _path(original)
+        baseline = _OPERATION_BASELINES.get().get(str(self.root))
+        if baseline is None or str(path) in baseline or path == original:
+            return False
+        with self.read_lease([original]):
+            with self._locked() as state:
+                entry = state['files'].get(str(path))
+                if not entry or entry['status'] != 'protected' or not path.is_file():
+                    return False
+                descriptor = self._lease_descriptor(path)
+                with os.fdopen(descriptor, 'r+') as lock:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        return False
+                    if _digest(path) != _digest(original):
+                        return False
+                    with self._writable_output(state, path):
+                        path.unlink()
+                    del state['files'][str(path)]
+                    self._save(state)
+                    return True
+
     def reclaim(self, *, required_bytes: int = 0) -> dict:
         if type(required_bytes) is not int or required_bytes < 0:
             raise ValueError('material_budget_invalid')
