@@ -33,6 +33,12 @@ def selected() -> bool:
     return settings().get('transport') == 'host_chat'
 
 
+def _control_routes() -> list[str]:
+    return ['/usr/bin/env',
+            'OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE=' + str(runtime_control.controller_lock_file().absolute()),
+            'OA_FINANCE_PREAUDIT_STOP_FILE=' + str(runtime_control.stop_file().absolute())]
+
+
 def settings(provider: str | None = None) -> dict:
     return production_config.review_settings(provider)
 
@@ -524,7 +530,13 @@ def heartbeat(*, owner: str, source: Path, source_line: int, run_id: str | None 
             raise ValueError('host_review_stale_source')
         value.update(heartbeat_at=called_at, heartbeat_source=proof)
         guard.write(path, value)
-    return {'state': value['state'], 'phase': value['phase'], 'heartbeat_at': value['heartbeat_at']}
+    command = shlex.join([*_control_routes(),
+                         sys.executable, '-X', 'utf8', '-B', '-m', MODULE, '--operation', 'heartbeat',
+                         '--owner-task-id', owner, '--run-id', value['run_id'], '--include-pending'])
+    return {'state': value['state'], 'phase': value['phase'], 'heartbeat_at': value['heartbeat_at'],
+            'renew_by': called_at + 60, 'expires_at': called_at + PARENT_HEARTBEAT_MAX_AGE,
+            'max_wait_seconds': max(0, min(30, int(called_at + 60 - time.time()))),
+            'next_invocation': {'cmd': command, 'workdir': str(runtime_control.PROJECT_ROOT.absolute())}}
 
 
 
@@ -980,14 +992,13 @@ def publish(action: Path, *, prompt: str, timeout_seconds: int, kind: str = 'fin
                'expires_at': started_at + timeout_seconds, 'prompt': prompt, 'review_context': review_context or {}}
     _live(request, action, owner=owner)
     request_file = _request_file(action, kind, owner=owner, run_id=registered['run_id'])
-    draft_options = ('{"cmd":规范命令字符串字面量,"workdir":' + json.dumps(str(runtime_control.PROJECT_ROOT.absolute())) + '}'
-                     if registered.get('preview_binding') is not None else '{"cmd":规范命令字符串字面量}')
+    template = draft_invocation(request_file, request_file.with_name('model-decision-' + request['request_id'] + '.json'),
+                                {}, owner=owner).replace('JSON.stringify({})', 'JSON.stringify(本单原始JSON对象)', 1)
     request['prompt'] += (
         '\n保存 model JSON 必须调用专用 write-draft 接口，不使用通用文件写入或已有文件。\n'
-        f'用 {MODULE}.draft_command(Path({str(request_file)!r}), Path(新的私有决定文件绝对路径), '
-        f'model_payload, owner={owner!r}) 生成规范命令。\n'
-        '将返回命令作为 JSON 字符串字面量，独立原生 exec 只执行 '
-        f'text(await tools.exec_command({draft_options}));。\n'
+        '将下方“本单原始JSON对象”替换为本单完整 JSON 对象，在一个独立原生 functions.exec 内原样执行。'
+        'JSON 只填写一次，证据引用数组直接保留原值；无需 Python heredoc、生成命令或转抄长 shell 参数。\n'
+        + template + '\n'
         '专用接口独占写入并返回绑定本请求和实际字节 SHA256 的回执。'
         '等待该次配对工具输出真实完成，再 submit；回执生成后禁止更改决定文件。\n'
     )
@@ -1382,12 +1393,55 @@ def review(task: dict) -> dict:
 
 def draft_command(request_file: Path, decision_file: Path, payload: dict, *, owner: str) -> str:
     """The only accepted native command for publishing model-authored draft bytes."""
-    return shlex.join(['/usr/bin/env',
-                      'OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE=' + str(runtime_control.controller_lock_file().absolute()),
-                      'OA_FINANCE_PREAUDIT_STOP_FILE=' + str(runtime_control.stop_file().absolute()),
-                      'uv', 'run', '--quiet', 'python', '-B', '-m', MODULE, '--operation', 'write-draft',
+    return shlex.join([*_control_routes(),
+                      'uv', 'run', '--quiet', '--python', '3.11', 'python', '-X', 'utf8', '-B', '-m', MODULE, '--operation', 'write-draft',
                       '--owner-task-id', owner, '--request-file', str(request_file.absolute()),
                       '--decision-file', str(decision_file.absolute()), '--payload-json', json.dumps(payload, ensure_ascii=False, sort_keys=True)])
+
+
+_DRAFT_JOIN = ' + "\'" + JSON.stringify('
+_DRAFT_QUOTE = ').replaceAll(' + json.dumps("'") + ', ' + json.dumps("'\"'\"'") + ') + "\'", "workdir": '
+
+
+def draft_invocation(request_file: Path, decision_file: Path, payload: dict, *, owner: str) -> str:
+    prefix = shlex.join(shlex.split(draft_command(request_file, decision_file, {}, owner=owner))[:-1]) + ' '
+    return ('text(await tools.exec_command({"cmd": ' + json.dumps(prefix) + _DRAFT_JOIN
+            + json.dumps(payload, ensure_ascii=False, sort_keys=True) + _DRAFT_QUOTE
+            + json.dumps(str(runtime_control.PROJECT_ROOT.absolute())) + '}));')
+
+
+def draft_arguments(input_text: str) -> dict:
+    """Decode only the literal native JSON publication template, without evaluating JavaScript."""
+    try:
+        text = input_text.strip()
+        start = 'text(await tools.exec_command({"cmd": '
+        decoder = json.JSONDecoder()
+        if text.startswith(start):
+            prefix, end = decoder.raw_decode(text, len(start))
+            if text.startswith(_DRAFT_JOIN, end):
+                payload, end = decoder.raw_decode(text, end + len(_DRAFT_JOIN))
+                if not isinstance(prefix, str) or not isinstance(payload, dict) or not text.startswith(_DRAFT_QUOTE, end):
+                    raise ValueError('invalid_payload')
+                directory, end = decoder.raw_decode(text, end + len(_DRAFT_QUOTE))
+                if text[end:] != '}));':
+                    raise ValueError('invalid_statement')
+                args = {'cmd': prefix + shlex.quote(json.dumps(payload, ensure_ascii=False, separators=(',', ':'))),
+                        'workdir': directory}
+            else:
+                args = None
+        else:
+            args = None
+        if args is None:
+            match = re.fullmatch(r'\s*text\(await tools\.exec_command\((\{.*\})\)\);?\s*', input_text, re.DOTALL)
+            if match is None:
+                raise ValueError('invalid_statement')
+            args = json.loads(match.group(1))
+        if (set(args) not in ({'cmd'}, {'cmd', 'workdir'}) or not isinstance(args['cmd'], str)
+                or 'workdir' in args and args['workdir'] != str(runtime_control.PROJECT_ROOT.absolute())):
+            raise ValueError('invalid_arguments')
+        return args
+    except (ValueError, KeyError, TypeError, AttributeError) as error:
+        raise ValueError('host_review_source_untrusted') from error
 
 
 def publish_draft(request_file: Path, decision_file: Path, payload: dict, *, owner: str) -> dict:
@@ -1433,49 +1487,56 @@ def _shell_result(output) -> dict:
     return results[0]
 
 
+def _same_json_payload(authored, published) -> bool:
+    if type(authored) in {int, float} and type(published) in {int, float}:
+        return authored == published
+    if type(authored) is not type(published):
+        return False
+    if isinstance(authored, dict):
+        return authored.keys() == published.keys() and all(_same_json_payload(value, published[key]) for key, value in authored.items())
+    if isinstance(authored, list):
+        return len(authored) == len(published) and all(_same_json_payload(left, right) for left, right in zip(authored, published))
+    return authored == published
+
+
 def _draft_publication(input_text, output, decision_file: Path, *, preview: bool = False) -> dict:
     # A full single-statement match excludes commented paths, branches, extra
     # commands, shell operators and unrelated successful results.
     if not isinstance(input_text, str):
         raise ValueError('host_review_source_untrusted')
-    match = re.fullmatch(r'\s*text\(await tools\.exec_command\((\{.*\})\)\);?\s*', input_text, re.DOTALL)
-    if match is None:
-        raise ValueError('host_review_source_untrusted')
     try:
-        args = json.loads(match.group(1))
-        if set(args) not in ({'cmd'}, {'cmd', 'workdir'}) or not isinstance(args['cmd'], str):
-            raise ValueError('invalid_command')
-        if 'workdir' in args and args['workdir'] != str(runtime_control.PROJECT_ROOT.absolute()):
-            raise ValueError('invalid_project_directory')
+        args = draft_arguments(input_text)
         if preview and args.get('workdir') != str(runtime_control.PROJECT_ROOT.absolute()):
             raise ValueError('invalid_project_directory')
         command_tokens = shlex.split(args['cmd'])
-        if len(command_tokens) not in {17, 20}:
+        routes = _control_routes()
+        tokens = command_tokens[3:] if command_tokens[:3] == routes else command_tokens
+        prefixes = (['uv', 'run', '--quiet', '--python', '3.11', 'python', '-X', 'utf8', '-B', '-m', MODULE, '--operation', 'write-draft'],
+                    ['uv', 'run', '--quiet', 'python', '-B', '-m', MODULE, '--operation', 'write-draft'])
+        prefix = next((part for part in prefixes if tokens[:len(part)] == part and len(tokens) == len(part) + 8), None)
+        if prefix is None:
             raise ValueError('invalid_command')
-        tokens = command_tokens[-17:]
-        if tokens[:9] != ['uv', 'run', '--quiet', 'python', '-B', '-m', MODULE, '--operation', 'write-draft'] or len(tokens) != 17:
+        options = tokens[len(prefix):]
+        if options[::2] != ['--owner-task-id', '--request-file', '--decision-file', '--payload-json']:
             raise ValueError('invalid_command')
-        if tokens[9] != '--owner-task-id' or tokens[11] != '--request-file' or tokens[13] != '--decision-file' or tokens[15] != '--payload-json':
-            raise ValueError('invalid_command')
-        owner, request_file, target = tokens[10], Path(tokens[12]), Path(tokens[14])
-        payload = json.loads(tokens[16])
-        canonical = draft_command(request_file, target, payload, owner=owner)
-        # Historical native sources used the exact bare command and inherited
-        # their controls. New publications carry only the two fixed routes.
-        expected_tokens = shlex.split(canonical)
-        expected_tokens[-1] = tokens[16]
-        if len(command_tokens) == 17:
-            expected_tokens = expected_tokens[3:]
-        expected_command = shlex.join(expected_tokens)
+        owner, request_file, target = options[1], Path(options[3]), Path(options[5])
+        payload = json.loads(options[7])
+        expected_options = ['--owner-task-id', owner, '--request-file', str(request_file.absolute()),
+                            '--decision-file', str(target.absolute()), '--payload-json', options[7]]
+        expected_command = shlex.join((routes if command_tokens[:3] == routes else []) + prefix + expected_options)
         if target != decision_file or args['cmd'] != expected_command:
             raise ValueError('invalid_command')
         result = _shell_result(output)
         receipt = json.loads(result['output'])
         raw, request = _read(request_file)
+        draft_raw, published_payload = _read(target)
+        if (not _same_json_payload(payload, published_payload)
+                or draft_raw != (json.dumps(published_payload, ensure_ascii=False, sort_keys=True) + '\n').encode()):
+            raise ValueError('changed_draft')
         expected = {'schema_version': 1, 'kind': 'preaudit_host_draft_publication', 'owner_task_id': owner,
                     'request_file': str(request_file), 'request_id': request['request_id'],
                     'request_sha256': hashlib.sha256(raw).hexdigest(), 'decision_file': str(target),
-                    'decision_sha256': hashlib.sha256((json.dumps(payload, ensure_ascii=False, sort_keys=True) + '\n').encode()).hexdigest()}
+                    'decision_sha256': hashlib.sha256(draft_raw).hexdigest()}
         if owner != request['owner_task_id'] or receipt != expected:
             raise ValueError('invalid_receipt')
         if hashlib.sha256(review_context.read_input(target, private=True)).hexdigest() != receipt['decision_sha256']:
@@ -1743,9 +1804,13 @@ def main(argv=None) -> int:
         result = release_failed_slot(args.request_file, owner=owner, source=args.source_session_file,
                                      source_line=args.source_line, run_id=args.run_id)
     elif args.operation == 'heartbeat':
-        if args.source_session_file is None or args.source_line is None:
+        if args.source_session_file is None and args.source_line is None:
+            anchor = source_anchor(owner=owner, run_id=args.run_id)
+        elif args.source_session_file is None or args.source_line is None:
             parser.error('heartbeat requires the current parent native source call')
-        result = heartbeat(owner=owner, source=args.source_session_file, source_line=args.source_line, run_id=args.run_id)
+        else:
+            anchor = {'source': args.source_session_file, 'source_line': args.source_line}
+        result = heartbeat(owner=owner, **anchor, run_id=args.run_id)
         if args.include_pending:
             result.update(requests=pending(owner=owner, run_id=args.run_id),
                           round=round_status(owner=owner, run_id=args.run_id))

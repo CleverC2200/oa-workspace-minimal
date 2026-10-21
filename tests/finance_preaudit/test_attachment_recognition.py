@@ -123,7 +123,8 @@ def test_action_file_cli_reads_frozen_finance_pages(
         'message': {'content': '读数 12345；右下角日期无法确认。'}}]})
 
     routes = json.loads(read_material.read(path).split('[reader.image_tool_routes]\n')[1])
-    result = recognition.main([*routes['original_read']['argv'][4:], '--output-dir', str(tmp_path / 'out')])
+    argv = routes['original_read']['argv']
+    result = recognition.main([*argv[argv.index('--action-file'):], '--output-dir', str(tmp_path / 'out')])
     assert (result, len(calls)) == (0, expected_calls)
 
     summary = json.loads(capsys.readouterr().out)
@@ -147,7 +148,8 @@ def test_dispatch_region_command_keeps_frozen_source_and_partial_coverage(
     calls = fake_http(monkeypatch, lambda _: {'choices': [{'finish_reason': 'stop',
         'message': {'content': '局部文字无法确认'}}]})
 
-    assert recognition.main([*page['region_read']['argv_prefix'][4:],
+    argv = page['region_read']['argv_prefix']
+    assert recognition.main([*argv[argv.index('--file'):],
         '--region', '1', '1', '7', '7', '--prompt', '读取选区', '--output-dir', str(tmp_path / 'out')]) == 0
 
     summary = json.loads(capsys.readouterr().out)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import sys
 from pathlib import Path
 
 import pytest
@@ -162,7 +163,7 @@ def test_reader_dispatches_source_bound_image_tools_without_preparing_copies(tmp
 
     routes = json.loads(view.split('[reader.image_tool_routes]\n')[1])
     assert routes['original_read']['argv'] == [
-        'python3', '-B', '-m', 'apps.oa_approval.attachment_recognition', '--action-file', str(action),
+        sys.executable, '-X', 'utf8', '-B', '-m', 'apps.oa_approval.attachment_recognition', '--action-file', str(action),
     ]
     route = routes['pages'][0]
     assert route['evidence_ref'] == 'material:prepared.images.sheet-resource.1'
@@ -172,7 +173,7 @@ def test_reader_dispatches_source_bound_image_tools_without_preparing_copies(tmp
     assert route['region_read']['argv_prefix'][-2:] == ['--file', str(source)]
     assert route['region_read']['append_arguments'] == ['--region', 'X0', 'Y0', 'X1', 'Y1', '--prompt', 'QUESTION']
     assert route['auxiliary_copy']['argv'] == [
-        'python3', '-B', '-m', 'apps.oa_approval.image_compression', '--file', str(source),
+        sys.executable, '-X', 'utf8', '-B', '-m', 'apps.oa_approval.image_compression', '--file', str(source),
     ]
     assert route['auxiliary_copy']['counts_as_original_page_coverage'] is False
     assert route['auxiliary_copy']['recognition_authorization'] == 'requires_current_scope'
