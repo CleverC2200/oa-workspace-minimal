@@ -248,9 +248,14 @@ if any(slot and slot.get('pid') is not None and
     raise ValueError('maintenance_original_process_active')
 closed = review_interruption.closed_run(mirror['run_id'], Path(progress['actions'][0]))
 original_cooldown = closed['cooldown']
+closed_sources = original_cooldown.get('sources') if isinstance(original_cooldown, dict) else None
+project_continuation = (cooldown['run_id'] is None and isinstance(original_cooldown, dict)
+    and original_cooldown.get('run_id') is None and isinstance(closed_sources, list) and bool(closed_sources)
+    and cooldown['sources'][:len(closed_sources)] == closed_sources
+    and {**original_cooldown, 'sources': cooldown['sources']} == cooldown)
 if (closed['cause'] != guard.STOP_REASON or not isinstance(original_cooldown, dict)
         or not (original_cooldown.get('run_id') == mirror['run_id']
-                or (cooldown['run_id'] is None and original_cooldown == cooldown))
+                or project_continuation)
         or (cooldown['run_id'] is not None and original_cooldown != cooldown)
         or closed['controller_instance_id'] != mirror['controller_instance_id']
         or closed['controller'] != progress['controller'] or closed['project_root'] != str(root)
@@ -264,7 +269,7 @@ def project_notices():
     import hashlib
     completed = finance_preaudit_run._timestamp(saved['completed_at']).timestamp()
     if (cooldown['triggered_at'] < completed and
-            (original_cooldown != cooldown or cooldown['triggered_at'] <
+            (not project_continuation or cooldown['triggered_at'] <
              finance_preaudit_run._timestamp(mirror['started_at']).timestamp())):
         raise ValueError('maintenance_project_notice_untrusted')
     notices = [{'source_sha256':hashlib.sha256(source.encode()).hexdigest(),
@@ -274,6 +279,8 @@ def project_notices():
     if (len(notices) != len(cooldown['sources'])
             or {notice['source_sha256'] for notice in notices} != set(cooldown['sources'])
             or any(not cooldown['triggered_at'] <= notice['occurred_at'] < cooldown['blocked_until'] for notice in notices)
+            or (project_continuation and any(notice['source_sha256'] not in closed_sources
+                and notice['occurred_at'] < completed for notice in notices))
             or not any(notice['occurred_at'] == cooldown['triggered_at']
                        and notice['notice_code'] == cooldown['notice_code'] for notice in notices)):
         raise ValueError('maintenance_project_notice_untrusted')
@@ -435,13 +442,24 @@ def assert_original_execution_safe(target_root: Path, original: OriginalExecutio
             attribution = proof.get('cooldown_attribution', 'approval_run')
             if attribution == 'project_notice':
                 notices = proof.get('project_notices')
+                closed_cooldown = proof.get('closed_cooldown')
+                closed_sources = closed_cooldown.get('sources') if isinstance(closed_cooldown, dict) else None
+                project_continuation = (isinstance(closed_cooldown, dict)
+                    and closed_cooldown.get('run_id') is None
+                    and isinstance(closed_sources, list) and bool(closed_sources)
+                    and cooldown.get('sources', [])[:len(closed_sources)] == closed_sources
+                    and {**closed_cooldown, 'sources': cooldown.get('sources')} == cooldown)
+                completed = datetime.fromisoformat(saved['completed_at']).timestamp()
                 if (cooldown.get('run_id') is not None or not isinstance(notices, list) or not notices
                         or any(not isinstance(notice, dict) for notice in notices)
                         or {notice.get('source_sha256') for notice in notices} != set(cooldown.get('sources', []))
                         or len(notices) != len(cooldown.get('sources', []))
-                        or (cooldown['triggered_at'] < datetime.fromisoformat(saved['completed_at']).timestamp()
-                            and (proof.get('closed_cooldown') != cooldown
+                        or (cooldown['triggered_at'] < completed
+                            and (not project_continuation
                                  or cooldown['triggered_at'] < datetime.fromisoformat(saved['started_at']).timestamp()))
+                        or (project_continuation and any(notice.get('source_sha256') not in closed_sources
+                            and (type(notice.get('occurred_at')) not in (int, float)
+                                 or notice['occurred_at'] < completed) for notice in notices))
                         or not any(notice.get('occurred_at') == cooldown['triggered_at']
                                    and notice.get('notice_code') == cooldown['notice_code'] for notice in notices)):
                     raise RuntimeError('maintenance_original_execution_untrusted')

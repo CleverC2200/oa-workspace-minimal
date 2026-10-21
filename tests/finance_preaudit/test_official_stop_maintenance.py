@@ -131,6 +131,14 @@ print(json.dumps(result))'''
         original = maintenance_runtime.OriginalExecution(Path(receipt['receipt_file']), owner, 'original-session')
         bind_tool_session(original.file, owner_task_id=owner, session_id=original.tool_session_id)
     assert receipt['state'] == 'exited' and receipt['exit_code'] == 1 and receipt['children_reaped'] is True
+    if variant == 'project_notice_after_exit':
+        with sqlite3.connect(Path(os.environ['CODEX_HOME']) / 'thread_history_1.sqlite') as database:
+            database.execute('INSERT INTO thread_turns VALUES (?,?,?,?,?)',
+                ('main-chat', 'later-turn', json.dumps({'code': 'serverOverloaded'}), time.time(), 'failed'))
+        subprocess.run([str(interpreter), '-B', '-E', '-c',
+            'from pathlib import Path; from apps.oa_finance_preaudit import approval_guard; '
+            'approval_guard.observe_project_errors(Path.cwd())'], cwd=root, check=True, capture_output=True,
+            env={**os.environ, 'OA_REVIEW_PROVIDER': 'openai', 'OA_REVIEW_TRANSPORT': 'host_chat'})
     runtime_control.write_control_bytes_atomic(root / 'runtime/control/write-policy.json', json.dumps({
         'schema_version': 1, 'kind': 'preaudit_write_policy',
         'authorized_workflows': [*production_config.FINANCE_WORKFLOWS, 'packaging_layout_approval'],
@@ -285,6 +293,20 @@ def test_project_notice_source_sync_keeps_approval_closure_and_unowned_notice_se
     assert len(proof['project_notices']) == 1
     assert result['approval_recovery_allowed'] is False and result['cooldown_preserved'] is True
     assert {p:(p.stat().st_ino,p.read_bytes()) for p in unchanged} == unchanged
+
+
+@pytest.mark.parametrize('official_production', ['project_notice_after_exit'], indirect=True)
+def test_appended_project_notice_sync_preserves_original_closure(official_production, monkeypatch, capsys):
+    root, original, _action, _before, expected, _remote, _cron = official_production
+    closed = root / ('runtime/control/approval-guard/runs/' + 'a' * 32 + '/closed-readonly.json')
+    before = closed.stat().st_ino, closed.read_bytes()
+    code, result = run_release(official_production, monkeypatch, capsys)
+    assert code == 0 and result['status'] == 'synced' and result['after_revision'] == expected
+    proof = result['original_execution']['official_stop_proof']
+    assert len(proof['closed_cooldown']['sources']) == 1 and len(proof['cooldown']['sources']) == 2
+    assert len(proof['project_notices']) == 2
+    assert result['cooldown_preserved'] is True and result['stop_preserved'] is True
+    assert (closed.stat().st_ino, closed.read_bytes()) == before
 
 
 @pytest.mark.parametrize('damage', ['source','code','time','cwd','unreadable_history','overlaps_original','foreign_run'])

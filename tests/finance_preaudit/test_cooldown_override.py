@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from pathlib import Path
 import subprocess
 import sys
@@ -13,7 +14,7 @@ from apps.oa_approval import runtime_control
 from apps.oa_finance_preaudit import approval_guard as guard, approval_lifecycle, cooldown_override
 from apps.oa_finance_preaudit import maintenance_runtime, production_config, production_release
 from scripts import finance_preaudit_run
-from tests.finance_preaudit.test_official_stop_maintenance import official_production, offline_live, project_notice_cooldown
+from tests.finance_preaudit.test_official_stop_maintenance import change_json, official_production, offline_live, project_notice_cooldown
 from tests.finance_preaudit.test_maintenance_runtime import clean_control_environment, compiled_maintenance_source
 from tests.finance_preaudit.test_production_release import git
 
@@ -88,6 +89,48 @@ def test_project_notice_during_original_run_can_be_consumed_without_rewriting_hi
         assert not runtime_control.stop_requested()
         assert {p: (p.stat().st_ino, p.read_bytes()) for p in unchanged} == unchanged
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize('official_production', ['project_notice_after_exit'], indirect=True)
+def test_appended_project_notice_can_be_consumed_without_rewriting_closure(stopped):
+    root, original, calls = stopped
+    cooldown = root / 'runtime/control/approval-guard/cooldown.json'
+    closed = root / ('runtime/control/approval-guard/runs/' + 'a' * 32 + '/closed-readonly.json')
+    unchanged = {p: (p.stat().st_ino, p.read_bytes()) for p in (cooldown, closed, original.file)}
+    assert len(json.loads(cooldown.read_bytes())['sources']) == 2
+    assert len(json.loads(closed.read_bytes())['cooldown']['sources']) == 1
+    with cooldown_override.one_round(root, owner_task_id=str(uuid4()), invocation_id=uuid4().hex, original=original):
+        guard.assert_admission()
+        assert not runtime_control.stop_requested()
+        assert {p: (p.stat().st_ino, p.read_bytes()) for p in unchanged} == unchanged
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('official_production', ['project_notice_after_exit'], indirect=True)
+@pytest.mark.parametrize('damage', ['missing_original', 'reordered', 'unknown_source', 'earlier_notice', 'changed_clock'])
+def test_appended_project_notice_rejects_untrusted_extension(stopped, damage):
+    root, original, calls = stopped
+    cooldown = guard.directory() / 'cooldown.json'
+    value = json.loads(cooldown.read_bytes())
+    if damage == 'missing_original':
+        change_json(cooldown, sources=value['sources'][1:])
+    elif damage == 'reordered':
+        change_json(cooldown, sources=value['sources'][::-1])
+    elif damage == 'unknown_source':
+        change_json(cooldown, sources=[*value['sources'], '0' * 64])
+    elif damage == 'earlier_notice':
+        closed = guard.directory() / ('runs/' + 'a' * 32 + '/closed-readonly.json')
+        stamp = json.loads(closed.read_bytes())['closed_at']
+        with sqlite3.connect(Path(os.environ['CODEX_HOME']) / 'thread_history_1.sqlite') as database:
+            database.execute('UPDATE thread_turns SET completed_at=? WHERE turn_id=?', (stamp, 'later-turn'))
+    else:
+        change_json(cooldown, triggered_at=value['triggered_at'] + 1, blocked_until=value['blocked_until'] + 1)
+    before = runtime_control.stop_file().read_bytes()
+    with pytest.raises(RuntimeError, match='maintenance_original_execution_untrusted'):
+        with cooldown_override.one_round(root, owner_task_id=str(uuid4()), invocation_id=uuid4().hex, original=original):
+            pytest.fail('untrusted appended project event accepted')
+    assert not calls and runtime_control.stop_file().read_bytes() == before
+    assert not (guard.directory() / 'cooldown-overrides').exists()
 
 
 @pytest.mark.parametrize('official_production', ['project_notice_before_run'], indirect=True)
