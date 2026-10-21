@@ -14,7 +14,8 @@ def test_workspace_fails_closed_without_native_bounded_filesystem(tmp_path, monk
     assert not list(tmp_path.iterdir())
 
 
-def test_workspace_rejects_too_small_reservation_before_starting_backend(tmp_path):
+def test_workspace_rejects_too_small_reservation_before_starting_backend(tmp_path, monkeypatch):
+    monkeypatch.setattr(bounded_staging.sys, 'platform', 'darwin')
     with pytest.raises(ValueError, match='bounded_staging_quota_too_small'):
         with bounded_staging.workspace(tmp_path / 'image.dmg', max_bytes=1024):
             pytest.fail('undersized workspace exposed')
