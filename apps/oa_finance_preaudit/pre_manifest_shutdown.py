@@ -205,10 +205,11 @@ def _observation_source(source: Path, owner: str, line: int) -> tuple[dict, dict
         'apps/oa_finance_preaudit/pre_manifest_shutdown.py'], cwd=ROOT, capture_output=True, check=True).stdout
     if hashlib.sha256(committed).hexdigest() != candidate['module_sha256']:
         raise ValueError(BLOCKED)
-    expected = 'text(await tools.exec_command(' + json.dumps(command(**_inputs(observed), candidate=observed['candidate']), ensure_ascii=False) + '));'
+    expected = command(**_inputs(observed), candidate=observed['candidate'])
     anchor = native['anchor']
+    calls = native_evidence.execution_calls(str(anchor['payload'].get('input', '')))
     if (anchor['payload'].get('name') not in {'exec', 'functions.exec'}
-            or native_evidence.normalize_output(str(anchor['payload'].get('input', ''))).strip() != expected
+            or calls != [('exec_command', expected)]
             or observed.get('kind') != 'preaudit_app_pre_manifest_observation' or observed.get('status') != 'ready'
             or observed['original_execution']['owner_task_id'] != owner
             or observed['children_source']['session_file'] != str(source.absolute())):

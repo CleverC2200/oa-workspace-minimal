@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -295,7 +296,7 @@ def records(source: Path, session: str):
                 'line': number, 'line_sha256': hashlib.sha256(raw).hexdigest()}
 
 
-def image_observations(source: Path, session: str, *, before: int, paths: set[str]):
+def image_observations(source: Path, session: str, *, before: int, not_before: float, paths: set[str]):
     pending = {}
     observed = []
     for number, row, proof in records(source, session):
@@ -331,6 +332,9 @@ def image_observations(source: Path, session: str, *, before: int, paths: set[st
             elif payload.get('name') in {'functions.exec', 'exec'} and isinstance(args, str):
                 path = single_image_path(args)
             if isinstance(path, str) and path in paths:
+                stamp = row.get('timestamp')
+                if not isinstance(stamp, str) or datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp() < not_before:
+                    continue
                 if not call_id or call_id in pending:
                     raise ValueError('host_review_source_untrusted')
                 pending[call_id] = (row, proof, path)

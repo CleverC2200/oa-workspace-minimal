@@ -115,10 +115,11 @@ def test_pre_manifest_shutdown_keeps_original_unknown_fields(pre_manifest_failur
     assert path.read_bytes() == original
 
 
-def observation_call(args):
+def observation_call(args, render=None):
     started = datetime.now(timezone.utc).isoformat()
     candidate = pre.observe(**args)
-    call = 'text(await tools.exec_command(' + json.dumps(pre.command(**args), ensure_ascii=False) + '));'
+    options = pre.command(**args)
+    call = render(options) if render else 'text(await tools.exec_command(' + json.dumps(options, ensure_ascii=False) + '));'
     line = native_call(args['source'], 'functions.exec', call, 'observe',
         {'exit_code': 0, 'output': json.dumps(candidate)})
     rows = args['source'].read_text().splitlines()
@@ -144,6 +145,33 @@ def test_pre_manifest_seal_authenticates_observation_and_survives_new_authority(
     pointer = args['target'] / 'runtime/control/rolling-controller-manifest.json'
     pointer.write_text('{}')
     assert pre.sealed(path) == receipt
+
+
+@pytest.mark.parametrize('representation', ['compact', 'reordered', 'unquoted', 'extra_call', 'wrong_workdir'])
+def test_pre_manifest_seal_compares_single_tool_arguments(pre_manifest_failure, representation):
+    args = pre_manifest_failure
+    def render(options):
+        if representation == 'unquoted':
+            encoded = '{workdir:' + json.dumps(options['workdir']) + ',cmd:' + json.dumps(options['cmd']) + '}'
+        else:
+            values = dict(reversed(list(options.items()))) if representation == 'reordered' else dict(options)
+            if representation == 'wrong_workdir':
+                values['workdir'] += '/other'
+            encoded = json.dumps(values, ensure_ascii=False, separators=(',', ':'))
+        call = 'text(await tools.exec_command(' + encoded + '));'
+        return call + call if representation == 'extra_call' else call
+    line = observation_call(args, render)
+    original_source = args['source'].read_bytes()
+    if representation in {'extra_call', 'wrong_workdir'}:
+        with pytest.raises(ValueError):
+            pre.seal(target=args['target'], owner=args['binding']['owner_task_id'],
+                     source=args['source'], observation_line=line)
+    else:
+        receipt = pre.seal(target=args['target'], owner=args['binding']['owner_task_id'],
+                           source=args['source'], observation_line=line)
+        assert receipt['status'] == 'verified'
+        assert pre.sealed(Path(args['binding']['receipt_file'])) == receipt
+    assert args['source'].read_bytes() == original_source
 
 
 def test_legacy_shape_and_native_relative_targets_preserve_original_fields(pre_manifest_failure):

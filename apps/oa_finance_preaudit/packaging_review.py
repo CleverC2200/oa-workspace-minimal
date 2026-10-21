@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
 import hashlib
 from dataclasses import asdict
 import json
@@ -185,11 +184,9 @@ def _observations(action: Path, source: dict, refs: list[str] | None = None, *, 
     if not required or not required.issubset(paths):
         raise ValueError('packaging_page_coverage')
     observed = {}
-    for row, proof, image_path, output in native_evidence.image_observations(
-            Path(source['session_file']), source['session_id'], before=source['line'], paths=set(paths.values())):
-        stamp = row.get('timestamp')
-        if not isinstance(stamp, str) or datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp() < source['dispatched_at']:
-            continue
+    for _row, proof, image_path, output in native_evidence.image_observations(
+            Path(source['session_file']), source['session_id'], before=source['line'],
+            not_before=source['dispatched_at'], paths=set(paths.values())):
         failed = output['failed']
         read = not failed and output['image']
         if not (read or allow_failed and failed):
