@@ -109,6 +109,19 @@ def test_native_preflight_is_readonly_and_reports_real_checkout(tmp_path):
     assert all(p.read_bytes() == value for p, value in before.items())
 
 
+def test_native_preflight_blocks_unregistered_experimental_material(tmp_path):
+    root = checkout(tmp_path)
+    venv(root)
+    scratch = root / '.scratch'
+    scratch.mkdir()
+    (scratch / 'experiment.bin').write_bytes(b'12345')
+    result = run(root, 'preflight', '--baseline', 'main')
+    assert result.returncode == 2
+    report = json.loads(result.stdout)
+    assert 'project_materials_unregistered' in report['reasons']
+    assert report['storage']['unregistered_bytes'] == 5
+
+
 def test_concise_preflight_shows_actual_module_and_graph_source(tmp_path):
     root = checkout(tmp_path)
     venv(root)
@@ -277,8 +290,12 @@ def test_native_setup_and_actions_execute_the_formal_entry(tmp_path):
     scripts = root / 'scripts'
     scripts.mkdir()
     (scripts / '__init__.py').write_text('')
-    (scripts / 'dev_environment.py').write_bytes(SCRIPT.read_bytes())
-    (scripts / 'shared_dependencies.py').write_bytes(SCRIPT.with_name('shared_dependencies.py').read_bytes())
+    for name in ('dev_environment.py', 'shared_dependencies.py', 'project_space.py'):
+        (scripts / name).write_bytes(SCRIPT.with_name(name).read_bytes())
+    approval = root / 'apps/oa_approval'
+    approval.mkdir()
+    (approval / '__init__.py').write_text('')
+    (approval / 'material_store.py').write_bytes((SCRIPT.parents[1] / 'apps/oa_approval/material_store.py').read_bytes())
     setup = command_from_config = shlex.split(configuration['setup']['script'])
     setup[0] = sys.executable
     process = subprocess.run(command_from_config, cwd=root, capture_output=True, text=True)

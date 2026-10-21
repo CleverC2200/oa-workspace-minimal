@@ -15,9 +15,10 @@ import tempfile
 from datetime import datetime, timezone
 
 try:
-    from scripts import shared_dependencies
+    from scripts import project_space, shared_dependencies
 except ModuleNotFoundError:
-    import shared_dependencies
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from scripts import project_space, shared_dependencies
 
 
 class PrerequisiteError(ValueError):
@@ -187,8 +188,9 @@ def environment_context(root):
 def preflight(root, *, baseline='origin/main', switch_to='main'):
     source = source_context(root, baseline, switch_to)
     environment = environment_context(root)
+    storage = project_space.preflight(root)
     tools = {name: shutil.which(name) is not None for name in ('git', 'uv', 'rtk')}
-    reasons = []
+    reasons = list(storage['reasons'])
     if source['role'] != 'development':
         reasons.append('development_clone_required')
     if source['baseline'].get('status') == 'missing':
@@ -200,7 +202,7 @@ def preflight(root, *, baseline='origin/main', switch_to='main'):
     if (root / 'runtime').is_symlink():
         reasons.append('shared_runtime_forbidden')
     return {'kind': 'oa_development_preflight', 'read_only': True, 'status': 'ready' if not reasons else 'missing_prerequisites',
-            'reasons': reasons, 'source': source, 'environment': environment, 'tools': tools,
+            'reasons': reasons, 'source': source, 'environment': environment, 'tools': tools, 'storage': storage,
             'codegraph': {'project': str(root), 'branch': source['branch'], 'head': source['head'],
                           'freshness': 'not_verified', 'next_step': 'verify_index_for_this_revision_or_use_source_search'}}
 
@@ -286,7 +288,7 @@ def prepare(root, baseline):
         raise PrerequisiteError(str(error)) from error
 
 
-QUALITY_CHECKS = ('skill', 'format', 'hygiene', 'links', 'yaml', 'schema', 'lint', 'environment')
+QUALITY_CHECKS = ('skill', 'format', 'hygiene', 'links', 'yaml', 'schema', 'lint', 'environment', 'storage')
 
 
 def check_configuration(root):
@@ -299,7 +301,7 @@ def check_configuration(root):
                 prefix + 'verify --tests tests/finance_preaudit/test_execution_readback.py',
                 prefix + 'verify --full'}
     optional = {'python3 -B -m scripts.project_space status',
-                'python3 -B -m scripts.project_space experiment --name default'}
+                'python3 -B -m scripts.project_space experiment --name experiment-$(date +%Y%m%d-%H%M%S)-$$'}
     try:
         value = tomllib.loads((root / '.codex/environments/environment.toml').read_text())
         actions = value['actions']

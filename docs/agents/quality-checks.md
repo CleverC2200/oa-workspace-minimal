@@ -2,6 +2,8 @@
 
 沿用 `scripts.quality` 和现有 GitHub quality workflow，不增加另一套检查平台。
 
+- `storage`：核对项目空间规范的 AGENTS 入口、原生 Actions、开发预检与 CI 接线，检查已接入的材料入口并拒绝新增写死的 `.scratch` 路径。具体容量由受管写入和运行时库存执行，静态入口检查不能证明任意 shell 命令都受到文件系统配额限制。实验产物须通过受管导入保存。
+
 - `payment-rules`：用 AST 读取 Worker，不导入业务代码。阻止 Worker 字符串再次写入人员关系、委托代付款或委托收款指令，报错指向共享付款规则。此检查只约束已发生的重复提示词，不判断实际材料，也不保证模型语义正确。历史 `ec9c4a1` 的原指令会触发检查；当前 Worker 通过，脱敏原句回归由 `test_quality_gates.py` 在本地及 CI 同一 pytest 入口运行。
 
 - `yaml`：安全解析受版本控制的 YAML，拒绝重复键，采用 YAML 1.2 布尔值约定。Issue form 检查基本结构、非空标题、字段类型、唯一 ID、下拉选项及 required 布尔值；这是本项目固定合同检查，不代表 GitHub 平台的全部限制。
