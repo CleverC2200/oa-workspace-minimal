@@ -565,10 +565,18 @@ def heartbeat(*, owner: str, source: Path, source_line: int, run_id: str | None 
             raise ValueError('host_review_stale_source')
         value.update(heartbeat_at=called_at, heartbeat_source=proof)
         guard.write(path, value)
+    if value['phase'] == 'packaging':
+        try:
+            guard.observe_project_errors(runtime_control.PROJECT_ROOT, owner_task_id=owner)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            runtime_control.request_stop('codex_review_technical_failure')
+            raise
     command = shlex.join([*_control_routes(),
                          sys.executable, '-X', 'utf8', '-B', '-m', MODULE, '--operation', 'heartbeat',
                          '--owner-task-id', owner, '--run-id', value['run_id'], '--include-pending'])
     return {'state': value['state'], 'phase': value['phase'], 'heartbeat_at': value['heartbeat_at'],
+            'transient_retries': guard.retry_budget(value['run_id']),
+            **({'stop_reason': runtime_control.stop_reason()} if runtime_control.stop_requested() else {}),
             'renew_by': called_at + 60, 'expires_at': called_at + PARENT_HEARTBEAT_MAX_AGE,
             'max_wait_seconds': max(0, min(30, int(called_at + 60 - time.time()))),
             'next_invocation': {'cmd': command, 'workdir': str(runtime_control.PROJECT_ROOT.absolute())}}
@@ -1847,8 +1855,12 @@ def main(argv=None) -> int:
             anchor = {'source': args.source_session_file, 'source_line': args.source_line}
         result = heartbeat(owner=owner, **anchor, run_id=args.run_id)
         if args.include_pending:
-            result.update(requests=pending(owner=owner, run_id=args.run_id),
-                          round=round_status(owner=owner, run_id=args.run_id))
+            if runtime_control.stop_requested():
+                result.update(requests=[], round={'ready': False, 'capacity': 0, 'slots': [],
+                    'run_id': args.run_id, 'phase': result['phase'], 'stop_reason': runtime_control.stop_reason()})
+            else:
+                result.update(requests=pending(owner=owner, run_id=args.run_id),
+                              round=round_status(owner=owner, run_id=args.run_id))
     elif args.operation == 'enter-packaging':
         result = enter_packaging(owner=owner, receipt_file=args.receipt_file, invocation_id=args.invocation_id,
                                 tool_session_id=args.tool_session_id, run_id=args.run_id)

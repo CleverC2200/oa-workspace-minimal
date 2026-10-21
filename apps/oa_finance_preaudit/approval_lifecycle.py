@@ -1,7 +1,8 @@
 """Fresh-run checks and readonly process ownership, separate from the Writer."""
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+import hashlib
 import os
 from pathlib import Path
 import time
@@ -206,7 +207,7 @@ def readonly_reaped(manifest: dict) -> bool:
 
 
 def certify_interruption(manifest: dict, *, cause: str) -> dict:
-    if (cause not in {guard.STOP_REASON, "controller_orphaned", "readonly_deadline_exceeded"}
+    if (cause not in guard.MODEL_STOP_REASONS | {"controller_orphaned", "readonly_deadline_exceeded"}
             or runtime_control.controller_owner_pid() != os.getpid()
             or not guard.maintenance_writer_idle()
             or not readonly_reaped(manifest)):
@@ -217,6 +218,13 @@ def certify_interruption(manifest: dict, *, cause: str) -> dict:
              "project_root": progress["project_root"], "actions": progress["actions"], "closed_at": time.time(),
              "readonly_reaped": True, "writer_inactive": True, "cause": cause,
              "cooldown": guard.cooldown() if cause == guard.STOP_REASON else None}
+    if cause == guard.RETRY_STOP_REASON:
+        budget = guard.retry_budget(manifest["run_id"])
+        if (budget is None or budget["retry_allowed"]
+                or any(budget[key] != manifest[key] for key in ("run_id", "controller_instance_id", "owner_task_id"))):
+            raise ValueError("approval_interruption_untrusted")
+        value.update(schema_version=2, retry_budget_fingerprint="sha256:" + hashlib.sha256(
+            runtime_control.read_control_bytes(guard.retry_budget_file(manifest["run_id"]))).hexdigest())
     path = run_directory(manifest["run_id"]) / "closed-readonly.json"
     existing = guard.read(path)
     if existing:
@@ -238,6 +246,64 @@ def interrupt_unwritten(manifest: dict, *, cause: str) -> int:
             if engine.interrupt_unwritten_review(Path(action), run_id=manifest["run_id"]):
                 count += 1
         return count
+
+
+def clear_retry_stop(manifest: dict) -> bool:
+    if runtime_control.stop_reason() != guard.RETRY_STOP_REASON:
+        return False
+    with runtime_control.request_writer_lease(runtime_control.GLOBAL_WRITER_KEY, runtime_control.writer_lock_file(), blocking=False):
+        current = controller_handoff._read_manifest()
+        proof = guard.read(run_directory(manifest["run_id"]) / "closed-readonly.json")
+        budget = guard.retry_budget(manifest["run_id"])
+        if (runtime_control.controller_owner_pid() != os.getpid() or not guard.maintenance_writer_idle()
+                or not readonly_reaped(manifest) or current is None or current["state"] != "failed"
+                or current["children_reaped"] is not True
+                or any(current[key] != manifest[key] for key in ("run_id", "controller_instance_id", "controller_pid"))
+                or proof is None or proof.get("schema_version") != 2 or proof.get("kind") != "approval_closed_readonly_run"
+                or proof.get("cause") != guard.RETRY_STOP_REASON
+                or proof.get("readonly_reaped") is not True or proof.get("writer_inactive") is not True
+                or budget is None or budget["retry_allowed"]
+                or budget['owner_task_id'] != manifest.get('owner_task_id')
+                or proof.get('controller') != _progress(manifest)['controller']
+                or any(proof.get(key) != manifest[key] or budget.get(key) != manifest[key]
+                       for key in ("run_id", "controller_instance_id"))
+                or proof.get("retry_budget_fingerprint") != "sha256:" + hashlib.sha256(
+                    runtime_control.read_control_bytes(guard.retry_budget_file(manifest["run_id"]))).hexdigest()):
+            raise ValueError("approval_retry_stop_untrusted")
+        metadata = runtime_control.stop_file().stat(follow_symlinks=False)
+        return runtime_control.clear_failure_stop(expected_reason=guard.RETRY_STOP_REASON,
+            expected_identity=(metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns))
+
+
+def clear_packaging_retry_stop(manifest: dict, *, owner: str) -> bool:
+    if runtime_control.stop_reason() != guard.RETRY_STOP_REASON:
+        return False
+    from . import app_review_shutdown
+    from scripts import finance_preaudit_run
+    from datetime import datetime
+    controller_lease = (nullcontext() if runtime_control.controller_owner_pid() == os.getpid()
+                        else runtime_control.global_controller_lease())
+    with controller_lease, runtime_control.request_writer_lease(
+            runtime_control.GLOBAL_WRITER_KEY, runtime_control.writer_lock_file(), blocking=False):
+        sealed = app_review_shutdown.sealed_round(owner=owner, run_id=manifest['run_id'])
+        report = finance_preaudit_run.read_execution(**sealed['original_execution'])
+        budget = guard.retry_budget(manifest['run_id'])
+        if (controller_handoff._read_manifest() != manifest or manifest['state'] != 'completed'
+                or manifest['children_reaped'] is not True or manifest.get('owner_task_id') != owner
+                or not guard.maintenance_writer_idle() or not readonly_reaped(manifest)
+                or sealed['phase'] != 'packaging' or sealed['close_reason'] == 'completed'
+                or any(sealed[key] != manifest[key] for key in ('run_id', 'controller_instance_id'))
+                or report.get('terminal') is not True or report.get('status') != 'completed'
+                or report.get('children_reaped') is not True
+                or any(report.get(key) != manifest[key] for key in ('run_id', 'controller_instance_id'))
+                or sealed.get('finance_receipt_sha256') != hashlib.sha256(runtime_control.read_control_bytes(
+                    Path(sealed['original_execution']['receipt_file']))).hexdigest()
+                or budget is None or budget['retry_allowed']
+                or any(budget[key] != manifest[key] for key in ('run_id', 'controller_instance_id', 'owner_task_id'))
+                or budget['started_at'] != datetime.fromisoformat(manifest['started_at']).timestamp()):
+            raise ValueError('approval_retry_stop_untrusted')
+        with runtime_control.stop_control_lease():
+            return runtime_control._clear_stop_locked(f'stop_requested:{guard.RETRY_STOP_REASON}\n'.encode())
 
 
 def startup(project_root: Path, *, observe_errors: bool = True) -> dict:

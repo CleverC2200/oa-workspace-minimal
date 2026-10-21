@@ -27,6 +27,7 @@ _ALLOWED_STOP_REASONS = frozenset(
         "writer_result_unknown",
         "codex_review_technical_failure",
         "codex_official_error_cooldown",
+        "codex_transient_retry_exhausted",
     }
 )
 _CYCLE_STOP_PAYLOAD = b"stop_requested:controller_cycle_stop\n"
@@ -74,6 +75,10 @@ def _write_stop_locked(reason: str | None) -> None:
         descriptor = os.open(target, flags, 0o600)
     except FileExistsError:
         previous = read_control_bytes(target)
+        if (previous == b"stop_requested:codex_transient_retry_exhausted\n" and reason not in {"controller_cycle_stop", "codex_transient_retry_exhausted"}
+                or reason == "codex_transient_retry_exhausted" and previous == _CYCLE_STOP_PAYLOAD):
+            write_control_bytes_atomic(target, b"stop_requested\n" if reason is None else f"stop_requested:{reason}\n".encode("ascii"))
+            return
         if (reason is None and previous in {b"stop_requested:codex_review_technical_failure\n", b"stop_requested:codex_official_error_cooldown\n"}) or (reason in {"codex_review_technical_failure", "codex_official_error_cooldown"}
                 and previous == _CYCLE_STOP_PAYLOAD) or (
                 previous == b"stop_requested:codex_official_error_cooldown\n"
