@@ -43,6 +43,7 @@ def run_pytest(tmp_path, source, *, selection=(), budget='170', shard=None):
         result = tmp_path / f'result-{shard}.json'
         selection = (*selection, '--ci-shard', str(shard))
     command = [sys.executable, '-m', 'pytest', '-q', '-c', str(ROOT / 'pytest.ini'),
+               '--basetemp', str(tmp_path / 'pytest-workspace'),
                '-p', 'xdist.plugin', '-p', 'scripts.pytest_evidence', str(sample)]
     environment = dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD='1', PYTEST_ADDOPTS='')
     environment.update(GITHUB_SHA='a' * 40, GITHUB_RUN_ID='1234', GITHUB_RUN_ATTEMPT='1', GITHUB_JOB='quality')
