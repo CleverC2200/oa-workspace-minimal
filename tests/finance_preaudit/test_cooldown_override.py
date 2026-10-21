@@ -43,6 +43,78 @@ def arguments():
     return result
 
 
+def ordinary_arguments(root):
+    old = arguments()
+    return [*old[:8], '--confirm-alerts', 'NO',
+        '--defer-action-file', str(root / 'first/action.json'),
+        '--defer-action-file', str(root / 'second/action.json'), *old[10:]]
+
+
+def test_ordinary_override_preserves_explicit_deferrals_without_recovery(tmp_path):
+    cooldown_override.validate_arguments(ordinary_arguments(tmp_path))
+
+
+@pytest.mark.parametrize('damage', ['alerts', 'capacity', 'workflow', 'relative', 'duplicate', 'recovery', 'unknown'])
+def test_ordinary_override_rejects_unrequested_scope(tmp_path, damage):
+    selected = ordinary_arguments(tmp_path)
+    if damage == 'alerts':
+        selected[9] = 'YES'
+    elif damage == 'capacity':
+        selected[3] = '4'
+    elif damage == 'workflow':
+        selected = selected[:-2]
+    elif damage == 'relative':
+        selected[11] = 'relative/action.json'
+    elif damage == 'duplicate':
+        selected[13] = selected[11]
+    elif damage == 'recovery':
+        selected[10:10] = ['--recover-confirmed-no-write-once', 'YES']
+    else:
+        selected[10] = '--recover-action-file'
+    with pytest.raises(ValueError, match='approval_cooldown_override_scope_invalid'):
+        cooldown_override.validate_arguments(selected)
+
+
+@pytest.mark.parametrize('official_production', ['project_notice', 'project_notice_with_history'], indirect=True)
+def test_project_notice_during_original_run_can_be_consumed_without_rewriting_history(stopped):
+    root, original, calls = stopped
+    cooldown = root / 'runtime/control/approval-guard/cooldown.json'
+    closed = root / ('runtime/control/approval-guard/runs/' + 'a' * 32 + '/closed-readonly.json')
+    unchanged = {p: (p.stat().st_ino, p.read_bytes()) for p in (cooldown, closed, original.file)}
+    value = json.loads(cooldown.read_bytes())
+    assert value['run_id'] is None and json.loads(closed.read_bytes())['cooldown'] == value
+    with cooldown_override.one_round(root, owner_task_id=str(uuid4()), invocation_id=uuid4().hex, original=original):
+        guard.assert_admission()
+        assert not runtime_control.stop_requested()
+        assert {p: (p.stat().st_ino, p.read_bytes()) for p in unchanged} == unchanged
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('official_production', ['project_notice_before_run'], indirect=True)
+def test_project_notice_before_original_run_cannot_consume_override(stopped):
+    root, original, calls = stopped
+    before = runtime_control.stop_file().read_bytes()
+    with pytest.raises(RuntimeError, match='maintenance_original_execution_untrusted'):
+        with cooldown_override.one_round(root, owner_task_id=str(uuid4()), invocation_id=uuid4().hex, original=original):
+            pytest.fail('unrelated original run accepted')
+    assert not calls and runtime_control.stop_file().read_bytes() == before
+    assert not (guard.directory() / 'cooldown-overrides').exists()
+
+
+@pytest.mark.parametrize('official_production', ['project_notice_with_history'], indirect=True)
+def test_untrusted_interrupted_history_still_blocks_override(stopped):
+    root, original, calls = stopped
+    path = root / ('runtime/control/approval-guard/runs/' + 'd' * 32 + '/closed-readonly.json')
+    value = json.loads(path.read_bytes())
+    guard.write(path, {**value, 'writer_inactive': False})
+    before = runtime_control.stop_file().read_bytes()
+    with pytest.raises(RuntimeError, match='maintenance_original_execution_untrusted'):
+        with cooldown_override.one_round(root, owner_task_id=str(uuid4()), invocation_id=uuid4().hex, original=original):
+            pytest.fail('untrusted historical interruption accepted')
+    assert not calls and runtime_control.stop_file().read_bytes() == before
+    assert not (guard.directory() / 'cooldown-overrides').exists()
+
+
 def foreign_startup(root):
     code = '''from pathlib import Path
 from apps.oa_finance_preaudit import approval_guard as guard, approval_lifecycle
@@ -197,12 +269,15 @@ def test_public_cli_rejects_incomplete_override_before_loading_auth(monkeypatch,
 
 
 @pytest.mark.parametrize("publication_delay", [0, .8])
-def test_public_cli_binds_real_wait_receipt_to_waiver_and_rejects_audit_drift(stopped, monkeypatch, publication_delay):
+@pytest.mark.parametrize('selection', ['ordinary', 'recover'])
+def test_public_cli_binds_real_wait_receipt_to_waiver_and_rejects_audit_drift(stopped, monkeypatch, publication_delay, selection):
     root, original, _calls = stopped
+    controller_arguments = ordinary_arguments(root) if selection == 'ordinary' else arguments()
     owner = str(uuid4())
     original_supervise = finance_preaudit_run.supervise
     receipts = []
     def supervised(_command, **options):
+        assert list(_command[-len(controller_arguments):]) == controller_arguments
         # A real local child checks admission with the inherited waiver, then publishes its own terminal mirror.
         code = r'''import os,json,datetime,subprocess,sys
 from pathlib import Path
@@ -272,7 +347,7 @@ print(json.dumps(result))
     monkeypatch.setattr(finance_preaudit_run.auth, "load_local_env", lambda: None)
     assert finance_preaudit_run.main(["--owner-task-id", owner, "--review-provider", "deepseek", "--ignore-cooldown-once", "YES",
         "--original-receipt-file", str(original.file), "--original-owner-task-id", original.owner_task_id,
-        "--original-tool-session-id", original.tool_session_id, "--", *arguments()]) == 0
+        "--original-tool-session-id", original.tool_session_id, "--", *controller_arguments]) == 0
     receipt = receipts[0]
     path = Path(receipt["receipt_file"])
     report = finance_preaudit_run.read_execution(path, owner_task_id=owner, invocation_id=path.parent.name)

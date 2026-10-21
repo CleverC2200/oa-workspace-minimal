@@ -249,7 +249,8 @@ if any(slot and slot.get('pid') is not None and
 closed = review_interruption.closed_run(mirror['run_id'], Path(progress['actions'][0]))
 original_cooldown = closed['cooldown']
 if (closed['cause'] != guard.STOP_REASON or not isinstance(original_cooldown, dict)
-        or original_cooldown.get('run_id') != mirror['run_id']
+        or not (original_cooldown.get('run_id') == mirror['run_id']
+                or (cooldown['run_id'] is None and original_cooldown == cooldown))
         or (cooldown['run_id'] is not None and original_cooldown != cooldown)
         or closed['controller_instance_id'] != mirror['controller_instance_id']
         or closed['controller'] != progress['controller'] or closed['project_root'] != str(root)
@@ -262,7 +263,9 @@ def project_notices():
         return []
     import hashlib
     completed = finance_preaudit_run._timestamp(saved['completed_at']).timestamp()
-    if cooldown['triggered_at'] < completed:
+    if (cooldown['triggered_at'] < completed and
+            (original_cooldown != cooldown or cooldown['triggered_at'] <
+             finance_preaudit_run._timestamp(mirror['started_at']).timestamp())):
         raise ValueError('maintenance_project_notice_untrusted')
     notices = [{'source_sha256':hashlib.sha256(source.encode()).hexdigest(),
                 'notice_code':code,'occurred_at':stamp}
@@ -288,6 +291,9 @@ def interrupted_actions():
         attempt = flows / state['workflow_key'] / 'cases' / state['case_key'] / ('attempt-' + str(state['attempt']))
         receipt = guard.read(attempt / 'review-interruption.json')
         action = str(attempt / 'action.json')
+        if (receipt is not None and receipt.get('run_id') != mirror['run_id']
+                and action not in progress['actions'] and item_failure.isolated(attempt, state)):
+            continue
         if (receipt is None or receipt.get('run_id') != mirror['run_id']
                 or receipt.get('controller_instance_id') != mirror['controller_instance_id']
                 or action not in progress['actions'] or not item_failure.isolated(attempt, state)):
@@ -324,7 +330,7 @@ report['official_stop_proof'] = {'kind':'preaudit_official_stop_source_only','re
     'controller_instance_id':mirror['controller_instance_id'],'readonly_reaped':True,'models_reaped':True,
     'supervisor_absent':True,'cooldown':cooldown,'actions':progress['actions'],
     'cooldown_attribution':'project_notice' if cooldown['run_id'] is None else 'approval_run',
-    'project_notices':notices,
+    'project_notices':notices,'closed_cooldown':original_cooldown,
     'interrupted_actions':interrupted,'evidence_files':fingerprints}
 '''
 
@@ -433,7 +439,9 @@ def assert_original_execution_safe(target_root: Path, original: OriginalExecutio
                         or any(not isinstance(notice, dict) for notice in notices)
                         or {notice.get('source_sha256') for notice in notices} != set(cooldown.get('sources', []))
                         or len(notices) != len(cooldown.get('sources', []))
-                        or cooldown['triggered_at'] < datetime.fromisoformat(saved['completed_at']).timestamp()
+                        or (cooldown['triggered_at'] < datetime.fromisoformat(saved['completed_at']).timestamp()
+                            and (proof.get('closed_cooldown') != cooldown
+                                 or cooldown['triggered_at'] < datetime.fromisoformat(saved['started_at']).timestamp()))
                         or not any(notice.get('occurred_at') == cooldown['triggered_at']
                                    and notice.get('notice_code') == cooldown['notice_code'] for notice in notices)):
                     raise RuntimeError('maintenance_original_execution_untrusted')
@@ -887,7 +895,8 @@ try:
             if stopped_collection:
                 preserved.append(str(attempt / 'action.json'))
             if (source_only is not None and source_only.get('kind') == 'preaudit_official_stop_source_only'
-                    and state.get('reason') == 'codex_review_interrupted'):
+                    and state.get('reason') == 'codex_review_interrupted'
+                    and str(attempt / 'action.json') in source_only['actions']):
                 action = str(attempt / 'action.json')
                 if not isolated or action not in source_only['interrupted_actions']:
                     raise ValueError()
