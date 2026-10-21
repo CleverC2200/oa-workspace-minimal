@@ -95,6 +95,8 @@ uv run --quiet python -X utf8 -B -m apps.oa_finance_preaudit.host_chat_review --
 
 原生日志可能在一次图片观察输出中内嵌多张大图。来源扫描按小块读取，保持原行号，跳过指定来源调用之前超过 32 MiB 的非目标记录；父心跳查找也跳过这些不可用作来源的记录。会话头、被引用调用及配对输出仍须在原 32 MiB 上限内，并按原字节计算指纹。调用之后、配对结果之前遇到超限记录时，无法确认它是否为目标输出，仍拒绝接收。原日志不改写；逐页业务观察要求不变。
 
+活动来源缺失时，可信原生读取器依次查找归档中的同名 `.jsonl` 和 `.jsonl.zst`。压缩归档沿用现有 `zstd` 只读解码，不落地解压副本；原会话身份、行号、字节摘要、权限和配对输出检查不变。解码错误或工具不可用时拒绝，结束或异常后等待解码进程退出，不改旧来源证明。
+
 ```bash
 uv run --quiet python -X utf8 -B -m apps.oa_finance_preaudit.host_chat_review --operation submit --owner-task-id <主会话UUID> --run-id <本轮run_id> --request-file <本轮request.json> --decision-file <本单私有决定json> --source-session-file <已登记子会话jsonl> --source-line <已完成决定写入行>
 ```

@@ -2,11 +2,61 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+from pathlib import Path
+import subprocess
 
 import pytest
 
 from apps.oa_finance_preaudit import host_chat_review as host
 from tests.finance_preaudit.test_host_chat_review import exchange, native_call, draft_source
+
+
+def test_compressed_native_anchor_preserves_original_line_bytes(exchange):
+    _, _, _owner, child, *_ = exchange
+    line = native_call(child, 'functions.exec', 'native publication', 'publication', {'exit_code': 0})
+    child.write_bytes(child.read_bytes().replace(b'\n', b'\r\n'))
+    session = json.loads(child.read_bytes().splitlines()[0])['payload']['id']
+    before = host._native_source(child, session, line, output=True)
+    archive = Path(os.environ['CODEX_HOME']) / 'archived_sessions'
+    archive.mkdir()
+    target = archive / (child.name + '.zst')
+    subprocess.run(['zstd', '-q', str(child), '-o', str(target)], check=True)
+    child.unlink()
+    compressed = target.read_bytes()
+    assert host._native_source(child, session, line, output=True) == before
+    assert target.read_bytes() == compressed and not child.exists()
+
+
+@pytest.mark.parametrize('damage', ['none', 'wrong_session', 'checksum', 'decoder_unavailable'])
+def test_compressed_native_source_reaps_decoder_and_rejects_invalid_evidence(exchange, monkeypatch, damage):
+    _, _, _owner, child, *_ = exchange
+    session = json.loads(child.read_text().splitlines()[0])['payload']['id']
+    archive = Path(os.environ['CODEX_HOME']) / 'archived_sessions'
+    archive.mkdir()
+    target = archive / (child.name + '.zst')
+    subprocess.run(['zstd', '-q', str(child), '-o', str(target)], check=True)
+    child.unlink()
+    if damage == 'checksum':
+        raw = bytearray(target.read_bytes())
+        raw[-1] ^= 1
+        target.write_bytes(raw)
+    if damage == 'decoder_unavailable':
+        monkeypatch.setenv('PATH', str(archive / 'no-decoder'))
+    created = []
+    popen = subprocess.Popen
+    def recording(*args, **kwargs):
+        process = popen(*args, **kwargs)
+        created.append(process)
+        return process
+    monkeypatch.setattr(host.subprocess, 'Popen', recording)
+    if damage == 'none':
+        assert host._native_source(child, session)[0]['header']['id'] == session
+    else:
+        with pytest.raises(ValueError, match='host_review_source_untrusted'):
+            host._native_source(child, 'wrong-session' if damage == 'wrong_session' else session)
+    assert len(created) == (0 if damage == 'decoder_unavailable' else 1)
+    assert all(process.poll() is not None and process.stdout.closed for process in created)
 
 
 def append_large_image_output(source):
@@ -50,7 +100,8 @@ def test_parent_heartbeat_finds_current_call_after_large_image_output(exchange):
 
 
 @pytest.mark.parametrize('target', ['header', 'call', 'paired_output', 'unknown_interleaved_output'])
-def test_oversized_referenced_or_unresolved_native_evidence_still_rejected(exchange, target):
+@pytest.mark.parametrize('compressed', [False, True])
+def test_oversized_referenced_or_unresolved_native_evidence_still_rejected(exchange, target, compressed):
     _, _, owner, child, *_ = exchange
     session = json.loads(child.read_text().splitlines()[0])['payload']['id']
     if target == 'header':
@@ -70,5 +121,11 @@ def test_oversized_referenced_or_unresolved_native_evidence_still_rejected(excha
                 stream.write(b'{"type":"response_item","payload":{"type":"custom_tool_call_output",'
                              b'"call_id":"publish-call","output":"{}"}}\n')
         output = True
+    if compressed:
+        archive = Path(os.environ['CODEX_HOME']) / 'archived_sessions'
+        archive.mkdir()
+        path = archive / (child.name + '.zst')
+        subprocess.run(['zstd', '-q', str(child), '-o', str(path)], check=True)
+        child.unlink()
     with pytest.raises(ValueError, match='host_review_source_untrusted'):
         host._native_source(child, session, line, output=output)
