@@ -11,6 +11,7 @@ from pathlib import Path
 import signal
 import subprocess
 import tempfile
+import textwrap
 import time
 from typing import Iterator
 
@@ -23,6 +24,28 @@ class OriginalExecution:
     file: Path
     owner_task_id: str
     tool_session_id: str
+
+
+def _material_read_program(program: str) -> str:
+    return '''
+from contextlib import contextmanager
+from importlib.util import find_spec
+@contextmanager
+def maintenance_material_read():
+    if find_spec('apps.oa_approval.material_store') is None:
+        yield
+        return
+    from apps.oa_approval import material_store
+    store = material_store.MaterialStore()
+    with store._locked(readonly=True):
+        token = material_store._ACTIVE_OPERATIONS.set(
+            material_store._ACTIVE_OPERATIONS.get() | {str(store.root)})
+    try:
+        yield
+    finally:
+        material_store._ACTIVE_OPERATIONS.reset(token)
+with maintenance_material_read():
+''' + textwrap.indent(program, '    ')
 
 
 def _reap_readonly_group(process: subprocess.Popen) -> None:
@@ -918,7 +941,7 @@ def read_current_inputs(target_root: Path, receipt: dict, *, require_reaped: boo
     environment.pop('PYTHONPATH', None)
     environment.pop('PYTHONHOME', None)
     try:
-        result = _run_readonly([str(target_root / '.venv/bin/python'), '-B', '-E', '-c', _CURRENT_INPUTS_READER,
+        result = _run_readonly([str(target_root / '.venv/bin/python'), '-B', '-E', '-c', _material_read_program(_CURRENT_INPUTS_READER),
             receipt['path'], receipt['sha256'], json.dumps([*FINANCE_WORKFLOWS, 'packaging_layout_approval']),
             json.dumps(official_stop_proof if official_stop_proof is not None else source_only_proof),
             json.dumps(allow_admission_blocked)],
@@ -955,7 +978,8 @@ def read_live_status(target_root: Path, *, require_reaped: bool = False,
     evidence_file = evidence_dir / 'status.json'
     try:
         result = _run_readonly(
-            [str(interpreter), '-B', '-E', '-m', 'apps.oa_finance_preaudit.cli',
+            [str(interpreter), '-B', '-E', '-c', _material_read_program(
+                'from apps.oa_finance_preaudit.cli import main\nraise SystemExit(main())\n'),
              'status', '--check-live', '--reconcile', '--summary',
              '--output-file', str(evidence_file)],
             target_root=target_root, environment=environment, timeout=300, require_reaped=require_reaped,
