@@ -20,6 +20,7 @@ from apps.oa_approval.material_inventory import discover as discover_project
 DEFAULT_LIMIT_BYTES = 3_000_000_000
 _ACTIVE_OPERATIONS = ContextVar('oa_material_operations', default=frozenset())
 _OPERATION_BASELINES = ContextVar('oa_material_baselines', default={})
+_AVAILABILITY_READS = ContextVar('oa_material_availability_reads', default={})
 
 
 def default_root() -> Path:
@@ -67,6 +68,21 @@ class MaterialStore:
 
     @contextmanager
     def _locked(self, *, readonly: bool = False, refresh: bool = True):
+        scope = _AVAILABILITY_READS.get().get(str(self.root))
+        if scope is not None:
+            if not readonly:
+                raise RuntimeError('material_read_write_forbidden')
+            _path(self.root)
+            if scope['state'] is None and self.root.exists():
+                scope['state'] = scope['leases'].enter_context(self._inventory_locked(readonly=True, refresh=False))
+            if scope['state'] is not None:
+                yield scope['state']
+                return
+        with self._inventory_locked(readonly=readonly, refresh=refresh) as state:
+            yield state
+
+    @contextmanager
+    def _inventory_locked(self, *, readonly: bool, refresh: bool):
         if readonly and not self.root.exists():
             yield {"schema_version": 1, "files": {}, "events": [], "directories": {}}
             return
@@ -93,6 +109,19 @@ class MaterialStore:
                 yield state
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
+
+    @contextmanager
+    def availability_read(self):
+        if str(self.root) in _AVAILABILITY_READS.get():
+            yield
+            return
+        with ExitStack() as leases:
+            scope = {'state': None, 'leases': leases}
+            token = _AVAILABILITY_READS.set({**_AVAILABILITY_READS.get(), str(self.root): scope})
+            try:
+                yield
+            finally:
+                _AVAILABILITY_READS.reset(token)
 
     @contextmanager
     def operation(self):
@@ -249,8 +278,11 @@ class MaterialStore:
     @contextmanager
     def read_lease(self, paths):
         paths = sorted({_path(Path(path)) for path in paths}, key=str)
+        scope = _AVAILABILITY_READS.get().get(str(self.root))
+        if scope is not None and scope['state'] is None and not self.root.exists():
+            scope['state'] = scope['leases'].enter_context(self._inventory_locked(readonly=False, refresh=False))
         with ExitStack() as stack:
-            with self._locked() as state:
+            with self._locked(readonly=str(self.root) in _AVAILABILITY_READS.get()) as state:
                 for path in paths:
                     entry = state['files'].get(str(path))
                     if entry and entry['status'] in {'retired', 'deletion_planned'}:
@@ -636,6 +668,8 @@ class MaterialStore:
         return self.copy_stream(path, BytesIO(data), source=source, expected_bytes=len(data))
 
     def managed_directory(self, name: str) -> Path:
+        if str(self.root) in _AVAILABILITY_READS.get():
+            raise RuntimeError('material_read_write_forbidden')
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,79}', name):
             raise ValueError('material_workspace_invalid')
         path = _path(self.root / 'experiments' / name)
@@ -652,3 +686,9 @@ def write_bytes(path: Path, data: bytes, *, source: dict | None = None) -> Path:
 def copy_stream(path: Path, stream, *, source: dict | None = None,
                 expected_bytes: int | None = None) -> Path:
     return MaterialStore().copy_stream(path, stream, source=source, expected_bytes=expected_bytes)
+
+
+@contextmanager
+def availability_read():
+    with MaterialStore().availability_read():
+        yield

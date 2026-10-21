@@ -345,3 +345,91 @@ def test_archive_expansion_is_admitted_before_member_file_write(tmp_path, monkey
     assert files == []
     assert 'material_budget_exceeded' in error
     assert not list((tmp_path / 'downloads').rglob('large.txt'))
+
+
+def test_availability_read_batches_checks_and_refuses_writes_until_exit(tmp_path):
+    import fcntl
+
+    store = MaterialStore(tmp_path / 'private', limit_bytes=10)
+    original = tmp_path / 'original'
+    store.write_bytes(original, b'123456')
+    inventory = (store.root / 'inventory.json').read_bytes()
+    with store.availability_read():
+        for _ in range(32):
+            MaterialStore(store.root).require_available(original)
+        with (store.root / 'inventory.lock').open('r+') as lock:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(RuntimeError, match='material_read_write_forbidden'):
+            store.write_bytes(original, b'changed')
+        with pytest.raises(RuntimeError, match='material_read_write_forbidden'):
+            store.managed_directory('unexpected')
+        assert not (store.root / 'experiments' / 'unexpected').exists()
+        assert original.read_bytes() == b'123456'
+    assert (store.root / 'inventory.json').read_bytes() == inventory
+    store.mark_disposable(original, closed=True, write_state='not_applicable')
+    store.write_bytes(tmp_path / 'next', b'12345')
+    original.write_bytes(b'123456')
+    with store.availability_read():
+        with pytest.raises(ValueError, match='material_retired'):
+            store.require_available(original)
+
+
+def test_empty_availability_scope_observes_later_inventory_and_refuses_local_write(tmp_path):
+    import json
+
+    store = MaterialStore(tmp_path / 'private')
+    original = tmp_path / 'original'
+    original.write_bytes(b'original')
+    with store.availability_read():
+        store.require_available(original)
+        assert not store.root.exists()
+        with pytest.raises(RuntimeError, match='material_read_write_forbidden'):
+            store.write_bytes(original, b'changed')
+        store.root.mkdir()
+        (store.root / 'inventory.lock').touch(mode=0o600)
+        (store.root / 'inventory.json').write_text(json.dumps({'schema_version': 1,
+            'files': {str(original): {'path': str(original), 'status': 'retired'}},
+            'events': [], 'directories': {}}))
+        with pytest.raises(ValueError, match='material_retired'):
+            store.require_available(original)
+    assert original.read_bytes() == b'original'
+
+
+def test_availability_scope_locks_inventory_created_after_scope_entry(tmp_path):
+    import fcntl
+    import json
+
+    store = MaterialStore(tmp_path / 'private')
+    original = tmp_path / 'original'
+    original.write_bytes(b'original')
+    with store.availability_read():
+        store.root.mkdir()
+        (store.root / 'inventory.lock').touch(mode=0o600)
+        (store.root / 'inventory.json').write_text(json.dumps({'schema_version': 1,
+            'files': {}, 'events': [], 'directories': {}}))
+        store.require_available(original)
+        with (store.root / 'inventory.lock').open('r+') as lock:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+@pytest.mark.parametrize('inventory_exists', [False, True])
+def test_file_read_lease_can_join_availability_scope(tmp_path, inventory_exists):
+    import fcntl
+
+    store = MaterialStore(tmp_path / 'private')
+    original = tmp_path / 'original'
+    original.write_bytes(b'original')
+    if inventory_exists:
+        store.adopt_files([original])
+    with store.availability_read():
+        with store.read_lease([original]):
+            store.require_available(original)
+            lease = next((store.root / 'leases').iterdir())
+            with lease.open('r+') as lock:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            assert original.read_bytes() == b'original'
+    with lease.open('r+') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
