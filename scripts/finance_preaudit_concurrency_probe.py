@@ -2658,7 +2658,7 @@ def _run_dispatched_tasks(
         nonlocal force_terminated
         if force_terminated:
             return
-        if futures and runtime_control.stop_reason() in {"codex_review_technical_failure", approval_guard.STOP_REASON}:
+        if futures and runtime_control.stop_reason() in {"codex_review_technical_failure", *approval_guard.MODEL_STOP_REASONS}:
             # Workers already observe the gate; retain their failure receipts
             # before forcibly reaping only the read-only review pool.
             wait(tuple(futures), timeout=codex_review_worker.OBSERVATION_INTERVAL_SECONDS + 1)
@@ -3390,7 +3390,7 @@ def _run_dispatched_tasks(
                         completed_reviews.append((index, prepare_elapsed, action_file, value))
             for index, prepare_elapsed, action_file, value in sorted(completed_reviews, key=lambda item: item[0]):
                 if value.get("status") != "reviewed":
-                    if runtime_control.stop_reason() == approval_guard.STOP_REASON:
+                    if runtime_control.stop_reason() in approval_guard.MODEL_STOP_REASONS:
                         outcomes[index] = TaskOutcome(index=index, status="stopped", value=value, error_code="stop_requested")
                         failed_now = True
                         first_review_error_code = first_review_error_code or "stop_requested"
@@ -4543,6 +4543,8 @@ def run_rolling_drain(
                         if notice is not None and notice["run_id"] == manifest["run_id"]
                         else {"status": "unknown"}
                     )
+                elif result.get('stop_reason') == approval_guard.RETRY_STOP_REASON:
+                    result['transient_retries'] = approval_guard.retry_budget(manifest['run_id'])
                 if result["processes_reaped"] is not True:
                     children_reaped = False
                     runtime_control.request_cycle_stop()
@@ -4552,18 +4554,18 @@ def run_rolling_drain(
             except BaseException:
                 if not children_reaped:
                     runtime_control.request_cycle_stop()
-                if children_reaped and native_pipeline and runtime_control.stop_reason() == approval_guard.STOP_REASON:
-                    approval_lifecycle.interrupt_unwritten(manifest, cause=approval_guard.STOP_REASON)
+                if children_reaped and native_pipeline and runtime_control.stop_reason() in approval_guard.MODEL_STOP_REASONS:
+                    approval_lifecycle.interrupt_unwritten(manifest, cause=runtime_control.stop_reason())
                 controller_handoff.finish(
                     manifest,
                     status="failed",
                     children_reaped=children_reaped,
                     health="degraded",
                 )
-                _clear_finished_cycle_stop(children_reaped=children_reaped)
+                _clear_finished_cycle_stop(children_reaped=children_reaped, manifest=manifest)
                 raise
-            if native_pipeline and runtime_control.stop_reason() == approval_guard.STOP_REASON:
-                approval_lifecycle.interrupt_unwritten(manifest, cause=approval_guard.STOP_REASON)
+            if native_pipeline and runtime_control.stop_reason() in approval_guard.MODEL_STOP_REASONS:
+                approval_lifecycle.interrupt_unwritten(manifest, cause=runtime_control.stop_reason())
             handoff = controller_handoff.finish(
                 manifest,
                 status=(
@@ -4577,7 +4579,7 @@ def run_rolling_drain(
                     "healthy" if result["status"] == "completed" else "degraded"
                 ),
             )
-            _clear_finished_cycle_stop(children_reaped=True)
+            _clear_finished_cycle_stop(children_reaped=True, manifest=manifest)
             return {
                 **result,
                 "recovered_cycle_stop": recovered_cycle_stop,
@@ -4758,7 +4760,7 @@ def _continuation_is_ready(
             and isolated + recovered == quarantine.get("pending_quarantined"))
 
 
-def _clear_finished_cycle_stop(*, children_reaped: bool) -> None:
+def _clear_finished_cycle_stop(*, children_reaped: bool, manifest: dict | None = None) -> None:
     if (
         not children_reaped
         or runtime_control.writer_active()
@@ -4766,6 +4768,8 @@ def _clear_finished_cycle_stop(*, children_reaped: bool) -> None:
     ):
         return
     try:
+        if manifest is not None and runtime_control.stop_reason() == approval_guard.RETRY_STOP_REASON:
+            approval_lifecycle.clear_retry_stop(manifest)
         runtime_control.clear_cycle_stop()
     except RuntimeError as error:
         raise ValueError("production_cycle_stop_cleanup_failed") from error
@@ -4911,8 +4915,8 @@ def _run_rolling_drain_locked(
         ):
             runtime_control.request_cycle_stop()
             status = "failed"
-            if runtime_control.stop_reason() == approval_guard.STOP_REASON:
-                stop_reason = approval_guard.STOP_REASON
+            if runtime_control.stop_reason() in approval_guard.MODEL_STOP_REASONS:
+                stop_reason = runtime_control.stop_reason()
                 last_decision = {
                     "action": "stop", "next_capacity": current_capacity,
                     "healthy_windows": 0, "reason": stop_reason,
@@ -5006,10 +5010,8 @@ def _run_rolling_drain_locked(
             "total_tokens",
         ):
             token_totals[field] += int(usage.get(field) or 0)
-    if stop_reason == approval_guard.STOP_REASON:
-        # Preparation can fail after the first official stop closes admission.
-        # Keep those task errors, but report the stop gate as the round's cause.
-        primary_error_code = approval_guard.STOP_REASON
+    if stop_reason in approval_guard.MODEL_STOP_REASONS:
+        primary_error_code = stop_reason
     elif status == "failed" and primary_error_code is None:
         external_stop_reason = runtime_control.stop_reason()
         if external_stop_reason != "controller_cycle_stop":

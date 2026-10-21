@@ -29,6 +29,10 @@ OWNER_ENV = "OA_APPROVAL_OWNER_TASK_ID"
 COOLDOWN_OVERRIDE_ENV = "OA_APPROVAL_COOLDOWN_OVERRIDE"
 EXECUTION_OWNERS_ENV = "OA_APPROVAL_EXECUTION_OWNERS"
 NOTICE_CODES = frozenset({"usage_limit", "model_unavailable", "rate_limit", "server_overloaded", "authentication"})
+RETRYABLE_NOTICE_CODES = frozenset({"rate_limit", "server_overloaded"})
+RETRY_STOP_REASON = "codex_transient_retry_exhausted"
+MAX_TRANSIENT_RETRIES = 2
+MODEL_STOP_REASONS = frozenset({STOP_REASON, RETRY_STOP_REASON})
 
 
 def directory() -> Path:
@@ -76,16 +80,17 @@ def notice_code(error: object) -> str | None:
     codes = {"usageLimitExceeded": "usage_limit", "serverOverloaded": "server_overloaded",
              "modelNotFound": "model_unavailable", "modelUnavailable": "model_unavailable",
              "rateLimitExceeded": "rate_limit", "unauthorized": "authentication"}
+    recognized = set()
     for native_code in (code, error.get("code")):
         if isinstance(native_code, str) and native_code in codes:
-            return codes[native_code]
+            recognized.add(codes[native_code])
     details = info.get("httpConnectionFailed") if code == "httpConnectionFailed" and isinstance(info, dict) else None
     for status in (details.get("httpStatusCode") if isinstance(details, dict) else None, error.get("httpStatusCode")):
         if type(status) is int and status in {401, 403, 429, 503}:
-            return {401: "authentication", 403: "authentication", 429: "rate_limit", 503: "server_overloaded"}[status]
+            recognized.add({401: "authentication", 403: "authentication", 429: "rate_limit", 503: "server_overloaded"}[status])
     message = error.get("message")
     if not isinstance(message, str):
-        return None
+        message = ''
     lower = message.lower().replace("\u2019", "'").replace("\u2018", "'")
     terms = {
         "usage_limit": ("you've hit your usage limit", "usage limit exceeded", "usage_limit_exceeded", "insufficient_quota"),
@@ -95,7 +100,9 @@ def notice_code(error: object) -> str | None:
         "authentication": ("account has been deactivated", "account is deactivated", "account suspended", "status 401", "status 403",
                            "unauthorized", "authentication failed", "invalid authentication credentials", "invalid api key", "incorrect api key"),
     }
-    return next((name for name, phrases in terms.items() if any(term in lower for term in phrases)), None)
+    recognized.update(name for name, phrases in terms.items() if any(term in lower for term in phrases))
+    return next((name for name in ('authentication', 'usage_limit', 'model_unavailable', 'rate_limit', 'server_overloaded')
+                 if name in recognized), None)
 
 
 def cooldown() -> dict | None:
@@ -114,8 +121,117 @@ def cooldown() -> dict | None:
     return value
 
 
+def retry_budget_file(run_id: str) -> Path:
+    from . import approval_lifecycle
+    return approval_lifecycle.run_directory(run_id) / "transient-retries.json"
+
+
+def _retry_budget_record(run_id: str) -> dict | None:
+    value = read(retry_budget_file(run_id))
+    if value is None:
+        return None
+    if (set(value) != {"schema_version", "kind", "run_id", "controller_instance_id", "owner_task_id", "started_at", "events"}
+            or value.get("schema_version") != 1 or value.get("kind") != "approval_transient_retry_budget"
+            or value.get("run_id") != run_id or not _timestamp(value.get("started_at"))
+            or not isinstance(value.get("events"), list) or not 1 <= len(value["events"]) <= MAX_TRANSIENT_RETRIES + 1
+            or re.fullmatch(r"[0-9a-f]{32}", str(value.get("controller_instance_id"))) is None
+            or not isinstance(value.get("owner_task_id"), str)):
+        raise ValueError("approval_retry_budget_untrusted")
+    keys = set()
+    for event in value["events"]:
+        if (not isinstance(event, dict) or set(event) != {"source_sha256", "notice_code", "occurred_at"}
+                or event.get("notice_code") not in RETRYABLE_NOTICE_CODES
+                or re.fullmatch(r"[0-9a-f]{64}", str(event.get("source_sha256"))) is None
+                or event["source_sha256"] in keys or not _timestamp(event.get("occurred_at"))
+                or not value["started_at"] <= event["occurred_at"] <= time.time() + OBSERVATION_SECONDS):
+            raise ValueError("approval_retry_budget_untrusted")
+        keys.add(event["source_sha256"])
+    return value
+
+
+def retry_budget(run_id: str) -> dict | None:
+    value = _retry_budget_record(run_id)
+    if value is None:
+        return None
+    return {**value, "failures": len(value["events"]),
+            "retry_allowed": len(value["events"]) <= MAX_TRANSIENT_RETRIES}
+
+
+def _record_transient_notice(code: str, source: str, occurred_at: float, project_root: Path,
+                             *, owner_task_id: str | None = None) -> dict:
+    from datetime import datetime
+    from . import approval_lifecycle, controller_handoff
+    manifest = controller_handoff._read_manifest()
+    if manifest is None or manifest["state"] not in {"running", "completed"}:
+        return {"status": "ignored", "reason": "no_active_round"}
+    started = datetime.fromisoformat(manifest["started_at"]).timestamp()
+    if occurred_at < started:
+        return {"status": "ignored", "reason": "earlier_round"}
+    from . import host_chat_review
+    owner = owner_task_id or os.environ.get(OWNER_ENV)
+    if owner is None:
+        return {"status": "ignored", "reason": "no_active_observer"}
+    if (manifest.get("owner_task_id") != owner or not owner
+            or manifest.get("review_configuration", {}).get("transport") != "host_chat"):
+        raise ValueError("approval_retry_round_untrusted")
+    registry_path = host_chat_review.registry_file(owner, manifest["run_id"])
+    registry = host_chat_review._registry(owner, run_id=manifest["run_id"], live=False) if os.path.lexists(registry_path) else None
+    reviewers = {manifest["owner_task_id"]}
+    if registry is not None:
+        if any(registry.get(field) != manifest[field] for field in ("owner_task_id", "run_id", "controller_instance_id")):
+            raise ValueError("approval_retry_round_untrusted")
+        reviewers.update(item["reviewer_task_id"] for item in registry["reviewers"])
+    if manifest['state'] == 'completed':
+        if registry is None or registry['phase'] != 'packaging' or registry['state'] != 'open' or registry.get('shutdown') is not None:
+            return {"status": "ignored", "reason": "no_active_round"}
+        from scripts import finance_preaudit_run
+        binding = registry['original_execution']
+        report = finance_preaudit_run.read_execution(**binding)
+        progress = approval_lifecycle._progress(manifest)
+        if (manifest['children_reaped'] is not True or report.get('terminal') is not True
+                or progress is None or Path(progress['project_root']).resolve() != Path(project_root).resolve()
+                or report.get('status') != 'completed' or report.get('children_reaped') is not True
+                or any(report.get(key) != manifest[key] for key in ('run_id', 'controller_instance_id'))
+                or hashlib.sha256(host_chat_review._read(Path(binding['receipt_file']))[0]).hexdigest() != registry.get('finance_receipt_sha256')
+                or not _timestamp(registry.get('heartbeat_at'))
+                or not 0 <= time.time() - registry['heartbeat_at'] < host_chat_review.PARENT_HEARTBEAT_MAX_AGE
+                or registry['execution_owners']):
+            raise ValueError("approval_retry_round_untrusted")
+    else:
+        progress = approval_lifecycle._progress(manifest)
+        if (runtime_control.controller_owner_pid() != manifest["controller_pid"]
+                or progress is None or process_identity(manifest["controller_pid"]) != progress["controller"]
+                or Path(progress['project_root']).resolve() != Path(project_root).resolve()
+                or not execution_owners_alive()):
+            raise ValueError("approval_retry_round_untrusted")
+    fields = source.split(":", 2)
+    if len(fields) != 3 or fields[0] != "main" or fields[1] not in reviewers:
+        return {"status": "ignored", "reason": "other_round_source"}
+    key = hashlib.sha256(source.encode()).hexdigest()
+    with runtime_control.stop_control_lease():
+        if controller_handoff._read_manifest() != manifest:
+            return {"status": "ignored", "reason": "round_changed"}
+        previous = _retry_budget_record(manifest["run_id"])
+        if previous is not None and (previous["started_at"] != started or any(previous[field] != manifest[field] for field in
+                                        ("run_id", "controller_instance_id", "owner_task_id"))):
+            raise ValueError("approval_retry_budget_untrusted")
+        events = previous["events"] if previous else []
+        matched = next((event for event in events if event["source_sha256"] == key), None)
+        if matched is not None and matched["notice_code"] != code:
+            raise ValueError("approval_retry_budget_untrusted")
+        if matched is None and len(events) <= MAX_TRANSIENT_RETRIES:
+            value = {"schema_version": 1, "kind": "approval_transient_retry_budget", "run_id": manifest["run_id"],
+                     "controller_instance_id": manifest["controller_instance_id"], "owner_task_id": manifest["owner_task_id"],
+                     "started_at": started, "events": [*events, {"source_sha256": key, "notice_code": code, "occurred_at": occurred_at}]}
+            write(retry_budget_file(manifest["run_id"]), value)
+        result = retry_budget(manifest["run_id"])
+        if not result["retry_allowed"]:
+            runtime_control._write_stop_locked(RETRY_STOP_REASON)
+        return result
+
+
 def record_notice(code: str, source: str, *, occurred_at: float | None = None,
-                  technical_stop_identity: tuple[int, int, int] | None = None) -> dict:
+                  technical_stop_identity: tuple[int, int, int] | None = None, append_only: bool = False) -> dict | None:
     now = time.time()
     occurred_at = now if occurred_at is None else occurred_at
     if code not in NOTICE_CODES or not _timestamp(occurred_at) or occurred_at > now + OBSERVATION_SECONDS:
@@ -126,6 +242,10 @@ def record_notice(code: str, source: str, *, occurred_at: float | None = None,
         try:
             previous = cooldown()
             overridden = cooldown_was_overridden(previous) if previous else False
+            if append_only and (previous is None or overridden or time.time() >= previous['blocked_until']
+                                or not previous['triggered_at'] <= occurred_at <= previous['blocked_until']):
+                publish = False
+                return previous
             if previous and key in previous["sources"]:
                 publish = now < previous["blocked_until"] and not overridden
                 return previous
@@ -178,15 +298,21 @@ def project_official_errors(project_root: Path) -> Iterator[tuple[str, str, floa
         raise ValueError("approval_official_history_unavailable") from error
 
 
-def observe_project_errors(project_root: Path) -> None:
+def observe_project_errors(project_root: Path, *, owner_task_id: str | None = None) -> None:
     # OpenAI Desktop errors do not describe the isolated DeepSeek API reviewer.
     # Its own CLI notices still pass through record_notice and the same cooldown.
     if production_config.review_settings()["provider"] == "deepseek":
         return
     try:
         for code, source, stamp in project_official_errors(project_root):
-            record_notice(code, source, occurred_at=stamp)
-    except (OSError, ValueError, TypeError) as error:
+            if code in RETRYABLE_NOTICE_CODES and production_config.review_settings()["transport"] == "host_chat":
+                if runtime_control.stop_reason() == STOP_REASON:
+                    record_notice(code, source, occurred_at=stamp, append_only=True)
+                else:
+                    _record_transient_notice(code, source, stamp, project_root, owner_task_id=owner_task_id)
+            else:
+                record_notice(code, source, occurred_at=stamp)
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
         raise ValueError("approval_official_history_unavailable") from error
 
 

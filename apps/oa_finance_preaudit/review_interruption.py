@@ -15,9 +15,12 @@ FORBIDDEN_WRITES = ("writer-boundary.json", "execution-receipt.json", "review-de
 def closed_run(run_id: str, action_file: Path) -> dict:
     path = approval_lifecycle.run_directory(run_id) / "closed-readonly.json"
     proof = guard.read(path)
-    if (proof is None or proof.get("schema_version") != 1 or proof.get("kind") != "approval_closed_readonly_run"
-            or set(proof) != {"schema_version", "kind", "run_id", "controller_instance_id", "controller", "project_root",
-                             "actions", "closed_at", "readonly_reaped", "writer_inactive", "cause", "cooldown"}
+    fields = {"schema_version", "kind", "run_id", "controller_instance_id", "controller", "project_root",
+              "actions", "closed_at", "readonly_reaped", "writer_inactive", "cause", "cooldown"}
+    if proof is not None and proof.get("schema_version") == 2:
+        fields.add("retry_budget_fingerprint")
+    if (proof is None or proof.get("schema_version") not in {1, 2} or proof.get("kind") != "approval_closed_readonly_run"
+            or set(proof) != fields
             or proof.get("run_id") != run_id or proof.get("readonly_reaped") is not True
             or not isinstance(proof.get("controller_instance_id"), str)
             or controller_handoff._RUN_ID.fullmatch(proof["controller_instance_id"]) is None
@@ -25,7 +28,7 @@ def closed_run(run_id: str, action_file: Path) -> dict:
             or not isinstance(proof.get("actions"), list) or any(not isinstance(action, str) for action in proof["actions"])
             or not isinstance(proof.get("project_root"), str) or not Path(proof["project_root"]).is_absolute()
             or proof.get("writer_inactive") is not True or not guard._timestamp(proof.get("closed_at"))
-            or proof.get("cause") not in {guard.STOP_REASON, "controller_orphaned", "readonly_deadline_exceeded"}
+            or proof.get("cause") not in guard.MODEL_STOP_REASONS | {"controller_orphaned", "readonly_deadline_exceeded"}
             or str(action_file) not in proof.get("actions", [])
             or not action_file.is_relative_to(Path(proof["project_root"]) / "runtime" / "finance_preaudit_flows")):
         raise ValueError("review_interruption_untrusted")
@@ -35,6 +38,14 @@ def closed_run(run_id: str, action_file: Path) -> dict:
                 or not guard._timestamp(cooldown.get("triggered_at")) or not guard._timestamp(cooldown.get("blocked_until"))
                 or cooldown["blocked_until"] - cooldown["triggered_at"] != guard.COOLDOWN_SECONDS):
             raise ValueError("review_interruption_untrusted")
+    if proof['cause'] == guard.RETRY_STOP_REASON:
+        budget = guard.retry_budget(run_id)
+        if (proof['schema_version'] != 2 or proof['cooldown'] is not None or budget is None or budget['retry_allowed']
+                or budget['controller_instance_id'] != proof['controller_instance_id']
+                or proof['retry_budget_fingerprint'] != evidence.file_fingerprint(guard.retry_budget_file(run_id))):
+            raise ValueError('review_interruption_untrusted')
+    elif proof['schema_version'] != 1:
+        raise ValueError('review_interruption_untrusted')
     return proof
 
 
@@ -59,7 +70,8 @@ def record(action_file: Path, state: dict, *, run_id: str) -> str:
                "original_action_fingerprint": evidence.file_fingerprint(action_file.with_name("interrupted-action.json")),
                "original_state_fingerprint": evidence.file_fingerprint(action_file.with_name("interrupted-state.json")),
                "closed_run_fingerprint": evidence.file_fingerprint(approval_lifecycle.run_directory(run_id) / "closed-readonly.json"),
-               "write_state": "not_requested", "next_step": "fresh_prepare_after_cooldown"}
+               "write_state": "not_requested", "next_step": (
+                   "fresh_prepare_next_round" if proof['cause'] == guard.RETRY_STOP_REASON else "fresh_prepare_after_cooldown")}
     target = action_file.with_name("review-interruption.json")
     previous = guard.read(target)
     if previous is not None and previous != payload:
@@ -83,7 +95,8 @@ def trusted(attempt_root: Path, state: dict) -> bool:
                 or receipt.get("controller_instance_id") != proof["controller_instance_id"]
                 or receipt.get("action_file") != str(attempt_root / "action.json")
                 or any(receipt.get(key) != state.get(key) for key in ("workflow_key", "case_key", "attempt"))
-                or receipt.get("write_state") != "not_requested" or receipt.get("next_step") != "fresh_prepare_after_cooldown"
+                or receipt.get("write_state") != "not_requested" or receipt.get("next_step") != (
+                    "fresh_prepare_next_round" if proof['cause'] == guard.RETRY_STOP_REASON else "fresh_prepare_after_cooldown")
                 or receipt.get("action_token_sha256") != hashlib.sha256(state["action_token"].encode()).hexdigest()
                 or state.get("review_interruption_fingerprint") != evidence.file_fingerprint(attempt_root / "review-interruption.json")
                 or action.get("review_interruption_fingerprint") != state["review_interruption_fingerprint"]
