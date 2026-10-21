@@ -517,9 +517,10 @@ def _prompt(action_file: Path) -> str:
         workflow_requirement = "只按该流程固定审核项判断，不得读取其他流程规则或证据；"
     if workflow_key in {"business_entertainment", "general_expense", "tpm_small_marketing_fee"}:
         workflow_requirement += _INVOICE_LINKAGE_REQUIREMENT
+    from . import read_material
     material_reading = (
-        "材料先运行 `python3 -m apps.oa_finance_preaudit.read_material "
-        + shlex.quote(str(action_file))
+        "材料先原样运行 `"
+        + read_material.command(action_file)
         + "` 读取；这是冻结材料的无损表格视图，列名后每行按列顺序给值，"
         "absent 表示原记录不存在的字段。保留原始读取状态与证据归属。"
         "完整读完视图即完成材料文本读取，无需再重复展开同一 material.json；"

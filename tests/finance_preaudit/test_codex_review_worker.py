@@ -208,7 +208,8 @@ def test_host_request_reads_complete_material_view_for_every_finance_workflow(
     monkeypatch.setattr(host_chat_review, "await_result", lambda _: {"status": "recorded"})
     assert host_chat_review.review(task) == {"status": "recorded"}
     prompt, = prompts
-    assert f"python3 -m apps.oa_finance_preaudit.read_material {action_file}" in prompt
+    from apps.oa_finance_preaudit import read_material
+    assert read_material.command(action_file) in prompt
     assert "完整读完视图即完成材料文本读取，无需再重复展开同一 material.json" in prompt
     assert "审核包、流程规则和必要附件内容仍须完整读取" in prompt
     assert "DeepSeek HTTP API" in prompt
@@ -474,7 +475,7 @@ def test_entertainment_worker_delivers_attribution_rule_and_preserves_preview(
         "assert '## 支付事实与费用归属' in rule.read_text()\n"
         + f"sys.path.insert(0,{str(Path(__file__).resolve().parents[2])!r})\n"
         "from apps.oa_finance_preaudit import read_material\n"
-        "command=re.search(r'`(python3 -m apps.oa_finance_preaudit.read_material [^`]+)`',prompt)\n"
+        "command=re.search(r'`([^`]+ -m apps.oa_finance_preaudit.read_material [^`]+)`',prompt)\n"
         "assert command\n"
         "view=read_material.read(Path(shlex.split(command.group(1))[-1]))\n"
         + f"assert all(fact in view for fact in {facts!r})\n"

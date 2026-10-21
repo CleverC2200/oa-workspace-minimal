@@ -43,17 +43,19 @@ App 等待异常保留主码 `host_review_exchange_failed`；写前完成异常�
 1. 保留原 `execution.json`、`invocation_id` 和工具 `session_id`，按上方入口绑定原 session。用本轮父会话的 3 次真实 spawn 回执登记槽位。来源行必须指向原生工具调用及其已完成输出；来源文件和路径不能猜测。命令中 3 组子会话文件、spawn 行按槽位 0、1、2 排列。
 
 ```bash
-python -B -m apps.oa_finance_preaudit.host_chat_review --operation register --owner-task-id <主会话UUID> --source-session-file <父原生会话jsonl> --reviewer-session-file <槽0子会话jsonl> --spawn-line <槽0spawn行> --reviewer-session-file <槽1子会话jsonl> --spawn-line <槽1spawn行> --reviewer-session-file <槽2子会话jsonl> --spawn-line <槽2spawn行> --receipt-file <原execution.json> --invocation-id <原调用ID> --tool-session-id <原session_id>
+uv run --quiet python -X utf8 -B -m apps.oa_finance_preaudit.host_chat_review --operation register --owner-task-id <主会话UUID> --source-session-file <父原生会话jsonl> --reviewer-session-file <槽0子会话jsonl> --spawn-line <槽0spawn行> --reviewer-session-file <槽1子会话jsonl> --spawn-line <槽1spawn行> --reviewer-session-file <槽2子会话jsonl> --spawn-line <槽2spawn行> --receipt-file <原execution.json> --invocation-id <原调用ID> --tool-session-id <原session_id>
 ```
 
-2. 注册回执成功后，在下一次独立原生 `functions.exec` 中续首次父任务心跳，再读取 pending。注册与首次心跳不得合并在同一次原生调用中；其来源时间早于注册时，心跳拒绝且不会续租。控制器在可信首次心跳前保持自身心跳，不取材或发布请求；注册与首次心跳共用原清单开始时间的 900 秒宽限，轮询不重新计时。等待期间 pending 为空不代表队列已完成。随后每次取得可信进度后读取当前请求，并在 60 秒以内续一次父任务心跳。App 父租约独立为 300 秒，用于容忍原生派单和工具调度超过 45 秒；控制器自身的 45 秒进程心跳门保持原值。父租约到期阈值为 5 分钟，到期后的下一次既有检查拒绝派单和结果，控制器观察器再请求停止。原进程身份丢失及显式停止仍在原检查点生效；单据截止时间约束首次可信接收，已按时接收的决定继续遵守上述 FIFO 与写前门禁。心跳必须来自主会话本次已落盘的原生调用，父会话 UUID 和实际调用时间均需可信。可在当前原生 exec 内调用 `source_anchor(owner=owner, operation="heartbeat")` 取得当前来源，再调用 `heartbeat(owner=owner, **anchor)`；重复旧来源不延长租约。维持原工具 session 的等待；不得等待直到控制器退出才派单。心跳到期后，新增派单和结果接收在下一次检查时拒绝，不把等待超时当审批重试授权。
+2. 注册回执成功后，在下一次独立原生 `functions.exec` 中续首次父任务心跳，再读取 pending。注册与首次心跳不得合并在同一次原生调用中；其来源时间早于注册时，心跳拒绝且不会续租。控制器在可信首次心跳前保持自身心跳，不取材或发布请求；注册与首次心跳共用原清单开始时间的 900 秒宽限，轮询不重新计时。等待期间 pending 为空不代表队列已完成。随后每次取得可信进度后读取当前请求，并在 60 秒以内续一次父任务心跳。App 父租约独立为 300 秒，用于容忍原生派单和工具调度超过 45 秒；控制器自身的 45 秒进程心跳门保持原值。父租约到期阈值为 5 分钟，到期后的下一次既有检查拒绝派单和结果，控制器观察器再请求停止。原进程身份丢失及显式停止仍在原检查点生效；单据截止时间约束首次可信接收，已按时接收的决定继续遵守上述 FIFO 与写前门禁。心跳必须来自主会话本次已落盘的原生调用，父会话 UUID 和实际调用时间均需可信。心跳 CLI 默认从已登记父会话自动定位当前原生调用，续期与 pending 快照在同次调用完成；重复旧来源不延长租约。维持原工具 session 的等待；不得等待直到控制器退出才派单。心跳到期后，新增派单和结果接收在下一次检查时拒绝，不把等待超时当审批重试授权。
 
 ```bash
-python -B -m apps.oa_finance_preaudit.host_chat_review --operation heartbeat --include-pending --owner-task-id <主会话UUID> --run-id <本轮run_id> --source-session-file <父原生会话jsonl> --source-line <本次heartbeat工具行>
-python -B -m apps.oa_finance_preaudit.host_chat_review --operation status --owner-task-id <主会话UUID> --run-id <本轮run_id>
+uv run --quiet python -X utf8 -B -m apps.oa_finance_preaudit.host_chat_review --operation heartbeat --include-pending --owner-task-id <主会话UUID> --run-id <本轮run_id>
+uv run --quiet python -X utf8 -B -m apps.oa_finance_preaudit.host_chat_review --operation status --owner-task-id <主会话UUID> --run-id <本轮run_id>
 ```
 
-`heartbeat --include-pending` 在续真实父心跳后返回本轮 requests 和 round，复用同次来源及既有 pending/status 校验。需自动定位当前心跳行时，在当前原生 exec 内使用上面的 Python `source_anchor`；只有心跳允许引用当前尚未返回的 exec。
+`heartbeat --include-pending` 返回 requests、round、下一次续期期限 `renew_by`、实际到期时间 `expires_at`、有界等待建议 `max_wait_seconds` 和可原样调用的 `next_invocation`。等待最多使用建议秒数，返回后先执行下一次心跳，再处理派单和结果。建议为零时立即续期；旧来源不会获得新的期限。显式 source 文件与行号必须同时提供，只有心跳允许引用当前尚未返回的 exec。
+
+父会话只监督取回、派单和提交，不在活动轮次内展开业务复核或长篇故障分析。需要较长分析时先按统一协议收尾。以上入口减少漏续步骤，不能保证模型或桌面在 300 秒内再次调度；没有新鲜真实父调用时继续停止，不通过后台进程、旧来源或延长租约维持运行。
 
 3. 请求文件名绑定本轮 owner，保留旧轮同 attempt 的请求、决定和提交证据。pending 只发现本轮注册表登记且属于当前 progress 的请求；派单使用返回的绝对路径，不拼接固定文件名。对 pending 返回的本轮请求，调用空闲原 Agent 的 `followup_task`，只传请求绝对路径和当前单据边界。保留该次真实工具调用来源；它完成后执行 assign，把请求绑定到原槽位。一个槽位有未交回请求时不能再派单。dispatch 的原生时间、请求指纹、子会话和来源必须匹配。
 
@@ -64,45 +66,37 @@ pending 的 round 及独立 status 返回本轮原 3 槽、可用容量和失败
 派单来源必须是登记过的父会话文件，同一个原生 call_id 或来源行只能绑定一个请求；同请求、同槽、同来源的重复 assign 保持幂等。明文 message 仍核对请求路径。App 原生记录使用当前已识别的有界 opaque 格式时，只记录 dispatch_message_readable=false，不宣称正文或当前请求已送达；当前请求归属必须继续由已登记子会话真实 write-draft 调用及其专用回执中的相同 request SHA-256 确认。缺确认、不同请求、错槽、过期或已关闭均拒绝，不读取密钥或解密日志。
 
 ```bash
-python -B -m apps.oa_finance_preaudit.host_chat_review --operation assign --owner-task-id <主会话UUID> --run-id <本轮run_id> --request-file <本轮request.json> --slot <0或1或2> --source-session-file <父原生会话jsonl> --source-line <本次followup行>
+uv run --quiet python -X utf8 -B -m apps.oa_finance_preaudit.host_chat_review --operation assign --owner-task-id <主会话UUID> --run-id <本轮run_id> --request-file <本轮request.json> --slot <0或1或2> --source-session-file <父原生会话jsonl> --source-line <本次followup行>
 ```
 
 真实 followup 完成后，可用下列入口定位已登记父会话中本请求、原槽位的调用。它按原生工具类型和配对输出校验，不把 exec 中提到 followup 的文本当作派单；未完成调用、失败输出或错轮次拒绝。返回 `source`、`source_line` 及 `next_invocation`（固定 cmd 与绝对 workdir），可直接交给 `tools.exec_command` 执行 assign；assign 仍复验请求、截止、槽位和幂等，定位本身不分配请求。
 
 ```bash
-python -B -m apps.oa_finance_preaudit.host_chat_review --operation source-anchor --anchor-operation followup_task --owner-task-id <主会话UUID> --run-id <本轮run_id> --request-file <本轮request.json> --slot <0或1或2>
+uv run --quiet python -X utf8 -B -m apps.oa_finance_preaudit.host_chat_review --operation source-anchor --anchor-operation followup_task --owner-task-id <主会话UUID> --run-id <本轮run_id> --request-file <本轮request.json> --slot <0或1或2>
 ```
 
 财务请求过期时，控制器只在原请求、冻结输入和未写入证据可信后撤销该项授权并隔离；其他槽位按原 FIFO 继续，失败项不在本轮重领。失败槽位仍占用，主线程先中断该原 Agent，再取得失败发生后的原生 `list_agents` 空闲、完成或已中断状态，调用 `release-failed-slot` 验证并释放。只有释放成功才给该槽位下一单。来源、共享身份或未知写入不可信时仍停止整轮。
 
 ```bash
-python -B -m apps.oa_finance_preaudit.host_chat_review --operation release-failed-slot --owner-task-id <主会话UUID> --run-id <本轮run_id> --request-file <失败请求绝对路径> --source-session-file <父原生会话jsonl> --source-line <失败后list_agents行>
+uv run --quiet python -X utf8 -B -m apps.oa_finance_preaudit.host_chat_review --operation release-failed-slot --owner-task-id <主会话UUID> --run-id <本轮run_id> --request-file <失败请求绝对路径> --source-session-file <父原生会话jsonl> --source-line <失败后list_agents行>
 ```
 
-4. 子 Agent 读取当前请求提示词、规则和冻结材料，形成本单决定或包装草稿。保存只使用专用 `write-draft`，目标必须是尚不存在的私有文件。先在本轮有效控制环境中调用 `host_chat_review.draft_command(Path(request_file), Path(decision_file), payload, owner=owner)`，取得固定发布命令。命令在 `uv run --quiet python -B -m ... --operation write-draft` 前携带 `/usr/bin/env` 及本轮 controller lock、stop file 的绝对路径，使独立原生 exec 使用相同控制目录；仅传这两项路径，核验时须与本轮完全一致。已有原生记录中的规范 bare uv 命令仍可核验。此仓库无 pyproject.toml，不使用会产生项目警告的 no-sync；发布只返回一个 JSON 回执。payload 是审核者形成的原 JSON；不手工拼接 shell 参数，不使用通用写文件脚本，不覆盖已有文件。
+4. 子 Agent 读取当前请求提示词、规则和冻结材料，形成本单决定或包装草稿。材料使用请求提示中的完整读取命令；它绑定当前解释器的绝对路径，并显式使用 UTF-8，不依赖 PATH 中的裸 python。附图工具导航沿用同一解释器。
 
-将该完整命令用 JSON 字符串字面量填入下方 cmd，再执行一个独立原生 exec。整个调用只含这一条表达式，不附加变量、注释、分支或其他工具。此示例中的占位文字必须替换为 draft_command 返回值，不能照字面执行：
+发布直接使用本次请求提示中的原生 `functions.exec` 模板，将 `JSON.stringify(本单原始JSON对象)` 的占位内容替换为完整 JSON 对象。JSON 只填写一次；由模板在本次调用中编码和 shell 引用后交给专用 write-draft。不再运行 Python heredoc 生成长命令，也不再转抄第二份证据引用。`draft_invocation` 是该模板的唯一生成器。
 
-准备命令时用标准 JSON 编码器生成整条原生调用，再原样执行输出，避免手工转义或模板字符串破坏来源合同。下面只生成文本，不发布草稿；`command` 是上一步 `draft_command` 的完整返回值：
+模板绑定本轮 owner、请求、尚不存在的私有决定文件、当前源码目录、controller lock 和 stop file。发布通过 uv 固定选择 Python 3.11，并显式使用 `-X utf8`；相对或其他 workdir 拒绝。整个原生调用仅含该单表达式，JSON 对象以外不添加变量、分支、注释或工具。校验器只静态解码受限模板，不执行 JavaScript。
 
-```python
-print('text(await tools.exec_command(' + json.dumps({'cmd': command}, ensure_ascii=False) + '));')
-```
+既有规范字面量发布和历史 bare uv 来源继续只读接受，原请求、配对输出及决定字节指纹仍必须一致。新审核按请求模板发布。子 Agent 交回专用回执及决定路径后返回空闲；来源行由主会话在已登记子会话定位。
 
-草稿发布后的来源行由主聊天从已登记子会话定位；子 Agent 交回专用回执及决定路径即可返回空闲。
-
-默认工具目录与审核工作树不同的时候，可在 exec_command 的同一个 JSON 对象中增加 workdir。其值必须是当前审核项目根目录的完整绝对路径，与宿主 PROJECT_ROOT 字符串完全一致；其他目录、相对路径及其他工具参数仍拒绝。cmd 和专用发布回执的校验保持相同。
-
-```javascript
-text(await tools.exec_command({"cmd":"完整规范命令字符串"}));
-```
+模型 JSON 与发布 JSON 逐字段核对，数组顺序及引用逐字一致。JSON number 的等值表示如 120.0 与 120 可以匹配，布尔值不等于数值，整数精度变化仍拒绝。实际发布文件必须保持专用接口的规范字节，并与原生配对回执的 SHA-256 完全一致。
 
 等该次原工具输出实际结束、exit_code=0，且 stdout 的专用发布回执匹配当前 request_id、request_sha256、目标文件和决定字节 SHA-256，再用其来源行 submit。仅文件存在、调用中提到路径、另一个命令成功或自行打印的成功对象均不构成证据。正在执行的 submit 不能充当自己的已完成发布证据。子 Agent 只交回决定，不调用 OA 完成动作。主对话保持心跳并等待原控制器，Writer 仍按认领顺序管理。
 
 原生日志可能在一次图片观察输出中内嵌多张大图。来源扫描按小块读取，保持原行号，跳过指定来源调用之前超过 32 MiB 的非目标记录；父心跳查找也跳过这些不可用作来源的记录。会话头、被引用调用及配对输出仍须在原 32 MiB 上限内，并按原字节计算指纹。调用之后、配对结果之前遇到超限记录时，无法确认它是否为目标输出，仍拒绝接收。原日志不改写；逐页业务观察要求不变。
 
 ```bash
-python -B -m apps.oa_finance_preaudit.host_chat_review --operation submit --owner-task-id <主会话UUID> --request-file <本轮request.json> --decision-file <本单私有决定json> --source-session-file <已登记子会话jsonl> --source-line <已完成决定写入行>
+uv run --quiet python -X utf8 -B -m apps.oa_finance_preaudit.host_chat_review --operation submit --owner-task-id <主会话UUID> --run-id <本轮run_id> --request-file <本轮request.json> --decision-file <本单私有决定json> --source-session-file <已登记子会话jsonl> --source-line <已完成决定写入行>
 ```
 
 财务原工具 session 和原回执均确认 completed、children_reaped=true，且新鲜结束门禁可信、Writer 空闲后，执行 `host_chat_review --operation enter-packaging --owner-task-id <主会话UUID>`。该操作只推进同轮阶段，不重启控制器，不增加 Agent；包装请求继续使用上方 pending、followup、assign、submit。包装业务确认和完成动作见[包装审核](packaging-review.md)。包装主审请求还必须由 App 完成入口产生可信 app-completion.json，绑定语义确认、决定、闭合 action/state、执行回执和文件指纹；独立复核请求只是只读结果，不代替 OA 完成。仅主审 submitted 或 draft_ready 时 normal close 拒绝，不能直接把本轮报完成。包装及结束对账完成后，执行下面的统一收尾。
@@ -128,7 +122,7 @@ python -B -m apps.oa_finance_preaudit.host_chat_review --operation submit --owne
 原控制器已失败退出、三个原生审核者尚未登记时，使用 `finish-unregistered-shutdown`。保留原 execution、清单、日志和 progress；取得原 session 的真实 terminal wait、原三个 spawn、interrupt 和最后 list_agents 来源，再将这些来源交给该入口。它只接受没有 action、准备/审核执行及 Writer 活动的失败轮，核对原进程已退出、回收、身份和时间顺序，独占新增 `pre-registration-shutdown.json`；原部分回执保持原字节，业务结果继续为失败。
 
 ```bash
-python -B -m apps.oa_finance_preaudit.host_chat_review --operation finish-unregistered-shutdown --owner-task-id <原父会话UUID> --receipt-file <原execution.json> --invocation-id <原调用ID> --tool-session-id <原session_id> --source-session-file <原父会话jsonl> --reviewer-session-file <槽0子会话jsonl> --spawn-line <槽0spawn行> --reviewer-session-file <槽1子会话jsonl> --spawn-line <槽1spawn行> --reviewer-session-file <槽2子会话jsonl> --spawn-line <槽2spawn行> --interrupt-line <槽0interrupt行> --interrupt-line <槽1interrupt行> --interrupt-line <槽2interrupt行> --source-line <最终list_agents行> --wait-line <原session终态wait行>
+uv run --quiet python -X utf8 -B -m apps.oa_finance_preaudit.host_chat_review --operation finish-unregistered-shutdown --owner-task-id <原父会话UUID> --receipt-file <原execution.json> --invocation-id <原调用ID> --tool-session-id <原session_id> --source-session-file <原父会话jsonl> --reviewer-session-file <槽0子会话jsonl> --spawn-line <槽0spawn行> --reviewer-session-file <槽1子会话jsonl> --spawn-line <槽1spawn行> --reviewer-session-file <槽2子会话jsonl> --spawn-line <槽2spawn行> --interrupt-line <槽0interrupt行> --interrupt-line <槽1interrupt行> --interrupt-line <槽2interrupt行> --source-line <最终list_agents行> --wait-line <原session终态wait行>
 ```
 
 新 App 轮次启动时复核原 execution 的收尾，包含未登记的失败轮；全局 ready、进程消失或待办为空不能代替该回执。来源缺失或存在取材、审核、写入时保持阻断，沿隔离排障入口处理。
@@ -165,7 +159,7 @@ python -B -m apps.oa_finance_preaudit.host_chat_review --operation finish-unregi
 4. 调用 `finish-shutdown`，提供同一父原生来源文件、按槽位顺序的 3 个 interrupt 行、最终 list_agents 行以及原 write_stdin 行。它检查时间顺序和配对输出摘要，保留精简来源证明。正常完成额外执行财务及包装原闭合门禁。缺证据时保持 pending，可继续监督并补齐证据。若正常计划期间发生取消，重新 begin-shutdown 以已记录的取消原因降为异常计划，原冻结时点保持不变；不能升级回正常计划。此时不能把它当成功或重启原审批。verified 后才结束父回合。
 
 ```bash
-python -B -m apps.oa_finance_preaudit.host_chat_review --operation begin-shutdown --owner-task-id <主会话UUID> --reason <原因>
+uv run --quiet python -X utf8 -B -m apps.oa_finance_preaudit.host_chat_review --operation begin-shutdown --owner-task-id <主会话UUID> --reason <原因>
 ```
 
 ```javascript
@@ -175,7 +169,7 @@ text(await tools.write_stdin({"session_id":12345,"chars":"","yield_time_ms":1000
 等待调用继续优先使用上方 JSON 引号键。收尾读取器也接受同一白名单属性的无引号 JavaScript 名称，值限 JSON 字符串或非负整数字面量；变量、计算属性、表达式、重复键及附加语句均拒绝。历史调用在唯一原 session 末尾 wait 前至多顺序执行两个固定字面量调用，也可兼容核验。前置调用可为 `text(await tools.exec_command({...}));`，参数限 cmd、workdir、max_output_tokens、yield_time_ms；或其他不同 session 的空 stdin `write_stdin`，且其真实结果必须已终态、退出 0。原 session 不得提前出现，前置轮询的 session 也不得重复。每个调用均须有按序配对的真实终态结果，数量必须一致，最终退出只取原 session 的末尾 wait。原 session 重复 wait、前置轮询非零或仍等待、尾随命令、动态参数、额外或缺失结果继续拒绝。兼容只解析原始调用，不执行 JavaScript，不改原生来源或配对输出；原会话、真实退出、回收及 Writer 校验保持。
 
 ```bash
-python -B -m apps.oa_finance_preaudit.host_chat_review --operation finish-shutdown --owner-task-id <主会话UUID> --source-session-file <父原生会话jsonl> --interrupt-line <槽0interrupt行> --interrupt-line <槽1interrupt行> --interrupt-line <槽2interrupt行> --source-line <最终list_agents行> --wait-line <原session真实终态wait行>
+uv run --quiet python -X utf8 -B -m apps.oa_finance_preaudit.host_chat_review --operation finish-shutdown --owner-task-id <主会话UUID> --source-session-file <父原生会话jsonl> --interrupt-line <槽0interrupt行> --interrupt-line <槽1interrupt行> --interrupt-line <槽2interrupt行> --source-line <最终list_agents行> --wait-line <原session真实终态wait行>
 ```
 
 CLI 的旧 `close` 操作也走相同收尾核验，不能省略证明参数。Python 内部 `close()` 只负责 exchange 止损，供父链失效观察器等使用，不构成主回合退出许可。突然失去整个父会话时仍由原父链门和300秒租约止损；没有活着的 App 主对话就无法补发原生中断。机器断电、App崩溃或所有保护进程同时被强杀不保证完整收尾，结果缺失保持 unknown。
