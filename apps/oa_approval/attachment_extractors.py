@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import date, datetime
 import hashlib
 import os
@@ -1036,6 +1037,40 @@ def prepare_materials(
     validation_manifest: List[Dict[str, Any]] = []
     structured_contents: List[Dict[str, Any]] = []
     out_dir.mkdir(parents=True, exist_ok=True)
+    prepared_contents: dict[tuple[str, str], tuple[list, list, list]] = {}
+
+    def prepare(item: Dict[str, Any], target_manifest: list) -> None:
+        path = Path(str(item.get("path") or "")).expanduser()
+        key = None
+        if path.suffix.lower() in SPREADSHEET_EXTS | LEGACY_SPREADSHEET_EXTS and path.is_file():
+            key = (path.suffix.lower(), _file_sha256(path))
+        cached = prepared_contents.get(key) if key is not None else None
+        destinations = (images, target_manifest, structured_contents)
+        if cached is not None:
+            for sources, destination in zip(cached, destinations):
+                for source in sources:
+                    entry = deepcopy(source)
+                    entry["resource_id"] = str(item.get("resource_id") or "")
+                    entry["name"] = str(item.get("name") or path.name)
+                    entry.pop("parent_resource_id", None)
+                    if destination is not target_manifest and item.get("parent_resource_id"):
+                        entry["parent_resource_id"] = str(item["parent_resource_id"])
+                    destination.append(entry)
+            return
+        starts = [len(destination) for destination in destinations]
+        _prepare_one_attachment(
+            item, out_dir=out_dir, images=images, manifest=target_manifest,
+            structured_contents=structured_contents, compact_pdf=compact_pdf,
+            compact_spreadsheet=compact_spreadsheet,
+        )
+        if key is not None and all(
+            entry.get("status") in SUCCESSFUL_PREPARATION_STATUSES | SKIPPED_PREPARATION_STATUSES
+            for entry in target_manifest[starts[1]:]
+        ):
+            prepared_contents[key] = tuple(
+                deepcopy(destination[start:]) for destination, start in zip(destinations, starts)
+            )
+
     for item in attachments:
         extracted = (
             item.get("extracted_files")
@@ -1047,15 +1082,7 @@ def prepare_materials(
             image_count_before = len(images)
             for child in extracted:
                 if isinstance(child, dict):
-                    _prepare_one_attachment(
-                        child,
-                        out_dir=out_dir,
-                        images=images,
-                        manifest=child_manifest,
-                        structured_contents=structured_contents,
-                        compact_pdf=compact_pdf,
-                        compact_spreadsheet=compact_spreadsheet,
-                    )
+                    prepare(child, child_manifest)
             validation_manifest.extend(child_manifest)
             manifest.append(
                 {
@@ -1069,15 +1096,7 @@ def prepare_materials(
             )
         else:
             manifest_count_before = len(manifest)
-            _prepare_one_attachment(
-                item,
-                out_dir=out_dir,
-                images=images,
-                manifest=manifest,
-                structured_contents=structured_contents,
-                compact_pdf=compact_pdf,
-                compact_spreadsheet=compact_spreadsheet,
-            )
+            prepare(item, manifest)
             validation_manifest.extend(manifest[manifest_count_before:])
     if any(
         str(item.get("status") or "") not in SUCCESSFUL_PREPARATION_STATUSES | SKIPPED_PREPARATION_STATUSES

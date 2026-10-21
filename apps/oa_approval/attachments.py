@@ -1600,6 +1600,33 @@ def download_resources(
             runtime_control.stop_error("已请求停止财务预审，停止本单附件下载")
         ]
 
+    content_paths: dict[tuple[str, str], Path] = {}
+    content_lock = threading.Lock()
+
+    def share_content(path: Path, *, newly_downloaded: bool = False) -> Path:
+        digest = _attachment_content_sha256(path)
+        if not digest:
+            raise RuntimeError("attachment_content_unreadable")
+        key = (path.suffix.lower(), digest)
+        with content_lock:
+            previous = content_paths.setdefault(key, path)
+            if (
+                newly_downloaded and path != previous
+                and path.parent.resolve() == dest_dir.resolve()
+                and not path.is_symlink()
+            ):
+                path.unlink()
+            return previous
+
+    def download(resource: Dict[str, Any]) -> Tuple[Path | None, str]:
+        path, error = _download_resource_direct(
+            resource, dest_dir=dest_dir, timeout_sec=timeout_sec,
+            original_batch=original_batch,
+        )
+        if path is not None and not error:
+            path = share_content(path, newly_downloaded=True)
+        return path, error
+
     outcomes: List[Dict[str, Any]] = [{} for _item in targets]
     pending: List[tuple[int, Dict[str, Any]]] = []
     original_batch = None
@@ -1637,6 +1664,7 @@ def download_resources(
         if cached_entry:
             cached_item = _manifest_entry_to_item(dest_dir, resource, cached_entry)
             if cached_item:
+                cached_item["path"] = str(share_content(Path(cached_item["path"])))
                 outcomes[index] = {"item": cached_item}
                 continue
         pending.append((index, resource))
@@ -1647,19 +1675,7 @@ def download_resources(
     worker_count = _download_worker_count(len(pending), raw_concurrency)
     if pending:
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = [
-                (
-                    index,
-                    executor.submit(
-                        _download_resource_direct,
-                        resource,
-                        dest_dir=dest_dir,
-                        timeout_sec=timeout_sec,
-                        original_batch=original_batch,
-                    ),
-                )
-                for index, resource in pending
-            ]
+            futures = [(index, executor.submit(download, resource)) for index, resource in pending]
             for index, future in futures:
                 try:
                     path, err = future.result()
@@ -1689,6 +1705,8 @@ def download_resources(
                     dest_dir=dest_dir,
                     timeout_sec=timeout_sec,
                 )
+                if path is not None and not err:
+                    path = share_content(path, newly_downloaded=True)
             item = None
         if err:
             code = download_error_code(err)

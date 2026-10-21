@@ -2,6 +2,8 @@
 
 沿用 `scripts.quality` 和现有 GitHub quality workflow，不增加另一套检查平台。
 
+附件内容复用由 `test_attachment_content_reuse.py` 经真实下载、准备和 `collect_case` 入口检查。相同名称但内容不同仍分别保存，每个附件 ID 独立读取并保留明细归属；相同正文复用下载文件，Excel 复用解析产物，不删除旧 attempt 的缓存文件。历史 67 份工作簿重复保存及重复提图的形状在旧实现上分别触发路径数量、提取次数与采集文件数量断言失败；DOCX、压缩包内图片与视频的反例保护原有子附件身份。该文件沿用下方本地及 CI 的 pytest 集合。
+
 - `payment-rules`：用 AST 读取 Worker，不导入业务代码。阻止 Worker 字符串再次写入人员关系、委托代付款或委托收款指令，报错指向共享付款规则。此检查只约束已发生的重复提示词，不判断实际材料，也不保证模型语义正确。历史 `ec9c4a1` 的原指令会触发检查；当前 Worker 通过，脱敏原句回归由 `test_quality_gates.py` 在本地及 CI 同一 pytest 入口运行。
 
 - `yaml`：安全解析受版本控制的 YAML，拒绝重复键，采用 YAML 1.2 布尔值约定。Issue form 检查基本结构、非空标题、字段类型、唯一 ID、下拉选项及 required 布尔值；这是本项目固定合同检查，不代表 GitHub 平台的全部限制。

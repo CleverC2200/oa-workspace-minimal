@@ -700,7 +700,7 @@ class TestReadAdaptersContract:
             "resource-a",
             "resource-b",
         ]
-        assert len({Path(str(item["path"])).name for item in downloaded}) == 2
+        assert len({Path(str(item["path"])).name for item in downloaded}) == 1
 
     def test_attachment_cache_is_scoped_by_request_and_flow(self) -> None:
         class RecordedResponse(io.BytesIO):
