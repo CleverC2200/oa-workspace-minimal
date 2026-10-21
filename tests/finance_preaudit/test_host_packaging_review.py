@@ -303,6 +303,37 @@ def test_required_recheck_uses_another_existing_slot_before_parent_acceptance(pa
     assert accepted['recheck_result']['assignment']['slot'] == 1
 
 
+@pytest.mark.parametrize('scope', ['before_dispatch', 'current_dispatch'])
+@pytest.mark.parametrize('damage', ['missing_output', 'invalid_output'])
+def test_packaging_submission_pairs_only_current_dispatch_image_calls(package_round, scope, damage):
+    path, _, owner, child = package_round
+    if scope == 'current_dispatch':
+        request, child = assigned_package(package_round)
+    original = json.loads(path.with_name('material.json').read_text())['prepared']['images'][0]['path']
+    native_exec(child, 'const r=await tools.view_image({path:' + json.dumps(original) + '});image(r.image_url);',
+        'damaged-image-call', 'not-json')
+    if damage == 'missing_output':
+        child.write_bytes(b''.join(child.read_bytes().splitlines(keepends=True)[:-1]))
+    if scope == 'before_dispatch':
+        request, child = assigned_package(package_round)
+    observe_pages(path, child)
+    target = request.parent / 'scoped-draft.json'
+    line = draft_source(child, request, target, owner, payload=envelope(path), call_id='scoped-publication')
+    original_source = child.read_bytes()
+    if scope == 'current_dispatch':
+        with pytest.raises(ValueError, match='host_review_source_untrusted'):
+            host.submit(request, target, owner=owner, source=child, source_line=line)
+    else:
+        host.submit(request, target, owner=owner, source=child, source_line=line)
+        reviewed = host.poll_result(request)
+        assert reviewed['status'] == 'reviewed'
+        proof = reviewed['source']
+        raw_lines = original_source.splitlines(keepends=True)
+        assert proof['line_sha256'] == hashlib.sha256(raw_lines[line - 1]).hexdigest()
+        assert proof['output_sha256'] == hashlib.sha256(raw_lines[proof['output_line'] - 1]).hexdigest()
+    assert child.read_bytes() == original_source
+
+
 @pytest.mark.parametrize('damage', ['stale', 'path_only', 'failed_image'])
 def test_app_packaging_does_not_treat_stale_or_failed_tools_as_reading(package_round, damage):
     path, _, owner, _ = package_round
