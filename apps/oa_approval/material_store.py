@@ -262,6 +262,12 @@ class MaterialStore:
     @contextmanager
     def _owner_eligible(self, entry: dict):
         path = _path(Path(entry['path']))
+        if self._inside_source_checkout(path):
+            yield False
+            return
+        if path.is_relative_to(self.root / 'experiments'):
+            yield entry['status'] in {'disposable', 'deletion_planned'} and not self._protected(path)
+            return
         owner = next((parent for parent in path.parents if (parent / 'state.json').exists()
                       or (parent / 'action.json').exists()), None)
         if owner is None:
@@ -331,10 +337,14 @@ class MaterialStore:
                 self._save(state)
         return freed
 
+    def _inside_source_checkout(self, path: Path) -> bool:
+        return any((parent / '.git').exists() and path.relative_to(parent).parts[0] != 'runtime'
+                   for parent in path.parents)
+
     def _protected(self, path: Path) -> bool:
+        if self._inside_source_checkout(path):
+            return True
         for parent in path.parents:
-            if (parent / '.git').exists() and path.relative_to(parent).parts[0] != 'runtime':
-                return True
             state_file = parent / 'state.json'
             if state_file.exists() or (parent / 'action.json').exists():
                 try:

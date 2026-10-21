@@ -83,6 +83,45 @@ def test_capacity_reclaims_closed_attempt_attachments_but_keeps_active_materials
     assert store.retired_materials()[0]['source']['request_id'] == '101'
 
 
+@pytest.mark.parametrize('location', ['git_scratch', 'nested_git_runtime', 'git_runtime', 'managed_experiment'])
+def test_closed_state_cannot_make_source_or_unfinished_experiment_disposable(tmp_path, location):
+    import hashlib
+    import json
+    import subprocess
+
+    store = MaterialStore(tmp_path / 'private', limit_bytes=4096)
+    if location != 'managed_experiment':
+        checkout = tmp_path / 'oa-workspace-dev'
+        subprocess.run(['git', 'init', '-q', str(checkout)], check=True)
+        if location == 'nested_git_runtime':
+            checkout = checkout / '.scratch/nested-checkout'
+            subprocess.run(['git', 'init', '-q', str(checkout)], check=True)
+        root = checkout / ('.scratch/fixture' if location == 'git_scratch' else 'runtime')
+    else:
+        root = store.root / 'experiments/trial'
+    received_at = '2026-10-20T00:00:00+00:00'
+    case = hashlib.sha256(f'101\x1f{received_at}'.encode()).hexdigest()
+    attempt = root / 'general_expense/cases' / case / 'attempt-1'
+    material = attempt / 'attachments/original.pdf'
+    material.parent.mkdir(parents=True)
+    material.write_bytes(b'123456')
+    (attempt / 'state.json').write_text(json.dumps({
+        'schema_version': 1, 'kind': 'preaudit_action', 'execution_state': 'closed',
+        'business_state': 'pass', 'write_state': 'submitted', 'workflow_key': 'general_expense',
+        'case_key': case, 'attempt': 1, 'request_id': '101', 'received_at': received_at, 'created_at': received_at,
+    }))
+    store.adopt_directory(root, source={'kind': 'legacy'})
+    used = store.report()['used_bytes']
+    result = store.reclaim(required_bytes=4096 - used + 1)
+    assert result['freed_bytes'] == (6 if location == 'git_runtime' else 0)
+    if location != 'git_runtime':
+        assert material.read_bytes() == b'123456'
+    if location == 'managed_experiment':
+        store.mark_disposable(material, closed=True, write_state='not_applicable')
+        result = store.reclaim(required_bytes=4096 - used + 1)
+        assert result['freed_bytes'] == 6
+
+
 def test_status_does_not_create_inventory(tmp_path):
     store = MaterialStore(tmp_path / 'private')
     assert store.report()['used_bytes'] == 0
