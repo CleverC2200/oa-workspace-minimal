@@ -197,9 +197,9 @@ python -m apps.oa_finance_preaudit.shutdown_stop_recovery \
 
 ## 本轮排除问题请求
 
-用户明确要求暂缓已知历史材料问题、继续其余待办时，可在滚动控制器追加 `--exclude-action-file /absolute/old/attempt/action.json --exclusion-issue ISSUE_NUMBER`。参数只对本次调用及其准备子进程生效，不进入默认调度。每项只接受主文件、原 action/state 身份与成功回执仍可信的历史 closed/submitted 动作，不要求读取已回收附件，也不将其历史完整性验证改成成功。
+用户明确要求暂缓已知历史材料问题、继续其余待办时，可在滚动控制器追加 `--exclude-action-file /absolute/old/attempt/action.json --exclusion-issue ISSUE_NUMBER`。参数只对本次调用及其准备子进程生效，不进入默认调度。每项接受主文件、原 action/state 身份与成功回执仍可信的历史 closed/submitted 动作；也接受最新、身份可信的 collecting/not_requested claim，且不得有决定、Writer 边界、意见、提交信封或执行回执。已有恢复回执仅绑定原字节，不认定恢复资格通过。排除不读取已回收附件，也不将历史完整性验证改成成功。
 
-原完整对账及其 blocked continuation 保留。执行范围投影只移除精确选中历史请求的身份冲突与相应待办数量，按流程及请求身份排除全部接收版本；后续刷新与恢复队列也排除同一请求。其余冲突、unknown/submitting、认证、冻结、授权、活动 Writer 及回收未知仍阻断。重复路径、相对路径、符号链接、缺失成功回执及原证据变动拒绝。不得用此入口恢复或重提被排除请求。
+原完整对账及 continuation 保留。执行范围投影只移除精确选中历史已提交请求的身份冲突、选中 collecting claim 的待办 finding 与相应待办数量，按流程及请求身份排除全部接收版本；后续刷新与恢复队列也排除同一请求。其余冲突、unknown/submitting、认证、冻结、授权、活动 Writer 及回收未知仍阻断。重复路径、相对路径、符号链接、缺失成功回执及原证据变动拒绝。不得用此入口恢复或重提被排除请求。
 
 执行收据明确记录 Issue、排除身份摘要、原文件身份及内容摘要，以及未修改的 raw_continuation；`historical_submission_verified=false` 表示本功能没有修复历史材料验证。控制器配置指纹绑定此收据，准备子进程重绑后必须与原收据完全相同。结束仍取得原控制器真实终态、Writer 空闲和 App 统一收尾证明，并分别报告已提交、排除及其他未解决项。
 
