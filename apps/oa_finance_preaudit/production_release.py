@@ -255,6 +255,8 @@ def release_source(
     confirmed_withdrawal: bool = False,
     failed_material_actions: tuple[Path, ...] = (),
     prepare_failure_recovery_preflight: bool = False,
+    excluded_action_files: tuple[Path, ...] = (),
+    exclusion_issue: int | None = None,
 ) -> dict:
     """Preflight, optionally ff-only sync, and verify while retaining both leases.
 
@@ -272,6 +274,15 @@ def release_source(
     material_proof = None
     material_fingerprints = None
     material_controls = None
+    exclusion_scope = None
+    exclusion_cron = None
+    if bool(excluded_action_files) != (exclusion_issue is not None):
+        raise RuntimeError('production_release_exclusion_binding_required')
+    if excluded_action_files:
+        if (stopped_maintenance or withdrawn_action is not None or failed_material_actions
+                or automation is None or original_execution is None):
+            raise RuntimeError('production_release_exclusion_binding_required')
+        exclusion_cron = _control_proof(_paused_cron(automation))
     if prepare_failure_recovery_preflight and (confirmed_sync or not failed_material_actions):
         raise RuntimeError('production_release_prepare_failure_preflight_invalid')
     if failed_material_actions:
@@ -314,6 +325,11 @@ def release_source(
     elif material_proof is None:
         _assert_no_stop(root)
     def assert_controls() -> None:
+        if exclusion_cron is not None:
+            if _control_proof(_paused_cron(automation)) != exclusion_cron:
+                raise RuntimeError('production_release_exclusion_controls_changed')
+            if exclusion_scope is not None:
+                exclusion_scope.verify()
         if withdrawal_cron is not None and _control_proof(_pinned_control(automation.file, private=False)) != withdrawal_cron:
             raise RuntimeError('production_release_withdrawal_controls_changed')
         if stopped_maintenance:
@@ -339,9 +355,9 @@ def release_source(
     loss_proof = None
     official_proof = None
     user_stop_proof = None
-    allow_admission_blocked = not stopped_maintenance and withdrawn_action is None and material_proof is None
+    allow_admission_blocked = not stopped_maintenance and withdrawn_action is None and material_proof is None and not excluded_action_files
     live = check_live or (lambda target: maintenance_runtime.read_live_status(target,
-        require_reaped=stopped_maintenance or withdrawn_action is not None or material_proof is not None,
+        require_reaped=stopped_maintenance or withdrawn_action is not None or material_proof is not None or bool(excluded_action_files),
         source_only_proof=material_proof or withdrawal_proof or loss_proof, official_stop_proof=official_proof,
         allow_admission_blocked=allow_admission_blocked))
     manifest_file = root / 'runtime/control/rolling-controller-manifest.json'
@@ -368,10 +384,16 @@ def release_source(
         if user_stop_proof is not None and report.get('owner_restart_proof') != user_stop_proof:
             raise RuntimeError('production_release_original_evidence_changed')
         return report
+    def read_snapshot() -> dict:
+        snapshot = live(root)
+        if exclusion_scope is not None:
+            exclusion_scope.verify()
+            return {**snapshot, 'reconciliation': exclusion_scope.project(snapshot['reconciliation'])}
+        return snapshot
     try:
         with maintenance_runtime.target_runtime_leases(root):
             assert_controls()
-            if stopped_maintenance or withdrawn_action is not None or material_proof is not None:
+            if stopped_maintenance or withdrawn_action is not None or material_proof is not None or excluded_action_files:
                 report = original_readback()
                 if supervisor_loss_source_only:
                     loss_proof = report['source_only_proof']
@@ -379,11 +401,17 @@ def release_source(
                     official_proof = report['official_stop_proof']
                 if user_stop_source_only:
                     user_stop_proof = report['owner_restart_proof']
+            if excluded_action_files:
+                from .request_exclusions import Scope
+                exclusion_scope = Scope.bind(root, excluded_action_files, issue=exclusion_issue)
+                pre_sync_evidence = {'request_exclusion_source_only': True,
+                    'execution_exclusions': exclusion_scope.receipt(),
+                    'approval_recovery_allowed': False, 'automation_state': 'PAUSED'}
             if withdrawn_action is not None:
                 from . import withdrawn_submission
                 withdrawal_observation = withdrawn_submission.observe(root, withdrawn_action)
                 withdrawal_proof = withdrawn_submission.source_proof(withdrawal_observation)
-            snapshot = live(root)
+            snapshot = read_snapshot()
             maintenance_runtime.assert_live_safe(snapshot, source_only_proof=material_proof or withdrawal_proof or loss_proof,
                 official_stop_proof=official_proof, allow_admission_blocked=allow_admission_blocked)
             if material_proof is not None:
@@ -394,6 +422,8 @@ def release_source(
                     'pre_sync_current_input_proof': snapshot['maintenance_current_inputs']}
             pre_sync_status = snapshot.get('maintenance_status_file')
             pre_sync_inputs = snapshot.get('maintenance_current_inputs')
+            if exclusion_scope is not None:
+                pre_sync_evidence.update(pre_sync_status_file=pre_sync_status, pre_sync_current_input_proof=pre_sync_inputs)
             if pre_sync_inputs and pre_sync_inputs.get('admission_blocked_actions'):
                 pre_sync_evidence = {'pre_sync_status_file': pre_sync_status,
                     'pre_sync_current_input_proof': pre_sync_inputs}
@@ -415,7 +445,7 @@ def release_source(
                 sync_started = True
                 _git(root, 'merge', '--ff-only', expected_revision)
                 allow_admission_blocked = False
-                snapshot = live(root)
+                snapshot = read_snapshot()
                 maintenance_runtime.assert_live_safe(snapshot, source_only_proof=material_proof or withdrawal_proof or loss_proof, official_stop_proof=official_proof)
                 if check_configuration is None:
                     from . import production_config
@@ -445,6 +475,9 @@ def release_source(
                 original_readback()
                 if snapshot['maintenance_current_inputs'].get('material_failure_fingerprints') != material_fingerprints:
                     raise RuntimeError('production_release_original_evidence_changed')
+            if exclusion_scope is not None:
+                original_readback()
+                exclusion_scope.verify()
             return {
                 'schema_version': 1, 'kind': 'production_source_release',
                 'status': 'synced' if confirmed_sync else 'ready',
@@ -453,11 +486,15 @@ def release_source(
                 'source_sync_state': 'updated' if after != before else 'not_updated',
                 'expected_revision': expected_revision, 'write_state': 'not_requested',
                 'source_sync_requested': confirmed_sync,
-                'next_process_ready': confirmed_sync and not stopped_maintenance and withdrawn_action is None and material_proof is None,
+                'next_process_ready': confirmed_sync and not stopped_maintenance and withdrawn_action is None and material_proof is None and exclusion_scope is None,
                 'production_acceptance': 'not_verified',
                 'status_file': snapshot.get('maintenance_status_file'),
                 'current_input_proof': snapshot.get('maintenance_current_inputs'),
-                'continuation': snapshot['reconciliation']['continuation'],
+                'continuation': (snapshot['reconciliation']['execution_exclusions']['raw_continuation']
+                    if exclusion_scope is not None else snapshot['reconciliation']['continuation']),
+                **({'execution_continuation': snapshot['reconciliation']['continuation'],
+                    'scoped_next_process_ready': confirmed_sync,
+                    'original_evidence_preserved': True} if exclusion_scope is not None else {}),
                 **pre_sync_evidence,
                 **({'material_failure_source_only': True, 'approval_recovery_allowed': False,
                     'original_evidence_preserved': True, 'automation_state': 'PAUSED',
@@ -511,6 +548,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--confirm-withdrawal', choices=('YES',))
     parser.add_argument('--preserve-material-failure', type=Path, action='append', default=[])
     parser.add_argument('--prepare-failure-recovery-preflight', choices=('YES',))
+    parser.add_argument('--exclude-action-file', type=Path, action='append', default=[])
+    parser.add_argument('--exclusion-issue', type=int)
     args = parser.parse_args(argv)
     before = _observed_revision(args.target_root)
     controls_before = None
@@ -521,7 +560,7 @@ def main(argv: list[str] | None = None) -> int:
             controls_before = _stopped_observation(args.target_root, automation,
                 official_stop_source_only=args.official_stop_source_only == 'YES')
         original = None
-        if args.stopped_maintenance == 'YES' or args.withdrawn_action_file is not None or args.preserve_material_failure:
+        if args.stopped_maintenance == 'YES' or args.withdrawn_action_file is not None or args.preserve_material_failure or args.exclude_action_file:
             if not all((args.original_receipt_file, args.original_owner_task_id, args.original_tool_session_id)):
                 raise RuntimeError('production_release_original_execution_required')
             original = maintenance_runtime.OriginalExecution(args.original_receipt_file,
@@ -534,7 +573,8 @@ def main(argv: list[str] | None = None) -> int:
                                  user_stop_source_only=args.user_stop_source_only == 'YES',
                                  withdrawn_action=args.withdrawn_action_file, confirmed_withdrawal=args.confirm_withdrawal == 'YES',
                                  failed_material_actions=tuple(args.preserve_material_failure),
-                                 prepare_failure_recovery_preflight=args.prepare_failure_recovery_preflight == 'YES')
+                                 prepare_failure_recovery_preflight=args.prepare_failure_recovery_preflight == 'YES',
+                                 excluded_action_files=tuple(args.exclude_action_file), exclusion_issue=args.exclusion_issue)
     except (OSError, ValueError, RuntimeError) as error:
         print(json.dumps(_failed_release(args.target_root, before, args.expected_revision, args.confirm_sync == 'YES', error,
             stopped_maintenance=args.stopped_maintenance == 'YES', automation=automation, controls_before=controls_before,

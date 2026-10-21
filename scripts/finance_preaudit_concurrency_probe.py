@@ -48,6 +48,7 @@ from apps.oa_finance_preaudit import (
     production_config,
     production_pending,
     reconciliation,
+    request_exclusions,
     review_failure_evidence,
     runtime_maintenance,
     session_alert,
@@ -1000,6 +1001,16 @@ def _deferred_action_states(
     return tuple(selected)
 
 
+def _filter_excluded_recoveries(scope, action_files: Sequence[Path]) -> tuple[Path, ...]:
+    rows = []
+    for path in action_files:
+        action, state = _read_object(path), _read_object(path.with_name('state.json'))
+        if any(key in action and action[key] != state.get(key) for key in ('request_id', 'workflow_key', 'received_at')):
+            raise ValueError('request_exclusion_untrusted')
+        rows.append({**state, 'recovery_action_file': str(path)})
+    return tuple(Path(row['recovery_action_file']) for row in scope.filter_candidates(rows))
+
+
 def _prepare_one(selection: PrepareSelection) -> dict:
     prepare_trace.stage("selection_contract")
     global_selection = False
@@ -1013,6 +1024,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
     admission_cutoff: datetime | None = None
     allowed_workflows = ROLLING_WORKFLOW_KEYS
     selected_targets: dict[tuple[str, str, str], dict] | None = None
+    exclusion_scope = None
 
     def failed(
         stage: str,
@@ -1087,6 +1099,15 @@ def _prepare_one(selection: PrepareSelection) -> dict:
             return failed("selection_contract")
         allowed_workflows = frozenset(raw_allowed_workflows)
         raw_targets = selection.get("target_actions")
+        raw_exclusions = selection.get("exclude_action_files", [])
+        raw_exclusion_issue = selection.get("exclusion_issue")
+        if raw_exclusions or raw_exclusion_issue is not None:
+            try:
+                exclusion_scope = request_exclusions.Scope.bind(PROJECT_ROOT, raw_exclusions, issue=raw_exclusion_issue)
+                if exclusion_scope.receipt() != selection.get('request_exclusions'):
+                    raise ValueError('request_exclusion_untrusted')
+            except (OSError, TypeError, ValueError):
+                return failed("selection_contract")
         if raw_targets is not None:
             if not isinstance(raw_targets, list) or not raw_targets:
                 return failed("selection_contract")
@@ -1167,8 +1188,12 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 return {"action": "admission_closed"}
             prepare_trace.stage("live_pending_read")
             try:
+                live_rows = cli._live_pending_identities()
+                if exclusion_scope is not None:
+                    exclusion_scope.verify()
+                    live_rows = exclusion_scope.filter_candidates(live_rows)
                 live_candidates = production_pending.actionable_fifo(
-                    cli._live_pending_identities(),
+                    live_rows,
                     excluded_identities=(
                         (
                             frozenset()
@@ -1233,11 +1258,14 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 return {"action": "admission_closed"}
             prepare_trace.stage("recovery_candidates")
             try:
+                selected_recoveries = (_filter_excluded_recoveries(exclusion_scope, recovery_action_files)
+                                       if exclusion_scope is not None else recovery_action_files)
+                recovery_rows = _recovery_candidates(selected_recoveries, assigned_identities=assigned_identities)
+                if exclusion_scope is not None:
+                    exclusion_scope.verify()
+                    recovery_rows = exclusion_scope.filter_candidates(recovery_rows)
                 recovery_candidates = production_pending.actionable_fifo(
-                    _recovery_candidates(
-                        recovery_action_files,
-                        assigned_identities=assigned_identities,
-                    ),
+                    recovery_rows,
                     allowed_workflows=allowed_workflows,
                 )
             except (ValueError, OSError):
@@ -2439,6 +2467,9 @@ def _run_dispatched_tasks(
     historical_unknown_identities: frozenset[tuple[str, str]] = frozenset(),
     recovery_action_files: Sequence[Path] = (),
     target_actions: Sequence[dict] = (),
+    excluded_action_files: Sequence[Path] = (),
+    exclusion_issue: int | None = None,
+    exclusion_receipt: dict | None = None,
     deferred_action_files: Sequence[Path] = (),
     committed_received_at: str | None = None,
     committed_request_id: str | None = None,
@@ -2470,6 +2501,7 @@ def _run_dispatched_tasks(
         or prepare_timeout_sec <= 0
         or heartbeat_interval_sec <= 0
         or ((recovery_queue or deferred_action_files) and not strict_global_fifo)
+        or ((excluded_action_files or exclusion_issue is not None or exclusion_receipt is not None) and not strict_global_fifo)
         or len(recovery_queue) > count
         or len(set(recovery_queue)) != len(recovery_queue)
         or not allowed_workflows
@@ -2825,6 +2857,10 @@ def _run_dispatched_tasks(
         }
         if target_actions:
             selection["target_actions"] = list(target_actions)
+        if excluded_action_files:
+            selection["exclude_action_files"] = [str(path) for path in excluded_action_files]
+            selection["exclusion_issue"] = exclusion_issue
+            selection["request_exclusions"] = exclusion_receipt
         if deferred_action_files:
             selection["defer_action_files"] = [str(path) for path in deferred_action_files]
         if recovery_queue:
@@ -3851,6 +3887,9 @@ def _run_global_dispatched_tasks(
     historical_unknown_identities: frozenset[tuple[str, str]] | None = None,
     recovery_action_files: Sequence[Path] = (),
     target_actions: Sequence[dict] = (),
+    excluded_action_files: Sequence[Path] = (),
+    exclusion_issue: int | None = None,
+    exclusion_receipt: dict | None = None,
     deferred_action_files: Sequence[Path] = (),
     committed_received_at: str | None = None,
     committed_request_id: str | None = None,
@@ -3886,6 +3925,10 @@ def _run_global_dispatched_tasks(
     }
     if target_actions:
         dispatcher_args["target_actions"] = target_actions
+    if excluded_action_files:
+        dispatcher_args["excluded_action_files"] = excluded_action_files
+        dispatcher_args["exclusion_issue"] = exclusion_issue
+        dispatcher_args["exclusion_receipt"] = exclusion_receipt
     if recovery_action_files:
         dispatcher_args["recovery_action_files"] = recovery_action_files
     if deferred_action_files:
@@ -3955,6 +3998,10 @@ def _rolling_snapshot(
         quarantine = reconciled["quarantine"]
         quarantined = quarantine["pending_quarantined"]
         actionable = quarantine["actionable_pending"]
+        excluded_pending = reconciled.get("scope_excluded_pending", 0)
+        if type(excluded_pending) is not int or not 0 <= excluded_pending <= pending:
+            raise ValueError("production_rolling_reconciliation_invalid")
+        pending -= excluded_pending
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("production_rolling_reconciliation_invalid") from error
     if (
@@ -4357,6 +4404,8 @@ def run_rolling_drain(
     authorized_recovery_once: bool = False,
     targets_only: bool = False,
     resume_action_files: Sequence[Path] = (),
+    excluded_action_files: Sequence[Path] = (),
+    exclusion_issue: int | None = None,
 ) -> dict:
     native_pipeline = pipeline_runner is _run_global_dispatched_tasks
     max_capacity = (3 if native_pipeline else 12) if max_capacity is None else max_capacity
@@ -4382,6 +4431,14 @@ def run_rolling_drain(
         raise ValueError("production_target_mode_required")
     if targets_only and (authorized_recovery_once or deferred_action_files or not native_pipeline):
         raise ValueError("production_target_scope_conflict")
+    if exclusion_issue is not None and not excluded_action_files:
+        raise ValueError("production_request_exclusion_invalid")
+    exclusion_scope = (request_exclusions.Scope.bind(PROJECT_ROOT, excluded_action_files, issue=exclusion_issue)
+                       if excluded_action_files else None)
+    if exclusion_scope is not None and targets_only:
+        raise ValueError("production_target_scope_conflict")
+    if exclusion_scope is not None and recovery_queue:
+        recovery_queue = _filter_excluded_recoveries(exclusion_scope, recovery_queue)
     targets = (target_scope.TargetScope.bind(
         PROJECT_ROOT / "runtime/finance_preaudit_flows", resume=resume_action_files,
         recover=recovery_action_files, workflows=allowed_workflows,
@@ -4399,6 +4456,14 @@ def run_rolling_drain(
         else reconcile_status
     )
     latest_reconciled: dict = {}
+    if exclusion_scope is not None:
+        original_exclusion_reconcile = scoped_reconcile_status
+        def exclusion_reconcile() -> dict:
+            nonlocal latest_reconciled
+            exclusion_scope.verify()
+            latest_reconciled = exclusion_scope.project(original_exclusion_reconcile())
+            return latest_reconciled
+        scoped_reconcile_status = exclusion_reconcile
     if targets is not None:
         original_reconcile = scoped_reconcile_status
         def target_reconcile() -> dict:
@@ -4435,6 +4500,10 @@ def run_rolling_drain(
                     authorized_workflows = frozenset(production_write._authorized_workflows(production_write._policy_path()))
                     fresh_queue = review_interruption.select(flow_root, scoped_reconcile_status(), allowed_workflows & authorized_workflows)
                     recovery_queue = tuple(dict.fromkeys((*recovery_queue, *fresh_queue)))
+            if exclusion_scope is not None:
+                exclusion_scope.verify()
+                recovery_queue = _filter_excluded_recoveries(exclusion_scope, recovery_queue)
+                scoped_reconcile_status()
             deferred_states = _deferred_action_states(deferred_action_files, allowed_workflows)
             if {Path(state["action_file"]).parent.parent for state in deferred_states} & {
                 path.parent.parent for path in recovery_queue
@@ -4466,8 +4535,12 @@ def run_rolling_drain(
                         "deferred_selected_count": len(deferred_states)} if deferred_states else {}),
                     "authorized_recovery_once": authorized_recovery_once,
                     "admission_cutoff": admission_cutoff,
+                    **({"execution_exclusions": exclusion_scope.receipt()} if exclusion_scope is not None else {}),
                 }
             )
+            if exclusion_scope is not None:
+                approval_guard.write(approval_lifecycle.run_directory(manifest['run_id']) / 'execution-exclusions.json',
+                    latest_reconciled.get('execution_exclusions', exclusion_scope.receipt()))
             children_reaped = True
             if native_pipeline:
                 run_context.enter_context(approval_lifecycle.run_scope(manifest, PROJECT_ROOT))
@@ -4483,6 +4556,8 @@ def run_rolling_drain(
                 nonlocal children_reaped, pending_recoveries
                 nonlocal committed_received_at, committed_request_id
                 nonlocal known_late_visible_keys
+                if exclusion_scope is not None:
+                    exclusion_scope.verify()
                 children_reaped = False
                 if pipeline_runner is _run_global_dispatched_tasks:
                     wave_result = _run_global_dispatched_tasks(
@@ -4494,6 +4569,9 @@ def run_rolling_drain(
                             historical_unknown_identities
                         ),
                         recovery_action_files=pending_recoveries,
+                        **({"excluded_action_files": excluded_action_files, "exclusion_issue": exclusion_issue,
+                            "exclusion_receipt": exclusion_scope.receipt()}
+                           if exclusion_scope is not None else {}),
                         **({"target_actions": targets.selections()} if targets else {}),
                         deferred_action_files=deferred_action_files,
                         committed_received_at=committed_received_at,
@@ -4582,6 +4660,8 @@ def run_rolling_drain(
             _clear_finished_cycle_stop(children_reaped=True, manifest=manifest)
             return {
                 **result,
+                **({"execution_exclusions": latest_reconciled.get('execution_exclusions', exclusion_scope.receipt())}
+                   if exclusion_scope is not None else {}),
                 "recovered_cycle_stop": recovered_cycle_stop,
                 "cache_maintenance": cache_maintenance,
                 "controller_handoff": handoff,
@@ -5261,6 +5341,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--rolling", action="store_true")
     parser.add_argument("--targets-only", action="store_true")
     parser.add_argument("--resume-action-file", action="append", type=Path, default=[])
+    parser.add_argument("--exclude-action-file", action="append", type=Path, default=[])
+    parser.add_argument("--exclusion-issue", type=int)
     parser.add_argument(
         "--workflow",
         action="append",
@@ -5290,6 +5372,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 or args.recover_action_file
                 or args.targets_only
                 or args.resume_action_file
+                or args.exclude_action_file
+                or args.exclusion_issue is not None
                 or args.defer_action_file
                 or args.workflow
                 or args.confirm_stale_children_reaped
@@ -5314,6 +5398,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.drain:
             raise ValueError("production_legacy_scheduler_removed")
         else:
+            if (args.exclude_action_file or args.exclusion_issue is not None) and not args.rolling:
+                raise ValueError("production_request_exclusion_requires_rolling")
+            if (bool(args.exclude_action_file) != (args.exclusion_issue is not None)
+                    or args.exclusion_issue is not None and args.exclusion_issue <= 0):
+                raise ValueError("production_request_exclusion_invalid")
             if args.max_capacity is not None:
                 _validate_rolling_capacity(args.capacity, args.max_capacity)
             if args.adaptive or args.capacity > approval_guard.MAX_MODEL_WORKERS or (args.max_capacity is not None and args.max_capacity > approval_guard.MAX_MODEL_WORKERS):
@@ -5331,6 +5420,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 rolling_args["targets_only"] = True
             if args.resume_action_file:
                 rolling_args["resume_action_files"] = tuple(args.resume_action_file)
+            if args.exclude_action_file:
+                rolling_args["excluded_action_files"] = tuple(args.exclude_action_file)
+            if args.exclusion_issue is not None:
+                rolling_args["exclusion_issue"] = args.exclusion_issue
             if args.max_capacity is not None:
                 rolling_args["max_capacity"] = args.max_capacity
             if args.recover_action_file:
