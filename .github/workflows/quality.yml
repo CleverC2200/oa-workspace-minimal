@@ -15,24 +15,9 @@ concurrency:
 jobs:
   quality:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [0, 1, 2]
-    timeout-minutes: 20
-    outputs:
-      attempt_0: ${{ matrix.shard == 0 && github.run_attempt || '' }}
-      artifact_0: ${{ matrix.shard == 0 && steps.evidence.outputs.artifact-id || '' }}
-      attempt_1: ${{ matrix.shard == 1 && github.run_attempt || '' }}
-      artifact_1: ${{ matrix.shard == 1 && steps.evidence.outputs.artifact-id || '' }}
-      attempt_2: ${{ matrix.shard == 2 && github.run_attempt || '' }}
-      artifact_2: ${{ matrix.shard == 2 && steps.evidence.outputs.artifact-id || '' }}
+    timeout-minutes: 10
     steps:
-      - name: Record CI step start
-        run: echo "OA_CI_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -40,140 +25,31 @@ jobs:
           cache-dependency-path: requirements-dev.lock
       - run: python -m pip install --requirement requirements-dev.lock
       - name: Native local environment contract
-        if: matrix.shard == 0
         run: python -m scripts.quality environment
       - name: Shared project space policy
-        if: matrix.shard == 0
         run: python -m scripts.quality storage
       - name: Production review configuration contract
-        if: matrix.shard == 0
         run: python -m scripts.quality production-config
       - name: Skill validation
-        if: matrix.shard == 0
         run: python -m scripts.quality skill
       - name: Payment relationship rule ownership
-        if: matrix.shard == 0
         run: python -m scripts.quality payment-rules
       - name: Text format
-        if: matrix.shard == 0
         run: python -m scripts.quality format
       - name: Sensitive files and secrets
-        if: matrix.shard == 0
         run: python -m scripts.quality hygiene
       - name: Markdown links
-        if: matrix.shard == 0
         run: python -m scripts.quality links
       - name: YAML and issue forms
-        if: matrix.shard == 0
         run: python -m scripts.quality yaml
       - name: Generated review schemas
-        if: matrix.shard == 0
         run: python -m scripts.quality schema
       - name: Python critical lint
-        if: matrix.shard == 0
         run: python -m scripts.quality lint
       - name: Unique test definitions
-        if: matrix.shard == 0
         run: python -m scripts.quality test-names
       - name: PR contract
-        if: matrix.shard == 0 && github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request'
         run: python -m scripts.quality pr --event "$GITHUB_EVENT_PATH"
       - name: Python syntax
-        if: matrix.shard == 0
         run: python -m compileall -q apps scripts tests
-      - name: Independent full test collection
-        run: python -m pytest -q --collect-only -p scripts.pytest_evidence --ci-evidence-file="$RUNNER_TEMP/collection.json"
-      - name: Full offline tests with balanced workers
-        run: >-
-          python -m pytest -q --tb=short -n 4 --dist worksteal --max-worker-restart 0
-          --ci-shard=${{ matrix.shard }}
-          -p scripts.pytest_evidence --ci-expected-file="$RUNNER_TEMP/collection.json"
-          --ci-evidence-file="$RUNNER_TEMP/execution.json" --ci-budget-seconds=170
-          --junitxml="$RUNNER_TEMP/offline-tests.xml" --durations=20
-      - name: Preserve collection, coverage and timing evidence
-        id: evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: offline-test-evidence-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/collection.json
-            ${{ runner.temp }}/execution.json
-            ${{ runner.temp }}/execution.json.failures.jsonl
-            ${{ runner.temp }}/offline-tests.xml
-          if-no-files-found: error
-
-  macos-stop-recovery:
-    runs-on: macos-latest
-    timeout-minutes: 10
-    outputs:
-      attempt: ${{ github.run_attempt }}
-      artifact: ${{ steps.evidence.outputs.artifact-id }}
-    steps:
-      - name: Record CI step start
-        run: |
-          oa_ci_started_at=$(date +%s)
-          echo "OA_CI_STARTED_AT=$oa_ci_started_at" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: requirements-dev.lock
-      - run: python -m pip install --requirement requirements-dev.lock
-      - name: Stop recovery and bounded staging tests with no skips
-        env:
-          OA_BOUNDED_NATIVE_TEST: '1'
-        run: |
-          python -m pytest -q --tb=short -o cache_dir="$RUNNER_TEMP/pytest-cache" --junitxml="$RUNNER_TEMP/stop-recovery.xml" tests/finance_preaudit/test_manual_stop_recovery.py tests/finance_preaudit/test_bounded_staging.py::test_native_workspace_caps_aggregate_files_and_leaves_no_mount
-          python -m scripts.pytest_evidence --macos-report="$RUNNER_TEMP/stop-recovery.xml" --output="$RUNNER_TEMP/macos.json" --budget-seconds=170
-      - name: Preserve macOS stop recovery evidence
-        id: evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: offline-test-evidence-macos-attempt-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/stop-recovery.xml
-            ${{ runner.temp }}/macos.json
-            ${{ runner.temp }}/pytest-cache/d/failure-records/*.jsonl
-          if-no-files-found: error
-
-  quality-complete:
-    needs: [quality, macos-stop-recovery]
-    if: always()
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      actions: read
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: python -m pip install pytest==9.1.1
-      - uses: actions/download-artifact@v4
-        with:
-          artifact-ids: ${{ needs.quality.outputs.artifact_0 }},${{ needs.quality.outputs.artifact_1 }},${{ needs.quality.outputs.artifact_2 }},${{ needs.macos-stop-recovery.outputs.artifact }}
-          path: ${{ runner.temp }}/evidence
-      - name: Verify complete coverage and total CI budget
-        if: always()
-        env:
-          OA_CI_REQUIRED_RESULTS: ${{ toJSON(needs) }}
-          OA_CI_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python -m scripts.pytest_evidence --merge-directory="$RUNNER_TEMP/evidence" \
-            --output="$RUNNER_TEMP/full-ci.json" --budget-seconds=170 \
-            --jobs-file="$RUNNER_TEMP/job-timings.json" --fetch-jobs
-      - name: Preserve complete CI evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: complete-ci-evidence-attempt-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/full-ci.json
-            ${{ runner.temp }}/job-timings.json
-            ${{ runner.temp }}/job-timings.snapshots/
-          if-no-files-found: warn

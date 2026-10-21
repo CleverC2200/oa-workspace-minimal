@@ -63,7 +63,7 @@ python3 -B -m scripts.dev_environment verify --tests tests/finance_preaudit/test
 python3 -B -m scripts.dev_environment verify --full
 ```
 
-可重复 `--check` 或 `--tests`；测试路径必须在本项目 tests 下。完整验收沿用现有质量集合、语法检查及全树测试，
+日常修改选择受影响的 `--tests`，配合必要 `--check`；远端只执行静态检查。可重复 `--check` 或 `--tests`，测试路径必须在本项目 tests 下。完整验收沿用现有质量集合、语法检查及全树测试，
 事先检查磁盘与活动控制器；控制器活动时推迟完整验证，不停止业务进程。完整检查不会因前一项失败而丢失后续结果。
 每项记录退出码和 passed/failed/not_run；任何必需项失败或未执行，整体非零。退出码保留首个可用失败码，
 被信号终止或无法启动时整体为1，并在对应项保留原码或未执行原因。
@@ -107,5 +107,5 @@ gh issue close <编号> --repo CleverC2200/oa-workspace-minimal --reason complet
 `gh issue close` 的 `--comment` 接受字符串，不提供 `--comment-file`。
 关闭条件及尚缺生产验收时的处理沿用[Issue 追踪](issue-tracker.md)，不因本地测试通过直接关闭。
 
-`python -m scripts.quality environment` 在现有质量 CI 中校验配置；环境命令行为回归随现有全树测试执行。
+`python -m scripts.quality environment` 在静态 CI 中校验配置；环境命令行为回归由本地受影响测试或显式完整入口执行。
 配置/命令测试通过不代表原生桌面按钮已现场验收，更不代表真实业务或生产恢复。
