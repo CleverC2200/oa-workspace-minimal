@@ -145,9 +145,11 @@ def test_shutdown_rejects_changed_or_unbound_wait_variable(exchange, code):
     assert json.loads(host.registry_file(owner).read_text())['shutdown']['status'] == 'pending'
 
 
-def test_shutdown_reads_archived_native_sources_without_rewriting_proofs(exchange):
+@pytest.mark.parametrize('compressed', [False, True])
+def test_shutdown_reads_archived_native_sources_without_rewriting_proofs(exchange, compressed):
     from pathlib import Path
     import os
+    import subprocess
     _, _, owner, child, _, manifest, _ = exchange
     shutdown.begin(owner=owner, reason='reviewer_failed')
     controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
@@ -159,16 +161,28 @@ def test_shutdown_reads_archived_native_sources_without_rewriting_proofs(exchang
     for source in child.parent.glob('*.jsonl'):
         original[source.name] = source.read_bytes()
         source.rename(archive / source.name)
+        if compressed:
+            target = archive / (source.name + '.zst')
+            subprocess.run(['zstd', '-q', str(archive / source.name), '-o', str(target)], check=True)
+            (archive / source.name).unlink()
+    archives = {path: path.read_bytes() for path in archive.iterdir()}
     result = shutdown.finish(owner=owner, **args)
     assert result['status'] == 'verified'
     assert result['driver_wait_source']['session_file'] == str(args['source'])
-    assert all((archive / name).read_bytes() == raw for name, raw in original.items())
+    assert {path: path.read_bytes() for path in archive.iterdir()} == archives
+    if not compressed:
+        assert all((archive / name).read_bytes() == raw for name, raw in original.items())
+    saved = host.registry_file(owner).read_bytes()
+    assert shutdown.sealed_round(owner=owner, run_id=manifest['run_id'])['shutdown']['status'] == 'verified'
+    assert host.registry_file(owner).read_bytes() == saved
 
 
 @pytest.mark.parametrize('damage', ['wrong_session', 'changed_call', 'symlink', 'writable', 'existing_invalid_source'])
-def test_shutdown_rejects_untrusted_archived_native_sources(exchange, damage):
+@pytest.mark.parametrize('compressed', [False, True])
+def test_shutdown_rejects_untrusted_archived_native_sources(exchange, damage, compressed):
     from pathlib import Path
     import os
+    import subprocess
     _, _, owner, child, _, manifest, _ = exchange
     shutdown.begin(owner=owner, reason='reviewer_failed')
     controller_handoff.finish(manifest, status='completed', children_reaped=True, health='healthy')
@@ -178,7 +192,6 @@ def test_shutdown_rejects_untrusted_archived_native_sources(exchange, damage):
     archive.mkdir()
     archived = archive / args['source'].name
     args['source'].rename(archived)
-    original = archived.read_bytes()
     if damage in {'wrong_session', 'changed_call'}:
         rows = archived.read_text().splitlines()
         index = 0 if damage == 'wrong_session' else 1
@@ -189,13 +202,19 @@ def test_shutdown_rejects_untrusted_archived_native_sources(exchange, damage):
             record['payload']['arguments'] = json.dumps({'task_name': 'unrelated', 'message': 'different child'})
         rows[index] = json.dumps(record)
         archived.write_text('\n'.join(rows) + '\n')
-    elif damage == 'symlink':
+    if compressed:
+        target = archive / (archived.name + '.zst')
+        subprocess.run(['zstd', '-q', str(archived), '-o', str(target)], check=True)
+        archived.unlink()
+        archived = target
+    original = archived.read_bytes()
+    if damage == 'symlink':
         target = archive / 'other.jsonl'
         archived.rename(target)
         archived.symlink_to(target)
     elif damage == 'writable':
         archived.chmod(0o666)
-    else:
+    elif damage == 'existing_invalid_source':
         args['source'].write_text('{}\n')
     with pytest.raises((ValueError, RuntimeError)):
         shutdown.finish(owner=owner, **args)

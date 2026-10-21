@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 import time
@@ -104,6 +105,8 @@ def _native_path(source: Path) -> Path:
         raise ValueError('host_review_source_untrusted')
     if not os.path.lexists(source):
         source = home / 'archived_sessions' / source.name
+        if not os.path.lexists(source):
+            source = source.with_name(source.name + '.zst')
         if any(path.is_symlink() for path in (source, *source.parents)):
             raise ValueError('host_review_source_untrusted')
     import stat
@@ -113,13 +116,49 @@ def _native_path(source: Path) -> Path:
     return source
 
 
+@contextmanager
+def _native_stream(source: Path):
+    path = _native_path(source)
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, 'rb') as stream:
+        import stat
+        metadata = os.fstat(stream.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
+            raise ValueError('host_review_source_untrusted')
+        if not path.name.endswith('.jsonl.zst'):
+            yield stream
+            return
+        try:
+            process = subprocess.Popen(['zstd', '-dc'], stdin=stream, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL)
+        except OSError as error:
+            raise ValueError('host_review_source_untrusted') from error
+        try:
+            yield process.stdout
+            while process.stdout.read(64 * 1024):
+                pass
+            if process.wait(timeout=5) != 0:
+                raise ValueError('host_review_source_untrusted')
+        except subprocess.TimeoutExpired as error:
+            raise ValueError('host_review_source_untrusted') from error
+        finally:
+            process.stdout.close()
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+
+
 def _native_source(source: Path, session: str, line: int = 1, *, output: bool = False) -> tuple[dict, dict]:
     """Read native session ancestry and one immutable tool-call anchor."""
     source = source.absolute()
     if type(line) is not int or line < 1:
         raise ValueError('host_review_source_untrusted')
     header = anchor = result = None
-    with _native_path(source).open('rb') as stream:
+    with _native_stream(source) as stream:
         for number, raw in _native_lines(stream):
             if raw is None:
                 if number in {1, line} or anchor is not None:
@@ -272,11 +311,7 @@ def _reviewers(reviewers: list[dict], owner: str, source: Path) -> list[dict]:
     for slot, entry in enumerate(reviewers):
         child = Path(entry['session_file']).absolute()
         # Read the header through the same native-source checks below.
-        descriptor = os.open(_native_path(child), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        with os.fdopen(descriptor, 'rb') as stream:
-            import stat
-            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-                raise ValueError('host_review_source_untrusted')
+        with _native_stream(child) as stream:
             header = json.loads(stream.readline(1024 * 1024)).get('payload', {})
         reviewer = header.get('id')
         UUID(reviewer)
@@ -1694,7 +1729,7 @@ def source_anchor(*, owner: str, operation: str = 'heartbeat', run_id: str | Non
     source = Path(value['reviewers'][0]['spawn_source']['session_file'])
     _native_source(source, owner)
     found = None
-    with _native_path(source).open('rb') as stream:
+    with _native_stream(source) as stream:
         for line, raw in _native_lines(stream):
             if raw is None:
                 continue
