@@ -68,8 +68,7 @@ def test_pre_registration_shutdown_seals_native_exit_without_rewriting_partial_e
     assert projected['controller_state'] == 'failed' and projected['children_reaped'] is True
     assert projected['state'] == 'supervisor_lost' and projected['recorded_state'] == 'exited'
     assert projected['status'] == 'blocked' and projected['terminal'] is False
-    with pytest.raises(ValueError, match='previous_round_incomplete'):
-        host.assert_previous_rounds_closed(owner=str(uuid4()))
+    host.assert_previous_rounds_closed(owner=str(uuid4()))
     command = ['--operation', 'finish-unregistered-shutdown', '--owner-task-id', args['owner'],
                '--receipt-file', str(args['receipt_file']), '--invocation-id', args['invocation_id'],
                '--tool-session-id', args['tool_session_id'], '--source-session-file', str(args['source']),
@@ -172,15 +171,14 @@ def test_sealed_pre_registration_history_can_be_read_while_current_writer_is_act
         host.assert_previous_rounds_closed(owner=str(uuid4()))
 
 
-def test_public_cli_provider_switch_keeps_original_app_closure_gate(failed_start, monkeypatch, capsys):
+def test_public_cli_provider_switch_ignores_historical_audit_gap(failed_start, monkeypatch, capsys):
     args, _ = failed_start
     original = args['receipt_file'].read_bytes()
     monkeypatch.setattr(runner.auth, 'load_local_env', lambda: None)
     monkeypatch.setattr(runner.approval_guard, 'observe_project_errors', lambda _: None)
     assert runner.approval_lifecycle.startup(runner.PROJECT_ROOT)['status'] == 'ready'
-    monkeypatch.setattr(runner, 'supervise', lambda *_args, **_options: pytest.fail('unclosed App round launched'))
-    assert runner.main(['--owner-task-id', str(uuid4()), '--review-provider', 'deepseek', '--', '--rolling']) == 1
-    result = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-    assert result['primary_failure'] == {'error_type': 'ValueError', 'error_code': 'host_review_previous_round_incomplete',
-                                         'phase': 'app_round_closure'}
+    started = []
+    monkeypatch.setattr(runner, 'supervise', lambda *_args, **_options: started.append(True) or {'result': 'completed'})
+    assert runner.main(['--owner-task-id', str(uuid4()), '--review-provider', 'deepseek', '--', '--rolling']) == 0
+    assert started == [True]
     assert args['receipt_file'].read_bytes() == original

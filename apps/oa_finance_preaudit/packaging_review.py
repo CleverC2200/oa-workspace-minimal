@@ -188,18 +188,16 @@ def _image_output(value) -> bool:
 
 
 def _single_image_path(code: str) -> str | None:
-    """Accept only the two documented, unconditional single-page read/emit forms."""
-    quoted_path = r'("(?:[^"\\]|\\.)*")'
-    arguments = r'\{\s*(?:"path"|path)\s*:\s*' + quoted_path + r'\s*(?:,\s*(?:"detail"|detail)\s*:\s*"(?:original|high)"\s*)?\}'
-    patterns = [
-        r'\s*const r\s*=\s*await tools\.view_image\(\s*' + arguments + r'\s*\);\s*image\(r\.image_url\);?\s*',
-        r'\s*image\(\(await tools\.view_image\(\s*' + arguments + r'\s*\)\)\.image_url\);?\s*',
-    ]
-    for pattern in patterns:
-        match = re.fullmatch(pattern, code)
-        if match is not None:
-            return json.loads(match.group(1))
-    return None
+    """Read literal arguments from an unconditional single-page read/emit call."""
+    code = host_chat_review._native_output(code)
+    match = re.fullmatch(r'\s*image\s*\(\s*\(\s*await\s+tools\s*\.\s*view_image\s*\(\s*(\{.*\})\s*\)\s*\)\s*\.\s*image_url\s*\)\s*;?\s*', code, re.DOTALL)
+    if match is None:
+        return None
+    try:
+        args = host_chat_review._literal_arguments(match.group(1), {'path', 'detail'})
+    except ValueError:
+        return None
+    return args['path'] if isinstance(args.get('path'), str) and args.get('detail', 'high') in {'high', 'original'} else None
 
 
 def _tool_failed(value) -> bool:

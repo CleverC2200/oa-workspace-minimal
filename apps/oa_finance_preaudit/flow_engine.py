@@ -159,12 +159,6 @@ _PACKAGING_PAGE_CLASSIFICATIONS = frozenset(
 )
 WORKFLOW_KEYS = tuple(_FLOW_SPECS)
 _FINANCE_WORKFLOW_KEYS = frozenset(WORKFLOW_KEYS) - {"packaging_layout_approval"}
-_GENERAL_EXPENSE_BUDGET_CONCLUSION = (
-    "当前阶段按既定策略暂不校验部门年度预算。"
-)
-_PAYMENT_COMPANY_PASS = re.compile(
-    r"^报销公司、支付公司、购买方三者一致，应选择.+支付。$"
-)
 _TPM_IMAGE_EVIDENCE_ITEM = "attachment_completeness"
 _TPM_IMAGE_EVIDENCE_PREFIX = "material:prepared.images."
 _TPM_SUBJECT_FIELD_CODE = "yskm"
@@ -180,15 +174,13 @@ _TPM_IMAGE_EVIDENCE_GAP = (
     "仅核对了附件名称与上传情况，未按清单与照片内容核对，请财务核对原单。"
 )
 _SMALL_MARKETING_SPECIAL_SUBJECT = "配送费-自提/租车费"
-_GENERAL_EXPENSE_DEFERRED_AMOUNT = re.compile(
-    r"均为收到货后自动付款.*[0-9]+(?:\.[0-9]+)?元"
-)
 _SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_MATERIAL_GAP_CODES = {
     "attachment_access_denied",
     "attachment_archive_failed",
     "attachment_content_incomplete",
+    "material_budget_exceeded",
     "legacy_doc_converter_unavailable",
     "legacy_doc_conversion_failed",
     "legacy_doc_conversion_timeout",
@@ -287,32 +279,6 @@ AuthorizationRenewer = submission.AuthorizationRenewer
 AuthorizationRefreshNeeded = submission.AuthorizationRefreshNeeded
 SubmitFrozen = submission.SubmitFrozen
 RecoverFrozen = submission.RecoverFrozen
-
-
-def _validate_general_expense_conclusions(items: list[dict]) -> None:
-    by_key = {str(item.get("item_key") or ""): item for item in items}
-    budget = by_key.get("budget", {})
-    if budget.get("status") == "pass" and (
-        str(budget.get("conclusion") or "").strip()
-        != _GENERAL_EXPENSE_BUDGET_CONCLUSION
-    ):
-        raise decision_validation.InvalidDecision("budget_conclusion")
-    company = by_key.get("payment_company_consistency", {})
-    if company.get("status") == "pass" and not _PAYMENT_COMPANY_PASS.fullmatch(
-        str(company.get("conclusion") or "").strip()
-    ):
-        raise decision_validation.InvalidDecision("payment_company_conclusion")
-    attachment = by_key.get("attachment_payment_evidence", {})
-    attachment_conclusion = str(attachment.get("conclusion") or "").strip()
-    if (
-        attachment.get("status") == "fail"
-        and ("实付0元" in attachment_conclusion or "先用后付" in attachment_conclusion)
-        and (
-            "实付0元" not in attachment_conclusion
-            or not _GENERAL_EXPENSE_DEFERRED_AMOUNT.search(attachment_conclusion)
-        )
-    ):
-        raise decision_validation.InvalidDecision("deferred_payment_conclusion")
 
 
 def _small_marketing_budget_subjects(material: dict) -> tuple[str, ...]:
@@ -456,24 +422,6 @@ def enforce_tpm_linked_invoice_evidence(items: list[dict], material: dict) -> bo
         item_key=_TPM_LINKED_INVOICE_ITEM,
         require_record=material.get("invoice_linkage_contract") == _INVOICE_LINKAGE_CONTRACT,
     )
-
-
-def _validate_small_marketing_conclusions(
-    items: list[dict],
-    material: dict,
-) -> None:
-    by_key = {str(item.get("item_key") or ""): item for item in items}
-    company = by_key.get("payment_company_consistency", {})
-    if company.get("status") == "pass" and not _PAYMENT_COMPANY_PASS.fullmatch(
-        str(company.get("conclusion") or "").strip()
-    ):
-        raise decision_validation.InvalidDecision("payment_company_conclusion")
-    if not small_marketing_requires_payment_attachments(material):
-        return
-    attachment = by_key.get("attachment_completeness", {})
-    conclusion = str(attachment.get("conclusion") or "")
-    if "支付截图" not in conclusion or "发票" not in conclusion:
-        raise decision_validation.InvalidDecision("payment_attachment_terms")
 
 
 def _read_object(path: Path, *, code: str) -> dict:
@@ -1804,17 +1752,6 @@ def _validate_review_decision(action: dict, packet: dict, quality_material: dict
         for item in normalized_items
     ):
         raise decision_validation.InvalidDecision("required_uncertain")
-    if action["workflow_key"] == "general_expense":
-        _validate_general_expense_conclusions(normalized_items)
-
-    if (
-        action["workflow_key"] == "small_marketing_fee"
-        and packet.get("rule_version") == _SMALL_MARKETING_RULE_VERSION
-    ):
-        _validate_small_marketing_conclusions(
-            normalized_items,
-            quality_material,
-        )
     if (
         action["workflow_key"] == "tpm_small_marketing_fee"
         and packet.get("rule_version") == _TPM_SMALL_MARKETING_RULE_VERSION

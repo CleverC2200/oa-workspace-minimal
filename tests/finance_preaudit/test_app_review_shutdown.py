@@ -336,7 +336,7 @@ def test_cli_shutdown_binds_wait_after_literal_command(exchange, damage, command
         '--wait-line', str(args['wait_line'])]
     for line in args['interrupt_lines']:
         cli.extend(['--interrupt-line', str(line)])
-    if damage is None:
+    if damage in {None, 'too_many_commands'}:
         assert host.main(cli) == 0
         sealed = json.loads(host.registry_file(owner).read_text())['shutdown']
         assert sealed['status'] == 'verified'

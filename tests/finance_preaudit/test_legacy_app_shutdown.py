@@ -48,8 +48,7 @@ def test_legacy_prepared_failure_seals_original_sources_without_reclassifying_ac
     args, progress = legacy_failure
     from apps.oa_finance_preaudit import legacy_app_shutdown as legacy
     originals = {p: p.read_bytes() for p in [args['receipt_file'], progress]}
-    with pytest.raises(ValueError, match='previous_round_incomplete'):
-        host.assert_previous_rounds_closed(owner=str(uuid4()))
+    host.assert_previous_rounds_closed(owner=str(uuid4()))
     assert legacy.finish(**args, confirm=False)['status'] == 'ready'
     assert not args['receipt_file'].with_name('legacy-app-shutdown.json').exists()
     sealed = legacy.finish(**args, confirm=True)

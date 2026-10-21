@@ -474,7 +474,7 @@ def reconcile(
                 "attempt": state["attempt"], "category": category,
                 "failure_code": state["reason"] if state.get("reason") in QUARANTINED_REASONS else "unknown_failure",
                 "write_state": state["write_state"], "automatic_retry": False,
-                "scope": receipt["scope"] if receipt else "unverified",
+                "scope": "item" if item_failure.isolated(attempt_root, state) else receipt["scope"] if receipt else "unverified",
                 "receipt_status": "verified" if receipt else "missing_or_invalid",
                 "recommendation": recommendation,
             })

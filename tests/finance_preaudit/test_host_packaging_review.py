@@ -118,6 +118,15 @@ def test_app_packaging_submission_requires_current_real_image_observation(packag
         packaging.validate_host_submission(path, payload, source, 'packaging_draft', {})
 
 
+def test_packaging_accepts_named_native_image_results(package_round):
+    path, _, owner, _ = package_round
+    request, child = assigned_package(package_round)
+    for index, page in enumerate(json.loads(path.with_name('material.json').read_text())['prepared']['images']):
+        native_exec(child, 'let observed = await\n tools . view_image ( {detail:"original",path:' + json.dumps(page['path']) + ',} );\nimage (observed . image_url);',
+                    f'named-image-{index}', [{'type': 'input_image', 'image_url': 'data:image/png;base64,recorded'}])
+    assert publish_payload(request, child, envelope(path), owner)['status'] == 'reviewed'
+
+
 def test_current_observed_app_draft_preserves_business_fields_without_cli(package_round, monkeypatch):
     import threading
     path, root, owner, child = package_round

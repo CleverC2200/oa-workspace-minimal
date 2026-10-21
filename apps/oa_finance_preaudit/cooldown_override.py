@@ -200,8 +200,6 @@ def one_round(project_root: Path, *, owner_task_id: str, invocation_id: str,
                 or any(guard.process_identity(owner["pid"]) != owner for owner in owners)):
             raise ValueError("approval_cooldown_override_evidence_changed")
         production_release._source(root, revision, production_release.ORIGIN, synchronized=True)
-        from . import app_review_shutdown
-        app_review_shutdown.assert_unregistered_executions_closed()
         archive = guard.directory() / "cooldown-overrides" / f"{invocation_id}-cooldown.json"
         audit_path = archive.with_name(f"{invocation_id}.json")
         audit = {"schema_version": 1, "kind": "approval_one_round_cooldown_override",

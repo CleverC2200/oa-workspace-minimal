@@ -706,7 +706,7 @@ def _quarantined_action_matches_selection(
             == state.get("review_failure_fingerprint")
             == receipt_fingerprint
         )
-    return _material_failure_action_matches_selection(
+    return (state.get("mode") != "preview" or item_failure.isolated(action_path.parent, state)) and _material_failure_action_matches_selection(
         action_path,
         action,
         state,

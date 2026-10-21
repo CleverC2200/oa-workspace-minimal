@@ -265,43 +265,16 @@ def _registration_lease(owner: str):
             os.close(fd)
 
 
-def _previous_rounds_closed(owner: str, run_id: str | None = None, reviewers: list[dict] = ()) -> None:
-    from scripts import finance_preaudit_run
-    base = registry_file(owner, legacy=True).parent
-    paths = [base / 'registry.json', *base.glob('*/registry.json')]
-    for path in paths:
-        if not path.exists() or (run_id is not None and path == registry_file(owner, run_id)):
-            continue
-        previous = _read(path)[1]
-        previous = _registry(owner, run_id=previous['run_id'], live=False, legacy=path.parent == base)
-        plan = previous.get('shutdown', {})
-        receipt = plan.get('receipt', {})
-        binding = previous.get('original_execution', {})
-        if (previous.get('owner_task_id') != owner or previous.get('state') not in {'closed', 'cancelled'}
-                or plan.get('status') != 'verified' or receipt.get('status') != 'verified'
-                or receipt.get('kind') != 'preaudit_app_shutdown'
-                or any(receipt.get(key) != previous.get(key) for key in ('owner_task_id', 'run_id', 'controller_instance_id'))
-                or receipt.get('exchange_state') != previous['state']
-                or receipt.get('children_reaped') is not True or receipt.get('writer_active') is not False
-                or receipt.get('execution_sha256') != hashlib.sha256(_read(Path(binding['receipt_file']))[0]).hexdigest()
-                or {item['reviewer_task_id'] for item in previous['reviewers']} & {item['reviewer_task_id'] for item in reviewers}):
-            raise ValueError('host_review_previous_round_incomplete')
-        report = finance_preaudit_run.read_execution(**binding)
-        if (report.get('terminal') is not True or report.get('children_reaped') is not True
-                or report.get('exit_code') != receipt.get('driver_exit_code')
-                or any(report.get(key) != previous.get(key) for key in ('run_id', 'controller_instance_id'))):
-            raise ValueError('host_review_previous_round_incomplete')
-    from . import app_review_shutdown
-    app_review_shutdown.assert_unregistered_executions_closed(exclude_run_id=run_id)
-    if runtime_control.writer_active() or runtime_control.active_request_writers():
+def _check_round_activity(run_id: str | None = None) -> None:
+    if (runtime_control.writer_active() or runtime_control.active_request_writers()
+            or (run_id is None and runtime_control.controller_active())):
         raise ValueError('host_review_previous_round_incomplete')
-
 
 
 def assert_previous_rounds_closed(*, owner: str) -> None:
     UUID(owner)
     with _registration_lease(owner):
-        _previous_rounds_closed(owner)
+        _check_round_activity()
 
 
 def _reviewers(reviewers: list[dict], owner: str, source: Path) -> list[dict]:
@@ -395,7 +368,7 @@ def register(reviewers: list[dict], *, owner: str, source: Path, receipt_file: P
                 if previous.get('state') != 'open' or previous.get('shutdown') is not None:
                     raise ValueError('host_review_parent_lost_or_closed')
                 return previous
-            _previous_rounds_closed(owner, run_id, registered)
+            _check_round_activity(run_id)
             _write_new(path, value)
     return value
 
@@ -1445,10 +1418,38 @@ def draft_invocation(request_file: Path, decision_file: Path, payload: dict, *, 
             + json.dumps(str(runtime_control.PROJECT_ROOT.absolute())) + '}));')
 
 
+def _literal_arguments(raw: str, keys: set[str]) -> dict:
+    """Parse only whitelisted data literals from native calls, never JS."""
+    key = '(?:' + '|'.join(sorted(keys)) + ')'
+    literal = r'(?:"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"|0|[1-9][0-9]*)'
+    member = rf'(?:"{key}"|{key})\s*:\s*{literal}'
+    if re.fullmatch(rf'\s*\{{\s*{member}(?:\s*,\s*{member})*\s*,?\s*\}}\s*', raw) is None:
+        raise ValueError('host_review_shutdown_wait_untrusted')
+    arguments = {}
+    for match in re.finditer(rf'(?P<key>"{key}"|{key})\s*:\s*(?P<value>{literal})', raw):
+        name = match['key'].strip('"')
+        if name in arguments:
+            raise ValueError('host_review_shutdown_wait_untrusted')
+        arguments[name] = json.loads(match['value'])
+    return arguments
+
+
+def _native_output(code: str) -> str:
+    wrapped = re.compile(
+        r'\b(?:const|let|var)\s+(?P<variable>[A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*'
+        r'(?P<call>await\s+tools\s*\.\s*(?:exec_command|write_stdin|view_image)\s*\(.*?\))\s*;\s*'
+        r'(?P<emit>text|image)\s*\(\s*(?:(?P=variable)(?P<image>\s*\.\s*image_url)?|JSON\s*\.\s*stringify\s*\(\s*(?P=variable)\s*\))\s*\)\s*;?', re.DOTALL)
+    def normalize(match):
+        value = '(' + match['call'] + ').image_url' if match['image'] else match['call']
+        return match['emit'] + '(' + value + ');'
+    code = re.sub(r'^\s*// @exec:[^\n]*\n', '', code, count=1)
+    return wrapped.sub(normalize, code)
+
+
 def draft_arguments(input_text: str) -> dict:
     """Decode only the literal native JSON publication template, without evaluating JavaScript."""
     try:
-        text = input_text.strip()
+        text = _native_output(input_text).strip()
         start = 'text(await tools.exec_command({"cmd": '
         decoder = json.JSONDecoder()
         if text.startswith(start):
@@ -1467,11 +1468,13 @@ def draft_arguments(input_text: str) -> dict:
         else:
             args = None
         if args is None:
-            match = re.fullmatch(r'\s*text\(await tools\.exec_command\((\{.*\})\)\);?\s*', input_text, re.DOTALL)
+            match = re.fullmatch(r'\s*text\s*\(\s*await\s+tools\s*\.\s*exec_command\s*\(\s*(\{.*\})\s*\)\s*\)\s*;?\s*', text, re.DOTALL)
             if match is None:
                 raise ValueError('invalid_statement')
-            args = json.loads(match.group(1))
-        if (set(args) not in ({'cmd'}, {'cmd', 'workdir'}) or not isinstance(args['cmd'], str)
+            args = _literal_arguments(match.group(1), {'cmd', 'workdir', 'max_output_tokens', 'yield_time_ms'})
+        if (not {'cmd'}.issubset(args) or set(args) - {'cmd', 'workdir', 'max_output_tokens', 'yield_time_ms'}
+                or any(type(args[key]) is not int for key in {'max_output_tokens', 'yield_time_ms'} & args.keys())
+                or not isinstance(args['cmd'], str)
                 or 'workdir' in args and args['workdir'] != str(runtime_control.PROJECT_ROOT.absolute())):
             raise ValueError('invalid_arguments')
         return args

@@ -16,6 +16,7 @@
 
 | 领域 | 症状 / 搜索词 | 主记录或历史组件 | 回归 / 经验入口 |
 |---|---|---|---|
+| 审批附加阻断收敛 | 固定措辞、原生调用包装、历史收尾、普通材料故障 | [#708](https://github.com/CleverC2200/oa-workspace-minimal/issues/708) | [公开入口回归](../../tests/finance_preaudit/test_approval_blocker_scope.py)；身份、授权、防重复提交与未知写入保护保留 |
 | CI 重跑证据 | 同名旧失败 artifact、failed-only rerun、run_attempt、汇总旧时钟超时 | [#540](https://github.com/CleverC2200/oa-workspace-minimal/issues/540) | [CI 证据回归](../../tests/finance_preaudit/test_ci_evidence.py)、[质量检查](../agents/quality-checks.md)；按 job 输出的 artifact ID 和 attempt 选择，正确性复用与本次计时分别核验 |
 | CI 任务元数据滞后 | job_timing_status_untrusted、上游已成功但 jobs 仍 in_progress、已有开始时间却仍 queued、readiness_exhausted | [#664](https://github.com/CleverC2200/oa-workspace-minimal/issues/664) | [合并证据 CLI 回归](../../tests/finance_preaudit/test_ci_evidence.py)、[质量 workflow](../../.github/workflows/quality.yml) |
 | 只读回收证明 | readonly_reaped=False、stop_requested、worker/model 进程组 | [#599](https://github.com/CleverC2200/oa-workspace-minimal/issues/599) | [只读公开回归](../../tests/finance_preaudit/test_readonly_execution.py)；保留失败判定与登记进程状态，根因与验收以票内证据为准 |
