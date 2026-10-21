@@ -229,6 +229,7 @@ def finish(*, owner: str, source: Path, interrupt_lines: list[int], status_line:
         if plan is None:
             raise ValueError('host_review_shutdown_not_started')
         if plan['status'] == 'verified':
+            _clear_packaging_retry_stop(value)
             return plan['receipt']
         verified = _verified_proofs(value, owner=owner, source=source, interrupt_lines=interrupt_lines,
                                     status_line=status_line, wait_line=wait_line, require_idle=True)
@@ -241,6 +242,7 @@ def finish(*, owner: str, source: Path, interrupt_lines: list[int], status_line:
         current = host._registry(owner, live=False, run_id=run_id)
         if current['shutdown'] != plan:
             if current['shutdown']['status'] == 'verified':
+                _clear_packaging_retry_stop(current)
                 return current['shutdown']['receipt']
             raise ValueError('host_review_shutdown_reason_conflict')
         if runtime_control.writer_active() or runtime_control.active_request_writers():
@@ -251,7 +253,18 @@ def finish(*, owner: str, source: Path, interrupt_lines: list[int], status_line:
                    **verified}
         current['shutdown'] = {**plan, 'status': 'verified', 'verified_at': time.time(), 'receipt': receipt}
         host.guard.write(path, current)
+    _clear_packaging_retry_stop(current)
     return receipt
+
+
+def _clear_packaging_retry_stop(value: dict) -> None:
+    if value['phase'] != 'packaging' or runtime_control.stop_reason() != host.guard.RETRY_STOP_REASON:
+        return
+    from . import approval_lifecycle, controller_handoff
+    manifest = controller_handoff._read_manifest()
+    if manifest is None or any(manifest[key] != value[key] for key in ('run_id', 'controller_instance_id')):
+        raise ValueError('approval_retry_stop_untrusted')
+    approval_lifecycle.clear_packaging_retry_stop(manifest, owner=value['owner_task_id'])
 
 
 def _unregistered_sources(*, owner: str, reviewers: list[dict], source: Path, execution: dict,
