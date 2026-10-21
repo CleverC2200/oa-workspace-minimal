@@ -77,7 +77,7 @@ def test_dispatcher_passes_frozen_exclusions_through_prepare_selection(excluded_
         return probe._prepare_one(selected)
     def dispatch(count, capacity, **kwargs):
         return dispatcher(count, capacity, **kwargs, renew_actions=lambda _: [], prepare_action=prepare,
-            executor_factory=lambda size: ThreadPoolExecutor(max_workers=size))
+            executor_factory=lambda size: ThreadPoolExecutor(max_workers=size), runtime_status=lambda: {'status': 'healthy'})
     monkeypatch.setattr(probe, '_run_dispatched_tasks', dispatch)
     monkeypatch.setattr(probe, '_preparation_executor', lambda: ThreadPoolExecutor(max_workers=1))
     monkeypatch.setattr(probe.codex_review_worker, '_reviewer_environment', lambda: {})
