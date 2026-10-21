@@ -13,19 +13,19 @@
   --original-owner-task-id <原聊天真实UUID> \
   --original-tool-session-id <原实际工具会话ID> \
   -- --rolling --fixed-capacity --capacity 3 --max-capacity 3 \
-  --confirm-write YES --recover-confirmed-no-write-once YES \
+  --confirm-write YES --confirm-alerts NO \
   --workflow travel_expense --workflow business_entertainment \
   --workflow business_support_fee --workflow small_marketing_fee \
   --workflow tpm_small_marketing_fee --workflow general_expense
 ```
 
-入口仅接受上述六类固定范围和参数顺序，拒绝只读、绑定、缺少原回执或不同并发参数的混用。启动前核对生产远端、代码、唯一 main、原实际退出、同轮只读进程回收和可信未写入中断；在控制器和全局 Writer 租约内运行一次完整 status，以私有文件保留字节数和 SHA-256，并使用现行校验器核对身份、授权、冻结、严格 continuation 和当前写入状态。不能使用旧状态文件放行。
+入口仅接受上述六类固定范围和参数顺序，拒绝只读、绑定、缺少原回执或不同并发参数的混用。普通待办可在流程参数前增加精确 `--defer-action-file`，原控制器继续核验可信未提交条件；默认不恢复历史隔离项。已另行授权一次隔离恢复时，保留原 `--confirm-write YES --recover-confirmed-no-write-once YES` 形式，不与精确暂缓混用。启动前核对生产远端、代码、唯一 main、原实际退出、同轮只读进程回收和可信未写入中断；在控制器和全局 Writer 租约内运行一次完整 status，以私有文件保留字节数和 SHA-256，并使用现行校验器核对身份、授权、冻结、严格 continuation 和当前写入状态。不能使用旧状态文件放行。
 
 历史 App 原轮须先取得[原生收尾证明](../agents/controller-execution.md#app-统一收尾)，登记前失败沿同文档的专用封存入口。该检查在创建豁免回执和清除停止标记之前完成，与新轮供应商无关；未封存时保留原停止标记和历史证据，不创建豁免回执。
 
 全部门禁通过后，入口保存 0600 的 cooldown-overrides 回执和原冷却字节副本，再精确清除已绑定的官方冷却停止标记。原 cooldown.json 保持身份和字节；人工、损坏、未知原因或新的停止门不能清除。豁免仅在当前任务、单次 invocation、原冷却指纹和原调用进程身份均匹配且仍存活时有效，不能传给另一监督调用或写入自动化配置。原进程退出后普通启动重新遵守现有冷却。
 
-主聊天官方错误可能在上一审批退出后生成 `run_id=null` 的冷却。入口从目标本机原生只读历史重新核验该项目的官方失败事件、错误类型、时间及每个来源摘要，要求当前冷却不早于原审批真实退出。上轮审批的关闭证明继续绑定它自己的原冷却和未写入中断，当前主聊天事件另以 `cooldown_attribution=project_notice` 留证。来源缺失、历史不可读、时间不符或其他审批 run 仍阻断；不得补造 run 归属或改写旧关闭证明。新鲜核验与消费期间，当前冷却和原审批证据均须保持不变。
+主聊天官方错误可以生成 `run_id=null` 的冷却。入口从目标本机原生只读历史重新核验该项目的官方失败事件、错误类型、时间及每个来源摘要。发生在原审批运行中的事件，须不早于原轮开始，且原关闭证明精确保存同一冷却；发生在审批退出后的事件，继续分别保留原关闭证明和后续主聊天冷却。两种情况均以 `cooldown_attribution=project_notice` 留证，不补造 run 归属或改写旧关闭证明。来源缺失、历史不可读、时间不符或其他审批 run 仍阻断。新鲜核验与消费期间，当前冷却和原审批证据均须保持不变。
 
 私有执行目录以独占创建消费这次豁免，execution.json 绑定实际监督者和控制器的 PID、出生时间、进程组与用户。开始执行后只允许该监督者、控制器及同 run/instance 的已登记只读 worker 使用；复制环境变量、原调用仍存活或冷却自然到期均不能复用该 invocation。终态回读验证原绑定，保留真实退出码。
 

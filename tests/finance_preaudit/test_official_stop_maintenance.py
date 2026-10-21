@@ -75,10 +75,45 @@ for path in (Path(os.environ['OA_CONTROLLER_EXECUTION_MANIFEST_FILE']),root/'run
  guard.write(path,manifest)
 print('offline fake only')
 raise SystemExit(1)'''
+    variant = getattr(request, 'param', 'deepseek')
+    if variant.startswith('project_notice'):
+        monkeypatch.setenv('CODEX_HOME', str(tmp_path / 'native-codex'))
+        notice = ''' import sqlite3,time
+ home=Path(os.environ['CODEX_HOME']); home.mkdir(parents=True,exist_ok=True)
+ stamp=time.time()
+ with sqlite3.connect(home/'state_5.sqlite') as database:
+  database.execute('CREATE TABLE threads (id TEXT,cwd TEXT,model_provider TEXT)')
+  database.execute('INSERT INTO threads VALUES (?,?,?)',('main-chat',str(root),'openai'))
+ with sqlite3.connect(home/'thread_history_1.sqlite') as database:
+  database.execute('CREATE TABLE thread_turns (thread_id TEXT,turn_id TEXT,error_json TEXT,completed_at REAL,status TEXT)')
+  database.execute('INSERT INTO thread_turns VALUES (?,?,?,?,?)',('main-chat','main-turn',json.dumps({'code':'serverOverloaded'}),stamp,'failed'))
+ active_run=os.environ.pop(guard.RUN_ENV)
+ guard.record_notice('server_overloaded','main:main-chat:main-turn',occurred_at=stamp)
+ os.environ[guard.RUN_ENV]=active_run'''
+        if variant == 'project_notice_before_run':
+            notice = notice.replace('stamp=time.time()',
+                "stamp=datetime.datetime.fromisoformat(manifest['started_at']).timestamp()-1")
+        child = child.replace(" guard.record_notice('server_overloaded','offline-first-error')", notice)
+    actions = [action, failure, completed_action]
+    if variant == 'project_notice_with_history':
+        historical = Path(_engine(_flows, 'older-interruption').next_action('travel_expense')['action_file'])
+        actions.append(historical)
+        child = child.replace('json.loads(sys.argv[1])', 'json.loads(sys.argv[1])[:3]')
+        history = '''historical={**manifest,'run_id':'d'*32,'controller_instance_id':'e'*32}
+with runtime_control.global_controller_lease(), lifecycle.run_scope(historical,root):
+ lifecycle.heartbeat(historical['run_id'],historical['controller_instance_id'],
+  {Path(json.loads(sys.argv[1])[-1])},[],writer_active=False)
+ guard.record_notice('server_overloaded','offline-historical-error')
+ lifecycle.interrupt_unwritten(historical,cause=guard.STOP_REASON)
+runtime_control._clear_stop(f'stop_requested:{guard.STOP_REASON}\\n'.encode())
+(guard.directory()/'cooldown.json').unlink()
+'''
+        child = child.replace('with runtime_control.global_controller_lease(), lifecycle.run_scope(manifest, root):',
+            history + 'with runtime_control.global_controller_lease(), lifecycle.run_scope(manifest, root):')
     directory = root / 'runtime/control/executions' / uuid4().hex
     owner = str(uuid4())
     with monkeypatch.context() as environment:
-        provider = getattr(request, 'param', 'deepseek')
+        provider = 'deepseek' if variant.startswith('project_notice') else variant
         environment.setenv('OA_REVIEW_PROVIDER', provider)
         environment.setenv('OA_REVIEW_TRANSPORT', 'host_chat' if provider == 'openai' else 'cli')
         environment.chdir(root)
@@ -90,7 +125,7 @@ from scripts.finance_preaudit_run import supervise
 result=supervise([sys.executable,'-B','-c',sys.argv[1],sys.argv[2],sys.argv[3]],
  directory=Path(sys.argv[4]),owner_task_id=sys.argv[5])
 print(json.dumps(result))'''
-        finished = subprocess.run([sys.executable, '-B', '-c', supervisor, child, json.dumps([str(p) for p in (action, failure, completed_action)]),
+        finished = subprocess.run([sys.executable, '-B', '-c', supervisor, child, json.dumps([str(p) for p in actions]),
             str(root), str(directory), owner], cwd=root, check=True, capture_output=True, text=True)
         receipt = json.loads(finished.stdout.strip().splitlines()[-1])
         original = maintenance_runtime.OriginalExecution(Path(receipt['receipt_file']), owner, 'original-session')

@@ -16,12 +16,25 @@ MANIFEST_ENV = "OA_CONTROLLER_EXECUTION_MANIFEST_FILE"
 
 
 def validate_arguments(arguments: list[str]) -> None:
-    expected = ["--rolling", "--fixed-capacity", "--capacity", "3", "--max-capacity", "3",
-                "--confirm-write", "YES", "--recover-confirmed-no-write-once", "YES"]
+    prefix = ["--rolling", "--fixed-capacity", "--capacity", "3", "--max-capacity", "3", "--confirm-write", "YES"]
+    workflows = []
     for workflow in production_config.FINANCE_WORKFLOWS:
-        expected.extend(("--workflow", workflow))
-    if arguments != expected:
+        workflows.extend(("--workflow", workflow))
+    if arguments == [*prefix, '--recover-confirmed-no-write-once', 'YES', *workflows]:
+        return
+    if arguments[:len(prefix)] != prefix or arguments[-len(workflows):] != workflows:
         raise ValueError("approval_cooldown_override_scope_invalid")
+    selection = arguments[len(prefix):-len(workflows)]
+    if selection[:2] == ['--confirm-alerts', 'NO']:
+        selection = selection[2:]
+    if len(selection) % 2:
+        raise ValueError("approval_cooldown_override_scope_invalid")
+    deferred = set()
+    for flag, raw in zip(selection[::2], selection[1::2]):
+        path = Path(raw)
+        if flag != '--defer-action-file' or not path.is_absolute() or '..' in path.parts or raw in deferred:
+            raise ValueError("approval_cooldown_override_scope_invalid")
+        deferred.add(raw)
 
 
 def _write_new(path: Path, raw: bytes) -> None:
