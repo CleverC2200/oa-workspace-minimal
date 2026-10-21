@@ -299,42 +299,88 @@ class MaterialStore:
                 allowed = False
             yield allowed
 
+    def _skip_reclamation(self, entry: dict, event: dict | None, reason: str) -> None:
+        path = _path(Path(entry['path']))
+        present = path.exists()
+        entry['status'] = 'protected' if present else 'retired'
+        entry['bytes'] = path.stat().st_size if present and path.is_file() else 0
+        if event is not None:
+            event.update(status='skipped', skip_reason=reason)
+
+    def _apply_reclamation_batch(self, state: dict, batch: list[tuple[dict, dict]]) -> int:
+        self._save(state)
+        freed = 0
+        try:
+            for entry, event in batch:
+                path = _path(Path(entry['path']))
+                if not path.is_file():
+                    self._skip_reclamation(entry, event, 'material_unavailable')
+                    continue
+                with self._eligible(entry) as eligible:
+                    if not eligible:
+                        self._skip_reclamation(entry, event, 'eligibility_changed')
+                        continue
+                    if _digest(path) != event['sha256']:
+                        self._skip_reclamation(entry, event, 'material_changed')
+                        continue
+                    with self._writable_output(state, path):
+                        path.unlink()
+                    freed += event['bytes']
+                    entry.update(status='retired', bytes=0)
+                    event['status'] = 'completed'
+        finally:
+            self._save(state)
+        return freed
+
     def _reclaim(self, state: dict, required_bytes: int) -> int:
         freed = 0
         used = self._used(state)
-        for entry in sorted(state['files'].values(), key=lambda item: (
-                not Path(item['path']).is_relative_to(self.root / 'experiments'), item['created_at'])):
-            if used + required_bytes <= self.limit_bytes:
-                break
-            if entry['status'] == 'reserved' or entry['status'] == 'writing':
-                continue
-            path = _path(Path(entry['path']))
-            if not path.is_file():
-                entry['status'] = 'retired'
-                entry['bytes'] = 0
-                self._save(state)
-                continue
-            with self._eligible(entry) as eligible:
-                if not eligible:
+        candidates = iter(sorted(state['files'].values(), key=lambda item: (
+            not Path(item['path']).is_relative_to(self.root / 'experiments'), item['created_at'])))
+        pending = {event['path']: event for event in state['events'] if event['status'] == 'planned'}
+        dirty = False
+        while used + required_bytes > self.limit_bytes:
+            batch = []
+            planned_bytes = 0
+            for entry in candidates:
+                if entry['status'] in {'reserved', 'writing'}:
                     continue
-                fingerprint = _digest(path)
-                if entry['sha256'] and fingerprint != entry['sha256']:
-                    entry['status'] = 'protected'
+                path = _path(Path(entry['path']))
+                previous = pending.get(str(path))
+                if not path.is_file():
+                    self._skip_reclamation(entry, previous, 'material_unavailable')
+                    dirty = True
+                    continue
+                with self._eligible(entry) as eligible:
+                    if not eligible:
+                        if entry['status'] == 'deletion_planned':
+                            self._skip_reclamation(entry, previous, 'eligibility_changed')
+                            dirty = True
+                        continue
+                    fingerprint = _digest(path)
+                    expected = entry['sha256'] or (previous or {}).get('sha256')
+                    if expected and fingerprint != expected:
+                        self._skip_reclamation(entry, previous, 'material_changed')
+                        dirty = True
+                        continue
+                    event = previous or {
+                        'path': str(path), 'source': entry['source'], 'bytes': path.stat().st_size,
+                        'sha256': fingerprint, 'time': _now(), 'reason': 'capacity', 'status': 'planned',
+                    }
+                    entry['status'] = 'deletion_planned'
+                    if previous is None:
+                        state['events'].append(event)
+                    batch.append((entry, event))
+                    planned_bytes += event['bytes']
+                if len(batch) >= 256 or used + required_bytes - planned_bytes <= self.limit_bytes:
+                    break
+            if not batch:
+                if dirty:
                     self._save(state)
-                    continue
-                event = {'path': str(path), 'source': entry['source'], 'bytes': path.stat().st_size,
-                         'sha256': fingerprint, 'time': _now(), 'reason': 'capacity', 'status': 'planned'}
-                entry['status'] = 'deletion_planned'
-                state['events'].append(event)
-                self._save(state)
-                with self._writable_output(state, path):
-                    path.unlink()
-                freed += event['bytes']
-                used -= event['bytes']
-                entry['status'] = 'retired'
-                entry['bytes'] = 0
-                event['status'] = 'completed'
-                self._save(state)
+                break
+            freed += self._apply_reclamation_batch(state, batch)
+            dirty = False
+            used = self._used(state)
         return freed
 
     def _inside_source_checkout(self, path: Path) -> bool:
@@ -506,7 +552,8 @@ class MaterialStore:
                             if expected_bytes is not None and written + len(block) > expected_bytes:
                                 raise ValueError('material_source_size_mismatch')
                             if len(block) > remaining:
-                                remaining += self._reclaim(state, len(block))
+                                self._reclaim(state, len(block))
+                                remaining = self.limit_bytes - self._used(state)
                             if len(block) > remaining:
                                 raise ValueError('material_budget_exceeded')
                             output.write(block)
