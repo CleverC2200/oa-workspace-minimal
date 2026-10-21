@@ -94,3 +94,5 @@
 - [#463 已封存宿主重启的停止恢复](https://github.com/CleverC2200/oa-workspace-minimal/issues/463)：[受控恢复合同](../runbooks/owner-restart-recovery.md)、[公开入口回归](../../tests/finance_preaudit/test_owner_restart_recovery.py)；区别于监督者丢失、退出码未知，不清其他原因的停止门。
 
 - [#549 原生日志夹具发布与读取竞争](https://github.com/CleverC2200/oa-workspace-minimal/issues/549)：[包装图片事件回归](../../tests/finance_preaudit/test_host_packaging_review.py)；复用原子字节发布，保留后台读取、来源校验和实际发布断言。
+
+- [#714](https://github.com/CleverC2200/oa-workspace-minimal/issues/714)：历史 collecting 恢复原因未被现行回执读取器接受；保留原证据，本轮精确排除，历史恢复暂缓。

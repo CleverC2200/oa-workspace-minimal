@@ -13,6 +13,8 @@ from . import attempt_state, flow_engine, reconciliation
 
 _MAIN_FILES = ('action.json', 'state.json', 'material.json', 'review-packet.json',
                'review-decision.json', 'remark.txt', 'submission-envelope.json', 'execution-receipt.json')
+_CLAIM_FORBIDDEN = ('review-decision.json', 'remark.txt', 'submission-envelope.json',
+                    'execution-receipt.json', 'writer-boundary.json')
 _ERROR = 'request_exclusion_untrusted'
 
 
@@ -40,6 +42,9 @@ class _Request:
     item_key: str
     attempt: int
     pins: tuple[dict, ...]
+    execution_state: str
+    write_state: str
+    write_authorized: bool
 
 
 @dataclass(frozen=True)
@@ -66,30 +71,42 @@ class Scope:
                 if (not path.is_absolute() or path != path.resolve() or not flow_engine._is_attempt_action_path(path, root)
                         or path.name != 'action.json'):
                     raise ValueError(_ERROR)
-                pins = tuple(_pin(path.with_name(name), root) for name in _MAIN_FILES)
+                claim_pins = tuple(_pin(path.with_name(name), root) for name in ('action.json', 'state.json'))
                 state = flow_engine._read_object(path.with_name('state.json'), code=_ERROR)
                 action = attempt_state.read_action(path)
-                if (not reader._attempt_identity_matches(path.parent, state, require_material=True)
+                collecting = state.get('execution_state') == 'collecting'
+                if (not reader._attempt_identity_matches(path.parent, state, require_material=not collecting)
                         or not action or any(state.get(key) != value for key, value in action.items())
-                        or any(state.get(key) != value for key, value in {
-                            'action': 'closed', 'execution_state': 'closed', 'write_state': 'submitted',
-                            'mode': 'controlled_write', 'write_authorized': True}.items())):
-                    raise ValueError(_ERROR)
-                reader._completion_receipt(path.parent, state)
-                material = flow_engine._read_object(path.with_name('material.json'), code=_ERROR)
-                packet = flow_engine._read_object(path.with_name('review-packet.json'), code=_ERROR)
-                decision = flow_engine._read_object(path.with_name('review-decision.json'), code=_ERROR)
-                if (state['material_fingerprint'] != 'sha256:' + pins[2]['sha256']
-                        or material.get('request_id') != state['request_id']
-                        or material.get('workflow_key') != state['workflow_key']
-                        or packet.get('workflow_key') != state['workflow_key']
-                        or packet.get('material_fingerprint') != state['material_fingerprint']
-                        or packet.get('rule_version') != decision.get('rule_version')
                         or state['request_id'] in seen):
                     raise ValueError(_ERROR)
+                if collecting:
+                    if (state.get('action') != 'collecting' or state.get('write_state') != 'not_requested'
+                            or state.get('write_authorized') is not False
+                            or any(os.path.lexists(path.with_name(name)) for name in _CLAIM_FORBIDDEN)):
+                        raise ValueError(_ERROR)
+                    recovery = path.with_name('recovery-receipt.json')
+                    pins = claim_pins + ((_pin(recovery, root),) if os.path.lexists(recovery) else ())
+                else:
+                    pins = claim_pins + tuple(_pin(path.with_name(name), root) for name in _MAIN_FILES[2:])
+                    if any(state.get(key) != value for key, value in {
+                            'action': 'closed', 'execution_state': 'closed', 'write_state': 'submitted',
+                            'mode': 'controlled_write', 'write_authorized': True}.items()):
+                        raise ValueError(_ERROR)
+                    reader._completion_receipt(path.parent, state)
+                    material = flow_engine._read_object(path.with_name('material.json'), code=_ERROR)
+                    packet = flow_engine._read_object(path.with_name('review-packet.json'), code=_ERROR)
+                    decision = flow_engine._read_object(path.with_name('review-decision.json'), code=_ERROR)
+                    if (state['material_fingerprint'] != 'sha256:' + pins[2]['sha256']
+                            or material.get('request_id') != state['request_id']
+                            or material.get('workflow_key') != state['workflow_key']
+                            or packet.get('workflow_key') != state['workflow_key']
+                            or packet.get('material_fingerprint') != state['material_fingerprint']
+                            or packet.get('rule_version') != decision.get('rule_version')):
+                        raise ValueError(_ERROR)
                 seen.add(state['request_id'])
                 requests.append(_Request(state['workflow_key'], state['request_id'], state['case_key'],
-                                         state['attempt'], pins))
+                                         state['attempt'], pins, state['execution_state'], state['write_state'],
+                                         state['write_authorized']))
             scope = cls(project_root, issue, tuple(requests))
             scope.verify()
             return scope
@@ -104,12 +121,25 @@ class Scope:
             if item is not None and (state.get('workflow_key') != item.workflow_key
                                      or state.get('write_state') in {'unknown', 'submitting'}):
                 raise ValueError(_ERROR)
+        for item in self._requests:
+            if item.execution_state == 'collecting':
+                matched = [state for state in states if state['case_key'] == item.item_key
+                           and state['workflow_key'] == item.workflow_key]
+                if len(matched) != 1 or matched[0]['attempt'] != item.attempt:
+                    raise ValueError(_ERROR)
         return states
 
     def _verify_pins(self) -> None:
         root = self.project_root / 'runtime/finance_preaudit_flows'
         try:
             for item in self._requests:
+                if item.execution_state == 'collecting':
+                    action = Path(item.pins[0]['path'])
+                    recovery_pinned = any(Path(pin['path']).name == 'recovery-receipt.json' for pin in item.pins)
+                    if (any(os.path.lexists(action.with_name(name)) for name in _CLAIM_FORBIDDEN)
+                            or os.path.lexists(action.with_name('recovery-receipt.json')) != recovery_pinned
+                            or max(number for number, _ in reconciliation._attempt_roots(action.parent.parent)) != item.attempt):
+                        raise ValueError(_ERROR)
                 for pin in item.pins:
                     if _pin(Path(pin['path']), root) != pin:
                         raise ValueError(_ERROR)
@@ -144,6 +174,8 @@ class Scope:
                 'historical_submission_verified': False, 'items': [
                     {'workflow_key': item.workflow_key, 'request_sha256': hashlib.sha256(item.request_id.encode()).hexdigest(),
                      'source_item_key': item.item_key, 'source_attempt': item.attempt,
+                     'source_execution_state': item.execution_state, 'source_write_state': item.write_state,
+                     'source_write_authorized': item.write_authorized,
                      'action_file': item.pins[0]['path'], 'pins': deepcopy(list(item.pins))}
                     for item in self._requests]}
 
@@ -167,30 +199,40 @@ class Scope:
                     or continuation['isolated_pending'] != result['quarantine']['pending_quarantined']):
                 raise ValueError(_ERROR)
             states = {(state['workflow_key'], state['case_key']): state for state in self._states()}
-            selected = {(item.workflow_key, item.item_key, item.attempt) for item in self._requests}
+            selected = {(item.workflow_key, item.item_key, item.attempt): item for item in self._requests}
             request_ids = {item.request_id for item in self._requests}
             removed = []
             active = set()
+            conflicts = 0
             for row in result['findings']:
                 state = states.get((row.get('workflow_key'), row.get('item_key')))
                 if state is not None and state.get('request_id') in request_ids:
                     if row.get('local_write_state') in {'unknown', 'submitting'}:
                         raise ValueError(_ERROR)
                 identity = (row.get('workflow_key'), row.get('item_key'), row.get('attempt'))
-                if identity in selected and row.get('category') == 'identity_conflict':
+                item = selected.get(identity)
+                if item is not None and item.execution_state == 'collecting' and row.get('category') == 'pending_not_handled':
+                    if (row.get('local_execution_state') != 'collecting'
+                            or row.get('local_write_state') != 'not_requested' or identity in removed):
+                        raise ValueError(_ERROR)
+                    removed.append(identity)
+                    active.add(item.request_id)
+                if item is not None and item.execution_state == 'closed' and row.get('category') == 'identity_conflict':
                     if (row.get('local_execution_state') != 'closed' or row.get('local_write_state') != 'submitted'
                             or row.get('recommendation') == 'deferred_historical_cleanup'
                             or identity in removed):
                         raise ValueError(_ERROR)
                     removed.append(identity)
                     active.add(state['request_id'])
+                    conflicts += 1
             count = len(removed)
-            if reasons.get('identity_conflict', 0) < count:
+            if reasons.get('identity_conflict', 0) < conflicts:
                 raise ValueError(_ERROR)
-            if count:
-                reasons['identity_conflict'] -= count
+            if conflicts:
+                reasons['identity_conflict'] -= conflicts
                 if not reasons['identity_conflict']:
                     del reasons['identity_conflict']
+            if count:
                 retained = []
                 for row in result['findings']:
                     if (row.get('workflow_key'), row.get('item_key'), row.get('attempt')) in removed:

@@ -6,7 +6,7 @@ import pytest
 
 from apps import json_artifact
 from apps.oa_finance_preaudit import flow_engine, reconciliation, request_exclusions
-from tests.finance_preaudit.test_flow_engine_replay import _decision, _engine, _grant, _material, _success
+from tests.finance_preaudit.test_flow_engine_replay import _candidates, _decision, _engine, _grant, _material, _success
 from tests.finance_preaudit.test_reconciliation import _state
 
 
@@ -34,6 +34,22 @@ def _closed_submission(project_root: Path) -> tuple[Path, list[dict], dict]:
              'received_at': '2026-08-23T09:00:00+08:00'}]
     raw = reconciliation.reconcile(root, pending_rows=rows, handled_rows=[])
     assert raw['continuation']['blocking_reasons'] == {'identity_conflict': 1}
+    return path, rows, raw
+
+
+def _collecting_claim(project_root: Path) -> tuple[Path, list[dict], dict]:
+    root = project_root / 'runtime/finance_preaudit_flows'
+
+    def interrupted(*_args):
+        raise SystemExit('recorded_preparation_interruption')
+
+    engine = _engine(root, collect_material=interrupted, authorization_source=_grant, submit_frozen=_success)
+    with pytest.raises(SystemExit, match='recorded_preparation_interruption'):
+        engine.next_action('travel_expense', mode='controlled_write')
+    path = next(root.glob('*/cases/*/attempt-1/action.json'))
+    rows = _candidates()
+    raw = reconciliation.reconcile(root, pending_rows=rows, handled_rows=[])
+    assert raw['findings'][0]['local_execution_state'] == 'collecting'
     return path, rows, raw
 
 
@@ -179,3 +195,81 @@ def test_exclusion_rejects_relative_action_and_unexplained_blocked_continuation(
     raw['continuation']['blocking_reasons'] = {}
     with pytest.raises(ValueError, match='request_exclusion_untrusted'):
         scope.project(raw)
+
+
+@pytest.mark.parametrize('recovery_receipt', [False, True])
+def test_exclusion_scopes_a_collecting_claim_without_validating_recovery_or_materials(tmp_path, recovery_receipt):
+    action, rows, raw = _collecting_claim(tmp_path)
+    if recovery_receipt:
+        action.with_name('recovery-receipt.json').write_text('{"failure_code":"codex_review_interrupted"}')
+    rows += [{**rows[0], 'received_at': '2026-08-24T09:00:00+08:00'},
+             {**rows[0], 'request_id': 'other-request'}]
+    raw = reconciliation.reconcile(tmp_path / 'runtime/finance_preaudit_flows', pending_rows=rows, handled_rows=[])
+    before = deepcopy(raw)
+    original_files = {path: path.read_bytes() for path in action.parent.iterdir() if path.is_file()}
+    scope = request_exclusions.Scope.bind(tmp_path, [action], issue=714)
+    projected = scope.project(raw)
+    assert projected['scope_excluded_pending'] == 2
+    assert projected['quarantine']['actionable_pending'] == 1
+    assert projected['findings'] == [] and projected['local_cases'] == 0
+    assert projected['counts'] == {} and projected['recommendations'] == {}
+    assert scope.filter_candidates(rows) == [rows[2]]
+    item = scope.receipt()['items'][0]
+    assert item['source_execution_state'] == 'collecting'
+    assert item['source_write_state'] == 'not_requested' and item['source_write_authorized'] is False
+    assert {Path(pin['path']).name for pin in item['pins']} == {'action.json', 'state.json'} | (
+        {'recovery-receipt.json'} if recovery_receipt else set())
+    assert scope.receipt()['historical_submission_verified'] is False
+    assert raw == before
+    assert {path: path.read_bytes() for path in action.parent.iterdir() if path.is_file()} == original_files
+
+
+@pytest.mark.parametrize('artifact', ['review-decision.json', 'remark.txt', 'submission-envelope.json',
+    'execution-receipt.json', 'writer-boundary.json'])
+@pytest.mark.parametrize('after_bind', [False, True])
+def test_collecting_exclusion_rejects_existing_or_new_write_artifacts_including_broken_links(tmp_path, artifact, after_bind):
+    action, _, raw = _collecting_claim(tmp_path)
+    scope = request_exclusions.Scope.bind(tmp_path, [action], issue=714) if after_bind else None
+    action.with_name(artifact).symlink_to(action.with_name('missing-artifact'))
+    with pytest.raises(ValueError, match='request_exclusion_untrusted'):
+        if scope is None:
+            request_exclusions.Scope.bind(tmp_path, [action], issue=714)
+        else:
+            scope.project(raw)
+
+
+@pytest.mark.parametrize('change', ['new_attempt', 'new_receipt', 'changed_receipt', 'authorized', 'unknown', 'submitting'])
+def test_collecting_exclusion_rejects_progress_or_changed_write_state(tmp_path, change):
+    action, _, _ = _collecting_claim(tmp_path)
+    recovery = action.with_name('recovery-receipt.json')
+    if change == 'changed_receipt':
+        recovery.write_text('{}')
+    scope = request_exclusions.Scope.bind(tmp_path, [action], issue=714)
+    if change == 'new_attempt':
+        action.parent.with_name('attempt-2').mkdir()
+    elif change in {'new_receipt', 'changed_receipt'}:
+        recovery.write_text('{"new":true}')
+    else:
+        state = json.loads(action.with_name('state.json').read_text())
+        if change == 'authorized':
+            state['write_authorized'] = True
+        else:
+            state['write_state'] = change
+        action.with_name('state.json').write_text(json.dumps(state))
+    with pytest.raises(ValueError, match='request_exclusion_untrusted'):
+        scope.verify()
+
+
+def test_collecting_exclusion_preserves_other_blocking_reasons_and_rejects_stale_claim(tmp_path):
+    action, _, raw = _collecting_claim(tmp_path)
+    scope = request_exclusions.Scope.bind(tmp_path, [action], issue=714)
+    raw['continuation'].update(status='blocked', scope='controller',
+                               blocking_reasons={'pending_write_state_unresolved': 1})
+    projected = scope.project(raw)
+    assert projected['continuation']['blocking_reasons'] == {'pending_write_state_unresolved': 1}
+    assert projected['continuation']['status'] == 'blocked'
+    state = json.loads(action.with_name('state.json').read_text())
+    _state(tmp_path / 'runtime/finance_preaudit_flows', state['request_id'], state['received_at'],
+           attempt=2, execution_state='collecting')
+    with pytest.raises(ValueError, match='request_exclusion_untrusted'):
+        request_exclusions.Scope.bind(tmp_path, [action], issue=714)

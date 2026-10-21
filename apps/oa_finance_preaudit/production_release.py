@@ -358,7 +358,7 @@ def release_source(
     allow_admission_blocked = not stopped_maintenance and withdrawn_action is None and material_proof is None and not excluded_action_files
     live = check_live or (lambda target: maintenance_runtime.read_live_status(target,
         require_reaped=stopped_maintenance or withdrawn_action is not None or material_proof is not None or bool(excluded_action_files),
-        source_only_proof=material_proof or withdrawal_proof or loss_proof, official_stop_proof=official_proof,
+        source_only_proof=collecting_exclusion_proof() or material_proof or withdrawal_proof or loss_proof, official_stop_proof=official_proof,
         allow_admission_blocked=allow_admission_blocked))
     manifest_file = root / 'runtime/control/rolling-controller-manifest.json'
     manifest = controller_handoff.manifest_snapshot(manifest_file)
@@ -384,10 +384,25 @@ def release_source(
         if user_stop_proof is not None and report.get('owner_restart_proof') != user_stop_proof:
             raise RuntimeError('production_release_original_evidence_changed')
         return report
+    def collecting_exclusion_proof() -> dict | None:
+        if exclusion_scope is None:
+            return None
+        items = [item for item in exclusion_scope.receipt()['items'] if item['source_execution_state'] == 'collecting']
+        return {'kind':'preaudit_collecting_exclusions_source_only', 'target_root':str(root), 'items':items} if items else None
     def read_snapshot() -> dict:
         snapshot = live(root)
         if exclusion_scope is not None:
             exclusion_scope.verify()
+            proof = collecting_exclusion_proof()
+            if proof is not None:
+                pending = {(row.get('workflow_key'), row.get('item_key'), row.get('attempt'))
+                    for row in snapshot['reconciliation']['findings'] if row.get('category') == 'pending_not_handled'}
+                expected = [item['action_file'] for item in proof['items']
+                    if (item['workflow_key'], item['source_item_key'], item['source_attempt']) in pending]
+                inputs = snapshot.get('maintenance_current_inputs', {})
+                if (sorted(inputs.get('excluded_collecting_actions', [])) != sorted(expected)
+                        or inputs.get('excluded_input_validation') != 'not_performed'):
+                    raise RuntimeError('maintenance_current_inputs_untrusted')
             return {**snapshot, 'reconciliation': exclusion_scope.project(snapshot['reconciliation'])}
         return snapshot
     try:

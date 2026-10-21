@@ -720,7 +720,7 @@ _CURRENT_INPUTS_READER = _HISTORICAL_STOP_VALIDATOR + r'''
 import hashlib, json, os, stat, sys
 from pathlib import Path
 from apps.oa_approval import auth
-from apps.oa_finance_preaudit import flow_engine, production_write, reconciliation, item_failure, recovery_receipt
+from apps.oa_finance_preaudit import flow_engine, production_write, reconciliation, item_failure, recovery_receipt, attempt_state
 root = Path.cwd().resolve()
 path, expected_hash, workflows_json, source_only_json, admission_json = sys.argv[1:]
 required = set(json.loads(workflows_json))
@@ -860,9 +860,53 @@ try:
                 or any(not isinstance(action, str) for action in source_only['actions'])
                 or len(set(source_only['actions'])) != len(source_only['actions'])):
             raise ValueError()
+    collecting_exclusions = {}
+    excluded_collecting = []
+    if source_only is not None and source_only.get('kind') == 'preaudit_collecting_exclusions_source_only':
+        if (set(source_only) != {'kind', 'target_root', 'items'} or source_only['target_root'] != str(root)
+                or not isinstance(source_only['items'], list) or not source_only['items']):
+            raise ValueError()
+        for excluded in source_only['items']:
+            selected = excluded['action_file']
+            if not isinstance(selected, str) or selected in collecting_exclusions:
+                raise ValueError()
+            collecting_exclusions[selected] = excluded
     for item in pending:
         state = by_key[(item['workflow_key'], item['item_key'], item['attempt'])]
         attempt = flows / state['workflow_key'] / 'cases' / state['case_key'] / ('attempt-' + str(state['attempt']))
+        excluded = collecting_exclusions.get(str(attempt / 'action.json'))
+        if excluded is not None:
+            reader = flow_engine.FlowEngine(root=flows, discover_candidates=None, collect_material=None)
+            if (not reader._attempt_identity_matches(attempt, state, require_material=False)
+                    or any(state.get(key) != value for key, value in {'action':'collecting',
+                        'execution_state':'collecting', 'write_state':'not_requested', 'write_authorized':False}.items())
+                    or state.get('mode') not in {'preview', 'controlled_write'}
+                    or excluded['source_execution_state'] != 'collecting' or excluded['source_write_state'] != 'not_requested'
+                    or excluded['source_write_authorized'] is not False
+                    or excluded['workflow_key'] != state['workflow_key'] or excluded['source_item_key'] != state['case_key']
+                    or excluded['source_attempt'] != state['attempt']
+                    or excluded['request_sha256'] != hashlib.sha256(state['request_id'].encode()).hexdigest()
+                    or not attempt_state.read_action(attempt / 'action.json')
+                    or any(os.path.lexists(attempt / name) for name in ('writer-boundary.json', 'execution-receipt.json',
+                        'review-decision.json', 'remark.txt', 'submission-envelope.json'))):
+                raise ValueError()
+            pins = excluded['pins']
+            names = [Path(pin['path']).name for pin in pins]
+            expected_names = ['action.json', 'state.json']
+            if os.path.lexists(attempt / 'recovery-receipt.json'):
+                expected_names.append('recovery-receipt.json')
+            if names != expected_names:
+                raise ValueError()
+            for pin in pins:
+                file = Path(pin['path'])
+                if file.parent != attempt or not flow_engine._managed_existing_path(file, flows):
+                    raise ValueError()
+                info = file.stat(follow_symlinks=False)
+                if pin != {'path':str(file), 'sha256':hashlib.sha256(file.read_bytes()).hexdigest(),
+                        'device':info.st_dev, 'inode':info.st_ino, 'mtime_ns':info.st_mtime_ns, 'size':info.st_size}:
+                    raise ValueError()
+            excluded_collecting.append(str(attempt / 'action.json'))
+            continue
         if state['execution_state'] == 'collecting':
             validate_collecting(flows, attempt, state)
         elif state['execution_state'] == 'review_required':
@@ -948,7 +992,9 @@ try:
     print(json.dumps({'kind':'preaudit_maintenance_current_inputs','status':'verified','read_only':True,
         'write_state':'not_requested','target_root':str(root),'status_sha256':expected_hash,
         'policy_sha256':policy_hash,'authorized_workflows':sorted(required),
-        'pending_frozen_count':len(pending),'validated_frozen_count':validated,
+        'pending_frozen_count':len(pending)-len(excluded_collecting),'validated_frozen_count':validated,
+        **({'excluded_collecting_actions':excluded_collecting, 'excluded_input_validation':'not_performed'}
+            if collecting_exclusions else {}),
         **({'admission_blocked_actions':admission_blocked} if allow_admission_blocked else {}),
         **({'verified_material_failure_actions':source_only['actions'], 'material_failure_recovery_ready':True,
             'material_failure_fingerprints':failure_fingerprints} if material_source_only else {}),
