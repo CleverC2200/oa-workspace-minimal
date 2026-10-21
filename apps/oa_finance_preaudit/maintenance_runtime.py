@@ -39,6 +39,9 @@ def maintenance_material_read():
     store = material_store.MaterialStore()
     original_locked = material_store.MaterialStore._locked
     with original_locked(store, readonly=True) as state:
+        if 'project_checkouts' not in state:
+            yield
+            return
         @contextmanager
         def locked_material_read(reader, *, readonly=False, refresh=True):
             if not readonly or reader.root != store.root:

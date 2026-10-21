@@ -560,6 +560,37 @@ def test_live_reader_batches_legacy_material_checks_in_target_process(
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
+def test_material_read_scope_observes_inventory_created_during_validation(compiled_maintenance_source, tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    shutil.copytree(compiled_maintenance_source / 'apps', tmp_path / 'apps')
+    inventory_root = tmp_path / 'new-inventory'
+    program = '''
+import json
+from pathlib import Path
+from apps.oa_approval.material_store import MaterialStore
+store = MaterialStore()
+target = Path.cwd() / 'material.pdf'
+target.write_bytes(b'original')
+store.root.mkdir(parents=True)
+(store.root / 'inventory.lock').touch(mode=0o600)
+(store.root / 'inventory.json').write_text(json.dumps({'schema_version':1,
+    'files':{str(target):{'path':str(target),'status':'retired'}},'events':[],'directories':{}}))
+try:
+    store.require_available(target)
+except ValueError as error:
+    assert str(error) == 'material_retired'
+else:
+    raise AssertionError('new retirement ignored')
+'''
+    result = subprocess.run([sys.executable, '-B', '-E', '-c', maintenance_runtime._material_read_program(program)],
+        cwd=tmp_path, env={**os.environ, 'OA_PROJECT_SPACE_ROOT': str(inventory_root)},
+        capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
 def test_stopped_readonly_status_refuses_unreaped_child_even_after_parent_exit(tmp_path):
     import sys
     interpreter = tmp_path / '.venv/bin/python'
