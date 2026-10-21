@@ -5,7 +5,7 @@ from uuid import uuid4
 
 import pytest
 
-from apps.oa_finance_preaudit import approval_lifecycle, host_chat_review as host
+from apps.oa_finance_preaudit import native_evidence, approval_lifecycle, host_chat_review as host
 from scripts import finance_preaudit_run as runner
 from tests.finance_preaudit.test_app_preregistration_shutdown import failed_start as failed_start
 from tests.finance_preaudit.test_host_chat_review import native_call as recorded_call
@@ -48,7 +48,7 @@ def test_legacy_prepared_failure_seals_original_sources_without_reclassifying_ac
     args, progress = legacy_failure
     from apps.oa_finance_preaudit import legacy_app_shutdown as legacy
     originals = {p: p.read_bytes() for p in [args['receipt_file'], progress]}
-    host.assert_previous_rounds_closed(owner=str(uuid4()))
+    host.assert_current_activity_idle(owner=str(uuid4()))
     assert legacy.finish(**args, confirm=False)['status'] == 'ready'
     assert not args['receipt_file'].with_name('legacy-app-shutdown.json').exists()
     sealed = legacy.finish(**args, confirm=True)
@@ -57,7 +57,7 @@ def test_legacy_prepared_failure_seals_original_sources_without_reclassifying_ac
     assert sealed['no_writes_by_original_run'] is True
     assert all(p.read_bytes() == raw for p, raw in originals.items())
     assert legacy.sealed(args['receipt_file']) == sealed
-    host.assert_previous_rounds_closed(owner=str(uuid4()))
+    host.assert_current_activity_idle(owner=str(uuid4()))
     assert legacy.finish(**args, confirm=True) == sealed
 
 
@@ -130,14 +130,14 @@ def test_legacy_owner_alias_requires_full_original_terminal_payload(legacy_failu
         'const r = await tools.write_stdin({session_id:"native-session",chars:"\\u0003",yield_time_ms:1000}); text(JSON.stringify(r));',
         'legacy-interrupted-terminal', {'exit_code': 1, 'output': json.dumps({**execution, 'receipt_file': str(path)})})
     from apps.oa_finance_preaudit import app_review_shutdown
-    native, proof = host._native_source(args['source'], args['source_owner'], args['wait_line'], output=True)
+    native, proof = native_evidence.read(args['source'], args['source_owner'], args['wait_line'], output=True)
     with pytest.raises(ValueError, match='shutdown_wait_untrusted'):
         app_review_shutdown._wait_result(native['anchor'], proof['output'], args['tool_session_id'])
     sealed = legacy.finish(**args, confirm=True)
     assert sealed['owner_task_id'] == alias
     assert sealed['source_owner_task_id'] == args['source_owner']
     assert sealed['historical_owner_matches_native_source'] is False
-    host.assert_previous_rounds_closed(owner=str(uuid4()))
+    host.assert_current_activity_idle(owner=str(uuid4()))
 
 
 def test_public_legacy_sealing_cli_defaults_to_preview(legacy_failure, monkeypatch, capsys):
@@ -156,7 +156,7 @@ def test_public_legacy_sealing_cli_defaults_to_preview(legacy_failure, monkeypat
     assert not args['receipt_file'].with_name('legacy-app-shutdown.json').exists()
     assert legacy.main([*command, '--confirm-seal', 'YES']) == 0
     assert json.loads(capsys.readouterr().out)['status'] == 'verified'
-    host.assert_previous_rounds_closed(owner=str(uuid4()))
+    host.assert_current_activity_idle(owner=str(uuid4()))
 
 
 @pytest.mark.parametrize('terminal_before_exit', [False, True])

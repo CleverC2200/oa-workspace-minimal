@@ -68,7 +68,7 @@ def test_pre_registration_shutdown_seals_native_exit_without_rewriting_partial_e
     assert projected['controller_state'] == 'failed' and projected['children_reaped'] is True
     assert projected['state'] == 'supervisor_lost' and projected['recorded_state'] == 'exited'
     assert projected['status'] == 'blocked' and projected['terminal'] is False
-    host.assert_previous_rounds_closed(owner=str(uuid4()))
+    host.assert_current_activity_idle(owner=str(uuid4()))
     command = ['--operation', 'finish-unregistered-shutdown', '--owner-task-id', args['owner'],
                '--receipt-file', str(args['receipt_file']), '--invocation-id', args['invocation_id'],
                '--tool-session-id', args['tool_session_id'], '--source-session-file', str(args['source']),
@@ -81,7 +81,7 @@ def test_pre_registration_shutdown_seals_native_exit_without_rewriting_partial_e
     assert receipt['status'] == 'verified' and receipt['driver_exit_code'] == 1
     assert receipt['run_id'] == result['run_id'] and receipt['no_actions_or_writes'] is True
     assert args['receipt_file'].read_bytes() == original
-    host.assert_previous_rounds_closed(owner=str(uuid4()))
+    host.assert_current_activity_idle(owner=str(uuid4()))
     report = runner.read_execution(args['receipt_file'], owner_task_id=args['owner'],
                                    invocation_id=args['invocation_id'], tool_session_id='native-session')
     assert report['status'] == 'blocked' and report['terminal'] is False
@@ -168,7 +168,7 @@ def test_sealed_pre_registration_history_can_be_read_while_current_writer_is_act
     monkeypatch.setattr(shutdown.runtime_control, 'writer_active', lambda: True)
     assert shutdown.sealed_unregistered(args['receipt_file']) == saved
     with pytest.raises(ValueError, match='previous_round_incomplete'):
-        host.assert_previous_rounds_closed(owner=str(uuid4()))
+        host.assert_current_activity_idle(owner=str(uuid4()))
 
 
 def test_public_cli_provider_switch_ignores_historical_audit_gap(failed_start, monkeypatch, capsys):

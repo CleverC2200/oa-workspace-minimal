@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from apps.oa_finance_preaudit import native_evidence
+
 import hashlib
 import json
 import os
@@ -17,14 +19,14 @@ def test_compressed_native_anchor_preserves_original_line_bytes(exchange):
     line = native_call(child, 'functions.exec', 'native publication', 'publication', {'exit_code': 0})
     child.write_bytes(child.read_bytes().replace(b'\n', b'\r\n'))
     session = json.loads(child.read_bytes().splitlines()[0])['payload']['id']
-    before = host._native_source(child, session, line, output=True)
+    before = native_evidence.read(child, session, line, output=True)
     archive = Path(os.environ['CODEX_HOME']) / 'archived_sessions'
     archive.mkdir()
     target = archive / (child.name + '.zst')
     subprocess.run(['zstd', '-q', str(child), '-o', str(target)], check=True)
     child.unlink()
     compressed = target.read_bytes()
-    assert host._native_source(child, session, line, output=True) == before
+    assert native_evidence.read(child, session, line, output=True) == before
     assert target.read_bytes() == compressed and not child.exists()
 
 
@@ -49,12 +51,12 @@ def test_compressed_native_source_reaps_decoder_and_rejects_invalid_evidence(exc
         process = popen(*args, **kwargs)
         created.append(process)
         return process
-    monkeypatch.setattr(host.subprocess, 'Popen', recording)
+    monkeypatch.setattr(native_evidence.subprocess, 'Popen', recording)
     if damage == 'none':
-        assert host._native_source(child, session)[0]['header']['id'] == session
+        assert native_evidence.read(child, session)[0]['header']['id'] == session
     else:
         with pytest.raises(ValueError, match='host_review_source_untrusted'):
-            host._native_source(child, 'wrong-session' if damage == 'wrong_session' else session)
+            native_evidence.read(child, 'wrong-session' if damage == 'wrong_session' else session)
     assert len(created) == (0 if damage == 'decoder_unavailable' else 1)
     assert all(process.poll() is not None and process.stdout.closed for process in created)
 
@@ -128,4 +130,15 @@ def test_oversized_referenced_or_unresolved_native_evidence_still_rejected(excha
         subprocess.run(['zstd', '-q', str(child), '-o', str(path)], check=True)
         child.unlink()
     with pytest.raises(ValueError, match='host_review_source_untrusted'):
-        host._native_source(child, session, line, output=output)
+        native_evidence.read(child, session, line, output=output)
+
+
+def test_native_read_requires_identified_call_before_pairing_output(exchange):
+    _, _, _owner, child, *_ = exchange
+    line = native_call(child, 'functions.exec', 'native publication', 'identified', {'exit_code': 0})
+    rows = [json.loads(raw) for raw in child.read_text().splitlines()]
+    for row in rows[line - 1:]:
+        row['payload'].pop('call_id', None)
+    child.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    with pytest.raises(ValueError, match='host_review_source_untrusted'):
+        native_evidence.read(child, rows[0]['payload']['id'], line, output=True)

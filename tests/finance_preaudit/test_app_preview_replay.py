@@ -212,7 +212,8 @@ def test_app_preview_freezes_the_actual_execution_sources(app_case, monkeypatch,
     prepared = json.loads(capsys.readouterr().out)
     manifest = json.loads((Path(prepared['audit']) / 'prepare.json').read_text())
     paths = {item['path'] for item in manifest['source_manifest']}
-    assert {'scripts/finance_preaudit_native_replay.py', 'scripts/finance_preaudit_run.py'} <= paths
+    assert {'scripts/finance_preaudit_native_replay.py', 'scripts/finance_preaudit_run.py',
+            'apps/oa_finance_preaudit/native_evidence.py'} <= paths
     frozen = Path(prepared['project_root']) / 'apps/oa_finance_preaudit/host_chat_review.py'
     frozen.write_bytes(frozen.read_bytes() + b'\n')
     run_arguments = ['--run' if arg == '--prepare' else arg for arg in arguments]

@@ -946,7 +946,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise ValueError("host_review_previous_round_incomplete")
             if gate["status"] == "ready":
                 phase = "app_round_closure"
-                host_chat_review.assert_previous_rounds_closed(owner=str(args.owner_task_id))
+                host_chat_review.assert_current_activity_idle(owner=str(args.owner_task_id))
             phase = "startup_gate"
             if gate["status"] != "ready" and not targeted:
                 print(json.dumps({"schema_version": 1, "kind": "approval_startup_gate", **gate}, sort_keys=True))
