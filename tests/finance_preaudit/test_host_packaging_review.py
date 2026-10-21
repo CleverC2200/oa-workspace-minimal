@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from apps.oa_approval import runtime_control
 from apps.oa_finance_preaudit import packaging_review as packaging, host_chat_review as host, controller_handoff
 from tests.finance_preaudit.test_packaging_review import action, draft
 from tests.finance_preaudit.test_host_chat_review import exchange, native_call, seal_execution, draft_source, wait_request
@@ -59,7 +60,7 @@ def native_exec(source, code, call_id, output):
     row = json.loads(rows[line-1])
     row['payload']['name'] = 'exec'
     rows[line-1] = json.dumps(row)
-    source.write_text('\n'.join(rows)+'\n')
+    runtime_control.write_control_bytes_atomic(source, ('\n'.join(rows)+'\n').encode('utf-8'))
     return line
 
 
@@ -69,6 +70,32 @@ def observe_pages(path, child):
         native_exec(child, 'const r=await tools.view_image({path:' + json.dumps(page['path']) + '});image(r.image_url);',
             f'look-{number}', [{'type': 'input_text', 'text': 'Script completed'},
                              {'type': 'input_image', 'image_url': 'data:image/png;base64,recorded'}])
+
+
+def test_native_image_event_publication_keeps_child_header_visible(package_round, monkeypatch):
+    import os
+    path, _, owner, _ = package_round
+    request, child = assigned_package(package_round)
+    observations = []
+    original_open, original_replace = Path.open, os.replace
+
+    def observe_open(source, mode='r', *args, **kwargs):
+        stream = original_open(source, mode, *args, **kwargs)
+        if source == child and 'w' in mode:
+            observations.append(host.poll_result(request))
+        return stream
+
+    def observe_replace(source, target, **kwargs):
+        if target == child.name:
+            observations.append(host.poll_result(request))
+        return original_replace(source, target, **kwargs)
+
+    monkeypatch.setattr(Path, 'open', observe_open)
+    monkeypatch.setattr(os, 'replace', observe_replace)
+    observe_pages(path, child)
+    assert observations == [None] * len(page_refs(path))
+    reviewed = publish_payload(request, child, envelope(path), owner)
+    assert reviewed['status'] == 'reviewed'
 
 
 def publish_payload(request, child, payload, owner, *, filename='draft.json'):
