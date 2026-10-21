@@ -21,6 +21,41 @@ from apps.oa_finance_preaudit import approval_guard as guard, approval_lifecycle
 if any(not Path(module.__file__).resolve().is_relative_to(root) for module in
        (host, shutdown, guard, lifecycle, controller_handoff)):
     raise ValueError('shutdown_stop_source_untrusted')
+from importlib.util import find_spec
+if find_spec('apps.oa_finance_preaudit.native_evidence') is not None:
+    from apps.oa_finance_preaudit import native_evidence as evidence
+    if (not Path(evidence.__file__).resolve().is_relative_to(root)
+        or evidence.FORMAT_VERSION != 1):
+        raise ValueError('shutdown_stop_source_untrusted')
+else:
+    from types import SimpleNamespace
+    def legacy_calls(code):
+        calls=[]
+        while code.strip():
+            match=re.match(r'\s*text\(await tools\.exec_command\((\{[^\n]+\})\)\);',code)
+            if match is None:
+                raise ValueError('shutdown_stop_begin_untrusted')
+            calls.append(('exec_command',host._literal_arguments(match[1],{'cmd','max_output_tokens'})))
+            code=code[match.end():]
+        return calls
+    def legacy_results(output):
+        def check(item):
+            if isinstance(item,str):
+                try: decoded=json.loads(item)
+                except ValueError: return
+                check(decoded)
+            elif isinstance(item,list):
+                for part in item: check(part)
+            elif isinstance(item,dict):
+                if item.get('isError') or item.get('error'):
+                    raise ValueError('shutdown_stop_begin_untrusted')
+                if 'output' not in item or not ('exit_code' in item or 'session_id' in item):
+                    for part in item.values(): check(part)
+        check(output)
+        return shutdown._execution_results(output)
+    evidence=SimpleNamespace(read=host._native_source,tool=host._tool,
+        execution_calls=legacy_calls,execution_results=legacy_results,
+        agent_status=host._native_agent_status)
 saved_execution=json.loads(finance_preaudit_run._read_evidence(Path(path)))
 value=host._registry(owner,live=False,run_id=report.get('run_id'))
 plan=value['shutdown']; receipt=plan['receipt']; mirror=controller_handoff._read_manifest()
@@ -41,20 +76,20 @@ stops=[]
 for reviewer,saved in zip(value['reviewers'],receipt['interrupt_sources'],strict=True):
     anchor,proof=shutdown._source(value,owner,source,saved['line'],earliest=plan['started_at'])
     output=proof.pop('output')
-    if (host._tool(anchor,'interrupt_agent')!={'target':reviewer['agent_path']}
+    if (evidence.tool(anchor,'interrupt_agent')!={'target':reviewer['agent_path']}
         or set(output)!={'previous_status'} or proof!=saved):
         raise ValueError('shutdown_stop_interrupt_untrusted')
-    host._native_agent_status(output['previous_status']); stops.append(proof)
+    evidence.agent_status(output['previous_status']); stops.append(proof)
 anchor,proof=shutdown._source(value,owner,source,receipt['children_source']['line'],earliest=plan['started_at'])
-host._tool(anchor,'list_agents'); output=proof.pop('output')
+evidence.tool(anchor,'list_agents'); output=proof.pop('output')
 if output.get('isError') or output.get('error') or proof['line']<=max(p['output_line'] for p in stops):
     raise ValueError('shutdown_stop_children_untrusted')
 statuses=[]
 for reviewer in value['reviewers']:
     matches=[a for a in output['agents'] if a.get('agent_name')==reviewer['agent_path']]
-    if len(matches)!=1 or host._native_agent_status(matches[0]['agent_status']) not in {'idle','completed','interrupted'}:
+    if len(matches)!=1 or evidence.agent_status(matches[0]['agent_status']) not in {'idle','completed','interrupted'}:
         raise ValueError('shutdown_stop_children_untrusted')
-    statuses.append({'agent_name':reviewer['agent_path'],'agent_status':host._native_agent_status(matches[0]['agent_status'])})
+    statuses.append({'agent_name':reviewer['agent_path'],'agent_status':evidence.agent_status(matches[0]['agent_status'])})
 proof['reviewers']=statuses
 if proof!=receipt['children_source']: raise ValueError('shutdown_stop_children_untrusted')
 anchor,proof=shutdown._source(value,owner,source,receipt['driver_wait_source']['line'],earliest=value['registered_at'])
@@ -68,19 +103,15 @@ expected={'kind':'preaudit_app_shutdown','status':'verified','owner_task_id':own
     'driver_exit_code':report['exit_code'],'children_reaped':True,'writer_active':False,
     'execution_sha256':host.hashlib.sha256(host._read(Path(path))[0]).hexdigest()}
 if receipt!=expected: raise ValueError('shutdown_stop_receipt_untrusted')
-native,begin=host._native_source(source,owner,int(sys.argv[4]),output=True)
+native,begin=evidence.read(source,owner,int(sys.argv[4]),output=True)
 anchor=native['anchor']; code=anchor['payload'].get('input','')
 if anchor['payload'].get('name') not in {'exec','functions.exec'}:
     raise ValueError('shutdown_stop_begin_untrusted')
 commands=[]
-remaining=code
-while remaining.strip():
-    match=re.match(r'\s*text\(await tools\.exec_command\((\{[^\n]+\})\)\);',remaining)
-    if match is None or len(commands)>=2:
+for tool,args in evidence.execution_calls(code):
+    if tool!='exec_command' or len(commands)>=2 or set(args)-{'cmd','max_output_tokens'}:
         raise ValueError('shutdown_stop_begin_untrusted')
-    args=shutdown._literal_arguments(match[1],{'cmd','max_output_tokens'})
     commands.append(shlex.split(args['cmd']))
-    remaining=remaining[match.end():]
 expected_commands=[['.venv/bin/python','-B','-m','apps.oa_finance_preaudit.host_chat_review',
     '--operation','begin-shutdown','--owner-task-id',owner,'--reason',plan['reason']]]
 if len(commands)==2:
@@ -89,20 +120,7 @@ if len(commands)==2:
         '--tool-session-id',session,'--retrieve-result'])
 if commands!=expected_commands:
     raise ValueError('shutdown_stop_begin_untrusted')
-results=[]
-def visit(item):
-    if isinstance(item,str):
-        try: visit(json.loads(item))
-        except ValueError: pass
-    elif isinstance(item,list):
-        for part in item: visit(part)
-    elif isinstance(item,dict):
-        if item.get('isError') or item.get('error'):
-            raise ValueError('shutdown_stop_begin_untrusted')
-        if 'output' in item and ('exit_code' in item or 'session_id' in item): results.append(item)
-        else:
-            for part in item.values(): visit(part)
-visit(begin['output'])
+results=evidence.execution_results(begin['output'])
 if (len(results)!=len(commands) or results[0].get('exit_code')!=0
     or any(type(r.get('exit_code')) is not int or r.get('session_id') is not None for r in results)):
     raise ValueError('shutdown_stop_begin_untrusted')
@@ -118,7 +136,7 @@ if started!={k:plan[k] for k in ('status','reason','started_at','interrupt_targe
 stop=root/'runtime/stop-preaudit.flag'; info=stop.lstat()
 modified=info.st_mtime_ns/1e9
 call_at=datetime.fromisoformat(anchor['timestamp'].replace('Z','+00:00')).timestamp()
-native_output,_=host._native_source(source,owner,begin['output_line'])
+native_output,_=evidence.read(source,owner,begin['output_line'])
 output_at=datetime.fromisoformat(native_output['anchor']['timestamp'].replace('Z','+00:00')).timestamp()
 if not datetime.fromisoformat(saved_execution['completed_at']).timestamp()<=call_at<=plan['started_at']<=modified<=output_at<=plan['verified_at']:
     raise ValueError('shutdown_stop_attribution_untrusted')

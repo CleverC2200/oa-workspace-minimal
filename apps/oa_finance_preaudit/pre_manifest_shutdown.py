@@ -5,12 +5,11 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-import re
 import shlex
 import subprocess
 import time
 
-from . import app_review_shutdown as shutdown, controller_handoff, host_chat_review as host, maintenance_runtime
+from . import app_review_shutdown as shutdown, controller_handoff, host_chat_review as host, maintenance_runtime, native_evidence
 
 MODULE = 'apps.oa_finance_preaudit.pre_manifest_shutdown'
 ROOT = Path(__file__).resolve().parents[2]
@@ -116,14 +115,14 @@ def _proofs(*, target: Path, binding: dict, reviewers: list[dict], source: Path,
     report, raw, execution = _original(target, binding)
     started = runner._timestamp(execution['started_at']).timestamp()
     completed = runner._timestamp(execution['completed_at']).timestamp()
-    native, launch = host._native_source(source, binding['owner_task_id'], launch_line, output=True)
+    native, launch = native_evidence.read(source, binding['owner_task_id'], launch_line, output=True)
     payload = native['anchor']['payload']
-    matched = re.fullmatch(r'\s*text\(await tools\.exec_command\((\{.*\})\)\);\s*', payload.get('input', ''), re.DOTALL)
-    if payload.get('name') not in {'exec', 'functions.exec'} or matched is None:
+    calls = native_evidence.execution_calls(payload.get('input', ''))
+    if payload.get('name') not in {'exec', 'functions.exec'} or len(calls) != 1 or calls[0][0] != 'exec_command':
         raise ValueError(BLOCKED)
-    options = shutdown._literal_arguments(matched[1], {'cmd', 'workdir', 'yield_time_ms', 'max_output_tokens'})
+    options = calls[0][1]
     argv = shlex.split(options['cmd'])
-    results = shutdown._execution_results(launch.pop('output'))
+    results = native_evidence.execution_results(launch.pop('output'))
     if (argv[:3] != ['.venv/bin/python', '-m', 'scripts.finance_preaudit_run']
             or argv[3:10] != ['--owner-task-id', binding['owner_task_id'], '--review-provider', 'openai',
                              '--review-transport', 'host_chat', '--']
@@ -187,8 +186,8 @@ def command(*, target: Path, binding: dict, reviewers: list[dict], source: Path,
 
 
 def _observation_source(source: Path, owner: str, line: int) -> tuple[dict, dict]:
-    native, proof = host._native_source(source, owner, line, output=True)
-    results = shutdown._execution_results(proof.pop('output'))
+    native, proof = native_evidence.read(source, owner, line, output=True)
+    results = native_evidence.execution_results(proof.pop('output'))
     if len(results) != 1:
         raise ValueError(BLOCKED)
     output = results[0]
@@ -209,13 +208,13 @@ def _observation_source(source: Path, owner: str, line: int) -> tuple[dict, dict
     expected = 'text(await tools.exec_command(' + json.dumps(command(**_inputs(observed), candidate=observed['candidate']), ensure_ascii=False) + '));'
     anchor = native['anchor']
     if (anchor['payload'].get('name') not in {'exec', 'functions.exec'}
-            or str(anchor['payload'].get('input', '')).strip() != expected
+            or native_evidence.normalize_output(str(anchor['payload'].get('input', ''))).strip() != expected
             or observed.get('kind') != 'preaudit_app_pre_manifest_observation' or observed.get('status') != 'ready'
             or observed['original_execution']['owner_task_id'] != owner
             or observed['children_source']['session_file'] != str(source.absolute())):
         raise ValueError(BLOCKED)
     from scripts import finance_preaudit_run as runner
-    returned, _ = host._native_source(source, owner, proof['output_line'])
+    returned, _ = native_evidence.read(source, owner, proof['output_line'])
     if not (runner._timestamp(anchor['timestamp']).timestamp() <= observed['observed_at']
             <= runner._timestamp(returned['anchor']['timestamp']).timestamp() <= time.time()):
         raise ValueError(BLOCKED)

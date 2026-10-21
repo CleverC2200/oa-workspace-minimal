@@ -75,8 +75,21 @@ wait=call('functions.exec','text(await tools.write_stdin('+json.dumps({'session_
 s.finish(owner=owner,source=parent,interrupt_lines=interrupts,status_line=status,wait_line=wait)
 print(begin)
 '''
+    if getattr(request, 'param', None) == 'legacy_interface':
+        package = root / 'apps/oa_finance_preaudit'
+        (package / 'native_evidence.py').rename(package / '_recorded_native.py')
+        for name in ('host_chat_review.py', 'app_review_shutdown.py', 'pre_manifest_shutdown.py'):
+            module = package / name
+            module.write_text(module.read_text().replace(', native_evidence', ', _recorded_native as native_evidence'))
+        with (package / 'host_chat_review.py').open('a') as stream:
+            stream.write('\n_native_source = native_evidence.read\n_tool = native_evidence.tool\n_literal_arguments = native_evidence.literal_arguments\n_native_agent_status = native_evidence.agent_status\n')
+        with (package / 'app_review_shutdown.py').open('a') as stream:
+            stream.write('\n_execution_results = native_evidence.execution_results\n')
     if getattr(request, 'param', None) == 'coarse_stop_clock':
         program = program.replace("marker.chmod(0o600)", "marker.chmod(0o600); stamp=time.time_ns()-10_000_000; __import__('os').utime(marker,ns=(stamp,stamp))")
+    if getattr(request, 'param', None) == 'named_begin':
+        program = program.replace("'text(await tools.exec_command('", "'const started = await tools.exec_command('")
+        program = program.replace("+'));',None,stop)", "+');text(started);',None,stop)")
     result = subprocess.run([str(root / '.venv/bin/python'), '-B', '-c', program,
         original.owner_task_id, str(parent), str(spec), str(original.file)], cwd=root,
         text=True, capture_output=True, check=True)
@@ -84,7 +97,7 @@ print(begin)
     return root, original, action, cron, live, begin, parent
 
 
-@pytest.mark.parametrize('sealed_target', [None, 'coarse_stop_clock'], indirect=True)
+@pytest.mark.parametrize('sealed_target', [None, 'coarse_stop_clock', 'named_begin', 'legacy_interface'], indirect=True)
 def test_target_owned_bound_reader_revalidates_original_native_shutdown(sealed_target, monkeypatch):
     original_reader = maintenance_runtime._run_readonly
 
@@ -151,9 +164,13 @@ def test_bound_reader_distinguishes_reused_pid_from_live_or_unknown_model(sealed
             process.wait(timeout=5)
 
 
-@pytest.mark.parametrize('damage', ['wrong_begin','wrong_owner','stop_time','wait','status','unverified','receipt','extra_command','extra_result'])
+@pytest.mark.parametrize('damage', ['wrong_begin','wrong_owner','stop_time','wait','status','unverified','receipt','extra_command','extra_result','module_version','module_origin'])
 def test_bound_reader_rejects_mismatched_shutdown_evidence(sealed_target, damage):
     root, original, _, _, _, begin, parent = sealed_target
+    if damage in {'module_version', 'module_origin'}:
+        module = root / 'apps/oa_finance_preaudit/native_evidence.py'
+        with module.open('a') as stream:
+            stream.write('\nFORMAT_VERSION = 2\n' if damage == 'module_version' else "\n__file__ = '/foreign/native_evidence.py'\n")
     if damage == 'wrong_begin': begin += 2
     if damage == 'wrong_owner':
         original = maintenance_runtime.OriginalExecution(original.file,'00000000-0000-0000-0000-000000000001',original.tool_session_id)

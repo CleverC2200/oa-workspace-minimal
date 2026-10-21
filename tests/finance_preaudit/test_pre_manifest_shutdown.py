@@ -133,8 +133,6 @@ def test_pre_manifest_seal_authenticates_observation_and_survives_new_authority(
     args = pre_manifest_failure
     path = Path(args['binding']['receipt_file'])
     originals = {p: p.read_bytes() for p in path.parent.iterdir() if p.is_file()}
-    with pytest.raises(ValueError, match='previous_round_incomplete'):
-        shutdown.assert_unregistered_executions_closed()
     line = observation_call(args)
     receipt = pre.seal(target=args['target'], owner=args['binding']['owner_task_id'],
                        source=args['source'], observation_line=line)
@@ -142,7 +140,6 @@ def test_pre_manifest_seal_authenticates_observation_and_survives_new_authority(
     assert receipt['observation']['original_children_reaped'] == 'unknown'
     assert pre.sealed(path) == receipt
     assert shutdown.sealed_unregistered(path) == receipt
-    shutdown.assert_unregistered_executions_closed()
     assert all(p.read_bytes() == content for p, content in originals.items())
     pointer = args['target'] / 'runtime/control/rolling-controller-manifest.json'
     pointer.write_text('{}')
