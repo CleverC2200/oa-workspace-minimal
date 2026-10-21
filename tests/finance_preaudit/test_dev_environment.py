@@ -295,7 +295,8 @@ def test_native_setup_and_actions_execute_the_formal_entry(tmp_path):
     approval = root / 'apps/oa_approval'
     approval.mkdir()
     (approval / '__init__.py').write_text('')
-    (approval / 'material_store.py').write_bytes((SCRIPT.parents[1] / 'apps/oa_approval/material_store.py').read_bytes())
+    for name in ('material_store.py', 'material_inventory.py'):
+        (approval / name).write_bytes((SCRIPT.parents[1] / 'apps/oa_approval' / name).read_bytes())
     setup = command_from_config = shlex.split(configuration['setup']['script'])
     setup[0] = sys.executable
     process = subprocess.run(command_from_config, cwd=root, capture_output=True, text=True)
