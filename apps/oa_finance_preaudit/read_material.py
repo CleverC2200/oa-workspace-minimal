@@ -5,10 +5,15 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 from pathlib import Path
 import sys
 
 from . import attempt_state
+
+
+def command(action_file: Path) -> str:
+    return shlex.join([sys.executable, '-X', 'utf8', '-B', '-m', __name__, str(action_file.absolute())])
 
 
 def _json(value: object) -> str:
@@ -69,7 +74,7 @@ def _image_tool_routes(material: dict, action_file: Path) -> dict:
     resources = material.get('resources') or []
     if not pages:
         return {}
-    recognition = ['python3', '-B', '-m', 'apps.oa_approval.attachment_recognition']
+    recognition = [sys.executable, '-X', 'utf8', '-B', '-m', 'apps.oa_approval.attachment_recognition']
     routes = {
         'kind': 'generated_tool_navigation',
         'readability': 'not_verified',
@@ -110,7 +115,7 @@ def _image_tool_routes(material: dict, action_file: Path) -> dict:
                 'coverage': 'image_region',
             }
             route['auxiliary_copy'] = {
-                'argv': ['python3', '-B', '-m', 'apps.oa_approval.image_compression', '--file', path],
+                'argv': [sys.executable, '-X', 'utf8', '-B', '-m', 'apps.oa_approval.image_compression', '--file', path],
                 'recognition_authorization': 'requires_current_scope',
                 'counts_as_original_page_coverage': False,
             }

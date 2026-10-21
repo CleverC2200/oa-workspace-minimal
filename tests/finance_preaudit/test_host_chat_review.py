@@ -208,7 +208,7 @@ def test_host_entertainment_rule_and_preview_keep_payment_distinct_from_attribut
         prompt = json.loads(request.read_text())['prompt']
         assert 'references/flows/business-entertainment.md' in prompt
         assert '## 支付事实与费用归属' in rule.read_text()
-        command = re.search(r'`(python3 -m apps.oa_finance_preaudit.read_material [^`]+)`', prompt)
+        command = re.search(r'`([^`]+ -m apps.oa_finance_preaudit.read_material [^`]+)`', prompt)
         assert command
         view = read_material.read(Path(shlex.split(command.group(1))[-1]))
         assert '付款65元成功' in view and '付款40元成功' in view
