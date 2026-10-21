@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 import json
 import hashlib
 import os
@@ -697,7 +698,8 @@ def _capture_browser_download(url: str, name: str, *, dest_dir: Path | None,
                 try:
                     page.goto(url, wait_until='domcontentloaded', timeout=_browser_timeout_ms(timeout_sec))
                 except Exception as navigation_error:
-                    if 'net::ERR_ABORTED' not in str(navigation_error):
+                    if ('net::ERR_ABORTED' not in str(navigation_error)
+                            and 'Page.goto: Download is starting' not in str(navigation_error)):
                         raise
             download = event.value
             captured_url = normalize_download_url(download.url, allow_extra_hosts=True)
@@ -1544,162 +1546,164 @@ def download_resources(
 
     downloaded: List[Dict[str, Any]] = []
     errors: List[Dict[str, str]] = []
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    material_store.MaterialStore().adopt_directory(dest_dir, source={
-        'request_id': request_id, 'flow_key': flow_key, 'kind': 'attachment',
-    })
-    cache_request_id, cache_flow_key = _cache_scope(
-        dest_dir, request_id=request_id, flow_key=flow_key
-    )
-    legacy_manifest = _load_manifest(dest_dir)
-    legacy_resources = legacy_manifest.setdefault("resources", {})
-    if runtime_control.stop_requested():
-        return [], [
-            runtime_control.stop_error("已请求停止财务预审，停止本单附件下载")
-        ]
+    with material_store.MaterialStore().operation():
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        material_store.MaterialStore().adopt_directory(dest_dir, source={
+            'request_id': request_id, 'flow_key': flow_key, 'kind': 'attachment',
+        })
+        cache_request_id, cache_flow_key = _cache_scope(
+            dest_dir, request_id=request_id, flow_key=flow_key
+        )
+        legacy_manifest = _load_manifest(dest_dir)
+        legacy_resources = legacy_manifest.setdefault("resources", {})
+        if runtime_control.stop_requested():
+            return [], [
+                runtime_control.stop_error("已请求停止财务预审，停止本单附件下载")
+            ]
 
-    outcomes: List[Dict[str, Any]] = [{} for _item in targets]
-    pending: List[tuple[int, Dict[str, Any]]] = []
-    original_batch = None
-    if any(resource.get('_invoice_original') for resource in targets):
-        from apps.oa_approval.invoice_originals import DownloadBatch
+        outcomes: List[Dict[str, Any]] = [{} for _item in targets]
+        pending: List[tuple[int, Dict[str, Any]]] = []
+        original_batch = None
+        if any(resource.get('_invoice_original') for resource in targets):
+            from apps.oa_approval.invoice_originals import DownloadBatch
 
-        try:
-            original_batch = DownloadBatch(str(request_id).strip())
-        except rpa_session.RpaSessionError as error:
-            return [], [{'code': error.code, 'message': '发票原件会话核验失败'}]
-        except Exception:
-            return [], [{'code': 'resource_ownership_untrusted', 'message': '发票原件归属核验失败'}]
-    for index, resource in enumerate(targets):
-        if resource.get("_invoice_original"):
-            checked = dict(resource)
-            checked["_ephemeral_cookie_header"] = _rpa_cookie_header(urllib.parse.urlsplit(OA_HOST).hostname or "")
             try:
-                url, error = _normalized_download_url(checked)
-                valid = not error and _initialize_workflow_document_context(
-                    checked, url, timeout_sec=timeout_sec, initialize=False,
-                    original_batch=original_batch,
-                )
+                original_batch = DownloadBatch(str(request_id).strip())
             except rpa_session.RpaSessionError as error:
-                return [], [{"code": error.code, "message": "发票原件会话核验失败"}]
-            if not valid:
-                return [], [{"code": "resource_ownership_untrusted", "message": "发票原件归属核验失败"}]
-        cached_entry = _cached_attachment_entry(
-            dest_dir,
-            resource,
-            request_id=cache_request_id,
-            flow_key=cache_flow_key,
-            legacy_resources=legacy_resources,
-            migrate_legacy=original_batch is None,
-        ) if reuse_cache else None
-        if cached_entry:
-            cached_item = _manifest_entry_to_item(dest_dir, resource, cached_entry)
-            if cached_item:
-                outcomes[index] = {"item": cached_item}
-                continue
-        pending.append((index, resource))
+                return [], [{'code': error.code, 'message': '发票原件会话核验失败'}]
+            except Exception:
+                return [], [{'code': 'resource_ownership_untrusted', 'message': '发票原件归属核验失败'}]
+        for index, resource in enumerate(targets):
+            if resource.get("_invoice_original"):
+                checked = dict(resource)
+                checked["_ephemeral_cookie_header"] = _rpa_cookie_header(urllib.parse.urlsplit(OA_HOST).hostname or "")
+                try:
+                    url, error = _normalized_download_url(checked)
+                    valid = not error and _initialize_workflow_document_context(
+                        checked, url, timeout_sec=timeout_sec, initialize=False,
+                        original_batch=original_batch,
+                    )
+                except rpa_session.RpaSessionError as error:
+                    return [], [{"code": error.code, "message": "发票原件会话核验失败"}]
+                if not valid:
+                    return [], [{"code": "resource_ownership_untrusted", "message": "发票原件归属核验失败"}]
+            cached_entry = _cached_attachment_entry(
+                dest_dir,
+                resource,
+                request_id=cache_request_id,
+                flow_key=cache_flow_key,
+                legacy_resources=legacy_resources,
+                migrate_legacy=original_batch is None,
+            ) if reuse_cache else None
+            if cached_entry:
+                cached_item = _manifest_entry_to_item(dest_dir, resource, cached_entry)
+                if cached_item:
+                    outcomes[index] = {"item": cached_item}
+                    continue
+            pending.append((index, resource))
 
-    raw_concurrency = str(
-        os.environ.get("OA_ATTACHMENT_DOWNLOAD_CONCURRENCY") or ""
-    ).strip()
-    worker_count = _download_worker_count(len(pending), raw_concurrency)
-    if pending:
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = [
-                (
-                    index,
-                    executor.submit(
-                        _download_resource_direct,
+        raw_concurrency = str(
+            os.environ.get("OA_ATTACHMENT_DOWNLOAD_CONCURRENCY") or ""
+        ).strip()
+        worker_count = _download_worker_count(len(pending), raw_concurrency)
+        if pending:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = [
+                    (
+                        index,
+                        executor.submit(
+                            copy_context().run,
+                            _download_resource_direct,
+                            resource,
+                            dest_dir=dest_dir,
+                            timeout_sec=timeout_sec,
+                            original_batch=original_batch,
+                        ),
+                    )
+                    for index, resource in pending
+                ]
+                for index, future in futures:
+                    try:
+                        path, err = future.result()
+                    except Exception as error:
+                        path, err = None, (
+                            f"{resource_name(targets[index]) or 'attachment.bin'}: "
+                            f"附件下载失败: {type(error).__name__}"
+                        )
+                    outcomes[index] = {"path": path, "error": err}
+
+        cache_entries = []
+        for index, resource in enumerate(targets):
+            outcome = outcomes[index]
+            cached_item = outcome.get("item")
+            if isinstance(cached_item, dict):
+                item, archive_err = _attach_archive_children(
+                    dest_dir, resource, cached_item
+                )
+                path = None
+                err = archive_err
+            else:
+                path = outcome.get("path")
+                err = str(outcome.get("error") or "")
+                if path is None and not err:
+                    path, err = _download_resource_with_browser(
                         resource,
                         dest_dir=dest_dir,
                         timeout_sec=timeout_sec,
-                        original_batch=original_batch,
-                    ),
-                )
-                for index, resource in pending
-            ]
-            for index, future in futures:
-                try:
-                    path, err = future.result()
-                except Exception as error:
-                    path, err = None, (
-                        f"{resource_name(targets[index]) or 'attachment.bin'}: "
-                        f"附件下载失败: {type(error).__name__}"
                     )
-                outcomes[index] = {"path": path, "error": err}
-
-    cache_entries = []
-    for index, resource in enumerate(targets):
-        outcome = outcomes[index]
-        cached_item = outcome.get("item")
-        if isinstance(cached_item, dict):
-            item, archive_err = _attach_archive_children(
-                dest_dir, resource, cached_item
-            )
-            path = None
-            err = archive_err
-        else:
-            path = outcome.get("path")
-            err = str(outcome.get("error") or "")
-            if path is None and not err:
-                path, err = _download_resource_with_browser(
-                    resource,
-                    dest_dir=dest_dir,
-                    timeout_sec=timeout_sec,
-                )
-            item = None
-        if err:
-            code = download_error_code(err)
-            errors.append({"code": code, "message": err})
-            if code in FATAL_DOWNLOAD_ERROR_CODES:
-                errors.insert(0, errors.pop())
-                break
-            continue
-        if item is None and path is not None:
-            if not valid_attachment_file(path):
-                code = _file_download_fail_code(path) or "attachment_download_failed"
-                errors.append(
-                    {
-                        "code": code,
-                        "message": f"{resource_name(resource) or path.name}: 下载文件无效",
-                    }
-                )
+                item = None
+            if err:
+                code = download_error_code(err)
+                errors.append({"code": code, "message": err})
                 if code in FATAL_DOWNLOAD_ERROR_CODES:
                     errors.insert(0, errors.pop())
                     break
                 continue
-            item = {
-                "resource_id": str(resource.get("id") or ""),
-                "name": resource_name(resource) or path.name,
-                "path": str(path),
-                "reused": False,
-            }
-            item, archive_err = _attach_archive_children(dest_dir, resource, item)
-            if archive_err:
-                errors.append(
-                    {"code": "attachment_archive_failed", "message": archive_err}
-                )
-                continue
-        if item is not None:
-            downloaded.append(item)
-            cache_entries.append((resource, item))
-    if original_batch is not None:
-        if runtime_control.stop_requested():
-            return [], [runtime_control.stop_error('已请求停止财务预审，停止本单附件下载')]
-        try:
-            valid = original_batch.recheck()
-        except rpa_session.RpaSessionError as error:
-            return [], [{'code': error.code, 'message': '发票原件会话核验失败'}]
-        except Exception:
-            valid = False
-        if runtime_control.stop_requested():
-            return [], [runtime_control.stop_error('已请求停止财务预审，停止本单附件下载')]
-        if not valid:
-            return [], [{'code': 'resource_ownership_untrusted', 'message': '发票原件批量下载归属已变化'}]
-    for resource, item in cache_entries:
-        _record_attachment_entry(
-            dest_dir, resource, item,
-            request_id=cache_request_id, flow_key=cache_flow_key,
-        )
-    _remove_legacy_manifest(dest_dir)
-    return downloaded, errors
+            if item is None and path is not None:
+                if not valid_attachment_file(path):
+                    code = _file_download_fail_code(path) or "attachment_download_failed"
+                    errors.append(
+                        {
+                            "code": code,
+                            "message": f"{resource_name(resource) or path.name}: 下载文件无效",
+                        }
+                    )
+                    if code in FATAL_DOWNLOAD_ERROR_CODES:
+                        errors.insert(0, errors.pop())
+                        break
+                    continue
+                item = {
+                    "resource_id": str(resource.get("id") or ""),
+                    "name": resource_name(resource) or path.name,
+                    "path": str(path),
+                    "reused": False,
+                }
+                item, archive_err = _attach_archive_children(dest_dir, resource, item)
+                if archive_err:
+                    errors.append(
+                        {"code": "attachment_archive_failed", "message": archive_err}
+                    )
+                    continue
+            if item is not None:
+                downloaded.append(item)
+                cache_entries.append((resource, item))
+        if original_batch is not None:
+            if runtime_control.stop_requested():
+                return [], [runtime_control.stop_error('已请求停止财务预审，停止本单附件下载')]
+            try:
+                valid = original_batch.recheck()
+            except rpa_session.RpaSessionError as error:
+                return [], [{'code': error.code, 'message': '发票原件会话核验失败'}]
+            except Exception:
+                valid = False
+            if runtime_control.stop_requested():
+                return [], [runtime_control.stop_error('已请求停止财务预审，停止本单附件下载')]
+            if not valid:
+                return [], [{'code': 'resource_ownership_untrusted', 'message': '发票原件批量下载归属已变化'}]
+        for resource, item in cache_entries:
+            _record_attachment_entry(
+                dest_dir, resource, item,
+                request_id=cache_request_id, flow_key=cache_flow_key,
+            )
+        _remove_legacy_manifest(dest_dir)
+        return downloaded, errors

@@ -1074,74 +1074,75 @@ def prepare_materials(
     compact_pdf: bool = False,
     compact_spreadsheet: bool = False,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    images: List[Dict[str, Any]] = []
-    manifest: List[Dict[str, Any]] = []
-    validation_manifest: List[Dict[str, Any]] = []
-    structured_contents: List[Dict[str, Any]] = []
-    out_dir.mkdir(parents=True, exist_ok=True)
-    material_store.MaterialStore().adopt_directory(out_dir, source={'kind': 'prepared'})
-    inputs = [Path(str(item.get('path') or '')) for item in attachments]
-    inputs.extend(Path(str(child.get('path') or '')) for item in attachments
-                  for child in item.get('extracted_files', []) if isinstance(child, dict))
-    with material_store.MaterialStore().read_lease(inputs):
-        for item in attachments:
-            source_path = Path(str(item.get('path') or ''))
-            if source_path.is_file():
-                material_store.MaterialStore().adopt(source_path, source={
-                    'resource_id': item.get('resource_id'), 'kind': 'attachment',
-                })
-            extracted = (
-                item.get("extracted_files")
-                if isinstance(item.get("extracted_files"), list)
-                else []
-            )
-            if extracted:
-                child_manifest: List[Dict[str, Any]] = []
-                image_count_before = len(images)
-                for child in extracted:
-                    if isinstance(child, dict):
-                        _prepare_one_attachment(
-                            child,
-                            out_dir=out_dir,
-                            images=images,
-                            manifest=child_manifest,
-                            structured_contents=structured_contents,
-                            compact_pdf=compact_pdf,
-                            compact_spreadsheet=compact_spreadsheet,
-                        )
-                validation_manifest.extend(child_manifest)
-                manifest.append(
-                    {
-                        "resource_id": str(item.get("resource_id") or ""),
-                        "name": str(item.get("name") or ""),
-                        "status": "archive_extracted",
-                        "archive_extracted_count": len(extracted),
-                        "image_count": len(images) - image_count_before,
-                        "skipped_videos": skipped_video_sources(child_manifest),
-                    }
+    with material_store.MaterialStore().operation():
+        images: List[Dict[str, Any]] = []
+        manifest: List[Dict[str, Any]] = []
+        validation_manifest: List[Dict[str, Any]] = []
+        structured_contents: List[Dict[str, Any]] = []
+        out_dir.mkdir(parents=True, exist_ok=True)
+        material_store.MaterialStore().adopt_directory(out_dir, source={'kind': 'prepared'})
+        inputs = [Path(str(item.get('path') or '')) for item in attachments]
+        inputs.extend(Path(str(child.get('path') or '')) for item in attachments
+                      for child in item.get('extracted_files', []) if isinstance(child, dict))
+        with material_store.MaterialStore().read_lease(inputs):
+            for item in attachments:
+                source_path = Path(str(item.get('path') or ''))
+                if source_path.is_file():
+                    material_store.MaterialStore().adopt(source_path, source={
+                        'resource_id': item.get('resource_id'), 'kind': 'attachment',
+                    })
+                extracted = (
+                    item.get("extracted_files")
+                    if isinstance(item.get("extracted_files"), list)
+                    else []
                 )
-            else:
-                manifest_count_before = len(manifest)
-                _prepare_one_attachment(
-                    item,
-                    out_dir=out_dir,
-                    images=images,
-                    manifest=manifest,
-                    structured_contents=structured_contents,
-                    compact_pdf=compact_pdf,
-                    compact_spreadsheet=compact_spreadsheet,
+                if extracted:
+                    child_manifest: List[Dict[str, Any]] = []
+                    image_count_before = len(images)
+                    for child in extracted:
+                        if isinstance(child, dict):
+                            _prepare_one_attachment(
+                                child,
+                                out_dir=out_dir,
+                                images=images,
+                                manifest=child_manifest,
+                                structured_contents=structured_contents,
+                                compact_pdf=compact_pdf,
+                                compact_spreadsheet=compact_spreadsheet,
+                            )
+                    validation_manifest.extend(child_manifest)
+                    manifest.append(
+                        {
+                            "resource_id": str(item.get("resource_id") or ""),
+                            "name": str(item.get("name") or ""),
+                            "status": "archive_extracted",
+                            "archive_extracted_count": len(extracted),
+                            "image_count": len(images) - image_count_before,
+                            "skipped_videos": skipped_video_sources(child_manifest),
+                        }
+                    )
+                else:
+                    manifest_count_before = len(manifest)
+                    _prepare_one_attachment(
+                        item,
+                        out_dir=out_dir,
+                        images=images,
+                        manifest=manifest,
+                        structured_contents=structured_contents,
+                        compact_pdf=compact_pdf,
+                        compact_spreadsheet=compact_spreadsheet,
+                    )
+                    validation_manifest.extend(manifest[manifest_count_before:])
+            if any(
+                str(item.get("status") or "") not in SUCCESSFUL_PREPARATION_STATUSES | SKIPPED_PREPARATION_STATUSES
+                for item in validation_manifest
+            ) or any(
+                str(item.get("status") or "") == "pdf_rendered"
+                and (
+                    int(item.get("image_count") or 0) < 1
+                    or int(item.get("image_count") or 0) != int(item.get("page_count") or 0)
                 )
-                validation_manifest.extend(manifest[manifest_count_before:])
-        if any(
-            str(item.get("status") or "") not in SUCCESSFUL_PREPARATION_STATUSES | SKIPPED_PREPARATION_STATUSES
-            for item in validation_manifest
-        ) or any(
-            str(item.get("status") or "") == "pdf_rendered"
-            and (
-                int(item.get("image_count") or 0) < 1
-                or int(item.get("image_count") or 0) != int(item.get("page_count") or 0)
-            )
-            for item in validation_manifest
-        ):
-            raise RuntimeError("attachment_content_incomplete")
-        return images, manifest, structured_contents
+                for item in validation_manifest
+            ):
+                raise RuntimeError("attachment_content_incomplete")
+            return images, manifest, structured_contents

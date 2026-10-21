@@ -15,7 +15,7 @@ from apps.oa_approval.image_compression import compress_image
 
 
 def invoke(source, destination, *options):
-    result = subprocess.run([sys.executable, '-B', '-m', 'apps.oa_approval.image_compression',
+    result = subprocess.run([sys.executable, '-B', '-c', "from apps.oa_approval import material_store; material_store.discover_project = lambda root: {'checkouts': [], 'scopes': {}, 'files': set()}; from apps.oa_approval.image_compression import main; raise SystemExit(main())",
         '--file', str(source), '--output-dir', str(destination), *options],
         capture_output=True, text=True, timeout=70)
     return result, json.loads(result.stdout)
@@ -79,6 +79,24 @@ def test_file_size_target_shrinks_noisy_image(tmp_path):
     assert result.returncode == 0
     assert report['output']['bytes'] <= 1024 < source.stat().st_size
     assert report['output']['width'] < 128
+
+
+def test_compression_capacity_failure_keeps_disposable_source_while_reading(tmp_path, monkeypatch):
+    from apps.oa_approval import image_compression, material_store
+
+    source = tmp_path / 'source.png'
+    with Image.effect_noise((128, 128), 100) as image:
+        image.convert('RGB').save(source)
+    original = source.read_bytes()
+    monkeypatch.setattr(material_store, 'DEFAULT_LIMIT_BYTES', len(original) + 1024)
+    store = material_store.MaterialStore()
+    store.adopt(source)
+    store.mark_disposable(source, closed=True, write_state='not_applicable')
+    report = image_compression.compress_image(source, output_dir=tmp_path / 'output', max_bytes=1024)
+    assert report['status'] == 'failed'
+    assert report['error_code'] == 'material_budget_exceeded'
+    assert source.read_bytes() == original
+    assert store.report()['retired_count'] == 0
 
 
 @pytest.mark.parametrize('failure', ['animation', 'invalid', 'source_pixels', 'decoded_pixels', 'timeout'])

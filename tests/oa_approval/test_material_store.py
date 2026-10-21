@@ -89,6 +89,33 @@ def test_status_does_not_create_inventory(tmp_path):
     assert not store.root.exists()
 
 
+def test_experiment_only_allows_admitted_imports_and_seals_files_after_failure(tmp_path):
+    store = MaterialStore(tmp_path / 'private', limit_bytes=8)
+    directory = store.managed_directory('trial')
+    with pytest.raises(PermissionError):
+        (directory / 'unmanaged').write_bytes(b'123456789')
+    store.write_bytes(directory / 'admitted', b'12345678')
+    with pytest.raises(PermissionError):
+        (directory / 'admitted').write_bytes(b'changed')
+    with pytest.raises(ValueError, match='material_budget_exceeded'):
+        store.write_bytes(directory / 'over-budget', b'x')
+    with pytest.raises(PermissionError):
+        (directory / 'still-sealed').write_bytes(b'x')
+    assert store.report()['used_bytes'] == 8
+
+
+def test_reusing_finished_experiment_reclaims_old_copy_then_reseals_directory(tmp_path):
+    store = MaterialStore(tmp_path / 'private', limit_bytes=8)
+    directory = store.managed_directory('trial')
+    store.write_bytes(directory / 'old', b'1234')
+    store.mark_disposable(directory / 'old', closed=True, write_state='not_applicable')
+    store.write_bytes(directory / 'new', b'12345')
+    assert not (directory / 'old').exists()
+    assert (directory / 'new').read_bytes() == b'12345'
+    with pytest.raises(PermissionError):
+        (directory / 'bypass').write_bytes(b'large')
+
+
 def test_two_processes_cannot_spend_same_capacity(tmp_path):
     import subprocess
     import sys
@@ -96,6 +123,8 @@ def test_two_processes_cannot_spend_same_capacity(tmp_path):
     program = '''
 from pathlib import Path
 import sys
+from apps.oa_approval import material_store
+material_store.discover_project = lambda root: {'checkouts': [], 'scopes': {}, 'files': set()}
 from apps.oa_approval.material_store import MaterialStore
 try:
     MaterialStore(Path(sys.argv[1]), limit_bytes=10).write_bytes(Path(sys.argv[2]), b'123456')
@@ -118,6 +147,8 @@ def test_crashed_external_reservation_releases_only_unused_capacity(tmp_path):
     program = '''
 from pathlib import Path
 import os, sys
+from apps.oa_approval import material_store
+material_store.discover_project = lambda root: {'checkouts': [], 'scopes': {}, 'files': set()}
 from apps.oa_approval.material_store import MaterialStore
 with MaterialStore(Path(sys.argv[1]), limit_bytes=10).reserved_file(Path(sys.argv[2]), max_bytes=10) as path:
     path.write_bytes(b'1234')

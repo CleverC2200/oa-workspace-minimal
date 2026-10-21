@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -12,8 +13,13 @@ import re
 import stat
 from uuid import uuid4
 
+from apps.oa_approval import material_inventory
+from apps.oa_approval.material_inventory import discover as discover_project
+
 
 DEFAULT_LIMIT_BYTES = 3_000_000_000
+_ACTIVE_OPERATIONS = ContextVar('oa_material_operations', default=frozenset())
+_OPERATION_BASELINES = ContextVar('oa_material_baselines', default={})
 
 
 def default_root() -> Path:
@@ -22,7 +28,7 @@ def default_root() -> Path:
 
 
 def _path(value: Path) -> Path:
-    path = Path(value).expanduser().absolute()
+    path = material_inventory.canonical_system_path(Path(value).expanduser())
     if '..' in path.parts or any(parent.is_symlink() for parent in (path, *path.parents)):
         raise ValueError('material_path_untrusted')
     return path
@@ -50,14 +56,17 @@ def _source(value: dict | None) -> dict:
 
 
 class MaterialStore:
-    def __init__(self, root: Path | None = None, *, limit_bytes: int | None = None):
+    def __init__(self, root: Path | None = None, *, limit_bytes: int | None = None,
+                 checkout_root: Path | None = None):
         self.root = _path(root if root is not None else default_root())
+        self.checkout_root = Path(checkout_root) if checkout_root is not None else material_inventory.default_checkout_root()
+        self._writable_experiments: set[Path] = set()
         self.limit_bytes = DEFAULT_LIMIT_BYTES if limit_bytes is None else limit_bytes
         if type(self.limit_bytes) is not int or not 1 <= self.limit_bytes <= 3_000_000_000:
             raise ValueError('material_budget_invalid')
 
     @contextmanager
-    def _locked(self, *, readonly: bool = False):
+    def _locked(self, *, readonly: bool = False, refresh: bool = True):
         if readonly and not self.root.exists():
             yield {"schema_version": 1, "files": {}, "events": [], "directories": {}}
             return
@@ -75,11 +84,51 @@ class MaterialStore:
                         or not isinstance(state.get('events'), list)):
                     raise ValueError('material_inventory_invalid')
                 state.setdefault('directories', {})
-                self._refresh(state)
+                state.setdefault('project_scopes', {})
+                state.setdefault('project_checkouts', [])
+                if refresh and str(self.root) not in _ACTIVE_OPERATIONS.get():
+                    self._refresh(state)
                 self._recover(state)
                 yield state
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
+
+    @contextmanager
+    def operation(self):
+        active = _ACTIVE_OPERATIONS.get()
+        key = str(self.root)
+        if key in active:
+            yield
+            return
+        with self._locked(refresh=False) as state:
+            snapshot = discover_project(self.checkout_root)
+            self._enroll_project(state, snapshot)
+            self._refresh(state, skip_scopes=set(snapshot['scopes']))
+            for entry in state['files'].values():
+                entry['bytes'] = self._size(entry)
+            self._save(state)
+            baseline = frozenset(state['files'])
+        token = _ACTIVE_OPERATIONS.set(active | {key})
+        baseline_token = _OPERATION_BASELINES.set({**_OPERATION_BASELINES.get(), key: baseline})
+        try:
+            yield
+        finally:
+            _OPERATION_BASELINES.reset(baseline_token)
+            _ACTIVE_OPERATIONS.reset(token)
+
+    def _enroll_project(self, state: dict, snapshot: dict) -> None:
+        state['project_scopes'].update(snapshot['scopes'])
+        state['project_checkouts'] = sorted(set(state['project_checkouts']) | {str(root) for root in snapshot['checkouts']})
+        for path in snapshot['files']:
+            self._register_file(state, path, source={'kind': 'legacy'})
+
+    def adopt_project(self, root: Path) -> dict:
+        snapshot = material_inventory.discover(root)
+        with self._locked(refresh=False) as state:
+            self._enroll_project(state, snapshot)
+            self._refresh(state, skip_scopes=set(snapshot['scopes']))
+            self._save(state)
+            return {'registered_count': len(snapshot['files']), 'used_bytes': self._used(state)}
 
     def _save(self, state: dict) -> None:
         temporary = self.root / ('.inventory-' + uuid4().hex)
@@ -106,7 +155,46 @@ class MaterialStore:
         return max(info.st_size, entry['bytes']) if entry['status'] == 'reserved' else info.st_size
 
     def _used(self, state: dict) -> int:
-        return sum(self._size(entry) for entry in state['files'].values())
+        baseline = _OPERATION_BASELINES.get().get(str(self.root), frozenset())
+        return sum(entry['bytes'] if key in baseline else self._size(entry)
+                   for key, entry in state['files'].items())
+
+    def _seal_experiment(self, directory: Path) -> None:
+        for current, directories, files in os.walk(directory, topdown=False, followlinks=False):
+            for name in files:
+                _path(Path(current) / name).chmod(0o400)
+            for name in directories:
+                _path(Path(current) / name).chmod(0o500)
+        directory.chmod(0o500)
+
+    @contextmanager
+    def _writable_output(self, state: dict, path: Path):
+        experiments = self.root / 'experiments'
+        directory = None
+        outer = False
+        if path.is_relative_to(experiments):
+            parts = path.relative_to(experiments).parts
+            if len(parts) < 2:
+                raise ValueError('material_workspace_invalid')
+            directory = _path(experiments / parts[0])
+            if str(directory) not in state['directories']:
+                raise ValueError('material_workspace_unregistered')
+            outer = directory not in self._writable_experiments
+            self._writable_experiments.add(directory)
+            directory.chmod(0o700)
+            for parent in reversed(path.parent.parents):
+                if parent.is_relative_to(directory) and parent.exists():
+                    _path(parent).chmod(0o700)
+            if path.parent.exists():
+                _path(path.parent).chmod(0o700)
+        try:
+            path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            _path(path)
+            yield
+        finally:
+            if directory is not None and outer:
+                self._writable_experiments.remove(directory)
+                self._seal_experiment(directory)
 
     def _recover(self, state: dict) -> None:
         for key, entry in list(state['files'].items()):
@@ -175,9 +263,9 @@ class MaterialStore:
                     descriptor = os.open(_path(lock_path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
                     lock = stack.enter_context(os.fdopen(descriptor, 'r+'))
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                from apps.oa_finance_preaudit.runtime_maintenance import _read_state
+                from apps.preaudit_state import read_state
 
-                action = _read_state(_path(owner / 'state.json'), strict_path_identity=True)
+                action = read_state(_path(owner / 'state.json'), strict_path_identity=True)
                 allowed = (action['execution_state'] == 'closed'
                            and action['write_state'] in {'not_requested', 'submitted'}
                            and not any('recovery' in item.name or 'quarantine' in item.name
@@ -191,15 +279,17 @@ class MaterialStore:
 
     def _reclaim(self, state: dict, required_bytes: int) -> int:
         freed = 0
+        used = self._used(state)
         for entry in sorted(state['files'].values(), key=lambda item: (
                 not Path(item['path']).is_relative_to(self.root / 'experiments'), item['created_at'])):
-            if self._used(state) + required_bytes <= self.limit_bytes:
+            if used + required_bytes <= self.limit_bytes:
                 break
             if entry['status'] == 'reserved' or entry['status'] == 'writing':
                 continue
             path = _path(Path(entry['path']))
             if not path.is_file():
                 entry['status'] = 'retired'
+                entry['bytes'] = 0
                 self._save(state)
                 continue
             with self._eligible(entry) as eligible:
@@ -215,9 +305,12 @@ class MaterialStore:
                 entry['status'] = 'deletion_planned'
                 state['events'].append(event)
                 self._save(state)
-                path.unlink()
+                with self._writable_output(state, path):
+                    path.unlink()
                 freed += event['bytes']
+                used -= event['bytes']
                 entry['status'] = 'retired'
+                entry['bytes'] = 0
                 event['status'] = 'completed'
                 self._save(state)
         return freed
@@ -245,23 +338,28 @@ class MaterialStore:
                                            if entry['status'] in {'protected', 'writing', 'reserved'}),
                     'retired_count': sum(entry['status'] == 'retired' for entry in state['files'].values())}
 
-    def _refresh(self, state: dict) -> None:
+    def _refresh(self, state: dict, *, skip_scopes: set[str] | None = None) -> None:
+        allowed_roots = [Path(path) for path in state.get('project_checkouts', [])]
+        for raw, all_material in state.get('project_scopes', {}).items():
+            if raw in (skip_scopes or set()):
+                continue
+            for path in material_inventory.scan_files(_path(Path(raw)), all_material=all_material,
+                                                       allowed_roots=allowed_roots):
+                self._register_file(state, path, source={'kind': 'legacy'})
         for raw, source in state['directories'].items():
             root = _path(Path(raw))
-            if not root.exists():
-                continue
-            for directory, dirs, files in os.walk(root, followlinks=False):
-                for name in dirs:
-                    _path(Path(directory) / name)
-                for name in files:
-                    path = _path(Path(directory) / name)
-                    if str(path) not in state['files']:
-                        if not stat.S_ISREG(path.stat().st_mode):
-                            raise ValueError('material_path_untrusted')
-                        state['files'][str(path)] = {
-                            'path': str(path), 'source': source, 'bytes': path.stat().st_size,
-                            'sha256': '', 'created_at': _now(), 'status': 'protected',
-                        }
+            for path in material_inventory.scan_files(root, all_material=True, allowed_roots=allowed_roots or [root]):
+                self._register_file(state, path, source=source)
+
+    def _register_file(self, state: dict, path: Path, *, source: dict) -> None:
+        path = _path(path)
+        if str(path) not in state['files']:
+            if not stat.S_ISREG(path.stat().st_mode):
+                raise ValueError('material_path_untrusted')
+            state['files'][str(path)] = {
+                'path': str(path), 'source': source, 'bytes': path.stat().st_size,
+                'sha256': '', 'created_at': _now(), 'status': 'protected',
+            }
 
     def registered_files(self) -> list[dict]:
         with self._locked(readonly=True) as state:
@@ -310,7 +408,8 @@ class MaterialStore:
             raise ValueError('material_path_untrusted')
         with self._locked() as state:
             state['directories'][str(path)] = _source(source)
-            self._refresh(state)
+            for item in material_inventory.scan_files(path, all_material=True):
+                self._register_file(state, item, source=_source(source))
             self._save(state)
             return {'status': 'protected', 'used_bytes': self._used(state)}
 
@@ -347,57 +446,61 @@ class MaterialStore:
                     expected_bytes: int | None = None) -> Path:
         input_name = getattr(stream, 'name', None)
         inputs = [Path(input_name)] if isinstance(input_name, str) and Path(input_name).is_file() else []
-        if not inputs:
-            return self._copy_stream(path, stream, source=source, expected_bytes=expected_bytes)
-        with self.read_lease(inputs):
-            return self._copy_stream(path, stream, source=source, expected_bytes=expected_bytes)
+        with self.operation():
+            if not inputs:
+                return self._copy_stream(path, stream, source=source, expected_bytes=expected_bytes)
+            with self.read_lease(inputs):
+                return self._copy_stream(path, stream, source=source, expected_bytes=expected_bytes)
 
     def _copy_stream(self, path: Path, stream, *, source: dict | None,
                      expected_bytes: int | None) -> Path:
         path = _path(path)
-        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
         _path(path)
         if expected_bytes is not None and (type(expected_bytes) is not int or expected_bytes < 0):
             raise ValueError('material_budget_invalid')
         with self._locked() as state:
-            self._reclaim(state, expected_bytes or 0)
-            if self._used(state) + (expected_bytes or 0) > self.limit_bytes:
-                raise ValueError('material_budget_exceeded')
-            temporary = path.with_name('.' + path.name + '.' + uuid4().hex + '.part')
-            entry = {'path': str(temporary), 'source': _source(source), 'bytes': 0, 'sha256': '',
-                     'created_at': _now(), 'status': 'writing'}
-            state['files'][str(temporary)] = entry
-            if str(path) not in state['files'] or state['files'][str(path)]['status'] == 'retired':
-                state['files'][str(path)] = {**entry, 'path': str(path), 'status': 'protected'}
-            self._save(state)
-            try:
-                descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-                digest = hashlib.sha256()
-                written = 0
-                with os.fdopen(descriptor, 'wb', buffering=0) as output:
-                    while block := stream.read(1024 * 1024):
-                        if expected_bytes is not None and written + len(block) > expected_bytes:
-                            raise ValueError('material_source_size_mismatch')
-                        self._reclaim(state, len(block))
-                        if self._used(state) + len(block) > self.limit_bytes:
-                            raise ValueError('material_budget_exceeded')
-                        output.write(block)
-                        digest.update(block)
-                        written += len(block)
-                    output.flush()
-                    os.fsync(output.fileno())
-                _path(path)
-                temporary.replace(path)
-                del state['files'][str(temporary)]
-                state['files'][str(path)] = {**entry, 'path': str(path), 'bytes': written,
-                                            'sha256': digest.hexdigest(), 'status': 'protected'}
+            with self._writable_output(state, path):
+                self._reclaim(state, expected_bytes or 0)
+                if self._used(state) + (expected_bytes or 0) > self.limit_bytes:
+                    raise ValueError('material_budget_exceeded')
+                temporary = path.with_name('.' + path.name + '.' + uuid4().hex + '.part')
+                entry = {'path': str(temporary), 'source': _source(source), 'bytes': 0, 'sha256': '',
+                         'created_at': _now(), 'status': 'writing'}
+                state['files'][str(temporary)] = entry
+                if str(path) not in state['files'] or state['files'][str(path)]['status'] == 'retired':
+                    state['files'][str(path)] = {**entry, 'path': str(path), 'status': 'protected'}
                 self._save(state)
-                return path
-            except BaseException:
-                temporary.unlink(missing_ok=True)
-                state['files'].pop(str(temporary), None)
-                self._save(state)
-                raise
+                remaining = self.limit_bytes - self._used(state)
+                try:
+                    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                    digest = hashlib.sha256()
+                    written = 0
+                    with os.fdopen(descriptor, 'wb', buffering=0) as output:
+                        while block := stream.read(1024 * 1024):
+                            if expected_bytes is not None and written + len(block) > expected_bytes:
+                                raise ValueError('material_source_size_mismatch')
+                            if len(block) > remaining:
+                                remaining += self._reclaim(state, len(block))
+                            if len(block) > remaining:
+                                raise ValueError('material_budget_exceeded')
+                            output.write(block)
+                            remaining -= len(block)
+                            digest.update(block)
+                            written += len(block)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    _path(path)
+                    temporary.replace(path)
+                    del state['files'][str(temporary)]
+                    state['files'][str(path)] = {**entry, 'path': str(path), 'bytes': written,
+                                                'sha256': digest.hexdigest(), 'status': 'protected'}
+                    self._save(state)
+                    return path
+                except BaseException:
+                    temporary.unlink(missing_ok=True)
+                    state['files'].pop(str(temporary), None)
+                    self._save(state)
+                    raise
 
     @contextmanager
     def reserved_file(self, path: Path, *, max_bytes: int, source: dict | None = None, external: bool = False):
@@ -406,30 +509,31 @@ class MaterialStore:
             raise ValueError('material_budget_invalid')
         if max_bytes > self.limit_bytes:
             raise ValueError('material_budget_exceeded')
-        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-        with self._locked() as state:
-            if path.exists():
-                raise ValueError('material_output_exists')
-            self._reclaim(state, max_bytes)
-            if self._used(state) + max_bytes > self.limit_bytes:
-                raise ValueError('material_budget_exceeded')
-            entry = {'path': str(path), 'source': _source(source), 'bytes': max_bytes,
-                     'sha256': '', 'created_at': _now(), 'status': 'reserved', 'external': external}
-            state['files'][str(path)] = entry
-            self._save(state)
-            try:
-                yield path
-                _path(path)
-                if path.exists() and (not path.is_file() or path.stat().st_size > max_bytes):
-                    raise ValueError('material_output_limit_exceeded')
-            finally:
-                if path.exists():
-                    _path(path)
-                    state['files'][str(path)] = {**entry, 'bytes': path.stat().st_size,
-                                                'sha256': _digest(path), 'status': 'protected'}
-                else:
-                    state['files'].pop(str(path), None)
-                self._save(state)
+        with self.operation():
+            with self._locked() as state:
+                with self._writable_output(state, path):
+                    if path.exists():
+                        raise ValueError('material_output_exists')
+                    self._reclaim(state, max_bytes)
+                    if self._used(state) + max_bytes > self.limit_bytes:
+                        raise ValueError('material_budget_exceeded')
+                    entry = {'path': str(path), 'source': _source(source), 'bytes': max_bytes,
+                             'sha256': '', 'created_at': _now(), 'status': 'reserved', 'external': external}
+                    state['files'][str(path)] = entry
+                    self._save(state)
+                    try:
+                        yield path
+                        _path(path)
+                        if path.exists() and (not path.is_file() or path.stat().st_size > max_bytes):
+                            raise ValueError('material_output_limit_exceeded')
+                    finally:
+                        if path.exists():
+                            _path(path)
+                            state['files'][str(path)] = {**entry, 'bytes': path.stat().st_size,
+                                                        'sha256': _digest(path), 'status': 'protected'}
+                        else:
+                            state['files'].pop(str(path), None)
+                        self._save(state)
 
     def write_bytes(self, path: Path, data: bytes, *, source: dict | None = None) -> Path:
         return self.copy_stream(path, BytesIO(data), source=source, expected_bytes=len(data))
@@ -440,6 +544,7 @@ class MaterialStore:
         path = _path(self.root / 'experiments' / name)
         path.mkdir(parents=True, mode=0o700, exist_ok=False)
         self.adopt_directory(path, source={'kind': 'experiment'})
+        self._seal_experiment(path)
         return path
 
 
