@@ -32,6 +32,8 @@
 
 录制 CLI 的分类与回执用例通过共享 fixture 缩短观察间隔，仍启动真实子进程；超时用例在既有 executor 接口缩短测试期限，仍走真实超时和进程回收。`real_observation_interval` 用例保留生产 5 秒周期，核对首次错误在重试前停止。生产默认、停止门与历史证据不受这些测试参数影响。
 
+准备超时回收夹具通过原真实执行器等待子进程 PID 和匹配阶段快照，再向调度器返回 Future，保持原 watchdog 计时与回收路径。`test_dispatcher_prepare_timeout_reclaims_owned_child_process_group` 的 1.2 秒启动延迟会使原 1 秒测试预算在对象就绪前耗尽；修复后仍使用 1 秒预算，核验真实子进程退出和超时诊断，不靠增加预算消除竞态。
+
 证据覆盖沿用已接线的公开入口检查，不增加第二套结论规则。`test_invoice_linkage_preview.py` 核验上传附件不能代替可信 OA 关联；`test_invoice_evidence_coverage.py` 核验关联票面资料进入 collect_case、真实 Worker 冻结输入及 preview；`test_invoice_material_diagnostics.py` 核验文件记录与正文读取分别计数。这些检查不证明模型业务判断总是正确。
 
 重复错误与旧版本验证记录见 [#419](https://github.com/CleverC2200/oa-workspace-minimal/issues/419)。旧实现未保留票面资料时，既有 collect_case 回归因缺少 `invoice_evidence` 失败；未确认 OA 关联仍判通过的旧消费端，使 preview 回归出现 `pass != needs_human`。历史代码只在私有离线检查进程加载，未替换当前工作树或历史单据材料。

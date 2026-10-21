@@ -107,6 +107,7 @@ def _spawn_ignoring_term_child() -> subprocess.Popen:
 
 
 def _prepare_with_owned_child(_workflow: str) -> dict:
+    time.sleep(float(os.environ.get("OA_TEST_PREPARE_START_DELAY", "0")))
     _spawn_ignoring_term_child()
     time.sleep(30)
     return {"action": "failed", "error_code": "late_prepare_result"}
@@ -5300,13 +5301,16 @@ def test_dispatcher_harvests_review_done_before_prepare_failure_is_processed(
     )
 
 
+@pytest.mark.parametrize("startup_delay", [0, 1.2])
 def test_dispatcher_prepare_timeout_reclaims_owned_child_process_group(
     tmp_path: Path,
     monkeypatch,
+    startup_delay,
 ) -> None:
     marker = tmp_path / "child.pid"
     stop_requests: list[bool] = []
     monkeypatch.setenv("OA_TEST_PREPARE_CHILD_PID_FILE", str(marker))
+    monkeypatch.setenv("OA_TEST_PREPARE_START_DELAY", str(startup_delay))
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.runtime_control,
         "stop_requested",
@@ -5320,7 +5324,33 @@ def test_dispatcher_prepare_timeout_reclaims_owned_child_process_group(
 
     real_record = finance_preaudit_concurrency_probe.prepare_trace.record_timeout
     real_reaped = finance_preaudit_concurrency_probe._processes_reaped
+    real_executor = finance_preaudit_concurrency_probe._preparation_executor
     reaped_checks = []
+
+    def ready_executor():
+        executor = real_executor()
+        submit = executor.submit
+
+        def submit_ready(*args, **kwargs):
+            future = submit(*args, **kwargs)
+            deadline = time.monotonic() + 10
+            while True:
+                samples = (tmp_path / "runtime" / "control").glob("prepare-progress-*.json")
+                if marker.is_file() and any(
+                    json.loads(path.read_text())["stage"] == "selection_contract" for path in samples
+                ):
+                    return future
+                if time.monotonic() >= deadline:
+                    finance_preaudit_concurrency_probe._terminate_executor(
+                        executor, owned_process_groups=True,
+                    )
+                    raise AssertionError("preparation fixture did not become ready")
+                time.sleep(0.01)
+
+        monkeypatch.setattr(executor, "submit", submit_ready)
+        return executor
+
+    monkeypatch.setattr(finance_preaudit_concurrency_probe, "_preparation_executor", ready_executor)
 
     def checked_reaped(*args, **kwargs):
         result = real_reaped(*args, **kwargs)
