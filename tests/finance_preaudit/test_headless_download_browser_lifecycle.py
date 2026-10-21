@@ -20,6 +20,7 @@ def install_download_browser(
     close_error=False,
     stop_error=False,
     interrupt=False,
+    download_start=False,
 ):
     import playwright.sync_api
 
@@ -43,6 +44,8 @@ def install_download_browser(
                 raise KeyboardInterrupt
             if download_error:
                 raise RuntimeError("synthetic download failure")
+            if download_start:
+                raise RuntimeError('Page.goto: Download is starting')
 
     class Browser:
         def new_context(self, **kwargs):
@@ -125,3 +128,10 @@ def test_headless_download_interrupt_propagates_after_browser_cleanup(monkeypatc
     with pytest.raises(KeyboardInterrupt):
         attachments.launch_chrome_download("https://download.example.test/fixture", "fixture.txt")
     assert events == ["driver_start", ("browser_close", True), "driver_stop"]
+
+
+def test_native_download_start_navigation_still_streams_captured_attachment(monkeypatch, tmp_path):
+    events = install_download_browser(monkeypatch, tmp_path, download_start=True)
+    assert attachments.launch_chrome_download('https://download.example.test/fixture', 'fixture.txt') == ''
+    assert (tmp_path / 'fixture.txt').read_bytes() == b'synthetic attachment'
+    assert events == ['driver_start', ('browser_close', True), 'driver_stop']

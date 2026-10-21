@@ -126,6 +126,78 @@ def test_status_includes_other_git_worktree_materials(tmp_path, monkeypatch, cap
     assert not (tmp_path / 'private').exists()
 
 
+def test_download_admission_counts_legacy_materials_in_production_checkout(tmp_path, monkeypatch):
+    from io import BytesIO
+    from apps.oa_approval import attachments, material_inventory, material_store
+
+    root = checkout(tmp_path)
+    production = tmp_path / 'oa-workspace-minimal'
+    production.mkdir()
+    subprocess.run(['git', 'init', '-q', str(production)], check=True)
+    legacy = production / 'runtime/old/attachments/original.pdf'
+    legacy.parent.mkdir(parents=True)
+    legacy.write_bytes(b'12345678')
+    monkeypatch.setattr(material_store, 'discover_project', material_inventory.discover)
+    monkeypatch.setattr(material_inventory, 'default_checkout_root', lambda: root)
+    monkeypatch.setattr(material_store, 'DEFAULT_LIMIT_BYTES', 8)
+    monkeypatch.setattr(attachments, 'OA_HOST', 'https://synthetic.example')
+    monkeypatch.setattr(attachments, 'EXTRA_DOWNLOAD_HOSTS', {'synthetic.example'})
+    monkeypatch.setattr(attachments.safe_http, 'urlopen', lambda *_a, **_k: BytesIO(b'%PDF-1.7'))
+    output = root / 'runtime/new/attachments'
+    files, errors = attachments.download_resources([
+        {'id': '4', 'name': 'invoice.pdf', 'downloadUrl': 'https://synthetic.example/invoice'},
+    ], dest_dir=output, timeout_sec=1, allow_browser_download=True, reuse_cache=False,
+       request_id='101', flow_key='general_expense')
+    assert files == []
+    assert errors[0]['code'] == 'material_budget_exceeded'
+    assert material_store.MaterialStore().report()['used_bytes'] == 8
+    assert legacy.read_bytes() == b'12345678'
+    assert not list(output.glob('*.pdf'))
+
+
+def test_registered_project_roots_count_future_legacy_material_directories(tmp_path, monkeypatch):
+    import pytest
+    from apps.oa_approval import material_inventory, material_store
+
+    root = checkout(tmp_path)
+    monkeypatch.setattr(material_store, 'discover_project', material_inventory.discover)
+    store = material_store.MaterialStore(checkout_root=root, limit_bytes=8)
+    store.adopt_project(root)
+    future = root / 'runtime/future/prepared/page.png'
+    future.parent.mkdir(parents=True)
+    future.write_bytes(b'12345678')
+    with pytest.raises(ValueError, match='material_budget_exceeded'):
+        store.write_bytes(tmp_path / 'incoming', b'x')
+    assert store.report()['used_bytes'] == 8
+    assert not (tmp_path / 'incoming').exists()
+
+
+def test_inventory_retains_pytest_aliases_and_sockets_without_double_counting(tmp_path, monkeypatch, capsys):
+    import socket
+
+    root = checkout(tmp_path)
+    monkeypatch.setenv('OA_PROJECT_SPACE_ROOT', str(tmp_path / 'private'))
+    canonical = root / '.scratch/run/test-0'
+    canonical.mkdir(parents=True)
+    (canonical / 'material.bin').write_bytes(b'12345678')
+    alias = canonical.with_name('test-current')
+    alias.symlink_to(canonical, target_is_directory=True)
+    broken_alias = canonical.with_name('removed-current')
+    broken_alias.symlink_to(canonical.with_name('removed'), target_is_directory=True)
+    channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    ipc = canonical / 'local.sock'
+    monkeypatch.chdir(canonical)
+    channel.bind('local.sock')
+    try:
+        assert project_space.main(['--root', str(root), 'status']) == 1
+        report = json.loads(capsys.readouterr().out)
+        assert report['unregistered_count'] == 1
+        assert report['unregistered_bytes'] == 8
+        assert alias.is_symlink() and broken_alias.is_symlink() and ipc.exists()
+    finally:
+        channel.close()
+
+
 def test_status_reports_capacity_even_when_all_registered_materials_are_protected(tmp_path, monkeypatch, capsys):
     root = checkout(tmp_path)
     monkeypatch.setenv('OA_PROJECT_SPACE_ROOT', str(tmp_path / 'private'))

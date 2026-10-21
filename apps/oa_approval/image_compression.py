@@ -140,38 +140,39 @@ def compress_image(source: Path, *, output_dir: Path | None = None, max_dimensio
             'quality': quality, 'source_max_bytes': MAX_SOURCE_BYTES, 'source_max_pixels': MAX_SOURCE_PIXELS,
             'decoded_max_pixels': MAX_DECODED_PIXELS, 'worker_data_bytes': WORKER_DATA_BYTES,
             'worker_cpu_seconds': 30, 'timeout_seconds': timeout_seconds}
-        material_store.MaterialStore().adopt_directory(destination, source={'kind': 'image_compression'})
-        raw = _read_source(source)
-        source_digest = hashlib.sha256(raw).hexdigest()
-        report['source'] = {'path': str(source), 'sha256': source_digest, 'bytes': len(raw)}
-        with tempfile.TemporaryDirectory(prefix='.working-', dir=destination) as scratch:
-            scratch = Path(scratch)
-            input_file = scratch / 'source'
-            material_store.write_bytes(input_file, raw, source={'kind': 'image_compression_source'})
-            input_file.chmod(0o600)
-            reserved_output = scratch / 'encoded'
-            command = [sys.executable, '-B', '-m', __spec__.name, '--worker', '--file', str(input_file),
-                '--output-dir', str(scratch), '--max-dimension', str(max_dimension), '--max-pixels', str(max_pixels),
-                '--max-bytes', str(max_bytes), '--quality', str(quality), '--reserved-output', str(reserved_output)]
-            with material_store.MaterialStore().reserved_file(reserved_output, max_bytes=max_bytes, external=True,
-                                                               source={'kind': 'compressed_image'}):
-                result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
-                    text=True, timeout=timeout_seconds)
-            if result.returncode != 0:
-                raise ValueError('image_compression_worker_failed')
-            detail = json.loads(result.stdout)
-            if detail['status'] != 'complete':
-                raise ValueError(detail['error_code'])
-            output = reserved_output
-            content = _read_source(output)
-            if hashlib.sha256(_read_source(source)).hexdigest() != source_digest:
-                raise ValueError('image_source_changed')
-            final = destination / detail['output']['name']
-            output.rename(final)
-            report.update({key: value for key, value in detail.items() if key not in {'source', 'output'}})
-            report['source'].update(detail['source'])
-            report['output'] = {**detail['output'], 'path': str(final), 'bytes': len(content),
-                                'sha256': hashlib.sha256(content).hexdigest()}
+        with material_store.MaterialStore().operation(), material_store.MaterialStore().read_lease([source]):
+            material_store.MaterialStore().adopt_directory(destination, source={'kind': 'image_compression'})
+            raw = _read_source(source)
+            source_digest = hashlib.sha256(raw).hexdigest()
+            report['source'] = {'path': str(source), 'sha256': source_digest, 'bytes': len(raw)}
+            with tempfile.TemporaryDirectory(prefix='.working-', dir=destination) as scratch:
+                scratch = Path(scratch)
+                input_file = scratch / 'source'
+                material_store.write_bytes(input_file, raw, source={'kind': 'image_compression_source'})
+                input_file.chmod(0o600)
+                reserved_output = scratch / 'encoded'
+                command = [sys.executable, '-B', '-m', __spec__.name, '--worker', '--file', str(input_file),
+                    '--output-dir', str(scratch), '--max-dimension', str(max_dimension), '--max-pixels', str(max_pixels),
+                    '--max-bytes', str(max_bytes), '--quality', str(quality), '--reserved-output', str(reserved_output)]
+                with material_store.MaterialStore().reserved_file(reserved_output, max_bytes=max_bytes, external=True,
+                                                                   source={'kind': 'compressed_image'}):
+                    result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
+                        text=True, timeout=timeout_seconds)
+                if result.returncode != 0:
+                    raise ValueError('image_compression_worker_failed')
+                detail = json.loads(result.stdout)
+                if detail['status'] != 'complete':
+                    raise ValueError(detail['error_code'])
+                output = reserved_output
+                content = _read_source(output)
+                if hashlib.sha256(_read_source(source)).hexdigest() != source_digest:
+                    raise ValueError('image_source_changed')
+                final = destination / detail['output']['name']
+                output.rename(final)
+                report.update({key: value for key, value in detail.items() if key not in {'source', 'output'}})
+                report['source'].update(detail['source'])
+                report['output'] = {**detail['output'], 'path': str(final), 'bytes': len(content),
+                                    'sha256': hashlib.sha256(content).hexdigest()}
     except subprocess.TimeoutExpired:
         report['error_code'] = 'image_compression_timeout'
     except FileExistsError:
