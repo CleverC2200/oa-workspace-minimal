@@ -4,9 +4,9 @@
 
 - `storage`：核对项目空间规范的 AGENTS 入口、原生 Actions、开发预检与 CI 接线，检查已接入的材料入口并拒绝新增写死的 `.scratch` 路径。具体容量由受管写入和运行时库存执行，静态入口检查不能证明任意 shell 命令都受到文件系统配额限制。实验产物须通过受管导入保存。
 
-附件内容复用由 `test_attachment_content_reuse.py` 经真实下载、准备和 `collect_case` 入口检查。相同名称但内容不同仍分别保存，每个附件 ID 独立读取并保留明细归属；相同正文复用下载文件，Excel 复用解析产物，不删除旧 attempt 的缓存文件。历史 67 份工作簿重复保存及重复提图的形状在旧实现上分别触发路径数量、提取次数与采集文件数量断言失败；DOCX、压缩包内图片与视频的反例保护原有子附件身份。该文件沿用下方本地及 CI 的 pytest 集合。
+附件内容复用由 `test_attachment_content_reuse.py` 经真实下载、准备和 `collect_case` 入口检查。相同名称但内容不同仍分别保存，每个附件 ID 独立读取并保留明细归属；相同正文复用下载文件，Excel 复用解析产物，不删除旧 attempt 的缓存文件。历史 67 份工作簿重复保存及重复提图的形状在旧实现上分别触发路径数量、提取次数与采集文件数量断言失败；DOCX、压缩包内图片与视频的反例保护原有子附件身份。该文件在本地按改动范围运行。
 
-- `payment-rules`：用 AST 读取 Worker，不导入业务代码。阻止 Worker 字符串再次写入人员关系、委托代付款或委托收款指令，报错指向共享付款规则。此检查只约束已发生的重复提示词，不判断实际材料，也不保证模型语义正确。历史 `ec9c4a1` 的原指令会触发检查；当前 Worker 通过，脱敏原句回归由 `test_quality_gates.py` 在本地及 CI 同一 pytest 入口运行。
+- `payment-rules`：用 AST 读取 Worker，不导入业务代码。阻止 Worker 字符串再次写入人员关系、委托代付款或委托收款指令，报错指向共享付款规则。此检查只约束已发生的重复提示词，不判断实际材料，也不保证模型语义正确。历史 `ec9c4a1` 的原指令会触发检查；当前 Worker 通过，脱敏原句回归由 `test_quality_gates.py` 在本地 pytest 入口运行。
 
 - `yaml`：安全解析受版本控制的 YAML，拒绝重复键，采用 YAML 1.2 布尔值约定。Issue form 检查基本结构、非空标题、字段类型、唯一 ID、下拉选项及 required 布尔值；这是本项目固定合同检查，不代表 GitHub 平台的全部限制。
 - `schema`：通过离线 FlowEngine 冻结六类财务包，检查真实生成器的 JSON Schema；同时检查包装 V2 生成器。拒绝供应商已实际拒绝过的空属性对象。包装页、非包装页、不确定页和 Excel 映射进入原消费者的回归保留在 pytest 中。静态有效不证明供应商已经实际接受全部分支。
@@ -20,19 +20,18 @@
 
 `tests/conftest.py` 在每个 pytest 用例启动时拒绝未替换的 Python DNS、IPv4/IPv6 连接及 UDP 发送，包括同进程的线程。本地 Unix IPC 保持可用。触发 `offline_network_forbidden` 时，为该用例注入录制客户端或显式替换真实传输；拒绝使用 pytest 失败信号，业务适配器的 `except Exception` 无法把它吞成预期的读取失败。
 
-本地和 CI 使用同一 pytest 测试集合。完整 CI 的并行配置见 [quality workflow](../../.github/workflows/quality.yml)，使用 xdist 动态分配任务。`test_offline_network_guard.py` 通过独立 pytest 调用验证漏注入的默认发票客户端、线程内 IPv4/IPv6、显式 HTTP fake 和本地 IPC。子 pytest 加载同一 conftest；普通 Python 子进程、原生外部程序、独立临时脚本及模块导入期间的操作不在此夹具保护范围内，不能由 pytest 成功推断这些操作无网络访问。新增离线回放应放到既有测试入口，独立回放仍需显式录制客户端及单独的传输保护。
+[quality workflow](../../.github/workflows/quality.yml) 只保留一个 Ubuntu 静态 job，执行 lint、语法、敏感信息、链接以及必要 schema、生产配置和文档合同检查，保留普通 job 超时。行为测试在本机 Mac 按受影响范围运行；显式完整入口见[开发环境](dev-environment.md)。`test_offline_network_guard.py` 通过独立 pytest 调用验证漏注入的默认发票客户端、线程内 IPv4/IPv6、显式 HTTP fake 和本地 IPC。子 pytest 加载同一 conftest；普通 Python 子进程、原生外部程序、独立临时脚本及模块导入期间的操作不在此夹具保护范围内，不能由 pytest 成功推断这些操作无网络访问。新增离线回放应放到既有测试入口，独立回放仍需显式录制客户端及单独的传输保护。
 
-完整 CI 在三个标准 Ubuntu runner 上各自独立串行收集全套节点，再按节点 SHA256 的固定三分规则分配测试，每个 runner 保持四个 worker 并动态分配测试。静态门在分片 0 执行。`scripts.pytest_evidence` 在筛选前核对完整收集，再核对本分片各 worker 的集合和每项执行次数，记录分配数量、CPU 和耗时；worker 丢失、失败、漏跑、重复或新增 skip 均失败。Linux 只允许既有文件出生时间相关的 12 项 skip，以及固定容量临时卷的精确原生验收用例。既有 macOS 专项执行停止恢复和原生容量验收，聚合逐项核对完整覆盖，缺失、重复或 skip 均失败。
+本地默认 pytest 通过 `tests/conftest.py` 加载 `scripts.pytest_evidence`，失败身份保存在 `.pytest_cache/d/failure-records/` 的独立运行文件。setup、call、teardown 失败报告到达时立即同步落盘，记录用例身份、阶段、worker、收集指纹及可用的执行绑定，不保存异常正文。后续进程被终止仍保留已经发生的失败；未完成运行不能作为通过依据。`test_ci_evidence.py` 用真实 pytest 终止回归核验默认与显式入口及旧记录保护。
 
-本地默认 pytest 通过 `tests/conftest.py` 加载同一插件，失败身份保存在 `.pytest_cache/d/failure-records/` 的独立运行文件；CI 显式证据入口则写入 `execution.json.failures.jsonl`。Linux 和 macOS 的既有 artifact 步骤均上传各自的即时失败记录。setup、call、teardown 失败报告到达时立即同步落盘，记录用例身份、阶段、worker、完整收集指纹及可用的 CI 轮次绑定，不保存异常正文。它不替代完整执行回执或作为通过依据；CI 已有同名失败记录时拒绝复用输出。`test_ci_evidence.py` 的实际 pytest 终止回归核验默认与显式入口，证明旧版在失败后中断会丢失记录，新版保留失败身份且不生成完整成功回执。
+需要完整执行证据时，显式运行独立收集，再把该文件交给执行入口：
 
-`quality-complete` 等待三个分片和 macOS 专项，按这些 job 在 `needs` 输出的 artifact ID 精确下载原始证据，不按同名列表或宽泛通配符选择，也不把上次汇总产物当作输入。原始 artifact 名含逻辑分片及 `run_attempt`；JSON 同时绑定源码、run、attempt 和 job。汇总要求所有必需任务成功，再核对三份完整收集、各 job 实际 attempt、分片归属、逐项并集恰好一次，以及 macOS JUnit 无跳过、无失败。输出缺失、产物身份不符或重跑失败时停止，不回退到旧成功。
+```bash
+python -m pytest -q --collect-only --ci-evidence-file="<新收集文件>"
+python -m pytest -q --tb=short --ci-expected-file="<新收集文件>" --ci-evidence-file="<新执行文件>"
+```
 
-170 秒运行预算按并行上游任务中最长的实际执行时间，加汇总任务从开始执行到完成验证的时间计算。上游起止来自[GitHub 当前 workflow attempt 的任务元数据](https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-workflow-run-attempt)，包含检出、依赖安装、静态门、测试、证据上传和收尾；汇总包含检出、安装、下载和元数据查询。任务集合、成功状态、源码分支 SHA、run 和 attempt 必须匹配；PR 测试源码的合并候选 SHA 仍由原 artifact 校验独立绑定。缺少、重复、错轮或无效时间证据均拒绝。汇总完成后最终回执的上传和收尾按 GitHub 完成记录另报。
-
-完整回执分别记录运行关键路径、从最早上游开始到汇总验证的墙钟跨度，以及调度等待对关键路径的影响。分片启动错开和汇总等待执行器不计入运行预算；完整覆盖、必需任务状态和 170 秒阈值保持。真实主机的执行超限仍失败，不用本地通过或单个任务通过代替完整 hosted CI 验收。历史墙钟计时报告保持原判定，修复与验收见 [#554](https://github.com/CleverC2200/oa-workspace-minimal/issues/554)。
-
-仅重跑失败任务时，未重跑的成功 job 可明确复用原 artifact ID 和 attempt；汇总记录 `evidence_attempts`、`artifact_ids` 与 `reused_jobs`。本 attempt 的关键路径只计本轮实际执行的最长上游任务和汇总开销；复用 job 的原始证据和 GitHub 元数据执行时长仍各自核验 170 秒预算，历史等待不计入本轮。只重跑汇总时，本轮关键路径只计汇总实际执行时间。JSON 和 JUnit 按 attempt 留存，不自动重跑失败 worker。
+两个调用使用相同测试选择和源码。执行入口核对可信收集、每项恰好执行一次、worker 完整性和失败状态；跳过项不能形成完整通过证明。显式失败记录写入 `<新执行文件>.failures.jsonl`，已有输出或同名失败记录拒绝覆盖。插件记录本次 pytest 耗时，不施加宿主 CI 时间预算。远端不运行全量业务 pytest、macOS 专项、跨 job 产物汇总或作业元数据查询；历史 CI 回执保持原判定。
 
 录制 CLI 的分类与回执用例通过共享 fixture 缩短观察间隔，仍启动真实子进程；超时用例在既有 executor 接口缩短测试期限，仍走真实超时和进程回收。`real_observation_interval` 用例保留生产 5 秒周期，核对首次错误在重试前停止。生产默认、停止门与历史证据不受这些测试参数影响。
 
@@ -44,6 +43,6 @@
 
 ## 实际模型只读回归
 
-需要验证 Worker 的业务判断时，按[通用费用实际模型回归](../runbooks/finance-native-replay.md)准备私有冻结材料，再显式调用原生 Worker 并闭合 preview。默认 CI 只运行该入口的离线行为测试，不调用模型，不把工程通过替代实际模型验收。
+需要验证 Worker 的业务判断时，按[通用费用实际模型回归](../runbooks/finance-native-replay.md)准备私有冻结材料，再显式调用原生 Worker 并闭合 preview。该入口的离线行为测试在本地按范围执行，不调用模型，不把工程通过替代实际模型验收。
 
-同一 CLI 的 `--verify` 只读取既有原生回放和独立复核记录。逐项状态不符、独立业务复核拒绝或遗漏、绑定指纹不符及非原生记录均返回非零；原始模型结果保持业务未验收，不因生成校验报告改写。检查无法代替对原始证据和意见理由的独立判断。`test_native_replay.py` 在既有 pytest 与 CI 入口核验这些行为。[#425](https://github.com/CleverC2200/oa-workspace-minimal/issues/425) 留存真实历史错误及最终正确结果的只读拒绝/通过证明。
+同一 CLI 的 `--verify` 只读取既有原生回放和独立复核记录。逐项状态不符、独立业务复核拒绝或遗漏、绑定指纹不符及非原生记录均返回非零；原始模型结果保持业务未验收，不因生成校验报告改写。检查无法代替对原始证据和意见理由的独立判断。`test_native_replay.py` 在既有本地 pytest 入口核验这些行为。[#425](https://github.com/CleverC2200/oa-workspace-minimal/issues/425) 留存真实历史错误及最终正确结果的只读拒绝/通过证明。

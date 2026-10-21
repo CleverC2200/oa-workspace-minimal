@@ -100,14 +100,14 @@ review_required 只读取当前冻结包装材料，逐页直接看原图，不�
 
 只有财务、包装、海外、结束门禁全部可信，无当前隔离、未决写入或超期处置时，才用现行 --clear-production --confirm-recovered YES结束生产故障窗口。清除只改变窗口，不改变单据或回执。prune 仅在原控制器终态和全部Writer空闲后执行；retention_plan_invalid保留证据，按controller_failed映射提醒，不手工删除运行记录。
 
-## 程序故障派单
+## 程序故障登记与汇总
 
-程序故障开发派发保持一窗口一次、一轮修复约束，优先采用已发布 repair_dispatch入口，不能因通知unknown重复派发：
-1. status查询活动归属；reserved先确认之前创建结果，running用Codex任务工具检查绑定任务，2小时无进展升级，不能只看目录存在就永久等待。
-2. reserve --window-key <告警window_id；缺失时原error_code+first_seen稳定摘要> --source-thread-id <本任务ID>。已有当前或旧格式窗口记录不创建第二个任务；已有活动占位报告其任务和进度。无归属占位需人工核实，调度不能 quarantine-orphan、删除或盲目重建。
-3. 只有 reserve确认为reserved且尚未创建，才 list_projects核对保存的 oa-workspace-dev 路径 /Users/synear/HermesWorkspace/profiles/oa/projects/oa-workspace-dev，并通过 create_thread一次创建local开发修复任务；不在生产建工作树、不用shell启动隐藏任务。创建确认真实threadId后bind；仅clientThreadId或结果不明保持待确认，不重试。真实绑定任务已被任务工具确认终态后，按相同reservation_id/thread_id finish --result completed|failed|waiting_for_user --confirm-terminal YES受控归档活动占位，窗口历史保留。
-4. 已确认未写入的隔离恢复失败属于人工接管处置，不另派重复开发任务；明确程序缺陷才派发。通知/创建工具缺失或失败均保留具体原因并报告人工处置，不绕过门禁。
+程序故障默认登记或更新 GitHub Issue 并汇总。按[Bug 记录规范](../agents/bug-ledger.md)和[Issue 追踪](../agents/issue-tracker.md)查找同范围问题，记录脱敏故障码、本轮来源任务、证据位置、未完成项与人工下一步。保留历史记录；原因未明时只记录相关现象，不能把隔离或普通队列为空当成修复完成。
 
-新开发修复任务提示词只含脱敏故障码、窗口、来源任务和回执位置，并包含：用户授权本故障一轮诊断、必要修改、聚焦回归、必要完整测试、Standards/Spec双路审查及一次问题修正；读AGENTS、CONTRIBUTING和隔离恢复手册，保留无关脏工作；只在保存的开发克隆内隔离开发，沿用uv、RTK。重大业务规则/授权变化、未知写入判定、放宽门禁、删证据、无法确定原因或需要新凭据时停止并给出具体人工下一步，不自动派生另一修复任务。符合小范围验证与审查时可本地提交、推送origin、Draft PR、CI通过转Ready并合并、确认Issue关闭；生产持控制器/Writer租约、空闲干净main后ff同步，新进程只读核验。发布不启动审批验收或恢复历史，正常授权审批由唯一cron负责。每阶段用自己的reservation_id/thread_id progress记录进度；派发任务无权限发起第二个修复任务、改频率或启停自动化。
+审批父聊天负责监督、审核派单和收尾。故障登记不自动创建开发修复任务，也不自动推进开发、推送、PR、合并或生产同步。已有当前同范围的明确授权继续有效，各动作按[发布约定](../../CONTRIBUTING.md#开发与生产隔离及发布)执行；需要开发时在保存的开发克隆内处理，生产审批与修复分开留证。
+
+已有修复任务沿用 `repair_dispatch status` 查询归属，再用 Codex 任务工具核对真实进度。`reserved` 先确认原创建结果，`running` 检查绑定任务，2 小时无进展升级；通知 unknown、只有 clientThreadId 或创建结果不明时保持待确认，不重复创建。每阶段由原 reservation_id/thread_id 记录进度，真实终态确认后才受控 finish，保留窗口历史。另有明确派发授权时，按[阻断恢复](blocking-recovery.md)的原派单入口处理；登记故障不会新增该授权。
+
+重大业务规则或授权变化、未知写入判断、放宽门禁、删除证据、无法确定原因或需要新凭据时，保留具体原因和人工下一步。原身份、授权、冻结、Writer、未知写入及停止策略保持；审批父聊天继续完成原会话等待与安全收尾，不能用开发任务代替这些责任。
 
 故障归属按本轮实际 run_id/controller_instance_id/来源任务关联，告警窗口只是通知历史，旧日期不得代替本轮。换窗口键前查询当前及历史派单记录的同轮归属；已有任务或归属不明不创建第二个任务。收到技术退出码前不按固定静默时长或浏览器关闭警告认定卡死。
