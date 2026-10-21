@@ -116,6 +116,46 @@ def test_reusing_finished_experiment_reclaims_old_copy_then_reseals_directory(tm
         (directory / 'bypass').write_bytes(b'large')
 
 
+@pytest.mark.parametrize('recovery', ['report', 'cli_status'])
+def test_interrupted_experiment_import_is_resealed_and_partial_payload_stays_protected(tmp_path, monkeypatch, capsys, recovery):
+    import subprocess
+    import sys
+    from apps.oa_approval import material_store
+    from scripts import project_space
+
+    monkeypatch.setattr(material_store, 'DEFAULT_LIMIT_BYTES', 8)
+    store = MaterialStore()
+    directory = store.managed_directory('trial')
+    program = '''
+from pathlib import Path
+import os, sys
+from apps.oa_approval import material_store
+material_store.discover_project = lambda root: {'checkouts': [], 'scopes': {}, 'files': set()}
+class Interrupted:
+    calls = 0
+    def read(self, size):
+        self.calls += 1
+        if self.calls == 1:
+            return b'1234'
+        os._exit(2)
+material_store.MaterialStore(Path(sys.argv[1]), limit_bytes=8).copy_stream(Path(sys.argv[2]), Interrupted())
+'''
+    result = subprocess.run([sys.executable, '-B', '-c', program, str(store.root), str(directory / 'unfinished')], timeout=10)
+    assert result.returncode == 2
+    if recovery == 'cli_status':
+        root = tmp_path / 'oa-workspace-dev'
+        subprocess.run(['git', 'init', '-q', str(root)], check=True)
+        assert project_space.main(['--root', str(root), 'status']) == 0
+        capsys.readouterr()
+    report = store.report()
+    assert report['used_bytes'] == 4
+    assert report['protected_bytes'] == report['used_bytes']
+    assert any(entry['status'] == 'protected' and entry['bytes'] == 4 for entry in store.registered_files())
+    assert not (directory / 'unfinished').exists()
+    with pytest.raises(PermissionError):
+        (directory / 'bypass').write_bytes(b'123456789')
+
+
 def test_two_processes_cannot_spend_same_capacity(tmp_path):
     import subprocess
     import sys

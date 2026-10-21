@@ -86,6 +86,7 @@ class MaterialStore:
                 state.setdefault('directories', {})
                 state.setdefault('project_scopes', {})
                 state.setdefault('project_checkouts', [])
+                self._seal_registered_experiments(state)
                 if refresh and str(self.root) not in _ACTIVE_OPERATIONS.get():
                     self._refresh(state)
                 self._recover(state)
@@ -160,12 +161,27 @@ class MaterialStore:
                    for key, entry in state['files'].items())
 
     def _seal_experiment(self, directory: Path) -> None:
-        for current, directories, files in os.walk(directory, topdown=False, followlinks=False):
-            for name in files:
-                _path(Path(current) / name).chmod(0o400)
+        if stat.S_IMODE(directory.stat().st_mode) != 0o500:
+            directory.chmod(0o500)
+        for current, directories, files in os.walk(directory, followlinks=False):
             for name in directories:
-                _path(Path(current) / name).chmod(0o500)
-        directory.chmod(0o500)
+                path = _path(Path(current) / name)
+                if stat.S_IMODE(path.stat().st_mode) != 0o500:
+                    path.chmod(0o500)
+            for name in files:
+                path = _path(Path(current) / name)
+                if stat.S_IMODE(path.stat().st_mode) != 0o400:
+                    path.chmod(0o400)
+
+    def _seal_registered_experiments(self, state: dict) -> None:
+        experiments = self.root / 'experiments'
+        for raw in state['directories']:
+            directory = _path(Path(raw))
+            if directory.is_relative_to(experiments) and len(directory.relative_to(experiments).parts) == 1:
+                if directory.exists():
+                    if not directory.is_dir():
+                        raise ValueError('material_path_untrusted')
+                    self._seal_experiment(directory)
 
     @contextmanager
     def _writable_output(self, state: dict, path: Path):
