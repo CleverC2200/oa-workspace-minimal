@@ -31,6 +31,20 @@ def compiled_maintenance_source(tmp_path_factory):
     return target
 
 
+def legacy_material_scanner(root):
+    installed = root / 'apps/oa_approval/material_store.py'
+    source = installed.read_text()
+    source = source.replace('with self._locked(readonly=True, refresh=False) as state:',
+                            'with self._locked(readonly=True) as state:')
+    target = '        allowed_roots = [Path(path) for path in state.get(\'project_checkouts\', [])]'
+    assert target in source
+    source = source.replace(target,
+        '        counter = self.checkout_root / "material-scan-count"\n'
+        '        count = int(counter.read_text()) if counter.exists() else 0\n'
+        '        counter.write_text(str(count + 1))\n' + target, 1)
+    installed.write_text(source)
+
+
 def test_maintenance_source_cache_reads_changed_bytes_with_same_size_and_mtime(
     compiled_maintenance_source, tmp_path,
 ):
@@ -153,7 +167,7 @@ def test_source_admission_bridge_keeps_other_safety_gates(tmp_path, invalid):
         maintenance_runtime.assert_live_safe(snapshot, allow_admission_blocked=True, **extra)
 
 
-@pytest.mark.parametrize('variant', ('old_gate', 'new_gate', 'frozen_drift', 'writer-boundary.json',
+@pytest.mark.parametrize('variant', ('old_gate', 'new_gate', 'legacy_scanner', 'frozen_drift', 'writer-boundary.json',
     'execution-receipt.json', 'review-decision.json', 'remark.txt', 'submission-envelope.json'))
 def test_source_bridge_uses_installed_frozen_validator_without_writing(tmp_path, monkeypatch, variant):
     import sys
@@ -167,11 +181,13 @@ def test_source_bridge_uses_installed_frozen_validator_without_writing(tmp_path,
     source = Path(maintenance_runtime.__file__).resolve().parents[2]
     shutil.copytree(source / 'apps', tmp_path / 'apps', ignore=shutil.ignore_patterns('__pycache__'))
     installed = tmp_path / 'apps/oa_finance_preaudit/flow_engine.py'
-    if variant != 'new_gate':
+    if variant not in {'new_gate', 'legacy_scanner'}:
         new = '_action, persisted, _packet = reader._open_attempt(action_path, require_reviewable=False)'
         text = installed.read_text()
         assert new in text
         installed.write_text(text.replace(new, '_action, persisted, _packet = reader._open_attempt(action_path)', 1))
+    if variant == 'legacy_scanner':
+        legacy_material_scanner(tmp_path)
     interpreter = tmp_path / '.venv/bin/python'
     interpreter.parent.mkdir(parents=True)
     interpreter.write_text('#!/bin/sh\nexec "' + sys.executable + '" "$@"\n')
@@ -201,13 +217,18 @@ def test_source_bridge_uses_installed_frozen_validator_without_writing(tmp_path,
     status.write_bytes(raw)
     status.chmod(0o600)
     receipt = {'path': str(status), 'sha256': hashlib.sha256(raw).hexdigest()}
+    if variant == 'legacy_scanner':
+        from apps.oa_approval.material_store import MaterialStore
+        MaterialStore().adopt(status)
     if variant == 'old_gate':
         with pytest.raises(RuntimeError, match='maintenance_frozen_inputs_untrusted'):
             maintenance_runtime.read_current_inputs(tmp_path, receipt)
-    if variant in ('old_gate', 'new_gate'):
+    if variant in ('old_gate', 'new_gate', 'legacy_scanner'):
         result = maintenance_runtime.read_current_inputs(tmp_path, receipt, allow_admission_blocked=True)
         assert result['admission_blocked_actions'] == [str(attempt / 'action.json')]
         assert result['pending_frozen_count'] == result['validated_frozen_count'] == 1
+        if variant == 'legacy_scanner':
+            assert (tmp_path / 'material-scan-count').read_text() == '1'
     else:
         with pytest.raises(RuntimeError, match='maintenance_frozen_inputs_untrusted'):
             maintenance_runtime.read_current_inputs(tmp_path, receipt, allow_admission_blocked=True)
@@ -478,6 +499,42 @@ def test_read_live_status_requires_terminal_success_and_exact_receipt(tmp_path, 
     else:
         with pytest.raises(RuntimeError, match=code):
             maintenance_runtime.read_live_status(tmp_path)
+
+
+def test_live_reader_batches_legacy_material_checks_in_target_process(
+    compiled_maintenance_source, tmp_path, monkeypatch,
+):
+    import sys
+
+    shutil.copytree(compiled_maintenance_source / 'apps', tmp_path / 'apps')
+    legacy_material_scanner(tmp_path)
+    target = tmp_path / 'material.pdf'
+    target.write_bytes(b'original')
+    from apps.oa_approval.material_store import MaterialStore
+    MaterialStore().adopt(target)
+    (tmp_path / 'apps/oa_finance_preaudit/cli.py').write_text(
+        'import hashlib,json,sys\nfrom pathlib import Path\n'
+        'from apps.oa_approval.material_store import MaterialStore\n'
+        'def main():\n'
+        ' store = MaterialStore()\n'
+        ' for _ in range(5): store.require_available(Path.cwd()/"material.pdf")\n'
+        ' raw=json.dumps({"refresh_count":int(Path("material-scan-count").read_text())}).encode()\n'
+        ' target=Path(sys.argv[sys.argv.index("--output-file")+1])\n'
+        ' target.write_bytes(raw); target.chmod(0o600)\n'
+        ' print(json.dumps({"status_file":{"path":str(target),"bytes":len(raw),'
+        '"sha256":hashlib.sha256(raw).hexdigest()}}))\n'
+        ' return 0\n'
+        'if __name__ == "__main__": raise SystemExit(main())\n')
+    interpreter = tmp_path / '.venv/bin/python'
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text('#!/bin/sh\nexec "' + sys.executable + '" "$@"\n')
+    interpreter.chmod(0o700)
+    monkeypatch.setattr(maintenance_runtime, 'read_current_inputs', lambda *_args, **_kwargs: {'status': 'verified'})
+
+    payload = maintenance_runtime.read_live_status(tmp_path)
+
+    assert payload['refresh_count'] == 1
+    assert target.read_bytes() == b'original'
 
 
 def test_stopped_readonly_status_refuses_unreaped_child_even_after_parent_exit(tmp_path):
