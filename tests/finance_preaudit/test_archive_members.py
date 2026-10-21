@@ -43,7 +43,27 @@ def _rar_transport(monkeypatch, entries, *, tool="/usr/bin/bsdtar", omit=(), dec
             output = ""
         return SimpleNamespace(returncode=0, stdout=output, stderr="")
 
+    class StreamedExtraction:
+        def __init__(self, args, **_kwargs):
+            if '-tvf' in args or 'l' in args:
+                self.stdout = io.BytesIO(run(args).stdout.encode())
+            else:
+                extracted.append(True)
+                member = args[-1]
+                self.stdout = io.BytesIO(b'' if member in omit else b'read')
+            self.returncode = 0
+
+        def wait(self, **_kwargs):
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
     monkeypatch.setattr(attachments.subprocess, "run", run)
+    monkeypatch.setattr(attachments.subprocess, "Popen", StreamedExtraction)
     return extracted
 
 

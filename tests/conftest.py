@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
+import os
 import socket
 from threading import Event
 
@@ -71,3 +72,27 @@ def isolate_native_process_doubles(monkeypatch):
     # Explicit Popen-double IDs must never become real ps or killpg targets.
     monkeypatch.setattr(approval_guard, "process_identity", lambda pid: None if pid in {12345, 123456} else identity(pid))
     monkeypatch.setattr(approval_guard, "group_alive", lambda pid: False if pid in {12345, 123456} else alive(pid))
+
+
+@pytest.fixture(autouse=True)
+def isolate_project_material_budget(tmp_path: Path, tmp_path_factory: pytest.TempPathFactory,
+                                    monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    from apps.oa_approval import material_store
+
+    pool = tmp_path_factory.mktemp('project-space')
+    monkeypatch.setenv('OA_PROJECT_SPACE_ROOT', str(pool))
+    monkeypatch.setattr(material_store, 'discover_project', lambda _root: {
+        'checkouts': [], 'scopes': {}, 'files': set(),
+    })
+    yield
+    for root in (pool, tmp_path):
+        for current, directories, files in os.walk(root, followlinks=False):
+            Path(current).chmod(0o700)
+            for name in directories:
+                path = Path(current) / name
+                if not path.is_symlink():
+                    path.chmod(0o700)
+            for name in files:
+                path = Path(current) / name
+                if path.is_file() and not path.is_symlink():
+                    path.chmod(0o600)

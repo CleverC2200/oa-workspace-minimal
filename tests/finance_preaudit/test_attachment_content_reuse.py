@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import ExitStack
 import io
 from pathlib import Path
 from threading import Lock
@@ -11,7 +12,7 @@ from openpyxl.drawing.image import Image as WorkbookImage
 from PIL import Image
 import pytest
 
-from apps.oa_approval import attachment_cache, attachment_extractors, attachments, spreadsheet_images
+from apps.oa_approval import attachment_cache, attachment_extractors, attachments, material_store, spreadsheet_images
 from apps.oa_finance_preaudit import case_bundle
 
 
@@ -95,6 +96,44 @@ def test_cached_content_reuse_preserves_files_from_prior_attempts(tmp_path, reco
     assert all(path.read_bytes() == workbook_bytes for path in originals)
     assert [item['resource_id'] for item in files] == ['first', 'second']
     assert all(item['reused'] is True for item in files)
+
+
+@pytest.mark.parametrize('duplicate_state', ['new', 'leased', 'preexisting'])
+def test_download_content_reuse_accounts_for_retained_and_discarded_copies(
+    tmp_path, monkeypatch, workbook_bytes, duplicate_state,
+):
+    monkeypatch.setenv('OA_FINANCE_PREAUDIT_CACHE_DB', str(tmp_path / 'cache.sqlite3'))
+    monkeypatch.setenv('OA_ATTACHMENT_DOWNLOAD_CONCURRENCY', '1')
+    monkeypatch.setattr(attachments, 'OA_HOST', 'https://oa.example.test')
+    monkeypatch.setattr(material_store, 'DEFAULT_LIMIT_BYTES', len(workbook_bytes) * 2)
+    store = material_store.MaterialStore()
+    destination = tmp_path / 'downloads'
+    destination.mkdir()
+    targets = resources(['first', 'second', 'third'] if duplicate_state == 'new' else ['first', 'second'])
+    if duplicate_state == 'preexisting':
+        store.write_bytes(destination / attachments.deterministic_filename(targets[1]), workbook_bytes)
+    with ExitStack() as readers:
+        def download(resource, *, dest_dir, **_kwargs):
+            path = dest_dir / attachments.deterministic_filename(resource)
+            if not path.exists():
+                store.write_bytes(path, workbook_bytes, source={'resource_id': resource['id']})
+            if duplicate_state == 'leased' and resource['id'] == 'second':
+                readers.enter_context(store.read_lease([path]))
+            return path, ''
+
+        monkeypatch.setattr(attachments, '_download_resource_direct', download)
+        files, errors = attachments.download_resources(
+            targets, dest_dir=destination, timeout_sec=1, allow_browser_download=True,
+            request_id='recorded', flow_key='tpm_small_marketing_fee', reuse_cache=False,
+        )
+        assert errors == []
+        assert [item['resource_id'] for item in files] == [item['id'] for item in targets]
+        assert len({item['path'] for item in files}) == 1
+        copies = 1 if duplicate_state == 'new' else 2
+        assert len(list(destination.glob('*.xlsx'))) == copies
+        assert len(store.registered_files()) == copies
+        assert store.report()['used_bytes'] == len(workbook_bytes) * copies
+        assert all(path.read_bytes() == workbook_bytes for path in destination.glob('*.xlsx'))
 
 
 def test_preparation_reuses_content_and_rebinds_each_resource(tmp_path, monkeypatch, workbook_bytes):

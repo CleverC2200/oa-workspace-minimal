@@ -455,12 +455,15 @@ class InvoiceFlow:
         return result
 
     def read_material(self, attempt: str) -> dict:
+        from apps.oa_approval.material_store import MaterialStore
+
         directory = self._attempt(attempt)
         material = self._read(directory / 'material.json')
         _require(material.get('attempt') == attempt, 'invoice_artifact_invalid')
         for item in material['attachments']:
             p = directory / item['path']
             _require(not Path(item['path']).is_absolute() and p.resolve().is_relative_to(directory.resolve()) and not p.is_symlink(), 'invoice_attachment_path_invalid')
+            MaterialStore().require_available(p)
             _require(hashlib.sha256(p.read_bytes()).hexdigest() == item['sha256'], 'invoice_attachment_changed')
         return material
 

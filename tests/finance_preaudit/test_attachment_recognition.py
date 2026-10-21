@@ -368,21 +368,23 @@ def test_no_model_process_or_subprocess_is_started(tmp_path, monkeypatch):
 
 def test_frozen_action_preserves_page_identity_and_inputs(tmp_path, monkeypatch):
     calls = fake_api(monkeypatch)
-    path = image(tmp_path)
+    attempt = tmp_path / 'attempt'
+    attempt.mkdir()
+    path = image(attempt)
     material = {'workflow_key': 'travel_expense', 'prepared': {'images': [{
         'resource_id': 'trip', 'path': str(path), 'kind': 'image',
         'owner_detail_id': 'row-2', 'content_sha256': hashlib.sha256(path.read_bytes()).hexdigest()}],
         'structured_contents': []}}
     raw = json.dumps(material).encode()
-    material_file = tmp_path / 'material.json'
+    material_file = attempt / 'material.json'
     material_file.write_bytes(raw)
-    packet = tmp_path / 'review-packet.json'
+    packet = attempt / 'review-packet.json'
     packet.write_text(json.dumps({'workflow_key': 'travel_expense', 'material_file': str(material_file),
                                  'material_fingerprint': 'sha256:' + hashlib.sha256(raw).hexdigest()}))
-    action = tmp_path / 'action.json'
+    action = attempt / 'action.json'
     action.write_text(json.dumps({'workflow_key': 'travel_expense', 'review_packet_file': str(packet)}))
     before = {p: p.read_bytes() for p in (action, packet, material_file, path)}
-    result = recognition.recognize(action_file=action, prompt='只读里程', output_dir=tmp_path.parent / (tmp_path.name + '-output'))
+    result = recognition.recognize(action_file=action, prompt='只读里程', output_dir=tmp_path / 'output')
     assert result['parts'][0]['evidence_ref'] == 'material:prepared.images.trip.1'
     assert result['parts'][0]['owner_detail_id'] == 'row-2'
     assert result['retention'] == {'scope': 'unmanaged', 'owner_attempts': []}
@@ -491,11 +493,13 @@ def test_malformed_response_diagnostic_does_not_hide_original_error(tmp_path, mo
 ])
 def test_frozen_incomplete_preparation_never_calls_api(tmp_path, monkeypatch, prepared, code):
     calls = fake_api(monkeypatch)
-    action = tmp_path / 'action.json'
+    attempt = tmp_path / 'attempt'
+    attempt.mkdir()
+    action = attempt / 'action.json'
     action.write_text('{}')
     monkeypatch.setattr(recognition, '_frozen', lambda _: ({'prepared': prepared}, {}))
     report = recognition.recognize(action_file=action, prompt='读附件',
-                                   output_dir=tmp_path.parent / (tmp_path.name + '-out'))
+                                   output_dir=tmp_path / 'out')
     assert report['status'] == 'failed'
     assert report['error_code'] == code
     assert calls == []
@@ -505,26 +509,28 @@ def test_frozen_docx_embedded_image_uses_preparer_digest(tmp_path, monkeypatch):
     import zipfile
     from apps.oa_approval import attachment_extractors
     calls = fake_api(monkeypatch)
-    picture = image(tmp_path)
-    document = tmp_path / 'evidence.docx'
+    attempt = tmp_path / 'attempt'
+    attempt.mkdir()
+    picture = image(attempt)
+    document = attempt / 'evidence.docx'
     with zipfile.ZipFile(document, 'w') as archive:
         archive.writestr('word/document.xml', '<document><body><p><t>invoice 123</t></p></body></document>')
         archive.writestr('word/media/image1.png', picture.read_bytes())
     images, manifest, structured = attachment_extractors.prepare_materials(
-        [{'path': str(document), 'resource_id': 'doc', 'name': document.name}], out_dir=tmp_path / 'prepared')
+        [{'path': str(document), 'resource_id': 'doc', 'name': document.name}], out_dir=attempt / 'prepared')
     assert images[0]['content_sha256'] == hashlib.sha256(picture.read_bytes()).hexdigest()
     material = {'workflow_key': 'general_expense', 'prepared': {
         'images': [{**page, 'path': str(page['path'])} for page in images],
         'manifest': manifest, 'structured_contents': structured}}
-    material_file = tmp_path / 'material.json'
+    material_file = attempt / 'material.json'
     material_file.write_text(json.dumps(material))
-    packet = tmp_path / 'review-packet.json'
+    packet = attempt / 'review-packet.json'
     packet.write_text(json.dumps({'workflow_key': 'general_expense', 'material_file': str(material_file),
         'material_fingerprint': 'sha256:' + hashlib.sha256(material_file.read_bytes()).hexdigest()}))
-    action = tmp_path / 'action.json'
+    action = attempt / 'action.json'
     action.write_text(json.dumps({'workflow_key': 'general_expense', 'review_packet_file': str(packet)}))
     result = recognition.recognize(action_file=action, prompt='读取文字和图片',
-        output_dir=tmp_path.parent / (tmp_path.name + '-result'))
+        output_dir=tmp_path / 'result')
     assert result['status'] == 'complete'
     assert len(result['parts']) == 2
     assert result['parts'][0]['parent_resource_id'] == 'doc'

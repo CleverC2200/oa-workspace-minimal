@@ -20,6 +20,8 @@ import pytest
 
 SHARDS = (0, 1, 2)
 _MANUAL_STOP = 'tests/finance_preaudit/test_manual_stop_recovery.py::'
+_NATIVE_STAGING = ('tests/finance_preaudit/test_bounded_staging.py::'
+                   'test_native_workspace_caps_aggregate_files_and_leaves_no_mount')
 _LINUX_SKIPS = {
     _MANUAL_STOP + name for name in (
         'test_first_maintenance_identity_is_bound_to_original_file_birth',
@@ -29,7 +31,7 @@ _LINUX_SKIPS = {
           for defect in ('later_edit', 'replacement', 'birth_mismatch', 'call_after_birth',
                          'result_before_modify', 'ctime', 'missing_birth', 'saved_payload', 'observed_before_result')),
     )
-}
+} | {_NATIVE_STAGING}
 
 
 def pytest_addoption(parser):
@@ -354,7 +356,8 @@ def merge_evidence(directory, budget, jobs):
     allowed = _LINUX_SKIPS if identity['platform'] == 'linux' else set()
     if any(values == ['skipped'] and node not in allowed for node, values in outcomes.items()):
         errors.append('unexpected_skip')
-    manual_nodes = [node.split('::')[-1] for node in nodes if node.startswith(_MANUAL_STOP)]
+    macos_nodes = [node.split('::')[-1] for node in nodes
+                   if node.startswith(_MANUAL_STOP) or node == _NATIVE_STAGING]
     macos = json.loads((paths['macos'] / 'macos.json').read_text())
     if (macos.get('schema_version') != 2 or macos.get('job') != 'macos-stop-recovery'
             or macos.get('platform') != 'darwin' or type(macos.get('run_attempt')) is not int
@@ -363,7 +366,7 @@ def merge_evidence(directory, budget, jobs):
         errors.append('macos_identity_mismatch')
     cases = ElementTree.parse(paths['macos'] / 'stop-recovery.xml').findall('.//testcase')
     if (macos.get('status') != 'verified' or macos.get('errors')
-            or Counter(case.get('name') for case in cases) != Counter(manual_nodes)
+            or Counter(case.get('name') for case in cases) != Counter(macos_nodes)
             or any(case.find(tag) is not None for case in cases for tag in ('skipped', 'failure', 'error'))):
         errors.append('macos_stop_recovery_incomplete')
     if (not _valid_time(macos.get('started_at')) or not _valid_time(macos.get('elapsed_seconds'))
@@ -387,7 +390,8 @@ def merge_evidence(directory, budget, jobs):
             'nodeids': nodes, 'collection_sha256': digest, 'collected_count': len(nodes),
             'executed_count': sum(len(values) for values in outcomes.values()),
             'counts': dict(Counter(value for values in outcomes.values() for value in values)),
-            'macos_stop_recovery_count': len(manual_nodes), 'shards': reports,
+            'macos_stop_recovery_count': sum(node.startswith(_MANUAL_STOP) for node in nodes),
+            'macos_native_staging_count': int(_NATIVE_STAGING in nodes), 'shards': reports,
             **timing,
             'budget_seconds': budget, 'errors': errors}
 

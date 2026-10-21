@@ -330,12 +330,15 @@ def _event_body(path: Path) -> object:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="repository-quality")
-    parser.add_argument("check", choices=("skill", "hygiene", "format", "links", "pr", "yaml", "schema", "lint", "environment", "production-config", "payment-rules", "test-names"))
+    parser.add_argument("check", choices=("skill", "hygiene", "format", "links", "pr", "yaml", "schema", "lint", "environment", "production-config", "payment-rules", "test-names", "storage"))
     parser.add_argument("--event", type=Path)
     args = parser.parse_args(argv)
     files = tracked_files()
     if args.check == "skill":
         findings = check_skill()
+    elif args.check == 'storage':
+        from scripts.project_space import check_policy
+        findings = check_policy(PROJECT_ROOT)
     elif args.check == 'test-names':
         findings = check_test_names(files)
     elif args.check == 'payment-rules':

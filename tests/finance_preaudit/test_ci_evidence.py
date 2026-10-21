@@ -14,6 +14,8 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+NATIVE_STAGING = ('tests/finance_preaudit/test_bounded_staging.py::'
+                  'test_native_workspace_caps_aggregate_files_and_leaves_no_mount')
 CI_IDENTITY = {'GITHUB_SHA': 'a' * 40, 'GITHUB_RUN_ID': '1234', 'GITHUB_RUN_ATTEMPT': '1',
                'OA_CI_HEAD_SHA': 'b' * 40}
 
@@ -43,6 +45,7 @@ def run_pytest(tmp_path, source, *, selection=(), budget='170', shard=None):
         result = tmp_path / f'result-{shard}.json'
         selection = (*selection, '--ci-shard', str(shard))
     command = [sys.executable, '-m', 'pytest', '-q', '-c', str(ROOT / 'pytest.ini'),
+               '--basetemp', str(tmp_path / 'pytest-workspace'),
                '-p', 'xdist.plugin', '-p', 'scripts.pytest_evidence', str(sample)]
     environment = dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD='1', PYTEST_ADDOPTS='')
     environment.update(GITHUB_SHA='a' * 40, GITHUB_RUN_ID='1234', GITHUB_RUN_ATTEMPT='1', GITHUB_JOB='quality')
@@ -201,7 +204,7 @@ def attempt_artifacts(directory, attempt, *, started_at=None, failed_shard=None)
     started_at = time.time() - 2 if started_at is None else started_at
     manual = ('tests/finance_preaudit/test_manual_stop_recovery.py::'
               'test_first_maintenance_identity_is_bound_to_original_file_birth')
-    nodes = [f'tests/test_recorded.py::test_case_{index}' for index in range(8)] + [manual]
+    nodes = [f'tests/test_recorded.py::test_case_{index}' for index in range(8)] + [manual, NATIVE_STAGING]
     identity = {'schema_version': 2, 'root': '/offline', 'platform': 'linux',
                 'code_revision': 'a' * 40, 'run_id': '1234', 'run_attempt': attempt,
                 'job': 'quality', 'started_at': started_at}
@@ -212,7 +215,7 @@ def attempt_artifacts(directory, attempt, *, started_at=None, failed_shard=None)
         collection = {**identity, 'status': 'collected', 'nodeids': nodes,
                       'collection_sha256': digest(nodes)}
         selected = [node for node in nodes if hashlib.sha256(node.encode()).digest()[0] % 3 == shard]
-        outcomes = {node: ['skipped' if node == manual else 'passed'] for node in selected}
+        outcomes = {node: ['skipped' if node in {manual, NATIVE_STAGING} else 'passed'] for node in selected}
         execution = {**identity, 'status': 'verified', 'nodeids': selected, 'shard': shard,
                      'collection_sha256': digest(selected), 'collected_count': len(selected),
                      'executed_count': len(selected), 'outcomes': outcomes, 'errors': [],
@@ -226,7 +229,8 @@ def attempt_artifacts(directory, attempt, *, started_at=None, failed_shard=None)
     path = directory / f'offline-test-evidence-macos-attempt-{attempt}'
     path.mkdir()
     (path / 'stop-recovery.xml').write_text(
-        f'<testsuite><testcase name="{manual.split("::")[-1]}"/></testsuite>')
+        f'<testsuite><testcase name="{manual.split("::")[-1]}"/>'
+        f'<testcase name="{NATIVE_STAGING.split("::")[-1]}"/></testsuite>')
     (path / 'macos.json').write_text(json.dumps({**identity, 'job': 'macos-stop-recovery',
         'platform': 'darwin', 'status': 'verified', 'elapsed_seconds': 1,
         'budget_seconds': 170, 'errors': []}))
@@ -264,7 +268,7 @@ def test_partial_rerun_replaces_legacy_failed_artifact_instead_of_reusing_it(tmp
     output = tmp_path / 'merged.json'
     result = merge_attempt(tmp_path, output, 2, (2, 1, 1, 1))
     report = json.loads(output.read_text())
-    assert report['counts'] == {'passed': 8, 'skipped': 1}, result.stdout
+    assert report['counts'] == {'passed': 8, 'skipped': 2}, result.stdout
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -283,7 +287,7 @@ def test_matrix_uses_job_attempts_for_first_full_partial_and_aggregate_reruns(tm
     result = merge_attempt(tmp_path, output, attempt, selected)
     assert result.returncode == 0, result.stdout + result.stderr
     report = json.loads(output.read_text())
-    assert report['counts'] == {'passed': 8, 'skipped': 1}
+    assert report['counts'] == {'passed': 8, 'skipped': 2}
     assert report['run_attempt'] == attempt
     assert report['evidence_attempts'] == dict(zip(('quality-0', 'quality-1', 'quality-2', 'macos-stop-recovery'), selected))
     assert 0 <= report['elapsed_seconds'] < 170
@@ -291,6 +295,27 @@ def test_matrix_uses_job_attempts_for_first_full_partial_and_aggregate_reruns(tm
     durations = dict(zip(('0', '1', '2', 'macos'), (120, 130, 125, 25)))
     current = [durations[role] for role, actual in zip(('0', '1', '2', 'macos'), selected) if actual == attempt]
     assert report['upstream_seconds'] == max(current, default=0)
+
+
+@pytest.mark.parametrize('defect', ['missing', 'duplicate', 'skipped'])
+def test_native_staging_requires_passing_macos_receipt(tmp_path, defect):
+    from xml.etree import ElementTree
+
+    attempt_artifacts(tmp_path, 1)
+    path = tmp_path / 'offline-test-evidence-macos-attempt-1/stop-recovery.xml'
+    root = ElementTree.fromstring(path.read_text())
+    native = next(case for case in root if case.get('name') == NATIVE_STAGING.split('::')[-1])
+    if defect == 'missing':
+        root.remove(native)
+    elif defect == 'duplicate':
+        root.append(ElementTree.fromstring(ElementTree.tostring(native)))
+    else:
+        ElementTree.SubElement(native, 'skipped')
+    path.write_text(ElementTree.tostring(root, encoding='unicode'))
+    output = tmp_path / 'merged.json'
+    result = merge_attempt(tmp_path, output, 1, (1, 1, 1, 1))
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert 'macos_stop_recovery_incomplete' in json.loads(output.read_text())['errors']
 
 
 @pytest.mark.parametrize('defect', ['new_failure', 'missing_new', 'sha', 'run', 'attempt', 'shard',
