@@ -118,6 +118,26 @@ def test_app_packaging_submission_requires_current_real_image_observation(packag
         packaging.validate_host_submission(path, payload, source, 'packaging_draft', {})
 
 
+def test_packaging_submission_revalidates_compressed_archive_without_changing_proofs(package_round):
+    import os
+    import subprocess
+    path, _, owner, _ = package_round
+    request, child = assigned_package(package_round)
+    observe_pages(path, child)
+    target = request.parent / 'archived-draft.json'
+    line = draft_source(child, request, target, owner, payload=envelope(path), call_id='archive-write')
+    session = json.loads(child.read_text().splitlines()[0])['payload']['id']
+    source = host.validate_source(child, line, session, target, dispatched_at=time.time()-2)
+    ordinary = packaging.validate_host_submission(path, envelope(path), source, 'packaging_draft', {})
+    archive = Path(os.environ['CODEX_HOME']) / 'archived_sessions' / (child.name + '.zst')
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(['zstd', '-q', str(child), '-o', str(archive)], check=True)
+    child.unlink()
+    assert packaging.validate_host_submission(path, envelope(path), source, 'packaging_draft', {}) == ordinary
+    host.submit(request, target, owner=owner, source=child, source_line=line)
+    assert host.poll_result(request)['status'] == 'reviewed'
+
+
 def test_packaging_accepts_named_native_image_results(package_round):
     path, _, owner, _ = package_round
     request, child = assigned_package(package_round)

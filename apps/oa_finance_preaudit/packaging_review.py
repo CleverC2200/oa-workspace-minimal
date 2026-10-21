@@ -15,7 +15,7 @@ from uuid import uuid4
 from jsonschema import Draft202012Validator
 
 from apps.oa_approval import auth, runtime_control
-from . import attempt_state
+from . import attempt_state, native_evidence
 from . import codex_review_worker as worker, decision_validation, flow_engine, packaging_contract, review_decision, host_chat_review, review_context
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -172,47 +172,11 @@ def _page_paths(action: Path) -> dict[str, str]:
     return paths
 
 
-def _image_output(value) -> bool:
-    if isinstance(value, list):
-        return any(_image_output(item) for item in value)
-    if isinstance(value, dict):
-        if value.get('isError') is True or value.get('exit_code') not in {None, 0}:
-            return False
-        if value.get('type') == 'image' and isinstance(value.get('data'), str) and value.get('mimeType', '').startswith('image/'):
-            return True
-        if isinstance(value.get('image_url'), str) and value['image_url'].startswith('data:image/'):
-            return True
-        return any(_image_output(item) for item in value.values())
-    return False
 
 
 
-def _single_image_path(code: str) -> str | None:
-    """Read literal arguments from an unconditional single-page read/emit call."""
-    code = host_chat_review._native_output(code)
-    match = re.fullmatch(r'\s*image\s*\(\s*\(\s*await\s+tools\s*\.\s*view_image\s*\(\s*(\{.*\})\s*\)\s*\)\s*\.\s*image_url\s*\)\s*;?\s*', code, re.DOTALL)
-    if match is None:
-        return None
-    try:
-        args = host_chat_review._literal_arguments(match.group(1), {'path', 'detail'})
-    except ValueError:
-        return None
-    return args['path'] if isinstance(args.get('path'), str) and args.get('detail', 'high') in {'high', 'original'} else None
 
 
-def _tool_failed(value) -> bool:
-    if isinstance(value, str):
-        try:
-            return _tool_failed(json.loads(value))
-        except ValueError:
-            return False
-    if isinstance(value, list):
-        return any(_tool_failed(item) for item in value)
-    if isinstance(value, dict):
-        return (value.get('isError') is True or bool(value.get('error'))
-                or ('exit_code' in value and value['exit_code'] != 0)
-                or any(_tool_failed(item) for item in value.values()))
-    return False
 
 def _observations(action: Path, source: dict, refs: list[str] | None = None, *, allow_failed: bool = False) -> list[dict]:
     """Pair actual original-page tool calls with image outputs in this assignment."""
@@ -221,40 +185,19 @@ def _observations(action: Path, source: dict, refs: list[str] | None = None, *, 
     if not required or not required.issubset(paths):
         raise ValueError('packaging_page_coverage')
     observed = {}
-    with host_chat_review._native_path(Path(source['session_file'])).open('rb') as stream:
-        for number, raw in host_chat_review._native_lines(stream):
-            if number >= source['line']:
-                break
-            if raw is None:
-                continue
-            row = json.loads(raw)
-            payload = row.get('payload', {})
-            if row.get('type') != 'response_item' or payload.get('type') not in {'function_call', 'custom_tool_call'}:
-                continue
-            args = payload.get('arguments', payload.get('input', ''))
-            image_path = None
-            if payload.get('name') in {'view_image', 'functions.view_image'}:
-                try:
-                    image_path = (json.loads(args) if isinstance(args, str) else args).get('path')
-                except (ValueError, AttributeError):
-                    continue
-            elif payload.get('name') in {'functions.exec', 'exec'} and isinstance(args, str):
-                image_path = _single_image_path(args)
-            if image_path not in paths.values():
-                continue
-            stamp = row.get('timestamp')
-            if not isinstance(stamp, str) or datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp() < source['dispatched_at']:
-                continue
-            _, proof = host_chat_review._native_source(Path(source['session_file']), source['session_id'], number, output=True)
-            output = proof.pop('output')
-            failed = _tool_failed(output)
-            read = not failed and _image_output(output)
-            if proof['output_line'] >= source['line'] or not (read or allow_failed and failed):
-                continue
-            proof['observation_state'] = 'read' if read else 'failed'
-            for ref, path in paths.items():
-                if path == image_path and ref in required:
-                    observed[ref] = {**proof, 'page_ref': ref, 'path_sha256': review_context.input_sha256(Path(path))}
+    for row, proof, image_path, output in native_evidence.image_observations(
+            Path(source['session_file']), source['session_id'], before=source['line'], paths=set(paths.values())):
+        stamp = row.get('timestamp')
+        if not isinstance(stamp, str) or datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp() < source['dispatched_at']:
+            continue
+        failed = output['failed']
+        read = not failed and output['image']
+        if not (read or allow_failed and failed):
+            continue
+        proof['observation_state'] = 'read' if read else 'failed'
+        for ref, path in paths.items():
+            if path == image_path and ref in required:
+                observed[ref] = {**proof, 'page_ref': ref, 'path_sha256': review_context.input_sha256(Path(path))}
     if set(observed) != required:
         raise ValueError('packaging_observation_missing')
     return [observed[ref] for ref in paths if ref in required]
