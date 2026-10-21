@@ -194,3 +194,13 @@ python -m apps.oa_finance_preaudit.shutdown_stop_recovery \
 原生来源必须完整匹配原 `begin-shutdown`，可随后包含精确绑定的只读 `--retrieve-result`；任意额外命令均拒绝。目标解释器重新核对原真实 wait、三个审核槽收尾、停止时间归属、进程身份及进程组、当前身份认证、授权、冻结和完整 continuation；原 cron 必须 PAUSED。确认执行追加 `--confirm-recovery YES`，在租约内复验并保存私有审计。历史证据、旧意见和隔离保持原样。
 
 读取结果的 `status`、`stop_cleared` 和 `receipt_file`。只有 `cleared` 才完成恢复；末尾审计失败时清门可能已发生，先核实际状态和回执，不重复执行。清门本身不表示源码已同步或审批已恢复。
+
+## 本轮排除问题请求
+
+用户明确要求暂缓已知历史材料问题、继续其余待办时，可在滚动控制器追加 `--exclude-action-file /absolute/old/attempt/action.json --exclusion-issue ISSUE_NUMBER`。参数只对本次调用及其准备子进程生效，不进入默认调度。每项只接受主文件、原 action/state 身份与成功回执仍可信的历史 closed/submitted 动作，不要求读取已回收附件，也不将其历史完整性验证改成成功。
+
+原完整对账及其 blocked continuation 保留。执行范围投影只移除精确选中历史请求的身份冲突与相应待办数量，按流程及请求身份排除全部接收版本；后续刷新与恢复队列也排除同一请求。其余冲突、unknown/submitting、认证、冻结、授权、活动 Writer 及回收未知仍阻断。重复路径、相对路径、符号链接、缺失成功回执及原证据变动拒绝。不得用此入口恢复或重提被排除请求。
+
+执行收据明确记录 Issue、排除身份摘要、原文件身份及内容摘要，以及未修改的 raw_continuation；`historical_submission_verified=false` 表示本功能没有修复历史材料验证。控制器配置指纹绑定此收据，准备子进程重绑后必须与原收据完全相同。结束仍取得原控制器真实终态、Writer 空闲和 App 统一收尾证明，并分别报告已提交、排除及其他未解决项。
+
+安装本能力或其他已授权源码时，可在生产源码发布入口使用相同的两个参数，并提供原执行三项绑定。原 cron 必须为 PAUSED，其他停机维护模式不能混用，全部原证据在同步前后保持一致。发布回执保留原 blocked continuation，另列 execution_continuation 与 scoped_next_process_ready，普通 next_process_ready 仍为 false。源码同步不授权普通无排除范围的审批；本次审批必须再次显式传入同一清单并经过新鲜门禁。完整同步入口见[生产源码发布门](production-source-release.md)。
