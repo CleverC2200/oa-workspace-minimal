@@ -320,7 +320,7 @@ def test_marketing_legacy_v1_packet_can_finish_original_five_items(
     assert closed["business_state"] == "needs_human"
 
 
-def test_marketing_v2_requires_payment_and_invoice_in_fallback_conclusion(
+def test_marketing_v2_accepts_attachment_conclusion_without_fixed_terms(
     tmp_path: Path,
 ) -> None:
     engine = _engine(
@@ -338,14 +338,15 @@ def test_marketing_v2_requires_payment_and_invoice_in_fallback_conclusion(
         ["pass", "pass", "pass", "uncertain", "pass", "pass"]
     )
     reviewed[1]["conclusion"] = "附件完整。"
-    decision_file = tmp_path / "missing-fallback-terms.json"
+    decision_file = tmp_path / "natural-attachment-conclusion.json"
     json_artifact.write_json_atomic(decision_file, _decision(action, reviewed))
 
-    with pytest.raises(ValueError, match="review_decision_invalid"):
-        engine.complete_review(Path(action["action_file"]), decision_file)
+    closed = engine.complete_review(Path(action["action_file"]), decision_file)
+
+    assert closed["business_state"] == "needs_human"
 
 
-def test_marketing_real_field_rows_require_fallback_terms(tmp_path: Path) -> None:
+def test_marketing_real_field_rows_accept_natural_conclusion(tmp_path: Path) -> None:
     engine = _engine(
         tmp_path,
         facts=[
@@ -362,11 +363,12 @@ def test_marketing_real_field_rows_require_fallback_terms(tmp_path: Path) -> Non
         ["pass", "pass", "pass", "uncertain", "pass", "pass"]
     )
     reviewed[1]["conclusion"] = "附件完整。"
-    decision_file = tmp_path / "real-fields-missing-fallback-terms.json"
+    decision_file = tmp_path / "real-fields-natural-conclusion.json"
     json_artifact.write_json_atomic(decision_file, _decision(action, reviewed))
 
-    with pytest.raises(ValueError, match="review_decision_invalid"):
-        engine.complete_review(Path(action["action_file"]), decision_file)
+    closed = engine.complete_review(Path(action["action_file"]), decision_file)
+
+    assert closed["business_state"] == "needs_human"
 
 
 def test_marketing_special_subject_keeps_existing_attachment_conclusion(
@@ -395,18 +397,19 @@ def test_marketing_special_subject_keeps_existing_attachment_conclusion(
     assert closed["business_state"] == "needs_human"
 
 
-def test_marketing_company_pass_requires_prescribed_conclusion(tmp_path: Path) -> None:
+def test_marketing_company_pass_accepts_natural_conclusion(tmp_path: Path) -> None:
     engine = _engine(tmp_path)
     action = engine.next_action(WORKFLOW_KEY)
     reviewed = _reviewed_items(
         ["pass", "pass", "pass", "uncertain", "pass", "pass"]
     )
     reviewed[-1]["conclusion"] = "报销公司、支付公司与购买方一致。"
-    decision_file = tmp_path / "invalid-company-pass.json"
+    decision_file = tmp_path / "natural-company-pass.json"
     json_artifact.write_json_atomic(decision_file, _decision(action, reviewed))
 
-    with pytest.raises(ValueError, match="review_decision_invalid"):
-        engine.complete_review(Path(action["action_file"]), decision_file)
+    closed = engine.complete_review(Path(action["action_file"]), decision_file)
+
+    assert closed["business_state"] == "needs_human"
 
 
 def test_invalid_review_quarantine_persists_confirmed_no_write(

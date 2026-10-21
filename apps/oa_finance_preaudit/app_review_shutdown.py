@@ -56,20 +56,7 @@ def _source(value: dict, owner: str, source: Path, line: int, *, earliest: float
     return native['anchor'], proof
 
 
-def _literal_arguments(raw: str, keys: set[str]) -> dict:
-    """Parse only whitelisted data literals from native calls, never JS."""
-    key = '(?:' + '|'.join(sorted(keys)) + ')'
-    literal = r'(?:"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"|0|[1-9][0-9]*)'
-    member = rf'(?:"{key}"|{key})\s*:\s*{literal}'
-    if re.fullmatch(rf'\s*\{{\s*{member}(?:\s*,\s*{member})*\s*\}}\s*', raw) is None:
-        raise ValueError('host_review_shutdown_wait_untrusted')
-    arguments = {}
-    for match in re.finditer(rf'(?P<key>"{key}"|{key})\s*:\s*(?P<value>{literal})', raw):
-        name = match['key'].strip('"')
-        if name in arguments:
-            raise ValueError('host_review_shutdown_wait_untrusted')
-        arguments[name] = json.loads(match['value'])
-    return arguments
+_literal_arguments = host._literal_arguments
 
 
 def _execution_results(output) -> list[dict]:
@@ -98,14 +85,9 @@ def _wait_result(anchor: dict, output: dict, session: str, *, allow_interrupt: b
     payload = anchor.get('payload', {})
     if payload.get('name') not in {'exec', 'functions.exec'} or not payload.get('call_id'):
         raise ValueError('host_review_source_untrusted')
-    code = payload.get('input', payload.get('arguments'))
-    wrapped = re.fullmatch(
-        r'\s*const\s+(?P<variable>[A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*await tools\.write_stdin\((?P<wait>\{.*\})\);\s*'
-        r'text\((?:(?P=variable)|JSON\.stringify\((?P=variable)\))\);?\s*', code or '', re.DOTALL)
-    if wrapped is not None:
-        code = 'text(await tools.write_stdin(' + wrapped['wait'] + '));'
-    call = r'text\(await tools\.(exec_command|write_stdin)\((\{(?:[^{}"]|"(?:[^"\\]|\\.)*")*\})\)\);?\s*'
-    if re.fullmatch(r'\s*(?:' + call + r'){1,3}', code or '', re.DOTALL) is None:
+    code = host._native_output(payload.get('input', payload.get('arguments')) or '')
+    call = r'text\s*\(\s*await\s+tools\s*\.\s*(exec_command|write_stdin)\s*\(\s*(\{(?:[^{}"]|"(?:[^"\\]|\\.)*")*\})\s*\)\s*\)\s*;?\s*'
+    if re.fullmatch(r'\s*(?:' + call + r')+', code or '', re.DOTALL) is None:
         raise ValueError('host_review_source_untrusted')
     calls = re.findall(call, code, re.DOTALL)
     if calls[-1][0] != 'write_stdin':

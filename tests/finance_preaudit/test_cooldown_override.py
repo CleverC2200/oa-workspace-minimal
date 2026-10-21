@@ -403,22 +403,19 @@ print(json.dumps(result))
 
 @pytest.mark.parametrize('official_production', ['openai'], indirect=True)
 @pytest.mark.parametrize('provider', ['openai', 'deepseek'])
-def test_public_cli_unclosed_app_round_preserves_stop_and_creates_no_waiver(stopped, monkeypatch, capsys, provider):
+def test_public_cli_historical_app_audit_gap_does_not_block_authorized_waiver(stopped, monkeypatch, capsys, provider):
     root, original, _calls = stopped
     assert json.loads(original.file.read_bytes())['review_configuration']['transport'] == 'host_chat'
-    before = runtime_control.stop_file().read_bytes()
     original_bytes = original.file.read_bytes()
     monkeypatch.setattr(finance_preaudit_run.auth, 'load_local_env', lambda: None)
-    monkeypatch.setattr(finance_preaudit_run, 'supervise', lambda *_args, **_options: pytest.fail('unclosed App round launched'))
+    started = []
+    monkeypatch.setattr(finance_preaudit_run, 'supervise', lambda *_args, **_options: started.append(True) or {'result': 'completed'})
     result = finance_preaudit_run.main(['--owner-task-id', str(uuid4()), '--review-provider', provider,
         '--ignore-cooldown-once', 'YES', '--original-receipt-file', str(original.file),
         '--original-owner-task-id', original.owner_task_id, '--original-tool-session-id', original.tool_session_id,
         '--', *arguments()])
-    assert result == 1
-    assert runtime_control.stop_file().read_bytes() == before
+    assert result == 0 and started == [True]
+    assert not runtime_control.stop_file().exists()
     assert original.file.read_bytes() == original_bytes
-    assert not (guard.directory() / 'cooldown-overrides').exists()
-    output = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-    assert output['error_code'] == 'controller_execution_evidence_failed'
-    assert output['primary_failure'] == {'error_type': 'ValueError', 'error_code': 'host_review_previous_round_incomplete',
-                                         'phase': 'cooldown_override'}
+    assert len(list((guard.directory() / 'cooldown-overrides').glob('*.json'))) == 2
+    assert _calls == [root]

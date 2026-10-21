@@ -87,7 +87,7 @@ uv run --quiet python -X utf8 -B -m apps.oa_finance_preaudit.host_chat_review --
 
 发布直接使用本次请求提示中的原生 `functions.exec` 模板，将 `JSON.stringify(本单原始JSON对象)` 的占位内容替换为完整 JSON 对象。JSON 只填写一次；由模板在本次调用中编码和 shell 引用后交给专用 write-draft。不再运行 Python heredoc 生成长命令，也不再转抄第二份证据引用。`draft_invocation` 是该模板的唯一生成器。
 
-模板绑定本轮 owner、请求、尚不存在的私有决定文件、当前源码目录、controller lock 和 stop file。发布通过 uv 固定选择 Python 3.11，并显式使用 `-X utf8`；相对或其他 workdir 拒绝。整个原生调用仅含该单表达式，JSON 对象以外不添加变量、分支、注释或工具。校验器只静态解码受限模板，不执行 JavaScript。
+模板绑定本轮 owner、请求、尚不存在的私有决定文件、当前源码目录、controller lock 和 stop file。发布通过 uv 固定选择 Python 3.11，并显式使用 `-X utf8`；相对或其他 workdir 拒绝。接受等价的常量参数调用、结果变量和 JSON.stringify 输出包装，以及常规输出长度和等待参数。校验器核对实际参数、原请求、模型 JSON 与成功配对回执，不执行来源代码；变量名和换行不构成拒绝理由。
 
 既有规范字面量发布和历史 bare uv 来源继续只读接受，原请求、配对输出及决定字节指纹仍必须一致。新审核按请求模板发布。子 Agent 交回专用回执及决定路径后返回空闲；来源行由主会话在已登记子会话定位。
 
@@ -159,7 +159,7 @@ uv run --quiet python -X utf8 -B -m apps.oa_finance_preaudit.host_chat_review --
 
 1. 调用 `begin-shutdown`，reason 选择 completed、cancelled、reviewer_failed 或 parent_lost。它冻结本轮派单、续租及迟到结果，返回原 3 个 `interrupt_targets` 和原工具 session ID。非正常原因关闭 exchange；只有原执行终态与回收可信，且 Controller、全局及请求 Writer 均空闲时，才省略周期停止请求。不发信号终止 Writer。begin 与在途包装完成共用原轮锁，可能等待已进入的 Writer 完成后才返回；不承诺抢占写入。单独的 exchange cancelled/closed 不代表统一收尾已完成。
 2. 对返回的每个原 Agent 调用一次原生 `collaboration.interrupt_agent`，即使它当前已经空闲，也保留实际配对回执。不得新增或替换 Agent。随后调用原生 `collaboration.list_agents`，确认本轮 3 槽全部为 idle、completed 或 interrupted；仍 running、缺失、工具失败或来源不可验证时保持 pending。
-3. 继续等待原工具 session 和 Writer。原工具必须有实际终态 `write_stdin` 回执，调用单独使用下方形状；只轮询、不写 stdin。财务阶段已经取得的同一原 session 退出回执可复用。进程回执必须 terminal、children_reaped=true，退出码与原生等待一致，Writer 和请求 Writer 均空闲。非零退出只可封存为取消/异常收尾，不能报业务完成；unknown 写入及封存失败保持原阻断，不重放。
+3. 继续等待原工具 session 和 Writer。原工具必须有实际终态 `write_stdin` 回执，可使用下方示例或等价的结果变量输出；只轮询、不写 stdin。财务阶段已经取得的同一原 session 退出回执可复用。进程回执必须 terminal、children_reaped=true，退出码与原生等待一致，Writer 和请求 Writer 均空闲。非零退出只可封存为取消/异常收尾，不能报业务完成；unknown 写入及封存失败保持原阻断，不重放。
 4. 调用 `finish-shutdown`，提供同一父原生来源文件、按槽位顺序的 3 个 interrupt 行、最终 list_agents 行以及原 write_stdin 行。它检查时间顺序和配对输出摘要，保留精简来源证明。正常完成额外执行财务及包装原闭合门禁。缺证据时保持 pending，可继续监督并补齐证据。若正常计划期间发生取消，重新 begin-shutdown 以已记录的取消原因降为异常计划，原冻结时点保持不变；不能升级回正常计划。此时不能把它当成功或重启原审批。verified 后才结束父回合。
 
 ```bash
@@ -170,7 +170,7 @@ uv run --quiet python -X utf8 -B -m apps.oa_finance_preaudit.host_chat_review --
 text(await tools.write_stdin({"session_id":12345,"chars":"","yield_time_ms":1000}));
 ```
 
-等待调用继续优先使用上方 JSON 引号键。收尾读取器也接受同一白名单属性的无引号 JavaScript 名称，值限 JSON 字符串或非负整数字面量；变量、计算属性、表达式、重复键及附加语句均拒绝。历史调用在唯一原 session 末尾 wait 前至多顺序执行两个固定字面量调用，也可兼容核验。前置调用可为 `text(await tools.exec_command({...}));`，参数限 cmd、workdir、max_output_tokens、yield_time_ms；或其他不同 session 的空 stdin `write_stdin`，且其真实结果必须已终态、退出 0。原 session 不得提前出现，前置轮询的 session 也不得重复。每个调用均须有按序配对的真实终态结果，数量必须一致，最终退出只取原 session 的末尾 wait。原 session 重复 wait、前置轮询非零或仍等待、尾随命令、动态参数、额外或缺失结果继续拒绝。兼容只解析原始调用，不执行 JavaScript，不改原生来源或配对输出；原会话、真实退出、回收及 Writer 校验保持。
+等待来源按工具参数与配对结果核验，接受引号或无引号属性名、结果变量及 JSON.stringify 输出包装。相邻调用须各有可区分的配对结果，不限制固定的前置调用数量；原 session 只出现一次且位于末尾，取得真实终态。会话不符、参数无法直接核验、输出被改写、结果未完成或缺配对回执仍拒绝。原执行、进程回收和 Writer 校验保持。
 
 ```bash
 uv run --quiet python -X utf8 -B -m apps.oa_finance_preaudit.host_chat_review --operation finish-shutdown --owner-task-id <主会话UUID> --source-session-file <父原生会话jsonl> --interrupt-line <槽0interrupt行> --interrupt-line <槽1interrupt行> --interrupt-line <槽2interrupt行> --source-line <最终list_agents行> --wait-line <原session真实终态wait行>
@@ -179,6 +179,8 @@ uv run --quiet python -X utf8 -B -m apps.oa_finance_preaudit.host_chat_review --
 CLI 的旧 `close` 操作也走相同收尾核验，不能省略证明参数。Python 内部 `close()` 只负责 exchange 止损，供父链失效观察器等使用，不构成主回合退出许可。突然失去整个父会话时仍由原父链门和300秒租约止损；没有活着的 App 主对话就无法补发原生中断。机器断电、App崩溃或所有保护进程同时被强杀不保证完整收尾，结果缺失保持 unknown。
 
 ## 控制器清单与历史证据
+
+新轮启动只使用当前运行与对账门禁，不扫描重验全部历史 App 审计收尾。旧轮缺少封存或原生日志不连带阻断新轮；旧结果仍不能复用，历史成功、未知和缺口保持原记录。当前活动控制器、Writer、未确认回收、身份或未决写入风险继续阻断。
 
 每次 execution 目录中的 `controller-manifest.json` 是该轮唯一完整可变清单。全局 `rolling-controller-manifest.json` 只保存版本与 owner、invocation、run、controller instance 的定位绑定，读取时同时核对指针和执行清单的原字节、文件身份与路径。owner 是原生父会话，invocation 是监督执行目录，run 是控制器轮次，controller instance 是进程身份；四者分别核验。指针或目标损坏、丢失、冲突及符号链接均阻断，不能当作未运行。
 

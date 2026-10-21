@@ -2089,7 +2089,7 @@ def test_prepare_global_fifo_returns_trusted_zero_write_quarantine(
 
 
 @pytest.mark.parametrize('mutation', [None, 'missing_receipt', 'receipt_changed', 'identity', 'writer', 'decision'])
-def test_prepare_preserves_trusted_controller_material_failure(tmp_path, monkeypatch, mutation):
+def test_prepare_isolates_trusted_material_failure_and_preserves_unsafe_stops(tmp_path, monkeypatch, mutation):
     probe = finance_preaudit_concurrency_probe
     request_id = 'failed-material'
     received_at = '2026-08-25T08:00:00+08:00'
@@ -2138,14 +2138,15 @@ def test_prepare_preserves_trusted_controller_material_failure(tmp_path, monkeyp
     })
 
     assert calls == [request_id]
-    assert stop_requests == ['production_probe_prepare_failed']
-    assert result['action'] == 'failed'
     if mutation is not None:
+        assert stop_requests == ['production_probe_prepare_failed']
+        assert result['action'] == 'failed'
         assert result['error_code'] == 'production_probe_fifo_mismatch'
     else:
+        assert stop_requests == []
+        assert result['action'] == 'quarantined'
         assert result['error_code'] == 'material_collection_failed'
-        assert result['failure_detail_code'] == 'attachment_content_incomplete'
-        assert result['prepare_failure']['reason_code'] == 'attachment_content_incomplete'
+
 
 
 def test_dispatcher_consumes_isolated_exact_recovery_before_ordinary_work(tmp_path, monkeypatch):

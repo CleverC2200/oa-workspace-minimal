@@ -23,10 +23,7 @@ def test_rejection_retains_only_sanitized_bound_diagnostics(tmp_path: Path, monk
     path = _action(tmp_path)
 
     def reject(*_args):
-        flow_engine._validate_small_marketing_conclusions(
-            [{"item_key": "payment_company_consistency", "status": "pass", "conclusion": "private-company"}],
-            {},
-        )
+        raise decision_validation.InvalidDecision("item_values")
 
     monkeypatch.setattr(cli, "_live_flow_engine", lambda **_: SimpleNamespace(complete_review=reject))
     monkeypatch.setattr(codex_review_worker.runtime_control, "stop_requested", lambda: False)
@@ -38,7 +35,7 @@ def test_rejection_retains_only_sanitized_bound_diagnostics(tmp_path: Path, monk
         text = file.read_text()
         assert "private" not in text
         receipt = json.loads(text)
-        assert receipt["validation_code"] == "payment_company_conclusion"
+        assert receipt["validation_code"] == "item_values"
         assert set(receipt) == {"schema_version", "kind", "action_token_sha256", "decision_sha256", "validation_code"}
     assert not (tmp_path / "review-decision.json").exists()
 

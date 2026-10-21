@@ -63,6 +63,8 @@ FlowEngine 的隔离和恢复仍须在完成锁内复核失败凭据、动作、
 
 ## 结构化审核决定
 
+宿主校验决定结构、当前动作身份及证据绑定，不以固定句式、标点或必须出现的业务关键词拒绝决定。业务核对要求仍由匹配流程的审核 Agent 执行。
+
 TPM 新包若含 `company_comparison_contract.version=1`，决定顶层还须包含 `company_comparison={"observed_refs": [...], "result": "match/mismatch/unknown", "reason": "各已读原值及角色冲突的业务判断"}`。合同由冻结材料整体指纹和 `state.company_comparison_contract_version=1` 绑定；第四项 `entity_consistency` 的状态分别对应 `pass/fail/uncertain`。通过结论保留实际报销公司、支付公司与购买方全称及一致性结果。宿主核验原值引用覆盖与结构，不按公司名称生成业务状态。角色与缺口规则见 [TPM 规则包](flows/tpm-small-marketing-fee.md#公司比较观察合同)。历史无标记包保持原合同，整体降级且无公司事实时不添加该观察。
 
 宿主可以使用 `python -m apps.oa_finance_preaudit.review_decision --action-file ... --input ... --output ...` 从当前冻结动作装配缺少的协议绑定字段。它只补 schema、kind、动作 token、流程键和规则版本，不生成或修改业务项、页面分类、证据或结论；已有冲突绑定保留并由完成边界拒绝。输出必须是 attempt 外的新临时文件，冻结资料改变时停止。普通 Worker 使用同一装配函数；历史只读容量复验保留专用 token，不进入装配或写入。

@@ -1153,7 +1153,8 @@ def next_native_reviewers(parent, owner):
     return reviewers
 
 
-def test_same_parent_runs_two_independent_rounds_after_verified_shutdown(exchange, monkeypatch):
+@pytest.mark.parametrize('audit_complete', [True, False])
+def test_same_parent_runs_two_independent_rounds_without_historical_audit_dependency(exchange, monkeypatch, audit_complete):
     from apps.oa_finance_preaudit import app_review_shutdown as shutdown
     from tests.finance_preaudit.test_app_review_shutdown import proofs
     from tests.finance_preaudit.test_app_reviewer_slots import original_execution
@@ -1163,7 +1164,8 @@ def test_same_parent_runs_two_independent_rounds_after_verified_shutdown(exchang
     shutdown.begin(owner=owner, reason='cancelled')
     controller_handoff.finish(old, status='completed', children_reaped=True, health='healthy')
     seal_execution(owner, old)
-    shutdown.finish(owner=owner, **proofs(owner, child))
+    if audit_complete:
+        shutdown.finish(owner=owner, **proofs(owner, child))
     protected = {path: path.read_bytes() for path in [host.registry_file(owner), old_request]}
     assert runtime_control.clear_cycle_stop()
     monkeypatch.setattr(controller_handoff, 'CONTROLLER_INSTANCE_ID', uuid4().hex)

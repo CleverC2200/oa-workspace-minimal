@@ -14,6 +14,12 @@ RECEIPT_FILE = "manual-review-receipt.json"
 ITEM_LOCAL_MATERIAL_FAILURE_DETAILS = frozenset({
     "attachment_access_denied",
     "attachment_archive_failed",
+    "attachment_content_incomplete",
+    "legacy_doc_converter_unavailable",
+    "legacy_doc_conversion_failed",
+    "legacy_doc_conversion_timeout",
+    "material_budget_exceeded",
+    "packaging_material_incomplete",
     "general_evidence_references_unresolved",
     "tpm_evidence_references_unresolved",
     "attachment_download_capacity_timeout",
@@ -147,7 +153,10 @@ def verified_receipt(root: Path, state: dict) -> dict | None:
 def isolated(root: Path, state: dict) -> bool:
     receipt = verified_receipt(root, state)
     if receipt is not None:
-        return receipt["scope"] == "item"
+        return receipt["scope"] == "item" or (
+            state.get("reason") == "material_collection_failed"
+            and _scope(root, state, confirmed_rejection=False) == "item"
+        )
     failure = evidence.read_receipt(root / "review-failure.json")
     return (not os.path.lexists(root / RECEIPT_FILE)
             and isinstance(failure, dict) and failure.get("schema_version") == 1
