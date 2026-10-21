@@ -42,6 +42,12 @@ def legacy_material_scanner(root):
         '        counter = self.checkout_root / "material-scan-count"\n'
         '        count = int(counter.read_text()) if counter.exists() else 0\n'
         '        counter.write_text(str(count + 1))\n' + target, 1)
+    target = '    def _recover(self, state: dict) -> None:\n'
+    assert target in source
+    source = source.replace(target, target +
+        '        counter = self.checkout_root / "material-recovery-count"\n'
+        '        count = int(counter.read_text()) if counter.exists() else 0\n'
+        '        counter.write_text(str(count + 1))\n', 1)
     installed.write_text(source)
 
 
@@ -504,6 +510,7 @@ def test_read_live_status_requires_terminal_success_and_exact_receipt(tmp_path, 
 def test_live_reader_batches_legacy_material_checks_in_target_process(
     compiled_maintenance_source, tmp_path, monkeypatch,
 ):
+    import fcntl
     import sys
 
     shutil.copytree(compiled_maintenance_source / 'apps', tmp_path / 'apps')
@@ -511,14 +518,24 @@ def test_live_reader_batches_legacy_material_checks_in_target_process(
     target = tmp_path / 'material.pdf'
     target.write_bytes(b'original')
     from apps.oa_approval.material_store import MaterialStore
-    MaterialStore().adopt(target)
+    store = MaterialStore()
+    store.adopt(target)
+    inventory = (store.root / 'inventory.json').read_bytes()
     (tmp_path / 'apps/oa_finance_preaudit/cli.py').write_text(
-        'import hashlib,json,sys\nfrom pathlib import Path\n'
+        'import fcntl,hashlib,json,sys\nfrom pathlib import Path\n'
         'from apps.oa_approval.material_store import MaterialStore\n'
         'def main():\n'
         ' store = MaterialStore()\n'
         ' for _ in range(5): store.require_available(Path.cwd()/"material.pdf")\n'
-        ' raw=json.dumps({"refresh_count":int(Path("material-scan-count").read_text())}).encode()\n'
+        ' with (store.root/"inventory.lock").open("r+") as lock:\n'
+        '  try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB); locked=False\n'
+        '  except BlockingIOError: locked=True\n'
+        ' try:\n'
+        '  with store._locked(): raise AssertionError("write admitted")\n'
+        ' except RuntimeError as error: refused=str(error)=="maintenance_material_write_forbidden"\n'
+        ' raw=json.dumps({"refresh_count":int(Path("material-scan-count").read_text()),'
+        '"recovery_count":int(Path("material-recovery-count").read_text()),'
+        '"ledger_lock_held":locked,"write_refused":refused}).encode()\n'
         ' target=Path(sys.argv[sys.argv.index("--output-file")+1])\n'
         ' target.write_bytes(raw); target.chmod(0o600)\n'
         ' print(json.dumps({"status_file":{"path":str(target),"bytes":len(raw),'
@@ -534,7 +551,44 @@ def test_live_reader_batches_legacy_material_checks_in_target_process(
     payload = maintenance_runtime.read_live_status(tmp_path)
 
     assert payload['refresh_count'] == 1
+    assert payload['recovery_count'] == 1
+    assert payload['ledger_lock_held'] is True
+    assert payload['write_refused'] is True
     assert target.read_bytes() == b'original'
+    assert (store.root / 'inventory.json').read_bytes() == inventory
+    with (store.root / 'inventory.lock').open('r+') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_material_read_scope_observes_inventory_created_during_validation(compiled_maintenance_source, tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    shutil.copytree(compiled_maintenance_source / 'apps', tmp_path / 'apps')
+    inventory_root = tmp_path / 'new-inventory'
+    program = '''
+import json
+from pathlib import Path
+from apps.oa_approval.material_store import MaterialStore
+store = MaterialStore()
+target = Path.cwd() / 'material.pdf'
+target.write_bytes(b'original')
+store.root.mkdir(parents=True)
+(store.root / 'inventory.lock').touch(mode=0o600)
+(store.root / 'inventory.json').write_text(json.dumps({'schema_version':1,
+    'files':{str(target):{'path':str(target),'status':'retired'}},'events':[],'directories':{}}))
+try:
+    store.require_available(target)
+except ValueError as error:
+    assert str(error) == 'material_retired'
+else:
+    raise AssertionError('new retirement ignored')
+'''
+    result = subprocess.run([sys.executable, '-B', '-E', '-c', maintenance_runtime._material_read_program(program)],
+        cwd=tmp_path, env={**os.environ, 'OA_PROJECT_SPACE_ROOT': str(inventory_root)},
+        capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
 
 
 def test_stopped_readonly_status_refuses_unreaped_child_even_after_parent_exit(tmp_path):
