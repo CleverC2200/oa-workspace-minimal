@@ -663,3 +663,55 @@ def test_fetched_matrix_can_converge_on_last_permitted_read(fetched_matrix):
     assert len(received) == 20 and waited == 19
     assert len(list(jobs_file.with_suffix('.snapshots').glob('*.json'))) == 20
     assert jobs_file.read_bytes() == received[-1]
+
+
+@pytest.mark.parametrize('ci_evidence', [False, True])
+def test_failure_identity_survives_termination_before_sessionfinish(tmp_path, ci_evidence):
+    marker = tmp_path / 'after-failure.ready'
+    sample = tmp_path / 'test_sample.py'
+    sample.write_text('from pathlib import Path\nimport time\n'
+                      'def test_past_failure():\n    assert False\n'
+                      f'def test_after_failure():\n    Path({str(marker)!r}).touch()\n    time.sleep(30)\n')
+    expected, result = tmp_path / 'collection.json', tmp_path / 'execution.json'
+    (tmp_path / 'conftest.py').write_bytes((ROOT / 'tests/conftest.py').read_bytes())
+    command = [sys.executable, '-m', 'pytest', '-q', '-c', str(ROOT / 'pytest.ini'),
+               '-o', f'cache_dir={tmp_path / "cache"}', '--confcutdir', str(tmp_path), str(sample)]
+    environment = dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD='1', PYTEST_ADDOPTS='')
+    environment.update(GITHUB_SHA='a' * 40, GITHUB_RUN_ID='1234', GITHUB_RUN_ATTEMPT='1', GITHUB_JOB='quality')
+    collected = subprocess.run(command + ['-p', 'scripts.pytest_evidence', '--collect-only',
+                               '--ci-evidence-file', str(expected)],
+                               cwd=ROOT, env=environment, capture_output=True, text=True, timeout=15)
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    with (tmp_path / 'run.log').open('w') as log:
+        options = ['-p', 'scripts.pytest_evidence', '--ci-expected-file', str(expected),
+                   '--ci-evidence-file', str(result)] if ci_evidence else []
+        process = subprocess.Popen(command + options, cwd=ROOT, env=environment, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            deadline = time.monotonic() + 10
+            while not marker.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(.01)
+            assert marker.is_file(), (tmp_path / 'run.log').read_text()
+        finally:
+            process.terminate()
+            process.wait(timeout=10)
+    assert process.returncode != 0
+    assert not result.exists()
+    failures = (result.with_name(result.name + '.failures.jsonl') if ci_evidence else
+                next((tmp_path / 'cache' / 'd' / 'failure-records').glob('*.jsonl')))
+    records = [json.loads(line) for line in failures.read_text().splitlines()]
+    assert len(records) == 1
+    record = records[0]
+    assert record['nodeid'].endswith('::test_past_failure')
+    assert record['phase'] == 'call'
+    assert record['collection_sha256'] == json.loads(expected.read_text())['collection_sha256']
+    assert (record['code_revision'], record['run_id'], record['run_attempt'], record['job']) == (
+        'a' * 40, '1234', 1, 'quality')
+    assert 'longrepr' not in record
+    if ci_evidence:
+        before = failures.read_bytes()
+        repeated = subprocess.run(command + options, cwd=ROOT, env=environment,
+                                  capture_output=True, text=True, timeout=15)
+        assert repeated.returncode != 0
+        assert 'ci_evidence_already_exists' in repeated.stderr
+        assert failures.read_bytes() == before
+        assert not result.exists()

@@ -7,6 +7,8 @@ from threading import Event
 
 import pytest
 
+pytest_plugins = ['scripts.pytest_evidence']
+
 
 @pytest.fixture(autouse=True)
 def reject_unrecorded_network(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:

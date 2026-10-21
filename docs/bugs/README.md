@@ -83,6 +83,7 @@
 
 更新时新增检索词、主票或必要回归入口即可。相同问题追加原 Issue 发生记录；关闭与复发遵守记录规范，不在索引中另行维护“已修复”状态。
 
+- [#688 测试中断前的失败身份丢失](https://github.com/CleverC2200/oa-workspace-minimal/issues/688)：[真实进程终止回归](../../tests/finance_preaudit/test_ci_evidence.py)；即时失败记录仅保留失败事实，完整通过仍依赖既有终态、集合与 CI 汇总门。
 - [#684 相同内容附件重复保存与提图](https://github.com/CleverC2200/oa-workspace-minimal/issues/684)：[下载、准备及明细归属回归](../../tests/finance_preaudit/test_attachment_content_reuse.py)；区分附件身份与正文存储，保留不同附件 ID 的归属，不按名称或大小跳过读取。
 - [#689 准备超时回收夹具未等待就绪](https://github.com/CleverC2200/oa-workspace-minimal/issues/689)：[真实启动延迟与回收回归](../../tests/finance_preaudit/test_concurrency_probe.py)；测试握手只建立被回收对象及诊断前提，生产 watchdog 与恢复门保持。
 

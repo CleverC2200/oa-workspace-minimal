@@ -22,6 +22,8 @@
 
 完整 CI 在三个标准 Ubuntu runner 上各自独立串行收集全套节点，再按节点 SHA256 的固定三分规则分配测试，每个 runner 保持四个 worker 并动态分配测试。静态门在分片 0 执行。`scripts.pytest_evidence` 在筛选前核对完整收集，再核对本分片各 worker 的集合和每项执行次数，记录分配数量、CPU 和耗时；worker 丢失、失败、漏跑、重复或新增 skip 均失败。Linux 只允许既有文件出生时间相关的 12 项 skip，macOS 停止恢复任务继续要求全部执行、无 skip。
 
+本地默认 pytest 通过 `tests/conftest.py` 加载同一插件，失败身份保存在 `.pytest_cache/d/failure-records/` 的独立运行文件；CI 显式证据入口则写入 `execution.json.failures.jsonl`。Linux 和 macOS 的既有 artifact 步骤均上传各自的即时失败记录。setup、call、teardown 失败报告到达时立即同步落盘，记录用例身份、阶段、worker、完整收集指纹及可用的 CI 轮次绑定，不保存异常正文。它不替代完整执行回执或作为通过依据；CI 已有同名失败记录时拒绝复用输出。`test_ci_evidence.py` 的实际 pytest 终止回归核验默认与显式入口，证明旧版在失败后中断会丢失记录，新版保留失败身份且不生成完整成功回执。
+
 `quality-complete` 等待三个分片和 macOS 专项，按这些 job 在 `needs` 输出的 artifact ID 精确下载原始证据，不按同名列表或宽泛通配符选择，也不把上次汇总产物当作输入。原始 artifact 名含逻辑分片及 `run_attempt`；JSON 同时绑定源码、run、attempt 和 job。汇总要求所有必需任务成功，再核对三份完整收集、各 job 实际 attempt、分片归属、逐项并集恰好一次，以及 macOS JUnit 无跳过、无失败。输出缺失、产物身份不符或重跑失败时停止，不回退到旧成功。
 
 170 秒运行预算按并行上游任务中最长的实际执行时间，加汇总任务从开始执行到完成验证的时间计算。上游起止来自[GitHub 当前 workflow attempt 的任务元数据](https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-workflow-run-attempt)，包含检出、依赖安装、静态门、测试、证据上传和收尾；汇总包含检出、安装、下载和元数据查询。任务集合、成功状态、源码分支 SHA、run 和 attempt 必须匹配；PR 测试源码的合并候选 SHA 仍由原 artifact 校验独立绑定。缺少、重复、错轮或无效时间证据均拒绝。汇总完成后最终回执的上传和收尾按 GitHub 完成记录另报。
