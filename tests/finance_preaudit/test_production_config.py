@@ -131,3 +131,13 @@ def test_openai_cli_guard_cannot_be_replaced_with_a_different_failure(repository
     text = path.read_text().replace('openai_review_cli_forbidden', 'codex_process_failed')
     path.write_text(text)
     assert 'production_config_openai_cli_guard_drift' in production_config.repository_findings(repository)
+
+
+def test_repository_candidate_registers_failures_without_automatic_delivery(capsys):
+    assert quality.main(['production-config']) == 0
+    assert capsys.readouterr().out == 'production-config: ok\n'
+    for relative in production_config.REPOSITORY_INPUTS[:2]:
+        text = (quality.PROJECT_ROOT / relative).read_text()
+        assert '程序故障默认登记或更新 GitHub Issue 并汇总' in text
+        assert '用户授权本故障一轮诊断' not in text
+        assert 'CI通过转Ready并合并' not in text
