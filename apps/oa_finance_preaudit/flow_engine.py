@@ -484,23 +484,28 @@ def _review_failure_fingerprint(
     return _file_fingerprint(receipt_path)
 
 
-def _evidence_fingerprint(material: dict) -> str:
+def _material_paths(material: dict) -> set[Path]:
     prepared = material.get("prepared")
     images = prepared.get("images") if isinstance(prepared, dict) else []
     image_items = images if isinstance(images, list) else []
     resources = material.get("resources")
     resource_items = resources if isinstance(resources, list) else []
     paths = {
-        Path(str(item.get("local_readonly_path") or "")).expanduser().resolve()
+        Path(str(item.get("local_readonly_path") or "")).expanduser().absolute()
         for item in resource_items
         if isinstance(item, dict)
     }
     paths.update(
-        Path(str(item.get("path") or "")).expanduser().resolve()
+        Path(str(item.get("path") or "")).expanduser().absolute()
         for item in image_items
         if isinstance(item, dict)
     )
     material_store.MaterialStore().require_available_files(paths)
+    return {path.resolve() for path in paths}
+
+
+def _evidence_fingerprint(material: dict) -> str:
+    paths = _material_paths(material)
     if any(str(path) in {"", "."} or not path.is_file() for path in paths):
         raise ValueError("frozen_material_changed")
     digest = hashlib.sha256()
@@ -978,7 +983,6 @@ def _path_within(value: object, root: Path, *, code: str) -> Path:
         raise ValueError(code)
     path = Path(raw).expanduser().resolve()
     expected_root = Path(root).expanduser().resolve()
-    material_store.MaterialStore().require_available(path)
     if not path.is_file() or not path.is_relative_to(expected_root):
         raise ValueError(code)
     return path
@@ -1012,6 +1016,7 @@ def _validate_material_bundle(
     prepared = material.get("prepared")
     if not isinstance(resources, list) or not isinstance(prepared, dict):
         raise ValueError("material_bundle_schema_invalid")
+    _material_paths(material)
     resource_ids: set[str] = set()
     resource_paths: dict[str, Path] = {}
     for resource in resources:
@@ -1056,7 +1061,6 @@ def _validate_material_bundle(
         else:
             raise ValueError("prepared_resource_unbound")
         image_path = Path(str(image.get("path") or "")).expanduser().resolve()
-        material_store.MaterialStore().require_available(image_path)
         if not image_path.is_file():
             raise ValueError("prepared_path_outside_request_root")
         if image_path.is_relative_to(prepared_path):
@@ -1151,6 +1155,7 @@ def _validate_flow_material(workflow_key: str, material: dict) -> None:
         raise ValueError("packaging_material_incomplete")
 
 
+@material_store.availability_read()
 def validate_frozen_evidence(
     *,
     material_file: Path,
@@ -1181,6 +1186,7 @@ def validate_frozen_evidence(
     return material
 
 
+@material_store.availability_read()
 def validate_frozen_review_inputs(
     *,
     attempt_root: Path,
@@ -2928,6 +2934,7 @@ class FlowEngine:
             action = self._renew_expired_authorization(path, action, persisted)
             return action
 
+    @material_store.availability_read()
     def _open_attempt(self, action_path: Path, *, require_reviewable: bool = True) -> tuple[dict, dict, dict]:
         action_path = action_path.expanduser().resolve()
         if (
@@ -3145,51 +3152,52 @@ class FlowEngine:
             try:
                 material_file = attempt_root / "material.json"
                 json_artifact.write_json_atomic(material_file, material, indent=2)
-                verified = _validate_material_bundle(
-                    material_file,
-                    expected_request_id=claim["request_id"],
-                    attachment_root=attachment_root,
-                    prepared_root=prepared_root,
-                )
-                _require_reviewable_material(workflow_key, material)
-                evidence_fingerprint = _evidence_fingerprint(material)
-                collection_seconds = max(
-                    0,
-                    int(time.monotonic() - collection_started),
-                )
-                packet = {
-                    "schema_version": SCHEMA_VERSION,
-                    "kind": "preaudit_review_packet",
-                    "workflow_key": workflow_key,
-                    "rule_version": spec["rule_version"],
-                    "material_file": str(material_file),
-                    "material_fingerprint": verified["material_fingerprint"],
-                    "items": _flow_items(workflow_key),
-                    **_review_packet_constraints(workflow_key, material),
-                    **(
-                        {
-                            "page_routing": _review_packet_routing(
-                                workflow_key,
-                                material,
-                            )
-                        }
-                        if workflow_key == "travel_expense"
-                        else {}
-                    ),
-                }
-                if "company_comparison_contract" in packet:
-                    claim["company_comparison_contract_version"] = 1
-                packet_file = attempt_root / "review-packet.json"
-                json_artifact.write_json_atomic(packet_file, packet, indent=2)
-                claim = {
-                    **claim,
-                    "material_file": str(material_file),
-                    "review_packet_file": str(packet_file),
-                    "material_fingerprint": verified["material_fingerprint"],
-                    "evidence_fingerprint": evidence_fingerprint,
-                    **fuel_trip_observation.binding(packet),
-                }
-                attempt_state.write(state_path, claim, indent=2)
+                with material_store.availability_read():
+                    verified = _validate_material_bundle(
+                        material_file,
+                        expected_request_id=claim["request_id"],
+                        attachment_root=attachment_root,
+                        prepared_root=prepared_root,
+                    )
+                    _require_reviewable_material(workflow_key, material)
+                    evidence_fingerprint = _evidence_fingerprint(material)
+                    collection_seconds = max(
+                        0,
+                        int(time.monotonic() - collection_started),
+                    )
+                    packet = {
+                        "schema_version": SCHEMA_VERSION,
+                        "kind": "preaudit_review_packet",
+                        "workflow_key": workflow_key,
+                        "rule_version": spec["rule_version"],
+                        "material_file": str(material_file),
+                        "material_fingerprint": verified["material_fingerprint"],
+                        "items": _flow_items(workflow_key),
+                        **_review_packet_constraints(workflow_key, material),
+                        **(
+                            {
+                                "page_routing": _review_packet_routing(
+                                    workflow_key,
+                                    material,
+                                )
+                            }
+                            if workflow_key == "travel_expense"
+                            else {}
+                        ),
+                    }
+                    if "company_comparison_contract" in packet:
+                        claim["company_comparison_contract_version"] = 1
+                    packet_file = attempt_root / "review-packet.json"
+                    json_artifact.write_json_atomic(packet_file, packet, indent=2)
+                    claim = {
+                        **claim,
+                        "material_file": str(material_file),
+                        "review_packet_file": str(packet_file),
+                        "material_fingerprint": verified["material_fingerprint"],
+                        "evidence_fingerprint": evidence_fingerprint,
+                        **fuel_trip_observation.binding(packet),
+                    }
+                    attempt_state.write(state_path, claim, indent=2)
             except Exception as error:
                 return self._persist_attempt_needs_admin(
                     attempt_root / "action.json",

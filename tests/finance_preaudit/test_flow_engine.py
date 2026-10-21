@@ -1102,3 +1102,101 @@ def test_changed_attempt_reference_blocks_without_rebinding(tmp_path: Path, repl
     assert blocked["reason"] == "persistent_state_invalid"
     assert Path(action["state_file"]).read_bytes() == original_state
     assert not path.with_name("execution-receipt.json").exists()
+
+
+@pytest.mark.parametrize('page_count', [1, 48])
+@pytest.mark.parametrize('entrypoint', ['frozen_inputs', 'resume', 'reconcile'])
+def test_frozen_inputs_batch_inventory_recovery_and_keep_original_bytes(tmp_path, page_count, entrypoint):
+    import sys
+    from apps.oa_approval.material_store import MaterialStore
+    from apps.oa_finance_preaudit import reconciliation
+    from tests.finance_preaudit.test_flow_engine_replay import _grant, _verify_grant, _success
+
+    unrelated = tmp_path / 'unrelated'
+    unrelated.mkdir()
+    files = [unrelated / str(index) for index in range(256)]
+    for path in files:
+        path.write_bytes(b'other')
+    MaterialStore().adopt_files(files)
+
+    def collect(request_id, attempt):
+        material = _travel_material_with_attachment(request_id, attempt)
+        original = material['prepared']['images'][0]
+        for index in range(1, page_count):
+            path = attempt / 'prepared' / f'page-{index}.png'
+            path.write_bytes(b'frozen-page-v1')
+            material['prepared']['images'].append({**original, 'path': str(path)})
+        return material
+
+    engine = flow_engine.FlowEngine(root=tmp_path / 'flows',
+        discover_candidates=lambda workflow: [{'request_id': 'recorded-request',
+            'received_at': '2026-08-22T09:00:00+08:00', 'workflow_key': workflow}],
+        collect_material=collect, authorization_source=_grant, authorization_verifier=_verify_grant,
+        submit_frozen=_success)
+    action = engine.next_action('travel_expense', mode='controlled_write')
+    assert action['action'] == 'review_required'
+    attempt = Path(action['action_file']).parent
+    original = {path: path.read_bytes() for path in attempt.rglob('*') if path.is_file()}
+    calls = []
+
+    def observe(frame, event, _arg):
+        if event == 'call' and frame.f_code.co_name in {'_recover', '_refresh'} and frame.f_code.co_filename.endswith('material_store.py'):
+            calls.append(frame.f_code.co_name)
+
+    previous = sys.getprofile()
+    sys.setprofile(observe)
+    try:
+        state = json.loads((attempt / 'state.json').read_text())
+        if entrypoint == 'frozen_inputs':
+            flow_engine.validate_frozen_review_inputs(attempt_root=attempt, state=state, workflow_key='travel_expense')
+        elif entrypoint == 'resume':
+            assert flow_engine.FlowEngine.resumable_review(tmp_path / 'flows', state)
+        else:
+            report = reconciliation.reconcile(tmp_path / 'flows', pending_rows=[{
+                'request_id': state['request_id'], 'received_at': state['received_at'],
+                'workflow_key': 'travel_expense'}], handled_rows=[])
+            assert report['continuation']['status'] == 'ready'
+    finally:
+        sys.setprofile(previous)
+    assert calls == ['_recover']
+    assert {path: path.read_bytes() for path in original} == original
+
+
+@pytest.mark.parametrize('mutation', ['same_bytes_symlink', 'retired', 'changed_bytes'])
+@pytest.mark.parametrize('material_kind', ['source', 'prepared'])
+def test_frozen_reads_refuse_changed_or_retired_material_and_release_inventory(tmp_path, mutation, material_kind):
+    import fcntl
+    from apps.oa_approval.material_store import MaterialStore
+
+    engine = flow_engine.FlowEngine(root=tmp_path / 'flows',
+        discover_candidates=lambda workflow: [{'request_id': 'recorded-request',
+            'received_at': '2026-08-22T09:00:00+08:00', 'workflow_key': workflow}],
+        collect_material=_travel_material_with_attachment)
+    action = engine.next_action('travel_expense')
+    attempt = Path(action['action_file']).parent
+    state = json.loads((attempt / 'state.json').read_text())
+    material = json.loads((attempt / 'material.json').read_text())
+    target = Path(material['resources'][0]['local_readonly_path'] if material_kind == 'source'
+        else material['prepared']['images'][0]['path'])
+    store = MaterialStore()
+    store.adopt_files([target])
+    frozen = {attempt / name: (attempt / name).read_bytes()
+        for name in ['state.json', 'action.json', 'material.json', 'review-packet.json']}
+    if mutation == 'same_bytes_symlink':
+        copied = target.with_name('same-bytes')
+        copied.write_bytes(target.read_bytes())
+        target.unlink()
+        target.symlink_to(copied)
+    elif mutation == 'retired':
+        inventory = store.root / 'inventory.json'
+        records = json.loads(inventory.read_text())
+        records['files'][str(target)]['status'] = 'retired'
+        inventory.write_text(json.dumps(records))
+    else:
+        target.write_bytes(b'replaced')
+    with pytest.raises(ValueError, match='frozen_material_changed'):
+        flow_engine.validate_frozen_review_inputs(attempt_root=attempt, state=state, workflow_key='travel_expense')
+    assert not flow_engine.FlowEngine.resumable_review(tmp_path / 'flows', state)
+    assert {path: path.read_bytes() for path in frozen} == frozen
+    with (store.root / 'inventory.lock').open('r+') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
