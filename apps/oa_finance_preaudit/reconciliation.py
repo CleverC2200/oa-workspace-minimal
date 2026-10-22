@@ -122,7 +122,7 @@ def _validated_state(
     return state
 
 
-def latest_states(root: Path) -> list[dict]:
+def latest_states(root: Path, *, current_pending: bool = False) -> list[dict]:
     runtime_root = Path(root).expanduser()
     if runtime_root.is_symlink() or not runtime_root.is_dir():
         raise ValueError("runtime_reconciliation_invalid")
@@ -148,12 +148,27 @@ def latest_states(root: Path) -> list[dict]:
                 if not attempts:
                     continue
                 attempt, attempt_root = max(attempts, key=lambda item: item[0])
-                state = _validated_state(
-                    attempt_root / "state.json",
-                    workflow_key=workflow_root.name,
-                    case_key=case_root.name,
-                    attempt=attempt,
-                )
+                try:
+                    state = _validated_state(
+                        attempt_root / "state.json",
+                        workflow_key=workflow_root.name,
+                        case_key=case_root.name,
+                        attempt=attempt,
+                    )
+                except ValueError:
+                    if not current_pending:
+                        raise
+                    from . import attempt_state
+                    from .flow_engine import FlowEngine
+
+                    state = json.loads(attempt_state.read_input(attempt_root / "state.json"))
+                    reader = FlowEngine(root=runtime_root, discover_candidates=lambda _: (),
+                                        collect_material=lambda *_: {})
+                    if (not isinstance(state, dict)
+                            or not reader._attempt_identity_matches(attempt_root, state, require_material=False)):
+                        raise ValueError("runtime_reconciliation_invalid")
+                    attempt_state.read_action(attempt_root / "action.json", state=state)
+                    state = {**state, "pending_state_invalid": True}
                 latest.append(state)
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError("runtime_reconciliation_invalid") from error
@@ -243,7 +258,8 @@ def quarantine_summary(
     return _quarantine_summary(root, latest_states(root), pending_rows)
 
 
-def _confirmed_prior_round(root: Path, state: dict, rows: list[dict], now: datetime) -> bool:
+def _confirmed_prior_round(root: Path, state: dict, rows: list[dict], now: datetime,
+                           *, require_materials: bool = True) -> bool:
     from .flow_engine import FlowEngine
 
     if len(rows) != 1 or rows[0].get("workflow_key") != state.get("workflow_key"):
@@ -262,7 +278,31 @@ def _confirmed_prior_round(root: Path, state: dict, rows: list[dict], now: datet
             return False
     except (ValueError, TypeError):
         return False
-    return FlowEngine.confirmed_submission(root, state)
+    return FlowEngine.confirmed_submission(root, state, require_materials=require_materials)
+
+
+def pending_exclusions(root: Path, states: Iterable[dict], pending_rows: Iterable[dict],
+                       handled_rows: Iterable[dict] = (), *, now: datetime | None = None) -> frozenset[tuple[str, str]]:
+    from .flow_engine import FlowEngine
+
+    pending = list(pending_rows)
+    handled = {_identity(row)[0] for row in handled_rows}
+    excluded = {_identity(row) for row in pending if _identity(row)[0] in handled}
+    now = now or datetime.now(timezone.utc)
+    for state in states:
+        rows = [row for row in pending if _identity(row)[0] == state['request_id']]
+        if not rows:
+            continue
+        if state.get('pending_state_invalid'):
+            excluded.update(_identity(row) for row in rows)
+            continue
+        if FlowEngine.refreshable_pending(root, state):
+            continue
+        if (state.get('write_state') == 'submitted'
+                and _confirmed_prior_round(root, state, rows, now, require_materials=False)):
+            continue
+        excluded.update(_identity(row) for row in rows)
+    return frozenset(excluded)
 
 
 def _deferred_historical_no_write_round(
@@ -344,6 +384,7 @@ def reconcile(
     handled_rows: Iterable[dict],
     workflow_key: str | None = None,
     now: datetime | None = None,
+    current_pending: bool = False,
 ) -> dict:
     from .flow_engine import FlowEngine
 
@@ -373,9 +414,16 @@ def reconcile(
 
     states = [
         state
-        for state in latest_states(root)
+        for state in latest_states(root, current_pending=current_pending)
         if workflow_key is None or state.get("workflow_key") == workflow_key
     ]
+    invalid_states = [state for state in states if state.get("pending_state_invalid")]
+    states = [state for state in states if not state.get("pending_state_invalid")]
+    for state in invalid_states:
+        findings.append({"item_key": state["case_key"], "workflow_key": state["workflow_key"],
+                         "attempt": state["attempt"], "category": "local_state_invalid",
+                         "recommendation": "manual_state_review"})
+        counts["local_state_invalid"] += 1
     for state in states:
         attempt_root = Path(root) / str(state["workflow_key"]) / "cases" / str(state["case_key"]) / f"attempt-{state['attempt']}"
         request_id = str(state.get("request_id") or "").strip()
@@ -388,7 +436,7 @@ def reconcile(
         current_rows = [row for row in pending_input if _identity(row)[0] == request_id]
         if request_pending and not exact_pending:
             if not handled and _confirmed_prior_round(
-                root, state, current_rows, current_time
+                root, state, current_rows, current_time, require_materials=not current_pending,
             ):
                 category = "prior_round_submitted"
             elif not handled and _superseded_unsubmitted_round(
@@ -529,7 +577,7 @@ def reconcile(
         or item["age_seconds"] >= long_wait_threshold_seconds
     ]
     failure_counts = Counter(item["failure_code"] for item in attention)
-    return {
+    report = {
         "schema_version": 1,
         "kind": "preaudit_reconciliation",
         "read_only": True,
@@ -583,3 +631,24 @@ def reconcile(
         ),
         "findings": sorted(findings, key=lambda item: item["item_key"]),
     }
+    if current_pending:
+        excluded = pending_exclusions(root, [*states, *invalid_states], pending_input, handled_input, now=current_time)
+        pending_identities = {_identity(row) for row in pending_input}
+        report['historical_continuation'] = report['continuation']
+        report['historical_quarantine'] = report['quarantine']
+        report['quarantine'] = {
+            'local_quarantined': report['quarantine']['local_quarantined'],
+            'pending_quarantined': len(excluded),
+            'actionable_pending': len(pending_identities - excluded),
+        }
+        report['continuation'] = {
+            'status': 'ready', 'scope': 'item' if excluded else 'none',
+            'isolated_pending': len(excluded), 'blocking_reasons': {},
+        }
+        deferred = [
+            {'item_key': _item_key(*_identity(row)), 'workflow_key': row.get('workflow_key'),
+             'reason': 'submission_or_attempt_verification_required'}
+            for row in pending_input if _identity(row) in excluded
+        ]
+        report['deferred_pending'] = {'read_only': True, 'total': len(deferred), 'items': deferred}
+    return report

@@ -191,6 +191,11 @@ def _live_pending_identities() -> list[dict]:
     )
 
 
+def _live_handled_identities() -> list[dict]:
+    configs = legacy_flow.load_all_configs()
+    return legacy_api.build_api(configs[0]).handled_rows(page_size=200, max_pages=100)
+
+
 def _live_flow_engine(
     *,
     controlled: bool = False,
@@ -249,6 +254,7 @@ def _live_reconciliation(
     *,
     workflow_key: str | None = None,
     workflow_keys: frozenset[str] | None = None,
+    current_pending: bool = True,
 ) -> dict:
     if workflow_key is not None and workflow_keys is not None:
         raise ValueError("runtime_reconciliation_invalid")
@@ -277,6 +283,7 @@ def _live_reconciliation(
         ],
         handled_rows=oa_api.handled_rows(page_size=200, max_pages=100),
         workflow_key=workflow_key,
+        current_pending=current_pending,
     )
 
 

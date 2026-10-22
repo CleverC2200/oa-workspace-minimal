@@ -119,7 +119,7 @@ uv run --quiet python -X utf8 -B -m apps.oa_finance_preaudit.host_chat_review --
 
 用户允许先跳过拿不准的单据时，在下一轮滚动入口重复传入 `--defer-action-file /absolute/path/to/action.json`。参数只缩小本次选择范围，不改变原单状态，不重采材料；不提供参数的后续轮次会重新选择该单。运行中不修改本轮选择，已有控制器先按下节完成收尾。
 
-暂缓对象必须是本轮流程范围内的最新 attempt，保持可信 `review_required / controlled_write / authorized`，身份、冻结和授权原状态校验通过，且不存在规范决定、意见、Writer 边界、执行回执或提交信封。域外路径、符号链接、重复路径、旧 attempt、与恢复选择重叠或任何校验失败均拒绝。私有草稿不等于已提交决定，不自动复制到新轮次。
+暂缓对象必须是本轮流程范围内的最新 attempt，保持可信 `review_required / controlled_write / authorized`，身份及原 action/state 绑定可信，且不存在规范决定、意见、Writer 边界、执行回执或提交信封。旧附件已回收时仍可暂缓，不读取旧附件以决定排除资格。域外路径、符号链接、重复路径、旧 attempt、与恢复选择重叠或任何身份/提交边界校验失败均拒绝。私有草稿不等于已提交决定，不自动复制到新轮次。
 
 全局对账和 Writer 门禁先按原规则通过，之后才从可行动数量中扣除当前待办的暂缓项，其余单据保持 FIFO。暂缓不能掩盖身份冲突、未知写入或损坏冻结，也不能代替隔离恢复。结果中的 `deferred_action_files` 和 `deferred_selected_count` 只说明本次选择；暂缓不计作提交或隔离。只剩暂缓项时本轮可结束，仍须明确报告这些待办没有完成，不把本轮结束称为全部待办已清空。
 

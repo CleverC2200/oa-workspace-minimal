@@ -5,7 +5,7 @@
 生产只读查询使用生产克隆与其 Python：
 
 ```bash
-status_dir=$(mktemp -d /tmp/oa-status.XXXXXX) &&
+status_dir=$(mktemp -d /private/tmp/oa-status.XXXXXX) &&
 .venv/bin/python -m apps.oa_finance_preaudit.cli status \
   --check-live --reconcile --summary --output-file "$status_dir/status.json"
 ```
@@ -53,6 +53,8 @@ OA GET 及已有白名单只读 POST 的网络连接异常最多重试一次，�
 输出保存原 handoff 与 continuation 阻断项，并列出文件摘要、快照时间及年龄。缺少海外、cron、完成选择或来源不完整时保留 unknown。`all_clear=false` 和 `startup_authorized=false` 表示本入口只汇总历史快照；源码可用、配置授权、生产部署、cron 配置与实际业务验收分别报告。启动仍需新一轮完整实时门禁；海外实际验收见[独立流程证据要求](../overseas-invoice.md)，App 只读业务回归见[原生回放](finance-native-replay.md)。
 
 ## 一次跨轮恢复
+
+本节保留旧请求排除范围的兼容恢复。普通轮次按[当前待办合同](hourly-production.md#每轮启动与实时对账)重新发现并取材，不靠本节命令重试普通失败项。需要精确恢复历史目标时，使用原 `--recover-action-file` 绑定，保留旧证据。
 
 用户已明确授权该范围后，唯一小时调度使用：
 

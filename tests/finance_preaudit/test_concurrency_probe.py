@@ -38,6 +38,7 @@ def isolate_alert_delivery(tmp_path, monkeypatch):
         return original(code, **kwargs)
     monkeypatch.setattr(alert, "alert_once", local_alert)
     monkeypatch.setattr(alert, "send_message", lambda *args, **kwargs: None)
+    monkeypatch.setattr(finance_preaudit_concurrency_probe.cli, "_live_handled_identities", list)
     from tests.finance_preaudit.test_approval_guard import official_history
     home = tmp_path / "official"
     official_history(home, finance_preaudit_concurrency_probe.PROJECT_ROOT, [])
@@ -1771,7 +1772,7 @@ def test_prepare_one_rejects_duplicate_recovery_identity(
     assert stops == ["production_probe_prepare_failed"]
 
 
-def test_unknown_snapshot_failure_happens_before_handoff_begin(monkeypatch) -> None:
+def test_ordinary_round_does_not_scan_historical_unknown_snapshot(monkeypatch) -> None:
     begins: list[dict] = []
     monkeypatch.setattr(finance_preaudit_concurrency_probe.approval_lifecycle, "startup", lambda *a, **kw: {"status": "ready"})
 
@@ -1798,16 +1799,19 @@ def test_unknown_snapshot_failure_happens_before_handoff_begin(monkeypatch) -> N
         "_local_unknown_quarantined_identities",
         fail_snapshot,
     )
+    def reached_begin(payload):
+        begins.append(payload)
+        raise RuntimeError("handoff_begin_reached")
     monkeypatch.setattr(
         finance_preaudit_concurrency_probe.controller_handoff,
         "begin",
-        lambda payload: begins.append(payload),
+        reached_begin,
     )
 
-    with pytest.raises(ValueError, match="production_probe_state_invalid"):
+    with pytest.raises(RuntimeError, match="handoff_begin_reached"):
         finance_preaudit_concurrency_probe.run_rolling_drain(capacity=3)
 
-    assert begins == []
+    assert len(begins) == 1
 
 
 def test_open_actions_are_global_fifo_across_workflows(tmp_path: Path) -> None:
@@ -2081,6 +2085,9 @@ def test_prepare_global_fifo_returns_trusted_zero_write_quarantine(
         return
     assert result == {
         "action": "quarantined",
+        "action_file": str(flow_root / 'travel_expense' / 'cases'
+                           / hashlib.sha256(f'{request_id}\x1f{received_at}'.encode()).hexdigest()
+                           / f'attempt-{2 if recovery else 1}' / 'action.json'),
         "error_code": reason,
         "write_state": "not_requested",
         **({"recovery_action_file": str(recovery)} if recovery else {}),
@@ -2557,7 +2564,7 @@ def test_prepare_stops_on_new_write_authorization_failure(monkeypatch) -> None:
     assert stop_requests == [True]
 
 
-def test_prepare_skips_exact_historical_write_authorization_failure(
+def test_prepare_refreshes_current_pending_instead_of_skipping_old_authorization_failure(
     monkeypatch,
 ) -> None:
     stop_requests: list[bool] = []
@@ -2619,7 +2626,7 @@ def test_prepare_skips_exact_historical_write_authorization_failure(
         "action_file": "/safe/new-action.json",
     }
     assert stop_requests == []
-    assert calls == [frozenset({historical_action})]
+    assert calls == [frozenset()]
 
 
 def test_prepare_requests_stop_when_next_action_raises(monkeypatch) -> None:
@@ -4871,6 +4878,33 @@ def test_dispatcher_harvests_prepare_error_that_requested_global_stop(
         == "production_probe_prepare_failed"
     )
     assert reviews == []
+
+
+def test_dispatcher_excludes_material_failure_for_the_rest_of_current_round(tmp_path, monkeypatch):
+    probe = finance_preaudit_concurrency_probe
+    failed = _quarantined_action(tmp_path / 'runtime/finance_preaudit_flows',
+                                  request_id='failed-first', received_at='2026-08-25T08:00:00+08:00')
+    selections = []
+
+    def prepare(selection):
+        selections.append(selection)
+        if len(selections) == 1:
+            return {'action': 'quarantined', 'action_file': str(failed),
+                    'error_code': 'material_collection_failed', 'write_state': 'not_requested'}
+        return {'action': 'no_action'}
+
+    monkeypatch.setattr(probe, '_preparation_executor', lambda: ThreadPoolExecutor(max_workers=1))
+    monkeypatch.setattr(probe.runtime_control, 'stop_requested', lambda: False)
+    result = probe._run_dispatched_tasks(
+        2, 1, project_root=tmp_path, strict_global_fifo=True, prepare_action=prepare,
+        review_worker=lambda _task: pytest.fail('failed item must not be reviewed'),
+        executor_factory=lambda capacity: ThreadPoolExecutor(max_workers=capacity),
+        heartbeat_interval_sec=0.005, runtime_status=lambda: {'status': 'healthy'},
+    )
+
+    assert result.failed == 0
+    assert len(selections) == 2
+    assert ['failed-first', '2026-08-25T08:00:00+08:00'] in selections[1]['assigned_identities']
 
 
 def test_dispatcher_bounded_drains_prepare_error_after_stop_signal(
@@ -7721,12 +7755,12 @@ def test_explicit_recovery_does_not_mix_automatic_interruption_selection(tmp_pat
     def begin(_config):
         raise ValueError('reached_original_begin')
     monkeypatch.setattr(probe.controller_handoff, 'begin', begin)
-    expected = 'reached_original_begin' if explicit else 'production_rolling_reconciliation_invalid'
+    expected = 'reached_original_begin'
     with pytest.raises(ValueError, match='^' + expected + '$'):
         probe.run_rolling_drain(capacity=3, max_capacity=3,
             live_status=lambda: {}, reconcile_status=lambda: {},
             recovery_action_files=(tmp_path / 'action.json',) if explicit else ())
-    assert calls == ([] if explicit else ['automatic'])
+    assert calls == []
 
 
 def test_finance_success_does_not_clear_whole_task_production_fault(tmp_path, monkeypatch, capsys):

@@ -225,11 +225,12 @@ def summary(payload: dict, *, detail_limit: int = 200) -> dict:
         result["reconciliation"]["manual_review"] = {**manual, "items": items, "visible": len(items)}
         if len(items) > detail_limit or (detail_limit == 0 and manual.get("items")):
             result["reconciliation"]["manual_review"].update(items=items[:detail_limit], visible=detail_limit, display_truncated=True)
-        pending = report.get("pending_dispositions", {})
-        if len(pending.get("items", [])) > detail_limit:
-            result["reconciliation"]["pending_dispositions"] = {
-                **pending, "items": pending["items"][:detail_limit], "visible": detail_limit, "display_truncated": True,
-            }
+        for key in ('pending_dispositions', 'deferred_pending'):
+            pending = report.get(key, {})
+            if len(pending.get("items", [])) > detail_limit:
+                result["reconciliation"][key] = {
+                    **pending, "items": pending["items"][:detail_limit], "visible": detail_limit, "display_truncated": True,
+                }
     return result
 
 

@@ -802,7 +802,7 @@ def _renew_actions(action_files: list[Path]) -> list[Path]:
     return renewed
 
 
-def _latest_local_states() -> list[dict]:
+def _latest_local_states(*, current_pending: bool = False) -> list[dict]:
     runtime_root = PROJECT_ROOT / "runtime"
     flow_root = runtime_root / "finance_preaudit_flows"
     if runtime_root.is_symlink() or flow_root.is_symlink():
@@ -811,7 +811,8 @@ def _latest_local_states() -> list[dict]:
         if runtime_root.exists() and not runtime_root.is_dir():
             raise ValueError("runtime_reconciliation_invalid")
         return []
-    return reconciliation.latest_states(flow_root)
+    return (reconciliation.latest_states(flow_root, current_pending=True) if current_pending
+            else reconciliation.latest_states(flow_root))
 
 
 def _historical_write_authorization_failures() -> frozenset[Path]:
@@ -837,6 +838,14 @@ def _historical_write_authorization_failures() -> frozenset[Path]:
             raise ValueError("production_probe_state_invalid")
         historical.add(action_file)
     return frozenset(historical)
+
+
+def _current_pending_exclusions(pending_rows: Sequence[dict]) -> frozenset[tuple[str, str]]:
+    return reconciliation.pending_exclusions(
+        PROJECT_ROOT / 'runtime/finance_preaudit_flows', _latest_local_states(current_pending=True),
+        [{**row, 'workflow_key': row.get('workflow_key') or row.get('flow_key')} for row in pending_rows],
+        cli._live_handled_identities(),
+    )
 
 
 def _local_quarantined_identities() -> frozenset[tuple[str, str]]:
@@ -989,7 +998,7 @@ def _deferred_action_states(
             or state.get("workflow_key") not in allowed_workflows
             or state.get("mode") != "controlled_write"
             or state.get("write_state") != "authorized"
-            or not flow_engine.FlowEngine.resumable_review(root, state)
+            or not flow_engine.FlowEngine.refreshable_pending(root, state)
             or any(os.path.lexists(path.with_name(name)) for name in (
                 "writer-boundary.json", "execution-receipt.json",
                 "review-decision.json", "remark.txt", "submission-envelope.json",
@@ -1159,10 +1168,11 @@ def _prepare_one(selection: PrepareSelection) -> dict:
         return failed("selection_contract")
     if runtime_control.stop_requested():
         return {"action": "failed", "error_code": "production_probe_stopped"}
+    current_pending = not recovery_action_files and selected_targets is None and exclusion_scope is None
     prepare_trace.stage("quarantine_probe")
     try:
         historical_authorization_failures = (
-            _historical_write_authorization_failures()
+            frozenset() if current_pending else _historical_write_authorization_failures()
         )
         quarantine_budget = _local_quarantine_count() + 1
     except ValueError as error:
@@ -1198,7 +1208,9 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                         (
                             frozenset()
                             if _include_isolated_development_items()
-                            else _local_quarantined_identities()
+                            else (_current_pending_exclusions(live_rows)
+                                  if current_pending
+                                  else _local_quarantined_identities())
                         )
                         | historical_unknown_identities
                         | assigned_identities
@@ -1371,6 +1383,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                             historical_unknown_identities,
                             workflow_key=selected_workflow,
                         ),
+                        current_pending=current_pending,
                     )
             except ValueError as error:
                 if str(error) == "completion_in_progress":
@@ -1438,6 +1451,8 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                 "action": "failed",
                 "error_code": "production_probe_stopped",
             }
+        if current_pending and action.get('action') == 'closed' and action.get('write_state') == 'not_requested':
+            return {'action': 'no_action'}
         if (
             recovery_action_file is not None
             and action.get("action") != "review_required"
@@ -1611,6 +1626,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
                     }
                 return {
                     "action": "quarantined",
+                    "action_file": str(action_path),
                     "error_code": str(action["reason"]),
                     "write_state": "not_requested",
                     **(
@@ -2537,6 +2553,7 @@ def _run_dispatched_tasks(
     outcomes: list[TaskOutcome[dict] | None] = [None] * count
     assigned: set[Path] = set()
     assigned_identities: dict[Path, tuple[str, str]] = {}
+    deferred_identities: set[tuple[str, str]] = set()
     assigned_order_keys: dict[int, tuple[datetime, str]] = {}
     pending_write_indices: set[int] = set()
     futures: dict[object, tuple[int, float, float, Path]] = {}
@@ -2806,7 +2823,7 @@ def _run_dispatched_tasks(
             deadlines.append(wall + prepare_timeout_sec - (now - preparation[2]))
         approval_lifecycle.heartbeat(run_id, controller_instance_id, assigned, deadlines, writer_active=writer is not None)
 
-    def validated_assigned_identity(action_file: Path) -> tuple[str, str]:
+    def validated_assigned_identity(action_file: Path, *, failed: bool = False) -> tuple[str, str]:
         action_path = action_file.resolve()
         state_path = action_path.with_name("state.json")
         if (
@@ -2827,7 +2844,7 @@ def _run_dispatched_tasks(
         }
         if (
             workflow_key not in ROLLING_WORKFLOW_KEYS
-            or not _prepared_action_matches_selection(
+            or not (_quarantined_action_matches_selection if failed else _prepared_action_matches_selection)(
                 action_path,
                 action,
                 state,
@@ -2840,7 +2857,7 @@ def _run_dispatched_tasks(
         return request_id, received_at
 
     def global_prepare_selection() -> dict:
-        identities: list[list[str]] = []
+        identities: list[list[str]] = [list(identity) for identity in sorted(deferred_identities)]
         for action_file in sorted(assigned):
             identity = assigned_identities.get(action_file)
             if identity is None:
@@ -3245,6 +3262,8 @@ def _run_dispatched_tasks(
                     and prepared.get("write_state") == "not_requested"
                     and prepared.get("error_code") in ITEM_LOCAL_QUARANTINE_REASONS
                 ):
+                    if prepared.get('action_file'):
+                        deferred_identities.add(validated_assigned_identity(Path(prepared['action_file']), failed=True))
                     recovery_queue = tuple(
                         path for path in recovery_queue
                         if str(path) != prepared.get("recovery_action_file")
@@ -3904,7 +3923,7 @@ def _run_global_dispatched_tasks(
         raise ValueError("approval_global_capacity_invalid")
     codex_review_worker._reviewer_environment()
     frozen_unknown = (
-        _local_unknown_quarantined_identities()
+        (_local_unknown_quarantined_identities() if recovery_action_files or target_actions or excluded_action_files else frozenset())
         if historical_unknown_identities is None
         else historical_unknown_identities
     )
@@ -3940,11 +3959,13 @@ def _run_global_dispatched_tasks(
 
 def _production_reconciliation(
     workflow_keys: frozenset[str] = ROLLING_WORKFLOW_KEYS,
+    *, current_pending: bool = True,
 ) -> dict:
     root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
     return cli._live_reconciliation(
         root,
         workflow_keys=workflow_keys,
+        current_pending=current_pending,
     )
 
 
@@ -4045,7 +4066,7 @@ def _quarantined_pending_count() -> int:
 def _local_quarantine_count() -> int:
     return reconciliation._quarantine_summary(
         PROJECT_ROOT / "runtime" / "finance_preaudit_flows",
-        _latest_local_states(),
+        _latest_local_states(current_pending=True),
         [],
     )["local_quarantined"]
 
@@ -4451,7 +4472,10 @@ def run_rolling_drain(
             return {"schema_version": 1, "kind": "approval_startup_gate", **gate,
                     **({"target_outcome": targets.outcome({}, controller_completed=False)} if targets else {})}
     scoped_reconcile_status = (
-        (lambda: _production_reconciliation(ROLLING_WORKFLOW_KEYS if targets else allowed_workflows))
+        (lambda: _production_reconciliation(
+            ROLLING_WORKFLOW_KEYS if targets else allowed_workflows,
+            current_pending=not bool(targets or excluded_action_files or recovery_action_files),
+        ))
         if reconcile_status is _production_reconciliation
         else reconcile_status
     )
@@ -4483,7 +4507,7 @@ def run_rolling_drain(
         with runtime_control.global_controller_lease(), ExitStack() as run_context:
             if targets and recovery_queue:
                 recovery_queue = targets.pending_recovery_actions(scoped_reconcile_status())
-            if authorized_recovery_once:
+            if authorized_recovery_once and exclusion_scope is not None:
                 from apps.oa_finance_preaudit.case_recovery import select_once
                 from apps.oa_finance_preaudit import production_write
                 authorized_workflows = frozenset(production_write._authorized_workflows(
@@ -4493,7 +4517,7 @@ def run_rolling_drain(
                     PROJECT_ROOT / "runtime" / "finance_preaudit_flows",
                     scoped_reconcile_status(), allowed_workflows & authorized_workflows,
                 )
-            if native_pipeline and targets is None and not recovery_action_files:
+            if native_pipeline and exclusion_scope is not None and targets is None and not recovery_action_files:
                 from apps.oa_finance_preaudit import production_write, review_interruption
                 flow_root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
                 if flow_root.exists() and any(state.get("reason") == review_interruption.REASON for state in reconciliation.latest_states(flow_root)):
@@ -4515,7 +4539,7 @@ def run_rolling_drain(
             ).isoformat()
             historical_unknown_identities = (
                 _local_unknown_quarantined_identities()
-                if pipeline_runner is _run_global_dispatched_tasks
+                if pipeline_runner is _run_global_dispatched_tasks and (recovery_queue or targets or exclusion_scope is not None)
                 else frozenset()
             )
             manifest = controller_handoff.begin(

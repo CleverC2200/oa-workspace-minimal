@@ -557,6 +557,10 @@ def _verify_submit_gate(
     if decision.get("kind") == manual_handoff.KIND and concurrency_control.sample_local_health().get("status") not in {"healthy", "pressure"}:
         raise ValueError("submission_job_invalid")
     attempt_root = paths["material_file"].parent
+    if any(path.is_dir() and _ATTEMPT.fullmatch(path.name)
+           and int(path.name.removeprefix('attempt-')) > job['attempt']
+           for path in attempt_root.parent.iterdir()):
+        raise ValueError('submission_job_invalid')
     state_path = attempt_root / "state.json"
     if state_path.is_symlink():
         raise ValueError("submission_job_invalid")

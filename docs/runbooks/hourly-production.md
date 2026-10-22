@@ -11,7 +11,7 @@
 自动化运行记忆只使用 /Users/synear/.codex/automations/oa-skill/memory.md，确认在工作树之外且可写。不要把界面显示的 $CODEX_HOME 路径按字面当作相对路径。不可写使用 automation_memory_path_invalid 停止；不回退到工作树。
 
 每次启动前及原控制器真实退出后的实时对账，均按 docs/runbooks/blocking-recovery.md 的文件输出方式执行一次。运行中采用下述原回执监视，不把启动门禁用于尚在提交的控制器。先新建私有临时目录，再在同一 exec_command 运行：
-status_dir=$(mktemp -d /tmp/oa-status.XXXXXX) &&
+status_dir=$(mktemp -d /private/tmp/oa-status.XXXXXX) &&
 .venv/bin/python -m apps.oa_finance_preaudit.cli status --check-live --reconcile --summary --output-file "$status_dir/status.json"
 完整保留原 session_id、exit_code 和输出；运行中使用原 ID 的 write_stdin 等待，不把工具等待窗口当业务超时。仅在 exit_code=0 后解析终态：stdout 保留原安全门和计数，完整 JSON 已保存到 status_file.path，并返回字节数和 SHA-256。明细的 display_truncated=true 只表示未在界面展开，不代表待办或人工核对项为零；按需校验同一文件的字节数/哈希，再分字段、小批量读取全部必要明细，不将整份文件重新打印。stdout 若仍被宿主截断，从本次已知且确认成功的文件提取门禁，不为补读重复查询 OA。原会话、文件或校验结果不可信仍停止，不用部分数据放行。所有身份、授权、continuation、锁、Writer 和交接安全判断保持原要求。
 
@@ -19,10 +19,12 @@ status_dir=$(mktemp -d /tmp/oa-status.XXXXXX) &&
 
 继续须凭据、OA 接口与专用浏览器会话正常、执行身份 verified、授权与冻结可信、所有控制器和 Writer 空闲、上一轮终态及子进程回收可信。continuation 须 status=ready、blocking_reasons={}、isolated_pending为非负整数且等于pending_quarantined、scope与计数一致。code_matches_current=false 若只表示已终态旧版本清单，且当前 Git干净同步、ready_for_start=true、children_reaped=true、restart_verified=true，其余门禁可信，可由 fresh process加载新版；不复用旧进程。不因笼统 degraded 或可信隔离数量停止其他待办。
 
+普通轮次按 OA 当前待办重新取材。`historical_continuation` 和 `historical_quarantine` 保留旧本地状态的诊断，启动使用当前 `continuation`；`deferred_pending` 是本轮暂缓核对的请求，不计为已提交。未进入 Writer 的可信旧尝试可重新采集，旧决定不复用；提交已开始、结果未知或身份/边界不可信的请求暂缓，其余可信待办继续。当前提交仍逐单验证本轮冻结、授权和目标。
+
 生产审核固定 3 槽，OpenAI 每轮只创建 3 个 App 子 Agent 并复用对话，控制器直接发布并轮询请求；DeepSeek 沿用独立 API key 的 CLI 工具承载。生产弹性和旧批次执行已退场；材料准备和全局 Writer 均为 1。每次启动产生独立 `run_id`，后续 pending、heartbeat、派单、包装和收尾命令都必须显式带同一 `--run-id`；旧轮证据只按 legacy 只读路径核验，不能回退到旧轮。门禁通过后只调用一次：
 
 ```bash
-.venv/bin/python -m scripts.finance_preaudit_run --owner-task-id <当前任务真实UUID> --review-provider openai --review-transport host_chat -- --rolling --fixed-capacity --capacity 3 --max-capacity 3 --confirm-write YES --confirm-alerts YES --recover-confirmed-no-write-once YES --workflow travel_expense --workflow business_entertainment --workflow business_support_fee --workflow small_marketing_fee --workflow tpm_small_marketing_fee --workflow general_expense
+.venv/bin/python -m scripts.finance_preaudit_run --owner-task-id <当前任务真实UUID> --review-provider openai --review-transport host_chat -- --rolling --fixed-capacity --capacity 3 --max-capacity 3 --confirm-write YES --confirm-alerts YES --workflow travel_expense --workflow business_entertainment --workflow business_support_fee --workflow small_marketing_fee --workflow tpm_small_marketing_fee --workflow general_expense
 ```
 
 上述参数选择本轮 OpenAI App 审核；其中 `--confirm-alerts YES` 只适用于本轮明确授权自动告警的调度任务。手动单轮无告警授权时省略此参数或显式传 `NO`，按[执行回执](../agents/controller-execution.md)保留本地失败及历史告警窗口。用户要求某轮改用 DeepSeek 时，同时把 `--review-provider` 改为 `deepseek`、`--review-transport` 改为 `cli`；审核型号与推理由现行供应商配置成对选择，原门禁继续有效。每轮回执记录实际配置，不改历史证据。不在原控制器未退出时发起另一个供应商的控制器。后续独立包装调用通过 `OA_REVIEW_PROVIDER` 沿用该轮选择，具体见[执行回执](../agents/controller-execution.md)。
@@ -70,7 +72,7 @@ worker 与外层监督进程每 5 秒观察本地原生错误，不产生模型 
 
 确已确认的外部对账门禁故障需要受控停止时，使用现有 `runtime_control.request_stop("production_reconciliation_blocked")`，并留存触发它的原对账回执。停止文件首次写入后不覆盖；原真正首错优先，具体原因贯通控制器 primary_error_code 和单次终态通知。普通人工、环境、损坏或未知停止保留原阻断和通用告警语义，只有可信 controller_cycle_stop 能按原回收门清理。不得因混合运行快照写停止标记。
 
-有限恢复保持原控制器在租约内按授权与可信未写入选择首个 attempt 一次；已存在后续 attempt 不自动再恢复，不使用 unknown 确认参数，未知写入不重试。指定恢复与普通新增分别核算。具体选择及失败类别见[阻断处置](blocking-recovery.md#一次跨轮恢复)，不自行挑旧路径、删隔离或重写冻结状态。
+普通轮次不再由“首 attempt 一次恢复”限制决定是否处理 OA 当前待办。同轮已领取或失败的身份保持排除，下一轮重新查询 OA，再对可信未提交项重新采集。精确指定目标、旧显式恢复及请求排除仍使用原绑定合同；`--recover-confirmed-no-write-once` 仅为旧请求排除范围保留兼容，不改变普通轮次的选择。未知写入不重试，旧证据不重写。
 
 ## 包装待审核
 

@@ -113,6 +113,222 @@ def _engine(
     )
 
 
+def _downloaded_material(request_id: str, attempt_root: Path) -> dict:
+    path = attempt_root / 'attachments' / 'evidence.bin'
+    path.write_bytes(b'current-oa-material')
+    material = _material(request_id)
+    material['resources'] = [{'request_id': request_id, 'resource_id': 'source-1',
+                             'source_resource_id': 'source-1', 'source_system': 'oa',
+                             'local_readonly_path': str(path)}]
+    material['prepared']['manifest'] = [{'resource_id': 'source-1', 'status': 'unsupported_file'}]
+    return material
+
+
+def test_current_pending_recollects_retired_unwritten_attempt(tmp_path):
+    calls = []
+    engine = _engine(tmp_path, collect_material=_downloaded_material,
+                     authorization_source=_grant, submit_frozen=lambda job: calls.append(job) or _success(job))
+    old = engine.next_action('travel_expense', mode='controlled_write')
+    old_root = Path(old['action_file']).parent
+    (old_root / 'attachments/evidence.bin').unlink()
+    preserved = {p: p.read_bytes() for p in old_root.iterdir() if p.is_file() and p.suffix != '.lock'}
+
+    fresh = engine.next_action('travel_expense', mode='controlled_write', current_pending=True)
+
+    assert fresh['action'] == 'review_required'
+    assert fresh['attempt'] == 2
+    assert (Path(fresh['action_file']).parent / 'attachments/evidence.bin').read_bytes() == b'current-oa-material'
+    assert {p: p.read_bytes() for p in preserved} == preserved
+    assert calls == []
+
+
+def test_current_pending_retries_failed_collection_next_round(tmp_path):
+    first = _engine(tmp_path, collect_material=lambda *_: (_ for _ in ()).throw(ValueError('download_failed')))
+    failed = first.next_action('travel_expense', current_pending=True)
+    original = Path(failed['state_file']).read_bytes()
+
+    fresh = _engine(tmp_path).next_action('travel_expense', current_pending=True)
+
+    assert fresh['action'] == 'review_required'
+    assert fresh['attempt'] == 2
+    assert Path(failed['state_file']).read_bytes() == original
+
+
+def test_current_pending_does_not_resume_absent_oa_item(tmp_path):
+    old = _engine(tmp_path).next_action('travel_expense')
+    original = Path(old['state_file']).read_bytes()
+
+    result = _engine(tmp_path, candidates=[]).next_action('travel_expense', current_pending=True)
+
+    assert result['action'] == 'closed'
+    assert 'action_file' not in result
+    assert Path(old['state_file']).read_bytes() == original
+
+
+def test_current_pending_skips_unknown_submission_and_processes_other_item(tmp_path):
+    rows = _candidates(('unknown-first', 'current-second'))
+    old = _engine(tmp_path, candidates=[rows[0]]).next_action('travel_expense')
+    _mark_unknown(old)
+    original = Path(old['state_file']).read_bytes()
+
+    fresh = _engine(tmp_path, candidates=rows).next_action('travel_expense', current_pending=True)
+
+    assert fresh['action'] == 'review_required'
+    assert json.loads(Path(fresh['state_file']).read_text())['request_id'] == 'current-second'
+    assert Path(old['state_file']).read_bytes() == original
+
+
+def test_current_pending_does_not_reclaim_handled_item(tmp_path):
+    rows = _candidates()
+    engine = _engine(tmp_path, candidates=rows, handled=[{'request_id': rows[0]['request_id']}])
+
+    result = engine.next_action('travel_expense', current_pending=True)
+
+    assert result['action'] == 'closed'
+    assert not list(tmp_path.rglob('state.json'))
+
+
+def test_current_pending_does_not_treat_closed_preview_as_oa_completion(tmp_path):
+    engine = _engine(tmp_path)
+    old = engine.next_action('travel_expense')
+    decision = tmp_path / 'preview-decision.json'
+    decision.write_text(json.dumps(_decision(old)))
+    assert engine.complete_review(Path(old['action_file']), decision)['write_state'] == 'not_requested'
+
+    fresh = engine.next_action('travel_expense', current_pending=True)
+
+    assert fresh['action'] == 'review_required'
+    assert fresh['attempt'] == 2
+
+
+def test_current_pending_rejects_late_decision_from_superseded_attempt(tmp_path):
+    calls = []
+    engine = _engine(tmp_path, authorization_source=_grant,
+                     submit_frozen=lambda job: calls.append(job) or _success(job))
+    old = engine.next_action('travel_expense', mode='controlled_write')
+    decision = tmp_path / 'old-decision.json'
+    decision.write_text(json.dumps(_decision(old)))
+    original = Path(old['state_file']).read_bytes()
+    fresh = engine.next_action('travel_expense', mode='controlled_write', current_pending=True)
+
+    result = engine.complete_review(Path(old['action_file']), decision)
+
+    assert fresh['attempt'] == 2
+    assert fresh['action_token'] != old['action_token']
+    assert result['reason'] == 'attempt_superseded'
+    assert Path(old['state_file']).read_bytes() == original
+    assert calls == []
+
+
+def test_current_pending_reconciliation_defers_unknown_without_blocking_other_items(tmp_path):
+    from apps.oa_finance_preaudit import reconciliation
+
+    rows = _candidates(('unknown-first', 'refresh-second'))
+    first = _engine(tmp_path, candidates=[rows[0]]).next_action('travel_expense')
+    _mark_unknown(first)
+    second = _engine(tmp_path, candidates=[rows[1]], collect_material=_downloaded_material).next_action('travel_expense', current_pending=True)
+    (Path(second['action_file']).parent / 'attachments/evidence.bin').unlink()
+
+    result = reconciliation.reconcile(tmp_path, pending_rows=rows, handled_rows=[], current_pending=True)
+
+    assert result['continuation'] == {'status': 'ready', 'scope': 'item', 'isolated_pending': 1, 'blocking_reasons': {}}
+    assert result['quarantine']['actionable_pending'] == 1
+    assert result['quarantine']['pending_quarantined'] == 1
+    assert result['historical_continuation']['status'] == 'blocked'
+    assert result['deferred_pending']['items'][0]['item_key'] == first['case_key']
+
+
+def test_current_pending_preserves_previous_submission_after_material_reclamation(tmp_path):
+    from apps.oa_finance_preaudit import reconciliation
+
+    engine = _engine(tmp_path, collect_material=_downloaded_material,
+                     authorization_source=_grant, submit_frozen=_success)
+    old = engine.next_action('travel_expense', mode='controlled_write')
+    decision = tmp_path / 'decision.json'
+    decision.write_text(json.dumps(_decision(old)))
+    assert engine.complete_review(Path(old['action_file']), decision)['write_state'] == 'submitted'
+    old_root = Path(old['action_file']).parent
+    (old_root / 'attachments/evidence.bin').unlink()
+    original = (old_root / 'state.json').read_bytes()
+    received = datetime.fromisoformat(json.loads(original)['created_at']) + timedelta(days=1)
+    rows = [{**_candidates()[0], 'received_at': received.isoformat()}]
+
+    result = reconciliation.reconcile(tmp_path, pending_rows=rows, handled_rows=[], current_pending=True,
+                                      now=received + timedelta(days=1))
+
+    assert result['counts'] == {'prior_round_submitted': 1}
+    assert result['continuation']['status'] == 'ready'
+    assert result['quarantine']['actionable_pending'] == 1
+    assert (old_root / 'state.json').read_bytes() == original
+
+
+def test_current_pending_cannot_hide_an_earlier_unknown_submission(tmp_path):
+    engine = _engine(tmp_path)
+    old = engine.next_action('travel_expense', current_pending=True)
+    fresh = engine.next_action('travel_expense', current_pending=True)
+    _mark_unknown(old)
+
+    result = engine.next_action('travel_expense', current_pending=True)
+
+    assert result['action'] == 'closed'
+    assert not Path(fresh['action_file']).parent.with_name('attempt-3').exists()
+
+
+def test_current_pending_keeps_unknown_submission_deferred_across_receive_versions(tmp_path):
+    old = _engine(tmp_path).next_action('travel_expense')
+    _mark_unknown(old)
+    original = Path(old['state_file']).read_bytes()
+    rows = [{**_candidates()[0], 'received_at': '2026-10-22T09:00:00+08:00'}]
+
+    result = _engine(tmp_path, candidates=rows).next_action('travel_expense', current_pending=True)
+
+    assert result['action'] == 'closed'
+    assert len(list(tmp_path.rglob('state.json'))) == 1
+    assert Path(old['state_file']).read_bytes() == original
+
+
+def test_retired_current_review_can_be_explicitly_deferred(tmp_path, monkeypatch):
+    from apps.oa_finance_preaudit import reconciliation
+    from scripts import finance_preaudit_concurrency_probe as probe
+
+    root = tmp_path / 'runtime/finance_preaudit_flows'
+    old = _engine(root, collect_material=_downloaded_material, authorization_source=_grant,
+                  submit_frozen=_success).next_action('travel_expense', mode='controlled_write')
+    (Path(old['action_file']).parent / 'attachments/evidence.bin').unlink()
+    original = Path(old['state_file']).read_bytes()
+    monkeypatch.setattr(probe, 'PROJECT_ROOT', tmp_path)
+    rows = _candidates()
+    report = reconciliation.reconcile(root, pending_rows=rows, handled_rows=[], current_pending=True)
+    live = {'credentials': {'status': 'ok'}, 'oa': {'execution_identity': 'verified',
+            'by_workflow': {'travel_expense': 1}, 'unsupported': 0}}
+
+    snapshot = probe._rolling_snapshot(lambda: live, lambda: report, frozenset({'travel_expense'}),
+                                       deferred_action_files=(Path(old['action_file']),))
+
+    assert snapshot == (1, 0, 0, 0)
+    assert Path(old['state_file']).read_bytes() == original
+
+
+def test_current_pending_retries_review_failure_after_material_reclamation(tmp_path):
+    calls = []
+    engine = _engine(tmp_path, collect_material=_downloaded_material, authorization_source=_grant,
+                     submit_frozen=lambda job: calls.append(job) or _success(job))
+    failed = _quarantined_review(engine, 'codex_process_failed')
+    old_root = Path(failed['action_file']).parent
+    (old_root / 'attachments/evidence.bin').unlink()
+    original = (old_root / 'state.json').read_bytes()
+
+    fresh = engine.next_action('travel_expense', mode='controlled_write', current_pending=True)
+    _quarantined_review(engine, 'codex_process_failed')
+    later = engine.next_action('travel_expense', mode='controlled_write', current_pending=True)
+
+    assert fresh['attempt'] == 2
+    assert later['attempt'] == 3
+    assert later['action'] == 'review_required'
+    assert (old_root / 'state.json').read_bytes() == original
+    assert calls == []
+
+
 def test_confirmed_material_failure_creates_fresh_attempt_only_after_live_check(
     tmp_path: Path,
 ) -> None:
@@ -1886,3 +2102,63 @@ def test_failed_recovery_preparation_keeps_a_complete_no_write_receipt(tmp_path,
             (source / "execution-receipt.json").mkdir()
         report = reconciliation.reconcile(tmp_path, pending_rows=[], handled_rows=[])
         assert report["recoveries"]["items"][0]["receipt_status"] == "missing_or_invalid"
+
+
+@pytest.mark.parametrize("same_request", [False, True])
+def test_current_pending_isolates_identity_bound_invalid_old_state(tmp_path, same_request):
+    from apps.oa_finance_preaudit import reconciliation
+
+    rows = _candidates(("old-request", "other-request"))
+    old = _engine(tmp_path, candidates=rows[:1]).next_action('travel_expense')
+    state_path = Path(old['state_file'])
+    state = json.loads(state_path.read_text())
+    state['business_state'] = 'broken-business-state'
+    state_path.write_text(json.dumps(state))
+    before = state_path.read_bytes()
+    pending = rows if same_request else rows[1:]
+
+    report = reconciliation.reconcile(tmp_path, pending_rows=pending, handled_rows=[], current_pending=True)
+    assert report['continuation']['status'] == 'ready'
+    assert report['quarantine']['actionable_pending'] == 1
+    assert report['deferred_pending']['total'] == int(same_request)
+    fresh = _engine(tmp_path, candidates=pending).next_action('travel_expense', current_pending=True)
+    assert json.loads(Path(fresh['state_file']).read_text())['request_id'] == 'other-request'
+    assert state_path.read_bytes() == before
+    with pytest.raises(ValueError, match='runtime_reconciliation_invalid'):
+        reconciliation.latest_states(tmp_path)
+
+
+def test_current_pending_keeps_unbound_corrupt_state_blocking(tmp_path):
+    from apps.oa_finance_preaudit import reconciliation
+
+    old = _engine(tmp_path).next_action('travel_expense')
+    Path(old['state_file']).write_text('{')
+    with pytest.raises(ValueError):
+        reconciliation.reconcile(tmp_path, pending_rows=_candidates(), handled_rows=[], current_pending=True)
+
+
+def test_global_prepare_skips_handled_pending_overlap_and_claims_other_item(tmp_path, monkeypatch):
+    from scripts import finance_preaudit_concurrency_probe as probe
+
+    root = tmp_path / 'runtime/finance_preaudit_flows'
+    root.mkdir(parents=True)
+    rows = _candidates(('handled-request', 'current-request'))
+    pending = [{**row, 'requestId': row['request_id'], 'flow_key': row['workflow_key'],
+                'support_status': 'supported', 'can_submit': True} for row in rows]
+    monkeypatch.setattr(probe, 'PROJECT_ROOT', tmp_path)
+    monkeypatch.setattr(probe.cli, '_live_pending_identities', lambda: pending)
+    monkeypatch.setattr(probe.cli, '_live_handled_identities', lambda: [rows[0]])
+    monkeypatch.setattr(probe.runtime_control, 'stop_requested', lambda: False)
+    monkeypatch.setattr(probe, '_include_isolated_development_items', lambda: False)
+    def engine(*, controlled, selected_identity):
+        assert controlled
+        return _engine(root, candidates=[row for row in rows
+                       if (row['request_id'], row['received_at']) == selected_identity],
+                       handled=[rows[0]], authorization_source=_grant, submit_frozen=_success)
+    monkeypatch.setattr(probe.cli, '_live_flow_engine', engine)
+
+    result = probe._prepare_one('*')
+    assert result['action'] == 'review_required', result
+    state = json.loads(Path(result['action_file']).with_name('state.json').read_text())
+    assert state['request_id'] == 'current-request'
+    assert not list(root.rglob('writer-boundary.json'))

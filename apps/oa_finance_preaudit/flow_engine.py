@@ -2796,7 +2796,7 @@ class FlowEngine:
         return action
 
     @classmethod
-    def confirmed_submission(cls, root: Path, state: dict) -> bool:
+    def confirmed_submission(cls, root: Path, state: dict, *, require_materials: bool = True) -> bool:
         """Read and verify a closed submission; never recover or persist an attempt."""
         def unavailable(*_args, **_kwargs):
             raise ValueError("read_only_port_unavailable")
@@ -2858,10 +2858,11 @@ class FlowEngine:
                     "tpm_small_marketing_fee:3",
                 }:
                     validation_state = {**state, "rule_version": rule_version}
-                validate_frozen_review_inputs(
-                    attempt_root=attempt_root, state=validation_state,
-                    workflow_key=state["workflow_key"],
-                )
+                if require_materials:
+                    validate_frozen_review_inputs(
+                        attempt_root=attempt_root, state=validation_state,
+                        workflow_key=state["workflow_key"],
+                    )
                 return True
         except (OSError, ValueError):
             return False
@@ -2885,6 +2886,122 @@ class FlowEngine:
         except (OSError, ValueError):
             return False
         return persisted == state
+
+    @classmethod
+    def refreshable_pending(cls, root: Path, state: dict) -> bool:
+        reader = cls(root=root, discover_candidates=lambda _: (), collect_material=lambda *_: {})
+        path = Path(str(state.get('action_file') or ''))
+        preview_closed = state.get('execution_state') == 'closed' and state.get('mode') == 'preview'
+        try:
+            if (not path.is_absolute() or path != path.resolve()
+                    or not reader._attempt_identity_matches(path.parent, state, require_material=False)
+                    or (state.get('execution_state') not in {'collecting', 'review_required', 'needs_admin'}
+                        and not preview_closed)
+                    or state.get('write_state') not in {'not_requested', 'authorized'}
+                    or state.get('mode') not in {'preview', 'controlled_write'}
+                    or state.get('write_authorized') is not (state.get('write_state') == 'authorized')
+                    or os.path.lexists(path.with_name('writer-boundary.json'))
+                    or (os.path.lexists(path.with_name('execution-receipt.json')) and not preview_closed)
+                    or any(os.path.lexists(path.with_name(name)) and _exclusive_lock_active(path.with_name(name))
+                           for name in ('complete.lock', 'prepare.lock'))):
+                return False
+            if preview_closed:
+                reader._completion_receipt(path.parent, state)
+            action = attempt_state.read_action(path, state=state)
+            if any(action.get(key) != state.get(key) for key in (
+                    'workflow_key', 'case_key', 'attempt', 'action', 'execution_state', 'write_state')):
+                return False
+            for previous in path.parent.parent.iterdir():
+                if previous == path.parent or _attempt_number(previous) is None:
+                    continue
+                prior = _read_object(previous / 'state.json', code='persistent_state_invalid')
+                if (not reader._attempt_identity_matches(previous, prior, require_material=False)
+                        or prior.get('write_state') in {'unknown', 'submitting', 'submitted'}
+                        or os.path.lexists(previous / 'writer-boundary.json')):
+                    return False
+                if os.path.lexists(previous / 'execution-receipt.json'):
+                    if prior.get('mode') != 'preview':
+                        return False
+                    reader._completion_receipt(previous, prior)
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def _claim_pending(self, workflow_key: str, candidate: dict, *, mode: str,
+                       latest: Path | None, discovery_seconds: int) -> Path:
+        case_key = _case_key(candidate['request_id'], candidate['received_at'])
+        attempt = (_attempt_number(latest) or 0) + 1 if latest else 1
+        root = self._root / workflow_key / 'cases' / case_key / f'attempt-{attempt}'
+        claim = _action_payload(
+            action='collecting', execution_state='collecting', business_state='not_available',
+            write_state='not_requested', workflow_key=workflow_key, mode=mode, write_authorized=False,
+            action_file=str(root / 'action.json'), state_file=str(root / 'state.json'),
+            case_key=case_key, attempt=attempt, request_id=candidate['request_id'],
+            received_at=candidate['received_at'], created_at=datetime.now(timezone.utc).isoformat(),
+            discovery_seconds=discovery_seconds,
+        )
+        root.mkdir(parents=True)
+        claim = attempt_state.create(root / 'action.json', claim)
+        attempt_state.write(root / 'state.json', claim, indent=2)
+        return root
+
+    def _next_current_pending(self, workflow_key: str, *, mode: str) -> dict:
+        from . import reconciliation
+
+        started = time.monotonic()
+        candidates = list(self._discover_candidates(workflow_key))
+        if self._discover_handled is None:
+            raise ValueError('recovery_live_state_unavailable')
+        handled = list(self._discover_handled())
+        if any(not isinstance(row, dict) for row in [*candidates, *handled]):
+            raise ValueError('flow_candidate_invalid')
+        if any(not row.get('request_id') or not row.get('received_at')
+               or row.get('workflow_key') != workflow_key for row in candidates):
+            raise ValueError('flow_candidate_invalid')
+        if any(row.get('request_id') and row.get('requestId')
+               and row['request_id'] != row['requestId'] for row in [*candidates, *handled]):
+            raise ValueError('flow_candidate_invalid')
+        if any(not (row.get('request_id') or row.get('requestId')) for row in handled):
+            raise ValueError('flow_candidate_invalid')
+        if len({row['request_id'] for row in candidates}) != len(candidates):
+            raise ValueError('flow_candidate_invalid')
+        handled_ids = {str(row.get('request_id') or row.get('requestId') or '') for row in handled}
+        excluded = reconciliation.pending_exclusions(
+            self._root, reconciliation.latest_states(self._root, current_pending=True), candidates, handled,
+        )
+        candidates.sort(key=lambda row: (row['received_at'], row['request_id']))
+        workflow_root = self._root / workflow_key
+        prepare_root = None
+        with _exclusive_lock(workflow_root / 'flow.lock'):
+            latest_by_case = {path.parent.name: path for path in self._latest_case_attempts(workflow_root)}
+            for candidate in candidates:
+                if candidate['request_id'] in handled_ids or (candidate['request_id'], candidate['received_at']) in excluded:
+                    continue
+                latest = latest_by_case.get(_case_key(candidate['request_id'], candidate['received_at']))
+                if latest is not None:
+                    state = _read_object(latest / 'state.json', code='persistent_state_invalid')
+                    if not self.refreshable_pending(self._root, state):
+                        continue
+                    try:
+                        with _exclusive_lock(latest / 'complete.lock', blocking=False), _exclusive_lock(latest / 'prepare.lock', blocking=False):
+                            current = _read_object(latest / 'state.json', code='persistent_state_invalid')
+                            if (current != state or os.path.lexists(latest / 'writer-boundary.json')
+                                    or (os.path.lexists(latest / 'execution-receipt.json')
+                                        and not (state.get('mode') == 'preview' and state.get('execution_state') == 'closed'))):
+                                continue
+                            prepare_root = self._claim_pending(workflow_key, candidate, mode=mode, latest=latest,
+                                                               discovery_seconds=max(0, int(time.monotonic() - started)))
+                    except BlockingIOError:
+                        continue
+                else:
+                    prepare_root = self._claim_pending(workflow_key, candidate, mode=mode, latest=None,
+                                                       discovery_seconds=max(0, int(time.monotonic() - started)))
+                if prepare_root is not None:
+                    break
+        if prepare_root is not None:
+            return self._prepare_attempt(prepare_root)
+        return _action_payload(action='closed', execution_state='closed', business_state='not_available',
+                               write_state='not_requested', workflow_key=workflow_key, mode=mode, write_authorized=False)
 
     @classmethod
     def inspect_target_action(cls, root: Path, action_file: Path, *, recovery: bool = False) -> dict:
@@ -3487,6 +3604,7 @@ class FlowEngine:
         mode: str = "preview",
         skip_write_authorization_failures: frozenset[Path] = frozenset(),
         skip_unknown_failures: frozenset[Path] = frozenset(),
+        current_pending: bool = False,
     ) -> dict:
         if workflow_key not in _FLOW_SPECS:
             raise ValueError("workflow_not_implemented")
@@ -3500,6 +3618,9 @@ class FlowEngine:
             or self._submit_frozen is None
         ):
             raise ValueError("run_mode_unauthorized")
+
+        if current_pending:
+            return self._next_current_pending(workflow_key, mode=mode)
 
         workflow_root = self._root / workflow_key
         skipped_write_authorization_failures = (
@@ -3824,32 +3945,9 @@ class FlowEngine:
                     selected["request_id"],
                     selected["received_at"],
                 )
-                case_root = workflow_root / "cases" / case_key
                 latest = latest_by_case.get(case_key)
-                attempt = (_attempt_number(latest) or 0) + 1 if latest else 1
-                prepare_root = case_root / f"attempt-{attempt}"
-                action_file = prepare_root / "action.json"
-                state_file = prepare_root / "state.json"
-                claim = _action_payload(
-                    action="collecting",
-                    execution_state="collecting",
-                    business_state="not_available",
-                    write_state="not_requested",
-                    workflow_key=workflow_key,
-                    mode=mode,
-                    write_authorized=False,
-                    action_file=str(action_file),
-                    state_file=str(state_file),
-                    case_key=case_key,
-                    attempt=attempt,
-                    request_id=selected["request_id"],
-                    received_at=selected["received_at"],
-                    created_at=datetime.now(timezone.utc).isoformat(),
-                    discovery_seconds=discovery_seconds,
-                )
-                prepare_root.mkdir(parents=True, exist_ok=True)
-                claim = attempt_state.create(action_file, claim)
-                attempt_state.write(state_file, claim, indent=2)
+                prepare_root = self._claim_pending(workflow_key, selected, mode=mode, latest=latest,
+                                                   discovery_seconds=discovery_seconds)
 
         if prepare_root is None:
             raise ValueError("persistent_state_invalid")
@@ -4356,6 +4454,10 @@ class FlowEngine:
         recovered_submission_result: dict | None = None,
         allow_manual_handoff: bool = False,
     ) -> dict:
+        if any((_attempt_number(path) or 0) > (_attempt_number(action_path.parent) or 0)
+               for path in action_path.parent.parent.iterdir()
+               if path.is_dir() and not path.is_symlink()):
+            return _needs_admin(_attempt_workflow_key(action_path.parent, self._root), 'attempt_superseded')
         review_started = time.monotonic()
         try:
             persisted_action = _read_object(
