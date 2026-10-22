@@ -278,7 +278,7 @@ def test_old_interrupts_cannot_be_reused_for_a_new_shutdown(exchange):
     'running_command', 'running_wait', 'wrong_exit', 'dynamic_command', 'duplicate_command_key',
     'extra_wait', 'trailing_command', 'too_many_commands', 'interleaved_statement'])
 @pytest.mark.parametrize('command_count', [1, 2])
-def test_cli_shutdown_binds_wait_after_literal_command(exchange, damage, command_count, prior_poll=False):
+def test_cli_shutdown_binds_wait_after_literal_command(exchange, damage, command_count, prior_poll=False, summary=False):
     _, _, owner, child, _, manifest, _ = exchange
     shutdown.begin(owner=owner, reason='reviewer_failed')
     controller_handoff.finish(manifest, status='failed', children_reaped=True, health='degraded')
@@ -288,6 +288,11 @@ def test_cli_shutdown_binds_wait_after_literal_command(exchange, damage, command
     host.guard.write(path, receipt)
     args = proofs(owner, child, exit_code=1)
     command = 'text(await tools.exec_command({cmd:"heartbeat {}",workdir:"/offline",max_output_tokens:2200}));\n'
+    if summary:
+        command = ('const r=await tools.exec_command({cmd:"heartbeat {}",workdir:"/offline",max_output_tokens:2200});'
+            'if(r.exit_code===0){const d=JSON.parse(r.output);text({exit_code:r.exit_code,state:d.state,'
+            'heartbeat_at:d.heartbeat_at,transient_retries:d.transient_retries,requests:d.requests?.map(q=>('
+            '{request_file:q.request_file,slot:q.assignment?.slot,state:q.assignment?.state}))});}else text(r);\n')
     wait = 'text(await tools.write_stdin({session_id:"original-session",chars:"",yield_time_ms:1000}));'
     results = [{'exit_code': 0, 'output': 'heartbeat returned'}, {'exit_code': 1, 'output': 'original driver exited'}]
     if damage is None and not prior_poll:
@@ -302,6 +307,13 @@ def test_cli_shutdown_binds_wait_after_literal_command(exchange, damage, command
     elif damage == 'duplicate_command_key': command = command.replace('cmd:"heartbeat {}"', 'cmd:"heartbeat {}",cmd:"other"')
     elif damage == 'extra_wait': wait += wait
     elif damage == 'trailing_command': wait += command
+    elif damage == 'summary_mutation': command = command.replace('text({', 'r.exit_code=0;text({')
+    elif damage == 'summary_call': command = command.replace('state:d.state', 'state:change(d.state)')
+    elif damage == 'summary_map_call': command = command.replace('request_file:q.request_file', 'request_file:change(q)')
+    elif damage == 'summary_other_result': command = command.replace('else text(r)', 'else text(other)')
+    elif damage == 'summary_condition': command = command.replace('r.exit_code===0', 'r.exit_code=0')
+    elif damage == 'summary_side_effect': command += 'change();'
+    elif damage == 'summary_redacted_result': results[0] = {'exit_code': 0, 'state': 'open'}
     if damage == 'interleaved_statement': command += 'text(1);\n'
     if damage == 'too_many_commands': command_count = 3
     results[:0] = [{'exit_code': 0, 'output': 'another query returned'}] * (command_count - 1)
@@ -346,6 +358,14 @@ def test_cli_shutdown_binds_wait_after_literal_command(exchange, damage, command
         with pytest.raises(ValueError): host.main(cli)
         assert json.loads(host.registry_file(owner).read_text())['shutdown']['status'] == 'pending'
     assert args['source'].read_bytes() == original
+
+
+@pytest.mark.parametrize('damage', [None, 'wrong_session', 'missing_result', 'extra_result',
+    'running_command', 'running_wait', 'wrong_exit', 'extra_wait', 'trailing_command',
+    'summary_mutation', 'summary_call', 'summary_map_call', 'summary_other_result', 'summary_condition',
+    'summary_side_effect', 'summary_redacted_result'])
+def test_cli_shutdown_binds_wait_after_command_summary(exchange, damage):
+    test_cli_shutdown_binds_wait_after_literal_command(exchange, damage, 1, summary=True)
 
 
 @pytest.mark.parametrize('damage', [None, 'poll_same_session', 'poll_input', 'poll_dynamic',

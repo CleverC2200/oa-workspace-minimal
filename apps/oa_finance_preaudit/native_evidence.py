@@ -343,8 +343,19 @@ def image_observations(source: Path, session: str, *, before: int, not_before: f
     return observed
 
 
+_COMMAND_SUMMARY = re.compile(
+    r'^\s*const\s+(?P<variable>[A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*'
+    r'(?P<call>await\s+tools\s*\.\s*exec_command\s*\(\s*\{(?:[^{}"]|"(?:[^"\\]|\\.)*")*\}\s*\))\s*;\s*'
+    r'if\((?P=variable)\.exit_code===0\)\{const (?P<data>[A-Za-z_$][A-Za-z0-9_$]*)=JSON\.parse\((?P=variable)\.output\);'
+    r'text\(\{exit_code:(?P=variable)\.exit_code,state:(?P=data)\.state,heartbeat_at:(?P=data)\.heartbeat_at,'
+    r'transient_retries:(?P=data)\.transient_retries,requests:(?P=data)\.requests\?\.map\(q=>\('
+    r'\{request_file:q\.request_file,slot:q\.assignment\?\.slot,state:q\.assignment\?\.state\}\)\)\}\);'
+    r'\}else text\((?P=variable)\);\s*', re.DOTALL)
+
+
 def execution_calls(code: str) -> list[tuple[str, dict]]:
     code = normalize_output(code)
+    code = _COMMAND_SUMMARY.sub(lambda match: 'text(' + match['call'] + ');', code, count=1)
     call = r'text\s*\(\s*await\s+tools\s*\.\s*(exec_command|write_stdin)\s*\(\s*(\{(?:[^{}"]|"(?:[^"\\]|\\.)*")*\})\s*\)\s*\)\s*;?\s*'
     if re.fullmatch(r'\s*(?:' + call + r')+', code or '', re.DOTALL) is None:
         raise ValueError('host_review_source_untrusted')
