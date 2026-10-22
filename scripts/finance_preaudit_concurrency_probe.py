@@ -1168,7 +1168,7 @@ def _prepare_one(selection: PrepareSelection) -> dict:
         return failed("selection_contract")
     if runtime_control.stop_requested():
         return {"action": "failed", "error_code": "production_probe_stopped"}
-    current_pending = not recovery_action_files and selected_targets is None and exclusion_scope is None
+    current_pending = not recovery_action_files and selected_targets is None
     prepare_trace.stage("quarantine_probe")
     try:
         historical_authorization_failures = (
@@ -4474,7 +4474,7 @@ def run_rolling_drain(
     scoped_reconcile_status = (
         (lambda: _production_reconciliation(
             ROLLING_WORKFLOW_KEYS if targets else allowed_workflows,
-            current_pending=not bool(targets or excluded_action_files or recovery_action_files),
+            current_pending=not bool(targets or recovery_action_files or authorized_recovery_once),
         ))
         if reconcile_status is _production_reconciliation
         else reconcile_status
@@ -4517,13 +4517,6 @@ def run_rolling_drain(
                     PROJECT_ROOT / "runtime" / "finance_preaudit_flows",
                     scoped_reconcile_status(), allowed_workflows & authorized_workflows,
                 )
-            if native_pipeline and exclusion_scope is not None and targets is None and not recovery_action_files:
-                from apps.oa_finance_preaudit import production_write, review_interruption
-                flow_root = PROJECT_ROOT / "runtime" / "finance_preaudit_flows"
-                if flow_root.exists() and any(state.get("reason") == review_interruption.REASON for state in reconciliation.latest_states(flow_root)):
-                    authorized_workflows = frozenset(production_write._authorized_workflows(production_write._policy_path()))
-                    fresh_queue = review_interruption.select(flow_root, scoped_reconcile_status(), allowed_workflows & authorized_workflows)
-                    recovery_queue = tuple(dict.fromkeys((*recovery_queue, *fresh_queue)))
             if exclusion_scope is not None:
                 exclusion_scope.verify()
                 recovery_queue = _filter_excluded_recoveries(exclusion_scope, recovery_queue)
@@ -4539,7 +4532,7 @@ def run_rolling_drain(
             ).isoformat()
             historical_unknown_identities = (
                 _local_unknown_quarantined_identities()
-                if pipeline_runner is _run_global_dispatched_tasks and (recovery_queue or targets or exclusion_scope is not None)
+                if pipeline_runner is _run_global_dispatched_tasks and (recovery_queue or targets)
                 else frozenset()
             )
             manifest = controller_handoff.begin(

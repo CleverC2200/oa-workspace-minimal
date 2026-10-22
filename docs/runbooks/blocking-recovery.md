@@ -199,6 +199,8 @@ python -m apps.oa_finance_preaudit.shutdown_stop_recovery \
 
 ## 本轮排除问题请求
 
+普通轮次带精确排除时仍按当前 OA 待办对账和重新取材，不触发历史中断恢复；历史诊断继续保留在原对账中。显式指定历史恢复或目标续审时，继续执行对应的历史证据合同。
+
 用户明确要求暂缓已知历史材料问题、继续其余待办时，可在滚动控制器追加 `--exclude-action-file /absolute/old/attempt/action.json --exclusion-issue ISSUE_NUMBER`。参数只对本次调用及其准备子进程生效，不进入默认调度。每项接受主文件、原 action/state 身份与成功回执仍可信的历史 closed/submitted 动作；也接受最新、身份可信的 collecting/not_requested claim，且不得有决定、Writer 边界、意见、提交信封或执行回执。已有恢复回执仅绑定原字节，不认定恢复资格通过。排除不读取已回收附件，也不将历史完整性验证改成成功。
 
 原完整对账及 continuation 保留。执行范围投影只移除精确选中历史已提交请求的身份冲突、选中 collecting claim 的待办 finding 与相应待办数量，按流程及请求身份排除全部接收版本；后续刷新与恢复队列也排除同一请求。其余冲突、unknown/submitting、认证、冻结、授权、活动 Writer 及回收未知仍阻断。重复路径、相对路径、符号链接、缺失成功回执及原证据变动拒绝。不得用此入口恢复或重提被排除请求。

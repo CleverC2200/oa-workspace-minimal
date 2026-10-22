@@ -8,8 +8,8 @@ import pytest
 from apps.oa_approval import runtime_control
 from apps.oa_finance_preaudit import approval_lifecycle, controller_handoff, reconciliation, request_exclusions
 from scripts import finance_preaudit_concurrency_probe as probe
-from tests.finance_preaudit.test_flow_engine_replay import _engine, _grant, _success
-from tests.finance_preaudit.test_request_exclusions import _closed_submission
+from tests.finance_preaudit.test_flow_engine_replay import _candidates, _downloaded_material, _engine, _grant, _success
+from tests.finance_preaudit.test_request_exclusions import _closed_submission, _collecting_claim
 
 
 @pytest.fixture
@@ -182,3 +182,70 @@ def test_cli_routes_repeated_explicit_exclusions_without_changing_defaults(monke
     assert probe.main(['--rolling', '--confirm-write', 'YES']) == 0
     assert 'excluded_action_files' not in calls[-1] and 'exclusion_issue' not in calls[-1]
     capsys.readouterr()
+
+
+@pytest.mark.parametrize('stage', ['admission', 'preparation', 'recovery'])
+def test_excluded_collecting_claim_keeps_current_pending_admission(tmp_path, monkeypatch, stage):
+    excluded, rows, _ = _collecting_claim(tmp_path)
+    root = tmp_path / 'runtime/finance_preaudit_flows'
+
+    other = _candidates(('another-request',))
+    engine = _engine(root, candidates=other, collect_material=_downloaded_material,
+                     authorization_source=_grant, submit_frozen=_success)
+    action = engine.next_action('travel_expense', mode='controlled_write', current_pending=True)
+    assert action['action'] == 'review_required'
+    Path(action['action_file']).parent.joinpath('attachments/evidence.bin').unlink()
+    original = {path: path.read_bytes() for path in root.rglob('*.json')}
+    live_rows = [*rows, *other]
+    monkeypatch.setattr(probe, 'PROJECT_ROOT', tmp_path)
+    monkeypatch.setattr(runtime_control, 'PROJECT_ROOT', tmp_path)
+    if stage == 'preparation':
+        monkeypatch.setattr(probe.cli, '_live_pending_identities', lambda: pending(live_rows))
+        monkeypatch.setattr(probe.cli, '_live_handled_identities', lambda: [])
+        monkeypatch.setattr(probe.cli, '_live_flow_engine', lambda **_: engine)
+        monkeypatch.setattr(probe, '_historical_write_authorization_failures', frozenset)
+        result = probe._prepare_one(selection(tmp_path, excluded))
+        assert result['action'] == 'review_required', result
+        assert Path(result['action_file']).parent.name == 'attempt-2'
+        assert all(path.read_bytes() == raw for path, raw in original.items())
+        return
+    modes = []
+
+    def reconcile(workflows=None, *, current_pending=True):
+        modes.append(current_pending)
+        return reconciliation.reconcile(root, pending_rows=live_rows, handled_rows=[],
+                                        current_pending=current_pending)
+
+    def live():
+        return {'credentials': {'status': 'ok'}, 'oa': {'execution_identity': 'verified',
+                'by_workflow': {'travel_expense': len(live_rows)}}}
+
+    calls = []
+
+    def pipeline(count, capacity, **_kwargs):
+        calls.append((count, capacity))
+        live_rows[:] = rows
+        return probe.PoolResult(requested=count, started=count, completed=count, failed=0,
+            timed_out=0, stopped=0, peak_active=1, elapsed_seconds=1,
+            outcomes=(probe.TaskOutcome(0, 'completed', {'status': 'completed',
+                                                       'token_usage': {'status': 'unknown'}}),))
+
+    monkeypatch.setattr(probe, '_production_reconciliation', reconcile)
+    if stage == 'recovery':
+        from apps.oa_finance_preaudit import production_write
+        monkeypatch.setattr(probe, '_run_global_dispatched_tasks', pipeline)
+        monkeypatch.setattr(approval_lifecycle, 'startup', lambda *_args, **_kwargs: {'status': 'ready'})
+        monkeypatch.setattr(production_write, '_authorized_workflows', lambda *_: probe.ROLLING_WORKFLOW_KEYS)
+        with pytest.raises(ValueError, match='production_rolling_reconciliation_invalid'):
+            probe.run_rolling_drain(capacity=3, live_status=live, reconcile_status=reconcile,
+                pipeline_runner=pipeline, excluded_action_files=[excluded], exclusion_issue=731,
+                authorized_recovery_once=True)
+        assert modes and not any(modes) and calls == []
+        assert all(path.read_bytes() == raw for path, raw in original.items())
+        return
+    result = probe.run_rolling_drain(capacity=3, live_status=live, reconcile_status=reconcile,
+        pipeline_runner=pipeline, excluded_action_files=[excluded], exclusion_issue=731)
+    assert result['status'] == 'completed' and calls == [(1, 3)]
+    assert modes and all(modes)
+    assert result['execution_exclusions']['raw_continuation']['status'] == 'ready'
+    assert all(path.read_bytes() == raw for path, raw in original.items())
