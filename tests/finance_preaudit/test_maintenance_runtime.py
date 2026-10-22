@@ -31,11 +31,12 @@ def compiled_maintenance_source(tmp_path_factory):
     return target
 
 
-def legacy_material_scanner(root):
+def legacy_material_scanner(root, *, public_scope=False):
     installed = root / 'apps/oa_approval/material_store.py'
     source = installed.read_text()
-    source = source.replace('with self._locked(readonly=True, refresh=False) as state:',
-                            'with self._locked(readonly=True) as state:')
+    if not public_scope:
+        source = source.replace('with self._locked(readonly=True, refresh=False) as state:',
+                                'with self._locked(readonly=True) as state:')
     target = '        allowed_roots = [Path(path) for path in state.get(\'project_checkouts\', [])]'
     assert target in source
     source = source.replace(target,
@@ -48,6 +49,23 @@ def legacy_material_scanner(root):
         '        counter = self.checkout_root / "material-recovery-count"\n'
         '        count = int(counter.read_text()) if counter.exists() else 0\n'
         '        counter.write_text(str(count + 1))\n', 1)
+    if not public_scope:
+        source = source.replace('def availability_read(self):', 'def _legacy_availability_read(self):')
+        flow = root / 'apps/oa_finance_preaudit/flow_engine.py'
+        import ast
+
+        class LegacyReads(ast.NodeTransformer):
+            def visit_FunctionDef(self, node):
+                node.decorator_list = [item for item in node.decorator_list
+                    if ast.unparse(item) != 'material_store.availability_read()']
+                return self.generic_visit(node)
+
+            def visit_With(self, node):
+                if any(ast.unparse(item.context_expr) == 'material_store.availability_read()' for item in node.items):
+                    return [self.visit(item) for item in node.body]
+                return self.generic_visit(node)
+
+        flow.write_text(ast.unparse(LegacyReads().visit(ast.parse(flow.read_text()))))
     installed.write_text(source)
 
 
@@ -507,14 +525,15 @@ def test_read_live_status_requires_terminal_success_and_exact_receipt(tmp_path, 
             maintenance_runtime.read_live_status(tmp_path)
 
 
-def test_live_reader_batches_legacy_material_checks_in_target_process(
-    compiled_maintenance_source, tmp_path, monkeypatch,
+@pytest.mark.parametrize('public_scope', [False, True])
+def test_live_reader_batches_installed_material_checks_in_target_process(
+    compiled_maintenance_source, tmp_path, monkeypatch, public_scope,
 ):
     import fcntl
     import sys
 
     shutil.copytree(compiled_maintenance_source / 'apps', tmp_path / 'apps')
-    legacy_material_scanner(tmp_path)
+    legacy_material_scanner(tmp_path, public_scope=public_scope)
     target = tmp_path / 'material.pdf'
     target.write_bytes(b'original')
     from apps.oa_approval.material_store import MaterialStore
@@ -522,20 +541,24 @@ def test_live_reader_batches_legacy_material_checks_in_target_process(
     store.adopt(target)
     inventory = (store.root / 'inventory.json').read_bytes()
     (tmp_path / 'apps/oa_finance_preaudit/cli.py').write_text(
-        'import fcntl,hashlib,json,sys\nfrom pathlib import Path\n'
+        'import fcntl,hashlib,json,sys\nfrom pathlib import Path\nfrom contextlib import nullcontext\n'
         'from apps.oa_approval.material_store import MaterialStore\n'
         'def main():\n'
         ' store = MaterialStore()\n'
-        ' for _ in range(5): store.require_available(Path.cwd()/"material.pdf")\n'
-        ' with (store.root/"inventory.lock").open("r+") as lock:\n'
-        '  try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB); locked=False\n'
-        '  except BlockingIOError: locked=True\n'
-        ' try:\n'
-        '  with store._locked(): raise AssertionError("write admitted")\n'
-        ' except RuntimeError as error: refused=str(error)=="maintenance_material_write_forbidden"\n'
-        ' raw=json.dumps({"refresh_count":int(Path("material-scan-count").read_text()),'
+        ' with (store.root/"inventory.lock").open("r+") as outer:\n'
+        '  try: fcntl.flock(outer,fcntl.LOCK_EX|fcntl.LOCK_NB); outer_locked=False\n'
+        '  except BlockingIOError: outer_locked=True\n'
+        ' with store.availability_read() if hasattr(store,"availability_read") else nullcontext():\n'
+        '  for _ in range(5): store.require_available(Path.cwd()/"material.pdf")\n'
+        '  with (store.root/"inventory.lock").open("r+") as lock:\n'
+        '   try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB); locked=False\n'
+        '   except BlockingIOError: locked=True\n'
+        '  try:\n'
+        '   store.write_bytes(Path.cwd()/"material.pdf", b"changed")\n'
+        '  except RuntimeError as error: refused=str(error) in {"maintenance_material_write_forbidden","material_read_write_forbidden"}\n'
+        ' raw=json.dumps({"refresh_count":int(Path("material-scan-count").read_text()) if Path("material-scan-count").exists() else 0,'
         '"recovery_count":int(Path("material-recovery-count").read_text()),'
-        '"ledger_lock_held":locked,"write_refused":refused}).encode()\n'
+        '"outer_lock_held":outer_locked,"ledger_lock_held":locked,"write_refused":refused,"lock_implementation":MaterialStore._locked.__name__}).encode()\n'
         ' target=Path(sys.argv[sys.argv.index("--output-file")+1])\n'
         ' target.write_bytes(raw); target.chmod(0o600)\n'
         ' print(json.dumps({"status_file":{"path":str(target),"bytes":len(raw),'
@@ -550,8 +573,10 @@ def test_live_reader_batches_legacy_material_checks_in_target_process(
 
     payload = maintenance_runtime.read_live_status(tmp_path)
 
-    assert payload['refresh_count'] == 1
+    assert payload['refresh_count'] == (0 if public_scope else 1)
+    assert payload['lock_implementation'] == ('_locked' if public_scope else 'locked_material_read')
     assert payload['recovery_count'] == 1
+    assert payload['outer_lock_held'] is (not public_scope)
     assert payload['ledger_lock_held'] is True
     assert payload['write_refused'] is True
     assert target.read_bytes() == b'original'
@@ -705,3 +730,32 @@ def test_live_safety_rejects_incomplete_sections_with_stable_code(section):
     snapshot[section] = None
     with pytest.raises(RuntimeError, match='maintenance_live_evidence_invalid'):
         maintenance_runtime.assert_live_safe(snapshot)
+
+
+@pytest.mark.parametrize('broken_capability', ['raises', 'not_callable'])
+def test_target_public_material_read_failure_does_not_fall_back_to_legacy(
+    compiled_maintenance_source, tmp_path, broken_capability,
+):
+    import os
+    import subprocess
+    import sys
+
+    shutil.copytree(compiled_maintenance_source / 'apps', tmp_path / 'apps')
+    installed = tmp_path / 'apps/oa_approval/material_store.py'
+    source = installed.read_text()
+    if broken_capability == 'raises':
+        source = source.replace('    def availability_read(self):\n',
+            '    def availability_read(self):\n        raise RuntimeError("installed_public_read_failed")\n', 1)
+        expected = 'installed_public_read_failed'
+    else:
+        source += '\nMaterialStore.availability_read = 1\n'
+        expected = 'maintenance_material_read_unsupported'
+    installed.write_text(source)
+    result = subprocess.run([sys.executable, '-B', '-E', '-c',
+        maintenance_runtime._material_read_program('raise AssertionError("validation continued")')],
+        cwd=tmp_path, env={**os.environ, 'OA_PROJECT_SPACE_ROOT': str(tmp_path / 'inventory')},
+        capture_output=True, text=True, timeout=10)
+    assert result.returncode != 0
+    assert expected in result.stderr
+    assert 'validation continued' not in result.stderr
+    assert not (tmp_path / 'inventory').exists()

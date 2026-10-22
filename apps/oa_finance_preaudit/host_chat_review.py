@@ -9,14 +9,13 @@ import json
 import os
 import re
 import shlex
-import subprocess
 import sys
 from pathlib import Path
 import time
 from uuid import UUID, uuid4
 
 from apps.oa_approval import runtime_control
-from . import attempt_state
+from . import attempt_state, native_evidence
 from . import approval_guard as guard, approval_lifecycle, production_config, review_context
 
 TRANSPORT_ENV = 'OA_REVIEW_TRANSPORT'
@@ -74,150 +73,6 @@ def _write_new(path: Path, value: dict) -> None:
             os.unlink(temporary, dir_fd=parent)
 
 
-
-def _native_lines(stream):
-    """Keep native line numbers while draining oversized, unreferenced records.
-
-    None is never usable as identity, a call anchor, or a paired result. Read in
-    fixed chunks so observing many images cannot allocate their combined body.
-    """
-    number = 0
-    while chunk := stream.readline(64 * 1024):
-        chunks, size = [chunk], len(chunk)
-        while not chunk.endswith(b'\n'):
-            chunk = stream.readline(64 * 1024)
-            if not chunk:
-                break
-            size += len(chunk)
-            if size <= 32 * 1024 * 1024:
-                chunks.append(chunk)
-            else:
-                chunks.clear()
-        number += 1
-        yield number, b''.join(chunks) if size <= 32 * 1024 * 1024 else None
-
-
-def _native_path(source: Path) -> Path:
-    source = source.absolute()
-    home = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex').absolute()
-    if (not source.is_relative_to(home / 'sessions') or '..' in source.parts
-            or any(path.is_symlink() for path in (source, *source.parents))):
-        raise ValueError('host_review_source_untrusted')
-    if not os.path.lexists(source):
-        source = home / 'archived_sessions' / source.name
-        if not os.path.lexists(source):
-            source = source.with_name(source.name + '.zst')
-        if any(path.is_symlink() for path in (source, *source.parents)):
-            raise ValueError('host_review_source_untrusted')
-    import stat
-    metadata = source.stat()
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
-        raise ValueError('host_review_source_untrusted')
-    return source
-
-
-@contextmanager
-def _native_stream(source: Path):
-    path = _native_path(source)
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(descriptor, 'rb') as stream:
-        import stat
-        metadata = os.fstat(stream.fileno())
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
-            raise ValueError('host_review_source_untrusted')
-        if not path.name.endswith('.jsonl.zst'):
-            yield stream
-            return
-        try:
-            process = subprocess.Popen(['zstd', '-dc'], stdin=stream, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL)
-        except OSError as error:
-            raise ValueError('host_review_source_untrusted') from error
-        try:
-            yield process.stdout
-            while process.stdout.read(64 * 1024):
-                pass
-            if process.wait(timeout=5) != 0:
-                raise ValueError('host_review_source_untrusted')
-        except subprocess.TimeoutExpired as error:
-            raise ValueError('host_review_source_untrusted') from error
-        finally:
-            process.stdout.close()
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5)
-
-
-def _native_source(source: Path, session: str, line: int = 1, *, output: bool = False) -> tuple[dict, dict]:
-    """Read native session ancestry and one immutable tool-call anchor."""
-    source = source.absolute()
-    if type(line) is not int or line < 1:
-        raise ValueError('host_review_source_untrusted')
-    header = anchor = result = None
-    with _native_stream(source) as stream:
-        for number, raw in _native_lines(stream):
-            if raw is None:
-                if number in {1, line} or anchor is not None:
-                    raise ValueError('host_review_source_untrusted')
-                continue
-            value = json.loads(raw)
-            if number == 1:
-                header = value
-                if header.get('type') != 'session_meta' or header.get('payload', {}).get('id') != session:
-                    raise ValueError('host_review_source_untrusted')
-            if number == line:
-                anchor = value
-                proof = {'session_file': str(source), 'line': line,
-                         'line_sha256': hashlib.sha256(raw).hexdigest()}
-                if not output:
-                    break
-            if output and anchor is not None and number > line:
-                payload = value.get('payload', {})
-                if (value.get('type') == 'response_item' and payload.get('type') in {'function_call_output', 'custom_tool_call_output'}
-                        and payload.get('call_id') == anchor.get('payload', {}).get('call_id')):
-                    result = payload.get('output')
-                    proof.update(output_line=number, output_sha256=hashlib.sha256(raw).hexdigest())
-                    break
-    if header is None or anchor is None or (output and result is None):
-        raise ValueError('host_review_source_untrusted')
-    proof['session_id'] = session
-    if output:
-        try:
-            # Native followup_task acknowledges successful dispatch with a paired
-            # empty output. Spawn and decision sources still require their payload.
-            if result == '' and anchor.get('payload', {}).get('name') in {
-                    'followup_task', 'collaboration.followup_task', 'functions.collaboration.followup_task'}:
-                result = {}
-            else:
-                result = json.loads(result) if isinstance(result, str) else result
-        except (TypeError, ValueError) as error:
-            raise ValueError('host_review_source_untrusted') from error
-        if not isinstance(result, (dict, list)):
-            raise ValueError('host_review_source_untrusted')
-        proof['output'] = result
-    return {'header': header['payload'], 'anchor': anchor}, proof
-
-
-def _tool(anchor: dict, name: str) -> dict:
-    payload = anchor.get('payload', {})
-    if (anchor.get('type') != 'response_item' or payload.get('type') not in {'function_call', 'custom_tool_call'}
-            or payload.get('name') not in {name, 'collaboration.' + name, 'functions.collaboration.' + name}
-            or not payload.get('call_id')):
-        raise ValueError('host_review_source_untrusted')
-    arguments = payload.get('arguments', payload.get('input'))
-    try:
-        value = json.loads(arguments) if isinstance(arguments, str) else arguments
-    except (ValueError, TypeError) as error:
-        raise ValueError('host_review_source_untrusted') from error
-    if not isinstance(value, dict):
-        raise ValueError('host_review_source_untrusted')
-    return value
-
-
 def registry_file(owner: str, run_id: str | None = None, *, legacy: bool = False) -> Path:
     UUID(owner)
     from . import controller_handoff
@@ -250,7 +105,6 @@ def _round_lease(owner: str, run_id: str | None = None):
             os.close(fd)
 
 
-
 @contextmanager
 def _registration_lease(owner: str):
     from . import controller_handoff
@@ -271,7 +125,7 @@ def _check_round_activity(run_id: str | None = None) -> None:
         raise ValueError('host_review_previous_round_incomplete')
 
 
-def assert_previous_rounds_closed(*, owner: str) -> None:
+def assert_current_activity_idle(*, owner: str) -> None:
     UUID(owner)
     with _registration_lease(owner):
         _check_round_activity()
@@ -283,15 +137,12 @@ def _reviewers(reviewers: list[dict], owner: str, source: Path) -> list[dict]:
     registered = []
     for slot, entry in enumerate(reviewers):
         child = Path(entry['session_file']).absolute()
-        # Read the header through the same native-source checks below.
-        with _native_stream(child) as stream:
-            header = json.loads(stream.readline(1024 * 1024)).get('payload', {})
-        reviewer = header.get('id')
+        child_native, child_proof = native_evidence.read(child, None)
+        reviewer = child_native['header'].get('id')
         UUID(reviewer)
-        child_native, child_proof = _native_source(child, reviewer)
         ancestry = child_native['header'].get('source', {}).get('subagent', {}).get('thread_spawn', {})
-        parent_native, spawn_proof = _native_source(source, owner, entry['spawn_line'], output=True)
-        arguments = _tool(parent_native['anchor'], 'spawn_agent')
+        parent_native, spawn_proof = native_evidence.read(source, owner, entry['spawn_line'], output=True)
+        arguments = native_evidence.tool(parent_native['anchor'], 'spawn_agent')
         agent_path = spawn_proof['output'].get('task_name')
         parent_source = parent_native['header'].get('source')
         parent_depth, parent_path = 0, None
@@ -443,7 +294,7 @@ def _registry(owner: str, *, live: bool = True, run_id: str | None = None, legac
         if (not isinstance(heartbeat_proof, dict)
                 or heartbeat_proof.get('session_file') != value['reviewers'][0]['spawn_source']['session_file']):
             raise ValueError('host_review_heartbeat_untrusted')
-        native, actual = _native_source(Path(heartbeat_proof['session_file']), owner, heartbeat_proof['line'])
+        native, actual = native_evidence.read(Path(heartbeat_proof['session_file']), owner, heartbeat_proof['line'])
         payload = native['anchor'].get('payload', {})
         text = str(payload.get('arguments', payload.get('input', '')))
         timestamp = native['anchor'].get('timestamp')
@@ -472,7 +323,6 @@ def _registry(owner: str, *, live: bool = True, run_id: str | None = None, legac
                 or not all(guard.process_identity(item['pid']) == item for item in value['execution_owners'])):
             raise ValueError('host_review_parent_lost_or_closed')
     return value
-
 
 
 def registered_reviewers(*, owner: str, run_id: str | None = None) -> list[dict]:
@@ -525,7 +375,7 @@ def heartbeat(*, owner: str, source: Path, source_line: int, run_id: str | None 
         from datetime import datetime
         if str(source.absolute()) != value['reviewers'][0]['spawn_source']['session_file']:
             raise ValueError('host_review_source_untrusted')
-        native, proof = _native_source(source, owner, source_line)
+        native, proof = native_evidence.read(source, owner, source_line)
         payload = native['anchor'].get('payload', {})
         text = str(payload.get('arguments', payload.get('input', '')))
         timestamp = native['anchor'].get('timestamp')
@@ -555,13 +405,6 @@ def heartbeat(*, owner: str, source: Path, source_line: int, run_id: str | None 
             'next_invocation': {'cmd': command, 'workdir': str(runtime_control.PROJECT_ROOT.absolute())}}
 
 
-
-def _native_agent_status(value) -> str:
-    if isinstance(value, str) and value in {'idle', 'completed', 'running', 'interrupted'}:
-        return value
-    if isinstance(value, dict) and set(value) == {'completed'} and (value['completed'] is None or isinstance(value['completed'], str)):
-        return 'completed'
-    raise ValueError('host_review_children_status_untrusted')
 
 
 def _package_completion(request: dict, assigned: dict) -> None:
@@ -646,8 +489,8 @@ def close(*, owner: str, reason: str = 'completed', source: Path | None = None, 
                     _package_completion(request, value['assignments'][request_id])
             if source is None or source_line is None or str(source.absolute()) != value['reviewers'][0]['spawn_source']['session_file']:
                 raise ValueError('host_review_source_untrusted')
-            native, proof = _native_source(source, owner, source_line, output=True)
-            _tool(native['anchor'], 'list_agents')
+            native, proof = native_evidence.read(source, owner, source_line, output=True)
+            native_evidence.tool(native['anchor'], 'list_agents')
             agents = proof['output'].get('agents')
             from datetime import datetime
             timestamp = native['anchor'].get('timestamp')
@@ -661,7 +504,7 @@ def close(*, owner: str, reason: str = 'completed', source: Path | None = None, 
                 matches = [agent for agent in agents if agent.get('agent_name') == reviewer['agent_path']]
                 if len(matches) != 1:
                     raise ValueError('host_review_children_not_idle')
-                status = _native_agent_status(matches[0].get('agent_status'))
+                status = native_evidence.agent_status(matches[0].get('agent_status'))
                 if status not in {'idle', 'completed', 'interrupted'}:
                     raise ValueError('host_review_children_not_idle')
                 statuses.append({'agent_name': reviewer['agent_path'], 'agent_status': status})
@@ -678,7 +521,6 @@ def close(*, owner: str, reason: str = 'completed', source: Path | None = None, 
     if reason != 'completed':
         request_abort_stop(value)
     return {'state': value['state'], 'reason': reason}
-
 
 
 def enter_packaging(*, owner: str, receipt_file: Path | None = None, invocation_id: str | None = None,
@@ -808,8 +650,8 @@ def _dispatch_source(request_file: Path, request: dict, registered: dict, *, slo
     reviewer = registered['reviewers'][slot]
     if str(source.absolute()) != registered['reviewers'][0]['spawn_source']['session_file']:
         raise ValueError('host_review_source_untrusted')
-    native, proof = _native_source(source, owner, source_line, output=True)
-    arguments = _tool(native['anchor'], 'followup_task')
+    native, proof = native_evidence.read(source, owner, source_line, output=True)
+    arguments = native_evidence.tool(native['anchor'], 'followup_task')
     message = arguments.get('message')
     readable = isinstance(message, str) and str(request_file) in message
     opaque = (isinstance(message, str) and 100 <= len(message) <= 1024 * 1024
@@ -886,8 +728,8 @@ def release_failed_slot(request_file: Path, *, owner: str, source: Path, source_
             raise ValueError('host_review_assignment_untrusted')
         if str(source.absolute()) != registered['reviewers'][0]['spawn_source']['session_file']:
             raise ValueError('host_review_source_untrusted')
-        native, idle = _native_source(source, owner, source_line, output=True)
-        _tool(native['anchor'], 'list_agents')
+        native, idle = native_evidence.read(source, owner, source_line, output=True)
+        native_evidence.tool(native['anchor'], 'list_agents')
         from datetime import datetime
         timestamp = native['anchor'].get('timestamp')
         if not isinstance(timestamp, str) or not proof['observed_at'] <= datetime.fromisoformat(timestamp.replace('Z', '+00:00')).timestamp() <= time.time():
@@ -897,7 +739,7 @@ def release_failed_slot(request_file: Path, *, owner: str, source: Path, source_
             raise ValueError('host_review_children_status_untrusted')
         reviewer = registered['reviewers'][assigned['slot']]
         matching = [agent for agent in agents if agent.get('agent_name') == reviewer['agent_path']]
-        if len(matching) != 1 or _native_agent_status(matching[0].get('agent_status')) not in {'idle', 'completed', 'interrupted'}:
+        if len(matching) != 1 or native_evidence.agent_status(matching[0].get('agent_status')) not in {'idle', 'completed', 'interrupted'}:
             raise ValueError('host_review_children_not_idle')
         idle.pop('output')
         assigned.update(state='failed_sealed', idle_source=idle)
@@ -1073,7 +915,7 @@ def _submission(request_file: Path, request: dict, *, registered: dict | None = 
                                  preview=registered.get('preview_binding') is not None):
         raise ValueError('host_review_source_untrusted')
     from datetime import datetime
-    native, _ = _native_source(Path(source['session_file']), assigned['reviewer_task_id'], source['line'])
+    native, _ = native_evidence.read(Path(source['session_file']), assigned['reviewer_task_id'], source['line'])
     published_at = datetime.fromisoformat(native['anchor']['timestamp'].replace('Z', '+00:00')).timestamp()
     if published_at > submitted['submitted_at']:
         raise ValueError('host_review_submission_untrusted')
@@ -1089,7 +931,7 @@ def _legacy_bootstrap_start(request: dict, registered: dict) -> float:
         manifest_raw, manifest = _read(Path(binding['receipt_file']).with_name('controller-manifest.json'))
         receipt = registered['shutdown']['receipt']
         saved = receipt['driver_wait_source']
-        native, proof = _native_source(Path(saved['session_file']), registered['owner_task_id'], saved['line'], output=True)
+        native, proof = native_evidence.read(Path(saved['session_file']), registered['owner_task_id'], saved['line'], output=True)
         waited = app_review_shutdown._wait_result(native['anchor'], proof.pop('output'), binding['tool_session_id'])
         if (proof != saved or json.loads(waited['output']) != {**execution, 'receipt_file': binding['receipt_file']}
                 or hashlib.sha256(execution_raw).hexdigest() != receipt['execution_sha256']
@@ -1150,7 +992,7 @@ def sealed_submission(request_file: Path, request: dict, registered: dict) -> di
     source = submitted['source']
     if source['session_file'] != reviewer['child_source']['session_file']:
         raise ValueError('host_review_source_untrusted')
-    native, _ = _native_source(Path(source['session_file']), reviewer['reviewer_task_id'], source['line'])
+    native, _ = native_evidence.read(Path(source['session_file']), reviewer['reviewer_task_id'], source['line'])
     published_at = datetime.fromisoformat(native['anchor']['timestamp'].replace('Z', '+00:00')).timestamp()
     if (not assigned['dispatched_at'] <= published_at <= submitted['submitted_at'] == assigned['submitted_at']
             or not submitted['submitted_at'] <= min(registered['shutdown']['started_at'], registered['closed_at'])
@@ -1405,8 +1247,6 @@ def review(task: dict) -> dict:
                 **_failure_detail(error), 'failure_recorded': False}
 
 
-
-
 def draft_command(request_file: Path, decision_file: Path, payload: dict, *, owner: str) -> str:
     """The only accepted native command for publishing model-authored draft bytes."""
     return shlex.join([*_control_routes(),
@@ -1415,79 +1255,18 @@ def draft_command(request_file: Path, decision_file: Path, payload: dict, *, own
                       '--decision-file', str(decision_file.absolute()), '--payload-json', json.dumps(payload, ensure_ascii=False, sort_keys=True)])
 
 
-_DRAFT_JOIN = ' + "\'" + JSON.stringify('
-_DRAFT_QUOTE = ').replaceAll(' + json.dumps("'") + ', ' + json.dumps("'\"'\"'") + ') + "\'", "workdir": '
 
 
 def draft_invocation(request_file: Path, decision_file: Path, payload: dict, *, owner: str) -> str:
     prefix = shlex.join(shlex.split(draft_command(request_file, decision_file, {}, owner=owner))[:-1]) + ' '
-    return ('text(await tools.exec_command({"cmd": ' + json.dumps(prefix) + _DRAFT_JOIN
-            + json.dumps(payload, ensure_ascii=False, sort_keys=True) + _DRAFT_QUOTE
-            + json.dumps(str(runtime_control.PROJECT_ROOT.absolute())) + '}));')
-
-
-def _literal_arguments(raw: str, keys: set[str]) -> dict:
-    """Parse only whitelisted data literals from native calls, never JS."""
-    key = '(?:' + '|'.join(sorted(keys)) + ')'
-    literal = r'(?:"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"|0|[1-9][0-9]*)'
-    member = rf'(?:"{key}"|{key})\s*:\s*{literal}'
-    if re.fullmatch(rf'\s*\{{\s*{member}(?:\s*,\s*{member})*\s*,?\s*\}}\s*', raw) is None:
-        raise ValueError('host_review_shutdown_wait_untrusted')
-    arguments = {}
-    for match in re.finditer(rf'(?P<key>"{key}"|{key})\s*:\s*(?P<value>{literal})', raw):
-        name = match['key'].strip('"')
-        if name in arguments:
-            raise ValueError('host_review_shutdown_wait_untrusted')
-        arguments[name] = json.loads(match['value'])
-    return arguments
-
-
-def _native_output(code: str) -> str:
-    wrapped = re.compile(
-        r'\b(?:const|let|var)\s+(?P<variable>[A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*'
-        r'(?P<call>await\s+tools\s*\.\s*(?:exec_command|write_stdin|view_image)\s*\(.*?\))\s*;\s*'
-        r'(?P<emit>text|image)\s*\(\s*(?:(?P=variable)(?P<image>\s*\.\s*image_url)?|JSON\s*\.\s*stringify\s*\(\s*(?P=variable)\s*\))\s*\)\s*;?', re.DOTALL)
-    def normalize(match):
-        value = '(' + match['call'] + ').image_url' if match['image'] else match['call']
-        return match['emit'] + '(' + value + ');'
-    code = re.sub(r'^\s*// @exec:[^\n]*\n', '', code, count=1)
-    return wrapped.sub(normalize, code)
+    return native_evidence.publication_invocation(prefix, payload, str(runtime_control.PROJECT_ROOT.absolute()))
 
 
 def draft_arguments(input_text: str) -> dict:
-    """Decode only the literal native JSON publication template, without evaluating JavaScript."""
-    try:
-        text = _native_output(input_text).strip()
-        start = 'text(await tools.exec_command({"cmd": '
-        decoder = json.JSONDecoder()
-        if text.startswith(start):
-            prefix, end = decoder.raw_decode(text, len(start))
-            if text.startswith(_DRAFT_JOIN, end):
-                payload, end = decoder.raw_decode(text, end + len(_DRAFT_JOIN))
-                if not isinstance(prefix, str) or not isinstance(payload, dict) or not text.startswith(_DRAFT_QUOTE, end):
-                    raise ValueError('invalid_payload')
-                directory, end = decoder.raw_decode(text, end + len(_DRAFT_QUOTE))
-                if text[end:] != '}));':
-                    raise ValueError('invalid_statement')
-                args = {'cmd': prefix + shlex.quote(json.dumps(payload, ensure_ascii=False, separators=(',', ':'))),
-                        'workdir': directory}
-            else:
-                args = None
-        else:
-            args = None
-        if args is None:
-            match = re.fullmatch(r'\s*text\s*\(\s*await\s+tools\s*\.\s*exec_command\s*\(\s*(\{.*\})\s*\)\s*\)\s*;?\s*', text, re.DOTALL)
-            if match is None:
-                raise ValueError('invalid_statement')
-            args = _literal_arguments(match.group(1), {'cmd', 'workdir', 'max_output_tokens', 'yield_time_ms'})
-        if (not {'cmd'}.issubset(args) or set(args) - {'cmd', 'workdir', 'max_output_tokens', 'yield_time_ms'}
-                or any(type(args[key]) is not int for key in {'max_output_tokens', 'yield_time_ms'} & args.keys())
-                or not isinstance(args['cmd'], str)
-                or 'workdir' in args and args['workdir'] != str(runtime_control.PROJECT_ROOT.absolute())):
-            raise ValueError('invalid_arguments')
-        return args
-    except (ValueError, KeyError, TypeError, AttributeError) as error:
-        raise ValueError('host_review_source_untrusted') from error
+    args = native_evidence.publication_arguments(input_text)
+    if 'workdir' in args and args['workdir'] != str(runtime_control.PROJECT_ROOT.absolute()):
+        raise ValueError('host_review_source_untrusted')
+    return args
 
 
 def publish_draft(request_file: Path, decision_file: Path, payload: dict, *, owner: str) -> dict:
@@ -1504,33 +1283,6 @@ def publish_draft(request_file: Path, decision_file: Path, payload: dict, *, own
             'request_file': str(request_file), 'request_id': request['request_id'],
             'request_sha256': hashlib.sha256(raw).hexdigest(), 'decision_file': str(decision_file),
             'decision_sha256': hashlib.sha256(review_context.read_input(decision_file, private=True)).hexdigest()}
-
-
-def _shell_result(output) -> dict:
-    """Accept one completed exec_command result; any nested failure rejects it."""
-    results = []
-    failed = False
-    def visit(value):
-        nonlocal failed
-        if isinstance(value, str):
-            try:
-                visit(json.loads(value))
-            except ValueError:
-                pass
-        elif isinstance(value, list):
-            for item in value:
-                visit(item)
-        elif isinstance(value, dict):
-            if value.get('isError') is True or ('exit_code' in value and (type(value['exit_code']) is not int or value['exit_code'] != 0)):
-                failed = True
-            if 'exit_code' in value and 'output' in value:
-                results.append(value)
-            for item in value.values():
-                visit(item)
-    visit(output)
-    if failed or len(results) != 1 or type(results[0].get('exit_code')) is not int or results[0]['exit_code'] != 0:
-        raise ValueError('host_review_source_untrusted')
-    return results[0]
 
 
 def _same_json_payload(authored, published) -> bool:
@@ -1572,7 +1324,7 @@ def _draft_publication(input_text, output, decision_file: Path, *, preview: bool
         expected_command = shlex.join((routes if command_tokens[:3] == routes else []) + prefix + expected_options)
         if target != decision_file or args['cmd'] != expected_command:
             raise ValueError('invalid_command')
-        result = _shell_result(output)
+        result = native_evidence.shell_result(output)
         receipt = json.loads(result['output'])
         raw, request = _read(request_file)
         draft_raw, published_payload = _read(target)
@@ -1597,7 +1349,7 @@ def validate_source(source: Path, line: int, session: str, decision_file: Path, 
 
 def _source_receipt(source: Path, line: int, reviewer: str, decision_file: Path, *, assigned: dict, preview: bool = False) -> dict:
     """Bind the registered child and its successful native decision-writing call."""
-    native, proof = _native_source(source, reviewer, line, output=True)
+    native, proof = native_evidence.read(source, reviewer, line, output=True)
     payload = native['anchor'].get('payload', {})
     if (native['anchor'].get('type') != 'response_item'
             or payload.get('type') not in {'function_call', 'custom_tool_call'}
@@ -1722,7 +1474,6 @@ def complete(action: Path, reviewed: dict, *, completer=None) -> dict:
                 **detail, **fingerprint, 'operation': 'complete', 'failure_phase': phase, 'failure_recorded': recorded}
 
 
-
 def source_anchor(*, owner: str, operation: str = 'heartbeat', run_id: str | None = None,
                   request_file: Path | None = None, slot: int | None = None) -> dict:
     """Find the actual already-logged parent call from inside its current tool invocation."""
@@ -1738,30 +1489,28 @@ def source_anchor(*, owner: str, operation: str = 'heartbeat', run_id: str | Non
             raise ValueError('host_review_run_untrusted')
         _live(request, Path(request['action_file']), owner=owner)
     source = Path(value['reviewers'][0]['spawn_source']['session_file'])
-    _native_source(source, owner)
+    native_evidence.read(source, owner)
     found = None
-    with _native_stream(source) as stream:
-        for line, raw in _native_lines(stream):
-            if raw is None:
-                continue
-            record = json.loads(raw)
-            payload = record.get('payload', {})
-            name = payload.get('name')
-            text = str(payload.get('arguments', payload.get('input', '')))
-            if (record.get('type') == 'response_item' and payload.get('type') in {'function_call', 'custom_tool_call'}
-                    and (operation == 'followup_task'
-                         and name in {'followup_task', 'collaboration.followup_task', 'functions.collaboration.followup_task'}
-                         or operation == 'heartbeat' and name in {'exec', 'functions.exec'}
-                         and 'heartbeat' in text and owner in text and value['run_id'] in text)):
-                if operation == 'followup_task':
-                    arguments = _tool(record, operation)
-                    reviewer = value['reviewers'][slot]
-                    message = arguments.get('message')
-                    if (arguments.get('target') not in {reviewer['agent_path'], reviewer['agent_path'].rsplit('/', 1)[-1]}
-                            or not isinstance(message, str)
-                            or not (str(request_file) in message or re.fullmatch(r'gAAAA[A-Za-z0-9_-]+={0,2}', message))):
-                        continue
-                found = {'source': source, 'source_line': line}
+    for line, record, _proof in native_evidence.records(source, owner):
+        if record is None:
+            continue
+        payload = record.get('payload', {})
+        name = payload.get('name')
+        text = str(payload.get('arguments', payload.get('input', '')))
+        if (record.get('type') == 'response_item' and payload.get('type') in {'function_call', 'custom_tool_call'}
+                and (operation == 'followup_task'
+                     and name in {'followup_task', 'collaboration.followup_task', 'functions.collaboration.followup_task'}
+                     or operation == 'heartbeat' and name in {'exec', 'functions.exec'}
+                     and 'heartbeat' in text and owner in text and value['run_id'] in text)):
+            if operation == 'followup_task':
+                arguments = native_evidence.tool(record, operation)
+                reviewer = value['reviewers'][slot]
+                message = arguments.get('message')
+                if (arguments.get('target') not in {reviewer['agent_path'], reviewer['agent_path'].rsplit('/', 1)[-1]}
+                        or not isinstance(message, str)
+                        or not (str(request_file) in message or re.fullmatch(r'gAAAA[A-Za-z0-9_-]+={0,2}', message))):
+                    continue
+            found = {'source': source, 'source_line': line}
     if found is None:
         raise ValueError('host_review_source_untrusted')
     if operation == 'followup_task':

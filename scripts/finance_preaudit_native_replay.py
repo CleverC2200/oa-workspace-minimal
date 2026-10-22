@@ -214,7 +214,8 @@ def app_run(args, manifest, audit):
         raise ValueError('app_replay_preview_required')
     paths = {item['path'] for item in manifest['source_manifest']}
     if not {'scripts/finance_preaudit_native_replay.py', 'scripts/finance_preaudit_run.py',
-            'apps/oa_finance_preaudit/host_chat_review.py'} <= paths:
+            'apps/oa_finance_preaudit/host_chat_review.py',
+            'apps/oa_finance_preaudit/native_evidence.py'} <= paths:
         raise ValueError('app_replay_source_snapshot_incomplete')
     for item in manifest['source_manifest']:
         if digest(Path(manifest['project_root']) / item['path']) != item['sha256']:

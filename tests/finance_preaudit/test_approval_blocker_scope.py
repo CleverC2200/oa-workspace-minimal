@@ -82,8 +82,8 @@ def test_historical_audit_gap_does_not_block_a_fresh_execution(exchange, monkeyp
     path = host.registry_file(owner)
     original = path.read_bytes()
     monkeypatch.setattr(runtime_control, "controller_active", lambda: False)
-    host.assert_previous_rounds_closed(owner=owner)
-    host.assert_previous_rounds_closed(owner=str(uuid4()))
+    host.assert_current_activity_idle(owner=owner)
+    host.assert_current_activity_idle(owner=str(uuid4()))
     assert path.read_bytes() == original
     assert 'shutdown' not in json.loads(original)
 
@@ -95,7 +95,7 @@ def test_current_activity_still_blocks_a_fresh_execution(exchange, monkeypatch, 
     monkeypatch.setattr(runtime_control, "controller_active", lambda: False)
     monkeypatch.setattr(runtime_control, active, lambda: True)
     with pytest.raises(ValueError, match='previous_round_incomplete'):
-        host.assert_previous_rounds_closed(owner=owner)
+        host.assert_current_activity_idle(owner=owner)
 
 
 @pytest.mark.parametrize('code', ['attachment_content_incomplete', 'legacy_doc_conversion_failed', 'material_budget_exceeded'])

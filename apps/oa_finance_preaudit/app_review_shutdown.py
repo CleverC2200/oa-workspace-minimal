@@ -9,12 +9,11 @@ from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
-import re
 import signal
 import time
 
 from apps.oa_approval import runtime_control
-from . import host_chat_review as host
+from . import host_chat_review as host, native_evidence
 
 
 def begin(*, owner: str, reason: str, run_id: str | None = None) -> dict:
@@ -48,7 +47,7 @@ def begin(*, owner: str, reason: str, run_id: str | None = None) -> dict:
 def _source(value: dict, owner: str, source: Path, line: int, *, earliest: float) -> tuple[dict, dict]:
     if str(source.absolute()) != value['reviewers'][0]['spawn_source']['session_file']:
         raise ValueError('host_review_source_untrusted')
-    native, proof = host._native_source(source, owner, line, output=True)
+    native, proof = native_evidence.read(source, owner, line, output=True)
     timestamp = native['anchor'].get('timestamp')
     if (not isinstance(timestamp, str)
             or not earliest <= datetime.fromisoformat(timestamp.replace('Z', '+00:00')).timestamp() <= time.time()):
@@ -56,58 +55,28 @@ def _source(value: dict, owner: str, source: Path, line: int, *, earliest: float
     return native['anchor'], proof
 
 
-_literal_arguments = host._literal_arguments
-
-
-def _execution_results(output) -> list[dict]:
-    results = []
-    def visit(item):
-        if isinstance(item, str):
-            try:
-                decoded = json.loads(item)
-            except ValueError:
-                return
-            visit(decoded)
-        elif isinstance(item, list):
-            for part in item: visit(part)
-        elif isinstance(item, dict):
-            if item.get('isError') is True:
-                raise ValueError('host_review_shutdown_wait_untrusted')
-            if 'output' in item and ('exit_code' in item or 'session_id' in item):
-                results.append(item)
-            else:
-                for part in item.values(): visit(part)
-    visit(output)
-    return results
-
-
 def _wait_result(anchor: dict, output: dict, session: str, *, allow_interrupt: bool = False) -> dict:
     payload = anchor.get('payload', {})
     if payload.get('name') not in {'exec', 'functions.exec'} or not payload.get('call_id'):
         raise ValueError('host_review_source_untrusted')
-    code = host._native_output(payload.get('input', payload.get('arguments')) or '')
-    call = r'text\s*\(\s*await\s+tools\s*\.\s*(exec_command|write_stdin)\s*\(\s*(\{(?:[^{}"]|"(?:[^"\\]|\\.)*")*\})\s*\)\s*\)\s*;?\s*'
-    if re.fullmatch(r'\s*(?:' + call + r')+', code or '', re.DOTALL) is None:
-        raise ValueError('host_review_source_untrusted')
-    calls = re.findall(call, code, re.DOTALL)
+    calls = native_evidence.execution_calls(payload.get('input', payload.get('arguments')) or '')
     if calls[-1][0] != 'write_stdin':
         raise ValueError('host_review_source_untrusted')
     prior_sessions = {session}
-    for index, (tool, raw) in enumerate(calls):
+    for index, (tool, args) in enumerate(calls):
         if tool == 'exec_command':
-            command = _literal_arguments(raw, {'cmd', 'workdir', 'max_output_tokens', 'yield_time_ms'})
+            command = args
             if (not isinstance(command.get('cmd'), str) or not command['cmd']
                     or 'workdir' in command and not isinstance(command['workdir'], str)
                     or any(type(command[key]) is not int for key in {'max_output_tokens', 'yield_time_ms'} & command.keys())):
                 raise ValueError('host_review_shutdown_wait_untrusted')
             continue
-        args = _literal_arguments(raw, {'session_id', 'chars', 'yield_time_ms', 'max_output_tokens'})
         final = index == len(calls) - 1
         if (not args.get('session_id') or (str(args['session_id']) != session if final else str(args['session_id']) in prior_sessions)
                 or args.get('chars', '') not in ({'', '\x03'} if final and allow_interrupt else {''})):
             raise ValueError('host_review_shutdown_wait_untrusted')
         prior_sessions.add(str(args['session_id']))
-    results = _execution_results(output)
+    results = native_evidence.execution_results(output)
     if (len(results) != len(calls)
             or any(type(result.get('exit_code')) is not int or result.get('session_id') is not None
                    for result in results)
@@ -126,9 +95,9 @@ def _idle_reviewers(value: dict, output: dict) -> list[dict]:
     canonical = []
     for reviewer in value['reviewers']:
         matches = [agent for agent in agents if agent.get('agent_name') == reviewer['agent_path']]
-        if len(matches) != 1 or host._native_agent_status(matches[0].get('agent_status')) not in {'idle', 'completed', 'interrupted'}:
+        if len(matches) != 1 or native_evidence.agent_status(matches[0].get('agent_status')) not in {'idle', 'completed', 'interrupted'}:
             raise ValueError('host_review_children_not_idle')
-        canonical.append({'agent_name': reviewer['agent_path'], 'agent_status': host._native_agent_status(matches[0]['agent_status'])})
+        canonical.append({'agent_name': reviewer['agent_path'], 'agent_status': native_evidence.agent_status(matches[0]['agent_status'])})
     return canonical
 
 
@@ -138,7 +107,7 @@ def _verify_completed_close(value: dict, *, owner: str, execution: dict, require
         raise ValueError('host_review_shutdown_incomplete')
     saved = value['children_idle_source']
     anchor, proof = _source(value, owner, Path(saved['session_file']), saved['line'], earliest=host._last_result_at(value))
-    host._tool(anchor, 'list_agents')
+    native_evidence.tool(anchor, 'list_agents')
     proof['reviewers'] = _idle_reviewers(value, proof.pop('output'))
     idle_at = datetime.fromisoformat(anchor['timestamp'].replace('Z', '+00:00')).timestamp()
     completed_at = datetime.fromisoformat(execution['completed_at'])
@@ -160,16 +129,16 @@ def _verified_proofs(value: dict, *, owner: str, source: Path, interrupt_lines: 
     for reviewer, line in zip(value['reviewers'], interrupt_lines):
         anchor, proof = _source(value, owner, source, line, earliest=value['shutdown']['started_at'])
         last_proof_at = max(last_proof_at, datetime.fromisoformat(anchor['timestamp'].replace('Z', '+00:00')).timestamp())
-        arguments = host._tool(anchor, 'interrupt_agent')
+        arguments = native_evidence.tool(anchor, 'interrupt_agent')
         previous = proof.pop('output')
         if (arguments != {'target': reviewer['agent_path']} or not isinstance(previous, dict)
                 or set(previous) != {'previous_status'}):
             raise ValueError('host_review_shutdown_interrupt_untrusted')
-        host._native_agent_status(previous['previous_status'])
+        native_evidence.agent_status(previous['previous_status'])
         stops.append(proof)
     anchor, statuses = _source(value, owner, source, status_line, earliest=value['shutdown']['started_at'])
     last_proof_at = max(last_proof_at, datetime.fromisoformat(anchor['timestamp'].replace('Z', '+00:00')).timestamp())
-    host._tool(anchor, 'list_agents')
+    native_evidence.tool(anchor, 'list_agents')
     if status_line <= max(item['output_line'] for item in stops):
         raise ValueError('host_review_stale_source')
     output = statuses.pop('output')
@@ -285,17 +254,17 @@ def _unregistered_sources(*, owner: str, reviewers: list[dict], source: Path, ex
         spawn, _ = _source(value, source_owner, source, reviewer['spawn_source']['line'], earliest=started)
         spawn_at = datetime.fromisoformat(spawn['timestamp'].replace('Z', '+00:00')).timestamp()
         anchor, proof = _source(value, source_owner, source, line, earliest=spawn_at)
-        arguments = host._tool(anchor, 'interrupt_agent')
+        arguments = native_evidence.tool(anchor, 'interrupt_agent')
         previous = proof.pop('output')
         if (line <= reviewer['spawn_source']['output_line'] or arguments not in (
                 {'target': reviewer['agent_path']}, {'target': reviewer['agent_path'].rsplit('/', 1)[-1]})
                 or not isinstance(previous, dict) or set(previous) != {'previous_status'}):
             raise ValueError('host_review_shutdown_interrupt_untrusted')
-        host._native_agent_status(previous['previous_status'])
+        native_evidence.agent_status(previous['previous_status'])
         stops.append(proof)
         stopped_at.append(datetime.fromisoformat(anchor['timestamp'].replace('Z', '+00:00')).timestamp())
     anchor, statuses = _source(value, source_owner, source, status_line, earliest=started)
-    host._tool(anchor, 'list_agents')
+    native_evidence.tool(anchor, 'list_agents')
     if (status_line <= max(item['output_line'] for item in stops)
             or datetime.fromisoformat(anchor['timestamp'].replace('Z', '+00:00')).timestamp() < max(stopped_at)):
         raise ValueError('host_review_stale_source')
@@ -307,7 +276,7 @@ def _unregistered_sources(*, owner: str, reviewers: list[dict], source: Path, ex
     if exit_result['exit_code'] != report['exit_code']:
         raise ValueError('host_review_shutdown_wait_untrusted')
     if legacy_source_owner is not None or strict_wait:
-        terminal, _ = host._native_source(source, source_owner, wait['output_line'])
+        terminal, _ = native_evidence.read(source, source_owner, wait['output_line'])
         terminal_at = runner._timestamp(terminal['anchor']['timestamp']).timestamp()
         call_at = runner._timestamp(anchor['timestamp']).timestamp()
         if not max(completed, call_at) <= terminal_at <= time.time():
@@ -436,45 +405,3 @@ def finish_unregistered(*, owner: str, reviewers: list[dict], source: Path, rece
         else:
             host._write_new(path, expected)
         return expected
-
-
-def assert_unregistered_executions_closed(*, exclude_run_id: str | None = None) -> None:
-    from . import controller_handoff
-    for path in (controller_handoff.manifest_file().parent / 'executions').glob('*/execution.json'):
-        execution = host._read(path)[1]
-        if execution.get('review_configuration') != host.IDENTITY:
-            continue
-        manifest_path = path.with_name('controller-manifest.json')
-        if not manifest_path.exists():
-            from scripts import finance_preaudit_run as runner
-            from . import pre_manifest_shutdown
-            if path.with_name(pre_manifest_shutdown.FILE).exists():
-                pre_manifest_shutdown.sealed(path)
-                continue
-            report = runner.read_execution(path, owner_task_id=execution['owner_task_id'], invocation_id=path.parent.name)
-            if report['status'] == 'skipped' and report['terminal'] is True:
-                continue
-            supervisor = execution.get('supervisor_process')
-            if (execution.get('state') == 'start_failed' and execution.get('controller_pid') is None
-                    and host.guard._valid_identity(supervisor)
-                    and host.guard.process_identity(supervisor['pid']) != supervisor):
-                continue
-            raise ValueError('host_review_previous_round_incomplete')
-        manifest = host._read(manifest_path)[1]
-        if manifest.get('run_id') == exclude_run_id:
-            continue
-        owner, run_id = execution.get('owner_task_id'), manifest.get('run_id')
-        registry = host.registry_file(owner, run_id)
-        legacy = host.registry_file(owner, legacy=True)
-        if registry.exists() or (legacy.exists() and host._read(legacy)[1].get('run_id') == run_id):
-            try:
-                registered = sealed_round(owner=owner, run_id=run_id)
-                if registered['original_execution']['receipt_file'] != str(path.absolute()):
-                    raise ValueError('host_review_previous_round_incomplete')
-            except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
-                raise ValueError('host_review_previous_round_incomplete') from error
-            continue
-        try:
-            sealed_unregistered(path)
-        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
-            raise ValueError('host_review_previous_round_incomplete') from error

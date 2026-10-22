@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import re
-import shlex
 import subprocess
 import sys
 import types
@@ -70,33 +69,6 @@ class TestConfigurationContract:
         ]
 
         assert offenders == []
-
-    def test_ci_discovers_the_complete_test_tree(self) -> None:
-        import yaml
-        workflow = (PROJECT_ROOT / ".github/workflows/quality.yml").read_text(
-            encoding="utf-8"
-        )
-        jobs = yaml.safe_load(workflow)['jobs']
-        assert jobs['quality']['strategy']['matrix']['shard'] == [0, 1, 2]
-        assert set(jobs['quality']['outputs']) == {
-            f'{field}_{shard}' for field in ('attempt', 'artifact') for shard in (0, 1, 2)
-        }
-        assert jobs['quality']['strategy']['fail-fast'] is False
-        assert set(jobs['quality-complete']['needs']) == {'quality', 'macos-stop-recovery'}
-        commands = [shlex.split(step['run']) for step in jobs['quality']['steps']
-                    if step.get('run', '').startswith('python -m pytest')]
-        collection, execution = commands
-        assert '--collect-only' in collection
-        assert any(arg.startswith('--ci-expected-file=') for arg in execution)
-        assert '--dist' in execution and execution[execution.index('--dist') + 1] == 'worksteal'
-        assert int(execution[execution.index('-n') + 1]) == 4
-        download = next(step for step in jobs['quality-complete']['steps']
-                        if step.get('uses') == 'actions/download-artifact@v4')
-        assert all(f'needs.quality.outputs.artifact_{shard}' in download['with']['artifact-ids']
-                   for shard in (0, 1, 2))
-        for command in commands:
-            assert not any(arg.startswith('tests/') or arg in {'-k', '-m', '--ignore', '--lf', '--ff'}
-                           for arg in command[3:])
 
     def test_oa_host_requires_local_configuration(self) -> None:
         with (

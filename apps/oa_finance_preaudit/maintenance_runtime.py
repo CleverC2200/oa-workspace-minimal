@@ -26,8 +26,8 @@ class OriginalExecution:
     tool_session_id: str
 
 
-def _material_read_program(program: str) -> str:
-    return '''
+def _material_read_program(program: str, *, local_only: bool = True) -> str:
+    return f'LOCAL_MATERIAL_READ = {local_only!r}\n' + '''
 from contextlib import contextmanager
 from importlib.util import find_spec
 @contextmanager
@@ -37,6 +37,16 @@ def maintenance_material_read():
         return
     from apps.oa_approval import material_store
     store = material_store.MaterialStore()
+    if hasattr(store, 'availability_read'):
+        availability_read = store.availability_read
+        if not callable(availability_read):
+            raise RuntimeError('maintenance_material_read_unsupported')
+        if LOCAL_MATERIAL_READ:
+            with availability_read():
+                yield
+        else:
+            yield
+        return
     original_locked = material_store.MaterialStore._locked
     with original_locked(store, readonly=True) as state:
         if 'project_checkouts' not in state:
@@ -1060,7 +1070,7 @@ def read_live_status(target_root: Path, *, require_reaped: bool = False,
     try:
         result = _run_readonly(
             [str(interpreter), '-B', '-E', '-c', _material_read_program(
-                'from apps.oa_finance_preaudit.cli import main\nraise SystemExit(main())\n'),
+                'from apps.oa_finance_preaudit.cli import main\nraise SystemExit(main())\n', local_only=False),
              'status', '--check-live', '--reconcile', '--summary',
              '--output-file', str(evidence_file)],
             target_root=target_root, environment=environment, timeout=300, require_reaped=require_reaped,

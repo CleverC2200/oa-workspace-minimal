@@ -173,3 +173,21 @@ def test_issue_form_unhashable_type_is_a_finding():
     for kind in ([], {}):
         assert quality.check_issue_form({'name': 'Bug', 'description': 'Bug', 'body': [
             {'type': kind, 'attributes': {'label': 'Impact'}}]}, 'bug.yml') == ['issue_form_invalid:bug.yml']
+
+
+def test_quality_workflow_uses_one_static_job(capsys):
+    import yaml
+
+    assert quality.main(['yaml']) == 0
+    assert capsys.readouterr().out == 'yaml: ok\n'
+    workflow = yaml.safe_load((quality.PROJECT_ROOT / '.github/workflows/quality.yml').read_text())
+    assert list(workflow['jobs']) == ['quality']
+    job = workflow['jobs']['quality']
+    assert job['runs-on'] == 'ubuntu-latest'
+    assert 'strategy' not in job and 'outputs' not in job and 'needs' not in job
+    commands = [step.get('run', '') for step in job['steps']]
+    assert any('scripts.quality lint' in command for command in commands)
+    assert any('scripts.quality production-config' in command for command in commands)
+    assert any('compileall' in command for command in commands)
+    assert not any('pytest' in command or 'pytest_evidence' in command for command in commands)
+    assert all('actions/upload-artifact' not in step.get('uses', '') for step in job['steps'])

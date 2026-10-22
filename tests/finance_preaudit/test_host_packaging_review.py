@@ -118,6 +118,26 @@ def test_app_packaging_submission_requires_current_real_image_observation(packag
         packaging.validate_host_submission(path, payload, source, 'packaging_draft', {})
 
 
+def test_packaging_submission_revalidates_compressed_archive_without_changing_proofs(package_round):
+    import os
+    import subprocess
+    path, _, owner, _ = package_round
+    request, child = assigned_package(package_round)
+    observe_pages(path, child)
+    target = request.parent / 'archived-draft.json'
+    line = draft_source(child, request, target, owner, payload=envelope(path), call_id='archive-write')
+    session = json.loads(child.read_text().splitlines()[0])['payload']['id']
+    source = host.validate_source(child, line, session, target, dispatched_at=time.time()-2)
+    ordinary = packaging.validate_host_submission(path, envelope(path), source, 'packaging_draft', {})
+    archive = Path(os.environ['CODEX_HOME']) / 'archived_sessions' / (child.name + '.zst')
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(['zstd', '-q', str(child), '-o', str(archive)], check=True)
+    child.unlink()
+    assert packaging.validate_host_submission(path, envelope(path), source, 'packaging_draft', {}) == ordinary
+    host.submit(request, target, owner=owner, source=child, source_line=line)
+    assert host.poll_result(request)['status'] == 'reviewed'
+
+
 def test_packaging_accepts_named_native_image_results(package_round):
     path, _, owner, _ = package_round
     request, child = assigned_package(package_round)
@@ -281,6 +301,37 @@ def test_required_recheck_uses_another_existing_slot_before_parent_acceptance(pa
     assert result['assignment']['reviewer_task_id'] != draft_receipt['host_result']['assignment']['reviewer_task_id']
     accepted = semantic_accept(receipt, package_round, recheck_required=True, recheck_request_file=str(request))
     assert accepted['recheck_result']['assignment']['slot'] == 1
+
+
+@pytest.mark.parametrize('scope', ['before_dispatch', 'current_dispatch'])
+@pytest.mark.parametrize('damage', ['missing_output', 'invalid_output'])
+def test_packaging_submission_pairs_only_current_dispatch_image_calls(package_round, scope, damage):
+    path, _, owner, child = package_round
+    if scope == 'current_dispatch':
+        request, child = assigned_package(package_round)
+    original = json.loads(path.with_name('material.json').read_text())['prepared']['images'][0]['path']
+    native_exec(child, 'const r=await tools.view_image({path:' + json.dumps(original) + '});image(r.image_url);',
+        'damaged-image-call', 'not-json')
+    if damage == 'missing_output':
+        child.write_bytes(b''.join(child.read_bytes().splitlines(keepends=True)[:-1]))
+    if scope == 'before_dispatch':
+        request, child = assigned_package(package_round)
+    observe_pages(path, child)
+    target = request.parent / 'scoped-draft.json'
+    line = draft_source(child, request, target, owner, payload=envelope(path), call_id='scoped-publication')
+    original_source = child.read_bytes()
+    if scope == 'current_dispatch':
+        with pytest.raises(ValueError, match='host_review_source_untrusted'):
+            host.submit(request, target, owner=owner, source=child, source_line=line)
+    else:
+        host.submit(request, target, owner=owner, source=child, source_line=line)
+        reviewed = host.poll_result(request)
+        assert reviewed['status'] == 'reviewed'
+        proof = reviewed['source']
+        raw_lines = original_source.splitlines(keepends=True)
+        assert proof['line_sha256'] == hashlib.sha256(raw_lines[line - 1]).hexdigest()
+        assert proof['output_sha256'] == hashlib.sha256(raw_lines[proof['output_line'] - 1]).hexdigest()
+    assert child.read_bytes() == original_source
 
 
 @pytest.mark.parametrize('damage', ['stale', 'path_only', 'failed_image'])
