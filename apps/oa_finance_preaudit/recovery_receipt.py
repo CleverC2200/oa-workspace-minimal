@@ -12,7 +12,7 @@ from . import review_failure_evidence as evidence
 
 NAME = "recovery-receipt.json"
 _CODES = {"material_collection_failed", "write_authorization_invalid", "codex_decision_invalid",
-          "codex_review_failed", "writer_result_unknown", *writer_outcomes.CONFIRMED_NO_WRITE_CODES}
+          "codex_review_failed", "codex_review_interrupted", "writer_result_unknown", *writer_outcomes.CONFIRMED_NO_WRITE_CODES}
 
 
 def _fingerprints(source: Path) -> dict:
