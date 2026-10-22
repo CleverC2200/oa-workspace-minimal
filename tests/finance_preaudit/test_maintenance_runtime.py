@@ -192,7 +192,8 @@ def test_source_admission_bridge_keeps_other_safety_gates(tmp_path, invalid):
 
 
 @pytest.mark.parametrize('variant', ('old_gate', 'new_gate', 'legacy_scanner', 'frozen_drift', 'writer-boundary.json',
-    'execution-receipt.json', 'review-decision.json', 'remark.txt', 'submission-envelope.json'))
+    'execution-receipt.json', 'review-decision.json', 'remark.txt', 'submission-envelope.json',
+    'current_pending', 'current_writer', 'current_unknown'))
 def test_source_bridge_uses_installed_frozen_validator_without_writing(tmp_path, monkeypatch, variant):
     import sys
     from apps.oa_finance_preaudit import flow_engine, production_config, reconciliation
@@ -225,8 +226,13 @@ def test_source_bridge_uses_installed_frozen_validator_without_writing(tmp_path,
         action = engine.next_action('general_expense', mode='controlled_write')
     attempt = Path(action['action_file']).parent
     state = json.loads((attempt / 'state.json').read_text())
-    if variant == 'frozen_drift':
+    if variant == 'frozen_drift' or variant.startswith('current_'):
         (attempt / 'material.json').write_text('{}')
+        if variant == 'current_writer':
+            (attempt / 'writer-boundary.json').write_text('{}')
+        elif variant == 'current_unknown':
+            state.update(write_state='unknown', write_authorized=False)
+            (attempt / 'state.json').write_text(json.dumps(state))
     elif variant.endswith('.json') or variant == 'remark.txt':
         (attempt / variant).write_text('{}')
     frozen = {p: p.read_bytes() for p in attempt.iterdir() if p.is_file()}
@@ -247,7 +253,16 @@ def test_source_bridge_uses_installed_frozen_validator_without_writing(tmp_path,
     if variant == 'old_gate':
         with pytest.raises(RuntimeError, match='maintenance_frozen_inputs_untrusted'):
             maintenance_runtime.read_current_inputs(tmp_path, receipt)
-    if variant in ('old_gate', 'new_gate', 'legacy_scanner'):
+    if variant == 'current_pending':
+        with pytest.raises(RuntimeError, match='maintenance_frozen_inputs_untrusted'):
+            maintenance_runtime.read_current_inputs(tmp_path, receipt, allow_admission_blocked=True)
+        result = maintenance_runtime.read_current_inputs(tmp_path, receipt, current_pending=True)
+        assert result['refreshable_pending_actions'] == [str(attempt / 'action.json')]
+        assert result['pending_frozen_count'] == result['validated_frozen_count'] == 0
+    elif variant.startswith('current_'):
+        with pytest.raises(RuntimeError, match='maintenance_frozen_inputs_untrusted'):
+            maintenance_runtime.read_current_inputs(tmp_path, receipt, current_pending=True)
+    elif variant in ('old_gate', 'new_gate', 'legacy_scanner'):
         result = maintenance_runtime.read_current_inputs(tmp_path, receipt, allow_admission_blocked=True)
         assert result['admission_blocked_actions'] == [str(attempt / 'action.json')]
         assert result['pending_frozen_count'] == result['validated_frozen_count'] == 1
@@ -258,6 +273,33 @@ def test_source_bridge_uses_installed_frozen_validator_without_writing(tmp_path,
             maintenance_runtime.read_current_inputs(tmp_path, receipt, allow_admission_blocked=True)
     assert {p: p.read_bytes() for p in attempt.iterdir() if p.is_file()} == frozen
     assert submissions == []
+
+
+@pytest.mark.parametrize('invalid', ('strict', 'duplicate', 'wrong_action', 'count', 'unknown_write', 'source_only'))
+def test_current_pending_source_proof_is_scoped_and_counted(tmp_path, invalid):
+    snapshot = admission_blocked_snapshot(tmp_path)
+    snapshot['reconciliation']['continuation'] = {
+        'status': 'ready', 'scope': 'none', 'isolated_pending': 0, 'blocking_reasons': {}}
+    proof = snapshot['maintenance_current_inputs']
+    action = proof.pop('admission_blocked_actions')[0]
+    proof.update(pending_frozen_count=0, validated_frozen_count=0, refreshable_pending_actions=[action])
+    maintenance_runtime.assert_live_safe(snapshot, current_pending=True)
+    options = {'current_pending': True}
+    if invalid == 'strict':
+        options['current_pending'] = False
+    elif invalid == 'duplicate':
+        proof['refreshable_pending_actions'] *= 2
+    elif invalid == 'wrong_action':
+        proof['refreshable_pending_actions'] = [str(tmp_path / 'other/action.json')]
+    elif invalid == 'count':
+        proof.update(pending_frozen_count=1, validated_frozen_count=1)
+    elif invalid == 'unknown_write':
+        snapshot['reconciliation']['findings'][0]['local_write_state'] = 'unknown'
+    else:
+        options['source_only_proof'] = {'historical_stopped_actions': []}
+        proof['preserved_stop_failures'] = []
+    with pytest.raises(RuntimeError, match='maintenance_'):
+        maintenance_runtime.assert_live_safe(snapshot, **options)
 
 
 @pytest.mark.parametrize('scenario,code', [

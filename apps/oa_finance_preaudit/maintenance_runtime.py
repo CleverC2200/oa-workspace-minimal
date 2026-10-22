@@ -524,7 +524,7 @@ def target_runtime_leases(target_root: Path) -> Iterator[None]:
 def assert_live_safe(payload: dict, *, maintenance_leases_held: bool = True,
                      original_closure: bool = False, source_only_proof: dict | None = None,
                      official_stop_proof: dict | None = None,
-                     allow_admission_blocked: bool = False) -> None:
+                     allow_admission_blocked: bool = False, current_pending: bool = False) -> None:
     """Require complete live identity/authentication and trusted continuation evidence."""
     if not isinstance(payload, dict) or any(
             not isinstance(payload.get(key), dict)
@@ -720,7 +720,21 @@ def assert_live_safe(payload: dict, *, maintenance_leases_held: bool = True,
                 or type(proof.get('validated_frozen_count')) is not int
                 or proof['validated_frozen_count'] != proof['pending_frozen_count']):
             raise RuntimeError('maintenance_current_inputs_untrusted')
-        if proof['pending_frozen_count'] != sum(row.get('category') == 'pending_not_handled' for row in reconciled['findings']):
+        refreshable = proof.get('refreshable_pending_actions', [])
+        if (not isinstance(refreshable, list) or any(not isinstance(path, str) for path in refreshable)
+                or len(set(refreshable)) != len(refreshable)):
+            raise RuntimeError('maintenance_current_inputs_untrusted')
+        if refreshable:
+            target = proof.get('target_root')
+            if (not current_pending or source_only_proof is not None or official_stop_proof is not None
+                    or not isinstance(target, str) or not Path(target).is_absolute()):
+                raise RuntimeError('maintenance_current_inputs_untrusted')
+            pending_paths = {str(Path(target) / 'runtime/finance_preaudit_flows' / str(row.get('workflow_key'))
+                / 'cases' / str(row.get('item_key')) / ('attempt-' + str(row.get('attempt'))) / 'action.json')
+                for row in reconciled['findings'] if row.get('category') == 'pending_not_handled'}
+            if not set(refreshable).issubset(pending_paths):
+                raise RuntimeError('maintenance_current_inputs_untrusted')
+        if proof['pending_frozen_count'] + len(refreshable) != sum(row.get('category') == 'pending_not_handled' for row in reconciled['findings']):
             raise RuntimeError('maintenance_current_inputs_untrusted')
 
 
@@ -732,10 +746,11 @@ from pathlib import Path
 from apps.oa_approval import auth
 from apps.oa_finance_preaudit import flow_engine, production_write, reconciliation, item_failure, recovery_receipt, attempt_state
 root = Path.cwd().resolve()
-path, expected_hash, workflows_json, source_only_json, admission_json = sys.argv[1:]
+path, expected_hash, workflows_json, source_only_json, admission_json, current_pending_json = sys.argv[1:]
 required = set(json.loads(workflows_json))
 source_only = json.loads(source_only_json)
 allow_admission_blocked = json.loads(admission_json)
+current_pending = json.loads(current_pending_json)
 code = 'maintenance_current_inputs_untrusted'
 
 def failure_files(attempt):
@@ -861,6 +876,7 @@ try:
     uncounted = []
     withdrawn = []
     admission_blocked = []
+    refreshable_pending = []
     material_failures = []
     failure_fingerprints = {}
     material_source_only = source_only is not None and source_only.get('kind') == 'preaudit_material_failure_source_only'
@@ -884,6 +900,9 @@ try:
     for item in pending:
         state = by_key[(item['workflow_key'], item['item_key'], item['attempt'])]
         attempt = flows / state['workflow_key'] / 'cases' / state['case_key'] / ('attempt-' + str(state['attempt']))
+        if current_pending and source_only is None and flow_engine.FlowEngine.refreshable_pending(flows, state):
+            refreshable_pending.append(str(attempt / 'action.json'))
+            continue
         excluded = collecting_exclusions.get(str(attempt / 'action.json'))
         if excluded is not None:
             reader = flow_engine.FlowEngine(root=flows, discover_candidates=None, collect_material=None)
@@ -1002,7 +1021,8 @@ try:
     print(json.dumps({'kind':'preaudit_maintenance_current_inputs','status':'verified','read_only':True,
         'write_state':'not_requested','target_root':str(root),'status_sha256':expected_hash,
         'policy_sha256':policy_hash,'authorized_workflows':sorted(required),
-        'pending_frozen_count':len(pending)-len(excluded_collecting),'validated_frozen_count':validated,
+        'pending_frozen_count':len(pending)-len(excluded_collecting)-len(refreshable_pending),'validated_frozen_count':validated,
+        **({'refreshable_pending_actions':refreshable_pending} if current_pending else {}),
         **({'excluded_collecting_actions':excluded_collecting, 'excluded_input_validation':'not_performed'}
             if collecting_exclusions else {}),
         **({'admission_blocked_actions':admission_blocked} if allow_admission_blocked else {}),
@@ -1021,7 +1041,7 @@ except (OSError, ValueError, RuntimeError, KeyError, TypeError):
 
 def read_current_inputs(target_root: Path, receipt: dict, *, require_reaped: bool = False,
                         source_only_proof: dict | None = None, official_stop_proof: dict | None = None,
-                        allow_admission_blocked: bool = False) -> dict:
+                        allow_admission_blocked: bool = False, current_pending: bool = False) -> dict:
     """Obtain current policy/frozen proof from the target's existing validators."""
     from .production_config import FINANCE_WORKFLOWS
     target_root = Path(target_root).expanduser().absolute()
@@ -1035,7 +1055,7 @@ def read_current_inputs(target_root: Path, receipt: dict, *, require_reaped: boo
         result = _run_readonly([str(target_root / '.venv/bin/python'), '-B', '-E', '-c', _material_read_program(_CURRENT_INPUTS_READER),
             receipt['path'], receipt['sha256'], json.dumps([*FINANCE_WORKFLOWS, 'packaging_layout_approval']),
             json.dumps(official_stop_proof if official_stop_proof is not None else source_only_proof),
-            json.dumps(allow_admission_blocked)],
+            json.dumps(allow_admission_blocked), json.dumps(current_pending)],
             target_root=target_root, environment=environment, timeout=300, require_reaped=require_reaped)
         if len(result.stdout.encode()) > 1_000_000:
             raise RuntimeError('maintenance_current_inputs_untrusted')
@@ -1053,7 +1073,7 @@ def read_current_inputs(target_root: Path, receipt: dict, *, require_reaped: boo
 
 def read_live_status(target_root: Path, *, require_reaped: bool = False,
                      source_only_proof: dict | None = None, official_stop_proof: dict | None = None,
-                     allow_admission_blocked: bool = False) -> dict:
+                     allow_admission_blocked: bool = False, current_pending: bool = False) -> dict:
     """Await target Python's own readonly status and verify its file-backed receipt."""
     target_root = Path(target_root).absolute()
     assert_target_environment(target_root)
@@ -1094,7 +1114,7 @@ def read_live_status(target_root: Path, *, require_reaped: bool = False,
         payload['maintenance_status_file'] = receipt
         payload['maintenance_current_inputs'] = read_current_inputs(target_root, receipt,
             require_reaped=require_reaped, source_only_proof=source_only_proof, official_stop_proof=official_stop_proof,
-            allow_admission_blocked=allow_admission_blocked)
+            allow_admission_blocked=allow_admission_blocked, current_pending=current_pending)
         return payload
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         raise RuntimeError('maintenance_live_status_failed') from error

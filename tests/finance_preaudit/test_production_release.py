@@ -403,6 +403,7 @@ def test_source_admission_bridge_closes_before_ordinary_postcheck(production, mo
         assert runtime_control.controller_active(target / 'runtime/control/rolling-controller.lock')
         assert runtime_control.active_request_writers(target / 'runtime/control/frozen-writer.lock') == 1
         calls.append(options['allow_admission_blocked'])
+        assert options['current_pending'] is True
         if git(target, 'rev-parse', 'HEAD') == before or post_blocked:
             return json.loads(original_bytes)
         return live_snapshot()
@@ -435,6 +436,29 @@ def test_source_admission_bridge_closes_before_ordinary_postcheck(production, mo
         assert result['next_process_ready'] is confirmed
         assert result['continuation']['status'] == ('ready' if confirmed else 'blocked')
     assert git(root, 'rev-parse', 'HEAD') == (expected if confirmed and not pre_blocked else before)
+
+
+def test_ordinary_release_keeps_current_pending_proof_through_postcheck(production, monkeypatch):
+    root, remote, revision = production
+    original = admission_blocked_snapshot(root)
+    original['reconciliation']['continuation'] = {
+        'status': 'ready', 'scope': 'none', 'isolated_pending': 0, 'blocking_reasons': {}}
+    proof = original['maintenance_current_inputs']
+    actions = proof.pop('admission_blocked_actions')
+    proof.update(pending_frozen_count=0, validated_frozen_count=0, refreshable_pending_actions=actions)
+    raw = json.dumps(original, sort_keys=True)
+    calls = []
+    def read_live(_target, **options):
+        calls.append(options['current_pending'])
+        return json.loads(raw)
+    monkeypatch.setattr(maintenance_runtime, 'read_live_status', read_live)
+    result = production_release.release_source(root, expected_revision=revision, expected_origin=str(remote),
+        confirmed_sync=True, check_configuration=lambda *_: [])
+    assert calls == [True, True]
+    assert result['status'] == 'synced'
+    assert result['next_process_ready'] is True
+    assert result['pre_sync_current_input_proof'] == result['current_input_proof'] == proof
+    assert json.dumps(original, sort_keys=True) == raw
 
 
 def test_release_reports_actual_source_after_post_sync_live_failure(production, monkeypatch, capsys):

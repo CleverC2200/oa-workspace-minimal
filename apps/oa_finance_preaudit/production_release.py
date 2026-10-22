@@ -356,10 +356,11 @@ def release_source(
     official_proof = None
     user_stop_proof = None
     allow_admission_blocked = not stopped_maintenance and withdrawn_action is None and material_proof is None and not excluded_action_files
+    current_pending = allow_admission_blocked
     live = check_live or (lambda target: maintenance_runtime.read_live_status(target,
         require_reaped=stopped_maintenance or withdrawn_action is not None or material_proof is not None or bool(excluded_action_files),
         source_only_proof=collecting_exclusion_proof() or material_proof or withdrawal_proof or loss_proof, official_stop_proof=official_proof,
-        allow_admission_blocked=allow_admission_blocked))
+        allow_admission_blocked=allow_admission_blocked, current_pending=current_pending))
     manifest_file = root / 'runtime/control/rolling-controller-manifest.json'
     manifest = controller_handoff.manifest_snapshot(manifest_file)
     if controller_handoff.manifest_payload(manifest) is None:
@@ -428,7 +429,7 @@ def release_source(
                 withdrawal_proof = withdrawn_submission.source_proof(withdrawal_observation)
             snapshot = read_snapshot()
             maintenance_runtime.assert_live_safe(snapshot, source_only_proof=material_proof or withdrawal_proof or loss_proof,
-                official_stop_proof=official_proof, allow_admission_blocked=allow_admission_blocked)
+                official_stop_proof=official_proof, allow_admission_blocked=allow_admission_blocked, current_pending=current_pending)
             if material_proof is not None:
                 material_fingerprints = snapshot['maintenance_current_inputs']['material_failure_fingerprints']
                 if set(material_fingerprints) != set(material_proof['actions']):
@@ -439,7 +440,7 @@ def release_source(
             pre_sync_inputs = snapshot.get('maintenance_current_inputs')
             if exclusion_scope is not None:
                 pre_sync_evidence.update(pre_sync_status_file=pre_sync_status, pre_sync_current_input_proof=pre_sync_inputs)
-            if pre_sync_inputs and pre_sync_inputs.get('admission_blocked_actions'):
+            if pre_sync_inputs and (pre_sync_inputs.get('admission_blocked_actions') or pre_sync_inputs.get('refreshable_pending_actions')):
                 pre_sync_evidence = {'pre_sync_status_file': pre_sync_status,
                     'pre_sync_current_input_proof': pre_sync_inputs}
             if controller_handoff.manifest_snapshot(manifest_file) != manifest:
@@ -461,7 +462,8 @@ def release_source(
                 _git(root, 'merge', '--ff-only', expected_revision)
                 allow_admission_blocked = False
                 snapshot = read_snapshot()
-                maintenance_runtime.assert_live_safe(snapshot, source_only_proof=material_proof or withdrawal_proof or loss_proof, official_stop_proof=official_proof)
+                maintenance_runtime.assert_live_safe(snapshot, source_only_proof=material_proof or withdrawal_proof or loss_proof,
+                    official_stop_proof=official_proof, current_pending=current_pending)
                 if check_configuration is None:
                     from . import production_config
                     findings = production_config.repository_findings(root)
