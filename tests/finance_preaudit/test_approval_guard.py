@@ -285,12 +285,14 @@ def test_startup_reclaims_only_proven_orphan_and_closes_original_manifest(tmp_pa
         old.wait()
 
 
-def prepared_case(tmp_path):
+def prepared_case(tmp_path, *, interrupt_recovery=False):
     root = tmp_path / "runtime" / "finance_preaudit_flows"
     rows = [{"request_id": "pending", "received_at": "2026-10-10 09:00:00", "workflow_key": "travel_expense"}]
     collections = []
     def collect(request, attempt):
         collections.append(attempt)
+        if interrupt_recovery and len(collections) == 2:
+            raise SystemExit("pause-recovery-collection")
         material = _material(request)
         material["declared_fields"] = {"version": len(collections)}
         return material
@@ -300,8 +302,9 @@ def prepared_case(tmp_path):
     return root, rows, collections, engine, action
 
 
-def test_interruption_revokes_authorization_and_next_attempt_refetches(tmp_path):
-    root, rows, collections, engine, action = prepared_case(tmp_path)
+@pytest.mark.parametrize("interrupt_recovery", [False, True])
+def test_interruption_revokes_authorization_and_next_attempt_refetches(tmp_path, interrupt_recovery):
+    root, rows, collections, engine, action = prepared_case(tmp_path, interrupt_recovery=interrupt_recovery)
     original = action.read_bytes()
     with runtime_control.global_controller_lease():
         manifest = controller_handoff.begin({"capacity": 3})
@@ -323,9 +326,26 @@ def test_interruption_revokes_authorization_and_next_attempt_refetches(tmp_path)
             assert review_interruption.select(root, report, frozenset({"travel_expense"})) == (action,)
             # Simulate the next eligible round after the official gate was safely cleared.
             runtime_control._clear_stop(f"stop_requested:{guard.STOP_REASON}\n".encode())
-            next_action = engine.recover_confirmed_no_write(action, confirmed=True)
-            assert next_action["attempt"] == 2 and len(collections) == 2
-            assert next_action["action_token"] != state["action_token"]
+            source = {path: path.read_bytes() for path in action.parent.iterdir() if path.is_file()}
+            if interrupt_recovery:
+                with pytest.raises(SystemExit, match="pause-recovery-collection"):
+                    engine.recover_confirmed_no_write(action, confirmed=True)
+            else:
+                next_action = engine.recover_confirmed_no_write(action, confirmed=True)
+                assert next_action["attempt"] == 2
+                assert next_action["action_token"] != state["action_token"]
+            report = reconciliation.reconcile(root, pending_rows=rows, handled_rows=[])
+            receipt = report["recoveries"]["items"][0]
+            assert receipt["receipt_status"] == "verified"
+            assert receipt["failure_code"] == "codex_review_interrupted"
+            assert receipt["status"] == ("started" if interrupt_recovery else "prepared")
+            assert receipt["result_action"] == ("not_available" if interrupt_recovery else "review_required")
+            assert receipt["automatic_retry"] is False
+            assert ("finished_at" in receipt) is not interrupt_recovery
+            target = action.parent.with_name("attempt-2")
+            assert not any((target / name).exists() for name in review_interruption.FORBIDDEN_WRITES)
+            assert {path: path.read_bytes() for path in source} == source
+            assert len(collections) == 2
             assert collections[0] != collections[1]
 
 

@@ -264,6 +264,9 @@ def test_source_bridge_uses_installed_frozen_validator_without_writing(tmp_path,
     ('valid_preview', None),
     ('valid_collecting', None),
     ('valid_recovered_collecting', None),
+    ('valid_interrupted_recovered_collecting', None),
+    ('damaged_interrupted_recovered_collecting_source', 'maintenance_frozen_inputs_untrusted'),
+    ('damaged_interrupted_recovered_collecting_receipt', 'maintenance_frozen_inputs_untrusted'),
     ('valid_recovered_frozen_collecting', None),
     ('valid_recovered_collecting_files', None),
     ('valid_recovered_collecting_review_action', None),
@@ -319,7 +322,23 @@ def test_target_owned_current_validators_check_policy_and_pending_frozen_preview
             authorization_verifier=_verify_grant, submit_frozen=lambda _job: pytest.fail('must not submit'))
         initial = engine.next_action('travel_expense', mode='controlled_write')
         previous = Path(initial['action_file'])
-        engine.quarantine_invalid_review(previous)
+        if 'interrupted' in scenario:
+            from apps.oa_finance_preaudit import approval_lifecycle, controller_handoff
+            control_files = (
+                ('OA_FINANCE_PREAUDIT_CONTROLLER_LOCK_FILE', 'rolling-controller.lock'),
+                ('OA_FROZEN_WRITER_LOCK_FILE', 'frozen-writer.lock'),
+                ('OA_FINANCE_PREAUDIT_STOP_FILE', 'stop-preaudit.flag'),
+            )
+            for key, name in control_files:
+                monkeypatch.setenv(key, str(tmp_path / 'control' / name))
+            with runtime_control.global_controller_lease():
+                manifest = controller_handoff.begin({'capacity': 3})
+                with approval_lifecycle.run_scope(manifest, tmp_path):
+                    approval_lifecycle.heartbeat(manifest['run_id'], manifest['controller_instance_id'],
+                        {previous}, [], writer_active=False)
+                    assert approval_lifecycle.interrupt_unwritten(manifest, cause='readonly_deadline_exceeded') == 1
+        else:
+            engine.quarantine_invalid_review(previous)
         engine = flow_engine.FlowEngine(root=flows, discover_candidates=engine._discover_candidates,
             discover_handled=lambda: [], collect_material=engine._collect_material,
             authorization_source=_grant, authorization_verifier=_verify_grant,
@@ -371,12 +390,25 @@ def test_target_owned_current_validators_check_policy_and_pending_frozen_preview
                         authorization_verifier=lambda *_args: False, submit_frozen=lambda _job: pytest.fail('must not submit'))
             with pytest.raises(KeyboardInterrupt, match='pause-after-material'):
                 proceed(engine)
+        elif 'interrupted' in scenario:
+            def interrupt_collection(*_args):
+                raise SystemExit('pause-before-collect')
+            engine = flow_engine.FlowEngine(root=flows, discover_candidates=engine._discover_candidates,
+                discover_handled=lambda: [], collect_material=interrupt_collection,
+                authorization_source=_grant, authorization_verifier=_verify_grant,
+                submit_frozen=lambda _job: pytest.fail('must not submit'))
+            with pytest.raises(SystemExit, match='pause-before-collect'):
+                proceed(engine)
         else:
             monkeypatch.setattr(engine, '_prepare_attempt', lambda _root: (_ for _ in ()).throw(SystemExit('pause-before-collect')))
             with pytest.raises(SystemExit, match='pause-before-collect'):
                 proceed(engine)
         attempt = 2 if recovering else 1
         path = next(flows.glob(f'{workflow}/cases/*/attempt-{attempt}/action.json'))
+        if scenario == 'damaged_interrupted_recovered_collecting_source':
+            previous.with_name('state.json').write_bytes(previous.with_name('state.json').read_bytes() + b'\n')
+        elif scenario == 'damaged_interrupted_recovered_collecting_receipt':
+            path.with_name('recovery-receipt.json').write_bytes(path.with_name('recovery-receipt.json').read_bytes() + b'\n')
         if 'writer_artifact' in scenario:
             path.with_name('writer-boundary.json').write_text('{}')
         elif scenario == 'damaged_frozen_collecting_material':
@@ -439,6 +471,10 @@ def test_target_owned_current_validators_check_policy_and_pending_frozen_preview
     status_file.write_bytes(raw)
     status_file.chmod(0o600)
     receipt = {'path': str(status_file), 'sha256': hashlib.sha256(raw).hexdigest()}
+    if 'interrupted' in scenario:
+        retained = {file: file.read_bytes() for file in flows.rglob('*') if file.is_file()}
+        for key, _name in control_files:
+            monkeypatch.delenv(key)
     if code:
         with pytest.raises(RuntimeError, match=code):
             maintenance_runtime.read_current_inputs(tmp_path, receipt)
@@ -452,7 +488,7 @@ def test_target_owned_current_validators_check_policy_and_pending_frozen_preview
             resumed = packaging_engine(flows, calls=[]).next_action(workflow, mode='controlled_write')
             assert resumed['action'] == 'review_required'
             assert resumed['attempt'] == state['attempt']
-        if scenario in {'valid_collecting', 'valid_frozen_collecting', 'valid_collecting_files', 'valid_collecting_review_action'} or recovering:
+        if scenario in {'valid_collecting', 'valid_frozen_collecting', 'valid_collecting_files', 'valid_collecting_review_action'} or (recovering and 'interrupted' not in scenario):
             from tests.finance_preaudit.test_flow_engine_submission import _grant, _verify_grant
             resumed = _engine(flows, state['request_id'], authorization_source=_grant,
                 authorization_verifier=_verify_grant, submit_frozen=lambda _job: pytest.fail('must not submit')).next_action(
@@ -462,6 +498,17 @@ def test_target_owned_current_validators_check_policy_and_pending_frozen_preview
             if recovering:
                 assert resumed['recovered_from_attempt'] == state['recovered_from_attempt'] == 1
                 assert resumed['recovery_reason'] == state['recovery_reason'] == 'codex_decision_invalid'
+    if 'interrupted' in scenario:
+        assert {file: file.read_bytes() for file in flows.rglob('*') if file.is_file()} == retained
+        assert status_file.read_bytes() == raw
+        if code is None:
+            recovery = snapshot['reconciliation']['recoveries']['items'][0]
+            assert recovery['receipt_status'] == 'verified'
+            assert recovery['status'] == 'started'
+            assert recovery['result_action'] == 'not_available'
+            assert recovery['automatic_retry'] is False
+            assert state['write_state'] == 'not_requested'
+            assert state['write_authorized'] is False
 
 
 @pytest.mark.parametrize('section,key,value,code', [
