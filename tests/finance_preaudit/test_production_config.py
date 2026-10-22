@@ -33,8 +33,11 @@ def test_source_default_model_drift_is_rejected_without_execution(repository):
     assert "production_config_reviewer_drift" in production_config.repository_findings(repository)
 
 
-def test_native_automation_shape_preserves_project_and_schedule():
+@pytest.mark.parametrize('legacy_recovery', [False, True])
+def test_native_automation_shape_preserves_project_and_schedule(legacy_recovery):
     prompt = (quality.PROJECT_ROOT / "config/automations/oa-skill-prompt.txt").read_text()
+    if legacy_recovery:
+        prompt = prompt.replace('--confirm-alerts YES', '--confirm-alerts YES --recover-confirmed-no-write-once YES')
     config = {"model": "gpt-6.1-sol", "reasoning_effort": "medium", "prompt": prompt,
               "rrule": "original-schedule", "kind": "cron", "execution_environment": "local",
               "target": {"type": "project", "project_id": "production-project"}}
@@ -50,6 +53,8 @@ def test_native_automation_shape_preserves_project_and_schedule():
     ("config/automations/oa-skill-prompt.txt", "--workflow general_expense", "--workflow packaging_layout_approval", "production_config_workflows_drift:template"),
     ("config/automations/oa-skill-prompt.txt", "--confirm-alerts YES", "--confirm-alerts NO", "production_config_command_invalid:template"),
     ("config/automations/oa-skill-prompt.txt", "--confirm-write YES", "--read-only", "production_config_command_invalid:template"),
+    ("config/automations/oa-skill-prompt.txt", "--confirm-alerts YES", "--confirm-alerts YES --recover-confirmed-no-write-once NO", "production_config_command_invalid:template"),
+    ("config/automations/oa-skill-prompt.txt", "--confirm-alerts YES", "--confirm-alerts YES --recover-confirmed-no-write-once YES --recover-confirmed-no-write-once YES", "production_config_command_invalid:template"),
     ("apps/oa_finance_preaudit/codex_review_worker.py", 'f\'model_reasoning_effort="{REASONING_EFFORT}"\'', '\'model_reasoning_effort="medium"\'', "production_config_native_settings_drift"),
 ])
 def test_repository_drift_is_rejected_at_quality_seam(repository, monkeypatch, capsys, relative, before, after, code):
